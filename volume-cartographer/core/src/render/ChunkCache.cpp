@@ -1249,7 +1249,8 @@ void ChunkCache::refreshFetchers(
         }
     });
     for (const auto& key : stoppedRemoteActivity)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     state->cv_.notify_all();
 }
 
@@ -1293,7 +1294,19 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
     });
     for (const auto& [serial, key] : retry) {
         (void)serial;
-        (void)queueFetchLocked(state, key, state->generation_, 0);
+        try {
+            (void)queueFetchLocked(state, key, state->generation_, 0);
+        } catch (...) {
+            // A fetcher that throws during queue setup must not orphan an
+            // InFlight entry (parked blocking readers would wait forever;
+            // the caller's cv notify wakes them to retry) or starve the
+            // remaining keys' restarts.
+            eraseUnresolvedEntryLocked(*state, key);
+            Logger()->warn(
+                "[ChunkCache] fetch restart failed for ({}, {}, {}, {}); "
+                "entry dropped for refetch on demand",
+                key.level, key.iz, key.iy, key.ix);
+        }
     }
 }
 
@@ -2318,18 +2331,13 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->decodeScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-    for (const auto& key : activeRemoteFetches) {
-        try {
-            notifyRemoteFetchListeners(state, key, false);
-        } catch (...) {
-            // A throwing listener must not skip the remaining stop events or
-            // the cv notify below - parked blocking readers whose entries
-            // were just cleared depend on that wake.
-            Logger()->warn(
-                "[ChunkCache] remote-fetch listener threw during "
-                "invalidation; continuing");
-        }
-    }
+    // Per-listener exception isolation: a throwing listener must not skip
+    // other listeners' stop events, the remaining keys, or the cv notify
+    // below - parked blocking readers whose entries were just cleared
+    // depend on that wake.
+    for (const auto& key : activeRemoteFetches)
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     for (const auto& operation : cancelledPersistence) {
         {
             std::lock_guard lock(operation->mutex);
@@ -3117,7 +3125,8 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
         }
     });
     if (remoteStart)
-        notifyRemoteFetchListeners(state, key, true);
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
     if (pruned || waitingForPersistence)
         state->cv_.notify_all();
 }
@@ -3371,7 +3380,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
         }
     }
     if (remoteActivityEnded)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     bool decodeRequested = false;
     std::shared_ptr<PersistenceOperation> persistence;
@@ -3785,7 +3795,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : activityKeys)
-        notifyRemoteFetchListeners(state, key, true);
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
 
     ChunkFetchResult fetch;
     const auto started = std::chrono::steady_clock::now();
@@ -3835,7 +3846,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : stopped)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     dispatchStorageObjectResult(
         state, objectKey, transferSerial, std::move(fetch), false);
@@ -5590,7 +5602,8 @@ void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
 
 void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                             const ChunkKey& key,
-                                            bool active)
+                                            bool active,
+                                            bool isolateCallbackExceptions)
 {
     std::vector<RemoteFetchActivityCallback> callbacks;
     {
@@ -5602,8 +5615,22 @@ void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
         }
     }
     for (auto& cb : callbacks) {
-        if (cb)
+        if (!cb)
+            continue;
+        if (!isolateCallbackExceptions) {
             cb(key, active);
+            continue;
+        }
+        try {
+            cb(key, active);
+        } catch (...) {
+            // Isolation is requested by scheduler worker threads (an escape
+            // would std::terminate the jthread) and by invalidation/refresh
+            // paths (stop events must reach every listener, and the cv
+            // notify that parked readers depend on must not be skipped).
+            Logger()->warn(
+                "[ChunkCache] remote-fetch listener threw; continuing");
+        }
     }
 }
 

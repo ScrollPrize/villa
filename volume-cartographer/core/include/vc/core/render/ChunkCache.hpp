@@ -770,7 +770,8 @@ private:
     static void notifyListeners(const std::shared_ptr<State>& state);
     static void notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                            const ChunkKey& key,
-                                           bool active);
+                                           bool active,
+                                           bool isolateCallbackExceptions = false);
     static std::uint64_t nextSchedulerGroup();
     static void invalidateState(const std::shared_ptr<State>& state);
     static void registerStateBudget(const std::shared_ptr<State>& state);

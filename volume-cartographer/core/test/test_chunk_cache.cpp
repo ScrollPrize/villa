@@ -1177,6 +1177,50 @@ TEST_CASE("ChunkCache invalidation ends remote activity exactly once")
     fs::remove_all(dir);
 }
 
+TEST_CASE("ChunkCache invalidation stop events survive a throwing listener")
+{
+    // Invalidation-path listener isolation: a throwing listener must not
+    // starve other listeners of their stop events or escape invalidate().
+    // Deterministic in either listener order: pre-fix, thrower-first skips
+    // the counter, counter-first lets the throw escape invalidate().
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+                     ("vc_chunk_activity_throwing_" + std::to_string(rng()));
+    fs::create_directories(dir);
+
+    auto service = makeService();
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 4}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    options.persistentCachePath = dir;
+    auto cache = service->acquireSource(
+        "remote-activity-throwing-listener", std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, std::move(options));
+
+    cache->addRemoteFetchActivityListener([&](const ChunkKey&, bool active) {
+        if (!active)
+            throw std::runtime_error("listener failure");
+    });
+    std::atomic<int> stopEvents{0};
+    cache->addRemoteFetchActivityListener([&](const ChunkKey&, bool active) {
+        if (!active)
+            ++stopEvents;
+    });
+
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    fetcher->waitStarted();
+    CHECK_NOTHROW(cache->invalidate());
+    CHECK(stopEvents.load() == 1);
+
+    fetcher->release();
+    fetcher->waitFinished();
+    fs::remove_all(dir);
+}
+
 TEST_CASE("ChunkCacheService isolates and invalidates sources independently")
 {
     auto service = makeService();
@@ -1462,6 +1506,10 @@ TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection"
     auto readerA = std::async(std::launch::async, [&] {
         return cache->getChunkBlocking(0, 0, 0, 0);
     });
+    // Declared before the guard so the guard destructs first: a failing
+    // REQUIRE below must release the fetcher before either future's
+    // destructor blocks on a still-parked reader.
+    std::future<ChunkResult> readerB;
     FetcherReleaseGuard releaseGuard(*fetcher);
     REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
 
@@ -1470,7 +1518,7 @@ TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection"
     // physically running (and parked in the fetcher).
     REQUIRE(fetcher->waitForStarted(2, std::chrono::seconds{5}));
 
-    auto readerB = std::async(std::launch::async, [&] {
+    readerB = std::async(std::launch::async, [&] {
         return cache->getChunkBlocking(0, 0, 0, 0);
     });
     // B joins the in-flight successor; both registrations must be visible
@@ -1512,12 +1560,14 @@ TEST_CASE("ChunkCache: six blocking readers all survive an invalidation")
     constexpr int kReaders = 6;
     std::vector<std::future<ChunkResult>> readers;
     readers.reserve(kReaders);
+    // Guard before population: if a later std::async throws mid-loop, the
+    // vector's unwinding must not block on futures parked in the fetcher.
+    FetcherReleaseGuard releaseGuard(*fetcher);
     for (int i = 0; i < kReaders; ++i) {
         readers.push_back(std::async(std::launch::async, [&] {
             return cache->getChunkBlocking(0, 0, 0, 0);
         }));
     }
-    FetcherReleaseGuard releaseGuard(*fetcher);
     REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
 
     cache->invalidate();
