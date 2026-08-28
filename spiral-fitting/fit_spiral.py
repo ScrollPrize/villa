@@ -4538,7 +4538,7 @@ class FitContext:
                         floating_threshold=self.config['dt_target_floating_threshold'],
                         num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                         max_stride=self.config['dt_target_max_stride'],
-                        max_total_points=20_000_000,
+                        max_total_points=5_000_000,
                     ))
             if compute_track_dt and self.config['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
                 track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
@@ -4548,7 +4548,7 @@ class FitContext:
                     floating_threshold=self.config['dt_target_floating_threshold'],
                     num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                     max_stride=self.config['dt_target_max_stride'],
-                    max_total_points=20_000_000,
+                    max_total_points=5_000_000,
                 ))
 
         patch_loss_values = get_patch_and_umbilicus_losses(
