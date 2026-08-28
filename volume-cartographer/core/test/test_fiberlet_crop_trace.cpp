@@ -1235,6 +1235,7 @@ TEST_CASE("Trace constraints split evenly and hard-link consecutive pieces")
     FiberletCropTraceLine degenerate;
     degenerate.pointsBaseXYZ = {{1, 2, 3}, {1, 2, 3}};
     FiberTraceConstraintConfig config;
+    CHECK(config.maximumWindingDistance == 1.5);
     config.maximumDistanceBaseVoxels = 0.0;
     config.parallelThreads = 1;
     const auto report = extractFiberTraceConstraints(
@@ -1707,6 +1708,14 @@ TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
     CHECK(cutoff.constraints.empty());
     CHECK(cutoff.rejectedWinding == 0);
     CHECK(cutoff.rejectedWindingCutoff == 1);
+
+    config.maximumWindingDistance = 4.0;
+    const auto extended = extract(std::nextafter(4.0, 0.0));
+    REQUIRE(extended.constraints.size() == 1);
+    CHECK(extended.rejectedWindingCutoff == 0);
+    const auto extendedCutoff = extract(4.0);
+    CHECK(extendedCutoff.constraints.empty());
+    CHECK(extendedCutoff.rejectedWindingCutoff == 1);
 
     config.enforceMaximumWindingDistance = false;
     const auto unbounded = extract(42.0);

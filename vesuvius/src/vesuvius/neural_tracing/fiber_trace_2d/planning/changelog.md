@@ -1,8 +1,22 @@
+# 2026-08-28: extended distance-weighted winding evidence
+
+- Raised H/V diagnostic and winding-BP raw winding admission to the exclusive
+  cutoff `4.0` while preserving the legacy parity default.
+- Added fixed power-of-two decay for complete H/V-aware winding contributions
+  by half-integer distance bin without weakening H/V relation or hard sign
+  evidence.
+
+# 2026-08-28: fixed-prepass winding Defect escape
+
+- Allowed fixed-prepass H/V pieces to become Defect during winding without
+  reopening the opposite direction, using a compact two-state-per-winding
+  layout and distinct pre-pass/final class diagnostics.
+
 # 2026-08-27: winding BP modes
 
 - Added a shared fixed-prepass orientation mode for both winding solvers which
-  freezes the initial H/V/Mixed MAP and removes orientation from subsequent
-  piece-state and message dimensions.
+  freezes the initial H/V choice and removes opposite-direction alternatives
+  from subsequent piece-state and message dimensions.
 - Added a calibration-free joint winding mode selected by an explicit fixed
   phase and scale, removing calibration states/messages while retaining joint
   H/V/Mixed, integer-support, and component-sign inference.
@@ -1576,3 +1590,27 @@
 - Added exact tiny-factor marginal validation, shared-calibration disconnected
   component coverage, configuration failures, and a measured 384-crop
   comparison.
+
+## 2026-08-28 - Winding-free Defect fibers
+
+- Replaced per-winding Defect states and their four-substitution factors with
+  one winding-free Defect state whose incident winding constraints are neutral.
+- Removed pre-pass Defect constraints before continuous initialization, made
+  integer support conditional on active mass, and added explicit winding
+  validity to CSV and OBJ output.
+
+## 2026-08-28 - Quantized interleaved winding targets
+
+- Replaced raw floating-point winding observations in H/V-aware BP with signed
+  half-integer interval targets after raw cutoff admission.
+- Preserved raw and effective targets separately in factor diagnostics and
+  documented a deferred continuous Ceres formulation.
+
+## 2026-08-28 - Hard perpendicular winding order
+
+- Made zero and reversed active-active winding predictions impossible for
+  every accepted nonzero signed perpendicular observation in alternating and
+  joint-grid BP.
+- Added exact negative-infinity-safe cavity accumulation and damping, applied
+  the rule to alternating calibration, and added a deterministic final Defect
+  projection for infeasible independently decoded node marginals.

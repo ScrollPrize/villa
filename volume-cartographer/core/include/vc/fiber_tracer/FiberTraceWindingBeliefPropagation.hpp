@@ -60,6 +60,8 @@ struct FiberTraceWindingBeliefPropagationConfig {
 };
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
+    double mixedUnaryCost = 0.5;
+    double orientationTemperature = 0.25;
     double minimumMeasurementScale = 0.5;
     double maximumMeasurementScale = 2.0;
     double calibrationTolerance = 1.0e-4;
@@ -153,13 +155,18 @@ struct FiberTraceWindingFactorDiagnostic {
     std::size_t canonicalNodeB = 0;
     double parallelScore = 0.0;
     double perpendicularScore = 0.0;
+    double windingWeightMultiplier = 1.0;
+    double effectiveParallelWindingWeight = 0.0;
+    double effectivePerpendicularWindingWeight = 0.0;
     std::optional<double> originalSignedDelta;
     std::optional<double> canonicalSignedDelta;
+    std::optional<double> effectiveSignedDelta;
     std::optional<std::size_t> normalComponent;
     bool selfEdge = false;
 };
 
 struct FiberTraceWindingBeliefPropagationReport {
+    std::vector<unsigned char> windingValid;
     std::vector<double> continuousWinding;
     std::vector<int> mapWinding;
     std::vector<double> posteriorMeanWinding;
@@ -214,6 +221,7 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::size_t calibrationGridCells = 0;
     std::size_t calibrationGridShifts = 0;
     std::size_t calibrationIterations = 0;
+    std::size_t hardSignProjectedDefects = 0;
     std::size_t selectedInitialization = 0;
     std::size_t rankDeficientUpdates = 0;
     bool calibrationConverged = false;

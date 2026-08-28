@@ -1,72 +1,53 @@
-# Task Log: Fixed pre-pass orientation for winding BP
+# Task log: extended distance-weighted winding constraints
 
-## Discovery
+## Findings
 
-- Joint-grid currently skips orientation BP and solves `(H|Mixed|V,k)` in one
-  model. Alternating runs orientation BP first but uses those marginals only as
-  soft unaries, so winding inference can still change the class.
-- Both winding implementations already use the same orientation/winding factor
-  semantics. Fixed-prepass mode will use a shared winding-only piece-state
-  layout and combine each integer candidate with stored fixed-class metadata;
-  it will not retain impossible orientation states or pay their message cost.
-- Existing component gauges implicitly use class A at winding zero. Fixed mode
-  must retain the pre-pass class at the gauge while fixing only the integer
-  winding origin.
+- The raw finite cutoff is applied during shared constraint extraction and is
+  currently exclusive.
+- H/V-aware winding solvers quantize admitted signed observations to
+  half-integer targets, but the prepared factor currently reuses one
+  perpendicular score for both H/V orientation and signed winding magnitude.
+- Distance decay therefore requires a separate prepared signed-winding weight;
+  mutating the original perpendicular score would unintentionally weaken H/V
+  classification.
+- The independent integer-only winding diagnostic deliberately uses raw targets
+  and will retain unscaled evidence.
+- Independent review identified that scaling only the signed perpendicular term
+  would bias a measured link toward zero winding through its unscaled parallel
+  term. The implementation will scale the complete winding contribution while
+  retaining the original H/V relation scores.
+- The generic constraint config is also used by the legacy parity labeler,
+  which cannot represent the widened range. Its default remains `1.5`; H/V CLI
+  modes select `4.0` unless explicitly overridden.
 
 ## Deviations
 
 - None.
 
-## Plan review
-
-- The independent review required winding-only state accounting across every
-  alternating calibration/energy stage, not only message passing; fixed-class
-  and orientation-mode persistence alongside retained soft pre-pass marginals;
-  explicit factor/gauge cardinality tests; and a repeated performance protocol.
-- It also clarified that Tie is not a fixed-class API value. Exact pre-pass MAP
-  ties are converted to Mixed before entering either winding solver.
-
-## Implementation
-
-- Added `--winding-fixed-orientation` for both `joint-grid` and `alternating`.
-  It runs the existing H/V/Mixed BP once, maps its posterior to a fixed class,
-  and then represents every piece state only by an integer winding candidate.
-- The fixed class is immutable metadata used while evaluating winding factors;
-  it is not a separately optimized or one-hot-expanded solver state. Mixed
-  retains its four-substitution factor calculation without introducing four
-  latent states.
-- Applied the reduced state layout to message passing, support expansion,
-  calibration updates, component gauges, decoded-energy ranking, and final
-  reports in both winding implementations.
-- Preserved the pre-pass soft class probabilities in diagnostics and added the
-  fixed class plus orientation-mode provenance to the consistency CSV.
-
 ## Validation
 
-- Built `vc_fiber_trace_chunk`, `test_fiber_trace_winding_bp`, and
-  `test_fiberlet_crop_trace` with `cmake --build volume-cartographer/build ...
-  -j 32`.
-- Registered focused CTest passed: 2/2 test binaries, including 18 winding-BP
-  and 74 crop-trace cases.
-- Joint-grid fixed-prepass and alternating fixed-prepass both completed on
-  `data/workdir3/crop_traces.zarr` with the Paris 4 Lasagna normal manifest,
-  1,361 pieces, and 35,673 constraints. Both retained the pre-pass assignment
-  of 710 H, 630 V, and 21 Mixed pieces.
-- CLI help exposes the option and using it without
-  `--bp-only --bp-inference sum-product-mixed` is rejected.
+- Release build:
+  `cmake --build volume-cartographer/build --target test_fiber_trace_winding_bp test_fiberlet_crop_trace vc_fiber_trace_chunk -j 32`
+- Focused CTest:
+  `ctest --test-dir volume-cartographer/build --output-on-failure -R 'test_fiber_trace_winding_bp|test_fiberlet_crop_trace'`
+  passed both tests in `0.89 s` total. Direct binaries reported 24 winding-BP
+  and 74 crop/constraint test cases passed.
+- Representative fixed-calibration crop used the existing 25%-quality command
+  on `data/workdir3/crop_traces.zarr`, with output under
+  `/tmp/fiber-winding-cutoff4-smoke`.
 
-## Performance
-
-Release-build timings used the established 1,024-crop command with fixed phase
-0.5, fixed scale 1.0, 32 workers, and three runs per mode. The fixed-prepass
-orientation BP took 0.630/0.631/0.636 seconds.
-
-| Mode | Candidate states | Solver seconds min/median/max | Command wall seconds min/median/max |
-| --- | ---: | ---: | ---: |
-| Joint H/V/Mixed+winding | 942,700 | 5.849 / 5.929 / 6.004 | 9.55 / 9.93 / 11.15 |
-| Fixed-prepass winding-only | 362,663 | 1.936 / 2.050 / 2.054 | 6.45 / 6.54 / 6.56 |
-
-The winding phase therefore uses 61.5% fewer candidate states and has a 2.9x
-median solver-time speedup. Numerics intentionally differ from joint inference
-because the requested mode freezes the independent H/V/Mixed result; the
-default mode remains unchanged.
+  ```bash
+  volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/crop_traces.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /tmp/fiber-winding-cutoff4-smoke/fibers --direction-dominance 0.9 --piece-length 512 --bp-only --bp-inference sum-product-mixed --bp-temperature 2.5 --bp-mixed-cost 5 --quality-fraction 0.25 --winding-fixed-phase 0.5 --winding-fixed-scale 1.0
+  ```
+- The widened cutoff retained `69,713` measured factors and produced
+  `1,404,929` candidate states. Effective signed-target/multiplier counts were:
+  `-3.5/0.125: 4,599`, `-2.5/0.25: 7,565`, `-1.5/0.5: 10,863`,
+  `-0.5/1: 10,852`, `0/1: 861`, `0.5/1: 11,052`,
+  `1.5/0.5: 10,316`, `2.5/0.25: 7,679`, and `3.5/0.125: 4,743`.
+- The crop completed but did not converge within 500 messages: residual
+  `1.8301`, discrete time `19.67 s`, and final H/V/Defect counts `3/5/1353`.
+  The preceding `<1.5` hard-sign run had `35,673` factors, `724,843` states,
+  residual `1.0636`, about `10.15 s`, and H/V/Defect `13/7/1341`. The requested
+  wider experiment is therefore operational but currently worsens convergence
+  and directional retention on this crop.
+- `git diff --check` passed.

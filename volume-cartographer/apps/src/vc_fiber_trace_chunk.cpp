@@ -104,6 +104,7 @@ struct Options {
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
     bool hasFixedCalibrationOption = false;
+    bool hasWindingCutoffOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -226,7 +227,7 @@ void usage(const char* executable)
               << "  --max-distance N           closest-pair threshold [128]\n"
               << "  --tangent-window N         centered tangent secant length [32]\n"
               << "  --winding-step N           Lasagna connector integration step [8]\n"
-              << "  --winding-cutoff N         exclusive finite winding cutoff [1.5]\n"
+              << "  --winding-cutoff N         exclusive finite winding cutoff [4 H/V; 1.5 parity]\n"
               << "  --no-winding-cutoff        retain every finite winding measurement\n"
               << "  --constraints-per-fiber N mutual strongest-link cap per source fiber\n"
               << "  --lp-relaxation            solve continuous [0,1] label relaxation\n"
@@ -605,9 +606,11 @@ Options parse(int argc, char** argv)
             if (!(options.constraints.maximumWindingDistance > 0.0))
                 fail("--winding-cutoff must be positive");
             options.constraints.enforceMaximumWindingDistance = true;
+            options.hasWindingCutoffOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--no-winding-cutoff") {
             options.constraints.enforceMaximumWindingDistance = false;
+            options.hasWindingCutoffOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--constraints-per-fiber") {
             const std::size_t limit =
@@ -718,6 +721,8 @@ Options parse(int argc, char** argv)
             }
             options.labeling.hvOnly = true;
         }
+        if (!options.hasWindingCutoffOption && options.labeling.hvOnly)
+            options.constraints.maximumWindingDistance = 4.0;
         if (!options.constraints.enforceMaximumWindingDistance &&
             options.mode == Mode::Constraints && !options.labeling.hvOnly) {
             fail("--no-winding-cutoff currently requires --hv-only");
@@ -1326,6 +1331,7 @@ void writeAndPrintBpReport(
         directions.size() != lines.size() ||
         originalTraceIndices.size() != lines.size() ||
         report.seedPieceIndex >= lines.size() ||
+        winding.windingValid.size() != lines.size() ||
         winding.continuousWinding.size() != lines.size() ||
         winding.mapWinding.size() != lines.size() ||
         winding.posteriorMeanWinding.size() != lines.size() ||
@@ -1336,6 +1342,10 @@ void writeAndPrintBpReport(
         winding.componentByPiece.size() != lines.size() ||
         winding.incidentSignedConstraints.size() != lines.size() ||
         winding.incidentSkippedConstraints.size() != lines.size() ||
+        (interleaved &&
+         (interleaved->classAProbability.size() != lines.size() ||
+          interleaved->mixedProbability.size() != lines.size() ||
+          interleaved->classBProbability.size() != lines.size())) ||
         (mixedState &&
          (report.verticalProbability.size() != lines.size() ||
           report.mixedProbability.size() != lines.size() ||
@@ -1358,40 +1368,47 @@ void writeAndPrintBpReport(
         throw std::logic_error(
             "Fixed-prepass winding report does not match represented pieces");
     }
+    const auto ternaryPrediction = [](double horizontal,
+                                      double mixed,
+                                      double vertical) {
+        const std::array probabilities{vertical, mixed, horizontal};
+        const double maximum = *std::max_element(
+            probabilities.begin(), probabilities.end());
+        if (std::count(
+                probabilities.begin(), probabilities.end(), maximum) != 1) {
+            return vc::fiber_tracer::FiberTernaryState::Tie;
+        }
+        return static_cast<vc::fiber_tracer::FiberTernaryState>(std::distance(
+            probabilities.begin(),
+            std::find(probabilities.begin(), probabilities.end(), maximum)));
+    };
+    const auto ternaryName = [](vc::fiber_tracer::FiberTernaryState state) {
+        switch (state) {
+        case vc::fiber_tracer::FiberTernaryState::Vertical:
+            return "v";
+        case vc::fiber_tracer::FiberTernaryState::Mixed:
+            return "defect";
+        case vc::fiber_tracer::FiberTernaryState::Horizontal:
+            return "h";
+        case vc::fiber_tracer::FiberTernaryState::Tie:
+            return "tie";
+        }
+        return "invalid";
+    };
     for (std::size_t piece = 0; piece < lines.size(); ++piece) {
-        if (fixedPrepass) {
-            switch (interleaved->fixedOrientationByPiece[piece]) {
-            case vc::fiber_tracer::FiberTraceFixedOrientation::Horizontal:
-                predictions[piece] =
-                    vc::fiber_tracer::FiberTernaryState::Horizontal;
-                break;
-            case vc::fiber_tracer::FiberTraceFixedOrientation::Mixed:
-                predictions[piece] =
-                    vc::fiber_tracer::FiberTernaryState::Mixed;
-                break;
-            case vc::fiber_tracer::FiberTraceFixedOrientation::Vertical:
-                predictions[piece] =
-                    vc::fiber_tracer::FiberTernaryState::Vertical;
-                break;
-            }
+        if (interleaved && winding.windingValid[piece] == 0) {
+            predictions[piece] =
+                vc::fiber_tracer::FiberTernaryState::Mixed;
+        } else if (interleaved) {
+            predictions[piece] = ternaryPrediction(
+                interleaved->classAProbability[piece],
+                interleaved->mixedProbability[piece],
+                interleaved->classBProbability[piece]);
         } else if (mixedState) {
-            const std::array probabilities{
-                report.verticalProbability[piece],
-                report.mixedProbability[piece],
+            predictions[piece] = ternaryPrediction(
                 report.horizontalProbability[piece],
-            };
-            const double maximum = *std::max_element(
-                probabilities.begin(), probabilities.end());
-            if (std::count(
-                    probabilities.begin(), probabilities.end(), maximum) == 1) {
-                predictions[piece] = static_cast<
-                    vc::fiber_tracer::FiberTernaryState>(std::distance(
-                        probabilities.begin(),
-                        std::find(
-                            probabilities.begin(),
-                            probabilities.end(),
-                            maximum)));
-            }
+                report.mixedProbability[piece],
+                report.verticalProbability[piece]);
         } else if (report.horizontalness[piece] <= 0.25) {
             predictions[piece] =
                 vc::fiber_tracer::FiberTernaryState::Vertical;
@@ -1403,13 +1420,26 @@ void writeAndPrintBpReport(
         }
     }
 
-    const auto [relativeWindingMinimum, relativeWindingMaximum] =
-        std::minmax_element(
-            winding.mapWinding.begin(), winding.mapWinding.end());
-    const int windingOutputOffset = -*relativeWindingMinimum;
+    std::optional<int> relativeWindingMinimum;
+    std::optional<int> relativeWindingMaximum;
+    for (std::size_t piece = 0; piece < lines.size(); ++piece) {
+        if (winding.windingValid[piece] == 0)
+            continue;
+        relativeWindingMinimum = relativeWindingMinimum
+            ? std::min(*relativeWindingMinimum, winding.mapWinding[piece])
+            : winding.mapWinding[piece];
+        relativeWindingMaximum = relativeWindingMaximum
+            ? std::max(*relativeWindingMaximum, winding.mapWinding[piece])
+            : winding.mapWinding[piece];
+    }
+    const int windingOutputOffset = relativeWindingMinimum
+        ? -*relativeWindingMinimum
+        : 0;
     std::map<int, std::vector<vc::core::io::NamedPolyline>> windingLines;
     std::map<int, std::vector<std::size_t>> windingPieceIndices;
     for (std::size_t piece = 0; piece < lines.size(); ++piece) {
+        if (winding.windingValid[piece] == 0)
+            continue;
         const int outputWinding =
             winding.mapWinding[piece] + windingOutputOffset;
         windingLines[outputWinding].push_back({
@@ -1454,7 +1484,10 @@ void writeAndPrintBpReport(
             "failed to open winding factor CSV: " + factorCsv.string());
     factorOutput
         << "constraint,piece_a,piece_b,node_a,node_b,parallel,perpendicular,"
-           "original_signed_delta,canonical_signed_delta,calibrated_signed_delta,"
+           "winding_weight_multiplier,effective_parallel_winding_weight,"
+           "effective_perpendicular_winding_weight,"
+           "original_signed_delta,canonical_raw_signed_delta,"
+           "effective_signed_delta,calibrated_signed_delta,"
            "normal_component,self_edge\n"
         << std::setprecision(17);
     const auto writeOptionalDouble = [](std::ostream& stream,
@@ -1475,15 +1508,20 @@ void writeAndPrintBpReport(
         factorOutput << factor.constraintIndex << ',' << factor.pieceA << ','
                      << factor.pieceB << ',' << factor.canonicalNodeA << ','
                      << factor.canonicalNodeB << ',' << factor.parallelScore
-                     << ',' << factor.perpendicularScore << ',';
+                     << ',' << factor.perpendicularScore << ','
+                     << factor.windingWeightMultiplier << ','
+                     << factor.effectiveParallelWindingWeight << ','
+                     << factor.effectivePerpendicularWindingWeight << ',';
         writeOptionalDouble(factorOutput, factor.originalSignedDelta);
         factorOutput << ',';
         writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
         factorOutput << ',';
-        if (factor.canonicalSignedDelta && interleaved)
-            factorOutput << *factor.canonicalSignedDelta * interleaved->measurementScale;
+        writeOptionalDouble(factorOutput, factor.effectiveSignedDelta);
+        factorOutput << ',';
+        if (factor.effectiveSignedDelta && interleaved)
+            factorOutput << *factor.effectiveSignedDelta * interleaved->measurementScale;
         else
-            writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
+            writeOptionalDouble(factorOutput, factor.effectiveSignedDelta);
         factorOutput << ',';
         writeOptionalSize(factorOutput, factor.normalComponent);
         factorOutput << ',' << (factor.selfEdge ? 1 : 0) << '\n';
@@ -1549,7 +1587,7 @@ void writeAndPrintBpReport(
         << "bp_status,vertical_threshold,"
            "horizontal_threshold,"
         << (mixedState ? "orientation_projection" : "horizontalness")
-        << ",winding_component,winding_continuous,winding_relative_map,"
+        << ",winding_component,winding_valid,winding_continuous,winding_relative_map,"
            "winding_output,"
            "winding_posterior_mean,winding_map_probability,winding_entropy,"
            "winding_candidate_min,winding_candidate_max,"
@@ -1563,7 +1601,9 @@ void writeAndPrintBpReport(
     if (interleaved) {
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
                      "winding_component_phase_sign,winding_solver,"
-                     "winding_orientation_mode,winding_fixed_orientation,"
+                     "winding_orientation_mode,winding_prepass_class,"
+                     "winding_final_class,winding_final_p_h,"
+                     "winding_final_p_defect,winding_final_p_v,"
                      "winding_calibration_mode,"
                      "winding_phase_mean,winding_scale_mean,"
                      "winding_component_positive_sign_probability";
@@ -1597,15 +1637,24 @@ void writeAndPrintBpReport(
                   << consistency.horizontalThreshold << ','
                   << report.horizontalness[piece] << ','
                   << winding.componentByPiece[piece] << ','
-                  << winding.continuousWinding[piece] << ','
-                  << winding.mapWinding[piece] << ','
-                  << winding.mapWinding[piece] + windingOutputOffset << ','
-                  << winding.posteriorMeanWinding[piece] << ','
-                  << winding.mapProbability[piece] << ','
-                  << winding.entropy[piece] << ','
-                  << winding.candidateMinimum[piece] << ','
-                  << winding.candidateMaximum[piece] << ','
-                  << winding.incidentSignedConstraints[piece] << ','
+                  << (winding.windingValid[piece] != 0 ? 1 : 0) << ',';
+        if (winding.windingValid[piece] != 0) {
+            csvOutput << winding.continuousWinding[piece] << ','
+                      << winding.mapWinding[piece] << ','
+                      << winding.mapWinding[piece] + windingOutputOffset << ','
+                      << winding.posteriorMeanWinding[piece] << ',';
+        } else {
+            csvOutput << "NA,NA,NA,NA,";
+        }
+        csvOutput << winding.mapProbability[piece] << ','
+                  << winding.entropy[piece] << ',';
+        if (winding.windingValid[piece] != 0) {
+            csvOutput << winding.candidateMinimum[piece] << ','
+                      << winding.candidateMaximum[piece] << ',';
+        } else {
+            csvOutput << "NA,NA,";
+        }
+        csvOutput << winding.incidentSignedConstraints[piece] << ','
                   << winding.incidentSkippedConstraints[piece] << ','
                   << current.degree
                   << ',' << current.incidentMeasurements << ','
@@ -1625,8 +1674,12 @@ void writeAndPrintBpReport(
         csvOptional(current.neighborCertainty);
         if (interleaved) {
             const std::size_t component = winding.componentByPiece[piece];
-            csvOutput << ',' << interleaved->posteriorMeanLatentCoordinate[piece]
-                      << ',' << interleaved->phaseMagnitude
+            csvOutput << ',';
+            if (winding.windingValid[piece] != 0)
+                csvOutput << interleaved->posteriorMeanLatentCoordinate[piece];
+            else
+                csvOutput << "NA";
+            csvOutput << ',' << interleaved->phaseMagnitude
                       << ',' << interleaved->measurementScale
                       << ',' << interleaved->componentPhaseSign.at(
                              component)
@@ -1643,7 +1696,11 @@ void writeAndPrintBpReport(
             } else {
                 csvOutput << "NA";
             }
-            csvOutput << ',' << vc::fiber_tracer::
+            csvOutput << ',' << ternaryName(predictions[piece])
+                      << ',' << interleaved->classAProbability.at(piece)
+                      << ',' << interleaved->mixedProbability.at(piece)
+                      << ',' << interleaved->classBProbability.at(piece)
+                      << ',' << vc::fiber_tracer::
                              fiberTraceWindingCalibrationModeName(
                                  interleaved->calibrationMode)
                       << ',' << interleaved->calibrationPhaseMean
@@ -1660,9 +1717,16 @@ void writeAndPrintBpReport(
     }
     if (!csvOutput)
         throw std::runtime_error("failed to write BP consistency CSV: " + csv.string());
-    const double meanWindingConfidence = std::accumulate(
-        winding.mapProbability.begin(), winding.mapProbability.end(), 0.0) /
-        static_cast<double>(winding.mapProbability.size());
+    double meanWindingConfidence = 0.0;
+    std::size_t validWindingCount = 0;
+    for (std::size_t piece = 0; piece < lines.size(); ++piece) {
+        if (winding.windingValid[piece] == 0)
+            continue;
+        meanWindingConfidence += winding.mapProbability[piece];
+        ++validWindingCount;
+    }
+    if (validWindingCount != 0)
+        meanWindingConfidence /= static_cast<double>(validWindingCount);
     std::cout << std::fixed << std::setprecision(6)
               << "fiber winding BP\n"
               << "status  pieces  variables  factors  components"
@@ -1679,9 +1743,10 @@ void writeAndPrintBpReport(
               << winding.messageIterations << "  " << winding.messageResidual
               << "  " << winding.effectiveWorkers << "  "
               << winding.totalCandidateStates << "  "
-              << *relativeWindingMinimum << "  " << *relativeWindingMaximum
+              << relativeWindingMinimum.value_or(0) << "  "
+              << relativeWindingMaximum.value_or(0)
               << "  0  "
-              << *relativeWindingMaximum + windingOutputOffset << "  "
+              << relativeWindingMaximum.value_or(0) + windingOutputOffset << "  "
               << meanWindingConfidence << "  " << winding.discreteSolveSeconds
               << '\n'
               << "winding_factor_csv=" << factorCsv
@@ -1694,7 +1759,7 @@ void writeAndPrintBpReport(
                 << "solver  orientation_mode  calibration_mode  phase_map  phase_mean  scale_map  scale_mean"
                    "  grid_cells  grid_shifts  entropy  lower_boundary"
                    "  upper_boundary  min_gain  max_gain  converged"
-                   "  decoded_energy\n"
+                   "  decoded_energy  hard_sign_projected_defects\n"
                 << vc::fiber_tracer::fiberTraceWindingSolverName(
                        interleaved->solver)
                 << "  " << vc::fiber_tracer::
@@ -1716,12 +1781,14 @@ void writeAndPrintBpReport(
                 << "  " << interleaved->maximumCalibrationGain
                 << "  "
                 << (interleaved->calibrationConverged ? "true" : "false")
-                << "  " << interleaved->decodedEnergy << '\n';
+                << "  " << interleaved->decodedEnergy
+                << "  " << interleaved->hardSignProjectedDefects << '\n';
         } else {
             std::cout
                 << "solver  orientation_mode  phase  scale  calibration_iterations"
                    "  calibration_converged  initialization"
-                   "  rank_deficient_updates  decoded_energy\n"
+                   "  rank_deficient_updates  decoded_energy"
+                   "  hard_sign_projected_defects\n"
                 << vc::fiber_tracer::fiberTraceWindingSolverName(
                        interleaved->solver)
                 << "  " << vc::fiber_tracer::
@@ -1733,7 +1800,8 @@ void writeAndPrintBpReport(
                 << (interleaved->calibrationConverged ? "true" : "false")
                 << "  " << interleaved->selectedInitialization << "  "
                 << interleaved->rankDeficientUpdates << "  "
-                << interleaved->decodedEnergy << '\n';
+                << interleaved->decodedEnergy << "  "
+                << interleaved->hardSignProjectedDefects << '\n';
         }
     }
     std::cout << std::fixed << std::setprecision(6);
@@ -2731,6 +2799,9 @@ int main(int argc, char** argv)
                                 static_cast<vc::fiber_tracer::
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                         windingConfig;
+                                joint.mixedUnaryCost = options.bp.mixedUnaryCost;
+                                joint.orientationTemperature =
+                                    options.bp.horizontalnessTemperature;
                                 joint.temperature = 0.25;
                                 interleavedWinding = vc::fiber_tracer::
                                     solveFiberTraceInterleavedWindingBeliefPropagation(

@@ -5253,6 +5253,26 @@
   `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
   Missing or cross-component normal evidence removes only the perpendicular
   winding term, not the H/V factor.
+- H/V-aware interleaved winding BP converts every admitted nonzero raw signed
+  observation to a signed half-integer interval center before continuous or
+  discrete inference: `(0,1] -> 0.5`, `(1,2] -> 1.5`, and so on. Exact signed
+  zero and hard continuity stay zero. The raw exclusive cutoff runs before
+  conversion and is not re-applied to the effective value. The independent
+  integer-only winding diagnostic remains raw because it has no H/V half
+  ladder. Alternating and joint-grid inference consume the same converted
+  target. Fixed phase `0.5` and scale `1.0` define the exact-step experiment;
+  adaptive calibration remains an explicit comparison mode.
+- H/V diagnostic and winding-BP CLI paths default to the exclusive raw winding
+  cutoff `4.0`; the shared extraction config and legacy parity-labeling path
+  retain their `<1.5` default. After half-integer conversion, multiply the
+  complete soft winding contribution by
+  `2^-floor(abs(effective_target))`: target magnitudes `0.5`, `1.5`, `2.5`, and
+  `3.5` therefore use `1`, `0.5`, `0.25`, and `0.125`. This multiplier applies
+  to both parallel same-winding and perpendicular signed-offset winding terms,
+  including continuous initialization and calibration. It must not change the
+  independent H/V orientation factor, continuity, the integer-only raw winding
+  diagnostic, or hard signed-order admissibility. The formula continues safely
+  for larger bins admitted by explicit cutoff overrides.
 - In `sum-product-mixed`, orientation and winding are one joint state per split
   piece. Every piece remains a distinct variable. Same-trace continuity is its
   parallel-score-1, zero-distance factor, not equality or variable collapse.
@@ -5269,19 +5289,27 @@
   multi-start calibration, numerical defaults, and output conventions.
 - Both winding solvers optionally support fixed-prepass orientation. The
   ordinary Mixed-state BP runs once, and each piece's unique H/Mixed/V MAP is
-  retained as its fixed class; an exact MAP tie becomes Mixed. The subsequent
-  solver has no orientation variable or three-way piece-state dimension: each
-  piece state is only an integer winding candidate decoded with the stored
-  fixed class. Component gauges fix winding zero without changing that class.
-  Mixed retains its normalized four-substitution winding factor semantics, but
-  those substitutions are factor evaluation and never latent piece states.
+  retained as its pre-pass class; an exact MAP tie becomes Mixed. The
+  subsequent solver cannot switch H to V or V to H, but may declare either
+  directional piece Mixed/Defect when winding evidence is incompatible. A
+  pre-pass H/V piece has one fixed-direction state per candidate integer plus
+  one winding-free Defect state. A pre-pass Defect piece has only that single
+  Defect state. Constraints incident to a pre-pass Defect are removed before
+  continuous initialization, component/gauge construction, and discrete BP.
+  A late Defect assignment makes every incident pair factor neutral.
+- A newly available late-Defect state has log unary
+  `-mixed_unary_cost/orientation_temperature`. Fixed-prepass winding factors
+  do not repeat the H/V same/different orientation energy; they use only
+  winding evidence, so the completed orientation pre-pass is not counted
+  twice. Alternating calibration and component-sign updates exclude pair mass
+  whenever either final endpoint state is Defect.
   Calibration, component sign, integer support, and winding potentials retain
   the selected solver's existing behavior. Reports preserve the soft pre-pass
-  marginals and separately record `fixed-prepass` plus the selected class per
-  piece. Joint orientation inference remains the default when the option is
-  absent.
-- `joint-grid` has no H/V/Mixed pre-pass. Each piece state is
-  `(A|Mixed|B,k)`, with the crop-central piece of each connected constraint
+  marginals and separately record `fixed-prepass`, the pre-pass class, and the
+  final H/Defect/V posterior per piece. Final OBJ layers use the final class.
+  Joint orientation inference remains the default when the option is absent.
+- `joint-grid` has no H/V/Mixed pre-pass. Each piece has `(A,k)` and `(B,k)`
+  states plus one winding-free Defect state, with the crop-central piece of each connected constraint
   component fixed to `(A,0)`. Each component has a binary ladder-order sign,
   while one explicit calibration variable over `(log gain, phase)` is shared
   by every component. Aligned-normal sign resolution remains separate and is
@@ -5292,9 +5320,19 @@
   `parallel*abs(delta)` plus
   `perpendicular*abs(gain*delta-signed_target)` when its signed target exists.
   Orientation and the Mixed unary retain `--bp-temperature`; winding retains
-  its established temperature `0.25`. A Mixed endpoint omits visible
-  orientation energy and uses the normalized four-A/B-substitution winding
-  potential, so it does not transmit a visible class preference.
+  its established temperature `0.25`. A Defect endpoint makes the complete
+  pair factor neutral, so it transmits neither orientation nor winding
+  evidence and cannot couple winding ladders through a crossing fiber.
+- Every accepted nonzero signed perpendicular measurement is also a hard
+  ordering constraint. In measurement coordinates, an active-active state is
+  admissible only when `signed_target*predicted_delta > 0`; zero and reversed
+  predicted deltas have exactly zero probability. Missing and exact-zero
+  signed targets, parallel-only evidence, and zero-distance hard continuity do
+  not activate the rule. A Defect endpoint remains neutral.
+- Exact zero-probability messages use finite-log sums plus negative-infinity
+  counts for cavity construction. Damping changes finite/impossible support
+  explicitly and must never evaluate `-inf - -inf` or replace the exclusion
+  with a finite sentinel penalty.
 - Joint gain uses an absolute lattice in `log(gain)` centered initially on
   gain 1; phase uses a fixed absolute lattice spanning `[0,0.5]`. Support
   changes are considered only after both message and calibration posteriors
@@ -5308,8 +5346,12 @@
   posterior stability, resolved support pressure, and consecutive stable
   iterations. Reports include solver mode, calibration MAP and posterior
   means, entropy, absolute gain bounds, boundary masses, grid shifts,
-  component-sign posterior/MAP, state count, and convergence. No label-changing
-  post-fit or automatic fallback to `alternating` is permitted.
+  component-sign posterior/MAP, state count, and convergence. No cost-based
+  post-fit or automatic fallback to `alternating` is permitted. A final
+  deterministic feasibility decode may only change active pieces to Defect in
+  order to remove a hard-sign violation left by independently decoded loopy-BP
+  node marginals; it never changes H to V, V to H, integer winding, phase,
+  scale, or component sign.
 - Joint-grid may instead use fixed calibration when both a phase in `[0,0.5]`
   and a finite positive measurement scale are supplied. Fixed calibration is
   a distinct reported mode, not a one-cell latent calibration posterior: pair
@@ -5333,15 +5375,16 @@
   scale cannot reduce residual noise merely by shrinking scale. Repeated
   endpoint pairs sum complete measurement energies. A component may consume
   signed evidence from only one aligned-normal component.
-- Mixed remains a piece-local error state with one unary cost. If either
-  endpoint is Mixed, omit orientation energy and define the winding potential
-  by the normalized average over all four latent A/B substitutions at the two
-  endpoints. This potential depends on integer coordinates but is invariant to
-  the other endpoint's visible class, so Mixed cannot propagate orientation or
-  gain multiplicity entropy.
+- Mixed remains a piece-local error state with one unary cost and no integer
+  winding coordinate. If either endpoint is Mixed, the complete pairwise
+  potential is neutral. It therefore disables parallel, perpendicular,
+  orientation, calibration, and component-sign evidence for that assignment.
 - For fixed phase and positive scale, run stable synchronous damped sum-product
-  over `(A,k)`, `(Mixed,k)`, and `(B,k)`. Sum boundary probability over classes
-  before adaptive integer support expansion. Gauges contain only `(A,0)`.
+  over `(A,k)`, `(B,k)`, and one Defect state. Sum boundary probability over
+  active classes and normalize by total active mass before adaptive integer
+  support expansion; zero active mass cannot request expansion. The single
+  Defect message slot is remapped by identity while active slots are remapped
+  by integer coordinate. Gauges contain only `(A,0)` in ordinary joint mode.
   Expansion continues until resolved or the explicit total-state guard throws.
 - Alternating calibration computes full pair beliefs. Oriented pair mass forms
   an expected squared-residual proposal in inverse-scale coordinates
@@ -5349,18 +5392,29 @@
   phase `[0,0.5]` and scale `[0.5,2]`; a rank-deficient normal matrix retains the
   previous unidentifiable values. Backtracking accepts the proposal only when
   the authoritative fixed-belief expected L1 winding energy does not increase.
+  Both component-sign selection and phase/scale backtracking reject candidates
+  that reverse any contributing nonzero signed perpendicular observation.
   Mixed pair mass does not calibrate phase or scale.
 - Use deterministic phase/scale initializations. Rank converged starts before
   nonconverged starts, then select the lowest complete energy of the per-node
   joint-marginal argmax assignment; this is a decoded loopy-BP assignment, not
   an exact MAP claim. Stable ties use initialization order. A message-limit
   result stops that start's calibration and remains a labeled finite candidate.
-- Reports expose joint A/Mixed/B marginals, integer MAP and posterior values,
+- Reports expose joint A/Mixed/B marginals and explicit winding validity.
+  Integer MAP/posterior values are authoritative only for active pieces;
+  Defect rows use `NA` in CSV winding fields and are excluded from `w_N` OBJ
+  layers. Reports additionally expose
   latent coordinate, phase, scale, component sign, calibration rank/status,
-  initialization, decoded energy, support, convergence, and timings. Published
+  initialization, decoded energy, hard-sign projected-Defect count, support,
+  convergence, and timings. Published
   `w_N` layers group integer `k` after a nonnegative display offset. The CSV
   retains relative `k` and component identity. Finite iteration-limit results
   remain usable but must be labeled nonconverged.
+- Winding factor diagnostics preserve raw original-order and raw
+  canonical-order signed observations, separately expose the effective
+  half-integer canonical target, its winding-weight multiplier, and its
+  effective parallel/perpendicular winding weights, and derive any calibrated
+  latent target from that effective value.
 - The reusable interleaved solver exposes an optional synchronous progress
   callback. Events identify preparation, the one-based multi-start
   initialization, calibration iteration, adaptive-support round, BP message

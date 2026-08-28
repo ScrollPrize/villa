@@ -23,12 +23,15 @@ namespace
 
 constexpr double kEpsilon = 1.0e-12;
 
+enum class JointClass : unsigned char { A = 0, Mixed = 1, B = 2 };
+
 struct Measurement {
     std::size_t constraintIndex = 0;
     std::size_t a = 0;
     std::size_t b = 0;
     double parallel = 0.0;
     double perpendicular = 0.0;
+    double windingMultiplier = 1.0;
     std::optional<double> signedDelta;
     std::optional<std::size_t> normalComponent;
 };
@@ -72,9 +75,42 @@ void validateConfig(const FiberTraceWindingBeliefPropagationConfig& config)
     }
 }
 
+double quantizedHalfWindingTarget(double value)
+{
+    if (value == 0.0)
+        return 0.0;
+    const double magnitude = std::ceil(std::abs(value)) - 0.5;
+    return std::copysign(magnitude, value);
+}
+
+double windingWeightMultiplier(double effectiveTarget)
+{
+    const double exponent = std::floor(std::abs(effectiveTarget));
+    if (!(exponent > 0.0))
+        return 1.0;
+    constexpr int maximumSubnormalExponent =
+        std::numeric_limits<double>::digits -
+        std::numeric_limits<double>::min_exponent;
+    if (exponent > static_cast<double>(maximumSubnormalExponent))
+        return 0.0;
+    return std::ldexp(1.0, -static_cast<int>(exponent));
+}
+
+double parallelWindingWeight(const Measurement& measurement)
+{
+    return measurement.windingMultiplier * measurement.parallel;
+}
+
+double perpendicularWindingWeight(const Measurement& measurement)
+{
+    return measurement.windingMultiplier * measurement.perpendicular;
+}
+
 PreparedWinding prepareWinding(
     const FiberTraceConstraintReport& constraints,
-    const FiberTraceBeliefTopology& topology)
+    const FiberTraceBeliefTopology& topology,
+    std::span<const JointClass> fixedOrientations = {},
+    bool quantizeHalfWinding = false)
 {
     if (topology.pieceLines.size() != constraints.pieces.size() ||
         topology.pieceCenterDistanceBaseVoxels.size() != constraints.pieces.size()) {
@@ -94,22 +130,37 @@ PreparedWinding prepareWinding(
         topology.softConstraintIndices.size());
     const auto addConstraint = [&](std::size_t index, bool continuity) {
         const auto& constraint = constraints.constraints.at(index);
+        if (!fixedOrientations.empty() &&
+            (fixedOrientations[constraint.pieceA] == JointClass::Mixed ||
+             fixedOrientations[constraint.pieceB] == JointClass::Mixed)) {
+            return;
+        }
         const std::size_t originalA = result.pieceToNode[constraint.pieceA];
         const std::size_t originalB = result.pieceToNode[constraint.pieceB];
         const std::size_t a = std::min(originalA, originalB);
         const std::size_t b = std::max(originalA, originalB);
-        std::optional<double> signedDelta = continuity
+        std::optional<double> canonicalSignedDelta = continuity
             ? std::optional<double>{0.0}
             : constraint.signedWindingDelta;
-        if (signedDelta && originalA > originalB)
-            *signedDelta = -*signedDelta;
+        if (canonicalSignedDelta && originalA > originalB)
+            *canonicalSignedDelta = -*canonicalSignedDelta;
+        std::optional<double> effectiveSignedDelta = canonicalSignedDelta;
+        if (effectiveSignedDelta && quantizeHalfWinding && !continuity) {
+            *effectiveSignedDelta = quantizedHalfWindingTarget(
+                *effectiveSignedDelta);
+        }
+        const double windingMultiplier =
+            effectiveSignedDelta && quantizeHalfWinding && !continuity
+            ? windingWeightMultiplier(*effectiveSignedDelta)
+            : 1.0;
         Measurement measurement{
             index,
             a,
             b,
             constraint.parallelScore,
             constraint.perpendicularScore,
-            signedDelta,
+            windingMultiplier,
+            effectiveSignedDelta,
             continuity ? std::nullopt : constraint.windingNormalComponent,
         };
         result.diagnostics.push_back({
@@ -120,8 +171,12 @@ PreparedWinding prepareWinding(
             b,
             constraint.parallelScore,
             constraint.perpendicularScore,
+            windingMultiplier,
+            windingMultiplier * constraint.parallelScore,
+            windingMultiplier * constraint.perpendicularScore,
             constraint.signedWindingDelta,
-            signedDelta,
+            canonicalSignedDelta,
+            effectiveSignedDelta,
             continuity ? std::nullopt : constraint.windingNormalComponent,
             false,
         });
@@ -217,8 +272,10 @@ PreparedWinding prepareWinding(
 
 double measurementSquaredWeight(const Measurement& measurement)
 {
-    return measurement.parallel +
-        (measurement.signedDelta ? measurement.perpendicular : 0.0);
+    return parallelWindingWeight(measurement) +
+        (measurement.signedDelta
+             ? perpendicularWindingWeight(measurement)
+             : 0.0);
 }
 
 double measurementSquaredTarget(const Measurement& measurement)
@@ -226,7 +283,8 @@ double measurementSquaredTarget(const Measurement& measurement)
     const double weight = measurementSquaredWeight(measurement);
     if (!(weight > 0.0) || !measurement.signedDelta)
         return 0.0;
-    return measurement.perpendicular * *measurement.signedDelta / weight;
+    return perpendicularWindingWeight(measurement) *
+        *measurement.signedDelta / weight;
 }
 
 std::vector<double> solveContinuous(
@@ -295,13 +353,16 @@ std::vector<double> solveContinuous(
     std::size_t terms = 0;
     const auto accumulate = [&](const Measurement& measurement) {
         const double delta = values[measurement.b] - values[measurement.a];
-        if (measurement.parallel > 0.0) {
-            squared += measurement.parallel * delta * delta;
+        const double parallelWeight = parallelWindingWeight(measurement);
+        if (parallelWeight > 0.0) {
+            squared += parallelWeight * delta * delta;
             ++terms;
         }
-        if (measurement.signedDelta && measurement.perpendicular > 0.0) {
+        const double perpendicularWeight =
+            perpendicularWindingWeight(measurement);
+        if (measurement.signedDelta && perpendicularWeight > 0.0) {
             const double residual = delta - *measurement.signedDelta;
-            squared += measurement.perpendicular * residual * residual;
+            squared += perpendicularWeight * residual * residual;
             ++terms;
         }
     };
@@ -318,9 +379,9 @@ double robustCost(const Edge& edge, int labelA, int labelB)
     const double delta = static_cast<double>(labelB - labelA);
     double cost = 0.0;
     for (const auto& measurement : edge.measurements) {
-        cost += measurement.parallel * std::abs(delta);
+        cost += parallelWindingWeight(measurement) * std::abs(delta);
         if (measurement.signedDelta) {
-            cost += measurement.perpendicular *
+            cost += perpendicularWindingWeight(measurement) *
                 std::abs(delta - *measurement.signedDelta);
         }
     }
@@ -336,6 +397,91 @@ double logSumExp(const std::vector<double>& values)
     for (const double value : values)
         sum += std::exp(value - maximum);
     return maximum + std::log(sum);
+}
+
+struct LogProductAccumulator {
+    double finiteSum = 0.0;
+    std::size_t negativeInfinityCount = 0;
+};
+
+bool isNegativeInfinity(double value)
+{
+    return std::isinf(value) && value < 0.0;
+}
+
+void addLogFactor(LogProductAccumulator& accumulator, double value)
+{
+    if (isNegativeInfinity(value)) {
+        ++accumulator.negativeInfinityCount;
+    } else if (std::isfinite(value)) {
+        accumulator.finiteSum += value;
+    } else {
+        throw std::runtime_error("Winding BP encountered an invalid log factor");
+    }
+}
+
+double logProductValue(const LogProductAccumulator& accumulator)
+{
+    return accumulator.negativeInfinityCount == 0
+        ? accumulator.finiteSum
+        : -std::numeric_limits<double>::infinity();
+}
+
+double logCavityValue(
+    const LogProductAccumulator& accumulator,
+    double removed)
+{
+    LogProductAccumulator cavity = accumulator;
+    if (isNegativeInfinity(removed)) {
+        if (cavity.negativeInfinityCount == 0)
+            throw std::logic_error("Winding BP cavity infinity count underflow");
+        --cavity.negativeInfinityCount;
+    } else if (std::isfinite(removed)) {
+        cavity.finiteSum -= removed;
+    } else {
+        throw std::runtime_error("Winding BP encountered an invalid cavity factor");
+    }
+    return logProductValue(cavity);
+}
+
+void normalizeLogVector(std::vector<double>& values)
+{
+    const double normalization = logSumExp(values);
+    if (!std::isfinite(normalization))
+        throw std::runtime_error("Winding BP message has no finite state");
+    for (double& value : values)
+        value -= normalization;
+}
+
+double dampMessage(
+    std::vector<double>& target,
+    const std::vector<double>& current,
+    double damping)
+{
+    normalizeLogVector(target);
+    double residual = 0.0;
+    for (std::size_t state = 0; state < target.size(); ++state) {
+        const bool targetImpossible = isNegativeInfinity(target[state]);
+        const bool currentImpossible = isNegativeInfinity(current[state]);
+        if (targetImpossible || currentImpossible) {
+            if (targetImpossible != currentImpossible)
+                residual = std::numeric_limits<double>::infinity();
+            if (currentImpossible && !targetImpossible) {
+                // A remapped support state has no meaningful old probability.
+                // Adopt its finite update immediately instead of interpolating
+                // through negative infinity.
+            } else if (targetImpossible) {
+                target[state] = -std::numeric_limits<double>::infinity();
+            }
+            continue;
+        }
+        const double damped = current[state] +
+            damping * (target[state] - current[state]);
+        residual = std::max(residual, std::abs(damped - current[state]));
+        target[state] = damped;
+    }
+    normalizeLogVector(target);
+    return residual;
 }
 
 template <std::size_t Size>
@@ -377,6 +523,7 @@ DiscreteRound solvePairwiseRound(
     result.bToA.resize(problem.edges.size());
     std::vector<std::vector<double>> nextAToB(problem.edges.size());
     std::vector<std::vector<double>> nextBToA(problem.edges.size());
+    std::vector<std::vector<LogProductAccumulator>> accumulators(nodeCount);
     for (std::size_t edge = 0; edge < problem.edges.size(); ++edge) {
         const auto& current = problem.edges[edge];
         result.aToB[edge].assign(logUnary[current.b].size(), 0.0);
@@ -400,15 +547,21 @@ DiscreteRound solvePairwiseRound(
     for (std::size_t iteration = 0; iteration < config.maximumMessageIterations; ++iteration) {
         #pragma omp parallel for schedule(static) num_threads(workers) if(useParallel)
         for (std::size_t node = 0; node < nodeCount; ++node) {
-            result.totals[node] = logUnary[node];
+            accumulators[node].assign(logUnary[node].size(), {});
+            result.totals[node].resize(logUnary[node].size());
+            for (std::size_t state = 0; state < logUnary[node].size(); ++state)
+                addLogFactor(accumulators[node][state], logUnary[node][state]);
             for (const std::size_t edge : problem.adjacency[node]) {
                 const auto& current = problem.edges[edge];
                 const auto& incoming = current.a == node
                     ? result.bToA[edge]
                     : result.aToB[edge];
                 for (std::size_t state = 0; state < incoming.size(); ++state)
-                    result.totals[node][state] += incoming[state];
+                    addLogFactor(accumulators[node][state], incoming[state]);
             }
+            for (std::size_t state = 0; state < logUnary[node].size(); ++state)
+                result.totals[node][state] =
+                    logProductValue(accumulators[node][state]);
         }
         double residual = 0.0;
         #pragma omp parallel for schedule(static) num_threads(workers) if(useParallel) reduction(max : residual)
@@ -420,42 +573,38 @@ DiscreteRound solvePairwiseRound(
                 candidates.clear();
                 for (std::size_t stateA = 0; stateA < result.bToA[edge].size(); ++stateA) {
                     candidates.push_back(
-                        result.totals[current.a][stateA] -
-                        result.bToA[edge][stateA] +
+                        logCavityValue(
+                            accumulators[current.a][stateA],
+                            result.bToA[edge][stateA]) +
                         logPotential(edge, stateA, stateB));
                 }
                 nextAToB[edge][stateB] = logSumExp(candidates);
             }
-            const double normAToB = logSumExp(nextAToB[edge]);
-            for (std::size_t state = 0; state < nextAToB[edge].size(); ++state) {
-                const double raw = nextAToB[edge][state] - normAToB;
-                const double damped = result.aToB[edge][state] +
-                    config.messageDamping * (raw - result.aToB[edge][state]);
-                residual = std::max(
-                    residual, std::abs(damped - result.aToB[edge][state]));
-                nextAToB[edge][state] = damped;
-            }
+            residual = std::max(
+                residual,
+                dampMessage(
+                    nextAToB[edge],
+                    result.aToB[edge],
+                    config.messageDamping));
 
             candidates.reserve(result.totals[current.b].size());
             for (std::size_t stateA = 0; stateA < result.bToA[edge].size(); ++stateA) {
                 candidates.clear();
                 for (std::size_t stateB = 0; stateB < result.aToB[edge].size(); ++stateB) {
                     candidates.push_back(
-                        result.totals[current.b][stateB] -
-                        result.aToB[edge][stateB] +
+                        logCavityValue(
+                            accumulators[current.b][stateB],
+                            result.aToB[edge][stateB]) +
                         logPotential(edge, stateA, stateB));
                 }
                 nextBToA[edge][stateA] = logSumExp(candidates);
             }
-            const double normBToA = logSumExp(nextBToA[edge]);
-            for (std::size_t state = 0; state < nextBToA[edge].size(); ++state) {
-                const double raw = nextBToA[edge][state] - normBToA;
-                const double damped = result.bToA[edge][state] +
-                    config.messageDamping * (raw - result.bToA[edge][state]);
-                residual = std::max(
-                    residual, std::abs(damped - result.bToA[edge][state]));
-                nextBToA[edge][state] = damped;
-            }
+            residual = std::max(
+                residual,
+                dampMessage(
+                    nextBToA[edge],
+                    result.bToA[edge],
+                    config.messageDamping));
         }
         result.aToB.swap(nextAToB);
         result.bToA.swap(nextBToA);
@@ -471,15 +620,21 @@ DiscreteRound solvePairwiseRound(
 
     #pragma omp parallel for schedule(static) num_threads(workers) if(useParallel)
     for (std::size_t node = 0; node < nodeCount; ++node) {
-        result.totals[node] = logUnary[node];
+        accumulators[node].assign(logUnary[node].size(), {});
+        result.totals[node].resize(logUnary[node].size());
+        for (std::size_t state = 0; state < logUnary[node].size(); ++state)
+            addLogFactor(accumulators[node][state], logUnary[node][state]);
         for (const std::size_t edge : problem.adjacency[node]) {
             const auto& current = problem.edges[edge];
             const auto& incoming = current.a == node
                 ? result.bToA[edge]
                 : result.aToB[edge];
             for (std::size_t state = 0; state < incoming.size(); ++state)
-                result.totals[node][state] += incoming[state];
+                addLogFactor(accumulators[node][state], incoming[state]);
         }
+        for (std::size_t state = 0; state < logUnary[node].size(); ++state)
+            result.totals[node][state] =
+                logProductValue(accumulators[node][state]);
     }
     result.probabilities.resize(nodeCount);
     for (std::size_t node = 0; node < nodeCount; ++node) {
@@ -516,8 +671,6 @@ DiscreteRound solveDiscreteRound(
         });
 }
 
-enum class JointClass : unsigned char { A = 0, Mixed = 1, B = 2 };
-
 struct JointState {
     JointClass orientation = JointClass::A;
     int winding = 0;
@@ -553,11 +706,22 @@ std::vector<JointClass> fixedJointClasses(
     return result;
 }
 
+std::size_t jointActiveOrientationCount(
+    std::size_t node,
+    std::span<const JointClass> fixedOrientations)
+{
+    if (fixedOrientations.empty())
+        return 2;
+    return fixedOrientations[node] == JointClass::Mixed ? 0 : 1;
+}
+
 std::size_t jointPieceStateCount(
+    std::size_t node,
     std::size_t integerCount,
     std::span<const JointClass> fixedOrientations)
 {
-    return fixedOrientations.empty() ? 3 * integerCount : integerCount;
+    return 1 +
+        jointActiveOrientationCount(node, fixedOrientations) * integerCount;
 }
 
 JointState jointState(
@@ -566,15 +730,19 @@ JointState jointState(
     int lower,
     std::span<const JointClass> fixedOrientations)
 {
-    if (!fixedOrientations.empty()) {
-        return {
-            fixedOrientations[node],
-            lower + static_cast<int>(state),
-        };
-    }
+    if (state == 0)
+        return {JointClass::Mixed, 0};
+    --state;
+    const std::size_t orientationCount = jointActiveOrientationCount(
+        node, fixedOrientations);
+    if (orientationCount == 0)
+        throw std::out_of_range("Defect-only winding state is invalid");
+    if (!fixedOrientations.empty())
+        return {fixedOrientations[node],
+                lower + static_cast<int>(state / orientationCount)};
     return {
-        static_cast<JointClass>(state % 3),
-        lower + static_cast<int>(state / 3),
+        state % 2 == 0 ? JointClass::A : JointClass::B,
+        lower + static_cast<int>(state / orientationCount),
     };
 }
 
@@ -583,6 +751,30 @@ double classOffset(JointClass orientation, int sign, double phase)
     return orientation == JointClass::B
         ? static_cast<double>(sign) * phase
         : 0.0;
+}
+
+bool requiresHardWindingSign(const Measurement& measurement)
+{
+    return measurement.perpendicular > 0.0 && measurement.signedDelta &&
+        *measurement.signedDelta != 0.0;
+}
+
+bool hardWindingSignCompatible(
+    const Measurement& measurement,
+    double predictedDelta)
+{
+    return !requiresHardWindingSign(measurement) ||
+        *measurement.signedDelta * predictedDelta > 0.0;
+}
+
+bool hardWindingSignCompatible(const Edge& edge, double predictedDelta)
+{
+    return std::all_of(
+        edge.measurements.begin(),
+        edge.measurements.end(),
+        [&](const Measurement& measurement) {
+            return hardWindingSignCompatible(measurement, predictedDelta);
+        });
 }
 
 double windingEnergy(
@@ -596,12 +788,15 @@ double windingEnergy(
     const double delta = static_cast<double>(b.winding - a.winding) +
         classOffset(b.orientation, sign, phase) -
         classOffset(a.orientation, sign, phase);
+    const double predictedDelta = delta / scale;
+    if (!hardWindingSignCompatible(edge, predictedDelta))
+        return std::numeric_limits<double>::infinity();
     double energy = 0.0;
     for (const auto& measurement : edge.measurements) {
-        energy += measurement.parallel * std::abs(delta);
+        energy += parallelWindingWeight(measurement) * std::abs(delta);
         if (measurement.signedDelta) {
-            energy += measurement.perpendicular *
-                std::abs(delta / scale - *measurement.signedDelta);
+            energy += perpendicularWindingWeight(measurement) *
+                std::abs(predictedDelta - *measurement.signedDelta);
         }
     }
     return energy;
@@ -616,21 +811,54 @@ double jointLogPotential(
     double scale,
     double temperature)
 {
-    if (a.orientation != JointClass::Mixed &&
-        b.orientation != JointClass::Mixed) {
-        return -windingEnergy(edge, a, b, sign, phase, scale) / temperature;
+    if (a.orientation == JointClass::Mixed ||
+        b.orientation == JointClass::Mixed)
+        return 0.0;
+    return -windingEnergy(edge, a, b, sign, phase, scale) / temperature;
+}
+
+template <typename PredictedDelta>
+std::size_t projectDecodedHardSigns(
+    const PreparedWinding& problem,
+    std::vector<JointState>& decoded,
+    std::span<const double> activeConfidence,
+    const PredictedDelta& predictedDelta)
+{
+    if (decoded.size() != problem.piecesByNode.size() ||
+        activeConfidence.size() != decoded.size()) {
+        throw std::logic_error("Winding hard-sign projection size mismatch");
     }
-    std::array<double, 4> latent{};
-    std::size_t index = 0;
-    for (const JointClass classA : {JointClass::A, JointClass::B}) {
-        for (const JointClass classB : {JointClass::A, JointClass::B}) {
-            a.orientation = classA;
-            b.orientation = classB;
-            latent[index++] =
-                -windingEnergy(edge, a, b, sign, phase, scale) / temperature;
+    std::vector<unsigned char> gauge(decoded.size(), 0);
+    for (const std::size_t node : problem.gaugeNodeByComponent)
+        gauge[node] = 1;
+    std::size_t projected = 0;
+    for (std::size_t edgeIndex = 0;
+         edgeIndex < problem.edges.size();
+         ++edgeIndex) {
+        const auto& edge = problem.edges[edgeIndex];
+        if (decoded[edge.a].orientation == JointClass::Mixed ||
+            decoded[edge.b].orientation == JointClass::Mixed ||
+            hardWindingSignCompatible(
+                edge,
+                predictedDelta(edgeIndex, decoded[edge.a], decoded[edge.b]))) {
+            continue;
         }
+        std::size_t disable = edge.b;
+        if (gauge[edge.a] != 0 && gauge[edge.b] == 0) {
+            disable = edge.b;
+        } else if (gauge[edge.b] != 0 && gauge[edge.a] == 0) {
+            disable = edge.a;
+        } else if (activeConfidence[edge.a] < activeConfidence[edge.b]) {
+            disable = edge.a;
+        } else if (activeConfidence[edge.b] < activeConfidence[edge.a]) {
+            disable = edge.b;
+        } else {
+            disable = std::max(edge.a, edge.b);
+        }
+        decoded[disable] = {JointClass::Mixed, 0};
+        ++projected;
     }
-    return logSumExp(latent) - std::log(4.0);
+    return projected;
 }
 
 struct JointParameters {
@@ -674,7 +902,7 @@ JointAdaptiveRound solveJointAdaptive(
             const std::size_t integers = static_cast<std::size_t>(
                 upper[node] - lower[node] + 1);
             const std::size_t stateCount = jointPieceStateCount(
-                integers, fixedOrientations);
+                node, integers, fixedOrientations);
             result.totalStates += stateCount;
             logUnary[node].resize(stateCount, 0.0);
             if (fixedOrientations.empty()) {
@@ -684,19 +912,25 @@ JointAdaptiveRound solveJointAdaptive(
                     orientationBeliefs.mixedProbability[piece],
                     orientationBeliefs.verticalProbability[piece],
                 };
+                logUnary[node][0] = std::log(
+                    std::max(orientationPrior[1], kEpsilon));
                 for (std::size_t integer = 0; integer < integers; ++integer) {
-                    for (std::size_t orientation = 0; orientation < 3; ++orientation) {
-                        logUnary[node][3 * integer + orientation] = std::log(
-                            std::max(orientationPrior[orientation], kEpsilon));
+                    for (std::size_t orientation = 0; orientation < 2; ++orientation) {
+                        const std::size_t prior = orientation == 0 ? 0 : 2;
+                        logUnary[node][1 + 2 * integer + orientation] = std::log(
+                            std::max(orientationPrior[prior], kEpsilon));
                     }
                 }
+            } else if (fixedOrientations[node] != JointClass::Mixed) {
+                logUnary[node][0] = -config.mixedUnaryCost /
+                    config.orientationTemperature;
             }
-            if (gauge[node] != 0) {
+            if (gauge[node] != 0 && fixedOrientations.empty()) {
                 std::fill(
                     logUnary[node].begin(),
                     logUnary[node].end(),
                     -std::numeric_limits<double>::infinity());
-                logUnary[node][0] = 0.0;
+                logUnary[node][1] = 0.0;
             }
         }
         if (result.totalStates > config.maximumTotalCandidateStates) {
@@ -753,17 +987,27 @@ JointAdaptiveRound solveJointAdaptive(
             if (gauge[node] != 0)
                 continue;
             const auto& probabilities = result.discrete.probabilities[node];
-            const std::size_t integers = fixedOrientations.empty()
-                ? probabilities.size() / 3
-                : probabilities.size();
+            const std::size_t orientationCount = jointActiveOrientationCount(
+                node, fixedOrientations);
+            if (orientationCount == 0)
+                continue;
+            const std::size_t integers =
+                (probabilities.size() - 1) / orientationCount;
             std::vector<double> windingProbability(integers, 0.0);
             for (std::size_t integer = 0; integer < integers; ++integer) {
-                windingProbability[integer] = fixedOrientations.empty()
-                    ? probabilities[3 * integer] +
-                        probabilities[3 * integer + 1] +
-                        probabilities[3 * integer + 2]
-                    : probabilities[integer];
+                for (std::size_t orientation = 0;
+                     orientation < orientationCount;
+                     ++orientation) {
+                    windingProbability[integer] += probabilities[
+                        1 + orientationCount * integer + orientation];
+                }
             }
+            const double activeProbability = std::accumulate(
+                windingProbability.begin(), windingProbability.end(), 0.0);
+            if (!(activeProbability > 0.0))
+                continue;
+            for (double& probability : windingProbability)
+                probability /= activeProbability;
             const std::size_t map = static_cast<std::size_t>(std::distance(
                 windingProbability.begin(),
                 std::max_element(
@@ -891,6 +1135,10 @@ double calibrationL1(
     for (const auto& term : terms) {
         const double latent =
             term.integer + term.phaseCoefficient * phase;
+        if (term.signedDelta && *term.signedDelta != 0.0 &&
+            *term.signedDelta * (latent / scale) <= 0.0) {
+            return std::numeric_limits<double>::infinity();
+        }
         const double residual = term.signedDelta
             ? latent / scale - *term.signedDelta
             : latent;
@@ -1056,9 +1304,11 @@ CalibrationUpdate updateCalibration(
             rhs1 += w * phaseCoefficient * signedDelta;
         };
         for (const auto& measurement : edge.measurements) {
-            addParallel(measurement.parallel);
+            addParallel(parallelWindingWeight(measurement));
             if (measurement.signedDelta)
-                addSigned(measurement.perpendicular, *measurement.signedDelta);
+                addSigned(
+                    perpendicularWindingWeight(measurement),
+                    *measurement.signedDelta);
         }
     }
     const double previousGain = 1.0 / current.scale;
@@ -1102,27 +1352,70 @@ double decodedJointEnergy(
     const FiberTraceInterleavedWindingConfig& config)
 {
     std::vector<JointState> decoded(problem.piecesByNode.size());
-    double energy = 0.0;
+    std::vector<double> activeConfidence(decoded.size(), 0.0);
     for (std::size_t node = 0; node < decoded.size(); ++node) {
         const auto& probabilities = round.discrete.probabilities[node];
-        const std::size_t state = static_cast<std::size_t>(std::distance(
-            probabilities.begin(),
-            std::max_element(probabilities.begin(), probabilities.end())));
-        decoded[node] = jointState(
-            node, state, round.lower[node], fixedOrientations);
-        const std::size_t piece = problem.piecesByNode[node].front();
-        const double prior = decoded[node].orientation == JointClass::A
-            ? orientationBeliefs.horizontalProbability[piece]
-            : decoded[node].orientation == JointClass::Mixed
-                ? orientationBeliefs.mixedProbability[piece]
-                : orientationBeliefs.verticalProbability[piece];
-        energy -= std::log(std::max(prior, kEpsilon));
+        std::array<double, 3> classProbability{};
+        for (std::size_t state = 0; state < probabilities.size(); ++state) {
+            const auto current = jointState(
+                node, state, round.lower[node], fixedOrientations);
+            classProbability[static_cast<std::size_t>(current.orientation)] +=
+                probabilities[state];
+        }
+        const JointClass finalClass =
+            classProbability[1] >= classProbability[0] &&
+                classProbability[1] >= classProbability[2]
+            ? JointClass::Mixed
+            : classProbability[0] > classProbability[2]
+                ? JointClass::A
+                : JointClass::B;
+        activeConfidence[node] =
+            std::max(classProbability[0], classProbability[2]) -
+            classProbability[1];
+        double maximum = -1.0;
+        for (std::size_t state = 0; state < probabilities.size(); ++state) {
+            const auto current = jointState(
+                node, state, round.lower[node], fixedOrientations);
+            if (current.orientation == finalClass &&
+                probabilities[state] > maximum) {
+                maximum = probabilities[state];
+                decoded[node] = current;
+            }
+        }
+    }
+    projectDecodedHardSigns(
+        problem,
+        decoded,
+        activeConfidence,
+        [&](std::size_t edgeIndex, const JointState& a, const JointState& b) {
+            const auto& edge = problem.edges[edgeIndex];
+            const int sign = parameters.componentSign.at(
+                problem.componentByNode[edge.a]);
+            const double latent = static_cast<double>(b.winding - a.winding) +
+                classOffset(b.orientation, sign, parameters.phase) -
+                classOffset(a.orientation, sign, parameters.phase);
+            return latent / parameters.scale;
+        });
+    double energy = 0.0;
+    for (std::size_t node = 0; node < decoded.size(); ++node) {
+        if (fixedOrientations.empty()) {
+            const std::size_t piece = problem.piecesByNode[node].front();
+            const double prior = decoded[node].orientation == JointClass::A
+                ? orientationBeliefs.horizontalProbability[piece]
+                : decoded[node].orientation == JointClass::Mixed
+                    ? orientationBeliefs.mixedProbability[piece]
+                    : orientationBeliefs.verticalProbability[piece];
+            energy -= std::log(std::max(prior, kEpsilon));
+        } else if (decoded[node].orientation == JointClass::Mixed &&
+                   fixedOrientations[node] != JointClass::Mixed) {
+            energy += config.mixedUnaryCost / config.orientationTemperature;
+        }
     }
     for (std::size_t edge = 0; edge < problem.edges.size(); ++edge) {
         const auto& current = problem.edges[edge];
         const int sign = parameters.componentSign.at(
             problem.componentByNode[current.a]);
-        energy -= config.temperature * jointLogPotential(
+        const double logPotential = jointLogPotential(
             current,
             decoded[current.a],
             decoded[current.b],
@@ -1130,6 +1423,9 @@ double decodedJointEnergy(
             parameters.phase,
             parameters.scale,
             config.temperature);
+        energy -= fixedOrientations.empty()
+            ? config.temperature * logPotential
+            : logPotential;
     }
     return energy;
 }
@@ -1267,11 +1563,15 @@ std::size_t gridPieceStateCount(
     const std::vector<unsigned char>& gauge,
     std::span<const JointClass> fixedOrientations)
 {
-    return gauge[node] != 0
-        ? 1
-        : jointPieceStateCount(
-              static_cast<std::size_t>(upper[node] - lower[node] + 1),
-              fixedOrientations);
+    if (gauge[node] != 0) {
+        return fixedOrientations.empty()
+            ? 1
+            : jointPieceStateCount(node, 1, fixedOrientations);
+    }
+    return jointPieceStateCount(
+        node,
+        static_cast<std::size_t>(upper[node] - lower[node] + 1),
+        fixedOrientations);
 }
 
 JointState gridPieceState(
@@ -1282,14 +1582,14 @@ JointState gridPieceState(
     std::span<const JointClass> fixedOrientations)
 {
     if (gauge[node] != 0) {
-        if (state != 0)
+        const std::size_t stateCount = fixedOrientations.empty()
+            ? 1
+            : jointPieceStateCount(node, 1, fixedOrientations);
+        if (state >= stateCount)
             throw std::out_of_range("Joint-grid gauge state is invalid");
-        return {
-            fixedOrientations.empty()
-                ? JointClass::A
-                : fixedOrientations[node],
-            0,
-        };
+        if (fixedOrientations.empty())
+            return {JointClass::A, 0};
+        return jointState(node, state, 0, fixedOrientations);
     }
     return jointState(node, state, lower[node], fixedOrientations);
 }
@@ -1305,12 +1605,15 @@ double gridWindingEnergy(
     const double delta = static_cast<double>(b.winding - a.winding) +
         classOffset(b.orientation, sign, phase) -
         classOffset(a.orientation, sign, phase);
+    const double predictedDelta = gain * delta;
+    if (!hardWindingSignCompatible(edge, predictedDelta))
+        return std::numeric_limits<double>::infinity();
     double result = 0.0;
     for (const auto& measurement : edge.measurements) {
-        result += measurement.parallel * std::abs(delta);
+        result += parallelWindingWeight(measurement) * std::abs(delta);
         if (measurement.signedDelta) {
-            result += measurement.perpendicular *
-                std::abs(gain * delta - *measurement.signedDelta);
+            result += perpendicularWindingWeight(measurement) *
+                std::abs(predictedDelta - *measurement.signedDelta);
         }
     }
     return result;
@@ -1335,64 +1638,26 @@ double gridLogPotential(
     JointState b,
     int sign,
     const GridCalibrationCell& calibration,
-    const FiberTraceJointGridWindingConfig& config)
+    const FiberTraceJointGridWindingConfig& config,
+    bool includeOrientationEnergy)
 {
-    if (a.orientation != JointClass::Mixed &&
-        b.orientation != JointClass::Mixed) {
-        const double orientationEnergy = gridOrientationEnergy(
-            edge, a.orientation, b.orientation);
-        const double windingEnergy = gridWindingEnergy(
-            edge,
-            a,
-            b,
-            sign,
-            calibration.gain,
-            calibration.phase);
-        return -orientationEnergy / config.orientationTemperature -
-            windingEnergy / config.temperature;
+    if (a.orientation == JointClass::Mixed ||
+        b.orientation == JointClass::Mixed)
+        return 0.0;
+    const double windingEnergy = gridWindingEnergy(
+        edge,
+        a,
+        b,
+        sign,
+        calibration.gain,
+        calibration.phase);
+    double result = -windingEnergy / config.temperature;
+    if (includeOrientationEnergy) {
+        result -= gridOrientationEnergy(
+            edge, a.orientation, b.orientation) /
+            config.orientationTemperature;
     }
-    std::array<double, 4> alternatives{};
-    std::size_t index = 0;
-    for (const JointClass classA : {JointClass::A, JointClass::B}) {
-        for (const JointClass classB : {JointClass::A, JointClass::B}) {
-            a.orientation = classA;
-            b.orientation = classB;
-            alternatives[index++] = -gridWindingEnergy(
-                edge,
-                a,
-                b,
-                sign,
-                calibration.gain,
-                calibration.phase) / config.temperature;
-        }
-    }
-    return logSumExp(alternatives) - std::log(4.0);
-}
-
-void normalizeLogVector(std::vector<double>& values)
-{
-    const double normalization = logSumExp(values);
-    if (!std::isfinite(normalization))
-        throw std::runtime_error("Joint-grid BP message has no finite state");
-    for (double& value : values)
-        value -= normalization;
-}
-
-double dampMessage(
-    std::vector<double>& target,
-    const std::vector<double>& current,
-    double damping)
-{
-    normalizeLogVector(target);
-    double residual = 0.0;
-    for (std::size_t state = 0; state < target.size(); ++state) {
-        const double damped = current[state] +
-            damping * (target[state] - current[state]);
-        residual = std::max(residual, std::abs(damped - current[state]));
-        target[state] = damped;
-    }
-    normalizeLogVector(target);
-    return residual;
+    return result;
 }
 
 double dampMessage(
@@ -1406,6 +1671,15 @@ double dampMessage(
     double residual = 0.0;
     for (std::size_t state = 0; state < 2; ++state) {
         target[state] -= normalization;
+        const bool targetImpossible = isNegativeInfinity(target[state]);
+        const bool currentImpossible = isNegativeInfinity(current[state]);
+        if (targetImpossible || currentImpossible) {
+            if (targetImpossible != currentImpossible)
+                residual = std::numeric_limits<double>::infinity();
+            if (targetImpossible)
+                target[state] = -std::numeric_limits<double>::infinity();
+            continue;
+        }
         const double damped = current[state] +
             damping * (target[state] - current[state]);
         residual = std::max(residual, std::abs(damped - current[state]));
@@ -1416,6 +1690,15 @@ double dampMessage(
     target[1] -= dampedNormalization;
     return residual;
 }
+
+struct GridLogTotals {
+    std::vector<std::vector<LogProductAccumulator>> pieceAccumulators;
+    std::vector<LogProductAccumulator> calibrationAccumulators;
+    std::vector<std::array<LogProductAccumulator, 2>> signAccumulators;
+    std::vector<std::vector<double>> pieceValues;
+    std::vector<double> calibrationValues;
+    std::vector<std::array<double, 2>> signValues;
+};
 
 void validateJointGridConfig(const FiberTraceJointGridWindingConfig& config)
 {
@@ -1515,15 +1798,14 @@ void initializeGridMessages(
     }
 }
 
-void buildGridTotals(
+GridLogTotals buildGridTotals(
     const PreparedWinding& problem,
     const GridRound& round,
-    const FiberTraceJointGridWindingConfig& config,
-    std::vector<std::vector<double>>& pieceTotals,
-    std::vector<double>& calibrationTotal,
-    std::vector<std::array<double, 2>>& signTotals)
+    const FiberTraceJointGridWindingConfig& config)
 {
-    pieceTotals.resize(problem.piecesByNode.size());
+    GridLogTotals totals;
+    totals.pieceAccumulators.resize(problem.piecesByNode.size());
+    totals.pieceValues.resize(problem.piecesByNode.size());
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
         const std::size_t stateCount = gridPieceStateCount(
             node,
@@ -1531,7 +1813,8 @@ void buildGridTotals(
             round.upper,
             round.gauge,
             round.fixedOrientations);
-        pieceTotals[node].resize(stateCount);
+        totals.pieceAccumulators[node].resize(stateCount);
+        totals.pieceValues[node].resize(stateCount);
         for (std::size_t state = 0; state < stateCount; ++state) {
             const auto decoded = gridPieceState(
                 node,
@@ -1539,47 +1822,78 @@ void buildGridTotals(
                 round.lower,
                 round.gauge,
                 round.fixedOrientations);
-            pieceTotals[node][state] = round.fixedOrientations.empty() &&
-                    decoded.orientation == JointClass::Mixed
+            const bool chargeDefect =
+                decoded.orientation == JointClass::Mixed &&
+                (round.fixedOrientations.empty() ||
+                 round.fixedOrientations[node] != JointClass::Mixed);
+            addLogFactor(totals.pieceAccumulators[node][state], chargeDefect
                 ? -config.mixedUnaryCost / config.orientationTemperature
-                : 0.0;
+                : 0.0);
         }
     }
-    if (round.fixedCalibration)
-        calibrationTotal.clear();
-    else
-        calibrationTotal.assign(round.calibrationCells.size(), 0.0);
-    signTotals.assign(problem.gaugeNodeByComponent.size(), {0.0, 0.0});
+    if (!round.fixedCalibration) {
+        totals.calibrationAccumulators.resize(round.calibrationCells.size());
+        totals.calibrationValues.resize(round.calibrationCells.size());
+    }
+    totals.signAccumulators.resize(problem.gaugeNodeByComponent.size());
+    totals.signValues.resize(problem.gaugeNodeByComponent.size());
     for (std::size_t edgeIndex = 0;
          edgeIndex < problem.edges.size();
          ++edgeIndex) {
         const auto& edge = problem.edges[edgeIndex];
         const auto& message = round.messages[edgeIndex];
         for (std::size_t state = 0; state < message.toA.size(); ++state)
-            pieceTotals[edge.a][state] += message.toA[state];
+            addLogFactor(
+                totals.pieceAccumulators[edge.a][state], message.toA[state]);
         for (std::size_t state = 0; state < message.toB.size(); ++state)
-            pieceTotals[edge.b][state] += message.toB[state];
+            addLogFactor(
+                totals.pieceAccumulators[edge.b][state], message.toB[state]);
         if (!round.fixedCalibration) {
             for (std::size_t state = 0;
                  state < message.toCalibration.size();
                  ++state) {
-                calibrationTotal[state] += message.toCalibration[state];
+                addLogFactor(
+                    totals.calibrationAccumulators[state],
+                    message.toCalibration[state]);
             }
         }
         const std::size_t component = problem.componentByNode[edge.a];
-        signTotals[component][0] += message.toSign[0];
-        signTotals[component][1] += message.toSign[1];
+        addLogFactor(totals.signAccumulators[component][0], message.toSign[0]);
+        addLogFactor(totals.signAccumulators[component][1], message.toSign[1]);
     }
+    for (std::size_t node = 0; node < totals.pieceValues.size(); ++node) {
+        for (std::size_t state = 0;
+             state < totals.pieceValues[node].size();
+             ++state) {
+            totals.pieceValues[node][state] =
+                logProductValue(totals.pieceAccumulators[node][state]);
+        }
+    }
+    for (std::size_t state = 0;
+         state < totals.calibrationValues.size();
+         ++state) {
+        totals.calibrationValues[state] =
+            logProductValue(totals.calibrationAccumulators[state]);
+    }
+    for (std::size_t component = 0;
+         component < totals.signValues.size();
+         ++component) {
+        for (std::size_t state = 0; state < 2; ++state) {
+            totals.signValues[component][state] =
+                logProductValue(totals.signAccumulators[component][state]);
+        }
+    }
+    return totals;
 }
 
 double updateGridFactor(
     const Edge& edge,
     const GridMessages& current,
     GridMessages& next,
-    const std::vector<double>& totalA,
-    const std::vector<double>& totalB,
-    const std::vector<double>& calibrationTotal,
-    const std::array<double, 2>& signTotal,
+    const std::vector<LogProductAccumulator>& totalA,
+    const std::vector<LogProductAccumulator>& totalB,
+    const std::vector<LogProductAccumulator>& calibrationTotal,
+    const std::array<LogProductAccumulator, 2>& signTotal,
     const GridRound& round,
     const FiberTraceJointGridWindingConfig& config)
 {
@@ -1590,15 +1904,16 @@ double updateGridFactor(
         cavityCalibration.resize(calibrationTotal.size());
     std::array<double, 2> cavitySign{};
     for (std::size_t state = 0; state < cavityA.size(); ++state)
-        cavityA[state] = totalA[state] - current.toA[state];
+        cavityA[state] = logCavityValue(totalA[state], current.toA[state]);
     for (std::size_t state = 0; state < cavityB.size(); ++state)
-        cavityB[state] = totalB[state] - current.toB[state];
+        cavityB[state] = logCavityValue(totalB[state], current.toB[state]);
     for (std::size_t state = 0; state < cavityCalibration.size(); ++state) {
         cavityCalibration[state] =
-            calibrationTotal[state] - current.toCalibration[state];
+            logCavityValue(
+                calibrationTotal[state], current.toCalibration[state]);
     }
-    cavitySign[0] = signTotal[0] - current.toSign[0];
-    cavitySign[1] = signTotal[1] - current.toSign[1];
+    cavitySign[0] = logCavityValue(signTotal[0], current.toSign[0]);
+    cavitySign[1] = logCavityValue(signTotal[1], current.toSign[1]);
 
     next.toA.assign(cavityA.size(), -std::numeric_limits<double>::infinity());
     next.toB.assign(cavityB.size(), -std::numeric_limits<double>::infinity());
@@ -1634,44 +1949,39 @@ double updateGridFactor(
                  ++calibration) {
                 for (std::size_t signState = 0; signState < 2; ++signState) {
                     const int sign = signState == 0 ? 1 : -1;
-                    const double value = cavityA[stateA] + cavityB[stateB] +
-                        (round.fixedCalibration
-                             ? 0.0
-                             : cavityCalibration[calibration]) +
-                        cavitySign[signState] +
-                        gridLogPotential(
-                            edge,
-                            a,
-                            b,
-                            sign,
-                            activeCalibrationCell(round, calibration),
-                            config);
-                    next.toA[stateA] = logAddExp(next.toA[stateA], value);
-                    next.toB[stateB] = logAddExp(next.toB[stateB], value);
+                    const double calibrationCavity = round.fixedCalibration
+                        ? 0.0
+                        : cavityCalibration[calibration];
+                    const double logPotential = gridLogPotential(
+                        edge,
+                        a,
+                        b,
+                        sign,
+                        activeCalibrationCell(round, calibration),
+                        config,
+                        round.fixedOrientations.empty());
+                    next.toA[stateA] = logAddExp(
+                        next.toA[stateA],
+                        cavityB[stateB] + calibrationCavity +
+                            cavitySign[signState] + logPotential);
+                    next.toB[stateB] = logAddExp(
+                        next.toB[stateB],
+                        cavityA[stateA] + calibrationCavity +
+                            cavitySign[signState] + logPotential);
                     if (!round.fixedCalibration) {
                         next.toCalibration[calibration] = logAddExp(
-                            next.toCalibration[calibration], value);
+                            next.toCalibration[calibration],
+                            cavityA[stateA] + cavityB[stateB] +
+                                cavitySign[signState] + logPotential);
                     }
                     next.toSign[signState] = logAddExp(
-                        next.toSign[signState], value);
+                        next.toSign[signState],
+                        cavityA[stateA] + cavityB[stateB] +
+                            calibrationCavity + logPotential);
                 }
             }
         }
     }
-    for (std::size_t state = 0; state < next.toA.size(); ++state)
-        next.toA[state] -= cavityA[state];
-    for (std::size_t state = 0; state < next.toB.size(); ++state)
-        next.toB[state] -= cavityB[state];
-    if (!round.fixedCalibration) {
-        for (std::size_t state = 0;
-             state < next.toCalibration.size();
-             ++state) {
-            next.toCalibration[state] -= cavityCalibration[state];
-        }
-    }
-    next.toSign[0] -= cavitySign[0];
-    next.toSign[1] -= cavitySign[1];
-
     double residual = 0.0;
     residual = std::max(
         residual,
@@ -1735,22 +2045,25 @@ void remapPieceMessages(
         auto& message = edge.a == node
             ? round.messages[edgeIndex].toA
             : round.messages[edgeIndex].toB;
-        const std::size_t orientationCount =
-            round.fixedOrientations.empty() ? 3 : 1;
+        const std::size_t orientationCount = jointActiveOrientationCount(
+            node, round.fixedOrientations);
         std::vector<double> remapped(
-            orientationCount *
+            jointPieceStateCount(
+                node,
                 static_cast<std::size_t>(newUpper - newLower + 1),
+                round.fixedOrientations),
             0.0);
+        remapped[0] = message[0];
         for (int winding = oldLower; winding <= oldUpper; ++winding) {
             for (std::size_t orientation = 0;
                  orientation < orientationCount;
                  ++orientation) {
                 const std::size_t oldState =
-                    orientationCount *
+                    1 + orientationCount *
                         static_cast<std::size_t>(winding - oldLower) +
                     orientation;
                 const std::size_t newState =
-                    orientationCount *
+                    1 + orientationCount *
                         static_cast<std::size_t>(winding - newLower) +
                     orientation;
                 remapped[newState] = message[oldState];
@@ -1780,6 +2093,8 @@ bool ensureIntegerSupport(
     bool changed = false;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
         if (round.gauge[node] != 0)
+            continue;
+        if (jointActiveOrientationCount(node, round.fixedOrientations) == 0)
             continue;
         const int oldLower = round.lower[node];
         const int oldUpper = round.upper[node];
@@ -1811,20 +2126,26 @@ bool adjustIntegerSupport(
         if (round.gauge[node] != 0)
             continue;
         const auto& probabilities = round.pieceProbabilities[node];
-        const std::size_t orientationCount =
-            round.fixedOrientations.empty() ? 3 : 1;
+        const std::size_t orientationCount = jointActiveOrientationCount(
+            node, round.fixedOrientations);
+        if (orientationCount == 0)
+            continue;
+        const std::size_t integers =
+            (probabilities.size() - 1) / orientationCount;
         const double lowerProbability = std::accumulate(
-            probabilities.begin(),
-            probabilities.begin() +
+            probabilities.begin() + 1,
+            probabilities.begin() + 1 +
                 static_cast<std::ptrdiff_t>(orientationCount),
             0.0);
         const double upperProbability = std::accumulate(
-            probabilities.end() -
-                static_cast<std::ptrdiff_t>(orientationCount),
+            probabilities.begin() + 1 +
+                static_cast<std::ptrdiff_t>(orientationCount * (integers - 1)),
             probabilities.end(),
             0.0);
         double meanWinding = 0.0;
-        for (std::size_t state = 0; state < probabilities.size(); ++state) {
+        double activeProbability = 0.0;
+        for (std::size_t state = 1; state < probabilities.size(); ++state) {
+            activeProbability += probabilities[state];
             meanWinding += probabilities[state] * static_cast<double>(
                 gridPieceState(
                     node,
@@ -1833,13 +2154,20 @@ bool adjustIntegerSupport(
                     round.gauge,
                     round.fixedOrientations).winding);
         }
+        if (!(activeProbability > 0.0))
+            continue;
+        meanWinding /= activeProbability;
+        const double normalizedLowerProbability =
+            lowerProbability / activeProbability;
+        const double normalizedUpperProbability =
+            upperProbability / activeProbability;
         const int oldLower = round.lower[node];
         const int oldUpper = round.upper[node];
-        if (lowerProbability > config.boundaryProbabilityThreshold &&
+        if (normalizedLowerProbability > config.boundaryProbabilityThreshold &&
             meanWinding - static_cast<double>(oldLower) <= 0.75) {
             --round.lower[node];
         }
-        if (upperProbability > config.boundaryProbabilityThreshold &&
+        if (normalizedUpperProbability > config.boundaryProbabilityThreshold &&
             static_cast<double>(oldUpper) - meanWinding <= 0.75) {
             ++round.upper[node];
         }
@@ -1858,30 +2186,26 @@ void updateGridMarginals(
     GridRound& round,
     const FiberTraceJointGridWindingConfig& config)
 {
-    std::vector<std::vector<double>> pieceTotals;
-    std::vector<double> calibrationTotal;
-    std::vector<std::array<double, 2>> signTotals;
-    buildGridTotals(
-        problem,
-        round,
-        config,
-        pieceTotals,
-        calibrationTotal,
-        signTotals);
-    round.pieceProbabilities.resize(pieceTotals.size());
-    for (std::size_t node = 0; node < pieceTotals.size(); ++node)
-        round.pieceProbabilities[node] = normalizedProbabilities(pieceTotals[node]);
+    const auto totals = buildGridTotals(problem, round, config);
+    round.pieceProbabilities.resize(totals.pieceValues.size());
+    for (std::size_t node = 0; node < totals.pieceValues.size(); ++node) {
+        round.pieceProbabilities[node] =
+            normalizedProbabilities(totals.pieceValues[node]);
+    }
     if (round.fixedCalibration)
         round.calibrationProbabilities.clear();
     else
-        round.calibrationProbabilities = normalizedProbabilities(calibrationTotal);
-    round.signProbabilities.resize(signTotals.size());
-    for (std::size_t component = 0; component < signTotals.size(); ++component) {
+        round.calibrationProbabilities =
+            normalizedProbabilities(totals.calibrationValues);
+    round.signProbabilities.resize(totals.signValues.size());
+    for (std::size_t component = 0;
+         component < totals.signValues.size();
+         ++component) {
         const double normalization = logAddExp(
-            signTotals[component][0], signTotals[component][1]);
+            totals.signValues[component][0], totals.signValues[component][1]);
         round.signProbabilities[component] = {
-            std::exp(signTotals[component][0] - normalization),
-            std::exp(signTotals[component][1] - normalization),
+            std::exp(totals.signValues[component][0] - normalization),
+            std::exp(totals.signValues[component][1] - normalization),
         };
     }
     round.lowerBoundaryProbability = 0.0;
@@ -2092,16 +2416,7 @@ GridRound solveJointGridRound(
     for (std::size_t iteration = 0;
          iteration < config.maximumMessageIterations;
          ++iteration) {
-        std::vector<std::vector<double>> pieceTotals;
-        std::vector<double> calibrationTotal;
-        std::vector<std::array<double, 2>> signTotals;
-        buildGridTotals(
-            problem,
-            round,
-            config,
-            pieceTotals,
-            calibrationTotal,
-            signTotals);
+        const auto totals = buildGridTotals(problem, round, config);
         std::vector<GridMessages> next(problem.edges.size());
         double residual = 0.0;
         #pragma omp parallel for schedule(dynamic, 4) num_threads(workers) if(useParallel) reduction(max : residual)
@@ -2116,10 +2431,10 @@ GridRound solveJointGridRound(
                     edge,
                     round.messages[edgeIndex],
                     next[edgeIndex],
-                    pieceTotals[edge.a],
-                    pieceTotals[edge.b],
-                    calibrationTotal,
-                    signTotals[component],
+                    totals.pieceAccumulators[edge.a],
+                    totals.pieceAccumulators[edge.b],
+                    totals.calibrationAccumulators,
+                    totals.signAccumulators[component],
                     round,
                     config));
         }
@@ -2300,6 +2615,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 : -1;
     }
 
+    report.windingValid.resize(pieceCount);
     report.continuousWinding.resize(pieceCount);
     report.mapWinding.resize(pieceCount);
     report.posteriorMeanWinding.resize(pieceCount);
@@ -2325,20 +2641,17 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         }
     }
     std::vector<JointState> decoded(prepared.piecesByNode.size());
+    std::vector<double> activeConfidence(decoded.size(), 0.0);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
         const auto& probabilities = round.pieceProbabilities[node];
         const std::size_t map = static_cast<std::size_t>(std::distance(
             probabilities.begin(),
             std::max_element(probabilities.begin(), probabilities.end())));
-        const auto mapState = gridPieceState(
-            node,
-            map,
-            round.lower,
-            round.gauge,
-            round.fixedOrientations);
-        decoded[node] = mapState;
+        auto mapState = gridPieceState(
+            node, map, round.lower, round.gauge, round.fixedOrientations);
         double meanWinding = 0.0;
+        double activeProbability = 0.0;
         double entropy = 0.0;
         double classA = 0.0;
         double mixed = 0.0;
@@ -2351,7 +2664,10 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 round.gauge,
                 round.fixedOrientations);
             const double probability = probabilities[state];
-            meanWinding += probability * static_cast<double>(current.winding);
+            if (current.orientation != JointClass::Mixed) {
+                activeProbability += probability;
+                meanWinding += probability * static_cast<double>(current.winding);
+            }
             if (current.orientation == JointClass::A)
                 classA += probability;
             else if (current.orientation == JointClass::Mixed)
@@ -2365,12 +2681,40 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         const double signMean = 2.0 *
                 report.componentPositivePhaseSignProbability[component] -
             1.0;
-        report.continuousWinding[piece] = continuousNodes[node];
-        report.mapWinding[piece] = mapState.winding;
+        double meanLatent = 0.0;
+        if (activeProbability > 0.0) {
+            meanLatent = (meanWinding +
+                signMean * report.calibrationPhaseMean * classB) /
+                activeProbability;
+            meanWinding /= activeProbability;
+        }
+        const JointClass finalClass = mixed >= classA && mixed >= classB
+            ? JointClass::Mixed
+            : classA > classB ? JointClass::A : JointClass::B;
+        activeConfidence[node] = std::max(classA, classB) - mixed;
+        double finalStateProbability = -1.0;
+        for (std::size_t state = 0; state < probabilities.size(); ++state) {
+            const auto current = gridPieceState(
+                node,
+                state,
+                round.lower,
+                round.gauge,
+                round.fixedOrientations);
+            if (current.orientation == finalClass &&
+                probabilities[state] > finalStateProbability) {
+                finalStateProbability = probabilities[state];
+                mapState = current;
+            }
+        }
+        decoded[node] = mapState;
+        const bool activeMap = finalClass != JointClass::Mixed;
+        report.windingValid[piece] = activeMap ? 1 : 0;
+        report.continuousWinding[piece] =
+            activeMap ? continuousNodes[node] : 0.0;
+        report.mapWinding[piece] = activeMap ? mapState.winding : 0;
         report.posteriorMeanWinding[piece] = meanWinding;
-        report.posteriorMeanLatentCoordinate[piece] = meanWinding +
-            signMean * report.calibrationPhaseMean * (classB + 0.5 * mixed);
-        report.mapProbability[piece] = probabilities[map];
+        report.posteriorMeanLatentCoordinate[piece] = meanLatent;
+        report.mapProbability[piece] = finalStateProbability;
         report.entropy[piece] = entropy;
         report.candidateMinimum[piece] = round.lower[node];
         report.candidateMaximum[piece] = round.upper[node];
@@ -2383,6 +2727,32 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         report.classAProbability[piece] = classA / classTotal;
         report.mixedProbability[piece] = mixed / classTotal;
         report.classBProbability[piece] = classB / classTotal;
+    }
+    const auto& selectedCalibration = round.fixedCalibration
+        ? round.fixedCalibrationParameters
+        : round.calibrationCells[calibrationMap];
+    report.hardSignProjectedDefects = projectDecodedHardSigns(
+        prepared,
+        decoded,
+        activeConfidence,
+        [&](std::size_t edgeIndex, const JointState& a, const JointState& b) {
+            const auto& edge = prepared.edges[edgeIndex];
+            const std::size_t component = prepared.componentByNode[edge.a];
+            const int sign = report.componentPhaseSign[component];
+            const double latent = static_cast<double>(b.winding - a.winding) +
+                classOffset(b.orientation, sign, selectedCalibration.phase) -
+                classOffset(a.orientation, sign, selectedCalibration.phase);
+            return selectedCalibration.gain * latent;
+        });
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        const std::size_t node = prepared.pieceToNode[piece];
+        const bool active = decoded[node].orientation != JointClass::Mixed;
+        report.windingValid[piece] = active ? 1 : 0;
+        report.continuousWinding[piece] =
+            active ? continuousNodes[node] : 0.0;
+        report.mapWinding[piece] = active ? decoded[node].winding : 0;
+        if (!active)
+            report.mapProbability[piece] = report.mixedProbability[piece];
     }
     report.decodedEnergy = 0.0;
     report.orientationMode = round.fixedOrientations.empty()
@@ -2407,12 +2777,12 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             }
         }
     }
-    const auto& selectedCalibration = round.fixedCalibration
-        ? round.fixedCalibrationParameters
-        : round.calibrationCells[calibrationMap];
     for (std::size_t node = 0; node < decoded.size(); ++node) {
-        if (decoded[node].orientation == JointClass::Mixed)
+        if (decoded[node].orientation == JointClass::Mixed &&
+            (round.fixedOrientations.empty() ||
+             round.fixedOrientations[node] != JointClass::Mixed)) {
             report.decodedEnergy += config.mixedUnaryCost;
+        }
     }
     for (const auto& edge : prepared.edges) {
         const std::size_t component = prepared.componentByNode[edge.a];
@@ -2426,10 +2796,13 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 b,
                 report.componentPhaseSign[component],
                 selectedCalibration,
-                config);
+                config,
+                round.fixedOrientations.empty());
         } else {
-            report.decodedEnergy += gridOrientationEnergy(
-                edge, a.orientation, b.orientation);
+            if (round.fixedOrientations.empty()) {
+                report.decodedEnergy += gridOrientationEnergy(
+                    edge, a.orientation, b.orientation);
+            }
             report.decodedEnergy += gridWindingEnergy(
                 edge,
                 a,
@@ -2552,9 +2925,10 @@ solveFiberTraceJointGridWindingBeliefPropagation(
 {
     const auto started = std::chrono::steady_clock::now();
     validateJointGridConfig(config);
-    const auto prepared = prepareWinding(constraints, topology);
     const auto fixedClasses = fixedJointClasses(
         fixedOrientations, constraints.pieces.size());
+    const auto prepared = prepareWinding(
+        constraints, topology, fixedClasses, true);
     const auto continuousStarted = std::chrono::steady_clock::now();
     double continuousResidual = 0.0;
     const auto continuousNodes = solveContinuous(prepared, continuousResidual);
@@ -2677,6 +3051,7 @@ FiberTraceWindingBeliefPropagationReport solveFiberTraceWindingBeliefPropagation
         report.totalCandidateStates += static_cast<std::size_t>(upper[node] - lower[node] + 1);
 
     const std::size_t pieceCount = constraints.pieces.size();
+    report.windingValid.assign(pieceCount, 1);
     report.continuousWinding.resize(pieceCount);
     report.mapWinding.resize(pieceCount);
     report.posteriorMeanWinding.resize(pieceCount);
@@ -2764,7 +3139,11 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
                 "Interleaved winding orientation beliefs are invalid");
         }
     }
-    if (!std::isfinite(config.minimumMeasurementScale) ||
+    if (!std::isfinite(config.mixedUnaryCost) ||
+        config.mixedUnaryCost < 0.0 ||
+        !std::isfinite(config.orientationTemperature) ||
+        !(config.orientationTemperature > 0.0) ||
+        !std::isfinite(config.minimumMeasurementScale) ||
         !std::isfinite(config.maximumMeasurementScale) ||
         !(config.minimumMeasurementScale > 0.0) ||
         config.maximumMeasurementScale < config.minimumMeasurementScale ||
@@ -2795,7 +3174,8 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
             0.0,
         });
     }
-    const auto prepared = prepareWinding(constraints, topology);
+    const auto prepared = prepareWinding(
+        constraints, topology, fixedClasses, true);
     const auto continuousStarted = std::chrono::steady_clock::now();
     double continuousResidual = 0.0;
     const auto continuousNodes = solveContinuous(prepared, continuousResidual);
@@ -2985,6 +3365,7 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
     else
         report.status = "converged";
 
+    report.windingValid.resize(pieceCount);
     report.continuousWinding.resize(pieceCount);
     report.mapWinding.resize(pieceCount);
     report.posteriorMeanWinding.resize(pieceCount);
@@ -3009,16 +3390,19 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
                 ++report.incidentSkippedConstraints[piece];
         }
     }
+    std::vector<JointState> decoded(prepared.piecesByNode.size());
+    std::vector<double> activeConfidence(decoded.size(), 0.0);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
         const auto& probabilities = best->round.discrete.probabilities[node];
         const std::size_t map = static_cast<std::size_t>(std::distance(
             probabilities.begin(),
             std::max_element(probabilities.begin(), probabilities.end())));
-        const JointState mapState = jointState(
+        auto mapState = jointState(
             node, map, best->round.lower[node], fixedClasses);
         double meanWinding = 0.0;
         double meanLatent = 0.0;
+        double activeProbability = 0.0;
         double entropy = 0.0;
         double classA = 0.0;
         double mixed = 0.0;
@@ -3029,13 +3413,14 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
             const double probability = probabilities[state];
             const auto current = jointState(
                 node, state, best->round.lower[node], fixedClasses);
-            meanWinding += probability * static_cast<double>(current.winding);
-            double offset = classOffset(
-                current.orientation, sign, best->parameters.phase);
-            if (current.orientation == JointClass::Mixed)
-                offset = 0.5 * static_cast<double>(sign) * best->parameters.phase;
-            meanLatent += probability *
-                (static_cast<double>(current.winding) + offset);
+            if (current.orientation != JointClass::Mixed) {
+                activeProbability += probability;
+                meanWinding += probability * static_cast<double>(current.winding);
+                meanLatent += probability *
+                    (static_cast<double>(current.winding) +
+                     classOffset(
+                         current.orientation, sign, best->parameters.phase));
+            }
             if (current.orientation == JointClass::A)
                 classA += probability;
             else if (current.orientation == JointClass::Mixed)
@@ -3045,11 +3430,33 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
             if (probability > 0.0)
                 entropy -= probability * std::log(probability);
         }
-        report.continuousWinding[piece] = continuousNodes[node];
-        report.mapWinding[piece] = mapState.winding;
+        if (activeProbability > 0.0) {
+            meanWinding /= activeProbability;
+            meanLatent /= activeProbability;
+        }
+        const JointClass finalClass = mixed >= classA && mixed >= classB
+            ? JointClass::Mixed
+            : classA > classB ? JointClass::A : JointClass::B;
+        activeConfidence[node] = std::max(classA, classB) - mixed;
+        double finalStateProbability = -1.0;
+        for (std::size_t state = 0; state < probabilities.size(); ++state) {
+            const auto current = jointState(
+                node, state, best->round.lower[node], fixedClasses);
+            if (current.orientation == finalClass &&
+                probabilities[state] > finalStateProbability) {
+                finalStateProbability = probabilities[state];
+                mapState = current;
+            }
+        }
+        decoded[node] = mapState;
+        const bool activeMap = finalClass != JointClass::Mixed;
+        report.windingValid[piece] = activeMap ? 1 : 0;
+        report.continuousWinding[piece] =
+            activeMap ? continuousNodes[node] : 0.0;
+        report.mapWinding[piece] = activeMap ? mapState.winding : 0;
         report.posteriorMeanWinding[piece] = meanWinding;
         report.posteriorMeanLatentCoordinate[piece] = meanLatent;
-        report.mapProbability[piece] = probabilities[map];
+        report.mapProbability[piece] = finalStateProbability;
         report.entropy[piece] = entropy;
         report.candidateMinimum[piece] = best->round.lower[node];
         report.candidateMaximum[piece] = best->round.upper[node];
@@ -3060,6 +3467,29 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
         report.classAProbability[piece] = classA / classTotal;
         report.mixedProbability[piece] = mixed / classTotal;
         report.classBProbability[piece] = classB / classTotal;
+    }
+    report.hardSignProjectedDefects = projectDecodedHardSigns(
+        prepared,
+        decoded,
+        activeConfidence,
+        [&](std::size_t edgeIndex, const JointState& a, const JointState& b) {
+            const auto& edge = prepared.edges[edgeIndex];
+            const int sign = best->parameters.componentSign.at(
+                prepared.componentByNode[edge.a]);
+            const double latent = static_cast<double>(b.winding - a.winding) +
+                classOffset(b.orientation, sign, best->parameters.phase) -
+                classOffset(a.orientation, sign, best->parameters.phase);
+            return latent / best->parameters.scale;
+        });
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        const std::size_t node = prepared.pieceToNode[piece];
+        const bool active = decoded[node].orientation != JointClass::Mixed;
+        report.windingValid[piece] = active ? 1 : 0;
+        report.continuousWinding[piece] =
+            active ? continuousNodes[node] : 0.0;
+        report.mapWinding[piece] = active ? decoded[node].winding : 0;
+        if (!active)
+            report.mapProbability[piece] = report.mixedProbability[piece];
     }
     if (progress) {
         progress({

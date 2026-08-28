@@ -154,9 +154,10 @@ aligned winding distance `> 0.3`. Both parallel views require normalized
 parallel score `> 0.5`; winding `< 0.5` is classified as same-winding and
 winding `>= 0.5` as separate-winding. Threshold comparisons are exact, so a
 score of `0.5` is absent and winding `0.5` belongs to separate-winding.
-Measured links with aligned winding distance greater than or equal to `1.5`
-are discarded before diagnostics and labeling. This is an exclusive cutoff;
-same-trace continuity remains at winding zero.
+H/V-only diagnostics and winding BP discard measured links with aligned
+winding distance greater than or equal to `4.0` by default. Legacy parity
+labeling retains its representable default cutoff of `1.5`. Both are exclusive
+cutoffs; same-trace continuity remains at winding zero.
 Use `--winding-cutoff N` to select another positive exclusive cutoff.
 Pass `--no-winding-cutoff` with `--hv-only` to retain every finite measured
 winding distance for diagnostics. Invalid and non-finite samples remain
@@ -834,10 +835,42 @@ component. Otherwise the H/V constraint remains valid but contributes no
 perpendicular winding evidence. A connected winding graph that would combine
 signed evidence from independently gauged normal components is rejected.
 
+The H/V-aware winding BP solvers do not use that raw signed magnitude
+directly. After the raw exclusive winding cutoff has admitted a constraint,
+they map every nonzero magnitude to its half-integer interval center while
+preserving sign:
+
+```text
+(0,1] -> 0.5
+(1,2] -> 1.5
+(2,3] -> 2.5
+(3,4) -> 3.5 with the default exclusive cutoff
+```
+
+Exact signed zero and hard same-trace continuity remain zero. The cutoff is
+not re-applied to the quantized value. Alternating and joint-grid H/V winding
+solvers, including their continuous initialization, share this conversion.
+The independent integer-only winding diagnostic remains raw because it has no
+half-offset H/V lattice.
+
+The complete soft winding contribution of an H/V-aware measured factor is
+multiplied by `2^-floor(abs(effective_target))`. The `0.5`, `1.5`, `2.5`, and
+`3.5` target bins therefore have multipliers `1`, `0.5`, `0.25`, and `0.125`.
+This scales both the parallel same-winding residual and the perpendicular
+signed-offset residual. It does not scale the separate H/V relation energy,
+hard same-trace continuity, or the strict sign requirement on a nonzero signed
+perpendicular observation. The formula continues for larger bins admitted by
+an explicit cutoff override. Factor CSV output records the multiplier plus the
+effective parallel and perpendicular winding weights.
+
+Fixed phase `0.5` and scale `1.0` provide the exact half-step experiment.
+Adaptive calibration remains available for comparison and can move latent
+phase or measurement scale even though the observations are quantized.
+
 For `sum-product-mixed`, `--winding-solver joint-grid` is the default. It runs
-one inference over `(H|Mixed|V,k)`, the global calibration grid, and one local
+one inference over `(H,k)`, `(V,k)`, one winding-free Defect state, the global calibration grid, and one local
 ladder-order sign per connected component. It does not run the earlier
-orientation BP first and does not repair labels afterward. The alternative
+orientation BP first. The alternative
 `--winding-solver alternating` retains the established orientation pre-pass,
 multi-start calibration, and numerical behavior for direct comparison.
 
@@ -849,16 +882,25 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 ```
 
 `--winding-fixed-orientation` runs the ordinary H/V/Mixed sum-product BP first.
-Each piece's unique MAP class is then fixed; an exact class tie becomes Mixed.
-The winding solver stores only integer winding candidates for pieces, not three
-impossible orientation variants, so the winding phase is also substantially
-smaller. The chosen backend still controls phase/scale calibration, component
-sign, integer-support expansion, and winding factor evaluation. A fixed Mixed
-piece retains the existing normalized four-substitution winding potential, but
-the substitutions are evaluated inside the factor and are not solver states.
+Each piece's unique MAP direction is then fixed; an exact class tie becomes
+Defect. During winding, a fixed H piece can be H or Defect and a fixed V piece
+can be V or Defect, but neither can switch to the opposite direction. A
+pre-pass Defect remains Defect. A directional piece has one fixed-direction
+state per integer winding plus one Defect state; Defect is not duplicated over
+the winding support. The chosen backend still controls phase/scale calibration,
+component sign, integer-support expansion, and winding factor evaluation.
+
+A late Defect pays the existing `--bp-mixed-cost` at `--bp-temperature` and is
+selected only from winding evidence; fixed mode does not repeat the H/V
+same/different orientation factor. A Defect assignment makes every incident
+pair factor neutral, disabling orientation, winding, calibration, and component
+sign evidence. Constraints attached to a pre-pass Defect are also removed from
+the continuous initializer and component graph.
 The consistency CSV preserves the soft pre-pass `p_v`, `p_mixed`, and `p_h`
-columns and adds `winding_orientation_mode` plus
-`winding_fixed_orientation` so the hard class used by winding is explicit.
+columns and records `winding_prepass_class`, `winding_final_class`, and final
+H/Defect/V probabilities. It writes `winding_valid=0` and `NA` for numeric
+winding fields of final Defect pieces. Defect pieces are excluded from `w_N`
+OBJ layers and remain visible in the ordinary Defect class OBJ.
 
 ```bash
 volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --bp-only --bp-inference sum-product-mixed
@@ -867,9 +909,8 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 
 In joint-grid mode, a non-Mixed pair factor charges orientation and winding
 evidence once. Orientation and the Mixed unary retain `--bp-temperature`;
-winding retains its established temperature `0.25`. A Mixed endpoint removes
-the visible orientation preference and uses the normalized four-substitution
-winding potential. Consequently, Mixed-cost tuning from the alternating model
+winding retains its established temperature `0.25`. A Mixed endpoint disables
+the complete pair factor. Consequently, Mixed-cost tuning from the alternating model
 is not expected to produce identical posteriors in the joint model. Every split
 piece remains a distinct variable. Same-trace continuity contributes its
 existing parallel-score-1, zero-difference factor, so other evidence can
@@ -879,9 +920,8 @@ The two oriented classes occupy interleaved integer lattices. Local class A is
 at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in
 `[0,0.5]`, and each disconnected component has a deterministic sign/class
 gauge. Physical H/V names and absolute integer offsets between disconnected
-components are not observable. A Mixed endpoint marginalizes the four latent
-A/B endpoint substitutions with a normalized average, retaining winding
-connectivity without transmitting a visible orientation preference.
+components are not observable. A Mixed endpoint has no winding coordinate and
+does not retain winding connectivity.
 
 For latent difference `delta`, a joint-grid measurement contributes:
 
@@ -897,6 +937,33 @@ parameterization is:
 parallel * abs(delta)
     + perpendicular * abs(delta / measurement_scale - signed_target)
 ```
+
+For every accepted nonzero signed perpendicular target, the corresponding
+predicted delta must also satisfy the strict order constraint:
+
+```text
+signed_target * predicted_delta > 0
+```
+
+Zero and reversed deltas have exactly zero active-active factor probability;
+they are not approximated by a large finite penalty. Exact signed zero,
+parallel-only evidence, missing signed targets, and zero-difference continuity
+do not activate this rule. A Defect endpoint remains neutral, so contradictory
+order evidence is resolved by disabling at least one involved piece.
+
+The log-space message implementation tracks finite sums and counts of
+negative-infinite terms separately. This permits exact exclusions with damped
+messages and gauge-adjacent factors without `-inf - -inf` cavity arithmetic.
+Alternating component-sign selection and phase/scale backtracking apply the
+same hard compatibility rule as the pair factors.
+
+Loopy BP reports retain their soft node marginals. Because independently
+selected node-marginal MAP states need not form a feasible edge assignment,
+publication performs one deterministic, monotone feasibility decode: for each
+remaining reversed active-active edge, the lower-confidence endpoint becomes
+Defect, preserving a gauge endpoint when possible. The CLI treats
+`winding_valid=0` as authoritative for H/V/Mixed OBJ output and reports the
+number of `hard_sign_projected_defects` in the winding calibration table.
 
 The perpendicular residual stays in the raw Lasagna-integral units. This is
 important: multiplying the observed target by scale would also scale its noise
@@ -957,9 +1024,10 @@ retained for reporting rather than reconstructed from reciprocal gain.
 
 The ordinary BP consistency CSV includes continuous winding, integer MAP,
 posterior mean, MAP probability, entropy, candidate bounds, component, and
-incident signed/skipped counts. `<base>_winding_factors.csv` records
-canonicalized factors, raw signed targets, and selected scale-calibrated latent
-targets. The consistency CSV additionally records posterior latent coordinate,
+incident signed/skipped counts. `<base>_winding_factors.csv` records the raw
+original-order target, raw canonical-order target, effective quantized
+canonical target, and selected scale-calibrated latent target. The consistency
+CSV additionally records posterior latent coordinate,
 phase, scale, component phase sign, solver and calibration modes, calibration
 posterior means,
 and the component-sign posterior when available. The solver's arbitrary
