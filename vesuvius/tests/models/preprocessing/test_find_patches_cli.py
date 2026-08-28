@@ -37,7 +37,7 @@ def test_exits_nonzero_when_no_volumes_found(tmp_path, monkeypatch):
     assert excinfo.value.code == 1
 
 
-def test_errors_on_missing_input_directory(tmp_path, monkeypatch):
+def test_errors_on_missing_input_directory(tmp_path, monkeypatch, capsys):
     config_path = _write_config(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         _run(
@@ -45,6 +45,11 @@ def test_errors_on_missing_input_directory(tmp_path, monkeypatch):
             ["--config", str(config_path), "-i", str(tmp_path / "missing")],
         )
     assert excinfo.value.code == 2
+    # Assert on the message, not just the code: on pre-fix code the same
+    # invocation also exits 2, but as "unrecognized arguments: -i" — and a
+    # future regression that drops the exists() check while keeping -i would
+    # change the failure mode without changing the number.
+    assert "Input directory does not exist" in capsys.readouterr().err
 
 
 def test_input_overrides_config_data_path(tmp_path, monkeypatch):
