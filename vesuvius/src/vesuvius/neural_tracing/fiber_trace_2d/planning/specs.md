@@ -5290,6 +5290,10 @@
 - Both winding solvers optionally support fixed-prepass orientation. The
   ordinary Mixed-state BP runs once, and each piece's unique H/Mixed/V MAP is
   retained as its pre-pass class; an exact MAP tie becomes Mixed. The
+  prepass uses `--bp-mixed-cost`. Its exact fixed assignment is written as
+  `<base>_prepass_h.obj`, `<base>_prepass_v.obj`,
+  `<base>_prepass_err.obj`, and the shared empty
+  `<base>_prepass_tie.obj` artifact. The
   subsequent solver cannot switch H to V or V to H, but may declare either
   directional piece Mixed/Defect when winding evidence is incompatible. A
   pre-pass H/V piece has one fixed-direction state per candidate integer plus
@@ -5298,7 +5302,9 @@
   continuous initialization, component/gauge construction, and discrete BP.
   A late Defect assignment makes every incident pair factor neutral.
 - A newly available late-Defect state has log unary
-  `-mixed_unary_cost/orientation_temperature`. Fixed-prepass winding factors
+  `-winding_defect_cost/orientation_temperature`. The finite nonnegative
+  `--winding-defect-cost` defaults independently to `0.5`; changing it must not
+  change the prepass unary. Fixed-prepass winding factors
   do not repeat the H/V same/different orientation energy; they use only
   winding evidence, so the completed orientation pre-pass is not counted
   twice. Alternating calibration and component-sign updates exclude pair mass
@@ -5306,7 +5312,8 @@
   Calibration, component sign, integer support, and winding potentials retain
   the selected solver's existing behavior. Reports preserve the soft pre-pass
   marginals and separately record `fixed-prepass`, the pre-pass class, and the
-  final H/Defect/V posterior per piece. Final OBJ layers use the final class.
+  final H/Defect/V posterior per piece. Winding diagnostics record the separate
+  winding Defect cost. Final OBJ layers use the final class.
   Joint orientation inference remains the default when the option is absent.
 - `joint-grid` has no H/V/Mixed pre-pass. Each piece has `(A,k)` and `(B,k)`
   states plus one winding-free Defect state, with the crop-central piece of each connected constraint
@@ -5314,6 +5321,9 @@
   while one explicit calibration variable over `(log gain, phase)` is shared
   by every component. Aligned-normal sign resolution remains separate and is
   never inferred by this variable.
+- Without fixed orientation, joint-grid uses `--winding-defect-cost` as its
+  sole Defect unary. Non-fixed alternating uses the orientation prepass
+  posterior as its orientation prior and does not charge this unary again.
 - A joint non-Mixed factor charges orientation and winding evidence once.
   Same classes cost the perpendicular score, different classes cost the
   parallel score, and every measurement additionally contributes

@@ -1,60 +1,59 @@
-# Plan: extended distance-weighted winding constraints
+# Plan: separate prepass and winding Defect controls
 
-## Constraint admission
+## CLI and solver configuration
 
-1. Change the H/V diagnostic/BP finite raw winding-distance default from the
-   exclusive cutoff `1.5` to `4.0` and update CLI help.
-2. Keep cutoff admission before H/V half-integer conversion. Values at or above
-   `4.0` remain rejected.
-3. Preserve the shared API and legacy parity-labeling default at `1.5`. Select
-   the H/V default explicitly in CLI modes that can represent larger offsets,
-   unless the user supplied a cutoff override.
+1. Keep `--bp-mixed-cost` scoped to the ordinary H/V/Mixed orientation BP.
+2. Add an independent finite nonnegative `--winding-defect-cost` option with
+   default `0.5`. In fixed-prepass mode it is the late-Defect unary in both
+   backends. In non-fixed joint-grid mode it is the joint solver's only Defect
+   unary. Non-fixed alternating continues to use the prepass posterior as its
+   orientation prior and does not charge this unary again.
+3. Accept the winding option only with
+   `--bp-only --bp-inference sum-product-mixed`, matching the other winding
+   controls. Do not make either cost silently inherit the other.
+4. Preserve the initial prepass cost in the ordinary BP report. Add an
+   explicit winding Defect cost to the interleaved winding report and its
+   console/CSV diagnostics so joint-only output is not mislabeled as a
+   prepass cost.
 
-## Winding evidence weighting
+## Prepass artifacts
 
-1. Derive a fixed multiplier from the absolute effective half-integer target:
-   `2^-floor(|target|)`, producing `1`, `0.5`, `0.25`, and `0.125` for the
-   admitted `0.5` through `3.5` bins.
-2. Store a winding-factor multiplier separately from the original parallel and
-   perpendicular H/V scores in the prepared factor representation.
-3. Multiply both the parallel same-winding term and perpendicular signed-offset
-   term by the multiplier. Use it consistently in continuous initialization,
-   alternating winding energy/calibration, joint-grid winding energy, hard-sign
-   applicability, and winding residual diagnostics.
-4. Do not decay H/V orientation energy, continuity, or the independent raw
-   integer-only winding diagnostic. Keep hard signed-order admissibility based
-   on the original nonzero signed observation, independent of soft decay.
-5. Continue the formula for explicit cutoffs beyond `4.0` using an underflow-
-   safe power-of-two implementation.
-6. Expose the multiplier and effective parallel/perpendicular winding weights in factor diagnostics so
-   the experiment is inspectable.
+1. When the winding report declares `FixedPrepass`, translate its exact fixed
+   orientation vector to the shared ternary state representation.
+2. Reuse `writeFiberletCropTernaryStateObjs` to write
+   `<base>_prepass_v.obj`, `<base>_prepass_err.obj`,
+   `<base>_prepass_h.obj`, and `<base>_prepass_tie.obj`.
+3. Keep final `<base>_{v,err,h,tie}.obj` output unchanged. The prepass tie file
+   is expected to be empty because exact prepass ties are fixed as Defect, but
+   retaining the common four-file contract avoids a second exporter.
 
 ## Testing
 
-1. Verify H/V CLI default selection is `4.0`, the shared/parity default remains
-   `1.5`, and extraction accepts values below its configured cutoff while
-   rejecting the exact boundary and above.
-2. Verify H/V-aware factor diagnostics and winding energies use the exact multipliers
-   for signed targets in all four admitted bins, including endpoint reversal.
-3. Verify the original perpendicular H/V weight remains unchanged while the
-   separate signed-winding weight decays, and that the raw integer-only
-   diagnostic remains unscaled.
-4. Run the focused constraint and winding-BP tests in the Release build, build
-   the CLI with 32 jobs, run the representative fixed-calibration crop, and run
-   `git diff --check`.
+1. Add focused solver coverage for both fixed-prepass backends proving the
+   winding report records its separate Defect cost while the exact fixed
+   orientation vector remains unchanged. Verify non-fixed alternating retains
+   its posterior-prior behavior.
+2. Verify exact fixed H/V/Defect assignments map to the expected prepass OBJ
+   layers and no prepass artifacts are claimed for joint orientation mode.
+3. Exercise CLI parsing for independent defaults, distinct explicit values,
+   invalid negative/non-finite values, and the required Mixed BP mode.
+4. Build the CLI and focused winding/crop tests with 32 jobs; run focused CTest
+   and `git diff --check`.
 
 ## Spec update
 
-Change the default exclusive raw cutoff to `4.0` for representable H/V winding
-inference and specify the fixed power-of-two decay of signed winding evidence
-after half-integer conversion. State that orientation evidence is not decayed
-and legacy parity labeling retains its own default and representability limit.
+Specify that `--bp-mixed-cost` belongs to the orientation prepass,
+`--winding-defect-cost` belongs to winding inference, their defaults are
+independent, and fixed-prepass runs persist the exact consumed assignment as
+separate OBJ layers.
 
 ## Docs updates
 
-Update the CLI default, cutoff examples, half-integer table, weighting formula,
-and diagnostic fields in `volume-cartographer/docs/fiber_chunk_tracing.md`.
+Update `volume-cartographer/docs/fiber_chunk_tracing.md` with both unary costs,
+their scopes, a fixed-orientation invocation example, and the prepass artifact
+names.
 
 ## Changelog
 
-Record the wider winding evidence range and distance-dependent winding weight.
+Record the independently tunable winding Defect unary and inspectable prepass
+OBJ partition.

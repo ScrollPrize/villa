@@ -85,6 +85,7 @@ struct Options {
     vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
+    double windingDefectCost = 0.5;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
@@ -101,6 +102,7 @@ struct Options {
     bool hasBpMixedCostOption = false;
     bool hasWindingSolverOption = false;
     bool hasWindingOrientationOption = false;
+    bool hasWindingDefectCostOption = false;
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
     bool hasFixedCalibrationOption = false;
@@ -199,7 +201,7 @@ void usage(const char* executable)
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
               << "  --bp-inference MODE       min-sum, sum-product, or sum-product-mixed [min-sum]\n"
-              << "  --bp-mixed-cost F         Mixed-state unary cost per piece [0.5]\n"
+              << "  --bp-mixed-cost F         orientation-prepass Mixed unary per piece [0.5]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -211,6 +213,7 @@ void usage(const char* executable)
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
+              << "  --winding-defect-cost F   winding-stage Defect unary per piece [0.5]\n"
               << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
               << "  --winding-fixed-scale F   disable calibration at positive scale F\n"
               << "  --winding-gain-cells N    initial joint gain cells [5]\n"
@@ -526,6 +529,16 @@ Options parse(int argc, char** argv)
             options.hasWindingOrientationOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-defect-cost") {
+            options.windingDefectCost = number(
+                index, argc, argv, "--winding-defect-cost");
+            if (!std::isfinite(options.windingDefectCost) ||
+                options.windingDefectCost < 0.0) {
+                fail("--winding-defect-cost must be finite and nonnegative");
+            }
+            options.hasWindingDefectCostOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-gain-cells") {
             options.jointGrid.initialGainCells = count(
                 index, argc, argv, "--winding-gain-cells");
@@ -773,7 +786,8 @@ Options parse(int argc, char** argv)
             fail("--bp-mixed-cost requires --bp-inference sum-product-mixed");
         }
         if ((options.hasWindingSolverOption || options.hasJointGridOption ||
-             options.hasWindingOrientationOption) &&
+             options.hasWindingOrientationOption ||
+             options.hasWindingDefectCostOption) &&
             (!options.bpOnly ||
              options.bpInference != vc::fiber_tracer::
                  FiberTraceBeliefInference::SumProductMixed)) {
@@ -1368,6 +1382,32 @@ void writeAndPrintBpReport(
         throw std::logic_error(
             "Fixed-prepass winding report does not match represented pieces");
     }
+    std::optional<vc::fiber_tracer::FiberTernaryStateObjPaths> prepassPaths;
+    if (fixedPrepass) {
+        std::vector<vc::fiber_tracer::FiberTernaryState> prepassStates;
+        prepassStates.reserve(lines.size());
+        for (const auto orientation : interleaved->fixedOrientationByPiece) {
+            switch (orientation) {
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Horizontal:
+                prepassStates.push_back(
+                    vc::fiber_tracer::FiberTernaryState::Horizontal);
+                break;
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Mixed:
+                prepassStates.push_back(
+                    vc::fiber_tracer::FiberTernaryState::Mixed);
+                break;
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Vertical:
+                prepassStates.push_back(
+                    vc::fiber_tracer::FiberTernaryState::Vertical);
+                break;
+            }
+        }
+        prepassPaths = vc::fiber_tracer::writeFiberletCropTernaryStateObjs(
+            lines,
+            prepassStates,
+            outputBase.parent_path() /
+                (outputBase.stem().string() + "_prepass"));
+    }
     const auto ternaryPrediction = [](double horizontal,
                                       double mixed,
                                       double vertical) {
@@ -1600,6 +1640,7 @@ void writeAndPrintBpReport(
            "neighbor_support_balance,neighbor_certainty";
     if (interleaved) {
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
+                     "winding_defect_unary_cost,"
                      "winding_component_phase_sign,winding_solver,"
                      "winding_orientation_mode,winding_prepass_class,"
                      "winding_final_class,winding_final_p_h,"
@@ -1681,6 +1722,7 @@ void writeAndPrintBpReport(
                 csvOutput << "NA";
             csvOutput << ',' << interleaved->phaseMagnitude
                       << ',' << interleaved->measurementScale
+                      << ',' << interleaved->defectUnaryCost
                       << ',' << interleaved->componentPhaseSign.at(
                              component)
                       << ',' << vc::fiber_tracer::fiberTraceWindingSolverName(
@@ -1756,7 +1798,7 @@ void writeAndPrintBpReport(
         if (interleaved->solver == vc::fiber_tracer::
                 FiberTraceWindingSolver::JointGrid) {
             std::cout
-                << "solver  orientation_mode  calibration_mode  phase_map  phase_mean  scale_map  scale_mean"
+                << "solver  orientation_mode  calibration_mode  defect_unary_cost  phase_map  phase_mean  scale_map  scale_mean"
                    "  grid_cells  grid_shifts  entropy  lower_boundary"
                    "  upper_boundary  min_gain  max_gain  converged"
                    "  decoded_energy  hard_sign_projected_defects\n"
@@ -1768,6 +1810,7 @@ void writeAndPrintBpReport(
                 << "  " << vc::fiber_tracer::
                        fiberTraceWindingCalibrationModeName(
                            interleaved->calibrationMode)
+                << "  " << interleaved->defectUnaryCost
                 << "  " << interleaved->phaseMagnitude
                 << "  " << interleaved->calibrationPhaseMean
                 << "  " << interleaved->measurementScale
@@ -1785,7 +1828,7 @@ void writeAndPrintBpReport(
                 << "  " << interleaved->hardSignProjectedDefects << '\n';
         } else {
             std::cout
-                << "solver  orientation_mode  phase  scale  calibration_iterations"
+                << "solver  orientation_mode  defect_unary_cost  phase  scale  calibration_iterations"
                    "  calibration_converged  initialization"
                    "  rank_deficient_updates  decoded_energy"
                    "  hard_sign_projected_defects\n"
@@ -1794,6 +1837,7 @@ void writeAndPrintBpReport(
                 << "  " << vc::fiber_tracer::
                        fiberTraceWindingOrientationModeName(
                            interleaved->orientationMode)
+                << "  " << interleaved->defectUnaryCost
                 << "  " << interleaved->phaseMagnitude << "  "
                 << interleaved->measurementScale << "  "
                 << interleaved->calibrationIterations << "  "
@@ -1978,6 +2022,14 @@ void writeAndPrintBpReport(
                   << "err  " << statePaths.mixed << '\n'
                   << "h  " << statePaths.horizontal << '\n'
                   << "tie  " << statePaths.tie << '\n';
+        if (prepassPaths) {
+            std::cout << "fiber direction fixed prepass OBJ layers\n"
+                      << "state  path\n"
+                      << "v  " << prepassPaths->vertical << '\n'
+                      << "err  " << prepassPaths->mixed << '\n'
+                      << "h  " << prepassPaths->horizontal << '\n'
+                      << "tie  " << prepassPaths->tie << '\n';
+        }
     }
     const auto printConsistencyMetric = [&] (
                                             const char* reference,
@@ -2716,7 +2768,7 @@ int main(int argc, char** argv)
                                 static_cast<vc::fiber_tracer::
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                         windingConfig;
-                                joint.mixedUnaryCost = options.bp.mixedUnaryCost;
+                                joint.mixedUnaryCost = options.windingDefectCost;
                                 joint.orientationTemperature =
                                     options.bp.horizontalnessTemperature;
                                 interleavedWinding = vc::fiber_tracer::
@@ -2799,7 +2851,7 @@ int main(int argc, char** argv)
                                 static_cast<vc::fiber_tracer::
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                         windingConfig;
-                                joint.mixedUnaryCost = options.bp.mixedUnaryCost;
+                                joint.mixedUnaryCost = options.windingDefectCost;
                                 joint.orientationTemperature =
                                     options.bp.horizontalnessTemperature;
                                 joint.temperature = 0.25;

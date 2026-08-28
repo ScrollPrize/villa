@@ -431,6 +431,7 @@ TEST_CASE("Alternating fixed-prepass winding has compact direction-defect states
 
     CHECK(solved.orientationMode ==
         FiberTraceWindingOrientationMode::FixedPrepass);
+    CHECK(solved.defectUnaryCost == doctest::Approx(5.0));
     CHECK(solved.fixedOrientationByPiece == fixed);
     CHECK(solved.classBProbability[0] > 0.99);
     CHECK(solved.mixedProbability[0] < 0.01);
@@ -586,6 +587,7 @@ TEST_CASE("Joint-grid fixed-prepass winding has compact direction-defect states"
 
     CHECK(solved.orientationMode ==
         FiberTraceWindingOrientationMode::FixedPrepass);
+    CHECK(solved.defectUnaryCost == doctest::Approx(5.0));
     CHECK(solved.fixedOrientationByPiece == fixed);
     CHECK(solved.classBProbability[0] > 0.99);
     CHECK(solved.mixedProbability[0] < 0.01);
@@ -606,6 +608,7 @@ TEST_CASE("Joint-grid fixed-prepass winding has compact direction-defect states"
             report, topology(source, report), joint);
     CHECK(jointOrientation.orientationMode ==
         FiberTraceWindingOrientationMode::Joint);
+    CHECK(jointOrientation.defectUnaryCost == doctest::Approx(5.0));
     CHECK(jointOrientation.fixedOrientationByPiece.empty());
     CHECK(jointOrientation.totalCandidateStates > solved.totalCandidateStates);
 }

@@ -1614,3 +1614,10 @@
 - Added exact negative-infinity-safe cavity accumulation and damping, applied
   the rule to alternating calibration, and added a deterministic final Defect
   projection for infeasible independently decoded node marginals.
+
+## 2026-08-28 - Separate prepass and winding Defect controls
+
+- Split the orientation-prepass Mixed unary from the winding-stage Defect
+  unary and exposed both costs with unambiguous diagnostics.
+- Added fixed-prepass H/V/Defect OBJ layers alongside the existing final
+  winding classification.

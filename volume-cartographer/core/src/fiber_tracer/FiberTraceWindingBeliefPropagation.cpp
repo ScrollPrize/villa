@@ -2539,6 +2539,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
     const std::size_t pieceCount = constraints.pieces.size();
     FiberTraceInterleavedWindingReport report;
     report.solver = FiberTraceWindingSolver::JointGrid;
+    report.defectUnaryCost = config.mixedUnaryCost;
     report.calibrationMode = round.fixedCalibration
         ? FiberTraceWindingCalibrationMode::Fixed
         : FiberTraceWindingCalibrationMode::Adaptive;
@@ -3327,6 +3328,7 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
         throw std::logic_error("Interleaved winding produced no initialization");
 
     FiberTraceInterleavedWindingReport report;
+    report.defectUnaryCost = config.mixedUnaryCost;
     report.variables = prepared.piecesByNode.size();
     report.factors = prepared.edges.size();
     report.connectedComponents = prepared.gaugeNodeByComponent.size();

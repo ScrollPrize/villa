@@ -210,6 +210,7 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
         FiberTraceWindingCalibrationMode::Adaptive;
     double phaseMagnitude = 0.0;
     double measurementScale = 1.0;
+    double defectUnaryCost = 0.5;
     double calibrationPhaseMean = 0.0;
     double calibrationScaleMean = 1.0;
     double calibrationEntropy = 0.0;

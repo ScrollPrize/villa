@@ -882,6 +882,9 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 ```
 
 `--winding-fixed-orientation` runs the ordinary H/V/Mixed sum-product BP first.
+Set its Mixed unary with `--bp-mixed-cost`. Set the later winding-stage Defect
+unary independently with `--winding-defect-cost`; both default to `0.5` and
+neither inherits an explicitly changed value from the other.
 Each piece's unique MAP direction is then fixed; an exact class tie becomes
 Defect. During winding, a fixed H piece can be H or Defect and a fixed V piece
 can be V or Defect, but neither can switch to the opposite direction. A
@@ -890,7 +893,7 @@ state per integer winding plus one Defect state; Defect is not duplicated over
 the winding support. The chosen backend still controls phase/scale calibration,
 component sign, integer-support expansion, and winding factor evaluation.
 
-A late Defect pays the existing `--bp-mixed-cost` at `--bp-temperature` and is
+A late Defect pays `--winding-defect-cost` at `--bp-temperature` and is
 selected only from winding evidence; fixed mode does not repeat the H/V
 same/different orientation factor. A Defect assignment makes every incident
 pair factor neutral, disabling orientation, winding, calibration, and component
@@ -901,6 +904,11 @@ columns and records `winding_prepass_class`, `winding_final_class`, and final
 H/Defect/V probabilities. It writes `winding_valid=0` and `NA` for numeric
 winding fields of final Defect pieces. Defect pieces are excluded from `w_N`
 OBJ layers and remain visible in the ordinary Defect class OBJ.
+The exact fixed assignment passed to winding is written separately as
+`<base>_prepass_h.obj`, `<base>_prepass_v.obj`,
+`<base>_prepass_err.obj`, and `<base>_prepass_tie.obj`; the tie layer is empty
+because prepass ties become Defect. Final `<base>_{h,v,err,tie}.obj` layers
+continue to describe the post-winding result.
 
 ```bash
 volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --bp-only --bp-inference sum-product-mixed
@@ -915,6 +923,12 @@ is not expected to produce identical posteriors in the joint model. Every split
 piece remains a distinct variable. Same-trace continuity contributes its
 existing parallel-score-1, zero-difference factor, so other evidence can
 override it at the corresponding cost.
+
+Without fixed orientation, joint-grid uses `--winding-defect-cost` as its only
+Defect unary. Non-fixed alternating uses the orientation BP posterior as its
+orientation prior and does not charge that unary again. The winding summary and
+`winding_defect_unary_cost` CSV column report the configured winding value
+separately from `bp_mixed_unary_cost`.
 
 The two oriented classes occupy interleaved integer lattices. Local class A is
 at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in

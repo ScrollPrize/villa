@@ -1,17 +1,9 @@
-# Task: extend and distance-weight signed winding evidence
+# Task: separate prepass and winding Defect controls
 
-Increase the H/V diagnostic and winding-BP default exclusive raw
-winding-distance cutoff from `1.5` to `4.0`. Preserve the legacy parity
-labeler's representable `<1.5` default.
+Split the orientation-prepass Mixed unary cost from the later winding-stage
+Defect unary cost. `--bp-mixed-cost` must configure only the initial H/V/Mixed
+BP, while a separate `--winding-defect-cost` configures Defect during winding.
 
-For H/V-aware winding inference, progressively reduce the signed winding
-evidence weight as its admitted half-integer target grows:
-
-- `|target| = 0.5`: multiplier `1`
-- `|target| = 1.5`: multiplier `0.5`
-- `|target| = 2.5`: multiplier `0.25`
-- `|target| = 3.5`: multiplier `0.125`
-
-The decay applies to the complete winding-distance factor contribution, not to
-the same constraint's independent H/V parallel/perpendicular relation evidence.
-Its hard signed-order requirement remains unweighted.
+When fixed-orientation winding is used, save the exact H/V/Defect assignment
+passed from the orientation prepass into the winding solver as separate OBJ
+layers, in addition to the existing final winding-state OBJ layers.
