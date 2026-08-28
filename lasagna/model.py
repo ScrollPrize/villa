@@ -3294,7 +3294,6 @@ class Model3D(nn.Module):
 		# Vectorized triangle barycentric solve. Only the KDTree candidate search
 		# stays on CPU. Float64 keeps shared-edge and overlapping-cell tie behavior
 		# stable across CPU and CUDA.
-		use_cuda = bool(torch.device(device).type == "cuda")
 		# Keep the immutable cell table in host memory. Only the k candidates for
 		# the current output chunk are staged on the compute device below.
 		tri0_s_cell = q10 - q00
@@ -3310,11 +3309,6 @@ class Model3D(nn.Module):
 
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		# if use_cuda and chunk < (1 << 20):
-		# 	# Peak GPU memory scales with chunk * k through the candidate edge and
-		# 	# barycentric tensors. If k_candidates grows large or OOMs appear,
-		# 	# lower this cap.
-		# 	chunk = 1 << 20
 		for start in range(0, total, chunk):
 			stop = min(total, start + chunk)
 			flat_idx = np.arange(start, stop, dtype=np.int64)
@@ -3342,7 +3336,6 @@ class Model3D(nn.Module):
 
 			pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
 			q00_c = _candidate_tensor(q00)
-			q10_c = _candidate_tensor(q10)
 			e0s = _candidate_tensor(tri0_s_cell)
 			e0t = _candidate_tensor(tri0_t_cell)
 
@@ -3366,6 +3359,7 @@ class Model3D(nn.Module):
 			del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
 
 			# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
+			q10_c = _candidate_tensor(q10)
 			e1u = _candidate_tensor(tri1_u_cell)
 			e1v = _candidate_tensor(tri1_v_cell)
 			rhs1 = pts_t[:, None, :] - q10_c
