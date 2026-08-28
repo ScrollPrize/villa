@@ -39,6 +39,14 @@ def test_every_key_has_generated_metadata():
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
 
 
+def test_dt_target_cadence_alias_remains_positive_in_schema():
+    fields = Config.catalog()["schema"]["fields"]
+    assert fields["theta_crossing_map_update_interval"]["minimum"] == 1
+    assert fields["dt_target_update_interval"]["minimum"] == 1
+    with pytest.raises(ValueError, match="Out-of-range"):
+        Config({"dt_target_update_interval": 0})
+
+
 def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {

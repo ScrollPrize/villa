@@ -265,6 +265,7 @@ def _field_spec(key, default):
                 1 if key in {
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
+                    "dt_target_update_interval",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
@@ -523,6 +524,9 @@ class Config:
         self.dt_progressive_exponent = 1.0
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
+        # Backward-compatible alias. FitContext phase-locks whole-object DT
+        # targets to theta_crossing_map_update_interval and keeps both values
+        # synchronized when either setting is changed.
         self.dt_target_update_interval = 100
         self.dt_target_max_stride = 128
         self.output_first_winding = 10
