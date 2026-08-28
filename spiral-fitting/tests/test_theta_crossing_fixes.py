@@ -51,7 +51,10 @@ class ThetaCrossingLossTests(unittest.TestCase):
     def test_patch_target_cache_uses_theta_potential_winding_units(self):
         dr = torch.tensor(10.0)
         patch_row = SimpleNamespace(
-            _dt_target_ijs=np.array([[0.25, 0.25], [0.75, 0.75]]))
+            _dt_target_ijs=np.array([[0.25, 0.25], [0.75, 0.75]]),
+            _dt_target_block_rc=np.array([[0, 0], [0, 1]], dtype=np.int32),
+            _dt_target_block_shape=(1, 2),
+        )
 
         class Atlas:
             def theta_node_ids(self, patch_indices, ijs):
@@ -79,6 +82,43 @@ class ThetaCrossingLossTests(unittest.TestCase):
             torch.zeros((1, 1)), torch.zeros((1, 1)), dr, cache,
             torch.tensor([0]))
         torch.testing.assert_close(target, torch.tensor([[50.0]]))
+
+    def test_patch_target_cache_uses_only_largest_connected_component(self):
+        dr = torch.tensor(10.0)
+        patch_row = SimpleNamespace(
+            _dt_target_ijs=np.array([
+                [0.25, 0.25], [0.25, 1.25], [2.25, 0.25],
+                [2.25, 2.25], [4.25, 4.25],
+            ]),
+            _dt_target_block_rc=np.array(
+                [[0, 0], [0, 1], [2, 0], [2, 2], [4, 4]],
+                dtype=np.int32),
+            _dt_target_block_shape=(5, 5),
+        )
+
+        class Atlas:
+            def theta_node_ids(self, patch_indices, ijs):
+                return np.array([4, 5, 6, 7, 8], dtype=np.int64)
+
+            def lookup(self, patch_indices, ijs):
+                return torch.stack([
+                    _spiral_point(0.0, 3, float(dr)),
+                    _spiral_point(0.0, 3, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                ])
+
+        crossing_map = SimpleNamespace(
+            winding_potentials=lambda node_ids, theta: torch.zeros(5))
+        cache = compute_patch_dt_target_cache(
+            _IdentityTransform(), dr, [patch_row], Atlas(), crossing_map,
+            floating_threshold=0.25)
+
+        # The three detached winding-9 singletons collectively outnumber the
+        # winding-3 main island, but their unrelated frames must not affect it.
+        torch.testing.assert_close(
+            cache['target_relative'].to(torch.int64), torch.tensor([3]))
 
     def test_patch_losses_ignore_padded_samples_in_both_radius_modes(self):
         dr = torch.tensor(10.0)

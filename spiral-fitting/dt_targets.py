@@ -499,17 +499,25 @@ def compute_patch_dt_target_cache(
         adjustments = crossing_map.winding_potentials(
             node_ids, theta).to(shifted.dtype)
         values = shifted + adjustments * dr_per_winding.detach()
+        theta_cpu = theta.float().cpu().numpy()
         values_cpu = values.float().cpu()
         dr = float(dr_per_winding.detach().cpu())
         offsets = np.concatenate([[0], np.cumsum(counts)])
-        for n in range(num_patches):
+        for n, patch in enumerate(patches):
             lo, hi = int(offsets[n]), int(offsets[n + 1])
             if hi == lo:
                 continue
+            # Each connected island in the theta atlas has an independent root
+            # potential. As in the original patch-cache implementation, choose
+            # the target only from the largest connected block component so
+            # unrelated unwrap frames are never pooled together.
+            _, main = _unwrap_block_samples(
+                theta_cpu[lo:hi], patch._dt_target_block_rc,
+                patch._dt_target_block_shape)
             # select_whole_object_target already returns winding units. Store
             # that integer directly; dividing by dr here would scale twice.
             selected = select_whole_object_target(
-                values_cpu[lo:hi], dr, floating_threshold)
+                values_cpu[lo:hi][main], dr, floating_threshold)
             target_relative[n] = torch.round(selected).to(torch.int64)
     return {
         'frame': 'theta_potential',
