@@ -3311,6 +3311,15 @@ class Model3D(nn.Module):
 		], axis=1)
 		del q00, q10, q01, q11
 		del tri0_s_cell, tri0_t_cell, tri1_u_cell, tri1_v_cell
+		# Zero-copy torch view of the cell table: torch's CPU index_select
+		# gathers candidate rows on all cores and without holding the GIL,
+		# copying exactly the bits numpy fancy indexing would.
+		cell_table_t = torch.from_numpy(cell_table)
+
+		def _gather_staged(cand: np.ndarray) -> torch.Tensor:
+			return cell_table_t.index_select(
+				0, torch.from_numpy(cand.reshape(-1)),
+			).view(int(cand.shape[0]), int(cand.shape[1]), -1)
 		if not use_tree:
 			centers_c = torch.as_tensor(centers, dtype=torch.float64, device=device)
 
@@ -3343,7 +3352,7 @@ class Model3D(nn.Module):
 			cand = np.asarray(cand, dtype=np.int64)
 			if cand.ndim == 1:
 				cand = cand[:, None]
-			return flat_idx, points, cand, cell_table[cand]
+			return flat_idx, points, cand, _gather_staged(cand)
 
 		prefetcher = None
 		pending = None
@@ -3367,7 +3376,7 @@ class Model3D(nn.Module):
 					cand = torch.topk(
 						d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
 					).indices.detach().cpu().numpy()
-					staged = cell_table[cand]
+					staged = _gather_staged(cand)
 
 				pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
 				cand_table = torch.as_tensor(
