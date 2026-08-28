@@ -152,7 +152,7 @@ def _run_losses(
     return np.array(radius_losses), np.array(dt_losses)
 
 
-def test_short_unequal_strips_transform_each_available_point_once():
+def test_short_unequal_strips_carry_one_dt_anchor_per_row():
     cfg = _make_cfg()
     base = _perfect_spiral_fiber(1.0)
     transform = CountingIdentityTransform()
@@ -160,7 +160,7 @@ def test_short_unequal_strips_transform_each_available_point_once():
         [base[:3], base[:5]], cfg, num_steps=1,
         num_points_per_pcl=1024, transform=transform)
 
-    assert transform.forward_counts == [8]
+    assert transform.forward_counts == [10]
     assert transform.inverse_counts == [8]
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
@@ -173,20 +173,20 @@ def test_mixed_short_and_long_strips_use_independent_caps(monkeypatch):
     assert len(long) > 1024
     transform = CountingIdentityTransform()
     captured_counts = []
-    real_helper = losses.strip_dt_target_in_sample_frame
+    real_helper = losses.endpoint_strip_dt_target_in_sample_frame
 
     def capture_mask(*args, **kwargs):
         captured_counts.append(kwargs['sample_mask'].sum(dim=-1).tolist())
         return real_helper(*args, **kwargs)
 
     monkeypatch.setattr(
-        losses, 'strip_dt_target_in_sample_frame', capture_mask)
+        losses, 'endpoint_strip_dt_target_in_sample_frame', capture_mask)
     radius_losses, dt_losses = _run_losses(
         [short, long], cfg, num_steps=1,
         num_points_per_pcl=1024, transform=transform)
 
     assert sorted(captured_counts[0]) == [3, 1024]
-    assert transform.forward_counts == [1027]
+    assert transform.forward_counts == [1029]
     assert transform.inverse_counts == [1027]
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
@@ -205,12 +205,11 @@ def test_endpoint_cache_carries_anchor_without_changing_loss_samples():
         [fiber], cfg, num_steps=1, seed=17, num_points_per_pcl=32,
         transform=endpoint_transform, whole_object_cache=True)
 
-    assert median_transform.forward_inputs[0].shape == (32, 3)
+    assert median_transform.forward_inputs[0].shape == (33, 3)
     assert endpoint_transform.forward_inputs[0].shape == (33, 3)
-    # The carried endpoint is prepended; all 32 random loss positions remain
-    # bitwise identical to the strip-median draw.
+    # Both modes carry the same endpoint and random loss positions.
     torch.testing.assert_close(
-        endpoint_transform.forward_inputs[0][1:],
+        endpoint_transform.forward_inputs[0],
         median_transform.forward_inputs[0], rtol=0, atol=0)
     np.testing.assert_allclose(endpoint_losses[0], median_losses[0], atol=1e-6)
     np.testing.assert_allclose(endpoint_losses[1], median_losses[1], atol=1e-6)

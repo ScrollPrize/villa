@@ -208,15 +208,18 @@ def endpoint_strip_dt_target_in_sample_frame(
     sample_anchor_theta, sample_anchor_adjustment, anchor_at_end,
     sample_mask=None,
 ):
-    """Transfer a strip target through an anchor-only sampled endpoint.
+    """Choose a strip target, transferring a cached one through its endpoint.
 
     PCL component walks begin at either endpoint of one member strip. The
     endpoint is transformed alongside the loss samples but is not itself a
     loss position. ``sample_anchor_adjustment`` expresses that walk origin in
-    the unchanged first-loss-pick unwrap frame.
+    the unchanged first-loss-pick unwrap frame. With no whole-object cache,
+    retain the sampled-median target; carrying the endpoint is harmless.
     """
     median_target, _ = _sample_median_target(
         sample_radii, sample_mask, dr_per_winding)
+    if cache is None:
+        return median_target
     target, valid = _target_through_strip_endpoint(
         sample_radii, dr_per_winding, cache, cache_idx,
         sample_anchor_theta, sample_anchor_adjustment, anchor_at_end,

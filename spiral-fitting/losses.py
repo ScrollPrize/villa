@@ -1345,12 +1345,9 @@ def get_unattached_pcl_strip_losses(
     if flat is None or flat['total'] == 0:
         return zero, zero
 
-    whole_object_cache = compute_dt and dt_target_cache is not None
     branch_probability = cfg['loss_fiber_link_branch_probability']
     num_rows = len(chosen_comps)
     starts_cpu = flat['starts_cpu'].numpy()
-    sampled_strip_rows = []
-    sampled_local_rows = []
     sampled_flat_rows = []
     pick_rows = []
     node_paths = []
@@ -1378,7 +1375,7 @@ def get_unattached_pcl_strip_losses(
             else np.arange(pos_from, pos_to - 1, -1, dtype=np.int64)
             for strip_idx, pos_from, pos_to in segments])
         walk_len = len(walk_locals)
-        if whole_object_cache:
+        if compute_dt:
             origin_strip = int(walk_strips[0])
             origin_local = int(walk_locals[0])
             origin_last = len(pcl_strips[origin_strip]['zyxs']) - 1
@@ -1396,8 +1393,6 @@ def get_unattached_pcl_strip_losses(
                 walk_len, num_points_per_pcl, replace=False))
         sampled_strip_row = walk_strips[picks]
         sampled_local_row = walk_locals[picks]
-        sampled_strip_rows.append(sampled_strip_row)
-        sampled_local_rows.append(sampled_local_row)
         sampled_flat_rows.append(
             starts_cpu[sampled_strip_row] + sampled_local_row)
         pick_rows.append(picks)
@@ -1412,22 +1407,13 @@ def get_unattached_pcl_strip_losses(
     sample_counts = np.asarray(
         [len(row) for row in sampled_flat_rows], dtype=np.int64)
     padded_count = int(sample_counts.max())
-    sampled_strip_indices = np.empty(
-        [num_rows, padded_count], dtype=np.int64)
-    sampled_local_indices = np.empty(
-        [num_rows, padded_count], dtype=np.int64)
     valid_gather_indices = np.empty(
         [num_rows, padded_count], dtype=np.int64)
     sample_mask_np = (
         np.arange(padded_count)[None, :] < sample_counts[:, None])
     valid_offset = 0
-    for k, (strip_row, local_row, picks, node_path) in enumerate(zip(
-            sampled_strip_rows, sampled_local_rows, pick_rows, node_paths)):
+    for k, (picks, node_path) in enumerate(zip(pick_rows, node_paths)):
         count = len(picks)
-        sampled_strip_indices[k, :count] = strip_row
-        sampled_strip_indices[k, count:] = strip_row[0]
-        sampled_local_indices[k, :count] = local_row
-        sampled_local_indices[k, count:] = local_row[0]
         padded_picks = np.empty(padded_count, dtype=np.int64)
         padded_picks[:count] = picks
         padded_picks[count:] = picks[0]
@@ -1453,7 +1439,7 @@ def get_unattached_pcl_strip_losses(
 
     packed_walks = _pack_walks(walks, crossing_map)
 
-    if whole_object_cache:
+    if compute_dt:
         anchor_flat_indices_t = _pinned_to_device(
             torch.as_tensor(anchor_flat_indices, dtype=torch.int64), device)
         anchor_zyxs = flat['zyxs'][anchor_flat_indices_t]
@@ -1468,7 +1454,7 @@ def get_unattached_pcl_strip_losses(
         anchor_theta = None
     spiral_zyxs = valid_spiral_zyxs[valid_gather_indices_t]
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-    if whole_object_cache:
+    if compute_dt:
         (shifted_radii, crossing_adjustments,
          anchor_sample_adjustment) = _unwrap_sampled_tracks(
             crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
@@ -1513,19 +1499,13 @@ def get_unattached_pcl_strip_losses(
     if not compute_dt:
         return radius_loss, zero
 
-    if whole_object_cache:
-        # The carried endpoint establishes the frame but is not part of any
-        # radius/DT aggregation or diagnostic sample set.
-        target_normalised = endpoint_strip_dt_target_in_sample_frame(
-            normalised_radii, dr_per_winding, dt_target_cache,
-            anchor_strip_indices, anchor_theta, anchor_sample_adjustment,
-            anchor_at_end, sample_mask=sample_mask)
-    else:
-        # Legacy strip-median mode does not construct a whole-object cache.
-        target_normalised = strip_dt_target_in_sample_frame(
-            normalised_radii, sampled_local_indices, theta,
-            crossing_adjustments, dr_per_winding, dt_target_cache,
-            sampled_strip_indices, sample_mask=sample_mask)
+    # The carried endpoint establishes the frame for a cached target but is
+    # excluded from every loss aggregation. Without a cache the same helper
+    # returns the legacy sampled-median target.
+    target_normalised = endpoint_strip_dt_target_in_sample_frame(
+        normalised_radii, dr_per_winding, dt_target_cache,
+        anchor_strip_indices, anchor_theta, anchor_sample_adjustment,
+        anchor_at_end, sample_mask=sample_mask)
     target_shifted = target_normalised + winding_t * dr_per_winding
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted, crossing_adjustments, dr_per_winding,
