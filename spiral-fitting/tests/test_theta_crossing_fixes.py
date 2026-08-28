@@ -122,15 +122,14 @@ class ThetaCrossingLossTests(unittest.TestCase):
             dr, cache, torch.tensor([0]), sample_mask=sample_mask)
         torch.testing.assert_close(target, torch.tensor([[30.0]]))
 
-    def test_strip_dt_median_and_cache_anchor_ignore_padded_points(self):
+    def test_strip_dt_median_fallback_ignores_padded_points(self):
         dr = torch.tensor(10.0)
         sample_mask = torch.tensor([[True, False, False]])
         zeros = torch.zeros((1, 3))
         cache = {
-            'keys': torch.tensor([0, 10]),
-            'key_scale': 100,
-            'theta': torch.zeros(2),
-            'adjustment': torch.tensor([0.0, 5.0]),
+            'frame': 'strip_endpoints',
+            'anchor_theta': torch.zeros((1, 2)),
+            'anchor_adjustment': torch.tensor([[0, 5]]),
             'target_relative': torch.tensor([3.0]),
             'valid': torch.tensor([True]),
         }
