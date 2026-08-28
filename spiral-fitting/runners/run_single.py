@@ -28,10 +28,12 @@ DEFAULT_RUN_CONFIG = Path(__file__).with_name("default_run_config.json")
 WANDB_CONFIG_KEYS = ("wandb_project", "wandb_entity")
 TRAINING_HISTORY_FILENAME = "training_metrics.jsonl"
 AGGREGATE_METRICS_FILENAME = "aggregate_metrics.json"
+SATISFACTION_METRICS_FILENAME = "satisfaction_metrics_fitted.json"
 STATE_FILENAME = ".run_single_state.json"
 STATE_VERSION = 1
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _INK_STRIP_SUFFIX = ".jpg"
+_FULL_LASAGNA_PREVIEW_MAX_WIDTH = 32768
 _WANDB_IN_USE_RETRY_DELAYS = (2.0, 5.0, 10.0, 20.0, 30.0)
 
 # Executing this file directly puts only runners/ on sys.path.
@@ -394,7 +396,60 @@ def _load_final_summary(fitted_dir: Path) -> dict:
     summary = metrics.get("summary")
     if not isinstance(summary, dict):
         raise RuntimeError(f"ink metrics summary must be a JSON object: {metrics_path}")
-    return summary
+    final = dict(summary)
+    satisfaction_path = (
+        fitted_dir.parent.parent / SATISFACTION_METRICS_FILENAME)
+    if satisfaction_path.is_file():
+        satisfaction = _load_json_object(
+            satisfaction_path, description="satisfaction metrics")
+        satisfaction_summary = satisfaction.get("summary")
+        if not isinstance(satisfaction_summary, dict):
+            raise RuntimeError(
+                "satisfaction metrics summary must be a JSON object: "
+                f"{satisfaction_path}")
+        final.update({
+            f"satisfaction/{key}": value
+            for key, value in satisfaction_summary.items()
+        })
+    return final
+
+
+def _build_rendered_ink_preview(ink_dir: Path):
+    """Join full-scroll tiles left-to-right into one W&B-sized panorama."""
+    from PIL import Image
+
+    paths = sorted(
+        path for path in ink_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == _INK_STRIP_SUFFIX)
+    if not paths:
+        raise RuntimeError(f"no rendered ink strips found in {ink_dir}")
+    sizes = []
+    for path in paths:
+        with Image.open(path) as image:
+            sizes.append(image.size)
+    full_width = sum(width for width, _height in sizes)
+    scale = min(1.0, _FULL_LASAGNA_PREVIEW_MAX_WIDTH / full_width)
+    scaled_sizes = [
+        (max(1, int(width * scale)), max(1, round(height * scale)))
+        for width, height in sizes
+    ]
+    preview_width = sum(width for width, _height in scaled_sizes)
+    preview_height = max(height for _width, height in scaled_sizes)
+    preview = Image.new("L", (preview_width, preview_height))
+    x = 0
+    for path, size in zip(paths, scaled_sizes):
+        with Image.open(path) as source:
+            strip = source.convert("L")
+            if strip.size != size:
+                strip = strip.resize(size, Image.Resampling.LANCZOS)
+            preview.paste(strip, (x, 0))
+        x += size[0]
+    return preview
+
+
+def _wandb_image(image, *, caption: str):
+    import wandb
+    return wandb.Image(image, caption=caption)
 
 
 def _numeric(value) -> bool:
@@ -483,15 +538,25 @@ def _wandb_init_after_release(**kwargs):
 
 def log_seed_final_metrics(
     summary: dict, *, project: str, entity: str, seed_run_id: str,
-    group: str | None = None
+    group: str | None = None, ink_dir: Path | None = None,
 ) -> bool:
+    preview = None
     try:
         run = _wandb_init_after_release(
             project=project, entity=entity, run_id=seed_run_id,
             name=seed_run_id, group=group, resume="must")
         try:
-            run.log({f"final/{key}": value for key, value in summary.items()
-                     if _numeric(value)})
+            payload = {
+                f"final/{key}": value for key, value in summary.items()
+                if _numeric(value)
+            }
+            if ink_dir is not None:
+                preview = _build_rendered_ink_preview(ink_dir)
+                payload["final/rendered_ink_full_lasagna"] = _wandb_image(
+                    preview,
+                    caption="Full Lasagna-flattened rendered ink panorama",
+                )
+            run.log(payload)
         finally:
             run.finish()
     except Exception as exc:
@@ -505,18 +570,22 @@ def log_seed_final_metrics(
             flush=True,
         )
         return False
+    finally:
+        if preview is not None:
+            preview.close()
     return True
 
 
 def _log_seed_final_metrics_once(
     summary: dict, *, metrics_stage: dict, state: dict, state_path: Path,
     project: str, entity: str, seed_run_id: str, group: str | None = None,
+    ink_dir: Path | None = None,
 ) -> None:
     if metrics_stage.get("wandb_final_logged"):
         return
     if log_seed_final_metrics(
         summary, project=project, entity=entity,
-        seed_run_id=seed_run_id, group=group,
+        seed_run_id=seed_run_id, group=group, ink_dir=ink_dir,
     ):
         metrics_stage["wandb_final_logged"] = True
         _atomic_write_json(state_path, state)
@@ -1004,11 +1073,14 @@ def run_resumable(
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
+            ink_dir = _state_artifact(
+                output, state["runs"][str(seed)]["render"], "ink_output")
             _log_seed_final_metrics_once(
                 summary, metrics_stage=state["runs"][str(seed)]["metrics"],
                 state=state, state_path=state_path,
                 project=project, entity=entity,
-                seed_run_id=seed_id, group=wandb_group)
+                seed_run_id=seed_id, group=wandb_group,
+                ink_dir=ink_dir)
 
     if len(seeds) < 2:
         return
@@ -1073,9 +1145,11 @@ def run(args: argparse.Namespace) -> None:
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
+            _run_dir, fitted_dir = find_fit_outputs(output / f"seed-{seed}")
             log_seed_final_metrics(
                 summary, project=wandb_project, entity=wandb_entity,
-                seed_run_id=seed_id, group=wandb_group)
+                seed_run_id=seed_id, group=wandb_group,
+                ink_dir=fitted_dir / "ink")
 
     if len(seeds) < 2:
         return
