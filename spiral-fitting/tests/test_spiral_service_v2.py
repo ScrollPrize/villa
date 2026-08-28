@@ -101,6 +101,7 @@ class FakeSession:
         self.progress = None
         self.live_calls = []
         self.preview_schedules = []
+        self.dt_loss_schedules = []
 
     def status(self):
         applied = ({"applied_config": dict(self.applied_config)}
@@ -120,12 +121,14 @@ class FakeSession:
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
             influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True, preview_schedule=None):
+            autosave_on_pause=True, preview_schedule=None,
+            dt_loss_schedule=None):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
         self.autosave_calls.append(autosave_on_pause)
         self.preview_schedules.append(copy.deepcopy(preview_schedule))
+        self.dt_loss_schedules.append(copy.deepcopy(dt_loss_schedule))
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -284,6 +287,8 @@ def _planned_run(state, request):
         "configuration": configuration,
         "iterations": request.pop("iterations"),
         "influence": request.pop("influence_config", {}),
+        "dt_loss_schedule": request.pop("dt_loss_schedule", {
+            "enabled": False, "last_fraction": 0.25}),
         "expected_session_revision": state.session_revision,
         **request,
     })
@@ -1886,6 +1891,8 @@ class ExplicitInitializationTests(HttpServiceFixture):
                 self.state.run({
                     "configuration": configuration,
                     "iterations": 3,
+                    "dt_loss_schedule": {
+                        "enabled": False, "last_fraction": 0.25},
                     "expected_session_revision": self.state.session_revision,
                 })
 
@@ -2281,7 +2288,6 @@ class UploadTests(unittest.TestCase):
             "influence_z": 1200,
             "influence_windings": 2.5,
             "influence_theta_frac": 0.2,
-            "influence_disable_dt_frac": 0.4,
             "influence_sigma": 0.25,
             "sample_count_influence_footprint_points": 512,
             "sample_count_influence_anchor_lattice_points": 2000,
@@ -2298,6 +2304,67 @@ class UploadTests(unittest.TestCase):
                 "influence_theta_frac": 1.5,
             }})
         self.assertEqual(caught.exception.status, 400)
+
+        with self.assertRaisesRegex(ApiError, "Unknown influence"):
+            _planned_run(self.state, {
+                "iterations": 10,
+                "influence_config": {"influence_disable_dt_frac": 0.4},
+            })
+
+    def test_run_requires_validates_and_propagates_dt_loss_schedule(self):
+        session = self._session()
+        for schedule in (
+                {"enabled": False, "last_fraction": 0.25},
+                {"enabled": True, "last_fraction": 0},
+                {"enabled": True, "last_fraction": 0.25},
+                {"enabled": True, "last_fraction": 1}):
+            _planned_run(self.state, {
+                "iterations": 10, "dt_loss_schedule": schedule})
+            self.assertEqual(session.dt_loss_schedules[-1], {
+                "enabled": schedule["enabled"],
+                "last_fraction": float(schedule["last_fraction"]),
+            })
+
+        base = {
+            "configuration": dict(Config.catalog()["defaults"]),
+            "iterations": 10,
+            "influence": {},
+            "expected_session_revision": self.state.session_revision,
+        }
+        invalid = (
+            None,
+            {},
+            {"enabled": True},
+            {"enabled": True, "last_fraction": 0.25, "extra": 1},
+            {"enabled": 1, "last_fraction": 0.25},
+            {"enabled": True, "last_fraction": True},
+            {"enabled": True, "last_fraction": "0.25"},
+            {"enabled": True, "last_fraction": -0.01},
+            {"enabled": True, "last_fraction": 1.01},
+            {"enabled": True, "last_fraction": float("inf")},
+            {"enabled": True, "last_fraction": float("nan")},
+        )
+        for schedule in invalid:
+            request = dict(base)
+            if schedule is not None:
+                request["dt_loss_schedule"] = schedule
+            with self.subTest(schedule=schedule), self.assertRaises(ApiError) as caught:
+                self.state.run(request)
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_run_configuration_rejects_removed_influence_dt_field(self):
+        self._session()
+        configuration = dict(Config.catalog()["defaults"])
+        configuration["influence_disable_dt_frac"] = 0.75
+        with self.assertRaisesRegex(ApiError, "complete configuration"):
+            self.state.run({
+                "configuration": configuration,
+                "iterations": 10,
+                "influence": {},
+                "dt_loss_schedule": {
+                    "enabled": False, "last_fraction": 0.25},
+                "expected_session_revision": self.state.session_revision,
+            })
 
     def test_run_passes_and_validates_mutable_training_config(self):
         session = self._session()
@@ -2356,6 +2423,8 @@ class UploadTests(unittest.TestCase):
             self.state.run({
                 "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
+                "dt_loss_schedule": {
+                    "enabled": False, "last_fraction": 0.25},
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
             })
@@ -2369,6 +2438,8 @@ class UploadTests(unittest.TestCase):
             self.state.run({
                 "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
+                "dt_loss_schedule": {
+                    "enabled": False, "last_fraction": 0.25},
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
             })

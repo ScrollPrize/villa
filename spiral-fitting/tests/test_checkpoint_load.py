@@ -210,6 +210,9 @@ class CheckpointPreflightTests(unittest.TestCase):
         unknown = _checkpoint(cfg={**durable_config(CONFIG), "who_am_i": 1})
         self.assertIn("does not match the current schema",
                       _inspect(unknown).message())
+        removed = _checkpoint(cfg={
+            **durable_config(CONFIG), "influence_disable_dt_frac": 0.75})
+        self.assertIn("influence_disable_dt_frac", _inspect(removed).message())
         incomplete = durable_config(CONFIG)
         del incomplete["optimizer_learning_rate"]
         self.assertIn("optimizer_learning_rate",

@@ -1,5 +1,6 @@
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -217,3 +218,18 @@ def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
         assert key not in catalog["schema"]["fields"]
         with pytest.raises(ValueError, match="Unknown"):
             Config({key: "straight" if key.endswith("sampling") else 1.0})
+
+
+def test_dt_loss_schedule_is_not_advanced_or_durable_configuration():
+    catalog = Config.catalog()
+    assert "influence_disable_dt_frac" not in catalog["defaults"]
+    assert "influence_disable_dt_frac" not in catalog["schema"]["fields"]
+    with pytest.raises(ValueError, match="Unknown"):
+        Config({"influence_disable_dt_frac": 0.75})
+
+
+def test_golden_metadata_uses_new_metric_and_excludes_removed_field():
+    golden = (Path(__file__).parent / "golden" / "golden_bands.json").read_text()
+    assert "run_dt_suppressed" in golden
+    assert "interactive_dt_suppressed" not in golden
+    assert "influence_disable_dt_frac" not in golden

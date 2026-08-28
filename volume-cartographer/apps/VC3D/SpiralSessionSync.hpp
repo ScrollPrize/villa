@@ -90,4 +90,24 @@ inline QJsonObject completeSpiralRunConfiguration(
     return result;
 }
 
+inline QJsonObject spiralRunRequest(
+    const QJsonObject& configuration,
+    int iterations,
+    const QJsonObject& influence,
+    const QJsonObject& dtLossSchedule,
+    qint64 expectedSessionRevision,
+    const QJsonObject& previewSchedule = {})
+{
+    QJsonObject result{
+        {QStringLiteral("configuration"), configuration},
+        {QStringLiteral("iterations"), iterations},
+        {QStringLiteral("influence"), influence},
+        {QStringLiteral("dt_loss_schedule"), dtLossSchedule},
+        {QStringLiteral("expected_session_revision"), expectedSessionRevision},
+    };
+    if (!previewSchedule.isEmpty())
+        result[QStringLiteral("preview_schedule")] = previewSchedule;
+    return result;
+}
+
 } // namespace vc3d

@@ -291,13 +291,22 @@ revision.
 Interactive influence settings are captured when each **Run** request starts.
 The fitter builds an influence region from the inputs pending at Run start;
 inputs added live use the same captured settings and extend the region's union.
-They also extend (never shorten) the DT-disabled deadline within the remaining
-Run window. The region is cleared only when the Run pauses, before autosaving.
+The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session. The **Disable DT** percentage controls
-how much of that run suppresses directional DT losses after incorporating its
-pending inputs.
+without reloading the resident session.
+
+Directional DT timing is an independent control on every interactive Run.
+When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
+When checked, the adjacent percentage is the eligible suffix of the originally
+requested Run: the first eligible iteration is
+`run_start + floor(iterations * (1 - percentage / 100))`. Thus 25% of a
+10,000-iteration Run suppresses DT for 7,500 iterations and permits it for the
+final 2,500; for small Runs the eligible step count is rounded up. Zero percent
+suppresses DT for the whole Run and 100% adds no suppression. Stopping early
+does not recalculate the original window. The schedule is transient Run state,
+not advanced configuration or checkpoint state, and is cleared before the
+Run's autosave.
 
 Input-local validation failures (for example, an empty fiber or a patch outside
 the fitted z range) are reported on that input and do not stop optimization;

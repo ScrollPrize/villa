@@ -45,6 +45,7 @@ import copy
 import dataclasses
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -264,7 +265,6 @@ def _validate_run_influence_config(value):
         "influence_z",
         "influence_windings",
         "influence_theta_frac",
-        "influence_disable_dt_frac",
         "influence_sigma",
         "sample_count_influence_footprint_points",
         "sample_count_influence_anchor_lattice_points",
@@ -288,7 +288,6 @@ def _validate_run_influence_config(value):
         "influence_z": (1.0, 1_000_000.0),
         "influence_windings": (0.1, 100.0),
         "influence_theta_frac": (0.01, 1.0),
-        "influence_disable_dt_frac": (0.0, 1.0),
         "influence_sigma": (0.000001, 10.0),
         "sample_count_influence_footprint_points": (1.0, 1_000_000.0),
         "sample_count_influence_anchor_lattice_points": (1.0, 1_000_000.0),
@@ -319,6 +318,34 @@ def _validate_run_influence_config(value):
             raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
         result[key] = int(result[key])
     return result
+
+
+def _validate_dt_loss_schedule(value):
+    """Validate the required, transient DT schedule on a Run request."""
+    if not isinstance(value, dict):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST, "dt_loss_schedule must be a JSON object")
+    expected = {"enabled", "last_fraction"}
+    if set(value) != expected:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule must contain exactly enabled and last_fraction")
+    enabled = value["enabled"]
+    if not isinstance(enabled, bool):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST, "dt_loss_schedule.enabled must be boolean")
+    fraction = value["last_fraction"]
+    if (isinstance(fraction, bool)
+            or not isinstance(fraction, (int, float))):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule.last_fraction must be numeric")
+    fraction = float(fraction)
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "dt_loss_schedule.last_fraction must be finite and between 0 and 1")
+    return {"enabled": enabled, "last_fraction": fraction}
 
 
 # Console lines whose information is already published as structured
@@ -1464,6 +1491,8 @@ class ServiceState:
         if iterations < 1:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "iterations must be at least 1")
+        dt_loss_schedule = _validate_dt_loss_schedule(
+            request.get("dt_loss_schedule"))
         schedule = request.get("preview_schedule")
         if schedule is not None:
             if not isinstance(schedule, dict):
@@ -1547,6 +1576,7 @@ class ServiceState:
                 "mark_incorporated": mark_incorporated,
                 "influence_config": influence_config,
                 "run_config": run_config,
+                "dt_loss_schedule": dt_loss_schedule,
                 # Whether this run's pause writes the durable autosave. It
                 # belongs to the run request, not to the plan: it changes
                 # nothing about the model, so it needs no planning round.

@@ -140,13 +140,14 @@ private:
     QSpinBox* _influenceZ = nullptr;
     QDoubleSpinBox* _influenceWindings = nullptr;
     QSpinBox* _influenceThetaPct = nullptr;
-    QSpinBox* _influenceDisableDtPct = nullptr;
     QDoubleSpinBox* _influenceAnchorWeight = nullptr;
     SpiralConfigProfileEditor* _advancedProfiles = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;
     QPushButton* _run = nullptr;
+    QCheckBox* _dtLossScheduleEnabled = nullptr;
+    QSpinBox* _dtLossLastPct = nullptr;
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;

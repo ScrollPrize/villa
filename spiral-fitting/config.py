@@ -544,7 +544,6 @@ class Config:
         self.influence_z = 3000.0
         self.influence_windings = 5.0
         self.influence_theta_frac = 0.5
-        self.influence_disable_dt_frac = 0.75
         self.influence_sigma = 0.3333
         self.influence_anchor_ramp_power = 2.0
         self.dense_spacing_density_lambda = "inverse_gap"

@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 33;
+    static constexpr int kApiVersion = 34;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -79,6 +79,7 @@ public:
     void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
                        const QJsonObject& runConfig,
+                       const QJsonObject& dtLossSchedule,
                        const QJsonObject& previewSchedule = {});
     void stopAfterIteration();
     // Save on service: writes to a service-host path.

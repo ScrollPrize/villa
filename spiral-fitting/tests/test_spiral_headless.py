@@ -21,6 +21,7 @@ import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             ConfigureCommand,
+                            DtLossScheduleCommand,
                             DistributedInteractiveFitSession,
                             FileStoreRendezvous, IncorporateCommand,
                             InteractiveFitSession, SaveCheckpointCommand,
@@ -773,6 +774,39 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._step_epoch, 1)
         self.assertEqual(session._state, SessionState.Running)
 
+    def test_every_run_queues_and_applies_dt_schedule_before_first_step(self):
+        session = self._idle_session(completed=100)
+        calls = []
+        session._context = SimpleNamespace(
+            run_dt_resume_iteration=175,
+            configure_dt_loss_schedule=lambda start, count, schedule: calls.append(
+                (start, count, schedule)))
+        schedule = {"enabled": True, "last_fraction": 0.25}
+
+        session.run(100, dt_loss_schedule=schedule)
+
+        self.assertEqual([command.kind for command in session._commands],
+                         ["dt_loss_schedule"])
+        session.wait_for_iteration(100)
+        self.assertEqual(calls, [(100, 100, schedule)])
+        self.assertEqual(session._iteration_in_progress, 100)
+
+    def test_distributed_run_propagates_schedule_to_every_rank_call(self):
+        session = self._proxy()
+        session._status["state"] = SessionState.Idle
+        observed = {}
+
+        def call(name, arguments, **kwargs):
+            observed.update({"name": name, "arguments": arguments})
+            return 25
+
+        session._call = call
+        schedule = {"enabled": True, "last_fraction": 0.4}
+
+        self.assertEqual(session.run(20, dt_loss_schedule=schedule), 25)
+        self.assertEqual(observed["name"], "run")
+        self.assertEqual(observed["arguments"]["dt_loss_schedule"], schedule)
+
     def test_command_from_another_epoch_fail_stops_the_rank(self):
         session = self._idle_session(rank=1, world_size=2)
         session._commands.append(IncorporateCommand(
@@ -822,6 +856,12 @@ class ProtocolTests(unittest.TestCase):
         session._stop_requested = False
         session._shutdown = False
         session._run_start_completed = completed
+        session._context = SimpleNamespace(
+            configure_dt_loss_schedule=lambda *_: None)
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000}
+        session._run_config = dict(session.requested_config)
+        session._warnings = []
         session.rank = rank
         session.world_size = world_size
         session._status_callback = None
@@ -977,7 +1017,8 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(250)
 
-        self.assertEqual(session._commands, [])
+        self.assertEqual(len(session._commands), 1)
+        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
@@ -1005,7 +1046,8 @@ class ProtocolTests(unittest.TestCase):
         target = session.run(250)
 
         self.assertEqual(target, 30_000)
-        self.assertEqual(session._commands, [])
+        self.assertEqual(len(session._commands), 1)
+        self.assertIsInstance(session._commands[0], DtLossScheduleCommand)
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
@@ -1169,8 +1211,38 @@ class ProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual([command.kind for command in session._commands],
-                         ["configure", "incorporate"])
+                         ["configure", "incorporate", "dt_loss_schedule"])
         self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
+
+    def test_failed_run_setup_cancels_schedule_and_clears_run_state(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._pending = 20
+        session._target = 30
+        session._warnings = []
+        session._run_config = {"loss_weight_patch_radius": 8.0}
+        calls = []
+        session._context = SimpleNamespace(
+            apply_config=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("bad setup")),
+            clear_interactive_run_state=lambda: calls.append("clear"))
+        schedule = DtLossScheduleCommand(
+            session_generation=0, run_start=10, requested_iterations=20,
+            schedule={"enabled": True, "last_fraction": 0.25})
+        session._commands = [schedule]
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        command = ConfigureCommand(
+            config={"loss_weight_patch_radius": 4.0},
+            previous_run_config={"loss_weight_patch_radius": 8.0})
+
+        session._run_configuration(command)
+
+        self.assertEqual(calls, ["clear"])
+        self.assertTrue(schedule.cancelled)
+        self.assertEqual(session._commands, [])
+        self.assertEqual(session._state, SessionState.Idle)
+        self.assertEqual(session._target, 10)
 
     def test_incorporation_warnings_reach_the_session_status(self):
         # The context takes the inputs but reports what it could not honour;
@@ -1266,7 +1338,7 @@ class ProtocolTests(unittest.TestCase):
             Path(path).write_bytes(_zip_checkpoint_bytes())
 
         session._context = SimpleNamespace(
-            clear_interactive_influence=lambda: calls.append("finish"),
+            clear_interactive_run_state=lambda: calls.append("finish"),
             save_checkpoint=save_checkpoint)
         session._publish_preview = lambda: calls.append("preview")
         return session
@@ -1309,6 +1381,22 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(session._state, SessionState.Idle)
             # No autosave means no metadata claiming one exists.
             self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
+
+    def test_early_stop_clears_run_state_before_autosave(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(calls, output)
+            session._pending = 20
+            session._target = 29
+            session._stop_requested = True
+
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(calls, ["finish", "save"])
+            self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(session._pending, 0)
 
     def test_scheduled_preview_is_queued_at_cadence_and_final_boundaries(self):
         calls = []
@@ -1559,7 +1647,7 @@ class ProtocolTests(unittest.TestCase):
         session.publishes_outputs = False
         calls = []
         session._context = SimpleNamespace(
-            clear_interactive_influence=lambda: calls.append("finish"),
+            clear_interactive_run_state=lambda: calls.append("finish"),
             save_checkpoint=lambda *_: calls.append("save"))
         session._publish_preview = lambda: calls.append("preview")
 

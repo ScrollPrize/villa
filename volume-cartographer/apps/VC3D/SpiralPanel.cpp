@@ -394,13 +394,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _influenceThetaPct = new QSpinBox(outputContents);
     _influenceThetaPct->setRange(1, 100); _influenceThetaPct->setSuffix(tr("% of wrap")); _influenceThetaPct->setValue(50);
     _influenceThetaPct->setToolTip(tr("Max influence half-extent along the wrap, as a fraction of a full turn"));
-    _influenceDisableDtPct = new QSpinBox(outputContents);
-    _influenceDisableDtPct->setRange(0, 100);
-    _influenceDisableDtPct->setSuffix(tr("%"));
-    _influenceDisableDtPct->setValue(75);
-    _influenceDisableDtPct->setToolTip(
-        tr("Fraction of each requested Run window that keeps directional DT losses disabled "
-           "after pending inputs are incorporated"));
     _influenceAnchorWeight = new QDoubleSpinBox(outputContents);
     _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
     _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
@@ -417,7 +410,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Influence z extent"), _influenceZ);
     outputForm->addRow(tr("Influence windings"), _influenceWindings);
     outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
-    outputForm->addRow(tr("% of iters to disable DT"), _influenceDisableDtPct);
     outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
     outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
 
@@ -692,6 +684,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _load = new QPushButton(tr("Initialize Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
+    _dtLossScheduleEnabled = new QCheckBox(
+        tr("Restrict DT losses to final"), runContents);
+    _dtLossScheduleEnabled->setChecked(false);
+    _dtLossLastPct = new QSpinBox(runContents);
+    _dtLossLastPct->setRange(0, 100);
+    _dtLossLastPct->setSuffix(tr("%"));
+    _dtLossLastPct->setValue(25);
+    _dtLossLastPct->setEnabled(false);
+    _dtLossScheduleEnabled->setToolTip(
+        tr("Suppress directional DT losses until the final percentage of "
+           "this Run; stopping early does not resize the window"));
+    _dtLossLastPct->setToolTip(
+        tr("Percentage of requested iterations eligible for DT losses"));
+    connect(_dtLossScheduleEnabled, &QCheckBox::toggled,
+            _dtLossLastPct, &QWidget::setEnabled);
     _backgroundPreview = new QCheckBox(tr("Background preview every"), runContents);
     _backgroundPreview->setObjectName(
         QStringLiteral("spiralBackgroundPreviewEnabled"));
@@ -715,6 +722,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // the far end with the stretch between them.
     controls->addWidget(new QLabel(tr("Iterations"), runContents));
     controls->addWidget(_iterations);
+    controls->addWidget(_dtLossScheduleEnabled);
+    controls->addWidget(_dtLossLastPct);
     controls->addWidget(_run);
     controls->addWidget(_stop);
     controls->addStretch(1);
@@ -1150,8 +1159,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                  _lossMapDiagnostics->isChecked()},
             };
         }
+        const QJsonObject dtLossSchedule{
+            {QStringLiteral("enabled"), _dtLossScheduleEnabled->isChecked()},
+            {QStringLiteral("last_fraction"),
+             _dtLossLastPct->value() / 100.0},
+        };
         _service->runIterations(_iterations->value(), influenceConfig(),
-                                runAdvancedConfig(), previewSchedule);
+                                runAdvancedConfig(), dtLossSchedule,
+                                previewSchedule);
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -1728,8 +1743,6 @@ QJsonObject SpiralPanel::influenceConfig() const
     }
     config[QStringLiteral("influence_enabled")] =
         _influenceEnabled->isChecked();
-    config[QStringLiteral("influence_disable_dt_frac")] =
-        _influenceDisableDtPct->value() / 100.0;
     if (_influenceEnabled->isChecked()) {
         config[QStringLiteral("influence_z")] =
             static_cast<double>(_influenceZ->value());
@@ -2349,9 +2362,11 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "influence_z", _influenceZ->value());
     settings.setValue(prefix + "influence_windings", _influenceWindings->value());
     settings.setValue(prefix + "influence_theta_pct", _influenceThetaPct->value());
-    settings.setValue(prefix + "influence_disable_dt_pct", _influenceDisableDtPct->value());
     settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
+    settings.setValue(prefix + "dt_loss_schedule_enabled",
+                      _dtLossScheduleEnabled->isChecked());
+    settings.setValue(prefix + "dt_loss_last_pct", _dtLossLastPct->value());
     settings.setValue(prefix + "background_preview_enabled",
                       _backgroundPreview->isChecked());
     settings.setValue(prefix + "background_preview_cadence",
@@ -2408,11 +2423,13 @@ void SpiralPanel::restore()
     _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
     _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
     _influenceThetaPct->setValue(settings.value(valuePrefix + "influence_theta_pct", 50).toInt());
-    _influenceDisableDtPct->setValue(
-        settings.value(valuePrefix + "influence_disable_dt_pct", 75).toInt());
     _influenceAnchorWeight->setValue(
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
+    _dtLossScheduleEnabled->setChecked(
+        settings.value(valuePrefix + "dt_loss_schedule_enabled", false).toBool());
+    _dtLossLastPct->setValue(
+        settings.value(valuePrefix + "dt_loss_last_pct", 25).toInt());
     _backgroundPreview->setChecked(
         settings.value(valuePrefix + "background_preview_enabled", false).toBool());
     _previewCadence->setValue(

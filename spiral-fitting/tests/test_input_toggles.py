@@ -143,6 +143,6 @@ def test_disabled_interactive_inputs_are_rejected_before_loading(
     context.clear_interactive_influence = lambda: None
     with mock.patch.object(torch.cuda, 'get_rng_state_all', return_value=[]), \
             mock.patch.object(torch.cuda, 'set_rng_state_all'):
-        with pytest.raises(RuntimeError, match=message):
-            context.incorporate_interactive_inputs(
-                [record], current_iteration=0, target_iteration=1)
+        result = context.incorporate_interactive_inputs([record])
+    assert result['outcomes'][0]['state'] == 'error'
+    assert message in result['outcomes'][0]['error']

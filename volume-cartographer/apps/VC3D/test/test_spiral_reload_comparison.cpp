@@ -129,6 +129,31 @@ private slots:
         QVERIFY(!configuration.contains("z_end"));
     }
 
+    void RunPayloadAlwaysCarriesIndependentDtLossSchedule()
+    {
+        const QJsonObject configuration{{"loss_weight_patch_radius", 8.0}};
+        const QJsonObject influence{{"influence_enabled", false}};
+        const QJsonObject preview{
+            {"cadence_iterations", 100}, {"diagnostics", false}};
+        const QList<QJsonObject> schedules{
+            QJsonObject{{"enabled", false}, {"last_fraction", 0.25}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 0.0}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 0.25}},
+            QJsonObject{{"enabled", true}, {"last_fraction", 1.0}},
+        };
+
+        for (const QJsonObject& schedule : schedules) {
+            const QJsonObject payload = vc3d::spiralRunRequest(
+                configuration, 10'000, influence, schedule, 42, preview);
+            QCOMPARE(payload["configuration"].toObject(), configuration);
+            QCOMPARE(payload["iterations"].toInt(), 10'000);
+            QCOMPARE(payload["influence"].toObject(), influence);
+            QCOMPARE(payload["dt_loss_schedule"].toObject(), schedule);
+            QCOMPARE(payload["expected_session_revision"].toInt(), 42);
+            QCOMPARE(payload["preview_schedule"].toObject(), preview);
+        }
+    }
+
     void EffectiveAdvancedConfigurationExcludesDockOwnedZRange()
     {
         const QJsonObject request{

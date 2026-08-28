@@ -770,6 +770,7 @@ void SpiralServiceManager::uploadCheckpointForResume(
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
                                          const QJsonObject& runConfig,
+                                         const QJsonObject& dtLossSchedule,
                                          const QJsonObject& previewSchedule)
 {
     const QJsonObject configuration =
@@ -779,14 +780,10 @@ void SpiralServiceManager::runIterations(int iterations,
     // neither their paths nor their contents, so restating the panel's
     // necessarily partial path view here can only create a false mismatch
     // (for example, winding_inference has no editable panel row).
-    QJsonObject body{
-        {QStringLiteral("command_id"), commandId()},
-        {QStringLiteral("configuration"), configuration},
-        {QStringLiteral("iterations"), iterations},
-        {QStringLiteral("influence"), influenceConfig},
-        {QStringLiteral("expected_session_revision"), _sessionRevision}};
-    if (!previewSchedule.isEmpty())
-        body[QStringLiteral("preview_schedule")] = previewSchedule;
+    QJsonObject body = vc3d::spiralRunRequest(
+        configuration, iterations, influenceConfig, dtLossSchedule,
+        _sessionRevision, previewSchedule);
+    body[QStringLiteral("command_id")] = commandId();
     postWithRetry(
         QStringLiteral("/session/run"),
         body,
