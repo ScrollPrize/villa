@@ -1384,6 +1384,9 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
+    // Releasing the pin re-enforces the entry-count capacity, so the entry
+    // the pin protected is evicted once its reader has the result.
+    CHECK(cache->stats().decodedBytes == 0);
 }
 
 TEST_CASE("ChunkCache: Missing fetch resolves to Missing status")

@@ -1697,12 +1697,17 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
                 notifyRemoteFetchListeners(state, key, true);
             } catch (...) {
                 // A throwing listener must not leak the pin - a leaked pin
-                // would exempt this chunk from eviction forever.
+                // would exempt this chunk from eviction forever. Enforcement
+                // may have given up while the pin hid the entry, so re-run
+                // it here just like the normal return path does.
                 lock.lock();
                 auto cleanup = state->entries_.find(key);
                 if (cleanup != state->entries_.end() &&
                     cleanup->second.blockingWaiters > 0)
                     --cleanup->second.blockingWaiters;
+                enforceCapacityLocked(state);
+                lock.unlock();
+                enforceSharedBudget(state);
                 throw;
             }
             lock.lock();
@@ -1717,10 +1722,12 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
             if (it->second.blockingWaiters > 0)
                 --it->second.blockingWaiters;
             ChunkResult result = resultFromEntryLocked(*state, key, it->second);
-            // While this reader's pin hid the entry, budget enforcement may
-            // have given up over budget. Re-enforce now that the pin is
-            // released - outside the state lock, since enforcement calls
-            // back into evictOldestDecoded, which takes it.
+            // While this reader's pin hid the entry, capacity and budget
+            // enforcement may have given up over their limits. Re-enforce
+            // now that the pin is released - the entry-count capacity under
+            // the lock, the shared byte budget outside it (enforcement
+            // calls back into evictOldestDecoded, which takes the lock).
+            enforceCapacityLocked(state);
             lock.unlock();
             enforceSharedBudget(state);
             return result;
