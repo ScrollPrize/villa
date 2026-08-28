@@ -2773,14 +2773,21 @@ std::string formatReferenceBpWindingBenchmark(
         }
         const std::size_t referencePiece = referenceIsA ? traceA : traceB;
         const std::size_t bpPiece = (referenceIsA ? traceB : traceA) - cross.referencePieces;
-        observations.push_back(vc::fiber_tracer::
-                makeFiberTraceReferenceWindingObservation(
-                    constraint,
-                    referenceIsA,
-                    0.5 * static_cast<double>(
-                        reference.sourceIdsByPiece[referencePiece]),
-                    bpPiece,
-                    winding));
+        const std::size_t referenceSource =
+            reference.sourceIdsByPiece[referencePiece];
+        if (referenceSource >= reference.sourceNames.size()) {
+            throw std::logic_error(
+                "Reference/BP constraint has an invalid reference source");
+        }
+        auto observation = vc::fiber_tracer::
+            makeFiberTraceReferenceWindingObservation(
+                constraint,
+                referenceIsA,
+                0.5 * static_cast<double>(referenceSource),
+                bpPiece,
+                winding);
+        observation.referenceSource = referenceSource;
+        observations.push_back(std::move(observation));
     }
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
@@ -2801,10 +2808,39 @@ std::string formatReferenceBpWindingBenchmark(
                << std::setw(12) << gauge.right
                << gauge.observations << '\n';
     }
+    constexpr std::array<const char*, 4> names{
+        "perpendicular", "parallel_same", "parallel_other", "sum"};
+    output << "reference fiber errors fraction=right/(right+wrong)\n"
+           << std::setw(8) << "winding"
+           << std::setw(8) << "perp_r" << std::setw(8) << "perp_w" << std::setw(8) << "perp_f"
+           << std::setw(8) << "same_r" << std::setw(8) << "same_w" << std::setw(8) << "same_f"
+           << std::setw(8) << "other_r" << std::setw(8) << "other_w" << std::setw(8) << "other_f"
+           << std::setw(8) << "sum_r" << std::setw(8) << "sum_w" << "sum_f\n";
+    for (std::size_t source = 0; source < reference.sourceNames.size(); ++source) {
+        const vc::fiber_tracer::FiberTraceReferenceSourceBenchmark empty;
+        const auto& referenceCounts = source < benchmark.references.size()
+            ? benchmark.references[source]
+            : empty;
+        output << std::setw(8) << std::setprecision(1)
+               << 0.5 * static_cast<double>(source);
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            const auto& counts = index < referenceCounts.classes.size()
+                ? referenceCounts.classes[index]
+                : referenceCounts.sum;
+            output << std::setw(8) << counts.right
+                   << std::setw(8) << counts.wrong;
+            if (counts.total == 0)
+                output << std::setw(8) << "NA";
+            else
+                output << std::setw(8) << std::setprecision(3)
+                       << static_cast<double>(counts.right) /
+                              static_cast<double>(counts.total);
+        }
+        output << '\n';
+    }
     output << "constraint accuracy\n"
            << std::setw(20) << "class" << std::setw(12) << "right" << std::setw(12) << "wrong" << std::setw(12) << "total"
            << "right_percent\n";
-    constexpr std::array<const char*, 4> names{"perpendicular", "parallel_same", "parallel_other", "sum"};
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto& counts = index < benchmark.classes.size() ? benchmark.classes[index] : benchmark.sum;
         output << std::setw(20) << names[index]

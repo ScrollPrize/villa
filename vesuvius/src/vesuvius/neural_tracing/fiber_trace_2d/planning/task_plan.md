@@ -1,68 +1,69 @@
-# Plan: retain the main BP constraint component
+# Plan: preserve the complete winding visibility mask
 
-## Semantics
+## Discovery and representation
 
-1. Expose a shared selector that reuses the winding solver's exact prepared
-   factor graph, including hard continuity, merged pair measurements, signed
-   perpendicular availability, quantized target multipliers, parallel cutoff,
-   and fixed-Mixed exclusions. Find its effective-winding components and retain
-   only the largest. Isolated pieces are one-piece components. Select
-   deterministically by piece count, then prefer the component containing the
-   crop-central piece, then the lowest original piece index.
-2. Add a shared constraint-report subset transform. Remap retained source
-   traces, pieces, per-trace piece indices, and constraint endpoints
-   consistently. Preserve source arc provenance and extraction
-   timing/candidate counters while recomputing subset constraint counters.
-   Return old trace and piece indices so CLI-owned lines, original IDs,
-   directions, and masks are subset explicitly rather than inferred from
-   geometry.
-3. Prepare the unfiltered topology to obtain its existing crop-central piece.
-   When fixed orientations are requested, solve the orientation prepass, use
-   its exact fixed classes for winding-component selection, subset, and repeat
-   monotonically until the represented cohort is one effective-winding
-   component. Reuse the final orientation prepass rather than solving it again.
-   Without fixed orientations, select once using the empty fixed-class set.
-   Rebuild topology after every subset and only then run final winding BP,
-   reference/BP cross extraction, and output. Reference fibers must not
-   participate in component selection. Print one compact cumulative filter
-   summary per solver run.
-4. Convert reference/reference and reference-to-BP diagnostic printers into
-   formatters. Accumulate their complete strings during the run and emit them,
-   in deterministic execution order, immediately before the
-   `direction-ablation` command returns. Leave progress and ordinary solver
-   reports streaming as they do now.
-5. Treat a reference/BP observation with no valid final active H/V winding
-   candidate as outside the benchmark population. Such constraints contribute
-   neither offset-calibration intervals nor right/wrong/total counts. Keep the
-   raw cross extraction unchanged so this is explicitly a post-solve benchmark
-   population rule.
+- Allow winding output discovery to be sparse by state and winding.
+- Derive the inclusive integer winding range from the minimum and maximum
+  discovered labels.
+- Keep physical artifact discovery separate from the logical layer grid. Every
+  present artifact retains strict header and polyline validation; missing files
+  are never synthesized or passed to the reader.
+- Materialize an empty Napari Shapes layer in the managed layer mapping for
+  every H/V/error/tie slot in that range, while attaching geometry only from
+  artifacts that exist. Count only real paths in `fiber_count` and retain the
+  current all-geometry-empty launch error.
 
-## Testing
+## Navigation
 
-- Unit-test largest effective-winding component retention, isolated pieces,
-  fixed-Mixed exclusions, parallel-cutoff and missing-sign splits, merged
-  pair-factor connectivity, deterministic equal-component selection,
-  constraint/source remapping, provenance, and counter recomputation.
-- Unit-test that final Mixed/Defect and invalid-winding endpoints are excluded
-  from calibration and every class total.
-- Add a CLI-level formatter/output-order test where practical; otherwise keep
-  formatters independently testable and validate a real reference-fiber run.
-- Build `vc_fiber_trace_chunk`, `test_fiberlet_crop_trace`, and
-  `test_fiber_trace_winding_bp`; run the focused tests and `git diff --check`.
+- Rotate the live visibility bits over the complete contiguous layer grid.
+- Preserve every state bit independently, including bits whose current or
+  destination layer has no geometry.
+- Compute the initial selection from nonempty loaded H/V geometry before adding
+  placeholders. Retain the current `All` fallback if no H/V geometry exists.
+- Leave reference and unmanaged layers unchanged.
+
+## Reference benchmark output
+
+- Carry each usable benchmark observation's original selected reference source
+  ID through gauge calibration; pieces and clipped runs from one JSON aggregate
+  into the same source row, while names remain CLI-only.
+- Accumulate right/wrong/total counts per reference fiber using the selected
+  gauge offset from one global calibration, including when one source touches
+  multiple gauges. Do not recalibrate individual sources. Exclude
+  candidate-free Mixed/Defect, invalid, and unsigned-perpendicular observations.
+- Print one compact row per selected reference source in source-ID order after
+  gauge calibration and before aggregate constraint accuracy. Include
+  only the source's virtual winding as its row identifier. Include
+  right/wrong/right-fraction triplets for perpendicular, parallel-same,
+  parallel-other, and sum; zero-observation fractions are `NA`. Require the
+  per-source class and sum counts to equal their aggregate counterparts.
+
+## Tests
+
+- Add sparse-artifact discovery coverage.
+- Add complete-grid materialization coverage for missing states, empty states,
+  and missing winding labels.
+- Verify arbitrary mask rotation is a bijection through missing-file,
+  empty-file, and completely absent winding slots; Previous must invert Next,
+  wraparound must work, and reference/unmanaged layers must remain untouched.
+- Retain malformed-present-artifact rejection coverage.
+- Run the focused Python viewer tests.
+- Extend the focused winding benchmark test for shared source IDs, multiple
+  gauges, candidate-free observations, zero-observation sources, and aggregate
+  count invariants; rerun the C++ tests.
 
 ## Spec update
 
-Document exact effective-winding-component filtering, fixed-orientation
-prepass iteration, deterministic selection, reference independence, remapping
-requirements, and end-of-command placement of both reference diagnostic
-sections.
+- Replace the complete-quartet requirement with sparse artifact discovery and
+  a complete contiguous logical visibility grid.
+- Remove the rule that missing destination layers discard incoming bits.
+- Specify the per-reference-fiber benchmark table and active-only semantics.
 
 ## Docs updates
 
-Update the chunk tracing documentation with the main-component filter summary
-and the deferred reference diagnostic output order.
+- Document placeholder layers and exact mask rotation across missing data.
+- Document the per-reference benchmark rows.
 
 ## Changelog
 
-Add one entry covering BP main-component retention and deferred reference
-diagnostics.
+- Record the winding viewer mask preservation fix.

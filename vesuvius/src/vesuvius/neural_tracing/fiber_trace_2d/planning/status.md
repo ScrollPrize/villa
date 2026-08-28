@@ -1,11 +1,11 @@
-# Status: retain the main BP constraint component
+# Status: preserve the complete winding visibility mask
 
-- [x] Capture the requested task.
-- [x] Inspect BP connectivity, reference diagnostics, and CLI control flow.
+- [x] Capture the requested behavior.
+- [x] Inspect winding artifact discovery, layer creation, and mask rotation.
 - [x] Write the implementation/test/docs plan.
 - [x] Complete independent plan review.
-- [x] Add shared largest-component filtering and tests.
-- [x] Apply filtering to the BP-only cohort.
-- [x] Defer reference tables and benchmark until command completion.
+- [x] Implement sparse discovery and complete logical layers.
+- [x] Add regression tests.
+- [x] Add per-reference-fiber benchmark error rows and tests.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Build and run focused validation.
+- [x] Run focused validation.

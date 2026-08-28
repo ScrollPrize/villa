@@ -1,5 +1,9 @@
 # Changelog
 
+- Made winding-viewer visibility rotation preserve a complete contiguous
+  logical state grid across missing/empty OBJ artifacts, and added active-only
+  per-reference error rows to the winding benchmark.
+
 - Added synchronous interleaved-winding solver progress events and throttled
   `vc_fiber_trace_chunk` stage output for long crop BP runs.
 - Added `--quality-fraction` to stored crop-trace consumers, reusing quality

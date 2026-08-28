@@ -1,11 +1,12 @@
-# Task: retain the main BP constraint component
+# Task: preserve the complete winding visibility mask
 
-For `vc_fiber_trace_chunk direction-ablation` BP runs:
+Fix the Napari winding viewer so Previous/Next circularly shifts the complete
+visibility mask through every integer winding in the observed range. Missing
+or empty OBJ state artifacts must not delete a mask bit. Materialize a logical
+field for every winding/state slot, especially H and V, and preserve arbitrary
+manual visibility patterns exactly while shifting.
 
-- remove disconnected BP constraint subgraphs before solving and retain only
-  the largest main component;
-- keep component selection independent of optional reference fibers;
-- move the reference/reference constraint tables and the reference-to-BP
-  winding benchmark to the end of CLI output.
-- exclude final Mixed/Defect or otherwise winding-invalid BP pieces from both
-  reference offset calibration and benchmark totals.
+Also add a per-reference-fiber error table before the aggregate reference-to-BP
+benchmark table. Each row must report right, wrong, and right-fraction values
+for perpendicular, parallel-same, parallel-other, and sum, using the same
+calibrated gauge offsets and active-only observations as the aggregate.

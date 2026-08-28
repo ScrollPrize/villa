@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <vector>
 
 namespace
@@ -283,12 +284,12 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
 {
     using Class = FiberTraceReferenceConstraintClass;
     std::vector<FiberTraceReferenceWindingObservation> observations{
-        {Class::Perpendicular, 0, 0.0, {2.0, 0.0}, 1},
-        {Class::ParallelSameWinding, 0, 0.5, {2.5, 0.0}, 1},
-        {Class::ParallelOtherWinding, 0, 1.0, {3.0, 5.0}, 2},
-        {Class::Perpendicular, 0, 1.5, {10.0, 0.0}, 1},
-        {Class::Perpendicular, 1, 0.0, {-3.25, 0.0}, 1},
-        {Class::ParallelOtherWinding, 1, 0.5, {0.0, 0.0}, 0},
+        {Class::Perpendicular, 0, 0.0, {2.0, 0.0}, 1, 0},
+        {Class::ParallelSameWinding, 0, 0.5, {2.5, 0.0}, 1, 0},
+        {Class::ParallelOtherWinding, 0, 1.0, {3.0, 5.0}, 2, 1},
+        {Class::Perpendicular, 0, 1.5, {10.0, 0.0}, 1, 1},
+        {Class::Perpendicular, 1, 0.0, {-3.25, 0.0}, 1, 0},
+        {Class::ParallelOtherWinding, 1, 0.5, {0.0, 0.0}, 0, 2},
     };
     const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
     REQUIRE(benchmark.gauges.size() == 2);
@@ -310,6 +311,50 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.sum.right == 4);
     CHECK(benchmark.sum.wrong == 1);
     CHECK(benchmark.sum.total == observations.size() - 1);
+    REQUIRE(benchmark.references.size() == 3);
+    CHECK(benchmark.references[0].classes[0].right == 2);
+    CHECK(benchmark.references[0].classes[1].right == 1);
+    CHECK(benchmark.references[0].sum.right == 3);
+    CHECK(benchmark.references[0].sum.wrong == 0);
+    CHECK(benchmark.references[0].sum.total == 3);
+    CHECK(benchmark.references[1].classes[0].wrong == 1);
+    CHECK(benchmark.references[1].classes[2].right == 1);
+    CHECK(benchmark.references[1].sum.right == 1);
+    CHECK(benchmark.references[1].sum.wrong == 1);
+    CHECK(benchmark.references[1].sum.total == 2);
+    CHECK(benchmark.references[2].sum.right == 0);
+    CHECK(benchmark.references[2].sum.wrong == 0);
+    CHECK(benchmark.references[2].sum.total == 0);
+    CHECK(std::accumulate(
+              benchmark.references.begin(),
+              benchmark.references.end(),
+              std::size_t{0},
+              [](std::size_t total, const auto& counts) {
+                  return total + counts.sum.right;
+              }) == benchmark.sum.right);
+    CHECK(std::accumulate(
+              benchmark.references.begin(),
+              benchmark.references.end(),
+              std::size_t{0},
+              [](std::size_t total, const auto& counts) {
+                  return total + counts.sum.wrong;
+              }) == benchmark.sum.wrong);
+    CHECK(std::accumulate(
+              benchmark.references.begin(),
+              benchmark.references.end(),
+              std::size_t{0},
+              [](std::size_t total, const auto& counts) {
+                  return total + counts.sum.total;
+              }) == benchmark.sum.total);
+    for (std::size_t classIndex = 0; classIndex < benchmark.classes.size(); ++classIndex) {
+        CHECK(std::accumulate(
+                  benchmark.references.begin(),
+                  benchmark.references.end(),
+                  std::size_t{0},
+                  [classIndex](std::size_t total, const auto& counts) {
+                      return total + counts.classes[classIndex].total;
+                  }) == benchmark.classes[classIndex].total);
+    }
 }
 
 TEST_CASE("Reference winding calibration includes boundaries and stable ties")

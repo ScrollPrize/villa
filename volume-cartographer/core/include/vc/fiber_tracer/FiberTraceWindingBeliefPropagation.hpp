@@ -275,6 +275,7 @@ struct FiberTraceReferenceWindingObservation {
     double virtualReferenceWinding = 0.0;
     std::array<double, 2> inferredReferenceWindings{0.0, 0.0};
     std::size_t inferredReferenceWindingCount = 0;
+    std::size_t referenceSource = 0;
 };
 
 struct FiberTraceReferenceBenchmarkCounts {
@@ -290,10 +291,16 @@ struct FiberTraceReferenceGaugeCalibration {
     std::size_t right = 0;
 };
 
+struct FiberTraceReferenceSourceBenchmark {
+    std::array<FiberTraceReferenceBenchmarkCounts, 3> classes;
+    FiberTraceReferenceBenchmarkCounts sum;
+};
+
 struct FiberTraceReferenceWindingBenchmark {
     double tolerance = 0.5;
     std::vector<FiberTraceReferenceGaugeCalibration> gauges;
     std::array<FiberTraceReferenceBenchmarkCounts, 3> classes;
+    std::vector<FiberTraceReferenceSourceBenchmark> references;
     FiberTraceReferenceBenchmarkCounts sum;
 };
 

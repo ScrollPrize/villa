@@ -12,6 +12,7 @@ from vesuvius.scripts.view_fiber_windings import (
     add_reference_layer,
     add_winding_layers,
     build_parser,
+    complete_winding_layer_keys,
     discover_reference_artifact,
     discover_winding_artifacts,
     load_reference_geometry,
@@ -137,12 +138,14 @@ def test_winding_discovery_uses_numeric_order_complete_quartets_and_ignores_sibl
     ]
 
 
-def test_winding_discovery_rejects_missing_quartet_member(tmp_path):
+def test_winding_discovery_accepts_sparse_state_artifacts(tmp_path):
     base = tmp_path / "fibers"
     for state in ("h", "v", "err"):
         _write_state(base, 0, state)
-    with pytest.raises(ValueError, match="missing state artifacts: tie"):
-        discover_winding_artifacts(base)
+    artifacts = discover_winding_artifacts(base)
+    assert [artifact.key for artifact in artifacts] == [
+        WindingLayerKey(0, state) for state in ("h", "v", "err")
+    ]
 
 
 def test_winding_discovery_requires_at_least_one_quartet(tmp_path):
@@ -286,18 +289,89 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     )
     viewer = FakeViewer()
     layers, fiber_count = add_winding_layers(viewer, geometry, 3.0)
-    assert tuple(layers) == (key, WindingLayerKey(2, "h"))
+    assert tuple(layers) == tuple(
+        WindingLayerKey(2, state) for state in ("h", "v", "err", "tie")
+    )
     assert fiber_count == 3
-    assert len(viewer.calls) == 2
-    data, kwargs = viewer.calls[0]
+    assert len(viewer.calls) == 4
+    data, kwargs = viewer.calls[1]
     assert len(data) == 2
     assert kwargs["edge_color"].shape == (2, 4)
     assert kwargs["edge_color"].dtype == np.float32
     assert kwargs["edge_width"] == 3.0
     np.testing.assert_array_equal(
-        viewer.calls[0][1]["edge_color"][0],
-        viewer.calls[1][1]["edge_color"][0],
+        viewer.calls[0][1]["edge_color"][0], kwargs["edge_color"][0]
     )
+    assert viewer.calls[2][0] == []
+    assert len(viewer.calls[2][1]["edge_color"]) == 4
+
+
+def test_add_winding_layers_materializes_missing_states_and_windings(tmp_path):
+    class FakeViewer:
+        def __init__(self):
+            self.calls = []
+
+        def add_shapes(self, data, **kwargs):
+            layer = type("FakeLayer", (), {"visible": kwargs["visible"]})()
+            self.calls.append((data, kwargs, layer))
+            return layer
+
+    geometry = (
+        WindingGeometry(
+            WindingArtifact(WindingLayerKey(1, "h"), tmp_path / "w1_h.obj"),
+            (np.zeros((2, 3), dtype=np.float32),),
+        ),
+        WindingGeometry(
+            WindingArtifact(WindingLayerKey(3, "v"), tmp_path / "w3_v.obj"),
+            (),
+        ),
+    )
+    viewer = FakeViewer()
+    layers, fiber_count = add_winding_layers(viewer, geometry, 2.0)
+    assert tuple(layers) == tuple(
+        WindingLayerKey(winding, state)
+        for winding in range(1, 4)
+        for state in ("h", "v", "err", "tie")
+    )
+    assert fiber_count == 1
+    assert len(viewer.calls) == 12
+    assert viewer.calls[0][0]
+    assert all(call[0] == [] for call in viewer.calls[1:])
+
+
+def test_materialized_grid_rotates_missing_empty_and_absent_slots(tmp_path):
+    class FakeLayer:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+    class FakeViewer:
+        def add_shapes(self, _data, **kwargs):
+            return FakeLayer(kwargs["visible"])
+
+    geometry = (
+        WindingGeometry(
+            WindingArtifact(WindingLayerKey(1, "h"), tmp_path / "w1_h.obj"),
+            (np.zeros((2, 3), dtype=np.float32),),
+        ),
+        WindingGeometry(
+            WindingArtifact(WindingLayerKey(3, "v"), tmp_path / "w3_v.obj"),
+            (),
+        ),
+    )
+    layers, _ = add_winding_layers(FakeViewer(), geometry, 2.0)
+    original = {
+        WindingLayerKey(1, "v"),  # Missing state file.
+        WindingLayerKey(2, "h"),  # Completely absent winding.
+        WindingLayerKey(3, "v"),  # Present but empty state file.
+    }
+    for key, layer in layers.items():
+        layer.visible = key in original
+    assert rotate_winding_layer_visibility(layers, 1) == {
+        WindingLayerKey(2, "v"),
+        WindingLayerKey(3, "h"),
+        WindingLayerKey(1, "v"),
+    }
+    assert rotate_winding_layer_visibility(layers, -1) == original
 
 
 def test_reference_layer_is_independent_bright_and_visible(tmp_path):
@@ -340,23 +414,23 @@ def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
         for state in ("h", "v", "err", "tie")
     )
     assert visible_winding_layers(keys, "h") == {
-        WindingLayerKey(2, "h"),
-        WindingLayerKey(10, "h"),
+        WindingLayerKey(winding, "h") for winding in range(2, 11)
     }
     assert visible_winding_layers(keys, "v") == {
-        WindingLayerKey(2, "v"),
-        WindingLayerKey(10, "v"),
+        WindingLayerKey(winding, "v") for winding in range(2, 11)
     }
     assert visible_winding_layers(keys, "broken") == {
         WindingLayerKey(winding, state)
-        for winding in (2, 10)
+        for winding in range(2, 11)
         for state in ("err", "tie")
     }
     assert visible_winding_layers(keys, "winding", winding=10) == {
         WindingLayerKey(10, "h"),
         WindingLayerKey(10, "v"),
     }
-    assert visible_winding_layers(keys, "all") == set(keys)
+    assert visible_winding_layers(keys, "all") == set(
+        complete_winding_layer_keys(keys)
+    )
     assert visible_winding_layers(keys, "none") == set()
 
 
@@ -395,7 +469,7 @@ def test_winding_visibility_rotation_wraps_and_handles_sparse_states():
         keys,
         (WindingLayerKey(0, "h"), WindingLayerKey(1, "v")),
         -1,
-    ) == {WindingLayerKey(4, "h")}
+    ) == {WindingLayerKey(4, "h"), WindingLayerKey(0, "v")}
     assert rotate_visible_winding_mask(
         keys,
         (
@@ -403,7 +477,7 @@ def test_winding_visibility_rotation_wraps_and_handles_sparse_states():
             WindingLayerKey(2, "err"),
         ),
         1,
-    ) == {WindingLayerKey(4, "h")}
+    ) == {WindingLayerKey(3, "h"), WindingLayerKey(3, "err")}
     assert rotate_visible_winding_mask(
         keys, (WindingLayerKey(4, "h"),), 1
     ) == {WindingLayerKey(0, "h")}
@@ -436,29 +510,34 @@ def test_layer_visibility_rotation_reads_live_complete_mask_only():
         def __init__(self, visible: bool):
             self.visible = visible
 
-    layers = {
-        WindingLayerKey(2, "h"): FakeLayer(False),
-        WindingLayerKey(3, "h"): FakeLayer(True),
-        WindingLayerKey(4, "h"): FakeLayer(False),
-        WindingLayerKey(4, "v"): FakeLayer(True),
-        WindingLayerKey(5, "v"): FakeLayer(False),
-        WindingLayerKey(2, "err"): FakeLayer(False),
-        WindingLayerKey(3, "err"): FakeLayer(True),
-        WindingLayerKey(3, "tie"): FakeLayer(False),
+    keys = tuple(
+        WindingLayerKey(winding, state)
+        for winding in range(2, 6)
+        for state in ("h", "v", "err", "tie")
+    )
+    visible = {
+        WindingLayerKey(3, "h"),
+        WindingLayerKey(4, "v"),
+        WindingLayerKey(3, "err"),
     }
+    layers = {key: FakeLayer(key in visible) for key in keys}
     unmanaged = FakeLayer(True)
     rotated = rotate_winding_layer_visibility(layers, -1)
     assert rotated == {
         WindingLayerKey(2, "h"),
+        WindingLayerKey(3, "v"),
         WindingLayerKey(2, "err"),
     }
     assert layers[WindingLayerKey(2, "h")].visible
     assert not layers[WindingLayerKey(3, "h")].visible
     assert not layers[WindingLayerKey(4, "v")].visible
+    assert layers[WindingLayerKey(3, "v")].visible
     assert layers[WindingLayerKey(2, "err")].visible
     assert not layers[WindingLayerKey(3, "err")].visible
     assert not layers[WindingLayerKey(3, "tie")].visible
     assert unmanaged.visible
+    restored = rotate_winding_layer_visibility(layers, 1)
+    assert restored == visible
 
 
 def test_navigation_uses_only_nonempty_h_or_v_geometry(tmp_path):

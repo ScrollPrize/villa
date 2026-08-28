@@ -5561,20 +5561,27 @@
   greatest number of inclusive-tolerance matches; ties prefer smaller absolute
   offset and then smaller signed offset. Gauges with no active candidates are
   absent.
-  Print balance mode, solver/status, per-gauge offset/right/total rows, then
-  aggregate `right`, `wrong`, `total`, and `right_percent` rows for
+  Print balance mode, solver/status, per-gauge offset/right/total rows, then one
+  compact row per original selected reference source in source order, identified
+  only by its virtual winding `0.5*i`. Each source row
+  contains `right`, `wrong`, and `right_fraction` for `perpendicular`,
+  `parallel_same`, `parallel_other`, and `sum`; zero-total fractions are `NA`.
+  Follow this with aggregate `right`, `wrong`, `total`, and
+  `right_percent` rows for
   `perpendicular`, `parallel_same`, `parallel_other`, and `sum`. Empty classes
-  print `NA` percent, and right plus wrong always equals total.
+  print `NA` percent, and right plus wrong always equals total. Per-source rows
+  reuse the single global gauge calibration, aggregate all runs and pieces of
+  one source, include explicit zero-observation sources, and sum exactly to the
+  aggregate `sum` row.
 - Buffer the reference/reference tables and every reference-to-BP benchmark
   generated across checkpoints and balance modes. Emit them in execution order
   after all ordinary `direction-ablation` summaries and immediately before the
   command returns.
-- The winding viewer consumes only the current published quartet
-  `<base>_w_N_{h,v,err,tie}.obj` for each discovered nonnegative display label
-  `N`. Aggregate `<base>_w_N.obj`, CSV reports, and unrelated siblings are not
-  state layers. At least one complete quartet is required; every member is
-  mandatory even when its OBJ is validly empty. Winding labels need not be
-  contiguous.
+- The winding viewer consumes current published state artifacts matching
+  `<base>_w_N_{h,v,err,tie}.obj`. Aggregate `<base>_w_N.obj`, CSV reports, and
+  unrelated siblings are not state layers. At least one matching artifact is
+  required, but state files and whole winding labels may be absent. Every file
+  that is present still receives strict header and geometry validation.
 - OBJ input follows the shared strict ordered-polyline contract. Container
   names are unique, indices are global and one-based but must reference only
   vertices owned by the current container, and every nonempty container owns
@@ -5582,18 +5589,20 @@
   branching, cycles, disconnected chains, unsupported records, and singleton
   winding fibers are errors. The existing fiber-presence reader uses the same
   parser while retaining its own header, metadata, and crop validation.
-- Every nonempty state artifact becomes an independent 3D Napari path layer.
+- Every H/V/error/tie slot at every integer winding from the lowest through the
+  highest observed artifact label becomes an independent managed 3D Napari
+  path layer. Present nonempty artifacts supply geometry; empty or absent
+  artifacts and completely absent intermediate windings become empty layers.
   H and V at one winding `N` have exactly the same bright opaque color derived
   from `N`; error and tie remain distinct from H/V and each other.
   Viewer category `Broken` contains both Mixed/error argmax (`err`) and exact
   argmax ties (`tie`). H, V, Broken, All, and None presets act across every
   winding. Full-size Previous/Next buttons snapshot and circularly rotate the
-  complete managed H/V/error/tie visibility mask over sorted represented
-  winding labels. Next moves source slot `i` to `(i+1) mod N`; Previous moves it
-  to `(i-1) mod N`, preserving state. Hidden bits move exactly like visible
-  bits, so arbitrary sparse selections and empty windings rotate without being
-  replaced by a preset. Missing destination-state layers discard their incoming
-  bit, and one represented winding is a no-op. The independent reference layer
+  complete managed H/V/error/tie visibility mask over that contiguous winding
+  range. Next moves source slot `i` to `(i+1) mod N`; Previous moves it to
+  `(i-1) mod N`, preserving state. Hidden bits move exactly like visible bits,
+  so arbitrary sparse selections and missing/empty windings rotate bijectively
+  without being replaced by a preset. One observed winding is a no-op. The independent reference layer
   and unmanaged Napari layers remain unchanged. The displayed winding label
   summarizes all currently visible managed winding labels and follows presets,
   rotations, and manual layer-visibility changes.

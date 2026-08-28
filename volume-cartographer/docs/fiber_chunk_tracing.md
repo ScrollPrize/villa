@@ -1086,19 +1086,22 @@ PYTHONPATH="$SRC/vesuvius/src" python -m vesuvius.scripts.view_fiber_windings "$
 ```
 
 The positional argument is the output base passed to `direction-ablation`; a
-trailing `.obj` is also accepted. The viewer requires every discovered winding
-to have the complete `_h`, `_v`, `_err`, and `_tie` quartet, including empty
-files. Aggregate `_w_N.obj` files and CSV diagnostics are ignored.
+trailing `.obj` is also accepted. Matching `_h`, `_v`, `_err`, and `_tie` files
+are discovered independently. Missing state files and whole intermediate
+winding labels are allowed; every present file remains strictly validated.
+Aggregate `_w_N.obj` files and CSV diagnostics are ignored.
 
-Each nonempty state file becomes one 3D path layer. H and V layers at the same
-winding share one bright winding-specific color; Broken and Tie remain visually
-distinct. `H`,
+Every state slot from the lowest through the highest observed integer winding
+becomes one managed 3D path layer. Missing or empty artifacts become empty
+placeholder layers, so their visibility bits still exist. H and V layers at
+the same winding share one bright winding-specific color; Broken and Tie remain
+visually distinct. `H`,
 `V`, and `Broken` show that category across all winding labels; Broken includes
 both `_err` and exact `_tie` layers. `All` and `None` set all winding-layer
 visibility at once. Full-size Previous and Next buttons circularly rotate the
-entire managed H/V/Broken/Tie visibility mask by one represented winding while
-preserving state. Visible and hidden bits both move, so any arbitrary pattern,
-including an empty winding among otherwise visible windings, wraps intact.
+entire managed H/V/Broken/Tie visibility mask by one winding in the contiguous
+observed range while preserving state. Visible and hidden bits both move, so
+any arbitrary pattern, including missing and empty slots, wraps intact.
 The reference and unrelated layers are untouched. The label lists all currently
 visible managed windings and follows manual layer-panel visibility changes. The
 first nonempty H/V winding is the initial view. `--width` changes the displayed
@@ -1184,6 +1187,12 @@ independently gauged BP winding subgraph. Each offset is selected by exhaustive
 closed-interval event search to maximize matches within an inclusive `0.5`
 winding tolerance. Offset ties prefer the value closest to zero, then the lower
 signed value. Output first lists each gauge's offset and matched/total count,
+then one compact error row for every selected reference JSON in source order,
+identified only by its filename-ordered virtual winding. Each row
+contains right/wrong/right-fraction columns for perpendicular, parallel-same,
+parallel-other, and sum; a zero-total fraction is `NA`. Multiple cropped runs
+and pieces accumulate into the same row. These rows reuse the one global gauge
+calibration and each class and sum count agrees with its aggregate. The command
 then reports:
 
 ```text

@@ -3038,6 +3038,7 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     }
 
     std::map<std::size_t, std::vector<std::size_t>> observationsByGauge;
+    std::size_t referenceSources = 0;
     for (std::size_t index = 0; index < observations.size(); ++index) {
         const auto& observation = observations[index];
         if (!std::isfinite(observation.virtualReferenceWinding) ||
@@ -3053,6 +3054,13 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         if (classIndex >= 3) {
             throw std::invalid_argument("Reference winding benchmark class is invalid");
         }
+        if (observation.referenceSource ==
+            std::numeric_limits<std::size_t>::max()) {
+            throw std::invalid_argument(
+                "Reference winding benchmark source is invalid");
+        }
+        referenceSources = std::max(
+            referenceSources, observation.referenceSource + 1);
         if (observation.inferredReferenceWindingCount == 0)
             continue;
         observationsByGauge[observation.integerGauge].push_back(index);
@@ -3060,6 +3068,7 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
 
     FiberTraceReferenceWindingBenchmark result;
     result.tolerance = tolerance;
+    result.references.resize(referenceSources);
     std::map<std::size_t, double> offsetByGauge;
     const auto isRight = [&](const FiberTraceReferenceWindingObservation& o, double offset) {
         const double expected = o.virtualReferenceWinding + offset;
@@ -3126,14 +3135,23 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         if (observation.inferredReferenceWindingCount == 0)
             continue;
         auto& counts = result.classes[static_cast<std::size_t>(observation.constraintClass)];
+        auto& reference = result.references[observation.referenceSource];
+        auto& referenceCounts =
+            reference.classes[static_cast<std::size_t>(observation.constraintClass)];
         ++counts.total;
+        ++referenceCounts.total;
+        ++reference.sum.total;
         ++result.sum.total;
         const bool right = isRight(observation, offsetByGauge.at(observation.integerGauge));
         if (right) {
             ++counts.right;
+            ++referenceCounts.right;
+            ++reference.sum.right;
             ++result.sum.right;
         } else {
             ++counts.wrong;
+            ++referenceCounts.wrong;
+            ++reference.sum.wrong;
             ++result.sum.wrong;
         }
     }
