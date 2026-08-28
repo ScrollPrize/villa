@@ -3544,7 +3544,8 @@ class FitContext:
                     preview_generator = torch.Generator(device=dr.device)
                     preview_generator.manual_seed(0x13198A2E)
                     get_winding_inference_losses(
-                        transform, dr, self.winding_inference, self.config,
+                        transform, dr, self.winding_inference, self.shell_map,
+                        self.config,
                         self.z_begin, self.z_end,
                         generator=preview_generator)
                 if self.unattached_pcl_strips:
@@ -4366,6 +4367,7 @@ class FitContext:
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
                 self.winding_inference,
+                self.shell_map,
                 self.config,
                 self.z_begin,
                 self.z_end,
