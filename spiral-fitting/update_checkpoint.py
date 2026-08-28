@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Rewrite a legacy Spiral checkpoint for the current VC3D Spiral workspace.
 
-The source checkpoint is never modified.  Only embedded configuration
-dictionaries are migrated; model, optimiser, scheduler, and RNG state are
-carried through unchanged.
+The source checkpoint is never modified. Embedded configuration dictionaries
+and obsolete numerical parameterisations are migrated; unrelated model,
+optimiser, scheduler, and RNG state is carried through unchanged.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 
 from checkpoint_io import load_checkpoint_cpu
+from checkpoint_migrations import migrate_legacy_gap_parameterization
 from config import Config, durable_config
 
 
@@ -204,12 +205,13 @@ def migrate_config(source: Mapping) -> tuple[dict, list[str], list[str], list[st
 
 
 def update_checkpoint(checkpoint: dict) -> tuple[dict, dict]:
-    """Migrate all embedded config snapshots without touching tensor state."""
+    """Migrate tensor parameterisations and all embedded config snapshots."""
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint root must be a dictionary")
     if "spiral_and_transform" not in checkpoint:
         raise ValueError("checkpoint has no 'spiral_and_transform' model state")
 
+    checkpoint = migrate_legacy_gap_parameterization(checkpoint)
     updated = dict(checkpoint)
     reports = {}
     fallback = checkpoint.get("cfg")

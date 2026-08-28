@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 
 
+DEFAULT_GAP_EXPANDER_CAPACITY = 144
+
+
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical"],
@@ -126,6 +129,29 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
 BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    # Historical checkpoints used an unbounded exponential gap map and used
+    # model_gap_expander_num_windings for both the physical estimate and the
+    # allocated lattice extent.  The checkpoint loader migrates their tensors;
+    # these defaults make the added semantic fields schema-compatible too.
+    "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
+    "model_gap_expander_min_gap": 1.0,
+    "model_gap_expander_softplus_bias": 4.0,
+})
+
+_GAP_EXPANDER_DESCRIPTIONS = {
+    "model_gap_expander_num_windings": (
+        "Legacy/fallback physical winding-count estimate used by exporters; "
+        "it does not allocate the gap lattice."),
+    "model_gap_expander_capacity_windings": (
+        "Allocated gap-lattice capacity, not a claim about the physical "
+        "winding count. Must be at least shell_outer_winding_idx + 3."),
+    "model_gap_expander_min_gap": (
+        "Hard numerical inter-winding gap floor in working voxels. The "
+        "minimum-spacing loss remains the separate geological preference."),
+    "model_gap_expander_softplus_bias": (
+        "Bias of the stable lower-bounded softplus gap parameterisation."),
+}
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
@@ -137,7 +163,10 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_num_flow_timesteps", "model_flow_bounds_z_margin",
     "model_flow_bounds_radius", "model_flow_voxel_resolution",
     "model_flow_field_type", "model_gap_expander_logit_resolution",
-    "model_gap_expander_num_windings", "model_linear_z_resolution",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_lr_scale",
+    "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
+    "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
 
 
@@ -170,6 +199,9 @@ MODEL_STAGE_KEYS = frozenset({
     "model_flow_field_direct_lr",
     "model_gap_expander_logit_resolution",
     "model_gap_expander_num_windings",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_min_gap",
+    "model_gap_expander_softplus_bias",
     "model_gap_expander_lr_scale",
     "model_linear_z_resolution",
     "model_initial_dr_per_winding",
@@ -254,6 +286,8 @@ def _field_spec(key, default):
         spec["ui_owner"] = "run"
     elif key in _INPUT_TOGGLE_DESCRIPTIONS:
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
+    elif key in _GAP_EXPANDER_DESCRIPTIONS:
+        spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
     return spec
 
 
@@ -284,8 +318,16 @@ class Config:
         self.model_flow_field_high_res_lr_ramp_steps = 1
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
+        # The physical winding estimate and the allocated transform capacity
+        # are deliberately separate.  shell_outer_winding_idx is the active
+        # hypothesis; num_windings remains the legacy/fallback physical
+        # estimate used by exporters, while capacity only shapes the lattice.
         self.model_gap_expander_num_windings = 130
+        self.model_gap_expander_capacity_windings = \
+            DEFAULT_GAP_EXPANDER_CAPACITY
         self.model_gap_expander_lr_scale = 0.3
+        self.model_gap_expander_min_gap = 1.0
+        self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
         # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
@@ -544,6 +586,14 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        if values["model_gap_expander_capacity_windings"] < 3:
+            raise ValueError(
+                "model_gap_expander_capacity_windings must be at least 3")
+        if not (0.0 < values["model_gap_expander_min_gap"]
+                < values["model_initial_dr_per_winding"]):
+            raise ValueError(
+                "model_gap_expander_min_gap must be positive and smaller "
+                "than model_initial_dr_per_winding")
         for key, value in overrides.items():
             setattr(self, key, value)
 
