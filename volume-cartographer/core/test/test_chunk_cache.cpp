@@ -159,6 +159,23 @@ private:
     bool released_ = false;
 };
 
+// Scope guard for tests that park readers on a MultiBlockingFetcher: declare
+// it AFTER the reader futures so it destructs first, releasing the fetcher
+// before a fatal assertion's unwinding blocks in a future destructor.
+// MultiBlockingFetcher::release() is idempotent.
+struct FetcherReleaseGuard {
+    explicit FetcherReleaseGuard(MultiBlockingFetcher& fetcher)
+        : fetcher_(fetcher)
+    {
+    }
+    ~FetcherReleaseGuard() { fetcher_.release(); }
+    FetcherReleaseGuard(const FetcherReleaseGuard&) = delete;
+    FetcherReleaseGuard& operator=(const FetcherReleaseGuard&) = delete;
+
+private:
+    MultiBlockingFetcher& fetcher_;
+};
+
 class BlockingEncodedFetcher : public IChunkFetcher {
 public:
     ChunkFetchResult fetch(const ChunkKey& key) override
@@ -1305,6 +1322,10 @@ TEST_CASE("ChunkCache: blocking read refetches when its entry is erased mid-wait
     auto pending = std::async(std::launch::async, [&] {
         return cache->getChunkBlocking(0, 0, 0, 0);
     });
+    // Declared after the future so it destructs first: a fatal assertion
+    // below must release the fetcher before the future's destructor blocks
+    // on the still-parked reader. release() is idempotent.
+    FetcherReleaseGuard releaseGuard(*fetcher);
     REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
 
     // Erase the entry out from under the parked reader; the reader must
@@ -1327,8 +1348,8 @@ TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
     // Regression: with less budget headroom than one chunk, the completion
     // path enforced the shared budget before notifying - evicting the
     // freshly decoded chunk out from under its parked reader every time, so
-    // even a retrying reader failed. The parked reader now pins the entry;
-    // eviction (and the budget's victim selection) must skip it.
+    // even a retrying reader failed. A parked blocking reader now protects
+    // its key; eviction (and the budget's victim selection) must skip it.
     auto service = makeService(16);  // one 4x4x4 uint8 chunk is 64 bytes
     auto fetcher = std::make_shared<CountingFetcher>();
     ChunkKey k{0, 0, 0, 0};
@@ -1360,8 +1381,8 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
 {
     // Same shape as the budget case, but through enforceCapacityLocked: the
     // completion path enforces the entry-count capacity before notifying,
-    // which erased the parked reader's freshly stored entry. Pinned entries
-    // must be skipped there too.
+    // which erased the parked reader's freshly stored entry. Keys with
+    // parked blocking readers must be skipped there too.
     auto service = makeService();
     auto fetcher = std::make_shared<CountingFetcher>();
     ChunkKey k{0, 0, 0, 0};
@@ -1384,9 +1405,133 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // Releasing the pin re-enforces the entry-count capacity, so the entry
-    // the pin protected is evicted once its reader has the result.
+    // The reader's exit re-enforces the entry-count capacity, so the entry
+    // its registration protected is evicted once the reader has the result.
     CHECK(cache->stats().decodedBytes == 0);
+}
+
+TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
+{
+    // The maintainer's multi-party scenario, single-successor form: a parked
+    // blocking reader survives invalidation, and the successor entry is
+    // created by ANOTHER party (here the main thread's tryGetChunk). The
+    // reader's key registration must protect that successor through the
+    // sub-chunk budget's completion-time enforcement even though the reader
+    // never touched it. Contract under the fix: exactly two fetches (the
+    // stale original and one shared successor - the emplace under the mutex
+    // dedupes whoever comes second), reader gets Data.
+    auto service = makeService(16);  // one 4x4x4 uint8 chunk is 64 bytes
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "successor-protection", fetcher);
+
+    auto pending = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    FetcherReleaseGuard releaseGuard(*fetcher);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+
+    cache->invalidate();
+    // Either this queues the successor or the woken reader already did;
+    // never both (mutex-serialized emplace on the same key).
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->release();
+
+    REQUIRE(pending.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    auto result = pending.get();
+    CHECK(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->size() == 64);
+    CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
+    CHECK(cache->stats().decodedBytes == 0);
+}
+
+TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection")
+{
+    // The maintainer's exact scenario: two readers on one key across an
+    // invalidation. Reader A parks, the entry is invalidated, A requeues the
+    // successor fetch; reader B joins while that fetch is in flight. Both
+    // registrations are observed (stats().blockingReaders == 2) before the
+    // fetch resolves, so whichever reader exits first, the other's key
+    // registration keeps the resolved chunk alive under the sub-chunk
+    // budget until it has read it. Exactly two fetches total.
+    auto service = makeService(16);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "two-reader-protection", fetcher);
+
+    auto readerA = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    FetcherReleaseGuard releaseGuard(*fetcher);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+
+    cache->invalidate();
+    // Reader A wakes, warns, and requeues; wait until the successor fetch is
+    // physically running (and parked in the fetcher).
+    REQUIRE(fetcher->waitForStarted(2, std::chrono::seconds{5}));
+
+    auto readerB = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    // B joins the in-flight successor; both registrations must be visible
+    // before the fetch is allowed to resolve.
+    bool bothRegistered = false;
+    for (int i = 0; i < 5000 && !bothRegistered; ++i) {
+        bothRegistered = cache->stats().blockingReaders == 2;
+        if (!bothRegistered)
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(bothRegistered);
+    fetcher->release();
+
+    REQUIRE(readerA.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    REQUIRE(readerB.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    auto resultA = readerA.get();
+    auto resultB = readerB.get();
+    CHECK(resultA.status == ChunkStatus::Data);
+    CHECK(resultB.status == ChunkStatus::Data);
+    REQUIRE(resultA.bytes);
+    REQUIRE(resultB.bytes);
+    CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
+    // Both readers exited; the last exit re-enforced the budget.
+    CHECK(cache->stats().decodedBytes == 0);
+    CHECK(cache->stats().blockingReaders == 0);
+}
+
+TEST_CASE("ChunkCache: six blocking readers all survive an invalidation")
+{
+    // Integration stress for the same contract: arrival timing is
+    // scheduler-dependent, so only the outcome is asserted - every reader
+    // gets Data, none exhausts the retry limit.
+    auto service = makeService(16);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "six-reader-stress", fetcher);
+
+    constexpr int kReaders = 6;
+    std::vector<std::future<ChunkResult>> readers;
+    readers.reserve(kReaders);
+    for (int i = 0; i < kReaders; ++i) {
+        readers.push_back(std::async(std::launch::async, [&] {
+            return cache->getChunkBlocking(0, 0, 0, 0);
+        }));
+    }
+    FetcherReleaseGuard releaseGuard(*fetcher);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+
+    cache->invalidate();
+    fetcher->release();
+
+    for (auto& reader : readers) {
+        REQUIRE(reader.wait_for(std::chrono::seconds{10}) ==
+                std::future_status::ready);
+        auto result = reader.get();
+        CHECK(result.status == ChunkStatus::Data);
+        REQUIRE(result.bytes);
+        CHECK(result.bytes->size() == 64);
+    }
+    CHECK(cache->stats().blockingReaders == 0);
 }
 
 TEST_CASE("ChunkCache: Missing fetch resolves to Missing status")

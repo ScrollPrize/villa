@@ -1666,82 +1666,113 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     // on remote sources that parked the caller (GUI thread included) for
     // the whole backlog's round trips.
     constexpr int kBlockingFetchPriorityOffset = -1024;
-    // A parked reader pins its entry (blockingWaiters) so decoded-budget
-    // eviction cannot erase the resolved chunk before the reader wakes -
-    // caches flagged decodedEvictionPreferSelf otherwise shed their own
-    // freshly decoded chunks first while a solve streams many of them, and
-    // when viewer tiles leave less than one chunk of budget headroom the
-    // completion path would evict the chunk before even notifying. Pinned
-    // entries are still cleared by invalidation; the chunk stays perfectly
-    // refetchable then, so retry the fetch instead of failing.
     constexpr int kEvictedRetryLimit = 5;
-    for (int attempt = 0;; ++attempt) {
-        auto [it, inserted] = state->entries_.emplace(key, Entry{});
-        it->second.backgroundDemand = true;
-        ++it->second.blockingWaiters;
-        bool notifyRemoteStart = false;
-        if (inserted) {
-            notifyRemoteStart = queueFetchLocked(
-                state, key, state->generation_, kBlockingFetchPriorityOffset);
-        } else if (it->second.status == EntryStatus::InFlight) {
-            const int boosted =
-                fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
-            if (boosted < it->second.basePriority) {
-                it->second.basePriority = boosted;
-                reprioritizeEntryLocked(*state, key, it->second);
+    // Register this reader on the key before any entry work. The count -
+    // not the entry - carries the eviction protection: both evictors and
+    // the budget's victim probe skip keys with parked blocking readers
+    // (hasParkedBlockingReaderLocked), so a resolved chunk cannot be erased
+    // before its reader wakes, and a successor entry created after an
+    // invalidation is protected from the moment it exists no matter which
+    // thread created it. Being reader-owned, the registration survives any
+    // entry lifecycle event and is released exactly once on every exit.
+    // Only deliberate invalidation (and demand withdrawal of a successor
+    // this reader never observed) can still remove the entry; the chunk
+    // stays perfectly refetchable then, so the loop retries instead of
+    // failing.
+    ++state->blockingReadersByKey_[key];
+    bool readerReleased = false;
+    auto releaseReaderLocked = [&] {
+        if (readerReleased)
+            return;
+        readerReleased = true;
+        auto parked = state->blockingReadersByKey_.find(key);
+        if (parked != state->blockingReadersByKey_.end() &&
+            --parked->second == 0)
+            state->blockingReadersByKey_.erase(parked);
+    };
+    // Exits release the reader registration, then re-run both limits: while
+    // the registration protected the entry, enforcement may have given up
+    // over budget. The entry-count capacity runs under the lock, the shared
+    // byte budget outside it (it calls back into evictOldestDecoded, which
+    // takes the lock).
+    auto finishLocked = [&](ChunkResult result) {
+        releaseReaderLocked();
+        enforceCapacityLocked(state);
+        lock.unlock();
+        enforceSharedBudget(state);
+        return result;
+    };
+    try {
+        for (int attempt = 0;; ++attempt) {
+            auto [it, inserted] = state->entries_.emplace(key, Entry{});
+            it->second.backgroundDemand = true;
+            bool notifyRemoteStart = false;
+            if (inserted) {
+                try {
+                    notifyRemoteStart = queueFetchLocked(
+                        state, key, state->generation_,
+                        kBlockingFetchPriorityOffset);
+                } catch (...) {
+                    // Queue setup failed before any task was installed:
+                    // erase the entry this reader created, or later readers
+                    // would wait forever on an InFlight entry that nothing
+                    // resolves.
+                    eraseUnresolvedEntryLocked(*state, key);
+                    throw;
+                }
+            } else if (it->second.status == EntryStatus::InFlight) {
+                const int boosted =
+                    fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
+                if (boosted < it->second.basePriority) {
+                    it->second.basePriority = boosted;
+                    reprioritizeEntryLocked(*state, key, it->second);
+                }
             }
-        }
-        if (notifyRemoteStart) {
-            lock.unlock();
-            try {
-                notifyRemoteFetchListeners(state, key, true);
-            } catch (...) {
-                // A throwing listener must not leak the pin - a leaked pin
-                // would exempt this chunk from eviction forever. Enforcement
-                // may have given up while the pin hid the entry, so re-run
-                // it here just like the normal return path does.
-                lock.lock();
-                auto cleanup = state->entries_.find(key);
-                if (cleanup != state->entries_.end() &&
-                    cleanup->second.blockingWaiters > 0)
-                    --cleanup->second.blockingWaiters;
-                enforceCapacityLocked(state);
+            if (notifyRemoteStart) {
                 lock.unlock();
-                enforceSharedBudget(state);
-                throw;
+                notifyRemoteFetchListeners(state, key, true);
+                lock.lock();
             }
-            lock.lock();
+            // Wait keyed by chunk key. Marking demand on whatever entry sits
+            // at the key (a mutex-protected side effect of the predicate)
+            // keeps demand pruning from erasing a successor this reader has
+            // observed; one it never observed can only vanish while the
+            // reader's own wake is still pending, which lands in the retry
+            // below.
+            state->cv_.wait(lock, [&] {
+                auto entry = state->entries_.find(key);
+                if (entry == state->entries_.end())
+                    return true;
+                entry->second.backgroundDemand = true;
+                return entry->second.status != EntryStatus::InFlight;
+            });
+            it = state->entries_.find(key);
+            if (it != state->entries_.end())
+                return finishLocked(
+                    resultFromEntryLocked(*state, key, it->second));
+            if (attempt >= kEvictedRetryLimit)
+                return finishLocked(ChunkResult{
+                    ChunkStatus::Error, state->dtype_,
+                    state->levels_[level].chunkShape, {},
+                    "chunk invalidated before blocking reader woke "
+                    "(retries exhausted)"});
+            Logger()->warn(
+                "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) to "
+                "invalidation mid-wait; refetching (attempt {}/{})",
+                level, iz, iy, ix, attempt + 1, kEvictedRetryLimit);
         }
-        waitForResolvedLocked(*state, lock, key);
-        it = state->entries_.find(key);
-        if (it != state->entries_.end()) {
-            // Guarded: after an invalidation erased the pinned entry, this
-            // may be a successor entry pinned by another reader. A wrongly
-            // released pin only sends that reader through this same retry
-            // path, so the imbalance is self-healing.
-            if (it->second.blockingWaiters > 0)
-                --it->second.blockingWaiters;
-            ChunkResult result = resultFromEntryLocked(*state, key, it->second);
-            // While this reader's pin hid the entry, capacity and budget
-            // enforcement may have given up over their limits. Re-enforce
-            // now that the pin is released - the entry-count capacity under
-            // the lock, the shared byte budget outside it (enforcement
-            // calls back into evictOldestDecoded, which takes the lock).
+    } catch (...) {
+        if (!lock.owns_lock())
+            lock.lock();
+        releaseReaderLocked();
+        try {
             enforceCapacityLocked(state);
             lock.unlock();
             enforceSharedBudget(state);
-            return result;
+        } catch (...) {
+            // Best-effort cleanup: keep the original exception.
         }
-        if (attempt >= kEvictedRetryLimit)
-            return ChunkResult{
-                ChunkStatus::Error, state->dtype_,
-                state->levels_[level].chunkShape, {},
-                "chunk invalidated before blocking reader woke "
-                "(retries exhausted)"};
-        Logger()->warn(
-            "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) to "
-            "invalidation mid-wait; refetching (attempt {}/{})",
-            level, iz, iy, ix, attempt + 1, kEvictedRetryLimit);
+        throw;
     }
 }
 
@@ -2021,6 +2052,10 @@ ChunkCache::Stats ChunkCache::stats() const
         if (auto scheduler = state->decodeScheduler_.lock())
             result.pendingDecodeTasks = scheduler->pending();
         result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
+        for (const auto& [key, parked] : state->blockingReadersByKey_) {
+            (void)key;
+            result.blockingReaders += parked;
+        }
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
         result.persistentCacheWarning = state->persistentCacheWarning_;
     }
@@ -2283,8 +2318,18 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->decodeScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-    for (const auto& key : activeRemoteFetches)
-        notifyRemoteFetchListeners(state, key, false);
+    for (const auto& key : activeRemoteFetches) {
+        try {
+            notifyRemoteFetchListeners(state, key, false);
+        } catch (...) {
+            // A throwing listener must not skip the remaining stop events or
+            // the cv notify below - parked blocking readers whose entries
+            // were just cleared depend on that wake.
+            Logger()->warn(
+                "[ChunkCache] remote-fetch listener threw during "
+                "invalidation; continuing");
+        }
+    }
     for (const auto& operation : cancelledPersistence) {
         {
             std::lock_guard lock(operation->mutex);
@@ -2781,6 +2826,15 @@ bool ChunkCache::addRequestDemandLocked(State& state,
 bool ChunkCache::hasDemandLocked(const Entry& entry)
 {
     return entry.backgroundDemand || !entry.viewDemands.empty();
+}
+
+bool ChunkCache::hasParkedBlockingReaderLocked(const State& state,
+                                               const ChunkKey& key)
+{
+    if (state.blockingReadersByKey_.empty())
+        return false;
+    return state.blockingReadersByKey_.find(key) !=
+           state.blockingReadersByKey_.end();
 }
 
 bool ChunkCache::cancelUndemandedEntryLocked(State& state,
@@ -5365,9 +5419,9 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
             continue;
         }
         Entry& entry = entryIt->second;
-        // Entries pinned by a parked blocking reader must survive until the
-        // reader wakes; capacity overshoots by at most the pinned count.
-        if (entry.blockingWaiters > 0)
+        // Entries whose key has a parked blocking reader must survive until
+        // that reader wakes; capacity overshoots by at most that count.
+        if (hasParkedBlockingReaderLocked(*state, *it))
             continue;
         const ChunkKey victim = *it;
         it = state->lru_.erase(it);
@@ -5390,10 +5444,10 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
             entry->second.status == EntryStatus::Data &&
-            entry->second.blockingWaiters == 0) {
-            // Must mirror evictOldestDecodedLocked's pin skip: reporting a
-            // pinned entry's touch would make the budget's enforce() loop
-            // keep selecting a victim whose eviction then refuses.
+            !hasParkedBlockingReaderLocked(*state, *it)) {
+            // Must mirror evictOldestDecodedLocked's reader skip: reporting
+            // a protected entry's touch would make the budget's enforce()
+            // loop keep selecting a victim whose eviction then refuses.
             return entry->second.budgetTouch;
         }
     }
@@ -5418,7 +5472,7 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
             continue;
-        if (entry.blockingWaiters > 0)
+        if (hasParkedBlockingReaderLocked(*state, *it))
             continue;
 
         const ChunkKey victim = *it;
@@ -5551,14 +5605,6 @@ void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
         if (cb)
             cb(key, active);
     }
-}
-
-void ChunkCache::waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key)
-{
-    state.cv_.wait(lock, [&] {
-        auto it = state.entries_.find(key);
-        return it == state.entries_.end() || it->second.status != EntryStatus::InFlight;
-    });
 }
 
 } // namespace vc::render
