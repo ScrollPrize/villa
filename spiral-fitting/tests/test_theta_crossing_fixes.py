@@ -72,7 +72,7 @@ class ThetaCrossingLossTests(unittest.TestCase):
         # Radius 3 plus theta potential 2 targets winding 5. The selector
         # already returns winding units even though dr is non-unit.
         torch.testing.assert_close(
-            cache['target_relative'], torch.tensor([5]))
+            cache['target_relative'].to(torch.int64), torch.tensor([5]))
         target = patch_dt_target_in_sample_frame(
             torch.tensor([[51.0]]), torch.zeros((1, 1, 2)),
             torch.zeros((1, 1)), torch.zeros((1, 1)), dr, cache,

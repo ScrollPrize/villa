@@ -30,10 +30,7 @@ import numpy as np
 import torch
 
 from spiral_sampling import load_spiral_sampling
-from sample_spiral import (
-    get_theta_and_radii,
-    get_theta_crossing_step_adjustments,
-)
+from sample_spiral import get_theta_and_radii
 
 
 _spiral_sampling = load_spiral_sampling()
@@ -72,6 +69,48 @@ def _transform_in_chunks(transform, zyxs, chunk_size):
         [transform(zyxs[start:start + chunk_size]) for start in range(0, zyxs.shape[0], chunk_size)],
         dim=0,
     )
+
+
+def _smallest_signed_dtype(minimum, maximum, *, prefer_int16=True):
+    """Return the smallest practical signed dtype covering an integer range."""
+    candidates = (torch.int16, torch.int32, torch.int64) if prefer_int16 \
+        else (torch.int32, torch.int64)
+    for dtype in candidates:
+        bounds = torch.iinfo(dtype)
+        if minimum >= bounds.min and maximum <= bounds.max:
+            return dtype
+    raise OverflowError(f'integer range [{minimum}, {maximum}] exceeds int64')
+
+
+def _compact_integer_tensor(values, name, *, prefer_int16=True):
+    """Losslessly convert an integer-valued tensor to a compact host tensor."""
+    values = values.detach()
+    if values.numel() == 0:
+        dtype = torch.int16 if prefer_int16 else torch.int32
+        return values.to(device='cpu', dtype=dtype)
+    if values.is_floating_point():
+        rounded = torch.round(values)
+        error = (values - rounded).abs().max()
+        if float(error) > 1.e-4:
+            raise ValueError(
+                f'{name} is not integer-valued (maximum rounding error '
+                f'{float(error):.6g})')
+        values = rounded
+    minimum = int(values.min())
+    maximum = int(values.max())
+    dtype = _smallest_signed_dtype(
+        minimum, maximum, prefer_int16=prefer_int16)
+    return values.to(device='cpu', dtype=dtype)
+
+
+def _stage_host_tensor(values, indices, device, *, dtype=None):
+    """Gather a small host subset and upload it to the loss device."""
+    selected = values[indices]
+    if dtype is not None:
+        selected = selected.to(dtype=dtype)
+    if device.type == 'cuda' and not selected.is_pinned():
+        selected = selected.pin_memory()
+    return selected.to(device=device, non_blocking=selected.is_pinned())
 
 
 def snap_dt_target(sample_median, dr_per_winding):
@@ -157,10 +196,13 @@ def patch_dt_target_in_sample_frame(
         # Patch loss samples have already been lifted into the shared
         # ThetaCrossingMap's per-patch root frame. Whole-patch targets are
         # cached in that same frame, so no sparse anchor search is necessary.
+        device = sample_theta.device
         cache_idx = torch.as_tensor(
-            patch_indices, dtype=torch.int64, device=sample_theta.device)
-        target = cache['target_relative'][cache_idx].to(sample_radii.dtype)
-        valid = cache['valid'][cache_idx]
+            patch_indices, dtype=torch.int64, device='cpu')
+        target = _stage_host_tensor(
+            cache['target_relative'], cache_idx, device,
+            dtype=sample_radii.dtype)
+        valid = _stage_host_tensor(cache['valid'], cache_idx, device)
         target = torch.broadcast_to(target, sample_theta.shape[:-1])
         valid = torch.broadcast_to(valid, sample_theta.shape[:-1])
         return torch.where(
@@ -190,6 +232,49 @@ def _transfer_target_through_anchor(
     return target_relative + sample_anchor_adjustment - cache_anchor_adjustment - local_crossing
 
 
+def _stage_strip_dt_cache(cache, cache_idx, device, value_dtype):
+    """Stage only the requested strips from a compact host cache."""
+    if 'offsets' not in cache:
+        return cache, cache_idx
+
+    cache_idx_cpu = torch.as_tensor(
+        cache_idx, dtype=torch.int64, device='cpu')
+    unique, inverse = torch.unique(
+        cache_idx_cpu.reshape(-1), sorted=True, return_inverse=True)
+    offsets = cache['offsets'].to(torch.int64)
+    begins = offsets[unique]
+    counts = offsets[unique + 1] - begins
+    staged_offsets = torch.zeros(unique.numel() + 1, dtype=torch.int64)
+    torch.cumsum(counts, dim=0, out=staged_offsets[1:])
+    total = int(staged_offsets[-1])
+    if total:
+        staged_strip = torch.repeat_interleave(
+            torch.arange(unique.numel(), dtype=torch.int64), counts)
+        within = (
+            torch.arange(total, dtype=torch.int64)
+            - staged_offsets[:-1][staged_strip])
+        source = begins[staged_strip] + within
+        local_idx = cache['local_idx'][source].to(torch.int64)
+        keys_cpu = staged_strip * cache['key_scale'] + local_idx
+    else:
+        source = torch.empty(0, dtype=torch.int64)
+        keys_cpu = torch.empty(0, dtype=torch.int64)
+
+    staged = {
+        'keys': _stage_host_tensor(keys_cpu, slice(None), device),
+        'key_scale': cache['key_scale'],
+        'theta': _stage_host_tensor(
+            cache['theta'], source, device, dtype=value_dtype),
+        'adjustment': _stage_host_tensor(
+            cache['adjustment'], source, device, dtype=value_dtype),
+        'target_relative': _stage_host_tensor(
+            cache['target_relative'], unique, device, dtype=value_dtype),
+        'valid': _stage_host_tensor(cache['valid'], unique, device),
+    }
+    remapped = inverse.reshape(cache_idx_cpu.shape).to(device=device)
+    return staged, remapped
+
+
 def snap_strip_dt_target(
     sample_local_idx, sample_theta, sample_adjustments,
     dr_per_winding, cache, cache_idx,
@@ -214,6 +299,10 @@ def snap_strip_dt_target(
     usable entry for any of the row's strips (strip_dt_target_in_sample_frame then
     falls back to the snapped sample median).
     """
+    cache, cache_idx = _stage_strip_dt_cache(
+        cache, cache_idx, sample_theta.device, sample_theta.dtype)
+    cache_idx = torch.as_tensor(
+        cache_idx, dtype=torch.int64, device=sample_theta.device)
     if cache_idx.dim() == 1:
         cache_idx = cache_idx[:, None].expand_as(sample_local_idx)
     point_valid = cache['valid'][cache_idx]  # (K, P)
@@ -475,9 +564,82 @@ def compute_patch_dt_target_cache(
             target_relative[n] = torch.round(selected).to(torch.int64)
     return {
         'frame': 'theta_potential',
-        'target_relative': target_relative,
-        'valid': valid,
+        'target_relative': _compact_integer_tensor(
+            target_relative, 'patch target winding'),
+        'valid': valid.cpu(),
         'num_points': total,
+    }
+
+
+def _compact_strip_cache_to_host(cache):
+    """Convert a construction cache into ragged, compact host storage."""
+    num_strips = int(cache['valid'].numel())
+    keys = cache['keys']
+    key_scale = int(cache['key_scale'])
+    if keys.numel():
+        strip_id = torch.div(keys, key_scale, rounding_mode='floor')
+        counts = torch.bincount(strip_id, minlength=num_strips)
+        local_idx = keys - strip_id * key_scale
+    else:
+        counts = torch.zeros(
+            num_strips, dtype=torch.int64, device=keys.device)
+        local_idx = torch.empty(0, dtype=torch.int64, device=keys.device)
+    offsets = torch.zeros(
+        num_strips + 1, dtype=torch.int64, device=counts.device)
+    torch.cumsum(counts, dim=0, out=offsets[1:])
+    return {
+        'storage': 'host_compact',
+        'offsets': _compact_integer_tensor(
+            offsets, 'strip cache offsets', prefer_int16=False),
+        'local_idx': _compact_integer_tensor(
+            local_idx, 'strip local point index'),
+        # Theta remains float32. Half precision near the +/-pi branch cut
+        # cannot preserve exact crossing classification.
+        'theta': cache['theta'].detach().to(device='cpu', dtype=torch.float32),
+        'adjustment': _compact_integer_tensor(
+            cache['adjustment'], 'strip unwrap adjustment'),
+        'target_relative': _compact_integer_tensor(
+            cache['target_relative'], 'strip target winding'),
+        'valid': cache['valid'].detach().to(device='cpu', dtype=torch.bool),
+        'key_scale': key_scale,
+        'num_points': int(cache['num_points']),
+    }
+
+
+def _widest_integer_dtype(caches, field):
+    rank = {torch.int16: 0, torch.int32: 1, torch.int64: 2}
+    return max((cache[field].dtype for cache in caches), key=rank.__getitem__)
+
+
+def _merge_compact_strip_caches(caches, key_scale):
+    """Join already-host-resident strip chunks without returning to CUDA."""
+    if not caches:
+        raise ValueError('expected at least one strip cache chunk')
+    counts = torch.cat([
+        cache['offsets'][1:].to(torch.int64)
+        - cache['offsets'][:-1].to(torch.int64)
+        for cache in caches
+    ])
+    offsets = torch.zeros(counts.numel() + 1, dtype=torch.int64)
+    torch.cumsum(counts, dim=0, out=offsets[1:])
+
+    def join_integer(field):
+        dtype = _widest_integer_dtype(caches, field)
+        return torch.cat([
+            cache[field].to(dtype=dtype) for cache in caches
+        ])
+
+    return {
+        'storage': 'host_compact',
+        'offsets': _compact_integer_tensor(
+            offsets, 'strip cache offsets', prefer_int16=False),
+        'local_idx': join_integer('local_idx'),
+        'theta': torch.cat([cache['theta'] for cache in caches]),
+        'adjustment': join_integer('adjustment'),
+        'target_relative': join_integer('target_relative'),
+        'valid': torch.cat([cache['valid'] for cache in caches]),
+        'key_scale': int(key_scale),
+        'num_points': sum(cache['num_points'] for cache in caches),
     }
 
 
@@ -485,7 +647,7 @@ def compute_patch_dt_target_cache(
 def compute_strip_dt_target_cache(
     slice_to_spiral_transform, dr_per_winding, zyxs, starts,
     windings=None, floating_threshold=0.25, num_points_per_strip=None, max_stride=None,
-    chunk_size=65536, max_total_points=None,
+    chunk_size=65536, max_total_points=None, _compact_host=True,
 ):
     # Whole-strip DT target determination for ordered point strips (unattached-pcl
     # strips and tracks), given their flat concatenated bundle: zyxs (N, 3) and
@@ -519,15 +681,16 @@ def compute_strip_dt_target_cache(
     }
     total = int(starts[-1]) if num_strips > 0 else 0
     if total == 0:
-        return empty_cache
+        return (_compact_strip_cache_to_host(empty_cache)
+                if _compact_host else empty_cache)
 
     # Production-scale track sets (tens of millions of points) make the
     # single-shot segmented sorts below spike tens of GB (observed OOM at
     # z8500-16500, 2026-07-19). Split the strips into contiguous groups of at
     # most max_total_points, build each group's cache independently, and
-    # merge with keys rebased onto one global key_scale. Group boundaries
-    # respect strip boundaries and groups ascend by strip id, so the merged
-    # 'keys' stay globally sorted (strip-major, then local index).
+    # compact each group to host memory immediately, then merge its ragged
+    # arrays there. Group boundaries respect strip boundaries and ascend by
+    # strip id, so offsets and per-strip targets concatenate directly.
     if max_total_points and total > int(max_total_points) and num_strips > 1:
         starts_cpu = starts.detach().cpu()
         subcaches = []
@@ -547,23 +710,12 @@ def compute_strip_dt_target_cache(
                 max_stride=max_stride, chunk_size=chunk_size,
                 max_total_points=None,
             )
-            local_scale = sub['key_scale']
-            strip_local = torch.div(sub['keys'], local_scale,
-                                    rounding_mode='floor')
-            local_idx = sub['keys'] - strip_local * local_scale
-            sub['keys'] = (strip_local + s0) * key_scale + local_idx
             subcaches.append(sub)
             s0 = s1
-        return {
-            'keys': torch.cat([c['keys'] for c in subcaches]),
-            'key_scale': key_scale,
-            'theta': torch.cat([c['theta'] for c in subcaches]),
-            'adjustment': torch.cat([c['adjustment'] for c in subcaches]),
-            'target_relative': torch.cat(
-                [c['target_relative'] for c in subcaches]),
-            'valid': torch.cat([c['valid'] for c in subcaches]),
-            'num_points': sum(c['num_points'] for c in subcaches),
-        }
+        if not _compact_host:
+            raise ValueError(
+                'chunked strip target caches require compact host output')
+        return _merge_compact_strip_caches(subcaches, key_scale)
 
     target_counts = lengths.clone()
     if num_points_per_strip and int(num_points_per_strip) > 0:
@@ -610,16 +762,21 @@ def compute_strip_dt_target_cache(
 
     if shifted.numel() > 1:
         same_strip = strip_id[1:] == strip_id[:-1]
-        step_adjustments = get_theta_crossing_step_adjustments(theta, dr)
-        step_adjustments = torch.where(same_strip, step_adjustments, torch.zeros_like(step_adjustments))
+        theta_diffs = torch.diff(theta.detach())
+        step_adjustments = (
+            (theta_diffs > np.pi).to(torch.int32)
+            - (theta_diffs < -np.pi).to(torch.int32))
+        step_adjustments = torch.where(
+            same_strip, step_adjustments,
+            torch.zeros_like(step_adjustments))
         cumsum_flat = torch.cat([
-            torch.zeros(1, device=device, dtype=step_adjustments.dtype),
+            torch.zeros(1, device=device, dtype=torch.int32),
             torch.cumsum(step_adjustments, dim=0),
         ], dim=0)
         adjustments = cumsum_flat - cumsum_flat[starts[:-1][strip_id]]
     else:
-        adjustments = torch.zeros_like(shifted)
-    values = shifted + adjustments
+        adjustments = torch.zeros_like(shifted, dtype=torch.int32)
+    values = shifted + adjustments.to(shifted.dtype) * dr
     if windings is not None:
         values = values - windings * dr
 
@@ -642,12 +799,14 @@ def compute_strip_dt_target_cache(
         floating_threshold,
     )
     target_relative = torch.where(valid, selected, torch.zeros_like(selected))
-    return {
+    result = {
         'keys': strip_id * key_scale + local_idx,
         'key_scale': key_scale,
         'theta': theta,
-        'adjustment': adjustments / dr,
+        'adjustment': adjustments,
         'target_relative': target_relative,
         'valid': valid,
         'num_points': int(values.numel()),
     }
+    return (_compact_strip_cache_to_host(result)
+            if _compact_host else result)
