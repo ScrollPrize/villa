@@ -714,9 +714,17 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
     }
-    if (converter.validCount() == 0) {
+    // A 2x2 grid is the clamped minimum: the UV range collapsed below one
+    // output pixel, so the tifxyz is degenerate no matter how many of its
+    // four corners happened to rasterize (0/4 was #1320; 1/4 slips the same
+    // way and still writes a mostly-sentinel surface).
+    const bool degenerate_grid =
+        converter.gridWidth() <= 2 && converter.gridHeight() <= 2;
+    if (converter.validCount() == 0 || degenerate_grid) {
         const cv::Vec2f range = converter.uvRange();
-        std::cerr << "Error: 0 grid points rasterized; not writing an all-sentinel tifxyz." << std::endl;
+        std::cerr << "Error: " << (degenerate_grid ? "degenerate 2 x 2 output grid"
+                                                   : "0 grid points rasterized")
+                  << "; not writing a sentinel-filled tifxyz." << std::endl;
         if (range[0] <= 1.5f && range[1] <= 1.5f) {
             std::cerr << "UV range is " << range[0] << " x " << range[1]
                       << " (normalized UVs?), which yields only a " << converter.gridWidth()
