@@ -1458,14 +1458,15 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
 
 TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
 {
-    // The maintainer's multi-party scenario, single-successor form: a parked
-    // blocking reader survives invalidation, and the successor entry is
-    // created by ANOTHER party (here the main thread's tryGetChunk). The
-    // reader's key registration must protect that successor through the
-    // sub-chunk budget's completion-time enforcement even though the reader
-    // never touched it. Contract under the fix: exactly two fetches (the
-    // stale original and one shared successor - the emplace under the mutex
-    // dedupes whoever comes second), reader gets Data.
+    // Contract coverage, single-successor form: a parked blocking reader
+    // survives invalidation, and the successor entry may be created by
+    // ANOTHER party (the main thread's tryGetChunk races the woken reader;
+    // either may win). The reader's key registration must protect the
+    // successor through the sub-chunk budget's completion-time enforcement
+    // even when the reader never touched it. Contract under the fix:
+    // exactly two fetches (the stale original and one shared successor -
+    // the emplace under the mutex dedupes whoever comes second), reader
+    // gets Data in every interleaving.
     auto service = makeService(16);  // one 4x4x4 uint8 chunk is 64 bytes
     auto fetcher = std::make_shared<MultiBlockingFetcher>();
     auto cache = makeServiceCache(service, "successor-protection", fetcher);
@@ -1494,13 +1495,16 @@ TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
 
 TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection")
 {
-    // The maintainer's exact scenario: two readers on one key across an
-    // invalidation. Reader A parks, the entry is invalidated, A requeues the
-    // successor fetch; reader B joins while that fetch is in flight. Both
-    // registrations are observed (stats().blockingReaders == 2) before the
-    // fetch resolves, so whichever reader exits first, the other's key
-    // registration keeps the resolved chunk alive under the sub-chunk
-    // budget until it has read it. Exactly two fetches total.
+    // Contract coverage for the maintainer's two-reader scenario: reader A
+    // parks, the entry is invalidated, A requeues the successor fetch;
+    // reader B joins while that fetch is in flight. Both registrations are
+    // observed (stats().blockingReaders == 2) before the fetch resolves, so
+    // whichever reader exits first, the other's key registration keeps the
+    // resolved chunk alive under the sub-chunk budget until it has read it.
+    // Exactly two fetches total. (The historical entry-pin bug needed a
+    // waiter still asleep when the successor appears - a schedule no
+    // external seam can force - so this asserts the current design's
+    // registration-survival contract rather than discriminating old code.)
     auto service = makeService(16);
     auto fetcher = std::make_shared<MultiBlockingFetcher>();
     auto cache = makeServiceCache(service, "two-reader-protection", fetcher);
