@@ -1292,6 +1292,36 @@ TEST_CASE("ChunkCache: getChunkBlocking returns Data immediately for a found chu
     CHECK(r.bytes->size() == 64);
 }
 
+TEST_CASE("ChunkCache: blocking read refetches when its entry is erased mid-wait")
+{
+    // Regression: a reader parked in getChunkBlocking could wake to find its
+    // entry erased (decoded-budget eviction or invalidation beat it to the
+    // lock after the fetch resolved) and surfaced a "chunk invalidated"
+    // error instead of refetching the perfectly refetchable chunk.
+    auto service = makeService();
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "blocking-refetch", fetcher);
+
+    auto pending = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+
+    // Erase the entry out from under the parked reader; the reader must
+    // requeue the fetch under the new generation rather than fail.
+    cache->invalidate();
+    fetcher->release();
+
+    REQUIRE(fetcher->waitForStarted(2, std::chrono::seconds{5}));
+    REQUIRE(pending.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    auto result = pending.get();
+    CHECK(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->size() == 64);
+    CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
+}
+
 TEST_CASE("ChunkCache: Missing fetch resolves to Missing status")
 {
     auto f = std::make_shared<CountingFetcher>();

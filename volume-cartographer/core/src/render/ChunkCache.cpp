@@ -1666,32 +1666,48 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     // on remote sources that parked the caller (GUI thread included) for
     // the whole backlog's round trips.
     constexpr int kBlockingFetchPriorityOffset = -1024;
-    auto [it, inserted] = state->entries_.emplace(key, Entry{});
-    it->second.backgroundDemand = true;
-    bool notifyRemoteStart = false;
-    if (inserted) {
-        notifyRemoteStart = queueFetchLocked(
-            state, key, state->generation_, kBlockingFetchPriorityOffset);
-    } else if (it->second.status == EntryStatus::InFlight) {
-        const int boosted =
-            fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
-        if (boosted < it->second.basePriority) {
-            it->second.basePriority = boosted;
-            reprioritizeEntryLocked(*state, key, it->second);
+    // A resolved entry can be erased between the fetch resolving and this
+    // waiter re-acquiring the lock: decoded-budget eviction removes whole
+    // entries (evictOldestDecodedLocked), and caches flagged
+    // decodedEvictionPreferSelf shed their own freshly decoded chunks first
+    // while a solve streams many of them. An evicted chunk is refetchable,
+    // so retry the fetch instead of failing; the bound only guards against
+    // a budget too small to hold even one in-demand chunk.
+    constexpr int kEvictedRetryLimit = 5;
+    for (int attempt = 0;; ++attempt) {
+        auto [it, inserted] = state->entries_.emplace(key, Entry{});
+        it->second.backgroundDemand = true;
+        bool notifyRemoteStart = false;
+        if (inserted) {
+            notifyRemoteStart = queueFetchLocked(
+                state, key, state->generation_, kBlockingFetchPriorityOffset);
+        } else if (it->second.status == EntryStatus::InFlight) {
+            const int boosted =
+                fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
+            if (boosted < it->second.basePriority) {
+                it->second.basePriority = boosted;
+                reprioritizeEntryLocked(*state, key, it->second);
+            }
         }
+        if (notifyRemoteStart) {
+            lock.unlock();
+            notifyRemoteFetchListeners(state, key, true);
+            lock.lock();
+        }
+        waitForResolvedLocked(*state, lock, key);
+        it = state->entries_.find(key);
+        if (it != state->entries_.end())
+            return resultFromEntryLocked(*state, key, it->second);
+        if (attempt >= kEvictedRetryLimit)
+            return ChunkResult{
+                ChunkStatus::Error, state->dtype_,
+                state->levels_[level].chunkShape, {},
+                "chunk evicted before blocking reader woke (retries exhausted)"};
+        Logger()->warn(
+            "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) to "
+            "eviction mid-wait; refetching (attempt {}/{})",
+            level, iz, iy, ix, attempt + 1, kEvictedRetryLimit);
     }
-    if (notifyRemoteStart) {
-        lock.unlock();
-        notifyRemoteFetchListeners(state, key, true);
-        lock.lock();
-    }
-    waitForResolvedLocked(*state, lock, key);
-    it = state->entries_.find(key);
-    if (it == state->entries_.end())
-        return ChunkResult{
-            ChunkStatus::Error, state->dtype_,
-            state->levels_[level].chunkShape, {}, "chunk invalidated"};
-    return resultFromEntryLocked(*state, key, it->second);
 }
 
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset)
