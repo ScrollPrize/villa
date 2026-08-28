@@ -184,6 +184,24 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
         Config({"track_max_tortuosity": "unlimited"})
 
 
+def test_gap_capacity_and_numerical_floor_are_explicit_and_validated():
+    catalog = Config.catalog()
+    defaults = catalog["defaults"]
+    fields = catalog["schema"]["fields"]
+    assert defaults["model_gap_expander_capacity_windings"] > (
+        defaults["model_gap_expander_num_windings"])
+    assert "not a claim" in fields[
+        "model_gap_expander_capacity_windings"]["description"]
+    assert "geological preference" in fields[
+        "model_gap_expander_min_gap"]["description"]
+    with pytest.raises(ValueError, match="capacity_windings"):
+        Config({"model_gap_expander_capacity_windings": 2})
+    with pytest.raises(ValueError, match="min_gap"):
+        Config({"model_gap_expander_min_gap": 0.0})
+    with pytest.raises(ValueError, match="min_gap"):
+        Config({"model_gap_expander_min_gap": 16.0})
+
+
 def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
     catalog = Config.catalog()
     for key in ("patch_strip_sampling", "patch_2d_sampling_max_area"):
