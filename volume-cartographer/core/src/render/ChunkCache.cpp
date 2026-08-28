@@ -1693,7 +1693,18 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
         }
         if (notifyRemoteStart) {
             lock.unlock();
-            notifyRemoteFetchListeners(state, key, true);
+            try {
+                notifyRemoteFetchListeners(state, key, true);
+            } catch (...) {
+                // A throwing listener must not leak the pin - a leaked pin
+                // would exempt this chunk from eviction forever.
+                lock.lock();
+                auto cleanup = state->entries_.find(key);
+                if (cleanup != state->entries_.end() &&
+                    cleanup->second.blockingWaiters > 0)
+                    --cleanup->second.blockingWaiters;
+                throw;
+            }
             lock.lock();
         }
         waitForResolvedLocked(*state, lock, key);
@@ -1705,7 +1716,14 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
             // path, so the imbalance is self-healing.
             if (it->second.blockingWaiters > 0)
                 --it->second.blockingWaiters;
-            return resultFromEntryLocked(*state, key, it->second);
+            ChunkResult result = resultFromEntryLocked(*state, key, it->second);
+            // While this reader's pin hid the entry, budget enforcement may
+            // have given up over budget. Re-enforce now that the pin is
+            // released - outside the state lock, since enforcement calls
+            // back into evictOldestDecoded, which takes it.
+            lock.unlock();
+            enforceSharedBudget(state);
+            return result;
         }
         if (attempt >= kEvictedRetryLimit)
             return ChunkResult{
@@ -5331,16 +5349,21 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
     if (!overBudget())
         return;
 
-    while (overBudget() && !state->lru_.empty()) {
-        auto victimIt = std::prev(state->lru_.end());
-        auto entryIt = state->entries_.find(*victimIt);
+    for (auto it = state->lru_.end();
+         overBudget() && it != state->lru_.begin();) {
+        --it;
+        auto entryIt = state->entries_.find(*it);
         if (entryIt == state->entries_.end()) {
-            state->lru_.erase(victimIt);
+            it = state->lru_.erase(it);
             continue;
         }
         Entry& entry = entryIt->second;
-        const ChunkKey victim = *victimIt;
-        state->lru_.erase(victimIt);
+        // Entries pinned by a parked blocking reader must survive until the
+        // reader wakes; capacity overshoots by at most the pinned count.
+        if (entry.blockingWaiters > 0)
+            continue;
+        const ChunkKey victim = *it;
+        it = state->lru_.erase(it);
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
             if (entry.bytes && !entry.persisted && !entry.persistentWriteQueued)

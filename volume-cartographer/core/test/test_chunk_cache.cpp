@@ -1351,6 +1351,39 @@ TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
+    // Releasing the pin re-enforces the budget, so the overshoot the pin
+    // allowed does not persist.
+    CHECK(service->decodedByteBudget()->stats().decodedBytes <= 16);
+}
+
+TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
+{
+    // Same shape as the budget case, but through enforceCapacityLocked: the
+    // completion path enforces the entry-count capacity before notifying,
+    // which erased the parked reader's freshly stored entry. Pinned entries
+    // must be skipped there too.
+    auto service = makeService();
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkKey k{0, 0, 0, 0};
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{55});
+    fetcher->setCanned(k, fr);
+
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    options.metadataEntryCapacity = 0;
+    auto cache = service->acquireSource(
+        "zero-entry-capacity", std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, std::move(options));
+
+    auto result = cache->getChunkBlocking(0, 0, 0, 0);
+    CHECK(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->size() == 64);
+    CHECK(fetcher->fetchCalls.load() == 1);
 }
 
 TEST_CASE("ChunkCache: Missing fetch resolves to Missing status")
