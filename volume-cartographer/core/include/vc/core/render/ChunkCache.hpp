@@ -358,6 +358,11 @@ private:
         std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
         bool backgroundDemand = false;
+        // Readers parked in getChunkBlocking pin the entry: decoded-budget
+        // eviction skips pinned entries so a resolved chunk cannot be erased
+        // before its blocking reader wakes. Invalidation still clears pinned
+        // entries; the blocking reader retries the fetch in that case.
+        int blockingWaiters = 0;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };

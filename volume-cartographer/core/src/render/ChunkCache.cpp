@@ -1666,17 +1666,19 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     // on remote sources that parked the caller (GUI thread included) for
     // the whole backlog's round trips.
     constexpr int kBlockingFetchPriorityOffset = -1024;
-    // A resolved entry can be erased between the fetch resolving and this
-    // waiter re-acquiring the lock: decoded-budget eviction removes whole
-    // entries (evictOldestDecodedLocked), and caches flagged
-    // decodedEvictionPreferSelf shed their own freshly decoded chunks first
-    // while a solve streams many of them. An evicted chunk is refetchable,
-    // so retry the fetch instead of failing; the bound only guards against
-    // a budget too small to hold even one in-demand chunk.
+    // A parked reader pins its entry (blockingWaiters) so decoded-budget
+    // eviction cannot erase the resolved chunk before the reader wakes -
+    // caches flagged decodedEvictionPreferSelf otherwise shed their own
+    // freshly decoded chunks first while a solve streams many of them, and
+    // when viewer tiles leave less than one chunk of budget headroom the
+    // completion path would evict the chunk before even notifying. Pinned
+    // entries are still cleared by invalidation; the chunk stays perfectly
+    // refetchable then, so retry the fetch instead of failing.
     constexpr int kEvictedRetryLimit = 5;
     for (int attempt = 0;; ++attempt) {
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
         it->second.backgroundDemand = true;
+        ++it->second.blockingWaiters;
         bool notifyRemoteStart = false;
         if (inserted) {
             notifyRemoteStart = queueFetchLocked(
@@ -1696,16 +1698,24 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
         }
         waitForResolvedLocked(*state, lock, key);
         it = state->entries_.find(key);
-        if (it != state->entries_.end())
+        if (it != state->entries_.end()) {
+            // Guarded: after an invalidation erased the pinned entry, this
+            // may be a successor entry pinned by another reader. A wrongly
+            // released pin only sends that reader through this same retry
+            // path, so the imbalance is self-healing.
+            if (it->second.blockingWaiters > 0)
+                --it->second.blockingWaiters;
             return resultFromEntryLocked(*state, key, it->second);
+        }
         if (attempt >= kEvictedRetryLimit)
             return ChunkResult{
                 ChunkStatus::Error, state->dtype_,
                 state->levels_[level].chunkShape, {},
-                "chunk evicted before blocking reader woke (retries exhausted)"};
+                "chunk invalidated before blocking reader woke "
+                "(retries exhausted)"};
         Logger()->warn(
             "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) to "
-            "eviction mid-wait; refetching (attempt {}/{})",
+            "invalidation mid-wait; refetching (attempt {}/{})",
             level, iz, iy, ix, attempt + 1, kEvictedRetryLimit);
     }
 }
@@ -5349,7 +5359,11 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
     for (auto it = state->lru_.rbegin(); it != state->lru_.rend(); ++it) {
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
-            entry->second.status == EntryStatus::Data) {
+            entry->second.status == EntryStatus::Data &&
+            entry->second.blockingWaiters == 0) {
+            // Must mirror evictOldestDecodedLocked's pin skip: reporting a
+            // pinned entry's touch would make the budget's enforce() loop
+            // keep selecting a victim whose eviction then refuses.
             return entry->second.budgetTouch;
         }
     }
@@ -5373,6 +5387,8 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         }
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
+            continue;
+        if (entry.blockingWaiters > 0)
             continue;
 
         const ChunkKey victim = *it;

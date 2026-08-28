@@ -1322,6 +1322,37 @@ TEST_CASE("ChunkCache: blocking read refetches when its entry is erased mid-wait
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
 }
 
+TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
+{
+    // Regression: with less budget headroom than one chunk, the completion
+    // path enforced the shared budget before notifying - evicting the
+    // freshly decoded chunk out from under its parked reader every time, so
+    // even a retrying reader failed. The parked reader now pins the entry;
+    // eviction (and the budget's victim selection) must skip it.
+    auto service = makeService(16);  // one 4x4x4 uint8 chunk is 64 bytes
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkKey k{0, 0, 0, 0};
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{55});
+    fetcher->setCanned(k, fr);
+
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    options.decodedEvictionPreferSelf = true;  // the lasagna solve config
+    auto cache = service->acquireSource(
+        "sub-chunk-budget", std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, std::move(options));
+
+    auto result = cache->getChunkBlocking(0, 0, 0, 0);
+    CHECK(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->size() == 64);
+    CHECK(fetcher->fetchCalls.load() == 1);
+}
+
 TEST_CASE("ChunkCache: Missing fetch resolves to Missing status")
 {
     auto f = std::make_shared<CountingFetcher>();
