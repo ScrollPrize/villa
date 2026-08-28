@@ -1211,6 +1211,13 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
 		del st[k]
 	with torch.no_grad():
+		# The ordinary flatten_map_flat below is the inverse correspondence on
+		# the exported output grid.  A warm start needs the other direction:
+		# one UV pair for every source-grid vertex, including invalid vertices.
+		# Keep it as a separate, unambiguous field; Spiral exports it to TIFF
+		# sidecars and never retains or transfers this checkpoint.
+		if mdl.flatten_direction == "forward":
+			st["flatten_forward_uv"] = mdl.flatten_map().detach().cpu()
 		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
 		sentinel = torch.full_like(xyz, -1.0)
 		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
@@ -1281,6 +1288,117 @@ def _initial_flatten_state(
 	return mdl._flatten_sample_current()
 
 
+def _project_flatten_source_to_warm_grid(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	*,
+	current_ranges,
+	target_ranges,
+	winding_ids,
+	source_step: float,
+	current_dr_per_winding: float,
+	target_dr_per_winding: float,
+	target_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Sample the current Spiral surface on the stored warm parameter grid."""
+	if int(xyz.shape[0]) != int(target_rows):
+		raise ValueError("warm flatten source and stored grid row counts differ")
+	if not (
+		len(current_ranges) == len(target_ranges) == len(winding_ids)):
+		raise ValueError("warm flatten winding layouts do not match")
+	current_dr = float(current_dr_per_winding)
+	target_dr = float(target_dr_per_winding)
+	if (not math.isfinite(current_dr) or current_dr <= 0.0
+			or not math.isfinite(target_dr) or target_dr <= 0.0):
+		raise ValueError("warm flatten radial sampling must be positive")
+
+	xyz_parts: list[torch.Tensor] = []
+	valid_parts: list[torch.Tensor] = []
+	column_parts: list[torch.Tensor] = []
+	device = xyz.device
+	dtype = xyz.dtype
+	for index, (current_bounds, target_bounds) in enumerate(zip(
+			current_ranges, target_ranges, strict=True)):
+		current_begin, current_end = (int(v) for v in current_bounds)
+		target_begin, target_end = (int(v) for v in target_bounds)
+		current_count = current_end - current_begin
+		target_count = target_end - target_begin
+		if current_count < 2 or target_count < 2:
+			raise ValueError("warm flatten winding has fewer than two samples")
+		position = (
+			torch.arange(target_count, device=device, dtype=torch.float64)
+			* current_dr / target_dr)
+		part_xyz = torch.empty(
+			int(xyz.shape[0]), target_count, 3,
+			device=device, dtype=dtype)
+		part_valid = torch.empty(
+			int(xyz.shape[0]), target_count,
+			device=device, dtype=torch.bool)
+		part_columns = torch.empty(target_count, device=device, dtype=dtype)
+		last_index = float(current_count - 1)
+		inside = position <= last_index
+		if bool(inside.any().detach().cpu()):
+			p = position[inside]
+			lo = torch.floor(p).to(dtype=torch.long)
+			hi = (lo + 1).clamp_max(current_count - 1)
+			fraction = (p - lo).to(dtype=dtype)
+			lo_abs = current_begin + lo
+			hi_abs = current_begin + hi
+			lower = xyz[:, lo_abs]
+			upper = xyz[:, hi_abs]
+			part_xyz[:, inside] = torch.lerp(
+				lower, upper, fraction.reshape(1, -1, 1))
+			part_valid[:, inside] = valid[:, lo_abs] & valid[:, hi_abs]
+			part_columns[inside] = torch.lerp(
+				lo_abs.to(dtype=dtype), hi_abs.to(dtype=dtype), fraction)
+
+		beyond = ~inside
+		if bool(beyond.any().detach().cpu()):
+			p = position[beyond]
+			winding = int(winding_ids[index])
+			seam_index = (
+				2.0 * math.pi * (float(winding) + 0.5)
+				* current_dr / float(source_step))
+			seam_span = seam_index - last_index
+			if not math.isfinite(seam_span) or seam_span <= 0.0:
+				raise ValueError("warm flatten winding sampling is inconsistent")
+			fraction = ((p - last_index) / seam_span).to(dtype=dtype)
+			last_abs = current_end - 1
+			if index + 1 < len(current_ranges):
+				next_abs = int(current_ranges[index + 1][0])
+				part_xyz[:, beyond] = torch.lerp(
+					xyz[:, last_abs:last_abs + 1],
+					xyz[:, next_abs:next_abs + 1],
+					fraction.reshape(1, -1, 1))
+				part_valid[:, beyond] = (
+					valid[:, last_abs:last_abs + 1]
+					& valid[:, next_abs:next_abs + 1])
+				part_columns[beyond] = torch.lerp(
+					position.new_tensor(float(last_abs), dtype=dtype),
+					position.new_tensor(float(next_abs), dtype=dtype),
+					fraction)
+			else:
+				previous = xyz[:, last_abs - 1:last_abs]
+				last = xyz[:, last_abs:last_abs + 1]
+				part_xyz[:, beyond] = (
+					last + (last - previous)
+					* (p - last_index).to(dtype=dtype).reshape(1, -1, 1))
+				part_valid[:, beyond] = (
+					valid[:, last_abs - 1:last_abs]
+					& valid[:, last_abs:last_abs + 1])
+				part_columns[beyond] = float(last_abs)
+		xyz_parts.append(part_xyz)
+		valid_parts.append(part_valid)
+		column_parts.append(part_columns)
+
+	projected_xyz = torch.cat(xyz_parts, dim=1)
+	projected_valid = torch.cat(valid_parts, dim=1)
+	projected_xyz = torch.where(
+		projected_valid.unsqueeze(-1), projected_xyz,
+		torch.zeros_like(projected_xyz))
+	return projected_xyz, projected_valid, torch.cat(column_parts)
+
+
 def _run_flatten_mode(
 	*,
 	cfg: dict,
@@ -1341,6 +1459,42 @@ def _run_flatten_mode(
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
 	initial_inversion = _truthy_config_bool(flatten_args.get("flatten_initial_inversion", True))
+	initial_uv = None
+	flatten_source_column_map = None
+	initialization_mode = "cold"
+	warm_spec = flatten_args.get("flatten_initial_uv")
+	if warm_spec is not None:
+		if flatten_direction != "forward":
+			raise ValueError("flatten_initial_uv requires the forward flatten solver")
+		if not isinstance(warm_spec, dict):
+			raise ValueError("flatten_initial_uv must be an object")
+		from flatten_uv import load_sidecars, validate_uv
+		uv_np, stored_valid_np, uv_metadata = load_sidecars(
+			str(warm_spec.get("metadata_path") or ""),
+			expected_source_step=source_step,
+			expected_output_step=flatten_output_step,
+			expected_winding_ids=warm_spec.get("winding_ids"),
+		)
+		xyz, valid, flatten_source_column_map = (
+			_project_flatten_source_to_warm_grid(
+				xyz,
+				valid,
+				current_ranges=warm_spec.get("winding_column_ranges") or (),
+				target_ranges=uv_metadata["winding_column_ranges"],
+				winding_ids=uv_metadata["winding_ids"],
+				source_step=source_step,
+				current_dr_per_winding=float(
+					warm_spec.get("sampling_dr_per_winding")),
+				target_dr_per_winding=float(
+					uv_metadata["sampling_dr_per_winding"]),
+				target_rows=int(uv_metadata["source_shape"][0]),
+			)
+		)
+		valid = valid & torch.from_numpy(stored_valid_np).to(
+			device=valid.device, dtype=torch.bool)
+		uv_np = validate_uv(uv_np, xyz.shape[:2], valid=stored_valid_np)
+		initial_uv = torch.from_numpy(uv_np)
+		initialization_mode = "warm"
 	mdl = model.Model3D.from_flatten_tifxyz_crop(
 		xyz,
 		valid,
@@ -1356,6 +1510,8 @@ def _run_flatten_mode(
 		flatten_output_margin=flatten_output_margin,
 		flatten_output_step=flatten_output_step,
 		flatten_initial_uv_rescale=flatten_initial_uv_rescale,
+		flatten_initial_uv=initial_uv,
+		flatten_source_column_map=flatten_source_column_map,
 	)
 	data = _dummy_flatten_data()
 
@@ -1368,7 +1524,9 @@ def _run_flatten_mode(
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
 		f"source_step={source_step:.6g} output_step={flatten_output_step:.6g} "
 		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g} "
-		f"initial_uv_rescale={int(flatten_initial_uv_rescale)}",
+		f"initial_uv_rescale={int(flatten_initial_uv_rescale)} "
+		f"flatten_correction_scales={len(mdl.flatten_map_ms)} "
+		f"initialization_mode={initialization_mode}",
 		flush=True,
 	)
 	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})

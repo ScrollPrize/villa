@@ -452,6 +452,16 @@ class Model3D(nn.Module):
 		self.flatten_output_shape: tuple[int, int] = (0, 0)
 		self.flatten_output_margin = 0.10
 		self.flatten_map_ms = nn.ParameterList()
+		self.register_buffer(
+			"flatten_base_uv",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
+		self.register_buffer(
+			"flatten_source_column_map",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
 		self.register_buffer("flatten_source_xyz", torch.empty(0, 0, 3, device=device, dtype=torch.float32))
 		self.register_buffer("flatten_source_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_source_cell_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
@@ -3403,7 +3413,14 @@ class Model3D(nn.Module):
 	def _flatten_map_flat(self) -> torch.Tensor:
 		if not self.flatten_enabled or len(self.flatten_map_ms) == 0:
 			raise RuntimeError("flatten map is not initialized")
-		return self._integrate_pyramid_3d(self.flatten_map_ms, pyramid_d=False)
+		value = self._integrate_pyramid_3d(
+			self.flatten_map_ms, pyramid_d=False)
+		if int(self.flatten_base_uv.numel()):
+			if tuple(self.flatten_base_uv.shape) != tuple(value.shape):
+				raise RuntimeError(
+					"flatten warm base shape does not match its correction field")
+			value = self.flatten_base_uv + value
+		return value
 
 	def flatten_map(self) -> torch.Tensor:
 		flat = self._flatten_map_flat()
@@ -3427,6 +3444,8 @@ class Model3D(nn.Module):
 		flatten_output_margin: float = 0.10,
 		flatten_output_step: float | None = None,
 		flatten_initial_uv_rescale: bool = True,
+		flatten_initial_uv: torch.Tensor | None = None,
+		flatten_source_column_map: torch.Tensor | None = None,
 	) -> None:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -3506,6 +3525,18 @@ class Model3D(nn.Module):
 		self.bias = nn.Parameter(torch.zeros(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
 		self.flatten_source_xyz = xyz_dev
 		self.flatten_source_valid = valid_dev
+		if flatten_source_column_map is None:
+			self.flatten_source_column_map = torch.empty(
+				0, device=device, dtype=torch.float32)
+		else:
+			column_map = flatten_source_column_map.detach().to(
+				device=device, dtype=torch.float32)
+			if tuple(column_map.shape) != (W,):
+				raise ValueError(
+					"flatten source column map must match the projected source width")
+			if not bool(torch.isfinite(column_map).all().detach().cpu()):
+				raise ValueError("flatten source column map contains non-finite values")
+			self.flatten_source_column_map = column_map.contiguous()
 		self.flatten_identity_y = torch.arange(map_h, device=device, dtype=torch.float32)
 		self.flatten_identity_x = torch.arange(map_w, device=device, dtype=torch.float32)
 		self.flatten_source_filter_stats = filter_stats
@@ -3539,6 +3570,16 @@ class Model3D(nn.Module):
 				device=device,
 				dtype=torch.float32,
 			)
+			if flatten_initial_uv is not None:
+				candidate = flatten_initial_uv.detach().to(
+					device=device, dtype=torch.float32)
+				if tuple(candidate.shape) != (H, W, 2):
+					raise ValueError(
+						"flatten initial UV shape "
+						f"{tuple(candidate.shape)} does not match source {(H, W, 2)}")
+				if not bool(torch.isfinite(candidate).all().detach().cpu()):
+					raise ValueError("flatten initial UV contains non-finite values")
+				identity = candidate.contiguous()
 			initial_point_mask = valid_dev
 		else:
 			identity = self._centered_flatten_source_map(
@@ -3565,11 +3606,27 @@ class Model3D(nn.Module):
 			initial_point_mask,
 		).detach()
 		flat = identity.permute(2, 0, 1).unsqueeze(1).contiguous()
-		self.flatten_map_ms = self._construct_pyramid_from_flat_3d(
-			flat,
-			self._scale_count_to_longer_dim_2(map_h, map_w),
-			pyramid_d=False,
-		)
+		if flatten_initial_uv is None:
+			self.flatten_base_uv = torch.empty(
+				0, device=device, dtype=torch.float32)
+			self.flatten_map_ms = self._construct_pyramid_from_flat_3d(
+				flat,
+				self._scale_count_to_longer_dim_2(map_h, map_w),
+				pyramid_d=False,
+			)
+		else:
+			if direction != "forward":
+				raise ValueError("flatten initial UV requires the forward solver")
+			self.flatten_base_uv = flat.detach()
+			self.flatten_map_ms = self._build_zero_pyramid(
+				n_scales=self._scale_count_to_longer_dim_2(map_h, map_w),
+				channels=2,
+				d=1,
+				h=map_h,
+				w=map_w,
+				device=device,
+				pyramid_d=False,
+			)
 		self.flatten_enabled = True
 		self.cylinder_enabled = False
 		self.cyl_shell_mode = False
@@ -3594,6 +3651,8 @@ class Model3D(nn.Module):
 		flatten_output_margin: float = 0.10,
 		flatten_output_step: float | None = None,
 		flatten_initial_uv_rescale: bool = True,
+		flatten_initial_uv: torch.Tensor | None = None,
+		flatten_source_column_map: torch.Tensor | None = None,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
 		output_step = (
@@ -3635,6 +3694,8 @@ class Model3D(nn.Module):
 			flatten_output_margin=flatten_output_margin,
 			flatten_output_step=output_step,
 			flatten_initial_uv_rescale=flatten_initial_uv_rescale,
+			flatten_initial_uv=flatten_initial_uv,
+			flatten_source_column_map=flatten_source_column_map,
 		)
 		return mdl
 
@@ -3663,6 +3724,18 @@ class Model3D(nn.Module):
 				output_margin=float(getattr(self, "flatten_output_margin", 0.10)),
 				min_shape=getattr(self, "flatten_output_shape", None),
 			)
+			if int(self.flatten_source_column_map.numel()):
+				x = out_map[..., 1]
+				last = int(self.flatten_source_column_map.shape[0]) - 1
+				lo = torch.floor(x).to(dtype=torch.long).clamp(0, max(0, last - 1))
+				hi = (lo + 1).clamp_max(last)
+				fraction = x - lo.to(dtype=x.dtype)
+				external_x = torch.lerp(
+					self.flatten_source_column_map[lo],
+					self.flatten_source_column_map[hi],
+					fraction,
+				)
+				out_map = torch.stack((out_map[..., 0], external_x), dim=-1)
 			if int(point_mask.shape[0]) > 1 and int(point_mask.shape[1]) > 1:
 				quad_mask = (
 					point_mask[:-1, :-1] &

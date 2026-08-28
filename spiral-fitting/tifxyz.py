@@ -452,7 +452,8 @@ def save_combined_tifxyz(
     source,
     *,
     first_winding=10,
-    cleanup_erosion_cells=None,
+	cleanup_erosion_cells=None,
+	sampling_dr_per_winding=None,
 ):
     """Atomically write consecutive winding grids as one QuadSurface.
 
@@ -582,6 +583,11 @@ def save_combined_tifxyz(
             "winding_ids": ids,
             "manifest_path": os.path.join(destination, "manifest.json"),
         }
+        if sampling_dr_per_winding is not None:
+            value = float(sampling_dr_per_winding)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError("sampling_dr_per_winding must be finite and positive")
+            published["sampling_dr_per_winding"] = value
         with open(os.path.join(temp_root, "manifest.json"), "w", encoding="utf-8") as stream:
             json.dump(published, stream, indent=2)
             stream.flush()

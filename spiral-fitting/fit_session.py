@@ -100,7 +100,11 @@ from config import Config
 # Version 32 separates client-local drafts from submitted inputs and adds
 # compare-and-swap revisions for tracked fibers.  A settled fiber remains in
 # status so reconnecting clients can resume from its opaque content revision.
-API_VERSION = 32
+# Version 33 adds service-owned background preview schedules, source-iteration
+# preview provenance, and active/pending publication state.  Preview capture is
+# an all-rank fit boundary, while flattening and artifact publication continue
+# independently of the client connection and the next Run.
+API_VERSION = 33
 
 
 class SessionState(str, Enum):

@@ -2,6 +2,7 @@
 
 #include "SpiralArtifactCache.hpp"
 #include "SpiralFiberRevisionUpload.hpp"
+#include "SpiralPreviewProvenance.hpp"
 #include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
@@ -241,6 +242,8 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _lastStatusGeneration = -1;
     _installedPreviewArtifact.clear();
     _installedPreviewSession.clear();
+    _displayedPreviewSourceIteration = -1;
+    _displayedPreviewInitializationMode.clear();
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
@@ -497,6 +500,8 @@ void SpiralServiceManager::disconnectFromService()
     _eventsInFlight = false;
     _artifactCache->clearEndpoint();
     _synchronizedSessionId.clear();
+    _displayedPreviewSourceIteration = -1;
+    _displayedPreviewInitializationMode.clear();
     _tunnel->stop();
     // Disconnecting from an independently started service never shuts the
     // service down; only a process this manager launched is terminated.
@@ -764,7 +769,8 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig)
+                                         const QJsonObject& runConfig,
+                                         const QJsonObject& previewSchedule)
 {
     const QJsonObject configuration =
         vc3d::completeSpiralRunConfiguration(
@@ -773,13 +779,17 @@ void SpiralServiceManager::runIterations(int iterations,
     // neither their paths nor their contents, so restating the panel's
     // necessarily partial path view here can only create a false mismatch
     // (for example, winding_inference has no editable panel row).
+    QJsonObject body{
+        {QStringLiteral("command_id"), commandId()},
+        {QStringLiteral("configuration"), configuration},
+        {QStringLiteral("iterations"), iterations},
+        {QStringLiteral("influence"), influenceConfig},
+        {QStringLiteral("expected_session_revision"), _sessionRevision}};
+    if (!previewSchedule.isEmpty())
+        body[QStringLiteral("preview_schedule")] = previewSchedule;
     postWithRetry(
         QStringLiteral("/session/run"),
-        {{QStringLiteral("command_id"), commandId()},
-         {QStringLiteral("configuration"), configuration},
-         {QStringLiteral("iterations"), iterations},
-         {QStringLiteral("influence"), influenceConfig},
-         {QStringLiteral("expected_session_revision"), _sessionRevision}},
+        body,
         Timeout::Command, kMutationRetries, {});
 }
 
@@ -1391,7 +1401,11 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     if (!active) {
         _synchronizedSessionId.clear();
         _installedPreviewSession.clear();
+        _displayedPreviewSourceIteration = -1;
+        _displayedPreviewInitializationMode.clear();
     } else if (sessionId != _synchronizedSessionId) {
+        _displayedPreviewSourceIteration = -1;
+        _displayedPreviewInitializationMode.clear();
         const QJsonObject request =
             status.value(QStringLiteral("session_request")).toObject();
         if (!request.isEmpty()) {
@@ -1407,7 +1421,10 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         _sawRunningSinceIdle = true;
     } else if (state == QStringLiteral("Idle") && _sawRunningSinceIdle) {
         _sawRunningSinceIdle = false;
-        requestPreview();
+        // A service-owned schedule captures the final Run boundary itself.
+        // Do not enqueue the legacy client-triggered duplicate.
+        if (status.value(QStringLiteral("preview_schedule")).toObject().isEmpty())
+            requestPreview();
     }
     emit sessionStatusChanged(status);
     syncArtifacts(status);
@@ -1442,6 +1459,19 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
+                QFile manifestFile(entryPath);
+                if (manifestFile.open(QIODevice::ReadOnly)) {
+                    const QJsonObject manifest =
+                        QJsonDocument::fromJson(manifestFile.readAll()).object();
+                    const auto provenance =
+                        vc3d::spiralPreviewProvenance(manifest);
+                    _displayedPreviewSourceIteration = provenance.sourceIteration;
+                    _displayedPreviewInitializationMode =
+                        provenance.initializationMode;
+                } else {
+                    _displayedPreviewSourceIteration = -1;
+                    _displayedPreviewInitializationMode.clear();
+                }
                 // A newly installed surface has no overlays until its own
                 // diagnostics artifact arrives; the previous generation's
                 // must not be drawn over it.

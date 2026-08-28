@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 32;
+    static constexpr int kApiVersion = 33;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -59,6 +59,14 @@ public:
     QJsonObject advertisedDataset() const { return _advertisedDataset; }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
+    qint64 displayedPreviewSourceIteration() const
+    {
+        return _displayedPreviewSourceIteration;
+    }
+    QString displayedPreviewInitializationMode() const
+    {
+        return _displayedPreviewInitializationMode;
+    }
 
     // Create the first resident session. The service exposes dataset and
     // checkpoint discovery before this without importing the fit runtime.
@@ -70,7 +78,8 @@ public:
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig);
+                       const QJsonObject& runConfig,
+                       const QJsonObject& previewSchedule = {});
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& name);
@@ -253,6 +262,8 @@ private:
     bool _previewRequestInFlight = false;
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
+    qint64 _displayedPreviewSourceIteration = -1;
+    QString _displayedPreviewInitializationMode;
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;

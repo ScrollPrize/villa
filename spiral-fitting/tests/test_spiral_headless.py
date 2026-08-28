@@ -1310,6 +1310,104 @@ class ProtocolTests(unittest.TestCase):
             # No autosave means no metadata claiming one exists.
             self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
 
+    def test_scheduled_preview_is_queued_at_cadence_and_final_boundaries(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(
+                calls, output, autosave_on_pause=False)
+            session._commands = []
+            session.session_generation = 0
+            session._preview_schedule = {
+                "cadence_iterations": 10, "diagnostics": True}
+            session._next_preview_iteration = 10
+            session._automatic_previews_disabled = False
+            session._preview_source_iteration = None
+
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(len(session._commands), 1)
+            command = session._commands[0]
+            self.assertIsInstance(command, spiral_runtime.ExportPreviewCommand)
+            self.assertTrue(command.automatic)
+            self.assertTrue(command.diagnostics)
+            self.assertEqual(command.expected_iteration, 10)
+            self.assertEqual(session._next_preview_iteration, 20)
+
+    def test_scheduled_preview_failure_disables_future_captures(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._automatic_previews_disabled = False
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        session._publish_preview = lambda diagnostics=False: (_ for _ in ()).throw(
+            RuntimeError("preview OOM"))
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10,
+            automatic=True)
+        session._run_export_preview(command)
+        self.assertTrue(session._automatic_previews_disabled)
+        self.assertIn("preview OOM", "\n".join(session._warnings))
+
+    def test_preview_capture_barriers_surround_rank_zero_export(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        events = []
+        session._preview_snapshot_barrier = lambda: events.append("barrier")
+        session._share_preview_capture_error = lambda error: (
+            events.append(("share", error)), error)[1]
+        session._publish_preview = lambda diagnostics=False: events.append("export")
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10, automatic=True)
+
+        session._run_export_preview(command)
+
+        self.assertEqual(
+            events, ["barrier", "export", ("share", None), "barrier"])
+        self.assertTrue(command.done.is_set())
+        self.assertIsNone(command.error)
+
+    def test_rank_zero_capture_failure_disables_cadence_on_secondary_rank(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._phase = "Optimizing"
+        session._warnings = []
+        session._automatic_previews_disabled = False
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = False
+        barriers = []
+        session._preview_snapshot_barrier = lambda: barriers.append(True)
+        session._share_preview_capture_error = lambda error: "rank 0 preview OOM"
+        command = spiral_runtime.ExportPreviewCommand(
+            session_generation=0, expected_iteration=10, automatic=True)
+
+        session._run_export_preview(command)
+
+        self.assertEqual(len(barriers), 2)
+        self.assertTrue(session._automatic_previews_disabled)
+        self.assertIn("rank 0 preview OOM", "\n".join(session._warnings))
+        self.assertIn("rank 0 preview OOM", command.error)
+
     def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
         session = self._idle_session(completed=4)
         session.requested_config = {"optimizer_num_training_steps": 30_000}
@@ -1415,13 +1513,38 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(results, [{"preview_manifest_path": "/preview/manifest.json",
                                     "preview_generation": 3}])
 
-    def test_export_preview_is_refused_outside_idle(self):
+    def test_export_preview_can_capture_a_running_iteration_boundary(self):
         session = self._idle_session()
         with session._condition:
             session._state = SessionState.Running
-        with self.assertRaisesRegex(RuntimeError, "not allowed in Running"):
-            session.export_preview(timeout=0.1)
-        self.assertEqual(session._commands, [])
+            session._phase = "Optimizing"
+            session._pending = 2
+            session._target = 2
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.publishes_outputs = True
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._preview_source_iteration = None
+        session._publish_preview = lambda diagnostics=False: None
+        results = []
+        requester = threading.Thread(
+            target=lambda: results.append(
+                session.export_preview(timeout=5.0)))
+        requester.start()
+        deadline = time.time() + 5
+        while not session._commands and time.time() < deadline:
+            time.sleep(0.005)
+        command = session._commands.pop(0)
+        self.assertEqual(command.expected_iteration, 0)
+        session._run_export_preview(command)
+        requester.join(5)
+        self.assertEqual(session._state, SessionState.Running)
+        self.assertEqual(session._phase, "Optimizing")
+        self.assertEqual(results, [{
+            "preview_manifest_path": None,
+            "preview_generation": 0,
+        }])
 
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

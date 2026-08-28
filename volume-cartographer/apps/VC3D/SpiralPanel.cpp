@@ -692,6 +692,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _load = new QPushButton(tr("Initialize Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
+    _backgroundPreview = new QCheckBox(tr("Background preview every"), runContents);
+    _backgroundPreview->setObjectName(
+        QStringLiteral("spiralBackgroundPreviewEnabled"));
+    _backgroundPreview->setChecked(false);
+    _previewCadence = new QSpinBox(runContents);
+    _previewCadence->setObjectName(QStringLiteral("spiralBackgroundPreviewCadence"));
+    _previewCadence->setRange(1, 1000000);
+    _previewCadence->setValue(100);
+    _previewCadence->setSuffix(tr(" iterations"));
+    _previewCadence->setEnabled(false);
+    _backgroundPreview->setToolTip(
+        tr("Capture iteration-consistent previews during this Run; flattening "
+           "continues on the service while fitting resumes"));
+    connect(_backgroundPreview, &QCheckBox::toggled,
+            _previewCadence, &QWidget::setEnabled);
     _run = new QPushButton(tr("Run"), runContents);
     _run->setEnabled(false);
     _stop = new QPushButton(tr("Stop after iteration"), runContents); _stop->setEnabled(false);
@@ -705,6 +720,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     controls->addStretch(1);
     controls->addWidget(_load);
     runLayout->addLayout(controls);
+    auto* previewScheduleRow = new QHBoxLayout;
+    previewScheduleRow->addWidget(_backgroundPreview);
+    previewScheduleRow->addWidget(_previewCadence);
+    previewScheduleRow->addStretch(1);
+    runLayout->addLayout(previewScheduleRow);
     _checkpointDownloadTimer = new QTimer(this);
     _checkpointDownloadTimer->setInterval(1000);
     auto refreshCheckpointDownload = [this]() {
@@ -1122,8 +1142,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         persist();
+        QJsonObject previewSchedule;
+        if (_backgroundPreview->isChecked()) {
+            previewSchedule = {
+                {QStringLiteral("cadence_iterations"), _previewCadence->value()},
+                {QStringLiteral("diagnostics"),
+                 _lossMapDiagnostics->isChecked()},
+            };
+        }
         _service->runIterations(_iterations->value(), influenceConfig(),
-                                runAdvancedConfig());
+                                runAdvancedConfig(), previewSchedule);
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -1999,6 +2027,38 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         stateText += tr(" — iteration %1/%2")
             .arg(status.value("current_iteration").toInteger())
             .arg(status.value("target_iteration").toInteger());
+    const qint64 previewIteration =
+        _service->displayedPreviewSourceIteration();
+    if (previewIteration >= 0) {
+        const qint64 currentIteration =
+            status.value(QStringLiteral("current_iteration")).toInteger();
+        stateText += tr("\nPreview: iteration %1 — lag %2")
+            .arg(previewIteration)
+            .arg(qMax<qint64>(0, currentIteration - previewIteration));
+        const QString initMode =
+            _service->displayedPreviewInitializationMode();
+        if (!initMode.isEmpty())
+            stateText += tr(" — %1 start").arg(initMode);
+    }
+    if (status.value(QStringLiteral("preview_active")).toBool())
+    {
+        const qint64 activeIteration = status.value(
+            QStringLiteral("preview_active_source_iteration")).toInteger(-1);
+        stateText += activeIteration >= 0
+            ? tr("\nPreparing preview from iteration %1").arg(activeIteration)
+            : tr("\nBackground preview publication active");
+    }
+    if (status.value(QStringLiteral("preview_pending")).toBool()) {
+        const qint64 pendingIteration = status.value(
+            QStringLiteral("preview_pending_source_iteration")).toInteger(-1);
+        stateText += pendingIteration >= 0
+            ? tr(" — iteration %1 pending").arg(pendingIteration)
+            : tr(" — newer snapshot pending");
+    }
+    const qint64 nextPreview =
+        status.value(QStringLiteral("next_preview_iteration")).toInteger(-1);
+    if (nextPreview >= 0)
+        stateText += tr(" — next at %1").arg(nextPreview);
     const QJsonObject previewPublish =
         status.value(QStringLiteral("preview_publish")).toObject();
     if (_previewTransferActive && !_previewTransferText.isEmpty()) {
@@ -2292,6 +2352,10 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "influence_disable_dt_pct", _influenceDisableDtPct->value());
     settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
+    settings.setValue(prefix + "background_preview_enabled",
+                      _backgroundPreview->isChecked());
+    settings.setValue(prefix + "background_preview_cadence",
+                      _previewCadence->value());
     settings.remove(prefix + "advanced_config");
 }
 
@@ -2349,6 +2413,10 @@ void SpiralPanel::restore()
     _influenceAnchorWeight->setValue(
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
+    _backgroundPreview->setChecked(
+        settings.value(valuePrefix + "background_preview_enabled", false).toBool());
+    _previewCadence->setValue(
+        settings.value(valuePrefix + "background_preview_cadence", 100).toInt());
     _advancedProfiles->clearSessionDefault();
     {
         const QSignalBlocker blocker(_checkpointChoice);

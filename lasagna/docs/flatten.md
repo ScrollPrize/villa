@@ -1,6 +1,6 @@
 # Flattening Implementation Status
 
-Status date: 2026-05-21
+Status date: 2026-08-28
 
 This document summarizes the current `model-init=flatten` implementation in
 `lasagna`, with enough context for a developer to continue the work.
@@ -118,6 +118,28 @@ The forward path also reuses:
 The optimizer is still plain Adam over `map_flatten_ms`; no sparse matrix solve
 or SLIM local/global loop is active in this working path.
 
+## Spiral Warm Starts
+
+Spiral background previews reuse the previous forward UV parameterization on
+its original canonical source grid. A warm start does not interpolate that UV
+field onto the new Spiral grid: doing so changes the fixed-diagonal
+triangulation and can introduce folds before optimization begins. Instead:
+
+1. The previous UV field and source-valid mask are loaded from schema-v3
+   `flatten-uv-row.tif`, `flatten-uv-col.tif`, `flatten-uv-valid.tif`, and
+   `flatten-uv.json` sidecars.
+2. The current Spiral XYZ field is sampled onto the previous winding grid.
+3. Optimization starts from the previous UV field exactly, with a zero
+   correction pyramid over the ordinary flatten objective.
+4. The ordinary full correction pyramid is optimized in one continuous Adam
+   stage, preserving its moment state for the entire warm solve.
+
+Only the source support common to both snapshots participates in the warm
+solve. The exported correspondence is mapped back to the current Spiral source
+columns, while the next UV sidecars retain the original canonical grid. The
+Spiral warm profile uses one 3,000-step Adam stage over all 16 correction
+levels on the measured background-preview workload.
+
 ## Export Behavior
 
 Both variants write the same normal VC3D-style tifxyz output:
@@ -182,8 +204,12 @@ Additional synthetic smoke:
 - The symmetric-Dirichlet forward loss masks invalid, degenerate, or flipped
   UV quads out of the sdir average; `flatten_orient` is the term that should
   push those back.
-- Checkpoints save `flatten_map_flat` as the export/output inverse map, not the
-  raw optimized forward UV map. This keeps `fit2tifxyz` compatibility.
+- Checkpoints keep `flatten_map_flat` as the export/output inverse map for
+  `fit2tifxyz` compatibility and save the optimized source-grid field
+  separately as `flatten_forward_uv`. Spiral exports that field as the
+  versioned `flatten-uv-row.tif`, `flatten-uv-col.tif`,
+  `flatten-uv-valid.tif`, and `flatten-uv.json` host-only warm-start sidecars;
+  the model checkpoint itself is not retained or transferred.
 
 ## Historical Note
 
@@ -204,9 +230,6 @@ Good follow-up tasks:
   real tifxyz and record wall time, final loss, valid output fraction, and
   visual quality.
 - Profile `_flatten_invert_forward_uv_map(...)` on large outputs.
-- Save the optimized forward UV map in checkpoints under a separate field,
-  for example `flatten_forward_uv_flat`, while keeping `flatten_map_flat`
-  as the compatible exported inverse map.
 - Add a stricter line-search or projected update for forward UV orientation if
   real data shows fold spikes.
 - Consider a faster spatial index for UV inversion if KD-tree candidate search

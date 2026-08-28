@@ -2588,7 +2588,10 @@ def optimize(
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_group = {"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)}
+						param_group = {
+							"params": [p],
+							"lr": _lr_scalespace(lr=settings.lr, scale_i=pi),
+						}
 						if name == "map_flatten_ms":
 							param_group["_flatten_scale_i"] = pi
 						param_groups_.append(param_group)

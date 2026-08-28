@@ -1563,6 +1563,7 @@ def save_combined_preview(
         source='fit_spiral interactive preview',
         first_winding=first_winding,
         cleanup_erosion_cells=3,
+        sampling_dr_per_winding=float(dr_per_winding.detach().cpu()),
     )
     return manifest
 

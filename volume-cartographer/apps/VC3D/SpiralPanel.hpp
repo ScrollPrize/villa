@@ -111,6 +111,8 @@ private:
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
     QSpinBox* _iterations = nullptr;
+    QCheckBox* _backgroundPreview = nullptr;
+    QSpinBox* _previewCadence = nullptr;
     QSpinBox* _legacyCheckpointStep = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
     // Read-only reports of what spiral-scroll.json specifies.

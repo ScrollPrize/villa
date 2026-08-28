@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -449,6 +450,7 @@ class ExportPreviewCommand(SessionCommand):
     #: cost about as much as the surface and only the client knows whether
     #: anyone is looking at them.
     diagnostics: bool = False
+    automatic: bool = False
 
 
 @dataclasses.dataclass
@@ -535,6 +537,10 @@ class InteractiveFitSession:
         self._preview_manifest = None
         self._preview_generation = 0
         self._preview_diagnostics = False
+        self._preview_source_iteration = None
+        self._preview_schedule = None
+        self._next_preview_iteration = None
+        self._automatic_previews_disabled = False
         self._preview_session_id = uuid.uuid4().hex
         # Set by every run; the default matters only for the interval before
         # the first one.
@@ -599,6 +605,14 @@ class InteractiveFitSession:
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
+                "preview_source_iteration": getattr(
+                    self, "_preview_source_iteration", None),
+                "preview_schedule": copy.deepcopy(getattr(
+                    self, "_preview_schedule", None)),
+                "next_preview_iteration": getattr(
+                    self, "_next_preview_iteration", None),
+                "automatic_previews_disabled": bool(getattr(
+                    self, "_automatic_previews_disabled", False)),
                 # Whether this generation carries loss overlays, so the host
                 # knows whether a diagnostics publication follows the surface.
                 "preview_diagnostics": getattr(
@@ -1173,33 +1187,92 @@ class InteractiveFitSession:
             self._leave_checkpoint_load()
         command.complete(discarded=True)
 
+    def _preview_snapshot_barrier(self):
+        """Synchronize every fitter rank around rank 0's raw snapshot copy."""
+        dist_context = getattr(getattr(self, "_context", None), "dist", None)
+        if not bool(getattr(dist_context, "is_distributed", False)):
+            return
+        import torch.distributed as dist
+        if dist.get_backend() == "nccl":
+            dist.barrier(device_ids=[int(dist_context.local_rank)])
+        else:
+            dist.barrier()
+
+    def _share_preview_capture_error(self, error):
+        """Broadcast rank 0's capture outcome so cadence stays rank-consistent."""
+        dist_context = getattr(getattr(self, "_context", None), "dist", None)
+        if not bool(getattr(dist_context, "is_distributed", False)):
+            return error
+        import torch
+        import torch.distributed as dist
+        payload = [error if bool(getattr(
+            dist_context, "is_main_process", False)) else None]
+        device = None
+        if dist.get_backend() == "nccl":
+            device = torch.device("cuda", int(dist_context.local_rank))
+        dist.broadcast_object_list(payload, src=0, device=device)
+        return payload[0]
+
     def _run_export_preview(self, command):
         """Export and publish one preview generation at the pause boundary."""
         with self._condition:
             previous_state = self._state
             previous_phase = self._phase
-            self._transition_locked(
-                SessionState.ExportingPreview, "Exporting preview",
-                reason=f"preview command {command.command_id}")
+            if previous_state is SessionState.Running:
+                self._phase = "Capturing preview snapshot"
+            else:
+                self._transition_locked(
+                    SessionState.ExportingPreview, "Exporting preview",
+                    reason=f"preview command {command.command_id}")
         error = None
+        collective_failure = None
         try:
-            self._progress_reporter().begin(
-                "exporting_preview", "Exporting preview")
-            self._publish_preview(diagnostics=command.diagnostics)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            self._preview_snapshot_barrier()
+            try:
+                if getattr(self, "publishes_outputs", True):
+                    self._progress_reporter().begin(
+                        "exporting_preview", "Exporting preview")
+                    self._publish_preview(diagnostics=command.diagnostics)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            error = self._share_preview_capture_error(error)
+            self._preview_snapshot_barrier()
+        except BaseException as exc:
+            collective_failure = exc
         finally:
             self._progress_reporter().clear()
             with self._condition:
-                self._transition_locked(previous_state, previous_phase)
+                if self._state is previous_state:
+                    self._phase = previous_phase
+                    self._condition.notify_all()
+                else:
+                    self._transition_locked(previous_state, previous_phase)
                 manifest = self._preview_manifest
                 generation = self._preview_generation
+                source_iteration = getattr(
+                    self, "_preview_source_iteration", None)
             self._publish_status()
-            if error is None:
-                command.complete(preview_manifest_path=manifest,
-                                 preview_generation=generation)
+            if collective_failure is not None:
+                command.fail(
+                    f"Preview snapshot synchronization failed: "
+                    f"{type(collective_failure).__name__}: {collective_failure}")
+            elif error is None:
+                result = {
+                    "preview_manifest_path": manifest,
+                    "preview_generation": generation,
+                }
+                if source_iteration is not None:
+                    result["source_fit_iteration"] = source_iteration
+                command.complete(**result)
             else:
+                if command.automatic:
+                    with self._condition:
+                        self._automatic_previews_disabled = True
+                        self._warnings.append(
+                            f"Automatic previews disabled for this Run: {error}")
                 command.fail(error)
+        if collective_failure is not None:
+            raise collective_failure
 
     def _run_incorporation(self, command):
         """Append newly uploaded ephemeral inputs to the resident fit.
@@ -1461,6 +1534,29 @@ class InteractiveFitSession:
                 self, "_run_start_completed",
                 self._completed - max(0, self._target - self._completed))
             run_step = max(0, self._completed - run_start)
+            schedule = getattr(self, "_preview_schedule", None)
+            schedule_due = (
+                schedule is not None
+                and not getattr(self, "_automatic_previews_disabled", False)
+                and self._next_preview_iteration is not None
+                and self._completed >= self._next_preview_iteration)
+            final_due = (
+                schedule is not None
+                and not getattr(self, "_automatic_previews_disabled", False)
+                and pause
+                and getattr(self, "_preview_source_iteration", None)
+                    != self._completed)
+            if schedule_due or final_due:
+                self._commands.append(ExportPreviewCommand(
+                    session_generation=self.session_generation,
+                    expected_iteration=self._completed,
+                    diagnostics=bool(schedule.get("diagnostics", False)),
+                    automatic=True))
+                if schedule_due:
+                    cadence = int(schedule["cadence_iterations"])
+                    while self._next_preview_iteration <= self._completed:
+                        self._next_preview_iteration += cadence
+                self._condition.notify_all()
         self._progress_reporter().update(run_step)
         self._publish_status()
         if pause:
@@ -1494,25 +1590,31 @@ class InteractiveFitSession:
     def _publish_preview(self, diagnostics=False):
         with self._condition:
             generation = self._preview_generation + 1
+            source_iteration = getattr(self, "_completed", 0)
         generation_path = (Path(self.paths.output_directory) / ".spiral-preview" /
                            self._preview_session_id / f"generation-{generation}")
         surface_id = f"spiral-output-generation-{generation}"
         manifest = self._context.export_preview(
             str(generation_path), surface_id, diagnostics=diagnostics)
+        manifest = dict(manifest)
+        manifest["source_fit_iteration"] = int(source_iteration)
+        manifest_path = Path(str(manifest["manifest_path"]))
+        if manifest_path.is_file():
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         with self._condition:
             self._preview_generation = generation
-            self._preview_manifest = str(manifest["manifest_path"])
+            self._preview_manifest = str(manifest_path)
             self._preview_diagnostics = bool(diagnostics)
-        # Publish while the session is still in ExportingPreview.  The host
-        # service synchronously Lasagna-flattens and packages this generation
-        # from the status callback, so clients cannot start another Run while
-        # the downloadable preview is still being prepared.
+            self._preview_source_iteration = int(source_iteration)
+        # The host callback only claims this immutable raw generation.
+        # Flattening, mapping, indexing, and transfer continue independently.
         self._publish_status()
 
     # Coordinator-thread commands.
     def run(self, count, pending_inputs=None, mark_incorporated=None,
             influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True, barrier=None):
+            autosave_on_pause=True, preview_schedule=None, barrier=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
@@ -1528,6 +1630,11 @@ class InteractiveFitSession:
             # property of the run that is pausing, decided at admission
             # rather than read from configuration at the boundary.
             self._autosave_on_pause = bool(autosave_on_pause)
+            self._preview_schedule = copy.deepcopy(preview_schedule)
+            self._next_preview_iteration = (
+                self._completed + int(preview_schedule["cadence_iterations"])
+                if preview_schedule else None)
+            self._automatic_previews_disabled = False
             # Frozen for the lifetime of this Run. Live additions must not
             # observe panel edits made after admission.
             self._active_influence_config = dict(influence_config or {})
@@ -1709,6 +1816,25 @@ class InteractiveFitSession:
                         command.records, no_future_step=True)
             command.complete(no_future_step=True, outcomes=[])
 
+    def disable_automatic_previews(self, error=None):
+        """Stop this Run's cadence after a capture/publication failure."""
+        with self._condition:
+            self._automatic_previews_disabled = True
+            abandoned = [command for command in self._commands
+                         if isinstance(command, ExportPreviewCommand)
+                         and command.automatic]
+            self._commands = [command for command in self._commands
+                              if command not in abandoned]
+            if error:
+                warning = f"Automatic previews disabled for this Run: {error}"
+                if warning not in self._warnings:
+                    self._warnings.append(warning)
+            self._condition.notify_all()
+        for command in abandoned:
+            command.cancel("automatic previews disabled")
+        self._publish_status()
+        return {"disabled": True}
+
     def save_checkpoint(self, path, timeout=120.0):
         with self._condition:
             if self._state is not SessionState.Idle:
@@ -1850,20 +1976,24 @@ class InteractiveFitSession:
         return self._queue_command(command, timeout)
 
     def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S,
-                       diagnostics=False):
+                       diagnostics=False, barrier=None):
         """Export and publish one preview generation, on request.
 
         A coordinator sub-operation: only the publishing rank exports, so it
         carries no command epoch, exactly like a checkpoint save.
         """
         with self._condition:
-            if self._state is not SessionState.Idle:
+            if self._state not in {SessionState.Idle, SessionState.Running}:
                 raise RuntimeError(
                     f"Preview export is not allowed in {self._state.name}")
-            if not getattr(self, "publishes_outputs", True):
-                raise RuntimeError("This rank does not publish outputs")
+            epoch = (
+                None if self._state is SessionState.Idle and barrier is None
+                else self._enter_epoch_locked("export_preview", barrier))
+            if self._state is SessionState.Running:
+                self._step_epoch = epoch
             command = ExportPreviewCommand(
                 session_generation=self.session_generation,
+                epoch=epoch,
                 expected_iteration=self._completed,
                 diagnostics=bool(diagnostics))
         return self._queue_command(command, timeout)
@@ -1949,10 +2079,14 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         path_changes=arguments.get("path_changes"),
                         autosave_on_pause=arguments.get(
                             "autosave_on_pause", True),
+                        preview_schedule=arguments.get("preview_schedule"),
                         barrier=barrier,
                     )
                 elif name == "stop":
                     result = session.stop(barrier=barrier)
+                elif name == "disable_automatic_previews":
+                    result = session.disable_automatic_previews(
+                        arguments.get("error"))
                 elif name == "reserve_incorporation":
                     result = session.reserve_live_incorporation(
                         arguments["target_iteration"],
@@ -1975,11 +2109,10 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         reservation_epoch=arguments["reservation_epoch"],
                         timeout=arguments.get("timeout", COMMAND_ACK_TIMEOUT_S))
                 elif name == "export_preview":
-                    # Coordinator sub-operation: only the publishing rank is
-                    # asked, and it carries no barrier.
                     result = session.export_preview(
                         arguments.get("timeout", PREVIEW_EXPORT_TIMEOUT_S),
-                        diagnostics=arguments.get("diagnostics", False))
+                        diagnostics=arguments.get("diagnostics", False),
+                        barrier=barrier)
                 elif name == "rebuild_model":
                     result = session.rebuild_model(
                         arguments["paths"], arguments["run"],
@@ -2429,7 +2562,7 @@ class DistributedInteractiveFitSession:
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
             influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True):
+            autosave_on_pause=True, preview_schedule=None):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
@@ -2440,6 +2573,7 @@ class DistributedInteractiveFitSession:
             "run_config": dict(run_config or {}),
             "path_changes": dict(path_changes or {}),
             "autosave_on_pause": bool(autosave_on_pause),
+            "preview_schedule": copy.deepcopy(preview_schedule),
         }
         return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S,
                           incorporation_callback=mark_incorporated)
@@ -2574,19 +2708,24 @@ class DistributedInteractiveFitSession:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
 
+    def disable_automatic_previews(self, error=None):
+        return self._call(
+            "disable_automatic_previews", {"error": error},
+            collective=False)
+
     def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S,
                        diagnostics=False):
         state = self.status()["state"]
-        if state != SessionState.Idle:
+        if state not in {SessionState.Idle, SessionState.Running}:
             raise RuntimeError(f"Preview export is not allowed in {state}")
-        # Explicitly a coordinator sub-operation: rank 0 publishes outputs,
-        # so rank 0 alone exports the preview, outside the epoch sequence.
+        # Every rank enters the same short source-snapshot boundary. Rank 0
+        # writes the raw TIFXYZ; siblings wait at the command boundary and all
+        # resume optimization together once capture finishes.
         return self._call("export_preview",
                           {"timeout": timeout,
                            "diagnostics": bool(diagnostics)},
-                          ranks=(0,),
                           timeout=timeout + COMMAND_ACK_GRACE_S,
-                          collective=False)
+                          collective=True)
 
     def rebuild_model(self, paths, run, timeout=1800.0):
         """Rebuild the model stage on every rank against retained inputs."""

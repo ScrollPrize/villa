@@ -573,6 +573,10 @@ class ServiceState:
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
         self._preview_export_active = False
+        self._preview_schedule = None
+        self._next_preview_iteration = None
+        self._automatic_previews_disabled = False
+        self._automatic_preview_generations = set()
         self.config_catalog = Config.catalog()
         self.session_revision = 0
 
@@ -663,6 +667,24 @@ class ServiceState:
                 dict(self._preview.progress)
                 if self._preview.progress else None)
             response["preview_publish_error"] = self._preview.error
+            response["preview_active"] = bool(self._preview.generation)
+            response["preview_pending"] = bool(
+                self._preview.pending_generation)
+            response["preview_source_iteration"] = (
+                self._preview.source_fit_iteration)
+            response["preview_active_source_iteration"] = (
+                self._preview.active_source_fit_iteration)
+            response["preview_pending_source_iteration"] = (
+                self._preview.pending_source_fit_iteration)
+            response["preview_initialization_mode"] = (
+                self._preview.initialization_mode)
+            response["preview_schedule"] = copy.deepcopy(
+                response.get("preview_schedule") or self._preview_schedule)
+            response["next_preview_iteration"] = response.get(
+                "next_preview_iteration", self._next_preview_iteration)
+            response["automatic_previews_disabled"] = (
+                self._automatic_previews_disabled
+                or bool(response.get("automatic_previews_disabled")))
             publishing = self._preview.status_progress()
             if publishing is not None:
                 response["phase"] = publishing["stage_name"]
@@ -1145,19 +1167,23 @@ class ServiceState:
 
     def _reset_session_scope(self):
         self._preview_export_active = False
+        self._preview_schedule = None
+        self._next_preview_iteration = None
+        self._automatic_previews_disabled = False
+        self._automatic_preview_generations.clear()
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
         self.ephemeral_records.clear()
         self.uploads_manager.reset()
-        previous_raw = self._preview.reset_session_scope()
-        if previous_raw:
+        stale_raw = self._preview.reset_session_scope()
+        for manifest in stale_raw:
             shutil.rmtree(
-                Path(previous_raw).parent, ignore_errors=True)
+                Path(manifest).parent, ignore_errors=True)
 
     def _status_changed(self, status):
-        # Runs on the fitter thread inside the pause/export window, so artifact
-        # digests are computed while training is stopped.
+        # Runs on the fitter thread. It may only claim immutable raw work;
+        # publication itself is background work and must never hold the fit.
         try:
             self._maybe_register_artifacts(status)
         except Exception as exc:
@@ -1236,14 +1262,44 @@ class ServiceState:
                     rank=rank, session_generation=generation)
 
     def _maybe_register_artifacts(self, status):
+        """Offer a raw snapshot to the bounded background publisher.
+
+        This callback runs on the fitter thread.  It must only claim or
+        coalesce the immutable raw generation; all Lasagna, mapping, hashing,
+        and indexing work belongs to the background publication thread.
+        """
         with self.lock:
             session_id = self.session_id
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
+            if preview_generation and status.get("preview_schedule"):
+                self._automatic_preview_generations.add(preview_generation)
+            old_pending = self._preview.pending_manifest
             publish_preview = bool(preview_manifest) and self._preview.claim(
-                session_id, preview_generation)
+                session_id, preview_generation, manifest=preview_manifest,
+                source_fit_iteration=status.get("preview_source_iteration",
+                                                status.get("current_iteration")),
+                diagnostics=bool(status.get("preview_diagnostics")))
+            replaced_pending = (
+                old_pending
+                and old_pending != self._preview.pending_manifest
+                and old_pending != self._preview.previous_raw_manifest)
+        if replaced_pending:
+            shutil.rmtree(Path(old_pending).parent, ignore_errors=True)
         if not publish_preview:
             return
+
+        snapshot = dict(status)
+        threading.Thread(
+            target=self._publish_preview_artifact,
+            args=(snapshot,), name="spiral-preview-publish",
+            daemon=True).start()
+
+    def _publish_preview_artifact(self, status):
+        with self.lock:
+            session_id = self.session_id
+            preview_generation = int(status.get("preview_generation") or 0)
+            preview_manifest = status.get("preview_manifest_path")
 
         try:
             publisher, published = self._publish_flattened_preview(
@@ -1284,6 +1340,10 @@ class ServiceState:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
                     self._preview.error = None
+                    self._preview.initialization_mode = (
+                        published.initialization_mode)
+                    self._preview.source_fit_iteration = (
+                        published.source_fit_iteration)
                 self.status_generation += 1
             self.artifacts.prune(
                 "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
@@ -1332,11 +1392,41 @@ class ServiceState:
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.error = error
+                    if preview_generation in self._automatic_preview_generations:
+                        self._automatic_previews_disabled = True
+                        disable_automatic = self.session
+                    else:
+                        disable_automatic = None
+                else:
+                    disable_automatic = None
+            if disable_automatic is not None:
+                try:
+                    disable_automatic.disable_automatic_previews(error)
+                except Exception as disable_exc:
+                    self.events.append(
+                        "log", "Could not disable automatic previews on the "
+                        f"fit workers: {type(disable_exc).__name__}: "
+                        f"{disable_exc}", severity="warning", source="service")
         finally:
+            next_status = None
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.finish(preview_generation)
+                    next_status = self._preview.take_pending()
+                    if next_status is not None:
+                        self._preview.claim(
+                            session_id, next_status["preview_generation"],
+                            manifest=next_status["preview_manifest_path"],
+                            source_fit_iteration=next_status.get(
+                                "current_iteration"),
+                            diagnostics=next_status.get(
+                                "preview_diagnostics", False))
                     self.status_generation += 1
+            if next_status is not None:
+                threading.Thread(
+                    target=self._publish_preview_artifact,
+                    args=(next_status,), name="spiral-preview-publish",
+                    daemon=True).start()
 
     def _update_preview_publish(self, generation, **values):
         with self.lock:
@@ -1374,6 +1464,24 @@ class ServiceState:
         if iterations < 1:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "iterations must be at least 1")
+        schedule = request.get("preview_schedule")
+        if schedule is not None:
+            if not isinstance(schedule, dict):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "preview_schedule must be an object when enabled")
+            try:
+                cadence = int(schedule.get("cadence_iterations"))
+            except (TypeError, ValueError):
+                cadence = 0
+            diagnostics = schedule.get("diagnostics", False)
+            if cadence < 1 or not isinstance(diagnostics, bool):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "preview_schedule requires cadence_iterations >= 1 and "
+                    "a boolean diagnostics value")
+            schedule = {"cadence_iterations": cadence,
+                        "diagnostics": diagnostics}
         current = session.status().get("applied_config")
         request_run = self.session_request.get("run") or {}
         if current is None:
@@ -1426,6 +1534,13 @@ class ServiceState:
                     no_future_step=no_future_step)
 
             self._active_run_influence = dict(influence_config)
+            current_iteration = int(
+                session.status().get("current_iteration") or 0)
+            self._preview_schedule = copy.deepcopy(schedule)
+            self._next_preview_iteration = (
+                current_iteration + schedule["cadence_iterations"]
+                if schedule else None)
+            self._automatic_previews_disabled = False
 
         run_arguments = {
                 "pending_inputs": pending,
@@ -1437,6 +1552,8 @@ class ServiceState:
                 # nothing about the model, so it needs no planning round.
                 "autosave_on_pause": autosave_on_pause,
         }
+        if schedule is not None:
+            run_arguments["preview_schedule"] = copy.deepcopy(schedule)
         try:
             target = session.run(iterations, **run_arguments)
         except BaseException:
@@ -1521,10 +1638,10 @@ class ServiceState:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A preview export is already in progress")
             state = session.status().get("state")
-            if state != SessionState.Idle:
+            if state not in {SessionState.Idle, SessionState.Running}:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
-                    f"Exporting a preview requires an idle session (state is "
+                    f"Exporting a preview requires an idle or running session (state is "
                     f"{SessionState(state).name})")
             self._preview_export_active = True
             self.status_generation += 1
@@ -1536,11 +1653,12 @@ class ServiceState:
         return {**self.status(), "accepted": True}
 
     def _export_preview(self, session, session_id, diagnostics=False):
-        """Run one export off the HTTP thread and report it through status.
+        """Capture one raw generation off the HTTP thread.
 
-        Publication follows the session's preview status on the fitter
-        thread, so this returns only once the whole generation is published;
-        nothing but this thread is waiting on it.
+        The session callback hands the immutable raw snapshot to the bounded
+        publication coordinator. This worker returns as soon as capture is
+        complete; Lasagna, mapping, indexing, and transfer remain background
+        work and cannot hold either fitting or a later Run.
         """
         try:
             session.export_preview(diagnostics=diagnostics)

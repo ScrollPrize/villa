@@ -1916,6 +1916,39 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     _check_cancel()
 
                 fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle)
+                uv_export = body.get("export_flatten_uv")
+                if uv_export is not None:
+                    if not isinstance(uv_export, dict):
+                        raise ValueError("export_flatten_uv must be an object")
+                    job.set_running(
+                        "saving", 0, 0, 0.0,
+                        stage_name="Exporting source-grid flatten UV sidecars")
+                    import torch
+                    from flatten_uv import write_sidecars
+                    st = torch.load(
+                        str(model_output), map_location="cpu", weights_only=False)
+                    if not isinstance(st, dict) or "flatten_forward_uv" not in st:
+                        raise ValueError(
+                            "flatten result contains no source-grid forward UV field")
+                    value = st["flatten_forward_uv"]
+                    if hasattr(value, "detach"):
+                        value = value.detach().cpu().numpy()
+                    valid = st.get("flatten_source_valid")
+                    if hasattr(valid, "detach"):
+                        valid = valid.detach().cpu().numpy()
+                    write_sidecars(
+                        str(uv_export.get("directory") or ""), value,
+                        fingerprint=str(
+                            uv_export.get("canonical_grid_fingerprint") or ""),
+                        source_step=float(uv_export["source_step"]),
+                        output_step=float(uv_export["output_step"]),
+                        valid=valid,
+                        winding_column_ranges=uv_export.get(
+                            "winding_column_ranges"),
+                        winding_ids=uv_export.get("winding_ids"),
+                        sampling_dr_per_winding=float(
+                            uv_export.get("sampling_dr_per_winding", 1.0)),
+                    )
                 if (body.get("embed_job_metadata", True)
                         and isinstance(job_spec, dict)
                         and Path(model_output).is_file()):

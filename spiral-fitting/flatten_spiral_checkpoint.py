@@ -249,6 +249,7 @@ def _export_source_surface(
         source="flatten_spiral_checkpoint.py",
         first_winding=first,
         cleanup_erosion_cells=3,
+        sampling_dr_per_winding=float(dr_per_winding.detach().cpu()),
     )
     del transform, model, dr_per_winding, winding_grids
     gc.collect()
