@@ -12,19 +12,18 @@ This module instead determines each object's target winding from a sparse, no-gr
 sample of the WHOLE object.  Normally its median is snapped to the nearest winding. If
 a majority of its points are genuinely away from every winding, however, it is treated
 as floating in a gap and targets the outward candidate: the DT loss then pulls a
-more-outward spiral winding inward onto the object. Targets are cached and
-refreshed every cfg['dt_target_update_interval'] steps (the target-determination pass
-transforms every object's sample points, so recomputing it each step would roughly
-duplicate the loss forward cost).
+more-outward spiral winding inward onto the object. Targets are cached and refreshed
+on the shared theta-crossing-map cadence (the target-determination pass transforms
+every object's sample points, so recomputing it each step would roughly duplicate the
+loss forward cost).
 
 Frames: unwrapped shifted radii are only defined up to an integer number of windings
-(the choice of unwrap reference point). Caches therefore retain, per object, a sparse
-field of integer unwrap adjustments at known positions -- UV coordinates for patches,
-within-strip point indices for strips/tracks -- plus theta at cache time. A loss
-sample anchors to its nearest cached position and transfers the target through the
-integer adjustments and the theta wrap difference at the anchor alone, so real radial
-variation (or drift since the last cache update) is never mistaken for an
-unwrap-frame change (see snap_patch_dt_target / snap_strip_dt_target).
+(the choice of unwrap reference point). Patches reuse the shared theta map's root
+frame directly; their target cache is invalidated whenever that map refreshes.
+Strips/tracks retain a sparse field of integer unwrap adjustments and theta at known
+within-strip point indices, because main tracks are not part of the shared theta map.
+A strip loss anchors to its nearest cached position and transfers the target through
+that anchor alone (see snap_strip_dt_target).
 """
 
 import numpy as np
@@ -154,6 +153,19 @@ def patch_dt_target_in_sample_frame(
     median_target = snap_dt_target(sample_median, dr_per_winding)
     if cache is None:
         return median_target
+    if cache.get('frame') == 'theta_potential':
+        # Patch loss samples have already been lifted into the shared
+        # ThetaCrossingMap's per-patch root frame. Whole-patch targets are
+        # cached in that same frame, so no sparse anchor search is necessary.
+        cache_idx = torch.as_tensor(
+            patch_indices, dtype=torch.int64, device=sample_theta.device)
+        target = cache['target_relative'][cache_idx].to(sample_radii.dtype)
+        valid = cache['valid'][cache_idx]
+        target = torch.broadcast_to(target, sample_theta.shape[:-1])
+        valid = torch.broadcast_to(valid, sample_theta.shape[:-1])
+        return torch.where(
+            valid[..., None], target[..., None] * dr_per_winding,
+            median_target)
     cache_idx = torch.as_tensor(patch_indices, dtype=torch.int64, device=sample_theta.device)
     cache_idx = torch.broadcast_to(cache_idx, sample_theta.shape[:-1])
     target, valid = snap_patch_dt_target(
@@ -415,76 +427,57 @@ def _unwrap_block_samples(theta, block_rc, block_shape):
 
 
 @torch.no_grad()
-def compute_patch_dt_target_cache(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, floating_threshold, chunk_size=65536):
-    # Whole-patch DT target determination: transform every patch's precomputed sparse
-    # sample (see prepare_patch_dt_target_samples) through the current scroll->spiral
-    # map in one batched pass, 2D-unwrap each patch's shifted radii over its block
-    # grid, and pool the largest connected component. Returns padded per-patch GPU
-    # tensors containing sparse UV coordinates, theta, relative integer adjustments,
-    # and the selected target relative to the same reference adjustment. These let a
-    # loss strip transfer the target through a nearby UV anchor without comparing
-    # shifted radii. 'valid' is False where no usable sample exists and
-    # 'anchor_dist_sq_limit' bounds how far that anchor may be (in both cases
-    # snap_patch_dt_target falls back to the strip median); scalar stats
-    # ('num_points', 'main_component_fraction') are included for logging.
+def compute_patch_dt_target_cache(
+    slice_to_spiral_transform, dr_per_winding, patches, patch_atlas,
+    crossing_map, floating_threshold, chunk_size=65536,
+):
+    """Choose one target per patch in the shared theta-potential frame.
+
+    The ordinary patch loss path already lifts every sampled point with
+    ``ThetaCrossingMap.adjustments_from_potentials``. Reusing that frame here
+    avoids retaining a second UV/theta/adjustment atlas. The caller invalidates
+    this cache whenever the theta map refreshes.
+    """
     device = dr_per_winding.device
     num_patches = len(patches)
     counts = np.array([len(p._dt_target_ijs) for p in patches], dtype=np.int64)
     total = int(counts.sum())
-    max_count = int(counts.max()) if num_patches else 0
-    padded_ijs = np.zeros((num_patches, max_count, 2), dtype=np.float32)
-    padded_theta = np.zeros((num_patches, max_count), dtype=np.float32)
-    relative_adjustments = np.zeros((num_patches, max_count), dtype=np.float32)
-    point_valid = np.zeros((num_patches, max_count), dtype=bool)
-    target_relative = np.zeros(num_patches, dtype=np.float32)
-    valid = counts > 0
-    main_component_points = 0
+    target_relative = torch.zeros(
+        num_patches, dtype=torch.int64, device=device)
+    valid = torch.from_numpy(counts > 0).to(device=device)
     if total > 0:
         ijs_np = np.concatenate([p._dt_target_ijs for p in patches], axis=0)
         patch_idx_np = np.repeat(np.arange(num_patches, dtype=np.int64), counts)
+        node_ids_np = patch_atlas.theta_node_ids(patch_idx_np, ijs_np)
         # The atlas is host-resident: the gather runs on CPU and only the
         # interpolated points land on the device.
         zyxs = patch_atlas.lookup(
             torch.from_numpy(patch_idx_np), torch.from_numpy(ijs_np))
         spiral_zyxs = _transform_in_chunks(slice_to_spiral_transform, zyxs, chunk_size)
-        theta_t, _, shifted_t = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-        theta_np = theta_t.cpu().numpy()
-        shifted_np = shifted_t.float().cpu().numpy()
-        dr = float(dr_per_winding.detach())
+        theta, _, shifted = get_theta_and_radii(
+            spiral_zyxs[..., 1:], dr_per_winding)
+        node_ids = torch.as_tensor(
+            node_ids_np, dtype=torch.int64, device=theta.device)
+        adjustments = crossing_map.winding_potentials(
+            node_ids, theta).to(shifted.dtype)
+        values = shifted + adjustments * dr_per_winding.detach()
+        values_cpu = values.float().cpu()
+        dr = float(dr_per_winding.detach().cpu())
         offsets = np.concatenate([[0], np.cumsum(counts)])
-        for n, patch in enumerate(patches):
-            lo, hi = offsets[n], offsets[n + 1]
+        for n in range(num_patches):
+            lo, hi = int(offsets[n]), int(offsets[n + 1])
             if hi == lo:
                 continue
-            adjustments, main = _unwrap_block_samples(
-                theta_np[lo:hi], patch._dt_target_block_rc, patch._dt_target_block_shape,
-            )
-            values = shifted_np[lo:hi][main] + adjustments[main] * dr
-            # Normalize both the sparse adjustment field and target to one arbitrary
-            # point in the main component. The arbitrary BFS frame then cancels.
-            reference_adjustment = adjustments[np.flatnonzero(main)[0]]
-            count = hi - lo
-            padded_ijs[n, :count] = patch._dt_target_ijs
-            padded_theta[n, :count] = theta_np[lo:hi]
-            relative_adjustments[n, :count] = adjustments - reference_adjustment
-            point_valid[n, :count] = main
-            target_relative[n] = float(select_whole_object_target(
-                torch.from_numpy(values), dr, floating_threshold,
-            )) - reference_adjustment
-            main_component_points += int(main.sum())
-    anchor_dist_sq_limits = np.array(
-        [p._dt_target_anchor_max_dist_sq for p in patches], dtype=np.float32,
-    ).reshape(num_patches)
+            # select_whole_object_target already returns winding units. Store
+            # that integer directly; dividing by dr here would scale twice.
+            selected = select_whole_object_target(
+                values_cpu[lo:hi], dr, floating_threshold)
+            target_relative[n] = torch.round(selected).to(torch.int64)
     return {
-        'ijs': torch.from_numpy(padded_ijs).to(device=device),
-        'theta': torch.from_numpy(padded_theta).to(device=device),
-        'relative_adjustment': torch.from_numpy(relative_adjustments).to(device=device),
-        'point_valid': torch.from_numpy(point_valid).to(device=device),
-        'target_relative': torch.from_numpy(target_relative).to(device=device),
-        'valid': torch.from_numpy(valid).to(device=device),
-        'anchor_dist_sq_limit': torch.from_numpy(anchor_dist_sq_limits).to(device=device),
+        'frame': 'theta_potential',
+        'target_relative': target_relative,
+        'valid': valid,
         'num_points': total,
-        'main_component_fraction': main_component_points / max(total, 1),
     }
 
 
