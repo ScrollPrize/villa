@@ -455,16 +455,44 @@ class FlatPatchReader:
             block = array[y0:y1, x0:x1, self.layer_indices]
         return np.asarray(block)
 
-    def read(self, y0: int, x0: int, out_h: int, out_w: int) -> np.ndarray:
-        """Read one padded H/W/Z patch with centered short-depth placement."""
+    def source_placement(self, y0: int, x0: int, out_h: int, out_w: int):
+        """Where in an output patch `read` puts source voxels, or None.
 
+        Everything outside this region is padding the reader inserted, and
+        training leaves such padding at zero rather than folding it into
+        normalization statistics.  Both `read` and the flat dataset derive
+        their placement from here so the two cannot drift apart.
+        """
         y1, x1 = y0 + out_h, x0 + out_w
         source_y0, source_x0 = max(0, y0), max(0, x0)
         source_y1, source_x1 = min(self.height, y1), min(self.width, x1)
+        if source_y1 <= source_y0 or source_x1 <= source_x0:
+            return None
+        depth_start = self.output_depth_start
+        return {
+            "source": (source_y0, source_y1, source_x0, source_x1),
+            "rows": slice(source_y0 - y0, source_y1 - y0),
+            "cols": slice(source_x0 - x0, source_x1 - x0),
+            "depth": slice(depth_start, depth_start + self.layer_indices.size),
+        }
+
+    def valid_region_zyx(self, y0: int, x0: int, out_h: int, out_w: int):
+        """`source_placement` as a Z/Y/X slice tuple, or None."""
+
+        placement = self.source_placement(y0, x0, out_h, out_w)
+        if placement is None:
+            return None
+        return (placement["depth"], placement["rows"], placement["cols"])
+
+    def read(self, y0: int, x0: int, out_h: int, out_w: int) -> np.ndarray:
+        """Read one padded H/W/Z patch with centered short-depth placement."""
+
         dtype = np.float32 if self.preprocessing == "tifxyz_robust" else np.uint8
         output = np.zeros((out_h, out_w, self.output_depth), dtype=dtype)
-        if source_y1 <= source_y0 or source_x1 <= source_x0:
+        placement = self.source_placement(y0, x0, out_h, out_w)
+        if placement is None:
             return output
+        source_y0, source_y1, source_x0, source_x1 = placement["source"]
         block = self._read_raw(source_y0, source_y1, source_x0, source_x1)
         if self.preprocessing == "tifxyz_robust":
             block = np.asarray(block, dtype=np.float32)
@@ -478,12 +506,7 @@ class FlatPatchReader:
             block = np.ascontiguousarray(block)
         else:
             raise ValueError(f"Unsupported flat preprocessing {self.preprocessing!r}")
-        depth_start = self.output_depth_start
-        output[
-            source_y0 - y0 : source_y1 - y0,
-            source_x0 - x0 : source_x1 - x0,
-            depth_start : depth_start + self.layer_indices.size,
-        ] = block
+        output[placement["rows"], placement["cols"], placement["depth"]] = block
         return output
 
 
@@ -518,7 +541,21 @@ class FlatBlockDataset(Dataset):
         # maps an all-zero patch to nonzero values.
         nonempty = int(patch_HWZ.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
-        patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
+        # Training normalizes only the voxels actually read from the source and
+        # leaves reader padding at zero (data/dataset.py::_tensor_sample).
+        # Robust normalization takes full-array percentiles, median and MAD, so
+        # normalizing the padded patch lets artificial zeros move the statistics
+        # for every real CT voxel.  divide_255 is unaffected: zero stays zero.
+        valid_zyx = self.reader.valid_region_zyx(
+            block.y0, block.x0, self.patch_size, self.patch_size
+        )
+        if self.preprocessing == "tifxyz_robust" and valid_zyx is not None:
+            patch_ZYX = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
+            patch_ZYX[valid_zyx] = normalize_flat_patch(
+                patch_ZYX[valid_zyx], self.preprocessing
+            )
+        else:
+            patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
         image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
         metadata = torch.tensor(
             [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
