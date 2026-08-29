@@ -925,15 +925,19 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
                                          false);
     surfaces.stripPositionMap = positionMap;
 
-    surfaces.lineZSlices.reserve(line.points.size());
+    if (config.buildLineZSlices) {
+        surfaces.lineZSlices.reserve(line.points.size());
+    }
     surfaces.lineUpVectors.reserve(line.points.size());
     for (size_t i = 0; i < line.points.size(); ++i) {
-        const cv::Vec3f origin = toVec3f(line.points[i].position);
-        const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
         const cv::Vec3f up = toVec3f(frameData.transportedUpVectors[i]);
-        auto plane = std::make_shared<PlaneSurface>();
-        plane->setFromNormalAndUp(origin, tangent, up);
-        surfaces.lineZSlices.push_back(std::move(plane));
+        if (config.buildLineZSlices) {
+            const cv::Vec3f origin = toVec3f(line.points[i].position);
+            const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
+            auto plane = std::make_shared<PlaneSurface>();
+            plane->setFromNormalAndUp(origin, tangent, up);
+            surfaces.lineZSlices.push_back(std::move(plane));
+        }
         surfaces.lineUpVectors.push_back(up);
     }
     return surfaces;

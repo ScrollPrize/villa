@@ -113,8 +113,23 @@ public:
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
         const CChunkedVolumeViewer::CameraState& camera,
         const std::map<std::string, GeneratedOverlay>& overlays = {});
-    bool setGeneratedLineViews(const GeneratedViews& views,
+    // Takes the views by value: the caller hands its (large - all line
+    // points, normals, branch polylines, strip map) struct over instead of
+    // this dialog copying it a second time.
+    bool setGeneratedLineViews(GeneratedViews views,
                                const CChunkedVolumeViewer::CameraState& camera);
+    // Shift freshly rebuilt strip surfaces so the fiber spot under the live
+    // strip cameras keeps its surface coordinate across the update. The
+    // controller calls this BEFORE re-registering the surfaces: the strip
+    // viewers keep their raw camera coordinates when they adopt replacements,
+    // so anchoring the new parameterization instead of moving the cameras
+    // keeps every frame — old, new, and the held overlays in between —
+    // pixel-stable through the swap. No-op without live strip views.
+    void anchorGeneratedStripSurfacesForUpdate(
+        QuadSurface* newLineSurface,
+        QuadSurface* newLineSideSlice,
+        const vc::lasagna::LineStripPositionMap& newPositionMap,
+        const std::vector<cv::Vec3f>& newLinePoints) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
@@ -157,7 +172,12 @@ public:
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
-    void setOptimizationBusy(bool busy);
+    // blockInput=true covers the panes with the input-swallowing overlay
+    // (initial seed solves: there is no line to edit yet). blockInput=false
+    // shows a passive top-center badge instead and leaves the panes
+    // interactive, so control points can keep being placed while a
+    // re-optimization runs (edits coalesce in the controller).
+    void setOptimizationBusy(bool busy, bool blockInput = true);
     void setOptimizationStatus(bool optimized);
     // Empty retracts the notice; see updateUmbilicusNotice().
     void setUmbilicusNotice(const QString& notice);
@@ -439,13 +459,17 @@ private:
     bool _optimizationStatusOptimized = false;
     // The overlay only blocks the mouse, so keyboard-driven edits have to test
     // this themselves before they queue any deferred state.
-    bool _optimizationBusy = false;
+    // True only while the blocking overlay is up (busy && blockInput):
+    // passive-badge solves keep editing live, and key handlers must match
+    // what a mouse click can reach.
+    bool _optimizationInputBlocked = false;
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
+    QPointer<QWidget> _optimizationBadge;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
@@ -487,10 +511,6 @@ private:
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
     std::vector<bool> _stripOverlaySwapPending;
-    // Volume point of the most recent control-point placement click; the next
-    // in-place update moves the current line position onto the control point
-    // nearest to it, so the marker lands on the new point with the new image.
-    std::optional<cv::Vec3f> _pendingPlacementFocus;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).

@@ -233,7 +233,8 @@ def load_winding_inference_store(path, device, *, verify=True, z_range=None):
 
 
 def _component_residual(
-    spiral_pairs, sample_pairs, target, dr_per_winding, z_begin, z_end,
+    spiral_pairs, sample_pairs, target, shell_pair_valid, dr_per_winding,
+    z_begin, z_end,
 ):
     theta, _radius, shifted = get_theta_and_radii(
         spiral_pairs[..., 1:], dr_per_winding)
@@ -249,7 +250,7 @@ def _component_residual(
         & (sample_pairs[..., 0] < float(z_end))
         & torch.isfinite(sample_pairs).all(dim=-1)
         & torch.isfinite(spiral_pairs).all(dim=-1)
-    ).all(dim=-1) & torch.isfinite(predicted) & (target > 0)
+    ).all(dim=-1) & torch.isfinite(predicted) & (target > 0) & shell_pair_valid
     return predicted - target, valid
 
 
@@ -272,6 +273,7 @@ def get_winding_inference_losses(
     slice_to_spiral_transform,
     dr_per_winding,
     store,
+    shell_map,
     cfg,
     z_begin,
     z_end,
@@ -304,7 +306,12 @@ def get_winding_inference_losses(
             "dense_spacing_winding_model_density": zero,
         }, {}
 
-    spiral = slice_to_spiral_transform(all_points.reshape(-1, 3)).reshape(-1, 2, 3)
+    shell_radius, sample_radius, _shell_confidence, shell_valid = \
+        shell_map.lookup(all_points)
+    shell_pair_valid = (
+        shell_valid & (sample_radius <= shell_radius)).all(dim=-1)
+    spiral = slice_to_spiral_transform(
+        all_points.reshape(-1, 3)).reshape(-1, 2, 3)
     losses = {}
     metrics = {}
     cursor = 0
@@ -315,12 +322,17 @@ def get_winding_inference_losses(
         component_spiral = spiral[cursor : cursor + count]
         component_points = all_points[cursor : cursor + count]
         component_target = all_targets[cursor : cursor + count]
+        component_shell_valid = shell_pair_valid[cursor : cursor + count]
         cursor += count
         residual, valid = _component_residual(
             component_spiral, component_points, component_target,
-            dr_per_winding, z_begin, z_end)
+            component_shell_valid, dr_per_winding, z_begin, z_end)
+        # Invalid pairs may contain non-finite transform residuals. Replace
+        # them before Huber evaluation so a later zero mask cannot encounter
+        # inf * 0 or nan * 0.
+        safe_residual = torch.where(valid, residual, torch.zeros_like(residual))
         per_pair = F.huber_loss(
-            residual, torch.zeros_like(residual), reduction="none",
+            safe_residual, torch.zeros_like(safe_residual), reduction="none",
             delta=float(cfg["winding_model_huber_delta"]),
         )
         valid_f = valid.to(per_pair.dtype)

@@ -737,7 +737,9 @@ class ThetaCrossingMap:
         """Return aggregate cycle/path-independence diagnostics."""
         return self.potential_inconsistencies()[0]
 
-    def adjustments(self, packed_walks, sampled_theta, dr_per_winding):
+    def adjustments(
+            self, packed_walks, sampled_theta, dr_per_winding, *,
+            return_walk_start_adjustment=False):
         """Gather cumulative crossing adjustments for packed sampled walks.
 
         Inputs are row-major. Packed edge IDs/directions describe each dense
@@ -747,7 +749,8 @@ class ThetaCrossingMap:
         row with a nonnegative reference-node ID is instead transported from
         that exact node through the start of the dense walk; relative/absolute
         winding losses use this to retain the annotated PCL point's frame even
-        when the random samples omit the walk origin.
+        when the random samples omit the walk origin. When requested, the second
+        return value is the dense walk origin's adjustment in that output frame.
         """
         if self.last_refresh_iteration is None and self.node_theta.numel() != self.num_nodes:
             raise RuntimeError('ThetaCrossingMap must be refreshed before use')
@@ -778,10 +781,19 @@ class ThetaCrossingMap:
         reference_step = (
             (reference_delta > np.pi).to(torch.int32)
             - (reference_delta < -np.pi).to(torch.int32))
+        walk_start_adjustment = torch.where(
+            reference_mask, reference_step, -picked[..., 0])
         picked = picked + torch.where(
             reference_mask, reference_step, torch.zeros_like(reference_step)
         )[..., None]
         picked = picked - torch.where(
             reference_mask[..., None], torch.zeros_like(picked[..., :1]),
             picked[..., :1])
-        return picked.to(dr_per_winding.dtype) * dr_per_winding.detach()
+        result = picked.to(dr_per_winding.dtype) * dr_per_winding.detach()
+        if return_walk_start_adjustment:
+            return (
+                result,
+                walk_start_adjustment.to(dr_per_winding.dtype)
+                * dr_per_winding.detach(),
+            )
+        return result

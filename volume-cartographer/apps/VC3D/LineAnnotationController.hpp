@@ -5,6 +5,7 @@
 #include <QPointer>
 #include <QString>
 #include <QFutureWatcher>
+#include <QThreadPool>
 
 #include <array>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -67,6 +69,17 @@ public:
         vc::lasagna::LineOptimizationResult result;
         std::string error;
         std::string eventName;
+    };
+
+    // One fiber's polyline as the side-strip intersection query consumes
+    // it: an immutable shared snapshot plus a memoized hash of its points
+    // and control points. Snapshots are cached per fiber and rebuilt only
+    // when the fiber's geometry actually changed (stored generation, or the
+    // owning session's line revision/edit epoch), so a query no longer
+    // deep-copies and re-hashes every loaded fiber per placement.
+    struct SideStripFiberSnapshot {
+        std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
+        uint64_t geometryHash = 0;
     };
 
     struct FiberSummary {
@@ -516,11 +529,14 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        // Cheap pre-snapshot staleness proxy (see sideStripQueryFingerprint);
+        // the hash-based cacheKey stays the precise layer underneath it.
+        QString fingerprint;
         std::string surfaceName;
         uint64_t sourceFiberId = 0;
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
-        std::vector<vc::atlas::FiberPolyline> fibers;
+        std::vector<SideStripFiberSnapshot> fibers;
         std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
     };
 
@@ -529,9 +545,16 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        QString fingerprint;
         std::string surfaceName;
         std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
         std::string error;
+        // The run painted partial (branch-link) markers before it finished;
+        // a FAILED run with this set corrupted the display, so the finish
+        // restores the surface's last known good set. Without it a failure
+        // keeps whatever was displayed (by-definition-fresher than any cache
+        // entry for a different fingerprint).
+        bool publishedPartial = false;
     };
 
     struct PaneRecord {
@@ -574,7 +597,27 @@ private:
                                            cv::Vec3f requestedLinkDirection);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
+    // Debouncing entry point (signal-connected): one placement triggers
+    // several overlay rebuilds, each re-requesting intersections; they
+    // coalesce into one dispatch per quiet window so the all-fiber snapshot
+    // is paid once, not per trigger.
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void dispatchSideStripIntersectionQuery(const std::string& surfaceName);
+    // Invalidate every side-strip query stamped so far (see the token-domain
+    // comment at the member declarations).
+    void invalidateSideStripQueries();
+    // Recompute the latest scheduling intent after erasing pending work: a
+    // stale latest token defeats the running-query dedupe and re-queues
+    // identical work.
+    void refreshLatestSideStripIntersectionToken();
+    // Cheap staleness proxy over everything the side-strip query reads (strip
+    // surface identity, fiber data generation, each pane session's line
+    // identity/epoch and branch count), computable without the all-fiber deep
+    // copy the precise hash needs. A false match only leaves cosmetic stale
+    // markers until the next trigger; a mismatch falls through to the hash.
+    [[nodiscard]] QString sideStripQueryFingerprint(
+        const std::string& surfaceName,
+        const cv::Mat_<cv::Vec3f>* stripPoints) const;
     void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
                                                  size_t firstControlPointIndex,
                                                  size_t secondControlPointIndex,
@@ -658,6 +701,12 @@ private:
                                     bool retraceAll,
                                     std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                     bool globalGoalsOnly = false);
+    // Debounced launch of the session's coalesced pending solve: control-point
+    // edits record dirty spans in the session's queue and call this; one solve
+    // over the union starts after a short quiet window (or, while a solve is
+    // in flight, from finishOptimization's epilogue).
+    void scheduleSolveDispatch(LineAnnotationSession& session);
+    void dispatchPendingSolve(const std::string& surfaceName);
     [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
         makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
                                          bool retraceAll,
@@ -781,7 +830,7 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsForSideStripQuery() const;
+    [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery() const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
@@ -840,6 +889,17 @@ private:
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
+    // Debounced autosave after a solve landing: consecutive landings coalesce
+    // into one saveSessionAsFiber (with its no-op probe, fiber summary
+    // rebuild, and linked-fiber sync) instead of paying it per landing. The
+    // flush never runs the synchronous finalize solve: a session mutated
+    // since the landing skips the save and relies on the next landing or the
+    // close paths (which finalize+save directly and supersede the pending
+    // flush). Cross-fiber operations and package switches flush explicitly
+    // so nothing reads a fiber whose newest geometry is still session-only.
+    void scheduleSessionAutoSave(LineAnnotationSession& session);
+    void flushSessionAutoSave(const std::string& surfaceName);
+    void flushAllPendingSessionAutoSaves();
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiberNow(const StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
@@ -873,6 +933,13 @@ private:
                                                           uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
+    // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
+    // callers: the scan is O(controls x linePoints) per fiber, and
+    // fiberSummaries() used to pay it for every loaded fiber on every
+    // emission (~90 ms at 666 fibers). Workers keep calling the static
+    // function directly.
+    [[nodiscard]] const std::vector<ControlSpanRecord>& cachedControlSpansForFiber(
+        const StoredFiber& fiber) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
         uint64_t fiberId) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(
@@ -1013,18 +1080,82 @@ private:
     // retirement) on the flushed saves having actually succeeded.
     uint64_t _fiberSaveFailureCount = 0;
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
+    // Side-strip query scheduling follows the render-job model: one active
+    // query (never cancelled by newer requests), one latest pending request,
+    // and results published even when superseded — they are fresher than
+    // what is displayed. All tokens are drawn from one monotonic sequence so
+    // they share a comparison domain:
+    // - _latestSideStripIntersectionToken: the newest scheduling intent
+    //   (dedupe of running/pending work).
+    // - _sideStripInvalidationWatermark: requests stamped BEFORE it are
+    //   invalid (pane closed, package switched, intentional clear) — the
+    //   only thing that cancels a running query or drops its result. The
+    //   shared atomic mirrors it for the worker's cancel callback.
+    // - _lastPublishedSideStripToken: monotonic publish guard.
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
-    std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
+    uint64_t _sideStripInvalidationWatermark = 0;
+    uint64_t _lastPublishedSideStripToken = 0;
+    std::shared_ptr<std::atomic<uint64_t>> _sideStripInvalidationWatermarkAtomic =
         std::make_shared<std::atomic<uint64_t>>(0);
     uint64_t _runningSideStripIntersectionToken = 0;
     uint64_t _runningSideStripIntersectionKey = 0;
     std::string _runningSideStripIntersectionSurfaceName;
-    uint64_t _lastSideStripIntersectionKey = 0;
-    std::string _lastSideStripIntersectionSurfaceName;
-    std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
+    // PER-SURFACE reuse cache of the last published result (a single global
+    // slot made two panes' unconditional catch-ups evict each other's entry
+    // and re-run their queries in a self-sustaining ping-pong).
+    struct SideStripReuseEntry {
+        uint64_t cacheKey = 0;
+        std::vector<SideStripMarker> markers;
+        QString fingerprint;
+    };
+    std::map<std::string, SideStripReuseEntry> _sideStripReuseCache;
+    QString _runningSideStripFingerprint;
+    // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
+    // stored fibers keyed by generation, open sessions keyed by
+    // (lineRevision, solve-queue epoch). Entries for fibers that vanished
+    // are swept on each rebuild.
+    struct SideStripSnapshotCacheEntry {
+        uint64_t validityA = 0;
+        uint64_t validityB = 0;
+        SideStripFiberSnapshot snapshot;
+    };
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripStoredSnapshotCache;
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripSessionSnapshotCache;
+    // Per-file cache behind fiberSnapshotsFromStorageWithPaths(): parsing a
+    // fiber JSON is the expensive step, so a file is reparsed only when its
+    // (size, mtime) token changes - the same metadata-token idiom as
+    // umbilicusFingerprint(), with the same caveat about a same-size rewrite
+    // inside one timestamp tick. CWindow refreshes the atlas search docks on
+    // every fiberSaved, which used to re-parse every fiber file in the
+    // package (seconds at ~666 fibers) ON THE GUI THREAD per save.
+    struct StorageSnapshotCacheEntry {
+        std::filesystem::file_time_type mtime{};
+        std::uintmax_t size = 0;
+        FiberSnapshotWithPath snapshot;
+    };
+    mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
+        _storageSnapshotCache;
+    // See cachedControlSpansForFiber: keyed by fiber id, valid while the
+    // fiber's save generation and the package generation match.
+    struct ControlSpanCacheEntry {
+        uint64_t generation = 0;
+        uint64_t packageGeneration = 0;
+        std::vector<ControlSpanRecord> spans;
+    };
+    mutable std::unordered_map<uint64_t, ControlSpanCacheEntry> _controlSpanCache;
     bool _sideStripIntersectionRunning = false;
-    std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
+    // One latest pending request PER SURFACE (a single global slot let a
+    // busy pane's refresh silently overwrite — and permanently starve — an
+    // unrelated pane's queued query). One query still runs at a time; the
+    // finish epilogue starts the queued request with the smallest token
+    // (FIFO across surfaces) after re-stamping it.
+    std::map<std::string, SideStripIntersectionRequest>
+        _pendingSideStripIntersectionRequests;
+    // Surfaces with a debounced side-strip dispatch scheduled.
+    std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
@@ -1053,4 +1184,13 @@ private:
     };
     std::optional<LinkCandidate> _linkCandidate;
     std::optional<LinkCandidate> _splitCandidate;
+
+    // Private pool for line-optimization solves. Its own pool rather than the
+    // global one so teardown is bounded by waitForDone() in the destructor
+    // (after requesting cooperative cancellation) and so long solves cannot
+    // starve the global pool's other users. Two threads: one live editing
+    // session plus one intersection-inspection or merged-fiber reopt session
+    // can solve concurrently; solves within one session are serialized by the
+    // per-session coalescing queue.
+    QThreadPool _lineSolvePool;
 };

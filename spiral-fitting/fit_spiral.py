@@ -46,6 +46,8 @@ from ddp_helpers import (
 )
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     Config, FitConfig, durable_config)
+from checkpoint_migrations import (expand_gap_checkpoint_capacity,
+                                   migrate_legacy_gap_parameterization)
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
@@ -1136,6 +1138,13 @@ class FitContext:
         # The runtime drives the context itself; it never hands control back
         # through this reference. PR 3 replaces it with explicit session flags.
         self.config = config
+        # Whole-object patch targets use the theta map's unwrap frame, so both
+        # caches intentionally have one authoritative refresh cadence. Keep
+        # the older DT-named setting as a synchronized compatibility alias.
+        self.config.update({
+            'dt_target_update_interval': self.config[
+                'theta_crossing_map_update_interval'],
+        })
         self.scroll = scroll
         self.paths = paths
         self.interactive_driver = interactive_driver
@@ -2891,7 +2900,8 @@ class FitContext:
                 print(message)
 
         self.dt_target_cache_manager = DtTargetCacheManager(
-            self.config['dt_target_update_interval'], report_first_dt_target_cache,
+            self.config['theta_crossing_map_update_interval'],
+            report_first_dt_target_cache,
         )
 
         if self.dist.is_distributed:
@@ -2969,6 +2979,7 @@ class FitContext:
     def _checkpoint_payload(self, completed_iterations):
         return {
             'schema_version': 2,
+            'gap_parameterization_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
@@ -3064,6 +3075,15 @@ class FitContext:
         if not isinstance(checkpoint, dict):
             return CheckpointVerdict(
                 False, ('checkpoint is not a state dictionary',), source=source)
+        try:
+            # Capacity growth is prefix-preserving: inspect the expanded copy
+            # without mutating the caller's checkpoint. load_checkpoint()
+            # performs the same migration only after this verdict succeeds.
+            checkpoint = expand_gap_checkpoint_capacity(
+                migrate_legacy_gap_parameterization(checkpoint),
+                self.config['model_gap_expander_capacity_windings'])
+        except ValueError as exc:
+            reasons.append(str(exc))
 
         # --- schema -------------------------------------------------------
         schema_version = int(checkpoint.get('schema_version', 1) or 1)
@@ -3300,6 +3320,9 @@ class FitContext:
                 torch.cuda.set_rng_state(state, device_index)
 
     def load_checkpoint(self, checkpoint):
+        checkpoint = expand_gap_checkpoint_capacity(
+            migrate_legacy_gap_parameterization(checkpoint),
+            self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)
@@ -3521,7 +3544,8 @@ class FitContext:
                     preview_generator = torch.Generator(device=dr.device)
                     preview_generator.manual_seed(0x13198A2E)
                     get_winding_inference_losses(
-                        transform, dr, self.winding_inference, self.config,
+                        transform, dr, self.winding_inference, self.shell_map,
+                        self.config,
                         self.z_begin, self.z_end,
                         generator=preview_generator)
                 if self.unattached_pcl_strips:
@@ -3904,9 +3928,32 @@ class FitContext:
         """
         path_changes = dict(path_changes or {})
         changed = set(config)
-        old_values = {key: self.config[key] for key in config}
+        cadence_keys = {
+            'theta_crossing_map_update_interval',
+            'dt_target_update_interval',
+        }
+        cadence_changed = changed & cadence_keys
+        tracked = set(config) | (cadence_keys if cadence_changed else set())
+        old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
+            if cadence_changed:
+                if cadence_keys <= changed and (
+                        int(config['theta_crossing_map_update_interval'])
+                        != int(config['dt_target_update_interval'])):
+                    raise ValueError(
+                        'theta_crossing_map_update_interval and '
+                        'dt_target_update_interval are one shared cadence and '
+                        'cannot be set to different values')
+                cadence = int(
+                    config['theta_crossing_map_update_interval']
+                    if 'theta_crossing_map_update_interval' in changed
+                    else config['dt_target_update_interval'])
+                self.config.update({
+                    'theta_crossing_map_update_interval': cadence,
+                    'dt_target_update_interval': cadence,
+                })
+                changed.update(cadence_keys)
             # Static path changes are rejected by the service. Shell atlas
             # construction settings are classified as prepared-input changes
             # and likewise never reach this live boundary; ordinary shell
@@ -4020,7 +4067,8 @@ class FitContext:
             if any(key.startswith('dt_') for key in changed) \
                     or dt_preparation_changed:
                 self.dt_target_cache_manager.update_interval = max(
-                    1, int(self.config['dt_target_update_interval']))
+                    1, int(self.config[
+                        'theta_crossing_map_update_interval']))
                 self.dt_target_cache_manager.reset()
             if changed & {
                     'optimizer_exp_lr_schedule',
@@ -4053,10 +4101,27 @@ class FitContext:
                 'patch_unverified_patch_exclusion_radius',
         }:
             self._build_theta_crossing_map()
+            self.dt_target_cache_manager.reset()
         elif 'theta_crossing_map_update_interval' in changed:
             # refresh_if_due observes the changed interval on the next step and
             # resets its cadence without rebuilding immutable topology.
             self.theta_crossing_map.invalidate()
+            self.dt_target_cache_manager.update_interval = max(
+                1, int(self.config[
+                    'theta_crossing_map_update_interval']))
+            self.dt_target_cache_manager.reset()
+
+    def _refresh_theta_crossing_map_for_step(self, iteration, transform):
+        refreshed = self.theta_crossing_map.refresh_if_due(
+            iteration, transform,
+            self.config['theta_crossing_map_update_interval'])
+        if refreshed:
+            self._enforce_theta_liftability()
+            # Patch targets use the theta map's root-relative frame. Reset all
+            # whole-object targets here so every active cache is rebuilt later
+            # in this same step, phase-locking both cache families.
+            self.dt_target_cache_manager.reset()
+        return refreshed
 
     def step(self, iteration):
         self.step_timer.start('fwd')
@@ -4076,12 +4141,9 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
-        theta_map_refreshed = self.theta_crossing_map.refresh_if_due(
+        theta_map_refreshed = self._refresh_theta_crossing_map_for_step(
             iteration,
-            self.slice_to_spiral_transform,
-            self.config['theta_crossing_map_update_interval'])
-        if theta_map_refreshed:
-            self._enforce_theta_liftability()
+            self.slice_to_spiral_transform)
 
         losses = {}
         log_metrics = {
@@ -4135,12 +4197,16 @@ class FitContext:
             if compute_patch_dt and self.config['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.verified_patches_list, self.patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.verified_patches_list, self.patch_atlas,
+                    self.theta_crossing_map,
+                    self.config['dt_target_floating_threshold'],
                 ))
             if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
                 unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.unverified_patches_list, self.unverified_patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.unverified_patches_list, self.unverified_patch_atlas,
+                    self.theta_crossing_map,
+                    self.config['dt_target_floating_threshold'],
                 ))
             if compute_patch_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                 pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
@@ -4301,6 +4367,7 @@ class FitContext:
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
                 self.winding_inference,
+                self.shell_map,
                 self.config,
                 self.z_begin,
                 self.z_end,

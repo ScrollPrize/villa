@@ -1,5 +1,7 @@
 #include "CChunkedVolumeViewer.hpp"
 
+#include <atomic>
+
 #include "CState.hpp"
 #include "elements/DownloadQueueDebugOverlay.hpp"
 #include "elements/DownloadQueueStats.hpp"
@@ -928,8 +930,19 @@ void CChunkedVolumeViewer::rebuildChunkArray()
 
     QPointer<CChunkedVolumeViewer> guard(this);
     std::weak_ptr<Volume> volumeWeak = _volume;
-    _chunkCbId = _chunkArray->addChunkReadyListener([guard, volumeWeak]() {
-        QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+    // Coalesce: chunks resolve in bursts (a landing re-fetches a strip's
+    // whole tile set), and one queued submitRender per chunk made the GUI
+    // thread grind through dozens of back-to-back render kicks - each paying
+    // the synchronous prelude (focus marker projection etc.) - before it
+    // could service input. One kick per burst repaints just as correctly.
+    auto renderKickQueued = std::make_shared<std::atomic<bool>>(false);
+    _chunkCbId = _chunkArray->addChunkReadyListener(
+        [guard, volumeWeak, renderKickQueued]() {
+        if (renderKickQueued->exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        QMetaObject::invokeMethod(qApp, [guard, volumeWeak, renderKickQueued]() {
+            renderKickQueued->store(false, std::memory_order_release);
             if (!guard)
                 return;
             auto volume = volumeWeak.lock();
@@ -6785,47 +6798,58 @@ void CChunkedVolumeViewer::updateStatusLabel()
     if (showStats && !statsTopRight) {
         items << statsItems;
     }
-    if (_chunkArray) {
-        const auto stats = _chunkArray->stats();
-        sharedCacheItems << vc3d::formatCacheStorageStats(stats);
-        if (stats.persistentCacheEnabled && stats.persistentCacheLowSpace) {
-            sharedCacheItems << QString("⚠ low disk: %1 free")
-                .arg(formatByteSize(stats.persistentCacheFreeBytes));
+    // Cache/scheduler statistics are informational; refresh them at most
+    // every 250 ms (see _sharedCacheStatsThrottle) instead of taking the
+    // shared cache and scheduler mutexes on every mouse move.
+    constexpr qint64 kSharedCacheStatsRefreshMs = 250;
+    if (!_sharedCacheStatsThrottle.isValid() ||
+        _sharedCacheStatsThrottle.elapsed() >= kSharedCacheStatsRefreshMs) {
+        _sharedCacheStatsThrottle.restart();
+        QStringList freshItems;
+        if (_chunkArray) {
+            const auto stats = _chunkArray->stats();
+            freshItems << vc3d::formatCacheStorageStats(stats);
+            if (stats.persistentCacheEnabled && stats.persistentCacheLowSpace) {
+                freshItems << QString("⚠ low disk: %1 free")
+                    .arg(formatByteSize(stats.persistentCacheFreeBytes));
+            }
+            if (!stats.persistentCacheWarning.empty()) {
+                freshItems << QStringLiteral("⚠ disk cache disabled: ") +
+                    QString::fromStdString(stats.persistentCacheWarning);
+            }
+            const QString network = vc3d::formatNetworkDownloadStats(
+                stats, _volume && _volume->isRemote());
+            if (!network.isEmpty())
+                freshItems << network;
         }
-        if (!stats.persistentCacheWarning.empty()) {
-            sharedCacheItems << QStringLiteral("⚠ disk cache disabled: ") +
-                QString::fromStdString(stats.persistentCacheWarning);
-        }
-        const QString network = vc3d::formatNetworkDownloadStats(
-            stats, _volume && _volume->isRemote());
-        if (!network.isEmpty())
-            sharedCacheItems << network;
-    }
 
-    // The RAM figure above already reports the *effective* chunk-cache
-    // capacity, so a floor raised above the configured setting is visible
-    // rather than silent.
-    auto appendSurfaceCacheStats = [&sharedCacheItems](const char* label,
-                                                       const vc::render::SurfaceCache* cache) {
-        if (!cache)
-            return;
-        const auto stats = cache->stats();
-        QString item = QString("%1 %2/%3 (%4 tiles")
-            .arg(QString::fromUtf8(label))
-            .arg(formatByteSize(stats.bytes))
-            .arg(formatByteSize(stats.capacity))
-            .arg(stats.tiles);
-        if (stats.tilesInFlight > 0)
-            item += QString(", %1 filling").arg(stats.tilesInFlight);
-        if (stats.tilesIncomplete > 0)
-            item += QString(", %1 partial").arg(stats.tilesIncomplete);
-        item += QStringLiteral(")");
-        sharedCacheItems << item;
-    };
-    appendSurfaceCacheStats("surface", _surfaceCache.get());
-    appendSurfaceCacheStats("surface overlay", _overlaySurfaceCache.get());
-    if (_surfaceCacheOutOfBand)
-        sharedCacheItems << QStringLiteral("surface: out of band");
+        // The RAM figure above already reports the *effective* chunk-cache
+        // capacity, so a floor raised above the configured setting is visible
+        // rather than silent.
+        auto appendSurfaceCacheStats = [&freshItems](const char* label,
+                                                     const vc::render::SurfaceCache* cache) {
+            if (!cache)
+                return;
+            const auto stats = cache->stats();
+            QString item = QString("%1 %2/%3 (%4 tiles")
+                .arg(QString::fromUtf8(label))
+                .arg(formatByteSize(stats.bytes))
+                .arg(formatByteSize(stats.capacity))
+                .arg(stats.tiles);
+            if (stats.tilesInFlight > 0)
+                item += QString(", %1 filling").arg(stats.tilesInFlight);
+            if (stats.tilesIncomplete > 0)
+                item += QString(", %1 partial").arg(stats.tilesIncomplete);
+            item += QStringLiteral(")");
+            freshItems << item;
+        };
+        appendSurfaceCacheStats("surface", _surfaceCache.get());
+        appendSurfaceCacheStats("surface overlay", _overlaySurfaceCache.get());
+        if (_surfaceCacheOutOfBand)
+            freshItems << QStringLiteral("surface: out of band");
+        _cachedSharedCacheItems = std::move(freshItems);
+    }
+    sharedCacheItems = _cachedSharedCacheItems;
 
     auto surf = _surfWeak.lock();
     const auto& cursorPos =

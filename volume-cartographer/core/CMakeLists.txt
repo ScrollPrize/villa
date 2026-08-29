@@ -30,6 +30,7 @@ add_library(vc_core
         src/RemoteFileCache.cpp
         src/RemoteVolumeMetadata.cpp
         src/HttpFetch.cpp
+        src/S3AuthFallback.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/PointCollections.cpp

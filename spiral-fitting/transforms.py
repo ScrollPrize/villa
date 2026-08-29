@@ -12,6 +12,12 @@ from torchdiffeq import odeint
 import gap_triton
 import sample_spiral
 from flow_fields import CartesianFlowField, CylindricalFlowField
+from gap_parameterization import (
+    calibrated_gap_softplus_scale,
+    initial_dr_logit,
+    lower_bounded_dr,
+    lower_bounded_gap,
+)
 from geom_utils import expm_2x2, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
@@ -104,13 +110,24 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
     domain = pyro.distributions.constraints.real_vector
     codomain = domain
 
-    def __init__(self, params, dr_per_winding, min_z, max_z, gap_expander_lr_scale, truncate_frac=None, event_dim=0, cache_size=0):
+    def __init__(self, params, dr_per_winding, min_z, max_z,
+                 gap_expander_lr_scale, min_gap=1.0, softplus_bias=4.0,
+                 softplus_scale=None, truncate_frac=None, event_dim=0,
+                 cache_size=0):
         super().__init__(cache_size=cache_size)
         self.params = params
         self.dr_per_winding = dr_per_winding
         self.min_z = min_z
         self.max_z = max_z
         self.gap_expander_lr_scale = gap_expander_lr_scale
+        self.min_gap = float(min_gap)
+        self.softplus_bias = float(softplus_bias)
+        self.softplus_scale = float(
+            softplus_scale
+            if softplus_scale is not None
+            else calibrated_gap_softplus_scale(
+                float(dr_per_winding.detach()), self.min_gap,
+                self.softplus_bias))
         self.truncate_frac = truncate_frac
         # One transform instance exists per training iteration, and the logits
         # parameter does not change within an iteration. Build the pinned+scaled
@@ -147,6 +164,11 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
                 'idx_total': float(idx[-1]),
                 'min_z': float(self.min_z),
                 'max_z': float(self.max_z),
+                'min_gap': self.min_gap,
+                'softplus_bias': self.softplus_bias,
+                'softplus_denominator': float(F.softplus(
+                    torch.tensor(self.softplus_bias))),
+                'softplus_scale': self.softplus_scale,
             }
             self.params._triton_consts = consts
         return consts
@@ -159,10 +181,13 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         # This returns the sequence of winding radii (true, not shifted) for the radials given by theta and z
         theta_normalised = theta / (2 * torch.pi)
         logits_by_winding = self.get_logits_by_winding(theta, z)
-        scales_by_winding = torch.exp(logits_by_winding * 2.e2)
+        inter_winding_distances = lower_bounded_gap(
+            logits_by_winding, self.dr_per_winding, self.min_gap,
+            self.softplus_bias, self.softplus_scale)
         if self.truncate_frac is not None:
-            scales_by_winding = torch.lerp(torch.ones([], device=scales_by_winding.device), scales_by_winding, self.truncate_frac)
-        inter_winding_distances = self.dr_per_winding * scales_by_winding
+            inter_winding_distances = torch.lerp(
+                self.dr_per_winding, inter_winding_distances,
+                self.truncate_frac)
         winding_zero_radii = self.dr_per_winding * theta_normalised
         winding_radii = winding_zero_radii[..., None] + torch.cat([torch.zeros_like(inter_winding_distances[..., :1]), torch.cumsum(inter_winding_distances, dim=-1)[..., :-1]], dim=-1)
         return winding_radii
@@ -171,7 +196,7 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         """Pinned, interpolated native gap logits at ``(theta, z)``.
 
         The returned values include ``gap_expander_lr_scale`` but deliberately
-        exclude the fixed ``2e2`` exponent scale. Keeping this interpolation in
+        exclude the calibrated softplus scale. Keeping this interpolation in
         one method makes the minimum-gap barrier use exactly the same pinning,
         grid coordinates, and bilinear sampling as the forward transform.
         """
@@ -193,13 +218,13 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
 
     def get_native_log_gaps(self, winding_idx, theta, z):
-        """Log native inter-winding distances before exponentiation.
+        """Log native lower-bounded inter-winding distances.
 
         ``dr_per_winding`` contributes to the value but is detached so a
         minimum-gap violation can only update the sampled local gap logits.
         This method is intentionally defined only for the untruncated transform:
-        warm-up truncation interpolates distances after exponentiation and has
-        no equivalent pre-exponentiation log gap.
+        warm-up truncation interpolates distances afterwards and has no
+        equivalent native log gap.
         """
         if self.truncate_frac is not None:
             raise ValueError('native log gaps are defined only for the untruncated transform')
@@ -208,7 +233,10 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
             min=0, max=logits_by_winding.shape[-1] - 1)
         sampled = torch.gather(
             logits_by_winding, -1, winding_idx[..., None]).squeeze(-1)
-        return torch.log(self.dr_per_winding.detach()) + sampled * 2.e2
+        gaps = lower_bounded_gap(
+            sampled, self.dr_per_winding.detach(), self.min_gap,
+            self.softplus_bias, self.softplus_scale)
+        return torch.log(gaps)
 
     def _call(self, input_zyx):
         theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
@@ -219,7 +247,10 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
             transformed_inner_radius, transformed_outer_radius = gap_triton.gap_bracketing_radii(
                 theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
                 consts['idx'], consts['idx_total'], self.dr_per_winding,
-                inner_winding_clipped, self.truncate_frac, consts['min_z'], consts['max_z'])
+                inner_winding_clipped, self.truncate_frac,
+                consts['min_z'], consts['max_z'], consts['min_gap'],
+                consts['softplus_bias'], consts['softplus_denominator'],
+                consts['softplus_scale'])
         else:
             transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
             transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
@@ -240,7 +271,10 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
             transformed_inner_radius, transformed_outer_radius, inner_winding_clipped = gap_triton.gap_search_radii(
                 theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
                 consts['idx'], consts['idx_total'], self.dr_per_winding,
-                transformed_radius, self.truncate_frac, consts['min_z'], consts['max_z'])
+                transformed_radius, self.truncate_frac,
+                consts['min_z'], consts['max_z'], consts['min_gap'],
+                consts['softplus_bias'], consts['softplus_denominator'],
+                consts['softplus_scale'])
         else:
             transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
             inner_winding_indices = torch.searchsorted(transformed_winding_radii, transformed_radius[..., None]).squeeze(-1) - 1
@@ -462,7 +496,15 @@ class SpiralAndTransform(nn.Module):
         self.linear_logits_scale = 40.  # larger value increases effective learning rate
 
         self.umbilicus_transform = UmbilicusTransform(umbilicus_zyx)
-        self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['model_initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
+        self.gap_min_gap = float(config.get(
+            'model_gap_expander_min_gap', 1.0))
+        self.gap_softplus_bias = float(
+            config.get('model_gap_expander_softplus_bias', 4.0))
+        self.gap_softplus_scale = calibrated_gap_softplus_scale(
+            float(config['model_initial_dr_per_winding']), self.gap_min_gap,
+            self.gap_softplus_bias)
+        self.dr_per_winding_logit = nn.Parameter(initial_dr_logit(
+            float(config['model_initial_dr_per_winding']), self.gap_min_gap))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
         flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
@@ -490,7 +532,9 @@ class SpiralAndTransform(nn.Module):
             resolution=config['model_gap_expander_logit_resolution'],
             min_z=flow_min_corner_zyx[0],
             max_z=flow_max_corner_zyx[0],
-            num_windings=config['model_gap_expander_num_windings'],
+            num_windings=config.get(
+                'model_gap_expander_capacity_windings',
+                config['model_gap_expander_num_windings']),
             dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
@@ -515,6 +559,9 @@ class SpiralAndTransform(nn.Module):
             self.flow_min_corner_zyx[0],
             self.flow_max_corner_zyx[0],
             self.cfg['model_gap_expander_lr_scale'],
+            self.gap_min_gap,
+            self.gap_softplus_bias,
+            self.gap_softplus_scale,
             truncate_frac,
         )
         if shared is not None:
@@ -561,7 +608,8 @@ class SpiralAndTransform(nn.Module):
         return pyro.distributions.transforms.ComposeTransform(parts).inv
 
     def get_dr_per_winding(self):
-        return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)
+        return lower_bounded_dr(
+            self.dr_per_winding_logit, self.gap_min_gap)
 
     def get_shared_transform_tensors(self):
         """The tiny graph paths every evaluation of one transform instance
@@ -583,7 +631,7 @@ class SpiralAndTransform(nn.Module):
         )
 
     def get_native_log_gaps(self, winding_idx, theta, z):
-        """Exact pre-exponentiation log gap for the native gap expander."""
+        """Exact log gap for the native lower-bounded gap expander."""
         gap_expander, _, _, truncate_frac = self._get_transform_parts()
         assert truncate_frac is None
         return gap_expander.get_native_log_gaps(winding_idx, theta, z)
