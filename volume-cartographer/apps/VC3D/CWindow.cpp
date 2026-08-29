@@ -702,6 +702,25 @@ bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
         path.string()).empty();
 }
 
+bool isSelectedEditableOpenDataSegmentsEntry(
+    const VolumePkg& pkg,
+    const vc::project::Entry& entry)
+{
+    if (!vc::project::hasEntryTag(entry, "open-data-editable") ||
+        vc::project::isLocationRemote(entry.location)) {
+        return false;
+    }
+    const auto selectedPath = pkg.outputSegmentsPath();
+    if (selectedPath.empty()) {
+        return false;
+    }
+    const auto entryPath = vc::project::resolveLocalPath(
+        entry.location, pkg.path().parent_path());
+    std::error_code error;
+    return std::filesystem::equivalent(selectedPath, entryPath, error) &&
+           !error;
+}
+
 std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
                                                        const std::string& loadedVolumeId)
 {
@@ -736,6 +755,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
 
     const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
     const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
+    const vc::project::Entry* targetMatch = nullptr;
     const vc::project::Entry* sourceMatch = nullptr;
 
     for (const auto& entry : pkg.segmentEntries()) {
@@ -743,15 +763,24 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
             continue;
         }
         if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
-            return &entry;
+            if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                return &entry;
+            }
+            if (!targetMatch) {
+                targetMatch = &entry;
+            }
+            continue;
         }
-        if (!sourceMatch &&
-            std::find(entry.tags.begin(), entry.tags.end(), sourceTag) != entry.tags.end()) {
-            sourceMatch = &entry;
+        if (std::find(entry.tags.begin(), entry.tags.end(), sourceTag) !=
+            entry.tags.end()) {
+            if (!sourceMatch ||
+                isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                sourceMatch = &entry;
+            }
         }
     }
 
-    return sourceMatch;
+    return targetMatch ? targetMatch : sourceMatch;
 }
 
 const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumePkg& pkg,
@@ -763,16 +792,26 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
     if (!coordinateSpace.empty()) {
         const std::string coordinateTag =
             "vc-open-data-coordinate-space:" + coordinateSpace;
+        const vc::project::Entry* coordinateMatch = nullptr;
         for (const auto& entry : pkg.segmentEntries()) {
             if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
                 std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
                     entry.tags.end()) {
-                if (matchedCatalogVolumeId) {
-                    *matchedCatalogVolumeId =
-                        openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+                if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                    coordinateMatch = &entry;
+                    break;
                 }
-                return &entry;
+                if (!coordinateMatch) {
+                    coordinateMatch = &entry;
+                }
             }
+        }
+        if (coordinateMatch && matchedCatalogVolumeId) {
+            *matchedCatalogVolumeId =
+                openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+        }
+        if (coordinateMatch) {
+            return coordinateMatch;
         }
         // Explicitly identified assets must never fall back to lineage-only
         // association, because native and virtual views share that lineage.

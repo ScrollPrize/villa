@@ -1591,7 +1591,7 @@ TEST_CASE("OpenDataSegmentCache names editable copies after the current segments
           editableSegmentsFolder / "segment-100");
 }
 
-TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder")
+TEST_CASE("OpenDataSegmentCache editable copy inherits routing from an aggregate root")
 {
     const auto testRoot = std::filesystem::temp_directory_path() /
                           ("vc_open_data_editable_selection_test_" +
@@ -1599,7 +1599,8 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
     std::filesystem::remove_all(testRoot);
 
     const auto sourceRoot = testRoot / "catalog-segments";
-    const auto sourceSegment = sourceRoot / "20241113070770";
+    const auto sourceFolder = sourceRoot / "published-L0";
+    const auto sourceSegment = sourceFolder / "20241113070770";
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     copyFixtureFile(fixtureSegment / "meta.json", sourceSegment / "meta.json");
@@ -1607,20 +1608,78 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
     copyFixtureFile(fixtureSegment / "y.tif", sourceSegment / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", sourceSegment / "z.tif");
     writeFile(sourceSegment / "catalog-origin.json", "{}");
-
-    const auto editableSegment =
-        defaultEditableCopyPathForCatalogSegment(sourceSegment, sourceRoot);
-    const auto editableRoot = editableSegment.parent_path();
-    copyCatalogSegmentToEditableDirectory(sourceSegment, editableSegment);
+    const auto otherCatalogRoot = testRoot / "other-catalog-segments";
+    const auto otherCatalogSegment =
+        otherCatalogRoot / "published-L0" / "other-segment";
+    copyFixtureFile(fixtureSegment / "meta.json", otherCatalogSegment / "meta.json");
+    copyFixtureFile(fixtureSegment / "x.tif", otherCatalogSegment / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", otherCatalogSegment / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", otherCatalogSegment / "z.tif");
+    writeFile(otherCatalogSegment / "catalog-origin.json", "{}");
 
     const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
     VolumePkg::setAutosaveRoot(testRoot / "autosave");
     auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(sourceRoot.string(), {"open-data", "immutable"}));
-    REQUIRE(pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"}));
-    pkg->setOutputSegments(editableRoot.string());
+    REQUIRE(pkg->addSegmentsEntry(
+        sourceRoot.string(),
+        {"open-data", "immutable", "vc-open-data-target-volume-id:vol1",
+         "vc-open-data-coordinate-space:sample/vol1@L0",
+         "vc-open-data-source-coordinate-level:0"}));
+    REQUIRE(pkg->addSegmentsEntry(sourceFolder.string(), {"manual"}));
+    REQUIRE(pkg->addSegmentsEntry(
+        otherCatalogRoot.string(),
+        {"open-data", "immutable", "vc-open-data-target-volume-id:vol2"}));
+
+    const auto registeredCatalogRoot =
+        registeredOpenDataCatalogRootForSegment(*pkg, sourceSegment);
+    REQUIRE(registeredCatalogRoot == sourceRoot);
+    const auto editableSegment =
+        defaultEditableCopyPathForCatalogSegment(
+            sourceSegment, registeredCatalogRoot);
+    const auto editableRoot = editableSegment.parent_path();
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, sourceSegment),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, sourceRoot / "unsafe-copy"),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        copyCatalogSegmentToEditableDirectory(
+            *pkg, sourceSegment, otherCatalogSegment),
+        doctest::Contains("immutable catalog"),
+        std::runtime_error);
+    const auto sourceAlias = testRoot / "catalog-segment-alias";
+    std::error_code symlinkError;
+    std::filesystem::create_directory_symlink(
+        sourceSegment, sourceAlias, symlinkError);
+    if (!symlinkError) {
+        CHECK_THROWS_WITH_AS(
+            copyCatalogSegmentToEditableDirectory(
+                *pkg, sourceSegment, sourceAlias),
+            doctest::Contains("immutable catalog"),
+            std::runtime_error);
+    }
+    copyCatalogSegmentToEditableDirectory(
+        *pkg, sourceSegment, editableSegment);
+
+    attachEditableOpenDataSegmentRoot(
+        *pkg, sourceSegment, editableRoot, true);
 
     CHECK(pkg->outputSegmentsPath() == editableRoot);
+    const auto editableEntry = std::find_if(
+        pkg->segmentEntries().begin(), pkg->segmentEntries().end(),
+        [&](const auto& entry) { return entry.location == editableRoot.string(); });
+    REQUIRE(editableEntry != pkg->segmentEntries().end());
+    CHECK(editableEntry->tags == std::vector<std::string>{
+        "open-data-editable",
+        "vc-open-data-target-volume-id:vol1",
+        "vc-open-data-coordinate-space:sample/vol1@L0",
+        "vc-open-data-source-coordinate-level:0",
+    });
     CHECK_FALSE(std::filesystem::exists(editableSegment / "catalog-origin.json"));
     const auto surface = pkg->loadSurface("20241113070770");
     REQUIRE(surface);

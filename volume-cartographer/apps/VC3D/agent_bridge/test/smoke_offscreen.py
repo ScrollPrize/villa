@@ -1141,22 +1141,32 @@ def check_open_data_editable_copy(
     volpkg: Path,
 ) -> None:
     catalog_root = root / "catalog-segments"
+    catalog_folder = catalog_root / "published-L0"
     segment_id = "20241113090990"
-    catalog_segment = catalog_root / segment_id
+    catalog_segment = catalog_folder / segment_id
     shutil.copytree(
         REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
         catalog_segment,
     )
     (catalog_segment / "catalog-origin.json").write_text("{}")
-    renamed_path = catalog_root / "must-not-rename"
+    renamed_path = catalog_folder / "must-not-rename"
 
     try:
+        project = json.loads(volpkg.read_text())
+        project.setdefault("segments", []).append({
+            "location": str(catalog_root),
+            "tags": [
+                "open-data",
+                "immutable",
+                "vc-open-data-segment-aggregate",
+                "vc-open-data-target-volume-id:vol1",
+            ],
+        })
+        project["output_segments"] = str(catalog_root)
+        volpkg.write_text(json.dumps(project))
         client.call(
-            "segments.attach",
-            {
-                "location": str(catalog_root),
-                "tags": ["open-data", "immutable"],
-            },
+            "volume.open",
+            {"path": str(volpkg)},
             timeout=RPC_TIMEOUT,
         )
         client.call(
@@ -1224,6 +1234,11 @@ def check_open_data_editable_copy(
         ]
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         active = state.get("activeSurface") or {}
+        listed, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
+        listed_active = next(
+            (segment for segment in listed.get("segments", []) if segment.get("active")),
+            {},
+        )
         results.record(
             "catalog_segment_create_editable_copy",
             copied.get("created") is True
@@ -1237,10 +1252,56 @@ def check_open_data_editable_copy(
             and (editable_segment / "z.tif").is_file()
             and editable_entries == [{
                 "location": str(editable_root),
-                "tags": ["open-data-editable"],
+                "tags": [
+                    "open-data-editable",
+                    "vc-open-data-target-volume-id:vol1",
+                ],
             }]
-            and active.get("id") == segment_id,
-            f"result={copied} active={active} entries={editable_entries}",
+            and project.get("output_segments") == str(editable_root)
+            and active.get("id") == segment_id
+            and listed_active.get("id") == segment_id
+            and listed_active.get("path") == str(editable_segment),
+            f"result={copied} active={active} listed_active={listed_active} "
+            f"output_segments={project.get('output_segments')} "
+            f"entries={editable_entries}",
+        )
+
+        retried, _ = client.call(
+            "segments.create_editable_copy",
+            {"segmentId": segment_id},
+            timeout=RPC_TIMEOUT,
+        )
+        project_after_retry = json.loads(volpkg.read_text())
+        editable_entries_after_retry = [
+            entry
+            for entry in project_after_retry.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(editable_root)
+        ]
+        listed_after_retry, _ = client.call(
+            "segments.list", {}, timeout=RPC_TIMEOUT
+        )
+        listed_active_after_retry = next(
+            (
+                segment
+                for segment in listed_after_retry.get("segments", [])
+                if segment.get("active")
+            ),
+            {},
+        )
+        results.record(
+            "catalog_segment_create_editable_copy_retry",
+            retried.get("created") is False
+            and retried.get("alreadyExisted") is True
+            and retried.get("activated") is True
+            and retried.get("sourcePath") == str(catalog_segment)
+            and retried.get("path") == str(editable_segment)
+            and editable_entries_after_retry == editable_entries
+            and project_after_retry.get("output_segments") == str(editable_root)
+            and listed_active_after_retry.get("id") == segment_id
+            and listed_active_after_retry.get("path") == str(editable_segment),
+            f"result={retried} listed_active={listed_active_after_retry} "
+            f"output_segments={project_after_retry.get('output_segments')} "
+            f"entries={editable_entries_after_retry}",
         )
 
         enabled, _ = client.call(
@@ -1252,6 +1313,47 @@ def check_open_data_editable_copy(
             "editable_copy_can_enable_editing",
             enabled.get("enabled") is True,
             f"result={enabled}",
+        )
+        client.call(
+            "segmentation.enable_editing",
+            {"enabled": False},
+            timeout=RPC_TIMEOUT,
+        )
+
+        reopened, _ = client.call(
+            "volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT
+        )
+        listed_after_reopen, _ = client.call(
+            "segments.list", {}, timeout=RPC_TIMEOUT
+        )
+        reopened_segment = next(
+            (
+                segment
+                for segment in listed_after_reopen.get("segments", [])
+                if segment.get("id") == segment_id
+            ),
+            {},
+        )
+        client.call(
+            "segments.activate",
+            {"segmentId": segment_id},
+            timeout=RPC_TIMEOUT,
+        )
+        enabled_after_reopen, _ = client.call(
+            "segmentation.enable_editing",
+            {"enabled": True},
+            timeout=RPC_TIMEOUT,
+        )
+        project_after_reopen = json.loads(volpkg.read_text())
+        results.record(
+            "editable_copy_survives_reopen",
+            reopened.get("opened") is True
+            and reopened_segment.get("path") == str(editable_segment)
+            and project_after_reopen.get("output_segments") == str(editable_root)
+            and enabled_after_reopen.get("enabled") is True,
+            f"reopened={reopened} segment={reopened_segment} "
+            f"output_segments={project_after_reopen.get('output_segments')} "
+            f"editing={enabled_after_reopen}",
         )
         client.call(
             "segmentation.enable_editing",
