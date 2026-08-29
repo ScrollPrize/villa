@@ -4,6 +4,49 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Scroll specification (spiral-scroll.json)
+
+`fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
+This is not covered by scrollprize.org/tutorial_spiral. Required keys:
+
+- `schema_version` — must equal `1`.
+- `name`, `voxel_size_um` — required, no validation beyond presence.
+- `spiral_outward_sense` — must be `"CW"` or `"ACW"` (case-insensitive).
+  No automated method determines this; it is read off the CT data by a
+  person in VC3D, or computed from an already-fitted spiral.
+
+Optional `paths` object for per-input overrides when a dataset's file names
+don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
+
+Also optional, and easy to get wrong silently: `normal_zarr_group`
+(default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr
+pyramid level the `normal_x`/`normal_y` lasagna stores are read at.
+**`lasagna_scale` must equal the actual downsample factor of whichever
+group you pick for this specific scroll's lasagna store** — read it from
+the store's own `.zattrs` multiscales metadata, do not assume it from
+another scroll's example or from a generic recommendation. A mismatched
+value either silently reads the wrong-resolution normal maps (no error) or
+throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
+large enough to push the requested z-range outside the (wrongly-scaled)
+store bounds.
+
+Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
+specifically):
+
+```json
+{
+  "schema_version": 1,
+  "name": "PHerc0826",
+  "voxel_size_um": 9.362,
+  "spiral_outward_sense": "CW",
+  "normal_zarr_group": "2",
+  "lasagna_scale": 4,
+  "paths": {
+    "tracks_dbm": "tracks/PHerc0826_20250821151701_surface_m7_L0_th0.2.dbm"
+  }
+}
+```
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
