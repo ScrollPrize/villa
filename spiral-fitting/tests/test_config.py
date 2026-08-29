@@ -59,7 +59,10 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     }
     assert {key for key in catalog["defaults"]
             if key.startswith("input_use_")} == expected
-    default_off = {"input_use_surf_sdt", "input_use_fiber_directions"}
+    default_off = {
+        "input_use_surf_sdt", "input_use_fiber_directions",
+        "input_use_tracks",
+    }
     for key in expected:
         assert catalog["defaults"][key] is (key not in default_off)
         assert catalog["schema"]["fields"][key]["type"] == "boolean"
