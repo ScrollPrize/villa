@@ -1,0 +1,5 @@
+{
+    "input_use_normals": false,
+    "input_use_fiber_directions": true,
+    "loss_weight_fiber_directions": 0.0
+}
