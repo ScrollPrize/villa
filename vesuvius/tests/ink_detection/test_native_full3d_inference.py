@@ -566,3 +566,69 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
         for level in range(6)
     )
+
+
+class _DepthRecorder(torch.nn.Module):
+    """Records the BCZYX depth each forward pass actually receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[int, ...]] = []
+
+    def forward(self, image_BCZYX):
+        self.seen.append(tuple(image_BCZYX.shape))
+        return {"ink": image_BCZYX.mean(dim=2, keepdim=True)}
+
+
+def test_native_inference_honours_the_checkpoint_input_depth_padding(monkeypatch):
+    """Training center-pads the model input to model_config.input_pad_depth_to
+    and flat inference passes the same value into TargetModel.  Native
+    inference has to as well, or a checkpoint trained at a padded depth is fed
+    an unpadded one."""
+    recorder = _DepthRecorder()
+    monkeypatch.setattr(native, "make_model", lambda config: recorder)
+    monkeypatch.setattr(native, "load_model_state", lambda model, state: None)
+    monkeypatch.setattr(
+        native, "select_native_inference_weights", lambda payload, source=None: ("model", {})
+    )
+    monkeypatch.setattr(native, "resolve_amp_dtype", lambda *a, **k: None)
+
+    config = SimpleNamespace(model=SimpleNamespace(input_pad_depth_to=5))
+    args = SimpleNamespace(
+        checkpoint="memory://checkpoint",
+        gpu_ids=(),
+        compile_model=False,
+        compile_mode="default",
+        amp_dtype="fp32",
+    )
+
+    bundle = native._load_native_model({}, config, args)
+    bundle.model(torch.zeros(1, 1, 3, 4, 4))
+
+    assert recorder.seen == [(1, 1, 5, 4, 4)], (
+        "native inference fed the network depth "
+        f"{recorder.seen[0][2]} where training would have fed 5"
+    )
+
+
+def test_native_inference_leaves_depth_alone_when_no_padding_is_configured(monkeypatch):
+    recorder = _DepthRecorder()
+    monkeypatch.setattr(native, "make_model", lambda config: recorder)
+    monkeypatch.setattr(native, "load_model_state", lambda model, state: None)
+    monkeypatch.setattr(
+        native, "select_native_inference_weights", lambda payload, source=None: ("model", {})
+    )
+    monkeypatch.setattr(native, "resolve_amp_dtype", lambda *a, **k: None)
+
+    config = SimpleNamespace(model=SimpleNamespace(input_pad_depth_to=None))
+    args = SimpleNamespace(
+        checkpoint="memory://checkpoint",
+        gpu_ids=(),
+        compile_model=False,
+        compile_mode="default",
+        amp_dtype="fp32",
+    )
+
+    bundle = native._load_native_model({}, config, args)
+    bundle.model(torch.zeros(1, 1, 3, 4, 4))
+    assert recorder.seen == [(1, 1, 3, 4, 4)]
