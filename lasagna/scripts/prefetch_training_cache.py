@@ -451,11 +451,11 @@ def main():
             corners_zyx = np.array([
                 [z, y, x]
                 for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)
-            ], dtype=np.float64)
+            ], dtype=np.floathi)
             corners_vol = _apply_affine_zyx(patch.cache_to_volume, corners_zyx)
             aabb_center = (corners_vol.min(axis=0) + corners_vol.max(axis=0)) / 2.0
             label_min = np.round(
-                aabb_center - np.array((L, L, L), dtype=np.float64) / 2.0
+                aabb_center - np.array((L, L, L), dtype=np.floathi) / 2.0
             ).astype(np.int64)
         else:
             label_min = np.array([z0, y0, x0], dtype=np.int64)

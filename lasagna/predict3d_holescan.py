@@ -338,7 +338,7 @@ def _find_holes_in_counts(
 	max_low_density: float,
 ) -> list[HoleFinding]:
 	voxels_per_slice = max(1, (y1 - y0) * (x1 - x0))
-	density = counts.astype(np.float64) / float(voxels_per_slice)
+	density = counts.astype(np.floathi) / float(voxels_per_slice)
 	findings: list[HoleFinding] = []
 	for start, end in _iter_runs(density <= max_low_density):
 		before_med, after_med = _bracket_density(density, start, end, bracket_window)

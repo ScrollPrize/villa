@@ -3263,20 +3263,20 @@ class Model3D(nn.Module):
 		# stays on CPU. Float64 keeps shared-edge and overlapping-cell tie behavior
 		# stable across CPU and CUDA.
 		use_cuda = bool(torch.device(device).type == "cuda")
-		tri0_s_cell = torch.as_tensor(q10 - q00, dtype=torch.float64, device=device)
-		tri0_t_cell = torch.as_tensor(q01 - q00, dtype=torch.float64, device=device)
-		tri1_u_cell = torch.as_tensor(q11 - q10, dtype=torch.float64, device=device)
-		tri1_v_cell = torch.as_tensor(q01 - q10, dtype=torch.float64, device=device)
-		q00_c = torch.as_tensor(q00, dtype=torch.float64, device=device)
-		q10_c = torch.as_tensor(q10, dtype=torch.float64, device=device)
-		x00_c = torch.as_tensor(x00, dtype=torch.float64, device=device)
-		x10_c = torch.as_tensor(x10, dtype=torch.float64, device=device)
-		x01_c = torch.as_tensor(x01, dtype=torch.float64, device=device)
-		x11_c = torch.as_tensor(x11, dtype=torch.float64, device=device)
-		rows_c = torch.as_tensor(rows.astype(np.float64), device=device)
-		cols_c = torch.as_tensor(cols.astype(np.float64), device=device)
+		tri0_s_cell = torch.as_tensor(q10 - q00, dtype=torch.floathi, device=device)
+		tri0_t_cell = torch.as_tensor(q01 - q00, dtype=torch.floathi, device=device)
+		tri1_u_cell = torch.as_tensor(q11 - q10, dtype=torch.floathi, device=device)
+		tri1_v_cell = torch.as_tensor(q01 - q10, dtype=torch.floathi, device=device)
+		q00_c = torch.as_tensor(q00, dtype=torch.floathi, device=device)
+		q10_c = torch.as_tensor(q10, dtype=torch.floathi, device=device)
+		x00_c = torch.as_tensor(x00, dtype=torch.floathi, device=device)
+		x10_c = torch.as_tensor(x10, dtype=torch.floathi, device=device)
+		x01_c = torch.as_tensor(x01, dtype=torch.floathi, device=device)
+		x11_c = torch.as_tensor(x11, dtype=torch.floathi, device=device)
+		rows_c = torch.as_tensor(rows.astype(np.floathi), device=device)
+		cols_c = torch.as_tensor(cols.astype(np.floathi), device=device)
 		if not use_tree:
-			centers_c = torch.as_tensor(centers, dtype=torch.float64, device=device)
+			centers_c = torch.as_tensor(centers, dtype=torch.floathi, device=device)
 
 		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=device)
 		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=device)
@@ -3294,7 +3294,7 @@ class Model3D(nn.Module):
 			flat_idx = np.arange(start, stop, dtype=np.int64)
 			oy = flat_idx // int(out_w)
 			ox = flat_idx - oy * int(out_w)
-			points = np.stack([lo[0] + oy.astype(np.float64), lo[1] + ox.astype(np.float64)], axis=-1)
+			points = np.stack([lo[0] + oy.astype(np.floathi), lo[1] + ox.astype(np.floathi)], axis=-1)
 			if use_tree:
 				_dist, cand = tree.query(points, k=k, workers=-1)
 				cand = np.asarray(cand, dtype=np.int64)
@@ -3302,11 +3302,11 @@ class Model3D(nn.Module):
 					cand = cand[:, None]
 				cand_t = torch.as_tensor(cand, dtype=torch.long, device=device)
 			else:
-				pts_bf = torch.as_tensor(points, dtype=torch.float64, device=device)
+				pts_bf = torch.as_tensor(points, dtype=torch.floathi, device=device)
 				d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
 				cand_t = torch.topk(d2, min(k, int(centers_c.shape[0])), dim=1, largest=False).indices
 
-			pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
+			pts_t = torch.as_tensor(points, dtype=torch.floathi, device=device)
 
 			# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
 			rhs0 = pts_t[:, None, :] - q00_c[cand_t]

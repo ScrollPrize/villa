@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- Nearest CC + pairwise distances (using cached DTs) -----------------
     dist_1 = np.full(shape, np.inf, dtype=np.float32)  # nearest CC distance
     idx_1 = np.zeros(shape, dtype=np.int32)             # CC index of nearest (0-based)
-    avg_dist = np.zeros((N, N), dtype=np.float64)       # pairwise avg distances
+    avg_dist = np.zeros((N, N), dtype=np.floathi)       # pairwise avg distances
 
     for i in range(N):
         dt_i = dt_all[i]
@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Greedy chain winding assignment ------------------------------------
     # total_avg[i] = mean distance from CC i to all other CCs
-    total_avg = np.zeros(N, dtype=np.float64)
+    total_avg = np.zeros(N, dtype=np.floathi)
     for i in range(N):
         vals = [avg_dist[i, j] for j in range(N) if i != j]
         total_avg[i] = np.mean(vals) if vals else 0.0

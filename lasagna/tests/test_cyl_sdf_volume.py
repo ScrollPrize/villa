@@ -33,7 +33,7 @@ class CylSdfVolumeTests(unittest.TestCase):
 		self.assertTrue(edges)
 		self.assertEqual(set(edges.values()), {2})
 
-		v = verts.to(dtype=torch.float64)
+		v = verts.to(dtype=torch.floathi)
 		f = faces.to(dtype=torch.long)
 		p0 = v[f[:, 0]]
 		p1 = v[f[:, 1]]

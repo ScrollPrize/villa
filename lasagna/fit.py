@@ -360,6 +360,16 @@ def _require_torch_device_available(device: torch.device) -> None:
 			f"{count} visible CUDA device(s)."
 		)
 
+def _set_device_floathi(device: torch.device):
+	import numpy as np
+	torch.floathi = torch.float64
+	np.floathi = np.float64
+	try:
+		torch.zeros(1, dtype=torch.float64, device=device)
+	except (RuntimeError, TypeError):
+		torch.floathi = torch.float32
+		np.floathi = np.float32
+
 
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
@@ -1304,6 +1314,7 @@ def _run_flatten_mode(
 		raise ValueError("model-init=flatten must not set --model-input")
 
 	device = torch.device(str(getattr(args, "device", "cuda")))
+	_set_device_floathi(device)
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
 	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
@@ -1521,6 +1532,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 
 	device = torch.device(data_cfg.device)
 	_require_torch_device_available(device)
+	_set_device_floathi(device)
 	init_mode = str(model_cfg.init_mode).strip().lower()
 	self_map_init = _validate_self_map_init_args(
 		self_map_init=self_map_init,
