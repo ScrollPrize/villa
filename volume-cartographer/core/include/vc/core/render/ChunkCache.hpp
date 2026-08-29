@@ -38,6 +38,13 @@ enum class PersistentCacheLayout {
     Auto,
     Legacy,
     ZarrMirror,
+    // A regular, unsharded Zarr store with VC-Delta3D as its chunk codec.
+    Delta3d,
+};
+
+enum class PersistentCacheEncoding {
+    SourceMirror,
+    Delta3dLossless,
 };
 
 struct PersistentCacheMetadataObject {
@@ -54,6 +61,8 @@ struct ChunkCacheOptions {
     std::optional<std::filesystem::path> persistentCacheBudgetRoot;
     // Auto selects an existing legacy footprint, otherwise an exact Zarr
     // mirror when metadata and physical-object fetchers are available.
+    // Delta3d is selected only by ChunkCacheService and preserves the source
+    // Zarr hierarchy and logical chunk keys while replacing its codec.
     PersistentCacheLayout persistentCacheLayout = PersistentCacheLayout::Auto;
     std::vector<PersistentCacheMetadataObject> zarrMirrorMetadata;
     // Deprecated compatibility fields. Readers accept legacy compressed
@@ -61,6 +70,13 @@ struct ChunkCacheOptions {
     bool compressPersistentCache = false;
     // Near-lossless persistent-cache quantization width; one is lossless.
     int cacheQuantBinWidth = 1;
+    // When the shared decoded-byte budget must evict, sources flagged here
+    // are preferred victims: they may not displace other participants'
+    // decoded data unless no flagged participant has anything left to give.
+    // Set by bulk background consumers (lasagna channel sampling for line
+    // solves) so their chunk streams cannot evict the viewer tiles the user
+    // is panning over.
+    bool decodedEvictionPreferSelf = false;
 };
 
 // Application-owned decoded chunk-cache service. Source identity strings are
@@ -90,6 +106,10 @@ public:
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
         std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
+        // Startup-only selection for remote-volume persistent caches. Sources
+        // acquired from this service cannot change representation in place.
+        PersistentCacheEncoding persistentCacheEncoding =
+            PersistentCacheEncoding::SourceMirror;
     };
 
     ChunkCacheService();
@@ -118,6 +138,7 @@ public:
     // running work are preserved; reductions evict only decoded LRU entries.
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
+    PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
 
@@ -171,6 +192,9 @@ public:
         std::size_t persistentCacheFreeBytes = 0;
         std::size_t persistentCacheMinimumFreeBytes = 0;
         std::optional<std::size_t> persistentCacheMaximumBytes;
+        // Non-empty when persistence was disabled for this volume, for example
+        // because another process is using an incompatible cache format.
+        std::string persistentCacheWarning;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
         std::size_t pendingDecodeTasks = 0;
@@ -178,7 +202,9 @@ public:
         // level. Persistent-cache probes count while the requested chunk is
         // still unavailable to rendering.
         std::vector<std::size_t> unresolvedFetchesByLevel;
-
+        // Readers currently parked inside getChunkBlocking (summed over
+        // keys). Chunks with parked readers are protected from eviction.
+        std::size_t blockingReaders = 0;
     };
 
     struct PersistentChunkDependency {
@@ -315,6 +341,7 @@ private:
     struct PersistentReadResult {
         std::vector<std::byte> bytes;
         bool sourcePayload = false;
+        bool decodedPayload = false;
     };
 
     struct Entry {
@@ -337,6 +364,15 @@ private:
         std::list<ChunkKey>::iterator lruIt;
     };
 
+    struct FetchContext {
+        std::uint64_t generation = 0;
+        std::uint64_t fetcherGeneration = 0;
+        std::uint64_t fetchSerial = 0;
+        std::uint64_t schedulerEpoch = 0;
+        std::shared_ptr<IChunkFetcher> fetcher;
+        std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
+    };
+
     struct PersistenceOperation {
         mutable std::mutex mutex;
         std::condition_variable cv;
@@ -346,6 +382,10 @@ private:
         std::atomic_bool writeQueued{false};
         std::uint64_t probeTaskId = 0;
         std::uint64_t sourceTaskId = 0;
+        // Foreground misses arriving while a maintenance Delta3D operation is
+        // decoding or publishing wait here, then re-probe the completed cache
+        // entry instead of issuing a duplicate source request.
+        std::vector<FetchContext> foregroundWaiters;
     };
 
     struct SourceTransfer {
@@ -461,6 +501,17 @@ private:
                            StorageObjectTransfer,
                            StorageObjectKeyHash> storageObjectTransfers_;
         std::list<ChunkKey> lru_;
+        // Readers currently parked inside getChunkBlocking, counted per key
+        // and owned by the readers themselves (registered on entry, released
+        // exactly once on every exit). The count - not the entry - carries
+        // the eviction protection: both evictors and the budget's victim
+        // probe skip keys with parked readers, so a successor entry created
+        // after an invalidation is protected from the moment it exists, and
+        // no entry lifecycle event can duplicate, destroy, or transfer a
+        // reader's registration. Slots are erased at zero; the map is empty
+        // whenever no blocking read is in progress.
+        std::unordered_map<ChunkKey, std::size_t, ChunkKeyHash>
+            blockingReadersByKey_;
         std::vector<std::size_t> unresolvedFetchesByLevel_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t decodedBudgetRegistration_ = 0;
@@ -498,16 +549,9 @@ private:
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
+        std::shared_ptr<void> persistentLease_;
+        std::string persistentCacheWarning_;
 
-    };
-
-    struct FetchContext {
-        std::uint64_t generation = 0;
-        std::uint64_t fetcherGeneration = 0;
-        std::uint64_t fetchSerial = 0;
-        std::uint64_t schedulerEpoch = 0;
-        std::shared_ptr<IChunkFetcher> fetcher;
-        std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
     };
 
     static ChunkResult resultFromEntryLocked(
@@ -528,6 +572,8 @@ private:
                                        Entry& entry,
                                        const ChunkRequestContext& request);
     static bool hasDemandLocked(const Entry& entry);
+    static bool hasParkedBlockingReaderLocked(const State& state,
+                                              const ChunkKey& key);
     static bool cancelUndemandedEntryLocked(State& state,
                                             const ChunkKey& key,
                                             Entry& entry);
@@ -549,7 +595,8 @@ private:
         const std::shared_ptr<State>& state,
         ChunkKey key,
         FetchContext context,
-        std::shared_ptr<ChunkFetchResult> fetched);
+        std::shared_ptr<ChunkFetchResult> fetched,
+        std::shared_ptr<PersistenceOperation> persistence = {});
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
@@ -612,25 +659,50 @@ private:
     static void queueFetchedDecode(const std::shared_ptr<State>& state,
                                    const ChunkKey& key,
                                    FetchContext context,
-                                   ChunkFetchResult fetched);
+                                   ChunkFetchResult fetched,
+                                   std::shared_ptr<PersistenceOperation> persistence = {});
     static void finishAndStore(const std::shared_ptr<State>& state,
                                const ChunkKey& key,
                                FetchContext context,
                                ChunkFetchResult fetch,
                                bool loadedFromPersistentCache);
+    static void finishDelta3dAndStore(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        FetchContext context,
+        ChunkFetchResult fetch,
+        std::shared_ptr<PersistenceOperation> persistence);
     static PersistentProbeResult probePersistent(const State& state,
                                                   const ChunkKey& key);
     static std::optional<PersistentReadResult> readPersistent(
         const State& state,
         const ChunkKey& key,
         const PersistentProbeResult& probe);
-    static void storeFetchResultLocked(const std::shared_ptr<State>& state,
-                                       const ChunkKey& key,
-                                       ChunkFetchResult fetch,
-                                       bool loadedFromPersistentCache);
+    static void storeFetchResultLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        ChunkFetchResult fetch,
+        bool loadedFromPersistentCache);
+    [[nodiscard]] static bool storeDelta3dFetchResultLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        ChunkFetchResult fetch,
+        const std::shared_ptr<PersistenceOperation>& persistence);
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
+    static bool queueDelta3dWrite(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        std::shared_ptr<const std::vector<std::byte>> bytes,
+        std::shared_ptr<PersistenceOperation> operation = {},
+        bool stateAlreadyLocked = false);
+    static void queueDelta3dMaintenanceDecode(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        FetchContext context,
+        ChunkFetchResult fetched,
+        std::shared_ptr<PersistenceOperation> operation);
     static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                                           const ChunkKey& key);
     static bool queuePersistentSourceWrite(
@@ -647,9 +719,17 @@ private:
         const ChunkKey& key,
         const std::vector<std::byte>& bytes);
     static bool writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
+    static bool writeDelta3dPersistent(
+        State& state,
+        const ChunkKey& key,
+        const std::vector<std::byte>& bytes);
     static bool writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentDelta3dPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentDelta3dEmptyPath(
+        const State& state,
+        const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentSourcePath(const State& state, const ChunkKey& key);
     static std::filesystem::path mirrorObjectPath(
@@ -666,6 +746,7 @@ private:
         const Options& options,
         const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers);
     static void publishMirrorMetadata(const std::shared_ptr<State>& state);
+    static void publishDelta3dMetadata(const std::shared_ptr<State>& state);
     static bool persistentEntryIsRaw(const State& state, const ChunkKey& key);
     static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
     static std::size_t persistentCacheBytes(
@@ -689,8 +770,8 @@ private:
     static void notifyListeners(const std::shared_ptr<State>& state);
     static void notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                            const ChunkKey& key,
-                                           bool active);
-    static void waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key);
+                                           bool active,
+                                           bool isolateCallbackExceptions = false);
     static std::uint64_t nextSchedulerGroup();
     static void invalidateState(const std::shared_ptr<State>& state);
     static void registerStateBudget(const std::shared_ptr<State>& state);

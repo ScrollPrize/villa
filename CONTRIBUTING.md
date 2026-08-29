@@ -38,7 +38,7 @@ We support the use of LLMs as coding assistants, and we make broad use of them o
 
 ## Developer installation 
 The codebase is constantly changing, and the python focused portions have complex dependencies, it is common to run into some issues here. For the most part we have 
-tried to settle on using `uv` lockfiles with `pyproject.toml` in the primary subprojected (`ink-detection`, `volume-cartographer`, `vesuvius`, and `volume-cartographer/scripts/spiral`). 
+tried to settle on using `uv` lockfiles with `pyproject.toml` in the primary subprojects (`ink-detection`, `volume-cartographer`, `vesuvius`, and `spiral-fitting`).
 it is highly recommended to use `uv`. 
 
 For these projects, moving into the dir with the `pyproject.toml` and using `uv sync` should get you up and running with a proper venv. in the case of `vesuvius` you

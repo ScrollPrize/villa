@@ -122,6 +122,39 @@ To run the synthetic smoke suite:
 uv run python -m unittest tests.test_pretrain_smoke -v
 ```
 
+## Point-supervised pretraining
+
+Pretraining can optionally reinforce patch embeddings with sparse annotated points while DINO, iBOT, KoLeo, and Gram remain active. The top-level defaults are:
+
+```json
+{
+  "point_supervision": {
+    "enabled": true,
+    "sampling_probability": 0.1,
+    "loss_weight": 0.05,
+    "different_type_margin": 0.0,
+    "max_points_per_view": 64
+  }
+}
+```
+
+Attach annotations to each applicable volume (paths are intentionally omitted from the runnable example config):
+
+```json
+{
+  "volume_path": "/path/to/volume.zarr",
+  "volume_scale": 1,
+  "point_collections": [
+    {"path": "~/points/fibers.json", "type": "fiber"},
+    {"path": "annotations/surface.json", "type": "surface"}
+  ]
+}
+```
+
+Each annotation file must be version 1 and contain a `collections` array whose entries contain `points` arrays with `p: [x, y, z]`. The configured `type` applies to every point in that file; equal type strings have equal meaning across volumes. `~` is expanded, while other relative paths remain relative to the process working directory.
+
+Coordinates are scale-0 voxel centers in XYZ order. Dinovol converts them to ZYX and maps voxel centers to the selected pyramid level using the co-registered level-shape ratio. Point-centered sampling and the point loss are inactive when the feature is disabled or no volume has `point_collections`. Only training samples and the two global views are supervised; validation, monitor batches, and local views keep their existing sampling behavior.
+
 ## Optional Task Eval During Pretraining
 
 `pretrain.py` can optionally run small downstream segmentation trainings during pretraining.

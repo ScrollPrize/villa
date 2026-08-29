@@ -447,8 +447,8 @@ export const team = {
   challenge: [
     {
       name: "Sean Johnson",
-      title: "Research Assistant",
-      href: "https://github.com/bruniss",
+      title: "Research Scientist",
+      href: "https://sean-johnson.dev/",
     },
     {
       name: "Hendrik Schilling",
@@ -462,7 +462,7 @@ export const team = {
     },
     {
       name: "Elian Rafael Dal Prá",
-      title: "ML Intern",
+      title: "Research Assistant",
       href: "https://twitter.com/elianrafaeldp",
     },
     {

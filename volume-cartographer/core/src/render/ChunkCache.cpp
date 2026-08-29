@@ -1,6 +1,7 @@
 #include "ChunkCache.hpp"
 
 #include <utils/thread_pool.hpp>
+#include <utils/Json.hpp>
 
 #include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -23,15 +24,377 @@
 #include <unordered_map>
 #include <utility>
 
+#if defined(_WIN32)
+#  define NOMINMAX
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
+#endif
+
 namespace vc::render {
 
 namespace {
 
-constexpr std::size_t kPersistentWriteBacklogBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kPersistentWriteBacklogBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kPersistentProbeWorkers = 32;
 constexpr std::size_t kDecodeWorkers = 8;
 constexpr int kTerminalLevelPriorityBonus = 100;
+constexpr std::string_view kDelta3dCacheMarkerName = ".vc_delta3d_cache";
+constexpr std::string_view kDelta3dCacheMarkerContents = "D3D1\n";
 std::atomic_size_t g_persistentWriteBacklogBytes{0};
+
+bool atomicWriteBytes(const std::filesystem::path& path,
+                      std::span<const std::byte> bytes);
+std::optional<std::vector<std::byte>>
+readFileBytes(const std::filesystem::path& path);
+
+bool hasSuffix(std::string_view value, std::string_view suffix)
+{
+    return value.size() >= suffix.size() &&
+           value.substr(value.size() - suffix.size()) == suffix;
+}
+
+std::vector<std::byte> jsonBytes(const utils::Json& value)
+{
+    const auto text = value.dump(2) + "\n";
+    return {
+        reinterpret_cast<const std::byte*>(text.data()),
+        reinterpret_cast<const std::byte*>(text.data() + text.size())};
+}
+
+void configureDelta3dV2Array(utils::Json& metadata)
+{
+    if (!metadata.is_object() || metadata.value("zarr_format", 0) != 2)
+        throw std::runtime_error("invalid Zarr v2 array metadata");
+    metadata["compressor"] = utils::Json{
+        {"id", vc::kDelta3dCodecName},
+        {"quant", vc::kCacheQuantLossless}};
+    // Cache compression starts from decoded logical voxels, so source-side
+    // filters must not be applied a second time when the cache is reopened.
+    metadata["filters"] = nullptr;
+    if (metadata.contains("dtype") && metadata["dtype"].is_string()) {
+        auto dtype = metadata["dtype"].get_string();
+        if (!dtype.empty() && dtype.front() != '|') {
+            dtype.front() = std::endian::native == std::endian::big ? '>' : '<';
+            metadata["dtype"] = dtype;
+        }
+    }
+}
+
+void configureDelta3dV3Array(utils::Json& metadata)
+{
+    if (!metadata.is_object() || metadata.value("zarr_format", 0) != 3 ||
+        metadata.value("node_type", "") != "array") {
+        throw std::runtime_error("invalid Zarr v3 array metadata");
+    }
+    // The cache payload is made from decoded logical C-order voxels. Reject
+    // sharding, discard source transforms, and describe those bytes directly.
+    if (metadata.contains("codecs") && metadata["codecs"].is_array()) {
+        for (const auto& codec : metadata["codecs"]) {
+            if (!codec.is_object())
+                continue;
+            const auto name = codec.value("name", "");
+            if (name == "sharding_indexed") {
+                throw std::runtime_error(
+                    "Delta3D persistent Zarr cache requires unsharded source arrays");
+            }
+        }
+    }
+    utils::Json codecs = utils::Json::array();
+    codecs.push_back(utils::Json{
+        {"name", "bytes"},
+        {"configuration", utils::Json{{
+            "endian", std::endian::native == std::endian::big
+                ? "big" : "little"}}}});
+    codecs.push_back(utils::Json{
+        {"name", vc::kDelta3dCodecName},
+        {"configuration", utils::Json{{"quant", vc::kCacheQuantLossless}}}});
+    metadata["codecs"] = std::move(codecs);
+}
+
+std::vector<PersistentCacheMetadataObject> delta3dZarrMetadata(
+    const std::vector<PersistentCacheMetadataObject>& source)
+{
+    std::vector<PersistentCacheMetadataObject> result;
+    result.reserve(source.size());
+    bool foundArray = false;
+    for (const auto& object : source) {
+        if (!isSafeZarrStoreKey(object.key))
+            throw std::runtime_error(
+                "unsafe Zarr metadata cache key: " + object.key);
+
+        PersistentCacheMetadataObject rewritten = object;
+        const std::string text(
+            reinterpret_cast<const char*>(object.bytes.data()),
+            object.bytes.size());
+        if (object.key == ".zarray" || hasSuffix(object.key, "/.zarray")) {
+            auto metadata = utils::Json::parse(text);
+            configureDelta3dV2Array(metadata);
+            rewritten.bytes = jsonBytes(metadata);
+            foundArray = true;
+        } else if (object.key == "zarr.json" ||
+                   hasSuffix(object.key, "/zarr.json")) {
+            auto metadata = utils::Json::parse(text);
+            if (metadata.value("node_type", "") == "array") {
+                configureDelta3dV3Array(metadata);
+                rewritten.bytes = jsonBytes(metadata);
+                foundArray = true;
+            }
+        } else if (object.key == ".zmetadata") {
+            auto consolidated = utils::Json::parse(text);
+            if (consolidated.contains("metadata") &&
+                consolidated["metadata"].is_object()) {
+                auto& entries = consolidated["metadata"];
+                for (auto it = entries.begin(); it != entries.end(); ++it) {
+                    if (it.key() == ".zarray" ||
+                        hasSuffix(it.key(), "/.zarray")) {
+                        configureDelta3dV2Array(*it);
+                        foundArray = true;
+                    }
+                }
+                rewritten.bytes = jsonBytes(consolidated);
+            }
+        }
+        result.push_back(std::move(rewritten));
+    }
+    if (!foundArray) {
+        throw std::runtime_error(
+            "Delta3D persistent Zarr cache requires source array metadata");
+    }
+    return result;
+}
+
+class PersistentCacheLease final {
+public:
+    enum class Mode { Shared, Exclusive };
+
+    static std::shared_ptr<PersistentCacheLease> tryAcquire(
+        const std::filesystem::path& cachePath, Mode mode)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(cachePath.parent_path(), ec);
+        if (ec)
+            return {};
+        auto lease = std::shared_ptr<PersistentCacheLease>(
+            new PersistentCacheLease(leasePath(cachePath)));
+        if (!lease->lock(mode))
+            return {};
+        return lease;
+    }
+
+    ~PersistentCacheLease()
+    {
+#if defined(_WIN32)
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            OVERLAPPED overlapped{};
+            UnlockFileEx(handle_, 0, 1, 0, &overlapped);
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+#endif
+    }
+
+    bool downgradeToShared()
+    {
+#if defined(_WIN32)
+        if (handle_ == INVALID_HANDLE_VALUE)
+            return false;
+        OVERLAPPED overlapped{};
+        if (!UnlockFileEx(handle_, 0, 1, 0, &overlapped))
+            return false;
+        return lockWindows(Mode::Shared);
+#else
+        return fd_ >= 0 && flock(fd_, LOCK_SH | LOCK_NB) == 0;
+#endif
+    }
+
+private:
+    explicit PersistentCacheLease(std::filesystem::path path)
+        : path_(std::move(path))
+    {
+    }
+
+    static std::filesystem::path leasePath(
+        const std::filesystem::path& cachePath)
+    {
+        return cachePath.parent_path() /
+               ("." + cachePath.filename().string() + ".vc_cache.lock");
+    }
+
+    bool lock(Mode mode)
+    {
+#if defined(_WIN32)
+        handle_ = CreateFileW(
+            path_.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        return handle_ != INVALID_HANDLE_VALUE && lockWindows(mode);
+#else
+        fd_ = open(path_.c_str(), O_RDWR | O_CREAT, 0666);
+        return fd_ >= 0 &&
+               flock(fd_, (mode == Mode::Shared ? LOCK_SH : LOCK_EX) |
+                              LOCK_NB) == 0;
+#endif
+    }
+
+#if defined(_WIN32)
+    bool lockWindows(Mode mode)
+    {
+        OVERLAPPED overlapped{};
+        DWORD flags = LOCKFILE_FAIL_IMMEDIATELY;
+        if (mode == Mode::Exclusive)
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        return LockFileEx(handle_, flags, 0, 1, 0, &overlapped) != 0;
+    }
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+    std::filesystem::path path_;
+};
+
+struct PersistentCachePreparation {
+    std::shared_ptr<PersistentCacheLease> lease;
+    std::string warning;
+};
+
+bool isExactCacheDirectoryTarget(const std::filesystem::path& path)
+{
+    if (path.empty() || !path.has_filename() || path == path.root_path())
+        return false;
+    if (path.parent_path().empty() || path.parent_path() == path.root_path())
+        return false;
+    const auto filename = path.filename();
+    if (filename.empty() || filename == "." || filename == "..")
+        return false;
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec == std::errc::no_such_file_or_directory)
+        ec.clear();
+    return !ec && !std::filesystem::is_symlink(status);
+}
+
+bool isStrictlyWithin(const std::filesystem::path& path,
+                      const std::filesystem::path& root)
+{
+    std::error_code ec;
+    const auto absolutePath = std::filesystem::absolute(path, ec).lexically_normal();
+    if (ec)
+        return false;
+    const auto absoluteRoot = std::filesystem::absolute(root, ec).lexically_normal();
+    if (ec || absolutePath == absoluteRoot)
+        return false;
+    auto pathIt = absolutePath.begin();
+    for (auto rootIt = absoluteRoot.begin(); rootIt != absoluteRoot.end();
+         ++rootIt, ++pathIt) {
+        if (pathIt == absolutePath.end() || *pathIt != *rootIt)
+            return false;
+    }
+    return true;
+}
+
+bool hasDelta3dCacheMarker(const std::filesystem::path& root)
+{
+    const auto bytes = readFileBytes(root / kDelta3dCacheMarkerName);
+    if (!bytes || bytes->size() != kDelta3dCacheMarkerContents.size())
+        return false;
+    return std::equal(
+        bytes->begin(), bytes->end(),
+        reinterpret_cast<const std::byte*>(kDelta3dCacheMarkerContents.data()));
+}
+
+PersistentCachePreparation preparePersistentCache(
+    const std::filesystem::path& root,
+    PersistentCacheEncoding encoding,
+    const std::optional<std::filesystem::path>& budgetRoot)
+{
+    PersistentCachePreparation result;
+    if (!isExactCacheDirectoryTarget(root)) {
+        result.warning = "persistent cache path is not a safe per-volume directory: " +
+                         root.string();
+        return result;
+    }
+    if (budgetRoot && !isStrictlyWithin(root, *budgetRoot)) {
+        result.warning = "persistent cache path is not an exact volume directory beneath its cache root: " +
+                         root.string();
+        return result;
+    }
+
+    const bool wantDelta3d =
+        encoding == PersistentCacheEncoding::Delta3dLossless;
+    auto compatible = [&] { return hasDelta3dCacheMarker(root) == wantDelta3d; };
+
+    result.lease = PersistentCacheLease::tryAcquire(
+        root, PersistentCacheLease::Mode::Shared);
+    if (!result.lease) {
+        result.warning = "persistent cache lease is held by a process replacing this volume cache";
+        return result;
+    }
+    if (compatible())
+        return result;
+
+    result.lease.reset();
+    result.lease = PersistentCacheLease::tryAcquire(
+        root, PersistentCacheLease::Mode::Exclusive);
+    if (!result.lease) {
+        // A same-format initializer may have completed between our shared and
+        // exclusive attempts. Recheck once under a new shared lease.
+        auto shared = PersistentCacheLease::tryAcquire(
+            root, PersistentCacheLease::Mode::Shared);
+        if (shared && compatible()) {
+            result.lease = std::move(shared);
+            return result;
+        }
+        result.warning =
+            "another process is using an incompatible persistent cache format";
+        return result;
+    }
+
+    // Recheck after acquiring exclusive ownership: another initializer could
+    // have completed while the lock was being converted.
+    if (!compatible()) {
+        std::error_code ec;
+        auto budget = budgetRoot
+            ? PersistentZarrCacheBudget::findForPath(root)
+            : std::shared_ptr<PersistentZarrCacheBudget>{};
+        if (budget)
+            budget->removeCacheSubtree(root, ec);
+        else
+            std::filesystem::remove_all(root, ec);
+        if (!ec) {
+            const auto bookkeeping = root.parent_path() /
+                ".vc_cache_bookkeeping" / root.filename();
+            std::filesystem::remove_all(bookkeeping, ec);
+        }
+        if (!ec)
+            std::filesystem::create_directories(root, ec);
+        if (!ec && wantDelta3d) {
+            const auto marker = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(
+                    kDelta3dCacheMarkerContents.data()),
+                kDelta3dCacheMarkerContents.size());
+            if (!atomicWriteBytes(root / kDelta3dCacheMarkerName, marker))
+                ec = std::make_error_code(std::errc::io_error);
+        }
+        if (ec) {
+            result.warning = "could not initialize requested persistent cache format: " +
+                             ec.message();
+            result.lease.reset();
+            return result;
+        }
+    }
+    if (!result.lease->downgradeToShared()) {
+        result.warning = "could not retain a shared persistent cache lease";
+        result.lease.reset();
+    }
+    return result;
+}
 
 bool reservePersistentWriteBytes(std::size_t bytes)
 {
@@ -58,6 +421,17 @@ void releasePersistentWriteBytes(std::size_t bytes)
     g_persistentWriteBacklogBytes.fetch_sub(bytes, std::memory_order_acq_rel);
 }
 
+void replacePersistentWriteBytes(std::size_t reservedBytes,
+                                 std::size_t replacementBytes)
+{
+    if (replacementBytes > reservedBytes) {
+        g_persistentWriteBacklogBytes.fetch_add(
+            replacementBytes - reservedBytes, std::memory_order_acq_rel);
+    } else if (reservedBytes > replacementBytes) {
+        releasePersistentWriteBytes(reservedBytes - replacementBytes);
+    }
+}
+
 std::string uniqueTmpSuffix()
 {
     // Several caches (viewers, core blocking readers, prefill — possibly in
@@ -80,6 +454,23 @@ utils::ThreadPool& persistentCacheWriterPool()
     return *pool;
 #else
     static utils::ThreadPool pool(1);
+    return pool;
+#endif
+}
+
+utils::ThreadPool& persistentCacheCompressionPool()
+{
+    // Compression is intentionally isolated from rendering's decode workers.
+    // Two workers provide steady write-back throughput while bounding the
+    // transient raw-plus-encoded working set to two chunks.
+    // Initialize the writer first so static teardown destroys the compression
+    // pool before the pool its running tasks publish into.
+    (void)persistentCacheWriterPool();
+#if defined(_WIN32)
+    static auto* pool = new utils::ThreadPool(2);
+    return *pool;
+#else
+    static utils::ThreadPool pool(2);
     return pool;
 #endif
 }
@@ -253,6 +644,7 @@ struct ChunkCacheService::Impl {
         : decodedByteBudget(std::move(options.decodedByteBudget))
         , initialAdaptiveDownloadState(
               std::move(options.initialAdaptiveDownloadState))
+        , persistentCacheEncoding(options.persistentCacheEncoding)
         , activeFetchWorkers(options.fetchConcurrency.maxConcurrentReads)
         , activeFetchAdaptive(options.fetchConcurrency.adaptive)
     {
@@ -286,7 +678,10 @@ struct ChunkCacheService::Impl {
         }
         fetchScheduler = std::make_shared<ChunkRequestScheduler>(
             workerCapacity, 7, schedulerSelectionGate,
-            adaptiveOptions, initialState);
+            adaptiveOptions, initialState,
+            persistentCacheEncoding == PersistentCacheEncoding::Delta3dLossless
+                ? 1
+                : 0);
         if (!activeFetchAdaptive) {
             fetchScheduler->configureConcurrency(activeFetchWorkers);
         }
@@ -294,6 +689,7 @@ struct ChunkCacheService::Impl {
 
     std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
     std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
+    const PersistentCacheEncoding persistentCacheEncoding;
     mutable std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<void>> sources;
     std::uint64_t nextSourceId = 1;
@@ -397,6 +793,11 @@ std::shared_ptr<ChunkCacheService> configureProcessChunkCacheService(
     }
 
     const auto current = registry.service->fetchConcurrency();
+    if (options.persistentCacheEncoding !=
+        registry.service->persistentCacheEncoding()) {
+        throw std::invalid_argument(
+            "process ChunkCacheService persistent encoding is fixed after creation");
+    }
     if (options.fetchConcurrency.workerCapacity != current.workerCapacity) {
         throw std::invalid_argument(
             "process ChunkCacheService worker capacity is fixed after creation");
@@ -447,6 +848,65 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     options.compressPersistentCache = false;
     options.cacheQuantBinWidth = 1;
     ChunkCache::validateSourceDefinition(levels, fetchers);
+    PersistentCachePreparation cachePreparation;
+    if (options.persistentCachePath &&
+        impl_->persistentCacheEncoding ==
+            PersistentCacheEncoding::Delta3dLossless) {
+        bool sharded = false;
+        for (std::size_t level = 0; level < fetchers.size(); ++level) {
+            const auto& fetcher = fetchers[level];
+            if (!fetcher)
+                continue;
+            const ChunkKey key{static_cast<int>(level), 0, 0, 0};
+            const auto object = fetcher->storageObject(key);
+            if (!object) {
+                throw std::runtime_error(
+                    "Delta3D persistent Zarr cache requires physical Zarr object support");
+            }
+            if (object->sharded()) {
+                sharded = true;
+                break;
+            }
+            const auto sourceKey = fetcher->sourceChunkKey(key);
+            if (!sourceKey || !isSafeZarrStoreKey(*sourceKey)) {
+                throw std::runtime_error(
+                    "Delta3D persistent Zarr cache requires safe native Zarr chunk keys");
+            }
+        }
+        if (sharded) {
+            cachePreparation.warning =
+                "Delta3D disk caching is disabled for sharded Zarr sources";
+            Logger()->warn(
+                "ChunkCache disabled persistent caching for {}: {}",
+                sourceIdentity, cachePreparation.warning);
+            options.persistentCachePath.reset();
+            options.persistentCacheBudgetRoot.reset();
+        } else {
+            options.zarrMirrorMetadata =
+                delta3dZarrMetadata(options.zarrMirrorMetadata);
+        }
+    }
+    if (options.persistentCachePath &&
+        (impl_->persistentCacheEncoding ==
+             PersistentCacheEncoding::Delta3dLossless ||
+         !options.zarrMirrorMetadata.empty() ||
+         hasDelta3dCacheMarker(*options.persistentCachePath))) {
+        cachePreparation = preparePersistentCache(
+            *options.persistentCachePath, impl_->persistentCacheEncoding,
+            options.persistentCacheBudgetRoot);
+        if (!cachePreparation.lease) {
+            Logger()->warn(
+                "ChunkCache disabled persistent caching for {}: {}",
+                sourceIdentity, cachePreparation.warning);
+            options.persistentCachePath.reset();
+            options.persistentCacheBudgetRoot.reset();
+        }
+    }
+    if (options.persistentCachePath &&
+        impl_->persistentCacheEncoding ==
+            PersistentCacheEncoding::Delta3dLossless) {
+        options.persistentCacheLayout = PersistentCacheLayout::Delta3d;
+    }
     options.persistentCacheLayout = ChunkCache::resolvePersistentCacheLayout(
         options, fetchers);
 
@@ -462,6 +922,18 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
                 "ChunkCache source was registered with incompatible metadata: " +
                 sourceIdentity);
         }
+        if (options.decodedEvictionPreferSelf !=
+            state->options_.decodedEvictionPreferSelf) {
+            // Eviction preference is a per-source policy captured by the
+            // FIRST acquisition's budget registration; it is deliberately not
+            // part of metadataCompatible (it describes no data), but a
+            // differing later request must not be ignored silently.
+            Logger()->warn(
+                "ChunkCache source {} already registered with "
+                "decodedEvictionPreferSelf={}; ignoring differing request",
+                sourceIdentity,
+                state->options_.decodedEvictionPreferSelf);
+        }
         ChunkCache::validateRefreshedFetchers(*state, fetchers);
         serviceLock.unlock();
         ChunkCache::refreshFetchers(state, std::move(fetchers));
@@ -473,6 +945,8 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     auto state = std::make_shared<ChunkCache::State>(
         std::move(levels), std::move(fetchers), fillValue, dtype,
         std::move(options), impl_->decodedByteBudget, sourceId, sourceIdentity);
+    state->persistentLease_ = std::move(cachePreparation.lease);
+    state->persistentCacheWarning_ = std::move(cachePreparation.warning);
     state->probeScheduler_ = impl_->probeScheduler;
     state->fetchScheduler_ = impl_->fetchScheduler;
     state->decodeScheduler_ = impl_->decodeScheduler;
@@ -488,6 +962,8 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
         ChunkCache::startPersistentCacheSizeScan(state);
     if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror)
         ChunkCache::publishMirrorMetadata(state);
+    else if (state->persistentLayout_ == PersistentCacheLayout::Delta3d)
+        ChunkCache::publishDelta3dMetadata(state);
     ChunkCache::registerStateBudget(state);
     impl_->sources.emplace(state->sourceIdentity_, state);
     return std::shared_ptr<ChunkCache>(
@@ -523,6 +999,12 @@ ChunkCacheService::FetchConcurrency ChunkCacheService::fetchConcurrency() const
     return {impl_->fetchScheduler->workerCapacity(),
             impl_->activeFetchWorkers,
             impl_->activeFetchAdaptive};
+}
+
+PersistentCacheEncoding
+ChunkCacheService::persistentCacheEncoding() const noexcept
+{
+    return impl_->persistentCacheEncoding;
 }
 
 std::size_t ChunkCacheService::sourceCount() const
@@ -643,6 +1125,7 @@ void ChunkCache::registerStateBudget(const std::shared_ptr<State>& state)
                 auto locked = weakState.lock();
                 return locked ? evictOldestDecoded(locked) : 0;
             },
+            state->options_.decodedEvictionPreferSelf,
         });
 }
 
@@ -724,9 +1207,9 @@ void ChunkCache::refreshFetchers(
         }
         state->storageObjectTransfers_.clear();
         restartUnresolvedLocked(state);
-        for (auto& [key, operation] : state->persistenceOperations_) {
-            if (operation->writeQueued.load(std::memory_order_acquire))
-                continue;
+        auto requeueOperation =
+            [&](const ChunkKey& key,
+                const std::shared_ptr<PersistenceOperation>& operation) {
             operation->probeTaskId = 0;
             operation->sourceTaskId = 0;
             FetchContext context{
@@ -740,16 +1223,16 @@ void ChunkCache::refreshFetchers(
             if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
                 (void)joinStorageObjectTransferLocked(
                     state, key, std::move(context), false, operation);
-                continue;
+                return;
             }
             if (operation->refresh) {
                 joinSourceTransferLocked(
                     state, key, std::move(context), false, operation);
-                continue;
+                return;
             }
             auto scheduler = state->probeScheduler_.lock();
             if (!scheduler)
-                continue;
+                return;
             const auto taskId = state->nextTaskId_->fetch_add(
                 1, std::memory_order_relaxed);
             operation->probeTaskId = taskId;
@@ -763,10 +1246,44 @@ void ChunkCache::refreshFetchers(
                         probePersistenceAndDispatch(
                             lockedState, key, operation);
                 });
+        };
+        for (auto it = state->persistenceOperations_.begin();
+             it != state->persistenceOperations_.end();) {
+            if (it->second->writeQueued.load(std::memory_order_acquire)) {
+                ++it;
+                continue;
+            }
+            try {
+                requeueOperation(it->first, it->second);
+                ++it;
+            } catch (...) {
+                // A fetcher that throws during the requeue must not escape
+                // before the cv notify below wakes parked blocking readers,
+                // and this operation's own waiters must fail rather than
+                // hang on a request nothing will run.
+                auto operation = it->second;
+                {
+                    std::lock_guard operationLock(operation->mutex);
+                    if (!operation->completed) {
+                        operation->result = {
+                            PersistentRequestStatus::Error,
+                            "persistent request restart failed"};
+                        operation->completed = true;
+                    }
+                }
+                operation->cv.notify_all();
+                Logger()->warn(
+                    "[ChunkCache] persistent request restart failed for "
+                    "({}, {}, {}, {}); request failed",
+                    it->first.level, it->first.iz, it->first.iy,
+                    it->first.ix);
+                it = state->persistenceOperations_.erase(it);
+            }
         }
     });
     for (const auto& key : stoppedRemoteActivity)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     state->cv_.notify_all();
 }
 
@@ -810,7 +1327,19 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
     });
     for (const auto& [serial, key] : retry) {
         (void)serial;
-        (void)queueFetchLocked(state, key, state->generation_, 0);
+        try {
+            (void)queueFetchLocked(state, key, state->generation_, 0);
+        } catch (...) {
+            // A fetcher that throws during queue setup must not orphan an
+            // InFlight entry (parked blocking readers would wait forever;
+            // the caller's cv notify wakes them to retry) or starve the
+            // remaining keys' restarts.
+            eraseUnresolvedEntryLocked(*state, key);
+            Logger()->warn(
+                "[ChunkCache] fetch restart failed for ({}, {}, {}, {}); "
+                "entry dropped for refetch on demand",
+                key.level, key.iz, key.iy, key.ix);
+        }
     }
 }
 
@@ -927,6 +1456,8 @@ PersistentCacheLayout ChunkCache::resolvePersistentCacheLayout(
 {
     if (!options.persistentCachePath)
         return PersistentCacheLayout::Legacy;
+    if (options.persistentCacheLayout == PersistentCacheLayout::Delta3d)
+        return PersistentCacheLayout::Delta3d;
 
     const auto& root = *options.persistentCachePath;
     const auto validateMirrorFetchers = [&] {
@@ -1006,6 +1537,39 @@ void ChunkCache::publishMirrorMetadata(const std::shared_ptr<State>& state)
             reservation.commit();
             throw std::runtime_error(
                 "failed to publish Zarr mirror metadata: " + path.string());
+        }
+        reservation.commit();
+    }
+}
+
+void ChunkCache::publishDelta3dMetadata(const std::shared_ptr<State>& state)
+{
+    if (!state || !state->options_.persistentCachePath ||
+        state->persistentLayout_ != PersistentCacheLayout::Delta3d) {
+        return;
+    }
+    for (const auto& object : state->options_.zarrMirrorMetadata) {
+        if (!isSafeZarrStoreKey(object.key)) {
+            throw std::runtime_error(
+                "unsafe Zarr metadata cache key: " + object.key);
+        }
+        const auto path = *state->options_.persistentCachePath /
+                          std::filesystem::path(object.key);
+        if (auto existing = readFileBytes(path); existing && *existing == object.bytes)
+            continue;
+        auto reservation = state->persistentBudget_
+            ? state->persistentBudget_->reserveProtectedWrite(
+                  path, object.bytes.size())
+            : PersistentZarrCacheBudget::WriteReservation{};
+        if (state->persistentBudget_ && !reservation) {
+            throw std::runtime_error(
+                "insufficient disk budget for Delta3D Zarr metadata: " +
+                path.string());
+        }
+        if (!atomicWriteBytes(path, object.bytes)) {
+            reservation.commit();
+            throw std::runtime_error(
+                "failed to publish Delta3D Zarr metadata: " + path.string());
         }
         reservation.commit();
     }
@@ -1140,22 +1704,123 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
 
-    auto [it, inserted] = state->entries_.emplace(key, Entry{});
-    it->second.backgroundDemand = true;
-    const bool notifyRemoteStart = inserted && queueFetchLocked(
-        state, key, state->generation_, 0);
-    if (notifyRemoteStart) {
+    // A caller of this method is parked until the chunk resolves, so its
+    // request must order ahead of the speculative prefetch backlog in the
+    // background queue (smaller backgroundPriority runs first; prefetches
+    // sit at >= 0). Without this, a blocking read issued while a solve
+    // streams chunks waits FIFO behind every chunk the solve enqueued -
+    // on remote sources that parked the caller (GUI thread included) for
+    // the whole backlog's round trips.
+    constexpr int kBlockingFetchPriorityOffset = -1024;
+    constexpr int kLostEntryRetryLimit = 5;
+    // Register this reader on the key before any entry work. The count -
+    // not the entry - carries the eviction protection: both evictors and
+    // the budget's victim probe skip keys with parked blocking readers
+    // (hasParkedBlockingReaderLocked), so a resolved chunk cannot be erased
+    // before its reader wakes, and a successor entry created after an
+    // invalidation is protected from the moment it exists no matter which
+    // thread created it. Being reader-owned, the registration survives any
+    // entry lifecycle event and is released exactly once on every exit.
+    // Only deliberate invalidation (and demand withdrawal of a successor
+    // this reader never observed) can still remove the entry; the chunk
+    // stays perfectly refetchable then, so the loop retries instead of
+    // failing.
+    ++state->blockingReadersByKey_[key];
+    bool readerReleased = false;
+    auto releaseReaderLocked = [&] {
+        if (readerReleased)
+            return;
+        readerReleased = true;
+        auto parked = state->blockingReadersByKey_.find(key);
+        if (parked != state->blockingReadersByKey_.end() &&
+            --parked->second == 0)
+            state->blockingReadersByKey_.erase(parked);
+    };
+    // Exits release the reader registration, then re-run both limits: while
+    // the registration protected the entry, enforcement may have given up
+    // over budget. The entry-count capacity runs under the lock, the shared
+    // byte budget outside it (it calls back into evictOldestDecoded, which
+    // takes the lock).
+    auto finishLocked = [&](ChunkResult result) {
+        releaseReaderLocked();
+        enforceCapacityLocked(state);
         lock.unlock();
-        notifyRemoteFetchListeners(state, key, true);
-        lock.lock();
+        enforceSharedBudget(state);
+        return result;
+    };
+    try {
+        for (int attempt = 0;; ++attempt) {
+            auto [it, inserted] = state->entries_.emplace(key, Entry{});
+            it->second.backgroundDemand = true;
+            bool notifyRemoteStart = false;
+            if (inserted) {
+                try {
+                    notifyRemoteStart = queueFetchLocked(
+                        state, key, state->generation_,
+                        kBlockingFetchPriorityOffset);
+                } catch (...) {
+                    // Queue setup failed before any task was installed:
+                    // erase the entry this reader created, or later readers
+                    // would wait forever on an InFlight entry that nothing
+                    // resolves.
+                    eraseUnresolvedEntryLocked(*state, key);
+                    throw;
+                }
+            } else if (it->second.status == EntryStatus::InFlight) {
+                const int boosted =
+                    fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
+                if (boosted < it->second.basePriority) {
+                    it->second.basePriority = boosted;
+                    reprioritizeEntryLocked(*state, key, it->second);
+                }
+            }
+            if (notifyRemoteStart) {
+                lock.unlock();
+                notifyRemoteFetchListeners(state, key, true);
+                lock.lock();
+            }
+            // Wait keyed by chunk key. Marking demand on whatever entry sits
+            // at the key (a mutex-protected side effect of the predicate)
+            // keeps demand pruning from erasing a successor this reader has
+            // observed; one it never observed can only vanish while the
+            // reader's own wake is still pending, which lands in the retry
+            // below.
+            state->cv_.wait(lock, [&] {
+                auto entry = state->entries_.find(key);
+                if (entry == state->entries_.end())
+                    return true;
+                entry->second.backgroundDemand = true;
+                return entry->second.status != EntryStatus::InFlight;
+            });
+            it = state->entries_.find(key);
+            if (it != state->entries_.end())
+                return finishLocked(
+                    resultFromEntryLocked(*state, key, it->second));
+            if (attempt >= kLostEntryRetryLimit)
+                return finishLocked(ChunkResult{
+                    ChunkStatus::Error, state->dtype_,
+                    state->levels_[level].chunkShape, {},
+                    "chunk entry removed before blocking reader woke "
+                    "(retries exhausted)"});
+            Logger()->warn(
+                "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) "
+                "mid-wait (invalidation, refresh, or demand withdrawal); "
+                "refetching (attempt {}/{})",
+                level, iz, iy, ix, attempt + 1, kLostEntryRetryLimit);
+        }
+    } catch (...) {
+        if (!lock.owns_lock())
+            lock.lock();
+        releaseReaderLocked();
+        try {
+            enforceCapacityLocked(state);
+            lock.unlock();
+            enforceSharedBudget(state);
+        } catch (...) {
+            // Best-effort cleanup: keep the original exception.
+        }
+        throw;
     }
-    waitForResolvedLocked(*state, lock, key);
-    it = state->entries_.find(key);
-    if (it == state->entries_.end())
-        return ChunkResult{
-            ChunkStatus::Error, state->dtype_,
-            state->levels_[level].chunkShape, {}, "chunk invalidated"};
-    return resultFromEntryLocked(*state, key, it->second);
 }
 
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset)
@@ -1305,6 +1970,13 @@ ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
         result.sourcePayloadMatchesPersistentCache = true;
         return result;
     }
+    if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+        result.persistentPath = persistentDelta3dPath(*state, key);
+        result.persistentEmptyPath = persistentDelta3dEmptyPath(*state, key);
+        result.persistentExtension.clear();
+        result.sourcePayloadMatchesPersistentCache = false;
+        return result;
+    }
     result.persistentPath = persistentPath(*state, key);
     result.persistentEmptyPath = persistentEmptyPath(*state, key);
     result.persistentExtension = fetcher->persistentCacheExtension(externalKey);
@@ -1322,7 +1994,8 @@ std::vector<ChunkKey> ChunkCache::persistedStorageObjectRepresentatives() const
     auto state = state_;
     std::vector<ChunkKey> result;
     if (!state->options_.persistentCachePath ||
-        state->persistentLayout_ != PersistentCacheLayout::ZarrMirror) {
+        (state->persistentLayout_ != PersistentCacheLayout::ZarrMirror &&
+         state->persistentLayout_ != PersistentCacheLayout::Delta3d)) {
         return result;
     }
 
@@ -1343,6 +2016,9 @@ std::vector<ChunkKey> ChunkCache::persistedStorageObjectRepresentatives() const
             continue;
         }
         std::string key = relative.generic_string();
+        constexpr std::string_view emptyPrefix = ".vc_cache_empty/";
+        if (key.starts_with(emptyPrefix))
+            key.erase(0, emptyPrefix.size());
         if (key.size() > 6 && key.ends_with(".empty"))
             key.resize(key.size() - 6);
         for (std::size_t level = 0; level < state->fetchers_.size(); ++level) {
@@ -1423,7 +2099,12 @@ ChunkCache::Stats ChunkCache::stats() const
         if (auto scheduler = state->decodeScheduler_.lock())
             result.pendingDecodeTasks = scheduler->pending();
         result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
+        for (const auto& [key, parked] : state->blockingReadersByKey_) {
+            (void)key;
+            result.blockingReaders += parked;
+        }
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
+        result.persistentCacheWarning = state->persistentCacheWarning_;
     }
     if (state->persistentBudget_) {
         const auto budget = state->persistentBudget_->stats();
@@ -1684,8 +2365,13 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->decodeScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
+    // Per-listener exception isolation: a throwing listener must not skip
+    // other listeners' stop events, the remaining keys, or the cv notify
+    // below - parked blocking readers whose entries were just cleared
+    // depend on that wake.
     for (const auto& key : activeRemoteFetches)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     for (const auto& operation : cancelledPersistence) {
         {
             std::lock_guard lock(operation->mutex);
@@ -1742,7 +2428,8 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
         const auto& fetcher = state->fetchers_.at(
             static_cast<std::size_t>(level));
         if (!fetcher ||
-            !fetcher->supportsSourcePayloadPersistence(fetcherKey(key))) {
+            (state->persistentLayout_ != PersistentCacheLayout::Delta3d &&
+             !fetcher->supportsSourcePayloadPersistence(fetcherKey(key)))) {
             return {PersistentRequestStatus::Error,
                     "source fetcher cannot persist encoded payload without decoding"};
         }
@@ -1763,8 +2450,25 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
                                 state->storageObjectTransfers_.find(objectKey);
                             transfer != state->storageObjectTransfers_.end()) {
                             transfer->second.refreshRequested = true;
+                            reprioritizeStorageObjectTransferLocked(
+                                *state, transfer->second);
                         }
                     }
+                } else if (auto transfer = state->sourceTransfers_.find(key);
+                           transfer != state->sourceTransfers_.end()) {
+                    ChunkWorkPriority priority;
+                    if (transfer->second.decodeRequested) {
+                        if (const auto entry = state->entries_.find(key);
+                            entry != state->entries_.end()) {
+                            priority = workPriorityLocked(
+                                *state, key, entry->second);
+                        }
+                    } else {
+                        priority.maintenance = true;
+                    }
+                    if (auto scheduler = state->fetchScheduler_.lock())
+                        scheduler->reprioritize(
+                            transfer->second.taskId, priority);
                 }
             }
         } else {
@@ -1916,22 +2620,26 @@ void ChunkCache::completePersistenceOperation(
     const std::shared_ptr<PersistenceOperation>& operation,
     PersistentRequestResult result)
 {
+    std::vector<FetchContext> foregroundWaiters;
     {
         std::lock_guard lock(state->mutex_);
+        {
+            std::lock_guard operationLock(operation->mutex);
+            if (operation->completed)
+                return;
+            operation->result = std::move(result);
+            operation->completed = true;
+        }
         const auto current = state->persistenceOperations_.find(key);
         if (current != state->persistenceOperations_.end() &&
             current->second == operation) {
             state->persistenceOperations_.erase(current);
         }
-    }
-    {
-        std::lock_guard lock(operation->mutex);
-        if (operation->completed)
-            return;
-        operation->result = std::move(result);
-        operation->completed = true;
+        foregroundWaiters = std::move(operation->foregroundWaiters);
     }
     operation->cv.notify_all();
+    for (auto& context : foregroundWaiters)
+        probePersistentAndDispatch(state, key, std::move(context));
 }
 
 ChunkResult ChunkCache::resultFromEntryLocked(
@@ -2162,6 +2870,15 @@ bool ChunkCache::hasDemandLocked(const Entry& entry)
     return entry.backgroundDemand || !entry.viewDemands.empty();
 }
 
+bool ChunkCache::hasParkedBlockingReaderLocked(const State& state,
+                                               const ChunkKey& key)
+{
+    if (state.blockingReadersByKey_.empty())
+        return false;
+    return state.blockingReadersByKey_.find(key) !=
+           state.blockingReadersByKey_.end();
+}
+
 bool ChunkCache::cancelUndemandedEntryLocked(State& state,
                                              const ChunkKey& key,
                                              Entry& entry)
@@ -2246,6 +2963,8 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
         entry.fetchTaskId = 0;
         ChunkWorkPriority priority;
         priority.maintenance = true;
+        if (const auto operation = transfer->second.persistence.lock())
+            priority.reserveForegroundSlot = !operation->refresh;
         if (auto scheduler = state.fetchScheduler_.lock())
             scheduler->reprioritize(sourceTaskId, priority);
     } else {
@@ -2259,7 +2978,24 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
             state.sourceTransfers_.erase(transfer);
         }
     }
-    cancel(entry.decodeTaskId, state.decodeScheduler_);
+    const bool persistenceOwnsDecode =
+        state.persistentLayout_ == PersistentCacheLayout::Delta3d &&
+        entry.decodeTaskId != 0 &&
+        state.persistenceOperations_.contains(key);
+    if (persistenceOwnsDecode) {
+        // The foreground and Delta3D persistence paths share this decode. Once
+        // it has been queued it must survive the foreground view dropping its
+        // demand, otherwise the blocking persistence operation would be left
+        // without an owner.
+        hadPendingTask = true;
+        taskAlreadyRunning = true;
+        ChunkWorkPriority priority;
+        priority.maintenance = true;
+        if (auto scheduler = state.decodeScheduler_.lock())
+            scheduler->reprioritize(entry.decodeTaskId, priority);
+    } else {
+        cancel(entry.decodeTaskId, state.decodeScheduler_);
+    }
     return hadPendingTask && !taskAlreadyRunning;
 }
 
@@ -2340,6 +3076,7 @@ void ChunkCache::probePersistentAndDispatch(const std::shared_ptr<State>& state,
                                             ChunkKey key,
                                             FetchContext context)
 {
+    bool waitingForPersistence = false;
     {
         std::lock_guard lock(state->mutex_);
         if (context.generation != state->generation_ ||
@@ -2352,7 +3089,16 @@ void ChunkCache::probePersistentAndDispatch(const std::shared_ptr<State>& state,
             return;
         }
         it->second.probeTaskId = 0;
+        if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+            if (auto operation = state->persistenceOperations_.find(key);
+                operation != state->persistenceOperations_.end()) {
+                operation->second->foregroundWaiters.push_back(context);
+                waitingForPersistence = true;
+            }
+        }
     }
+    if (waitingForPersistence)
+        return;
 
     PersistentProbeResult probe;
     try {
@@ -2382,6 +3128,7 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
 {
     bool pruned = false;
     bool remoteStart = false;
+    bool waitingForPersistence = false;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
         auto it = state->entries_.find(key);
@@ -2396,6 +3143,14 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
             pruned = true;
             return;
         }
+        if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+            if (auto operation = state->persistenceOperations_.find(key);
+                operation != state->persistenceOperations_.end()) {
+                operation->second->foregroundWaiters.push_back(context);
+                waitingForPersistence = true;
+                return;
+            }
+        }
         if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
             remoteStart = joinStorageObjectTransferLocked(
                 state, key, context, true, {});
@@ -2404,8 +3159,9 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
         }
     });
     if (remoteStart)
-        notifyRemoteFetchListeners(state, key, true);
-    if (pruned)
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
+    if (pruned || waitingForPersistence)
         state->cv_.notify_all();
 }
 
@@ -2443,6 +3199,8 @@ void ChunkCache::joinSourceTransferLocked(
                 priority = workPriorityLocked(*state, key, entry->second);
         } else {
             priority.maintenance = true;
+            if (const auto operation = transfer.persistence.lock())
+                priority.reserveForegroundSlot = !operation->refresh;
         }
         scheduler->reprioritize(transfer.taskId, priority);
         return;
@@ -2469,6 +3227,7 @@ void ChunkCache::joinSourceTransferLocked(
         }
     } else {
         priority.maintenance = true;
+        priority.reserveForegroundSlot = persistence && !persistence->refresh;
     }
     if (persistence)
         persistence->sourceTaskId = transfer.taskId;
@@ -2528,7 +3287,8 @@ void ChunkCache::queuePersistentDecode(const std::shared_ptr<State>& state,
 void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
                                     const ChunkKey& key,
                                     FetchContext context,
-                                    ChunkFetchResult fetched)
+                                    ChunkFetchResult fetched,
+                                    std::shared_ptr<PersistenceOperation> persistence)
 {
     bool pruned = false;
     auto payload = std::make_shared<ChunkFetchResult>(std::move(fetched));
@@ -2541,7 +3301,7 @@ void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
             it->second.fetchSerial != context.fetchSerial) {
             return;
         }
-        if (!hasDemandLocked(it->second)) {
+        if (!hasDemandLocked(it->second) && !persistence) {
             eraseUnresolvedEntryLocked(*state, key);
             pruned = true;
             return;
@@ -2552,13 +3312,17 @@ void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
         auto scheduler = state->decodeScheduler_.lock();
         if (!scheduler)
             return;
-        const auto priority = workPriorityLocked(*state, key, it->second);
+        auto priority = workPriorityLocked(*state, key, it->second);
+        if (!hasDemandLocked(it->second))
+            priority.maintenance = true;
         std::weak_ptr<State> weakState = state;
         scheduler->submit(
             taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
-            [weakState, key, context, payload] {
+            [weakState, key, context, payload,
+             persistence = std::move(persistence)] {
                 if (auto state = weakState.lock()) {
-                    decodeFetchedAndStore(state, key, context, payload);
+                    decodeFetchedAndStore(
+                        state, key, context, payload, persistence);
                 }
             });
     });
@@ -2602,7 +3366,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
                 ++state->remoteFetchesInFlight_;
                 state->activeRemoteFetches_[key].insert(transferSerial);
             }
-            notifyRemoteFetchListeners(state, key, true);
+            notifyRemoteFetchListeners(state, key, true,
+                                       /*isolateCallbackExceptions=*/true);
         }
         fetch = sourceTransfer.fetcher->fetchEncoded(
             fetcherKey(key), observeProgress);
@@ -2650,7 +3415,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
         }
     }
     if (remoteActivityEnded)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     bool decodeRequested = false;
     std::shared_ptr<PersistenceOperation> persistence;
@@ -2681,7 +3447,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
     };
 
     const bool persistenceSupported = persistence &&
-        sourceTransfer.fetcher->supportsSourcePayloadPersistence(fetcherKey(key));
+        (state->persistentLayout_ == PersistentCacheLayout::Delta3d ||
+         sourceTransfer.fetcher->supportsSourcePayloadPersistence(fetcherKey(key)));
     if (persistence && !persistenceSupported) {
         completePersistenceOperation(
             state, key, persistence,
@@ -2692,19 +3459,31 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
 
     if (fetch.status == ChunkFetchStatus::Found) {
         if (persistence) {
-            auto sourceBytes = std::make_shared<const std::vector<std::byte>>(
-                fetch.bytes);
-            if (!queuePersistentSourceWrite(
-                    state, key, std::move(sourceBytes), persistence)) {
-                completePersistenceOperation(
-                    state, key, persistence,
-                    {PersistentRequestStatus::Error,
-                     "could not queue exact-source persistent write"});
+            if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+                if (!decodeRequested) {
+                    queueDelta3dMaintenanceDecode(
+                        state, key, context, std::move(fetch), persistence);
+                }
+            } else {
+                auto sourceBytes = std::make_shared<const std::vector<std::byte>>(
+                    fetch.bytes);
+                if (!queuePersistentSourceWrite(
+                        state, key, std::move(sourceBytes), persistence)) {
+                    completePersistenceOperation(
+                        state, key, persistence,
+                        {PersistentRequestStatus::Error,
+                         "could not queue exact-source persistent write"});
+                }
             }
             fetch.persistentWriteHandled = true;
         }
-        if (decodeRequested)
-            queueFetchedDecode(state, key, context, std::move(fetch));
+        if (decodeRequested) {
+            queueFetchedDecode(
+                state, key, context, std::move(fetch),
+                state->persistentLayout_ == PersistentCacheLayout::Delta3d
+                    ? std::move(persistence)
+                    : std::shared_ptr<PersistenceOperation>{});
+        }
         return;
     }
 
@@ -3051,7 +3830,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : activityKeys)
-        notifyRemoteFetchListeners(state, key, true);
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
 
     ChunkFetchResult fetch;
     const auto started = std::chrono::steady_clock::now();
@@ -3101,7 +3881,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : stopped)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     dispatchStorageObjectResult(
         state, objectKey, transferSerial, std::move(fetch), false);
@@ -3275,11 +4056,16 @@ void ChunkCache::decodePersistentAndStore(
     bool resolved = false;
     try {
         if (auto cached = readPersistent(*state, key, probe)) {
-            decoded = cached->sourcePayload
-                ? context.fetcher->decodeSourcePayload(
-                      fetcherKey(key), std::move(cached->bytes))
-                : context.fetcher->decodePersistentBytes(
-                      fetcherKey(key), std::move(cached->bytes));
+            if (cached->decodedPayload) {
+                decoded.status = ChunkFetchStatus::Found;
+                decoded.bytes = std::move(cached->bytes);
+            } else {
+                decoded = cached->sourcePayload
+                    ? context.fetcher->decodeSourcePayload(
+                          fetcherKey(key), std::move(cached->bytes))
+                    : context.fetcher->decodePersistentBytes(
+                          fetcherKey(key), std::move(cached->bytes));
+            }
             resolved = decoded.status == ChunkFetchStatus::Found &&
                        decoded.bytes.size() == expectedChunkBytes(*state, key);
         }
@@ -3299,7 +4085,8 @@ void ChunkCache::decodeFetchedAndStore(
     const std::shared_ptr<State>& state,
     ChunkKey key,
     FetchContext context,
-    std::shared_ptr<ChunkFetchResult> fetched)
+    std::shared_ptr<ChunkFetchResult> fetched,
+    std::shared_ptr<PersistenceOperation> persistence)
 {
     {
         std::lock_guard lock(state->mutex_);
@@ -3326,8 +4113,17 @@ void ChunkCache::decodeFetchedAndStore(
         decoded.message = "unknown chunk decode exception";
     }
     decoded.persistentWriteHandled = persistentWriteHandled;
-
-    finishAndStore(state, key, context, std::move(decoded), false);
+    if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+        // Delta3D persistence always starts from the decoded logical chunk;
+        // source-codec bytes are never candidates for private-format writes.
+        decoded.persistentBytes.clear();
+        decoded.hasPersistentBytes = false;
+        finishDelta3dAndStore(
+            state, key, context, std::move(decoded),
+            std::move(persistence));
+    } else {
+        finishAndStore(state, key, context, std::move(decoded), false);
+    }
 }
 
 void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
@@ -3356,10 +4152,45 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
     notifyListeners(state);
 }
 
-void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
-                                        const ChunkKey& key,
-                                        ChunkFetchResult fetch,
-                                        bool loadedFromPersistentCache)
+void ChunkCache::finishDelta3dAndStore(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    FetchContext context,
+    ChunkFetchResult fetch,
+    std::shared_ptr<PersistenceOperation> persistence)
+{
+    bool persistenceQueued = false;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto it = state->entries_.find(key);
+        if (context.generation != state->generation_ ||
+            context.fetcherGeneration != state->fetcherGeneration_ ||
+            it == state->entries_.end() ||
+            it->second.fetchSerial != context.fetchSerial) {
+            return;
+        }
+        it->second.probeTaskId = 0;
+        it->second.fetchTaskId = 0;
+        it->second.decodeTaskId = 0;
+        persistenceQueued = storeDelta3dFetchResultLocked(
+            state, key, std::move(fetch), persistence);
+    }
+    if (persistence && !persistenceQueued) {
+        completePersistenceOperation(
+            state, key, persistence,
+            {PersistentRequestStatus::Error,
+             "could not persist shared Delta3D decode"});
+    }
+    enforceSharedBudget(state);
+    state->cv_.notify_all();
+    notifyListeners(state);
+}
+
+void ChunkCache::storeFetchResultLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    ChunkFetchResult fetch,
+    bool loadedFromPersistentCache)
 {
     auto it = state->entries_.find(key);
     if (it == state->entries_.end())
@@ -3440,6 +4271,88 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
     enforceCapacityLocked(state);
 }
 
+bool ChunkCache::storeDelta3dFetchResultLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    ChunkFetchResult fetch,
+    const std::shared_ptr<PersistenceOperation>& persistence)
+{
+    // This deliberately owns the Delta3D-only decisions instead of adding
+    // mode checks to storeFetchResultLocked. The ordinary SourceMirror store
+    // therefore remains instruction-for-instruction equivalent to its
+    // pre-Delta3D implementation.
+    auto entry = state->entries_.find(key);
+    if (entry == state->entries_.end())
+        return false;
+
+    Entry& value = entry->second;
+    if (value.unresolvedCounted && key.level >= 0 &&
+        key.level < static_cast<int>(state->unresolvedFetchesByLevel_.size())) {
+        auto& unresolved =
+            state->unresolvedFetchesByLevel_[static_cast<std::size_t>(key.level)];
+        if (unresolved > 0)
+            --unresolved;
+        value.unresolvedCounted = false;
+    }
+    if (value.inLru) {
+        state->lru_.erase(value.lruIt);
+        value.inLru = false;
+    }
+    if (value.status == EntryStatus::Data) {
+        state->decodedBytes_ -= value.decodedBytes;
+        removeDecodedBytesLocked(*state, value.decodedBytes);
+    }
+
+    value.bytes.reset();
+    value.error.clear();
+    value.decodedBytes = 0;
+    value.persisted = false;
+    value.persistentWriteQueued = false;
+
+    switch (fetch.status) {
+    case ChunkFetchStatus::Found:
+        if (fetch.bytes.size() != expectedChunkBytes(*state, key)) {
+            value.status = EntryStatus::Error;
+            value.error = "decoded chunk byte size does not match full chunk shape";
+            break;
+        }
+        if (state->options_.detectAllFillChunks &&
+            isAllFill(*state, fetch.bytes)) {
+            value.status = EntryStatus::AllFill;
+            value.persistentWriteQueued = persistence
+                ? queuePersistentSourceEmptyWrite(state, key, persistence)
+                : queuePersistentEmptyWrite(state, key);
+            break;
+        }
+        value.status = EntryStatus::Data;
+        value.decodedBytes = fetch.bytes.size();
+        value.bytes = std::make_shared<const std::vector<std::byte>>(
+            std::move(fetch.bytes));
+        state->decodedBytes_ += value.decodedBytes;
+        addDecodedBytesLocked(*state, value.decodedBytes);
+        value.persistentWriteQueued = queueDelta3dWrite(
+            state, key, value.bytes, persistence, true);
+        break;
+    case ChunkFetchStatus::Missing:
+        value.status = EntryStatus::Missing;
+        value.persistentWriteQueued = persistence
+            ? queuePersistentSourceEmptyWrite(state, key, persistence)
+            : queuePersistentEmptyWrite(state, key);
+        break;
+    case ChunkFetchStatus::HttpError:
+    case ChunkFetchStatus::IoError:
+    case ChunkFetchStatus::DecodeError:
+        value.status = EntryStatus::Error;
+        value.error = fetchErrorMessage(fetch);
+        break;
+    }
+
+    touchLocked(*state, key, value);
+    const bool persistenceQueued = value.persistentWriteQueued;
+    enforceCapacityLocked(state);
+    return persistenceQueued;
+}
+
 namespace {
 
 std::optional<std::vector<std::byte>> readFileBytes(const std::filesystem::path& path)
@@ -3475,6 +4388,19 @@ ChunkCache::PersistentProbeResult ChunkCache::probePersistent(
         return std::filesystem::exists(path, ec) && !ec;
     };
 
+    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d) {
+        result.primaryData = exists(persistentDelta3dPath(state, key));
+        if (!result.primaryData) {
+            const auto path = persistentDelta3dEmptyPath(state, key);
+            auto pin = state.persistentBudget_
+                ? state.persistentBudget_->pinRead(path)
+                : PersistentZarrCacheBudget::ReadPin{};
+            result.empty = exists(path);
+            pin.complete(result.empty);
+        }
+        return result;
+    }
+
     result.sourceData = exists(persistentSourcePath(state, key));
     if (persistentEntryIsRaw(state, key))
         result.compressedData = exists(persistentCompressedPath(state, key));
@@ -3498,7 +4424,6 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
     if (!state.options_.persistentCachePath || !probe.hasData())
         return std::nullopt;
 
-    const bool rawEntry = persistentEntryIsRaw(state, key);
     auto readManaged = [&](const std::filesystem::path& path) {
         auto pin = state.persistentBudget_
             ? state.persistentBudget_->pinRead(path)
@@ -3507,9 +4432,25 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
         pin.complete(bytes.has_value());
         return bytes;
     };
+    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d) {
+        auto encoded = readManaged(persistentDelta3dPath(state, key));
+        if (!encoded)
+            return std::nullopt;
+        auto decoded = vc::cacheDecompress(
+            std::span<const std::byte>(encoded->data(), encoded->size()),
+            expectedChunkBytes(state, key));
+        if (!decoded) {
+            Logger()->warn(
+                "ChunkCache corrupt Delta3D entry for {}/{}/{}/{}; refetching",
+                key.level, key.iz, key.iy, key.ix);
+            return std::nullopt;
+        }
+        return PersistentReadResult{std::move(*decoded), false, true};
+    }
+    const bool rawEntry = persistentEntryIsRaw(state, key);
     if (probe.sourceData) {
         if (auto source = readManaged(persistentSourcePath(state, key)))
-            return PersistentReadResult{std::move(*source), true};
+            return PersistentReadResult{std::move(*source), true, false};
     }
     if (rawEntry && probe.compressedData) {
         // Compressed variant wins when both formats exist: compaction and
@@ -3519,7 +4460,7 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
                 std::span<const std::byte>(compressed->data(), compressed->size()),
                 expectedChunkBytes(state, key));
             if (decompressed)
-                return PersistentReadResult{std::move(*decompressed), false};
+                return PersistentReadResult{std::move(*decompressed), false, false};
             // Corrupt compressed entry — fall through to ".bin"/refetch.
             Logger()->warn(
                 "ChunkCache corrupt compressed cache entry for {}/{}/{}/{} ({} bytes); "
@@ -3535,7 +4476,7 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
         return std::nullopt;
     if (rawEntry && bytes->size() != expectedChunkBytes(state, key))
         return std::nullopt;
-    return PersistentReadResult{std::move(*bytes), false};
+    return PersistentReadResult{std::move(*bytes), false, false};
 }
 
 bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
@@ -3585,6 +4526,241 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
         return false;
     }
     return true;
+}
+
+bool ChunkCache::queueDelta3dWrite(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    std::shared_ptr<const std::vector<std::byte>> bytes,
+    std::shared_ptr<PersistenceOperation> operation,
+    bool stateAlreadyLocked)
+{
+    if (!state || !state->options_.persistentCachePath || !bytes ||
+        state->persistentLayout_ != PersistentCacheLayout::Delta3d ||
+        bytes->size() != expectedChunkBytes(*state, key)) {
+        if (operation)
+            operation->writeQueued.store(false, std::memory_order_release);
+        return false;
+    }
+
+    const std::size_t rawBytes = bytes->size();
+    if (!reservePersistentWriteBytes(rawBytes)) {
+        if (operation)
+            operation->writeQueued.store(false, std::memory_order_release);
+        return false;
+    }
+    if (operation) {
+        const auto validateOperation = [&] {
+            const auto current = state->persistenceOperations_.find(key);
+            return current != state->persistenceOperations_.end() &&
+                   current->second == operation;
+        };
+        if (stateAlreadyLocked) {
+            if (!validateOperation()) {
+                releasePersistentWriteBytes(rawBytes);
+                return false;
+            }
+        } else {
+            std::lock_guard lock(state->mutex_);
+            if (!validateOperation()) {
+                releasePersistentWriteBytes(rawBytes);
+                return false;
+            }
+        }
+        operation->writeQueued.store(true, std::memory_order_release);
+    }
+    state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+        persistentCacheCompressionPool().enqueue(
+            [state, key, rawBytes, bytes = std::move(bytes), operation] {
+                std::shared_ptr<const std::vector<std::byte>> encoded;
+                std::string error;
+                try {
+                    auto payload = vc::cacheCompress(
+                        std::span<const std::byte>(bytes->data(), bytes->size()),
+                        state->levels_.at(static_cast<std::size_t>(key.level)).chunkShape,
+                        dtypeSize(state->dtype_), vc::kCacheQuantLossless);
+                    encoded =
+                        std::make_shared<const std::vector<std::byte>>(
+                            std::move(payload));
+                } catch (const std::exception& exception) {
+                    error = exception.what();
+                } catch (...) {
+                    error = "unknown Delta3D compression error";
+                }
+
+                if (encoded) {
+                    const std::size_t encodedBytes = encoded->size();
+                    // The accepted job already owns a raw-byte backlog slot.
+                    // Convert that reservation to the encoded payload instead
+                    // of attempting a second admission that can fail after the
+                    // expensive compression work has completed.
+                    replacePersistentWriteBytes(rawBytes, encodedBytes);
+                    try {
+                        persistentCacheWriterPool().enqueue(
+                            [state, key, encodedBytes, encoded = std::move(encoded),
+                             operation] {
+                                bool written = false;
+                                try {
+                                    written = writeDelta3dPersistent(
+                                        *state, key, *encoded);
+                                } catch (...) {
+                                }
+                                {
+                                    std::lock_guard lock(state->mutex_);
+                                    if (auto entry = state->entries_.find(key);
+                                        entry != state->entries_.end()) {
+                                        entry->second.persistentWriteQueued = false;
+                                        if (written)
+                                            entry->second.persisted = true;
+                                    }
+                                    state->persistentWritesInFlight_.fetch_sub(
+                                        1, std::memory_order_acq_rel);
+                                }
+                                releasePersistentWriteBytes(encodedBytes);
+                                state->cv_.notify_all();
+                                if (operation) {
+                                    completePersistenceOperation(
+                                        state, key, operation,
+                                        written
+                                            ? PersistentRequestResult{
+                                                  PersistentRequestStatus::Data, {}}
+                                            : PersistentRequestResult{
+                                                  PersistentRequestStatus::Error,
+                                                  "Delta3D persistent write failed"});
+                                }
+                            });
+                        return;
+                    } catch (...) {
+                        releasePersistentWriteBytes(encodedBytes);
+                        error = "could not queue Delta3D persistent write";
+                    }
+                } else {
+                    releasePersistentWriteBytes(rawBytes);
+                }
+
+                {
+                    std::lock_guard lock(state->mutex_);
+                    if (auto entry = state->entries_.find(key);
+                        entry != state->entries_.end()) {
+                        entry->second.persistentWriteQueued = false;
+                    }
+                    state->persistentWritesInFlight_.fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+                state->cv_.notify_all();
+                if (operation) {
+                    completePersistenceOperation(
+                        state, key, operation,
+                        {PersistentRequestStatus::Error,
+                         error.empty() ? "Delta3D compression failed" : error});
+                }
+            });
+    } catch (...) {
+        state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+        releasePersistentWriteBytes(rawBytes);
+        if (operation)
+            operation->writeQueued.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+void ChunkCache::queueDelta3dMaintenanceDecode(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    FetchContext context,
+    ChunkFetchResult fetched,
+    std::shared_ptr<PersistenceOperation> operation)
+{
+    if (!state || !operation)
+        return;
+    auto scheduler = state->decodeScheduler_.lock();
+    if (!scheduler) {
+        completePersistenceOperation(
+            state, key, operation,
+            {PersistentRequestStatus::Error, "Delta3D decode scheduler is unavailable"});
+        return;
+    }
+    const auto taskId = state->nextTaskId_->fetch_add(
+        1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto current = state->persistenceOperations_.find(key);
+        if (current == state->persistenceOperations_.end() ||
+            current->second != operation) {
+            return;
+        }
+        operation->probeTaskId = taskId;
+    }
+    ChunkWorkPriority priority;
+    priority.maintenance = true;
+    auto payload = std::make_shared<ChunkFetchResult>(std::move(fetched));
+    std::weak_ptr<State> weakState = state;
+    try {
+        scheduler->submit(
+            taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
+            [weakState, key, context, payload, operation] {
+            auto state = weakState.lock();
+            if (!state)
+                return;
+            {
+                std::lock_guard lock(state->mutex_);
+                const auto current = state->persistenceOperations_.find(key);
+                if (current == state->persistenceOperations_.end() ||
+                    current->second != operation ||
+                    context.generation != state->generation_ ||
+                    context.fetcherGeneration != state->fetcherGeneration_) {
+                    return;
+                }
+                operation->probeTaskId = 0;
+            }
+            ChunkFetchResult decoded;
+            try {
+                decoded = context.fetcher->decodeFetched(
+                    fetcherKey(key), std::move(*payload));
+            } catch (const std::exception& exception) {
+                decoded.status = ChunkFetchStatus::DecodeError;
+                decoded.message = exception.what();
+            } catch (...) {
+                decoded.status = ChunkFetchStatus::DecodeError;
+                decoded.message = "unknown chunk decode exception";
+            }
+            if (decoded.status != ChunkFetchStatus::Found ||
+                decoded.bytes.size() != expectedChunkBytes(*state, key)) {
+                completePersistenceOperation(
+                    state, key, operation,
+                    {PersistentRequestStatus::Error,
+                     decoded.message.empty()
+                         ? "source chunk failed to decode for Delta3D cache"
+                         : decoded.message});
+                return;
+            }
+            if (state->options_.detectAllFillChunks &&
+                isAllFill(*state, decoded.bytes)) {
+                if (!queuePersistentSourceEmptyWrite(state, key, operation)) {
+                    completePersistenceOperation(
+                        state, key, operation,
+                        {PersistentRequestStatus::Error,
+                         "could not queue persistent empty marker"});
+                }
+                return;
+            }
+            auto raw = std::make_shared<const std::vector<std::byte>>(
+                std::move(decoded.bytes));
+            if (!queueDelta3dWrite(state, key, std::move(raw), operation)) {
+                completePersistenceOperation(
+                    state, key, operation,
+                    {PersistentRequestStatus::Error,
+                     "could not queue Delta3D compression"});
+            }
+            });
+    } catch (...) {
+        completePersistenceOperation(
+            state, key, operation,
+            {PersistentRequestStatus::Error,
+             "could not queue Delta3D source decode"});
+    }
 }
 
 bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
@@ -3813,6 +4989,75 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     return true;
 }
 
+bool ChunkCache::writeDelta3dPersistent(
+    State& state,
+    const ChunkKey& key,
+    const std::vector<std::byte>& bytes)
+{
+    if (!state.options_.persistentCachePath)
+        return false;
+
+    const auto path = persistentDelta3dPath(state, key);
+    std::vector<std::filesystem::path> replacements{
+        persistentDelta3dEmptyPath(state, key),
+    };
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(
+              path, bytes.size(), replacements)
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+        return false;
+    const auto oldSize = regularFileSize(path).value_or(0);
+    const auto tmp = path.string() + uniqueTmpSuffix();
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return false;
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            file.close();
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) -
+                static_cast<std::int64_t>(oldSize));
+        reservation.commit();
+        return false;
+    }
+    std::int64_t removedBytes = 0;
+    for (const auto& replacement : replacements) {
+        if (const auto size = regularFileSize(replacement)) {
+            std::error_code removeEc;
+            if (std::filesystem::remove(replacement, removeEc) && !removeEc)
+                removedBytes += static_cast<std::int64_t>(*size);
+        }
+    }
+    const auto newSize = regularFileSize(path).value_or(bytes.size());
+    addPersistentCacheBytesDelta(
+        state,
+        static_cast<std::int64_t>(newSize) -
+            static_cast<std::int64_t>(oldSize) - removedBytes);
+    reservation.commit();
+    return true;
+}
+
 bool ChunkCache::writePersistentSource(
     State& state,
     const ChunkKey& key,
@@ -3893,12 +5138,16 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
     if (!state.options_.persistentCachePath)
         return false;
 
-    const auto path = persistentEmptyPath(state, key);
+    const auto path = state.persistentLayout_ == PersistentCacheLayout::Delta3d
+        ? persistentDelta3dEmptyPath(state, key)
+        : persistentEmptyPath(state, key);
     std::vector<std::filesystem::path> replacements{
         persistentSourcePath(state, key),
         persistentPath(state, key),
         persistentCompressedPath(state, key),
     };
+    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d)
+        replacements.push_back(persistentDelta3dPath(state, key));
     replacements.erase(
         std::remove(replacements.begin(), replacements.end(), path),
         replacements.end());
@@ -3980,6 +5229,21 @@ std::filesystem::path ChunkCache::persistentCompressedPath(const State& state, c
            (std::to_string(key.ix) + vc::kCompressedCacheExtension);
 }
 
+std::filesystem::path ChunkCache::persistentDelta3dPath(
+    const State& state,
+    const ChunkKey& key)
+{
+    const auto& fetcher = state.fetchers_.at(static_cast<std::size_t>(key.level));
+    const auto sourceKey = fetcher
+        ? fetcher->sourceChunkKey(fetcherKey(key))
+        : std::nullopt;
+    if (!sourceKey || !isSafeZarrStoreKey(*sourceKey)) {
+        throw std::runtime_error(
+            "Delta3D persistent Zarr cache has no safe native chunk key");
+    }
+    return *state.options_.persistentCachePath / std::filesystem::path(*sourceKey);
+}
+
 bool ChunkCache::persistentEntryIsRaw(const State& state, const ChunkKey& key)
 {
     return state.persistentExtensions_.at(static_cast<std::size_t>(key.level)) == ".bin";
@@ -3991,7 +5255,20 @@ std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const 
            ("level_" + std::to_string(key.level)) /
            std::to_string(key.iz) /
            std::to_string(key.iy) /
-           (std::to_string(key.ix) + ".empty");
+            (std::to_string(key.ix) + ".empty");
+}
+
+std::filesystem::path ChunkCache::persistentDelta3dEmptyPath(
+    const State& state,
+    const ChunkKey& key)
+{
+    const auto dataPath = persistentDelta3dPath(state, key);
+    const auto relative = dataPath.lexically_relative(
+        *state.options_.persistentCachePath);
+    auto markerRelative = relative;
+    markerRelative += ".empty";
+    return *state.options_.persistentCachePath / ".vc_cache_empty" /
+           markerRelative;
 }
 
 std::filesystem::path ChunkCache::persistentSourcePath(
@@ -4180,16 +5457,21 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
     if (!overBudget())
         return;
 
-    while (overBudget() && !state->lru_.empty()) {
-        auto victimIt = std::prev(state->lru_.end());
-        auto entryIt = state->entries_.find(*victimIt);
+    for (auto it = state->lru_.end();
+         overBudget() && it != state->lru_.begin();) {
+        --it;
+        auto entryIt = state->entries_.find(*it);
         if (entryIt == state->entries_.end()) {
-            state->lru_.erase(victimIt);
+            it = state->lru_.erase(it);
             continue;
         }
         Entry& entry = entryIt->second;
-        const ChunkKey victim = *victimIt;
-        state->lru_.erase(victimIt);
+        // Entries whose key has a parked blocking reader must survive until
+        // that reader wakes; capacity overshoots by at most that count.
+        if (hasParkedBlockingReaderLocked(*state, *it))
+            continue;
+        const ChunkKey victim = *it;
+        it = state->lru_.erase(it);
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
             if (entry.bytes && !entry.persisted && !entry.persistentWriteQueued)
@@ -4208,7 +5490,11 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
     for (auto it = state->lru_.rbegin(); it != state->lru_.rend(); ++it) {
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
-            entry->second.status == EntryStatus::Data) {
+            entry->second.status == EntryStatus::Data &&
+            !hasParkedBlockingReaderLocked(*state, *it)) {
+            // Must mirror evictOldestDecodedLocked's reader skip: reporting
+            // a protected entry's touch would make the budget's enforce()
+            // loop keep selecting a victim whose eviction then refuses.
             return entry->second.budgetTouch;
         }
     }
@@ -4232,6 +5518,8 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         }
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
+            continue;
+        if (hasParkedBlockingReaderLocked(*state, *it))
             continue;
 
         const ChunkKey victim = *it;
@@ -4349,7 +5637,8 @@ void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
 
 void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                             const ChunkKey& key,
-                                            bool active)
+                                            bool active,
+                                            bool isolateCallbackExceptions)
 {
     std::vector<RemoteFetchActivityCallback> callbacks;
     {
@@ -4361,17 +5650,23 @@ void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
         }
     }
     for (auto& cb : callbacks) {
-        if (cb)
+        if (!cb)
+            continue;
+        if (!isolateCallbackExceptions) {
             cb(key, active);
+            continue;
+        }
+        try {
+            cb(key, active);
+        } catch (...) {
+            // Isolation is requested by scheduler worker threads (an escape
+            // would std::terminate the jthread) and by invalidation/refresh
+            // paths (stop events must reach every listener, and the cv
+            // notify that parked readers depend on must not be skipped).
+            Logger()->warn(
+                "[ChunkCache] remote-fetch listener threw; continuing");
+        }
     }
-}
-
-void ChunkCache::waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key)
-{
-    state.cv_.wait(lock, [&] {
-        auto it = state.entries_.find(key);
-        return it == state.entries_.end() || it->second.status != EntryStatus::InFlight;
-    });
 }
 
 } // namespace vc::render

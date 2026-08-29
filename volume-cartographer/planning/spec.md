@@ -6,6 +6,13 @@
   not change as a side effect of diagnostics or scheduling work.
 - Remote fetching must remain asynchronous; UI and render threads must not wait
   on network or persistent-cache I/O.
+- S3 sources are attempted anonymously first. A successful response makes
+  anonymous access sticky for that store; an anonymous 401/403 retries with
+  available credentials and successful authenticated access becomes sticky.
+  A later anonymous 401/403 may upgrade a mixed-access store to authenticated
+  access. Not-found, unrelated client/server, and transport failures do not
+  select a mode. The access mode must not alter source identity, cache paths,
+  response bytes, or serialized locations.
 - Queue diagnostics must come from the existing chunk-cache request state, not
   from a parallel accounting system at viewer call sites.
 - A shared cache must report each unresolved chunk once regardless of how many
