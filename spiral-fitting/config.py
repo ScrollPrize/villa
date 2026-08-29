@@ -391,7 +391,7 @@ class Config:
         # re-enabling a source restores its previous tuning.
         self.input_use_verified_patches = True
         self.input_use_unverified_patches = True
-        self.input_use_tracks = True
+        self.input_use_tracks = False
         self.input_use_fibers = True
         self.input_use_fiber_directions = True
         self.input_use_pcl_absolute = True
