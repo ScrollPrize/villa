@@ -991,6 +991,33 @@ class NormalGatedRepulsionLoss(nn.Module):
 
 #######################################################################################################################
 
+#: nonlinearities a config may name for a loss that needs probabilities
+_NONLINEARITIES = {
+    'sigmoid': torch.sigmoid,
+    'softmax': lambda x: torch.softmax(x, dim=1),
+    'none': None,
+    'null': None,
+}
+
+
+def _resolve_nonlin(value):
+    """Turn a config's ``apply_nonlin`` into a callable.
+
+    Configs are YAML, so this arrives as a string; a callable is accepted too so
+    that Python callers are unaffected.  ``none`` turns the nonlinearity off,
+    which is what a model that already emits probabilities wants.
+    """
+    if value is None or callable(value):
+        return value
+    key = str(value).strip().lower()
+    if key not in _NONLINEARITIES:
+        raise ValueError(
+            f"unknown apply_nonlin {value!r}; expected one of "
+            f"{sorted(k for k in _NONLINEARITIES)}"
+        )
+    return _NONLINEARITIES[key]
+
+
 def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
     # Define losses that don't natively support ignore_index
     losses_without_ignore_support = ['BCEWithLogitsLoss', 'MSELoss', 'SmoothL1Loss', 'L1Loss', 'WeightedSmoothL1Loss']
@@ -1144,9 +1171,22 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         )
     
     elif name == 'MemoryEfficientSoftDiceLoss':
-        # Standalone memory efficient dice loss
+        # Standalone memory efficient dice loss.
+        #
+        # Dice needs probabilities.  DC_and_BCE_loss passes
+        # apply_nonlin=torch.sigmoid for exactly this reason, but the standalone
+        # path defaulted to None, so under the documented raw-logits setup
+        # (activation: none alongside BCEWithLogitsLoss) it consumed logits as
+        # if they were probabilities.  Once the mean logit drifts negative the
+        # dice denominator crosses zero and the loss explodes to ~1e13, which
+        # dominates the combined gradient and erases BCE supervision for as long
+        # as the regime lasts.
+        #
+        # A YAML config could not fix it either: the value arrives as a string,
+        # so passing it straight through could only ever yield None or something
+        # that raises when called.
         base_loss = MemoryEfficientSoftDiceLoss(
-            apply_nonlin=loss_config.get('apply_nonlin', None),
+            apply_nonlin=_resolve_nonlin(loss_config.get('apply_nonlin', 'sigmoid')),
             batch_dice=loss_config.get('batch_dice', False),
             do_bg=loss_config.get('do_bg', True),
             smooth=loss_config.get('smooth', 1.),
