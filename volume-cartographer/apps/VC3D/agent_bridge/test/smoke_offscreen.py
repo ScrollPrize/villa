@@ -295,10 +295,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 119
-            and coverage.get("registered") == 119
+            and coverage.get("described") == 120
+            and coverage.get("registered") == 120
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 119
+            and len(snapshot["methods"]) == 120
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -1134,6 +1134,138 @@ def check_segments_attach(
         )
 
 
+def check_open_data_editable_copy(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    catalog_root = root / "catalog-segments"
+    segment_id = "20241113090990"
+    catalog_segment = catalog_root / segment_id
+    shutil.copytree(
+        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
+        catalog_segment,
+    )
+    (catalog_segment / "catalog-origin.json").write_text("{}")
+    renamed_path = catalog_root / "must-not-rename"
+
+    try:
+        client.call(
+            "segments.attach",
+            {
+                "location": str(catalog_root),
+                "tags": ["open-data", "immutable"],
+            },
+            timeout=RPC_TIMEOUT,
+        )
+        client.call(
+            "segments.activate",
+            {"segmentId": segment_id},
+            timeout=RPC_TIMEOUT,
+        )
+
+        try:
+            client.call(
+                "segments.rename",
+                {"segmentId": segment_id, "newName": renamed_path.name},
+                timeout=RPC_TIMEOUT,
+            )
+            results.record(
+                "catalog_segment_rename_guard",
+                False,
+                "expected an immutable-cache error, got a result",
+            )
+        except BridgeError as error:
+            results.record(
+                "catalog_segment_rename_guard",
+                error.code == -32009
+                and error.data.get("action") == "segments.create_editable_copy"
+                and catalog_segment.is_dir()
+                and not renamed_path.exists(),
+                f"returned code={error.code} action={error.data.get('action')}",
+            )
+
+        started = time.monotonic()
+        try:
+            client.call(
+                "segmentation.enable_editing",
+                {"enabled": True},
+                timeout=RPC_TIMEOUT,
+            )
+            results.record(
+                "catalog_segment_editing_fails_fast",
+                False,
+                "expected an immutable-cache error, got a result",
+            )
+        except BridgeError as error:
+            elapsed = time.monotonic() - started
+            results.record(
+                "catalog_segment_editing_fails_fast",
+                error.code == -32009
+                and error.data.get("action") == "segments.create_editable_copy"
+                and elapsed < RPC_TIMEOUT,
+                f"returned code={error.code} action={error.data.get('action')} "
+                f"elapsed={elapsed:.3f}s",
+            )
+
+        copied, _ = client.call(
+            "segments.create_editable_copy",
+            {"segmentId": segment_id},
+            timeout=RPC_TIMEOUT,
+        )
+        editable_segment = Path(copied.get("path", ""))
+        editable_root = editable_segment.parent
+        project = json.loads(volpkg.read_text())
+        editable_entries = [
+            entry
+            for entry in project.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(editable_root)
+        ]
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        active = state.get("activeSurface") or {}
+        results.record(
+            "catalog_segment_create_editable_copy",
+            copied.get("created") is True
+            and copied.get("alreadyExisted") is False
+            and copied.get("activated") is True
+            and copied.get("sourcePath") == str(catalog_segment)
+            and editable_segment.is_dir()
+            and not (editable_segment / "catalog-origin.json").exists()
+            and (editable_segment / "x.tif").is_file()
+            and (editable_segment / "y.tif").is_file()
+            and (editable_segment / "z.tif").is_file()
+            and editable_entries == [{
+                "location": str(editable_root),
+                "tags": ["open-data-editable"],
+            }]
+            and active.get("id") == segment_id,
+            f"result={copied} active={active} entries={editable_entries}",
+        )
+
+        enabled, _ = client.call(
+            "segmentation.enable_editing",
+            {"enabled": True},
+            timeout=RPC_TIMEOUT,
+        )
+        results.record(
+            "editable_copy_can_enable_editing",
+            enabled.get("enabled") is True,
+            f"result={enabled}",
+        )
+        client.call(
+            "segmentation.enable_editing",
+            {"enabled": False},
+            timeout=RPC_TIMEOUT,
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "catalog_segment_editable_copy_workflow",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
@@ -1527,6 +1659,7 @@ def main() -> int:
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
+            check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
