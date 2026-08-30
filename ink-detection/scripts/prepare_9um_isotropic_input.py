@@ -13,6 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import math
 from pathlib import Path
+import time
 
 import numpy as np
 from numcodecs import Blosc
@@ -40,6 +41,39 @@ def open_source_array(path: str, level: str) -> zarr.Array:
         available = sorted(node.array_keys())
         raise KeyError(f"Pyramid level '{level}' not found in {path}; available: {available}")
     return node[level]
+
+
+
+def publish_partial(staged: Path, output: Path, *, attempts: int = 6, delay: float = 0.5) -> None:
+    """Rename a finished staging directory onto the output path.
+
+    POSIX renames a directory whose files are open. Windows refuses with
+    WinError 5 while any file inside is still open, and one handle is enough --
+    measured on this failure: renaming succeeds with nothing held, and fails with
+    exactly WinError 5 with a single file inside opened for read. After writing a
+    multi-gigabyte zarr, something holding a handle for a moment (an indexer, a
+    scanner) is ordinary, so retry briefly before giving up.
+
+    If it still fails, say what is true: every tile was written, so nothing needs
+    recomputing, and a manual rename finishes the job. The bare traceback this
+    replaces looked like a lost conversion.
+    """
+    for attempt in range(attempts):
+        try:
+            staged.replace(output)
+            return
+        except PermissionError as exc:
+            if attempt + 1 == attempts:
+                raise SystemExit(
+                    f"The conversion finished -- every tile was written -- but the result "
+                    f"could not be published:\n"
+                    f"  {staged}\n"
+                    f"  -> {output}\n"
+                    f"  {exc}\n"
+                    f"On Windows a directory cannot be renamed while any file inside it is "
+                    f"open. Nothing needs recomputing: rename the staging directory by hand."
+                ) from None
+            time.sleep(delay * (2 ** attempt))
 
 
 def main() -> int:
@@ -104,8 +138,10 @@ def main() -> int:
             completed += count
             if completed % 50 == 0 or completed == len(tiles):
                 print(f"tiles={completed}/{len(tiles)}", flush=True)
-    partial.replace(args.output_zarr)
-    print(f"wrote {args.output_zarr} shape={tuple(target.shape)}")
+    output_shape = tuple(target.shape)
+    del target, group  # release the store's handles before renaming its directory
+    publish_partial(partial, args.output_zarr)
+    print(f"wrote {args.output_zarr} shape={output_shape}")
     return 0
 
 
