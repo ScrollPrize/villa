@@ -54,7 +54,7 @@ def _read_chunk(session, array_url, metadata, index):
     begin = np.asarray(index, dtype=np.int64) * chunks
     chunk_shape = tuple(np.minimum(chunks, shape - begin))
     if response.status_code == 404:
-        return np.full(chunk_shape, metadata.get("fill_value", 0),
+        return np.full(chunk_shape, metadata.get("fill_value") or 0,
                        dtype=np.dtype(metadata["dtype"]))
     response.raise_for_status()
     compressor = metadata.get("compressor")
@@ -147,7 +147,7 @@ def _cell_argmax(presence, global_begin, cell_size, threshold, valid_begin, vali
     coords = global_zyx[valid]
     cells = coords // cell_size
     # Presence descending, then flat index ascending gives deterministic ties.
-    order = np.lexsort((flat_indices, -values[valid],
+    order = np.lexsort((flat_indices, -values[valid].astype(np.int64),
                         cells[:, 2], cells[:, 1], cells[:, 0]))
     ordered_cells = cells[order]
     first = np.ones(len(order), dtype=bool)

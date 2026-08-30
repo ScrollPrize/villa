@@ -1024,6 +1024,16 @@ def _decode_uint8_normal_component(value):
     return (value - 128.0) / 127.0
 
 
+def _decode_uint8_normal(nx_u8, ny_u8):
+    # Decode the uint8 nx/ny normal encoding to a unit zyx direction, plus a mask
+    # marking samples that carry a direction at all (both components unset = no data).
+    valid = ((nx_u8 != 0) | (ny_u8 != 0)).float()
+    nx = _decode_uint8_normal_component(nx_u8.float())
+    ny = _decode_uint8_normal_component(ny_u8.float())
+    nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
+    return F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1), valid
+
+
 
 def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
     # At each scroll-space point, pull the spiral-space cylinder normal (the outward radial
@@ -1069,12 +1079,10 @@ def get_fiber_direction_loss(transform, samples, num_points, epsilon, device):
     # potentially multi-million-point host pool every optimizer step.
     indices = np.random.randint(0, count, size=num_points)
     position = torch.as_tensor(samples["position_zyx"][indices], device=device)
-    nx = (torch.as_tensor(samples["nx"][indices], device=device).float() - 128.0) / 127.0
-    ny = (torch.as_tensor(samples["ny"][indices], device=device).float() - 128.0) / 127.0
-    nz = torch.sqrt(torch.clamp(1.0 - nx.square() - ny.square(), min=0.0))
-    direction = torch.stack((nz, ny, nx), dim=-1)
-    direction = direction / direction.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    confidence = torch.as_tensor(
+    direction, valid = _decode_uint8_normal(
+        torch.as_tensor(samples["nx"][indices], device=device),
+        torch.as_tensor(samples["ny"][indices], device=device))
+    confidence = valid * torch.as_tensor(
         samples["presence"][indices], device=device).float() / 255.0
     normal = get_radial_normal_in_scroll_space(
         transform, position, epsilon=epsilon)
@@ -1220,12 +1228,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     else:
         raise ValueError(f'unsupported lasagna backend {backend!r}')
     if compute_normals:
-        normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
-        nx = _decode_uint8_normal_component(nx_u8.float())
-        ny = _decode_uint8_normal_component(ny_u8.float())
-        nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
-        target_normal = F.normalize(
-            torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
+        target_normal, valid_normal = _decode_uint8_normal(nx_u8, ny_u8)  # zyx
+        normal_weight = valid_normal * in_bounds.float()
 
     if compute_spacing:
         # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below

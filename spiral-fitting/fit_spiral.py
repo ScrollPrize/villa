@@ -1533,15 +1533,19 @@ class FitContext:
             fiber_direction_samples = load_fiber_direction_samples(
                 self.fiber_directions_path, self.z_begin, self.z_end)
         elif self.config['loss_weight_fiber_directions'] > 0:
+            if not self.config['input_use_fiber_directions']:
+                raise RuntimeError(
+                    'fiber-direction loss is enabled, but its input source is '
+                    'off; set input_use_fiber_directions')
             raise RuntimeError(
-                'fiber-direction loss is enabled, but its sample directory '
+                'fiber-direction loss is enabled, but its sample file '
                 f'is missing: {self.fiber_directions_path!r}')
         if fiber_direction_samples is not None:
             print(f'fiber directions: {len(fiber_direction_samples["position_zyx"]):,} '
                   f'samples in z ROI')
         elif self.config['loss_weight_fiber_directions'] > 0:
             raise RuntimeError(
-                f'fiber-direction sample directory contains no points in '
+                f'fiber-direction sample file contains no points in '
                 f'z ROI [{self.z_begin}, {self.z_end})')
 
         # ==========================================================================
