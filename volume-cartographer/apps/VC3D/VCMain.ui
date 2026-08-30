@@ -1052,6 +1052,19 @@
        </property>
       </widget>
      </item>
+     <item row="11" column="0" colspan="4">
+      <widget class="QCheckBox" name="chkCoordinateFrames">
+       <property name="text">
+        <string>Show coordinate frames</string>
+       </property>
+       <property name="checked">
+        <bool>true</bool>
+       </property>
+       <property name="toolTip">
+        <string>Draw the X/Y/Z reference frame in the corner of the slice views</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </widget>
    </widget>
