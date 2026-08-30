@@ -51,7 +51,8 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {
         "input_use_verified_patches", "input_use_unverified_patches",
-        "input_use_tracks", "input_use_fibers", "input_use_pcl_absolute",
+        "input_use_tracks", "input_use_fibers",
+        "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",
         "input_use_pcl_drawn_control_points", "input_use_normals",
         "input_use_surf_sdt", "input_use_gradient_magnitude",
