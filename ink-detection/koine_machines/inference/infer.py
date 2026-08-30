@@ -1392,6 +1392,48 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
     )
 
 
+class _CompiledWithEagerFallback(torch.nn.Module):
+    """A compiled model that falls back to eager if the backend fails when it runs.
+
+    ``torch.compile`` compiles nothing: it returns a wrapper and the backend runs
+    on the first forward. A backend that cannot build therefore raises there, not
+    at the call ``maybe_compile_model`` guards -- so on any install without a
+    working Triton (every native-Windows one, since Triton ships no Windows
+    wheel) inference dies mid-run with ``TritonMissing`` instead of taking the
+    documented fallback. Guarding the first forward restores the promise the
+    warning already makes, and costs one attribute test per call until the first
+    forward has succeeded.
+
+    The eager module is the registered child so ``.to()``, ``.eval()`` and
+    ``repr`` behave normally; the compiled wrapper holds the very same module, so
+    registering it as well would only duplicate every parameter.
+    """
+
+    def __init__(self, eager_model: torch.nn.Module, compiled_model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = eager_model
+        object.__setattr__(self, "_compiled_model", compiled_model)
+        object.__setattr__(self, "_compiled_verified", False)
+
+    def forward(self, *args, **kwargs):
+        compiled_model = self._compiled_model
+        if compiled_model is None:
+            return self.model(*args, **kwargs)
+        if self._compiled_verified:
+            return compiled_model(*args, **kwargs)
+        try:
+            outputs = compiled_model(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning(
+                "torch.compile failed on the first forward (%s). Continuing without compilation.",
+                exc,
+            )
+            object.__setattr__(self, "_compiled_model", None)
+            return self.model(*args, **kwargs)
+        object.__setattr__(self, "_compiled_verified", True)
+        return outputs
+
+
 def maybe_compile_model(
     model: torch.nn.Module,
     *,
@@ -1411,7 +1453,7 @@ def maybe_compile_model(
         LOGGER.warning("torch.compile failed (%s). Continuing without compilation.", exc)
         return model
     LOGGER.info("Enabled torch.compile (mode=%s)", mode)
-    return compiled_model
+    return _CompiledWithEagerFallback(model, compiled_model)
 
 
 def prepare_model_for_inference(
