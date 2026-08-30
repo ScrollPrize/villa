@@ -390,7 +390,7 @@ class Config:
         self.input_use_unverified_patches = True
         self.input_use_tracks = True
         self.input_use_fibers = True
-        self.input_use_fiber_directions = True
+        self.input_use_fiber_directions = False
         self.input_use_pcl_absolute = True
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True

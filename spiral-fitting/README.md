@@ -544,8 +544,9 @@ The z ROI is half-open and expressed in the output/fitter coordinate system;
 `--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels. The
 extractor always covers the fiber volume's complete XY extent.
 
-Set `loss_weight_fiber_directions` above zero to enable the loss. The fitter
-loads the conventional `fiber_directions.npz` artifact and samples
-`sample_count_fiber_direction_points` observations per step. Positions and
-directions constrain only local fitted-sheet orientation; they do not attach a
-sample to a particular winding.
+Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
+to off/zero; set the toggle true and the weight above zero to enable the
+loss. The fitter then loads the conventional `fiber_directions.npz` artifact
+and samples `sample_count_fiber_direction_points` observations per step.
+Positions and directions constrain only local fitted-sheet orientation; they
+do not attach a sample to a particular winding.
