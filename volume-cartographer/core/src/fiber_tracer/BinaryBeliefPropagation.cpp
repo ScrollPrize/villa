@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 
@@ -78,7 +79,11 @@ void validate(std::size_t nodeCount, std::span<const BinaryPairwiseFactor> facto
 }  // namespace
 
 BinaryBeliefPropagationReport solveBinaryPairwiseSumProduct(
-    std::size_t nodeCount, std::span<const BinaryPairwiseFactor> factors, std::span<const BinaryBeliefState> fixedStates, const BinaryBeliefPropagationConfig& config)
+    std::size_t nodeCount,
+    std::span<const BinaryPairwiseFactor> factors,
+    std::span<const BinaryBeliefState> fixedStates,
+    const BinaryBeliefPropagationConfig& config,
+    const BinaryBeliefPropagationProgressCallback& progress)
 {
     const auto totalStart = std::chrono::steady_clock::now();
     validate(nodeCount, factors, fixedStates, config);
@@ -132,9 +137,10 @@ BinaryBeliefPropagationReport solveBinaryPairwiseSumProduct(
     const auto setupEnd = std::chrono::steady_clock::now();
     double residual = 0.0;
     bool stop = false;
+    std::exception_ptr progressFailure;
     auto phaseStart = setupEnd;
 
-#pragma omp parallel num_threads(workers) if (useParallel) shared(residual, stop, report, incomingMessages, nextIncomingMessages)
+#pragma omp parallel num_threads(workers) if (useParallel) shared(residual, stop, report, incomingMessages, nextIncomingMessages, progressFailure)
     {
 #pragma omp single
         {
@@ -193,7 +199,20 @@ BinaryBeliefPropagationReport solveBinaryPairwiseSumProduct(
                 report.messageConverged = stop;
                 const auto now = std::chrono::steady_clock::now();
                 report.messageUpdateMilliseconds += std::chrono::duration<double, std::milli>(now - phaseStart).count();
-                phaseStart = now;
+                if (progress) {
+                    try {
+                        progress({
+                            report.messageIterations,
+                            config.maximumMessageIterations,
+                            report.messageResidual,
+                            false,
+                        });
+                    } catch (...) {
+                        progressFailure = std::current_exception();
+                        stop = true;
+                    }
+                }
+                phaseStart = std::chrono::steady_clock::now();
             }
             if (stop)
                 break;
@@ -225,6 +244,16 @@ BinaryBeliefPropagationReport solveBinaryPairwiseSumProduct(
     report.setupMilliseconds = std::chrono::duration<double, std::milli>(setupEnd - totalStart).count();
     report.solveMilliseconds = std::chrono::duration<double, std::milli>(solveEnd - setupEnd).count();
     report.elapsedMilliseconds = std::chrono::duration<double, std::milli>(solveEnd - totalStart).count();
+    if (progressFailure)
+        std::rethrow_exception(progressFailure);
+    if (progress) {
+        progress({
+            report.messageIterations,
+            config.maximumMessageIterations,
+            report.messageResidual,
+            true,
+        });
+    }
     return report;
 }
 

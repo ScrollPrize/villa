@@ -56,6 +56,8 @@ void addMeasured(
     constraint.perpendicularScore = 1.0 - parallel;
     constraint.windingDistance = std::abs(signedDelta);
     constraint.signedWindingDelta = signedDelta;
+    constraint.parallelWindingDistance = std::abs(signedDelta);
+    constraint.signedParallelWindingDelta = signedDelta;
     constraint.windingNormalComponent = normalComponent;
     report.constraints.push_back(constraint);
 }
@@ -408,7 +410,8 @@ TEST_CASE("Interleaved winding uses signed half-integer observation bins")
         report, topology(source, report), config());
     REQUIRE(raw.factorDiagnostics.size() == expected.size());
     for (const auto& diagnostic : raw.factorDiagnostics) {
-        CHECK(diagnostic.effectiveParallelWindingDistance == 0.0);
+        CHECK(diagnostic.effectiveSignedParallelDelta ==
+            diagnostic.canonicalSignedParallelDelta);
         CHECK(diagnostic.effectivePerpendicularSignedDelta ==
             diagnostic.canonicalSignedDelta);
     }
@@ -655,14 +658,15 @@ TEST_CASE("Reference observations use authoritative latent endpoint algebra")
     FiberTraceConstraint parallel = perpendicular;
     parallel.parallelScore = 0.75;
     parallel.perpendicularScore = 0.25;
-    parallel.windingDistance = 1.6;
+    parallel.parallelWindingDistance = 1.6;
+    parallel.signedParallelWindingDelta = 1.6;
     const auto other = makeFiberTraceReferenceWindingObservation(parallel, true, 0.5, 0, winding);
     CHECK(other.constraintClass == FiberTraceReferenceConstraintClass::ParallelOtherWinding);
-    CHECK(other.inferredReferenceWindingCount == 2);
+    CHECK(other.inferredReferenceWindingCount == 1);
     CHECK(other.inferredReferenceWindings[0] == 2.25);
-    CHECK(other.inferredReferenceWindings[1] == 6.25);
 
-    parallel.windingDistance = 0.49;
+    parallel.parallelWindingDistance = 0.49;
+    parallel.signedParallelWindingDelta = 0.49;
     const auto same = makeFiberTraceReferenceWindingObservation(parallel, true, 0.5, 1, winding);
     CHECK(same.constraintClass == FiberTraceReferenceConstraintClass::ParallelSameWinding);
     CHECK(same.integerGauge == 4);
@@ -720,7 +724,7 @@ TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
     }
 }
 
-TEST_CASE("H/V-aware winding uses unsigned parallel targets and cutoff")
+TEST_CASE("H/V-aware winding uses signed parallel targets and cutoff")
 {
     const auto source = lines(6);
     auto report = pieces(source.size());
@@ -729,12 +733,14 @@ TEST_CASE("H/V-aware winding uses unsigned parallel targets and cutoff")
     same.pieceB = 1;
     same.parallelScore = 1.0;
     same.perpendicularScore = 0.0;
-    same.windingDistance = 0.2;
+    same.parallelWindingDistance = 0.2;
+    same.signedParallelWindingDelta = 0.2;
     report.constraints.push_back(same);
     FiberTraceConstraint separate = same;
     separate.pieceA = 2;
     separate.pieceB = 3;
-    separate.windingDistance = 0.6;
+    separate.parallelWindingDistance = 0.6;
+    separate.signedParallelWindingDelta = 0.6;
     report.constraints.push_back(separate);
     addMeasured(report, 4, 5, 0.25, 0.6);
 
@@ -835,6 +841,84 @@ TEST_CASE("H/V-aware winding uses unsigned parallel targets and cutoff")
         solveFiberTraceJointGridWindingBeliefPropagation(
             report, topology(source, report), invalid),
         std::invalid_argument);
+}
+
+TEST_CASE("Signed parallel winding distinguishes opposite ladder directions")
+{
+    const auto source = lines(2);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    const auto solveJoint = [&](double signedDelta) {
+        auto report = pieces(2);
+        addMeasured(report, 0, 1, 1.0, signedDelta);
+        FiberTraceJointGridWindingConfig joint;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) =
+            config();
+        joint.fixedPhaseMagnitude = 0.5;
+        joint.fixedMeasurementScale = 1.0;
+        joint.mixedUnaryCost = 20.0;
+        joint.stableIterations = 1;
+        return solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint, {}, fixed);
+    };
+    const auto positiveJoint = solveJoint(1.0);
+    const auto negativeJoint = solveJoint(-1.0);
+    CHECK(positiveJoint.mapLatentCoordinate[1] -
+              positiveJoint.mapLatentCoordinate[0] == doctest::Approx(1.0));
+    CHECK(negativeJoint.mapLatentCoordinate[1] -
+              negativeJoint.mapLatentCoordinate[0] == doctest::Approx(-1.0));
+
+    const auto solveAlternating = [&](double signedDelta) {
+        auto report = pieces(2);
+        addMeasured(report, 0, 1, 1.0, signedDelta);
+        FiberTraceInterleavedWindingConfig alternating;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(alternating) =
+            config();
+        alternating.mixedUnaryCost = 20.0;
+        alternating.maximumCalibrationIterations = 2;
+        return solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            topology(source, report),
+            orientationBeliefs({
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+            }),
+            alternating,
+            {},
+            fixed);
+    };
+    const auto positiveAlternating = solveAlternating(1.0);
+    const auto negativeAlternating = solveAlternating(-1.0);
+    CHECK(positiveAlternating.mapLatentCoordinate[1] -
+              positiveAlternating.mapLatentCoordinate[0] > 0.5);
+    CHECK(negativeAlternating.mapLatentCoordinate[1] -
+              negativeAlternating.mapLatentCoordinate[0] < -0.5);
+
+    auto unsignedReport = pieces(2);
+    FiberTraceConstraint unsignedOther;
+    unsignedOther.pieceA = 0;
+    unsignedOther.pieceB = 1;
+    unsignedOther.parallelScore = 1.0;
+    unsignedOther.perpendicularScore = 0.0;
+    unsignedOther.parallelWindingDistance = 1.0;
+    unsignedReport.constraints.push_back(unsignedOther);
+    FiberTraceJointGridWindingConfig unsignedConfig;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(unsignedConfig) =
+        config();
+    unsignedConfig.fixedPhaseMagnitude = 0.5;
+    unsignedConfig.fixedMeasurementScale = 1.0;
+    unsignedConfig.stableIterations = 1;
+    const auto unsignedSolved =
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            unsignedReport,
+            topology(source, unsignedReport),
+            unsignedConfig,
+            {},
+            fixed);
+    REQUIRE(unsignedSolved.factorDiagnostics.size() == 1);
+    CHECK_FALSE(unsignedSolved.factorDiagnostics[0].parallelWindingRetained);
+    CHECK(unsignedSolved.factorDiagnostics[0]
+              .effectiveParallelWindingWeight == 0.0);
 }
 
 TEST_CASE("Winding BP fixes an independent crop-central gauge per component")

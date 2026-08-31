@@ -1,19 +1,18 @@
-# Task log: penalize split-piece Defect boundaries
+# Task log: normal-alignment progress output
 
 ## Findings
 
-- Same-trace split boundaries already have one hard-continuity measurement,
-  but any factor with a Defect endpoint is currently neutral. Consequently the
-  existing continuity coefficient does not penalize active-to-Defect borders.
-- The penalty must be attached to the prepared edge rather than its individual
-  measurements so it is charged once per adjacent-piece boundary.
-- Both alternating and joint-grid winding solvers share the prepared edge but
-  use separate pair-potential implementations; both require the same term.
-- Independent review clarified that the activity regularizer must use
-  `orientationTemperature`, must live only on the two Defect-capable configs,
-  and must be printed/stored for reproducibility. The prepared-edge continuity
-  flag must be authoritative and OR-merged rather than inferred from numeric
-  scores.
+- The CLI prints its normal-alignment summary only after the complete
+  `sampleAndAlignLasagnaNormalLattice` call returns.
+- That call performs an opaque batch normal-volume read, deterministic lattice
+  factor construction, connected-component discovery, and up to 500 binary-BP
+  message iterations.
+- Binary BP currently exposes only its final report even though each iteration
+  already has a serial completion boundary with iteration count and residual.
+- Independent review required safe OpenMP callback exception propagation, a
+  real parallel-path regression, phase-local rather than global ETA semantics,
+  exact progress units, bounded callback frequency, exclusion of callback time
+  from BP timing fields, and success-only terminal completion.
 
 ## Deviations
 
@@ -21,17 +20,30 @@
 
 ## Validation
 
-- Built `vc_fiber_trace_chunk` and `test_fiber_trace_winding_bp` from the
-  existing optimized build tree. All 38 winding-BP test cases pass.
-- Ran the exact 500-fiber, 512-base-voxel-piece reference benchmark with
-  piece-break costs `0`, `1`, `8`, and `32`. The default-zero run reproduced
-  728 Defect pieces, 407/451 central Defects, 520 active/Defect continuity
-  boundaries, and 89.570% reference accuracy.
-- Cost `1` produced 718 Defects, 401/451 central Defects, 510 boundaries, and
-  89.517% accuracy. Cost `8` produced 730 Defects, 389/451 central Defects,
-  463 boundaries, and 89.548% accuracy. Cost `32` produced 834 Defects,
-  367/451 central Defects, 268 boundaries, and 88.940% accuracy.
-- The sweep confirms that the regularizer reduces split-piece transitions but
-  does not by itself solve the central gap: stronger values increasingly turn
-  whole non-central runs into Defect. The feature therefore remains opt-in
-  with a zero default.
+- Built the production CLI and focused tests:
+
+  ```text
+  cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_lasagna_normal_alignment test_fiber_trace_winding_bp test_fiberlet_crop_trace -j 16
+  ```
+
+- Focused results:
+
+  ```text
+  test_lasagna_normal_alignment: 8 test cases passed
+  test_fiber_trace_winding_bp: 41 test cases passed
+  test_fiberlet_crop_trace: 80 test cases passed
+  ```
+
+- The normal-alignment test exercises more than 32,768 factors so OpenMP uses
+  the production parallel path. It verifies ordered serialized callbacks,
+  success terminal events for early convergence and message-limit completion,
+  callback exception propagation outside OpenMP, and exact probabilities,
+  log odds, residual, convergence, component gauges, and aligned normals with
+  and without reporting.
+- Ran a CLI smoke against the established Paris4 `crop_traces.zarr` with two
+  quality-selected fibers and one configured BP iteration. The automatic
+  output reported all six phases in order with exact work totals, message
+  residual, `eta_to_limit`, and terminal completion before the existing normal
+  alignment summary. The remainder of the direction-ablation command also
+  completed successfully.
+- `git diff --check` passed.

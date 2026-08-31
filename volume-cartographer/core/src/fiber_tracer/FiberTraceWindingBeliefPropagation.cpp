@@ -35,6 +35,7 @@ struct Measurement {
     double parallelMultiplier = 1.0;
     double perpendicularMultiplier = 1.0;
     double parallelDistance = 0.0;
+    std::optional<double> parallelSignedDelta;
     std::optional<double> perpendicularSignedDelta;
     std::optional<std::size_t> normalComponent;
 };
@@ -104,7 +105,20 @@ double windingWeightMultiplier(double effectiveTarget)
 
 double parallelWindingWeight(const Measurement& measurement)
 {
+    if (measurement.parallelDistance != 0.0 &&
+        !measurement.parallelSignedDelta) {
+        return 0.0;
+    }
     return measurement.parallelMultiplier * measurement.parallel;
+}
+
+double parallelWindingResidual(
+    const Measurement& measurement,
+    double predictedDelta)
+{
+    return measurement.parallelSignedDelta
+        ? predictedDelta - *measurement.parallelSignedDelta
+        : std::abs(predictedDelta) - measurement.parallelDistance;
 }
 
 double perpendicularWindingWeight(const Measurement& measurement)
@@ -151,20 +165,39 @@ PreparedWinding prepareWinding(
         std::optional<double> canonicalSignedDelta = continuity
             ? std::optional<double>{0.0}
             : constraint.signedWindingDelta;
+        std::optional<double> canonicalSignedParallelDelta = continuity
+            ? std::optional<double>{0.0}
+            : constraint.signedParallelWindingDelta;
         if (canonicalSignedDelta && originalA > originalB)
             *canonicalSignedDelta = -*canonicalSignedDelta;
-        double effectiveParallelDistance = 0.0;
+        if (canonicalSignedParallelDelta && originalA > originalB)
+            *canonicalSignedParallelDelta = -*canonicalSignedParallelDelta;
+        double effectiveParallelDistance = continuity
+            ? 0.0
+            : constraint.parallelWindingDistance;
+        std::optional<double> effectiveSignedParallelDelta =
+            canonicalSignedParallelDelta;
         std::optional<double> effectivePerpendicularSignedDelta =
             canonicalSignedDelta;
         if (quantizeComponentTargets && !continuity) {
-            effectiveParallelDistance = quantizedIntegerWindingTarget(
-                constraint.windingDistance);
+            if (canonicalSignedParallelDelta) {
+                effectiveSignedParallelDelta = quantizedIntegerWindingTarget(
+                    *canonicalSignedParallelDelta);
+                effectiveParallelDistance = std::abs(
+                    *effectiveSignedParallelDelta);
+            } else {
+                effectiveParallelDistance = std::abs(
+                    quantizedIntegerWindingTarget(
+                        constraint.parallelWindingDistance));
+            }
             if (canonicalSignedDelta) {
                 effectivePerpendicularSignedDelta = quantizedHalfWindingTarget(
                     *canonicalSignedDelta);
             }
         }
         const bool parallelRetained =
+            (effectiveParallelDistance == 0.0 ||
+             effectiveSignedParallelDelta.has_value()) &&
             (!config.parallelWindingDistanceCutoff || continuity ||
              effectiveParallelDistance <
                  *config.parallelWindingDistanceCutoff);
@@ -186,10 +219,11 @@ PreparedWinding prepareWinding(
             parallelRetained ? parallelMultiplier : 0.0,
             perpendicularMultiplier,
             effectiveParallelDistance,
+            effectiveSignedParallelDelta,
             effectivePerpendicularSignedDelta,
             continuity ? std::nullopt : constraint.windingNormalComponent,
         };
-        result.diagnostics.push_back({
+        FiberTraceWindingFactorDiagnostic diagnostic{
             index,
             constraint.pieceA,
             constraint.pieceB,
@@ -208,7 +242,14 @@ PreparedWinding prepareWinding(
             continuity ? std::nullopt : constraint.windingNormalComponent,
             parallelRetained,
             false,
-        });
+        };
+        diagnostic.originalSignedParallelDelta =
+            constraint.signedParallelWindingDelta;
+        diagnostic.canonicalSignedParallelDelta =
+            canonicalSignedParallelDelta;
+        diagnostic.effectiveSignedParallelDelta =
+            effectiveSignedParallelDelta;
+        result.diagnostics.push_back(std::move(diagnostic));
         const std::pair<std::size_t, std::size_t> key{a, b};
         const auto [found, inserted] = edgeByPair.try_emplace(
             key, result.edges.size());
@@ -354,8 +395,13 @@ PreparedWinding prepareWinding(
                 if (edge.a != node)
                     continue;
                 for (const auto& measurement : edge.measurements) {
-                    if (!measurement.perpendicularSignedDelta ||
-                        !(measurement.perpendicular > 0.0) ||
+                    const bool signedPerpendicular =
+                        measurement.perpendicularSignedDelta &&
+                        measurement.perpendicular > 0.0;
+                    const bool signedParallel =
+                        measurement.parallelSignedDelta &&
+                        measurement.parallel > 0.0;
+                    if ((!signedPerpendicular && !signedParallel) ||
                         !measurement.normalComponent) {
                         continue;
                     }
@@ -383,13 +429,8 @@ double measurementSquaredTarget(const Measurement& measurement)
     const double weight = measurementSquaredWeight(measurement);
     if (!(weight > 0.0))
         return 0.0;
-    const double parallelTarget = measurement.parallelDistance == 0.0
-        ? 0.0
-        : measurement.perpendicularSignedDelta
-            ? std::copysign(
-                  measurement.parallelDistance,
-                  *measurement.perpendicularSignedDelta)
-            : measurement.parallelDistance;
+    const double parallelTarget =
+        measurement.parallelSignedDelta.value_or(0.0);
     return (parallelWindingWeight(measurement) * parallelTarget +
             perpendicularWindingWeight(measurement) *
                 measurement.perpendicularSignedDelta.value_or(0.0)) /
@@ -464,8 +505,8 @@ std::vector<double> solveContinuous(
         const double delta = values[measurement.b] - values[measurement.a];
         const double parallelWeight = parallelWindingWeight(measurement);
         if (parallelWeight > 0.0) {
-            const double residual =
-                std::abs(delta) - measurement.parallelDistance;
+            const double residual = parallelWindingResidual(
+                measurement, delta);
             squared += parallelWeight * residual * residual;
             ++terms;
         }
@@ -492,7 +533,7 @@ double robustCost(const Edge& edge, int labelA, int labelB)
     double cost = 0.0;
     for (const auto& measurement : edge.measurements) {
         cost += parallelWindingWeight(measurement) *
-            std::abs(std::abs(delta) - measurement.parallelDistance);
+            std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             cost += perpendicularWindingWeight(measurement) *
                 std::abs(delta - *measurement.perpendicularSignedDelta);
@@ -921,7 +962,7 @@ double windingEnergy(
     double energy = 0.0;
     for (const auto& measurement : edge.measurements) {
         energy += parallelWindingWeight(measurement) *
-            std::abs(std::abs(delta) - measurement.parallelDistance);
+            std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             energy += perpendicularWindingWeight(measurement) *
                 std::abs(
@@ -1283,6 +1324,7 @@ struct CalibrationTerm {
     double integer = 0.0;
     double phaseCoefficient = 0.0;
     std::optional<double> parallelDistance;
+    std::optional<double> signedParallelDistance;
     std::optional<double> signedDelta;
 };
 
@@ -1295,14 +1337,17 @@ double calibrationL1(
     for (const auto& term : terms) {
         const double latent =
             term.integer + term.phaseCoefficient * phase;
-        if (!term.parallelDistance && term.signedDelta &&
+        if (!term.parallelDistance && !term.signedParallelDistance &&
+            term.signedDelta &&
             *term.signedDelta != 0.0 &&
             *term.signedDelta * (latent / scale) <= 0.0) {
             return std::numeric_limits<double>::infinity();
         }
-        const double residual = term.parallelDistance
-            ? std::abs(latent) - *term.parallelDistance
-            : latent / scale - *term.signedDelta;
+        const double residual = term.signedParallelDistance
+            ? latent - *term.signedParallelDistance
+            : term.parallelDistance
+                ? std::abs(latent) - *term.parallelDistance
+                : latent / scale - *term.signedDelta;
         result += term.weight * std::abs(residual);
     }
     return result;
@@ -1438,16 +1483,24 @@ CalibrationUpdate updateCalibration(
         const double phaseCoefficient = static_cast<double>(sign) *
             ((belief.b.orientation == JointClass::B ? 1.0 : 0.0) -
              (belief.a.orientation == JointClass::B ? 1.0 : 0.0));
-        const auto addParallel = [&](double weight, double distance) {
+        const auto addParallel = [&](
+            double weight, const Measurement& measurement) {
             if (!(weight > 0.0))
                 return;
-            terms.push_back({
+            CalibrationTerm term{
                 belief.probability * weight,
                 integer,
                 phaseCoefficient,
-                distance,
                 std::nullopt,
-            });
+                std::nullopt,
+                std::nullopt,
+            };
+            if (measurement.parallelSignedDelta)
+                term.signedParallelDistance =
+                    *measurement.parallelSignedDelta;
+            else
+                term.parallelDistance = measurement.parallelDistance;
+            terms.push_back(std::move(term));
         };
         const auto addSigned = [&](double weight, double signedDelta) {
             if (!(weight > 0.0))
@@ -1456,6 +1509,7 @@ CalibrationUpdate updateCalibration(
                 belief.probability * weight,
                 integer,
                 phaseCoefficient,
+                std::nullopt,
                 std::nullopt,
                 signedDelta,
             });
@@ -1469,7 +1523,7 @@ CalibrationUpdate updateCalibration(
         for (const auto& measurement : edge.measurements) {
             addParallel(
                 parallelWindingWeight(measurement),
-                measurement.parallelDistance);
+                measurement);
             if (measurement.perpendicularSignedDelta)
                 addSigned(
                     perpendicularWindingWeight(measurement),
@@ -1783,7 +1837,7 @@ double gridWindingEnergy(
     double result = 0.0;
     for (const auto& measurement : edge.measurements) {
         result += parallelWindingWeight(measurement) *
-            std::abs(std::abs(delta) - measurement.parallelDistance);
+            std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             result += perpendicularWindingWeight(measurement) *
                 std::abs(
@@ -3383,13 +3437,19 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
         return observation;
     }
 
-    const double target = std::abs(quantizedIntegerWindingTarget(constraint.windingDistance));
+    const double target = std::abs(quantizedIntegerWindingTarget(
+        constraint.parallelWindingDistance));
     observation.constraintClass =
         target == 0.0 ? FiberTraceReferenceConstraintClass::ParallelSameWinding : FiberTraceReferenceConstraintClass::ParallelOtherWinding;
-    if (active) {
-        observation.inferredReferenceWindings[0] = winding.mapLatentCoordinate[bpPiece] - target;
-        observation.inferredReferenceWindings[1] = winding.mapLatentCoordinate[bpPiece] + target;
-        observation.inferredReferenceWindingCount = target == 0.0 ? 1 : 2;
+    if (active && (target == 0.0 || constraint.signedParallelWindingDelta)) {
+        const double signedTarget = target == 0.0
+            ? 0.0
+            : quantizedIntegerWindingTarget(
+                  *constraint.signedParallelWindingDelta);
+        const double direction = referenceIsEndpointA ? -1.0 : 1.0;
+        observation.inferredReferenceWindings[0] =
+            winding.mapLatentCoordinate[bpPiece] + direction * signedTarget;
+        observation.inferredReferenceWindingCount = 1;
     }
     return observation;
 }

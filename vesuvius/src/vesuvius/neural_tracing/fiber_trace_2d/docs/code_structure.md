@@ -2715,3 +2715,30 @@ Zarr external and strictly loads the replay bundle plus its relative artifacts.
 Graph replay adds a strict graph JSON, strict route JSON/OBJ agreement, and an
 independent napari route layer that participates in reload topology but not the
 fiberlet distance filter.
+
+## Crop Fiber Constraints
+
+`FiberTraceConstraints.cpp` splits stored crop traces into overlapping pieces,
+finds nearby piece pairs, and scores parallel versus perpendicular geometry.
+The perpendicular winding observation is the normal-aligned Lasagna integral
+on the closest connector. A parallel-dominant constraint additionally reuses
+every tangent-valid matched pair from its bidirectional parallel-score walk.
+All of those connectors are submitted in the same batched Lasagna sampling
+call; no per-pair volume reads are introduced.
+
+With a crop-aligned normal field, each walk integral is signed by its connector
+direction and aligned midpoint normal. Only samples in the closest connector's
+normal-alignment component enter the deterministic median. The published
+constraint therefore carries distinct closest/perpendicular and
+median/parallel distances plus their signed forms. Winding BP quantizes the
+parallel median onto the signed integer ladder and the perpendicular closest
+measurement onto the signed half-integer ladder. Parallel-dominant OBJ,
+labeling, CLI, and reference diagnostics use the median target.
+
+Before constraint extraction, `LasagnaNormalAlignment.cpp` builds the aligned
+normal lattice in sampling, factor, component, message, and finalize phases.
+`vc_fiber_trace_chunk direction-ablation` prints rate-limited progress for
+those phases. Its preparation ETAs are local to the current phase; message
+progress deliberately reports `eta_to_limit`, the projected time to the
+configured BP iteration limit, because convergence may terminate earlier and
+cannot be predicted from the current residual.

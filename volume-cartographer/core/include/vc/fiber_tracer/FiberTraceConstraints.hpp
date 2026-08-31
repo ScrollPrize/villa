@@ -56,6 +56,8 @@ struct FiberTraceConstraint {
     bool hardContinuity = false;
     std::optional<double> signedWindingDelta;
     std::optional<std::size_t> windingNormalComponent;
+    double parallelWindingDistance = 0.0;
+    std::optional<double> signedParallelWindingDelta;
 };
 
 struct FiberTraceConstraintReport {
@@ -155,7 +157,11 @@ struct FiberTraceConstraintObjReport {
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {},
-    const FiberTraceConstraintTracePairFilter& tracePairFilter = {});
+    const FiberTraceConstraintTracePairFilter& tracePairFilter = {},
+    const LasagnaNormalAlignmentField* alignedNormals = nullptr);
+
+[[nodiscard]] double dominantFiberTraceConstraintWindingDistance(
+    const FiberTraceConstraint& constraint) noexcept;
 
 struct FiberTraceOrderedCrossSourceConstraint {
     std::size_t constraintIndex = 0;

@@ -10,6 +10,7 @@
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
+#include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
 #include "utils/zarr.hpp"
@@ -1430,7 +1431,95 @@ TEST_CASE("Trace constraints distinguish parallel and perpendicular neighbors de
         CHECK(left.perpendicularScore == right.perpendicularScore);
         CHECK(left.windingDistance == right.windingDistance);
         CHECK(left.windingDistance == batched.constraints[index].windingDistance);
+        CHECK(left.parallelWindingDistance ==
+              right.parallelWindingDistance);
+        CHECK(left.parallelWindingDistance ==
+              batched.constraints[index].parallelWindingDistance);
     }
+}
+
+TEST_CASE("Parallel trace constraints use signed median walk winding")
+{
+    FiberletCropTraceLine first;
+    first.pointsBaseXYZ = {{0, 0, 0}, {256, 0, 0}};
+    FiberletCropTraceLine second;
+    second.pointsBaseXYZ = {{256, 10, 0}, {0, 10, 0}};
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 16.0;
+    config.enforceMaximumWindingDistance = false;
+    config.parallelThreads = 1;
+
+    LasagnaNormalAlignmentField field;
+    field.lattice = makeLasagnaNormalLattice(
+        {-32.0, -32.0, -32.0}, {320.0, 64.0, 64.0}, 32.0);
+    field.nodeByLatticeSample.resize(field.lattice.positionsBaseXYZ.size());
+    for (std::size_t node = 0; node < field.nodeByLatticeSample.size(); ++node)
+        field.nodeByLatticeSample[node] = node;
+    field.positionsBaseXYZ = field.lattice.positionsBaseXYZ;
+    field.alignment.alignedNormals.assign(
+        field.nodeByLatticeSample.size(), cv::Vec3f{0.0F, 1.0F, 0.0F});
+    field.alignment.componentByNode.assign(
+        field.nodeByLatticeSample.size(), 0);
+
+    std::size_t sampledConnectors = 0;
+    const auto extract = [&](const LasagnaNormalAlignmentField& normals) {
+        return extractFiberTraceConstraints(
+            {first, second},
+            config,
+            {},
+            [&](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+                double,
+                int) {
+                sampledConnectors = connectors.size();
+                std::vector<double> result;
+                result.reserve(connectors.size());
+                for (const auto& connector : connectors) {
+                    result.push_back(
+                        1.0 + connector.first[0] / 32.0);
+                }
+                return result;
+            },
+            {},
+            &normals);
+    };
+
+    const auto positive = extract(field);
+    REQUIRE(positive.constraints.size() == 1);
+    CHECK(sampledConnectors == 9);
+    CHECK(positive.constraints[0].windingDistance == doctest::Approx(1.0));
+    CHECK(positive.constraints[0].parallelWindingDistance ==
+          doctest::Approx(5.0));
+    CHECK(positive.constraints[0].signedParallelWindingDelta ==
+          doctest::Approx(5.0));
+
+    auto negativeField = field;
+    for (auto& normal : negativeField.alignment.alignedNormals)
+        normal *= -1.0F;
+    const auto negative = extract(negativeField);
+    REQUIRE(negative.constraints.size() == 1);
+    CHECK(negative.constraints[0].parallelWindingDistance ==
+          doctest::Approx(5.0));
+    CHECK(negative.constraints[0].signedParallelWindingDelta ==
+          doctest::Approx(-5.0));
+
+    auto splitField = field;
+    for (std::size_t node = 0; node < splitField.positionsBaseXYZ.size(); ++node) {
+        if (splitField.positionsBaseXYZ[node][0] >= 128.0F)
+            splitField.alignment.componentByNode[node] = 1;
+    }
+    const auto split = extract(splitField);
+    REQUIRE(split.constraints.size() == 1);
+    CHECK(split.constraints[0].windingNormalComponent == 0);
+    CHECK(split.constraints[0].parallelWindingDistance ==
+          doctest::Approx(2.5));
+    CHECK(split.constraints[0].signedParallelWindingDelta ==
+          doctest::Approx(2.5));
+
+    config.enforceMaximumWindingDistance = true;
+    config.maximumWindingDistance = 4.0;
+    const auto cutoff = extract(field);
+    CHECK(cutoff.constraints.empty());
+    CHECK(cutoff.rejectedWindingCutoff == 1);
 }
 
 TEST_CASE("Reference constraint selection keeps measured cross-source links")
@@ -1466,7 +1555,7 @@ TEST_CASE("Reference constraint selection keeps measured cross-source links")
         });
 
     CHECK(batchCalls == 1);
-    CHECK(batchedConnectors == 3);
+    CHECK(batchedConnectors > 3);
     CHECK(report.inputTraces == 4);
     CHECK(report.hardConstraints == 2);
     REQUIRE(report.constraints.size() == 5);
@@ -1489,6 +1578,7 @@ TEST_CASE("Reference constraint selection keeps measured cross-source links")
         CHECK(constraint.parallelScore == doctest::Approx(1.0));
         CHECK(constraint.perpendicularScore == doctest::Approx(0.0));
         CHECK(constraint.windingDistance > 0.0);
+        CHECK(constraint.parallelWindingDistance > 0.0);
     }
 
     CHECK(orderMeasuredCrossSourceFiberTraceConstraints(
@@ -1557,7 +1647,7 @@ TEST_CASE("Cross constraint extraction preserves input pieces and filters pairs"
     CHECK(cross.measuredCandidates == 4);
     CHECK(cross.constraints.size() == 4);
     CHECK(batchCalls == 1);
-    CHECK(connectors == 4);
+    CHECK(connectors > 4);
     for (std::size_t piece = 0; piece < cross.pieces.size(); ++piece) {
         CHECK(cross.pieces[piece].traceIndex == piece);
         CHECK(cross.pieces[piece].pieceIndex == 0);
@@ -1606,6 +1696,7 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
         result.parallelScore = parallel;
         result.perpendicularScore = perpendicular;
         result.windingDistance = winding;
+        result.parallelWindingDistance = winding;
         result.hardContinuity = hard;
         return result;
     };
@@ -2453,6 +2544,7 @@ TEST_CASE("Trace labeling can exclude measured parallel separate winding links")
             {static_cast<double>(a), 0.0, 0.0},
             {static_cast<double>(b), 0.0, 0.0},
             1.0, parallel, 1.0 - parallel, winding, hard});
+        constraints.constraints.back().parallelWindingDistance = winding;
     };
     add(0, 1, 0.5, 0.5, false);
     add(1, 2, 0.5001, 0.5, false);
@@ -2768,6 +2860,7 @@ TEST_CASE("Trace labeling H V only mode uses the retained triangle graph")
             {static_cast<double>(a), 0.0, 0.0},
             {static_cast<double>(b), 0.0, 0.0},
             1.0, parallel, 1.0 - parallel, winding, false});
+        constraints.constraints.back().parallelWindingDistance = winding;
     };
     add(0, 1, 0.1, 1.0);
     add(0, 2, 0.1, 1.0);

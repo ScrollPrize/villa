@@ -1646,3 +1646,19 @@
 - Kept the default at zero and recorded the selected value in console and CSV
   diagnostics. A 512-voxel-piece sweep showed that strong costs reduce local
   breaks but can disable complete runs, so no nonzero default was selected.
+
+## 2026-08-31 - Signed median parallel winding constraints
+
+- Reused every tangent-valid paired sample from the parallel-direction walk in
+  one batched winding read and replaced closest-point parallel separation with
+  the aligned signed median.
+- Separated parallel integer-ladder targets from closest-point perpendicular
+  half-ladder targets throughout BP, diagnostics, OBJ grouping, and legacy
+  labeling consumers.
+
+## 2026-08-31 - Normal-alignment progress
+
+- Added bounded phase progress for crop normal sampling, factor/component
+  preparation, normal-sign message passing, and finalization.
+- Added serialized binary-BP iteration callbacks with residuals, safe OpenMP
+  exception propagation, and CLI phase-local/message-limit ETAs.

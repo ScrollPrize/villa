@@ -276,7 +276,7 @@ FiberTraceConstraintSelection selectFiberTraceLabelConstraints(
         const bool excludeParallelSeparate =
             config.excludeParallelSeparateWinding &&
             !constraint.hardContinuity && constraint.parallelScore > 0.5 &&
-            constraint.windingDistance >= 0.5;
+            constraint.parallelWindingDistance >= 0.5;
         if (excludeNonPerpendicular) {
             ++selection.excludedNonPerpendicular;
         } else if (excludeParallelSeparate) {
@@ -348,7 +348,10 @@ FiberTraceLabelingReport solveFiberTraceLabels(
             constraint.parallelScore < 0.0 || constraint.parallelScore > 1.0 ||
             !std::isfinite(constraint.windingDistance) ||
             constraint.windingDistance < 0.0 ||
-            (!config.hvOnly && constraint.windingDistance >= 1.5)) {
+            !std::isfinite(constraint.parallelWindingDistance) ||
+            constraint.parallelWindingDistance < 0.0 ||
+            (!config.hvOnly &&
+             dominantFiberTraceConstraintWindingDistance(constraint) >= 1.5)) {
             throw std::invalid_argument(
                 "Fiber trace constraint contains invalid optimization scores");
         }
@@ -470,9 +473,10 @@ FiberTraceLabelingReport solveFiberTraceLabels(
 
         const double orientationSame = 1.0 - constraint.parallelScore;
         const double orientationDifferent = constraint.parallelScore;
-        const double windingSame = constraint.windingDistance;
+        const double windingSame =
+            dominantFiberTraceConstraintWindingDistance(constraint);
         const double windingDifferent =
-            std::abs(1.0 - constraint.windingDistance);
+            std::abs(1.0 - windingSame);
         lp.col_cost_[pair] = orientationSame +
             (config.hvOnly ? 0.0 : windingSame);
 
@@ -672,9 +676,10 @@ FiberTraceLabelingReport solveFiberTraceLabels(
             report.orientationCost += orientationSame * pair +
                 (orientationDifferent - orientationSame) * difference;
             if (!config.hvOnly) {
-                const double windingSame = constraint.windingDistance;
+                const double windingSame =
+                    dominantFiberTraceConstraintWindingDistance(constraint);
                 const double windingDifferent =
-                    std::abs(1.0 - constraint.windingDistance);
+                    std::abs(1.0 - windingSame);
                 report.windingCost += windingSame * pair +
                     (windingDifferent - windingSame) *
                         solution[oddDifferenceBase + edge];
@@ -699,8 +704,11 @@ FiberTraceLabelingReport solveFiberTraceLabels(
                 : constraint.parallelScore;
             if (!config.hvOnly) {
                 report.windingCost += isOdd(a) == isOdd(b)
-                    ? constraint.windingDistance
-                    : std::abs(1.0 - constraint.windingDistance);
+                    ? dominantFiberTraceConstraintWindingDistance(constraint)
+                    : std::abs(
+                          1.0 -
+                          dominantFiberTraceConstraintWindingDistance(
+                              constraint));
             }
         }
     }

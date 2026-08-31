@@ -69,7 +69,13 @@ enum class RejectReason { None, Tangent, Winding, WindingCutoff };
 
 struct ScoredCandidate {
     std::optional<FiberTraceConstraint> constraint;
+    std::vector<std::pair<cv::Vec3d, cv::Vec3d>> parallelConnectors;
     RejectReason rejection = RejectReason::None;
+};
+
+struct SignedWindingSample {
+    double value = 0.0;
+    std::size_t component = 0;
 };
 
 double length(const cv::Vec3d& value)
@@ -83,6 +89,53 @@ cv::Vec3d normalizedOrZero(const cv::Vec3d& value)
     if (!(magnitude > kEpsilon) || !std::isfinite(magnitude))
         return {0.0, 0.0, 0.0};
     return value * (1.0 / magnitude);
+}
+
+double median(std::vector<double> values)
+{
+    if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    std::sort(values.begin(), values.end());
+    const std::size_t upper = values.size() / 2;
+    if (values.size() % 2 != 0)
+        return values[upper];
+    return 0.5 * (values[upper - 1] + values[upper]);
+}
+
+std::optional<SignedWindingSample> signedWindingSample(
+    const std::pair<cv::Vec3d, cv::Vec3d>& connector,
+    double windingDistance,
+    const LasagnaNormalAlignmentField& alignedNormals)
+{
+    if (!std::isfinite(windingDistance))
+        return std::nullopt;
+    const cv::Vec3d delta = connector.second - connector.first;
+    const double connectorLength = cv::norm(delta);
+    if (!(connectorLength > kEpsilon) || !std::isfinite(connectorLength))
+        return std::nullopt;
+    const cv::Vec3d midpoint = 0.5 * (connector.first + connector.second);
+    const auto atA = alignedNormals.nearest(connector.first);
+    const auto atMidpoint = alignedNormals.nearest(midpoint);
+    const auto atB = alignedNormals.nearest(connector.second);
+    if (!atA || !atMidpoint || !atB ||
+        atA->component != atMidpoint->component ||
+        atB->component != atMidpoint->component) {
+        return std::nullopt;
+    }
+    const double signedAlignment =
+        (delta / connectorLength).dot(cv::Vec3d{
+            atMidpoint->normal[0],
+            atMidpoint->normal[1],
+            atMidpoint->normal[2],
+        });
+    if (!std::isfinite(signedAlignment) ||
+        std::abs(signedAlignment) <= kEpsilon) {
+        return std::nullopt;
+    }
+    return SignedWindingSample{
+        std::copysign(windingDistance, signedAlignment),
+        atMidpoint->component,
+    };
 }
 
 Point3 point3(const cv::Vec3d& point)
@@ -270,13 +323,17 @@ ScoredCandidate scoreCandidate(
     const auto initialB = centeredTangent(
         geometryB, arcB, config.tangentWindowBaseVoxels);
     if (!initialA.has_value() || !initialB.has_value())
-        return {{}, RejectReason::Tangent};
+        return {std::nullopt, {}, RejectReason::Tangent};
 
     const double initialDot = std::clamp(initialA->dot(*initialB), -1.0, 1.0);
     const int orientation = initialDot < 0.0 ? -1 : 1;
     double parallelSum = std::clamp(
         initialA->dot(*initialB * static_cast<double>(orientation)), -1.0, 1.0);
     std::size_t parallelCount = 1;
+    std::vector<std::pair<cv::Vec3d, cv::Vec3d>> parallelConnectors;
+    parallelConnectors.emplace_back(
+        pieceA.samplePointsBaseXYZ[candidate.sampleA],
+        pieceB.samplePointsBaseXYZ[candidate.sampleB]);
     const double refinementStep = config.resampleSpacingBaseVoxels *
         config.phaseRefinementStepFraction;
     const double refinementLimit = config.resampleSpacingBaseVoxels *
@@ -323,6 +380,9 @@ ScoredCandidate scoreCandidate(
                 tangentA->dot(*tangentB * static_cast<double>(orientation)),
                 -1.0,
                 1.0);
+            parallelConnectors.emplace_back(
+                samplePolylineArc(geometryA, arcs->first).point,
+                samplePolylineArc(geometryB, arcs->second).point);
             ++parallelCount;
         }
     }
@@ -332,7 +392,7 @@ ScoredCandidate scoreCandidate(
     const double rawPerpendicular = 1.0 - std::abs(initialDot);
     const double evidence = rawParallel + rawPerpendicular;
     if (!(evidence > kEpsilon) || !std::isfinite(evidence))
-        return {{}, RejectReason::Tangent};
+        return {std::nullopt, {}, RejectReason::Tangent};
 
     const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[candidate.sampleA];
     const cv::Vec3d pointB = pieceB.samplePointsBaseXYZ[candidate.sampleB];
@@ -347,7 +407,13 @@ ScoredCandidate scoreCandidate(
     constraint.parallelScore = rawParallel / evidence;
     constraint.perpendicularScore = rawPerpendicular / evidence;
     constraint.windingDistance = 0.0;
-    return {std::move(constraint), RejectReason::None};
+    if (constraint.parallelScore <= constraint.perpendicularScore)
+        parallelConnectors.resize(1);
+    return {
+        std::move(constraint),
+        std::move(parallelConnectors),
+        RejectReason::None,
+    };
 }
 
 }  // namespace
@@ -357,7 +423,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch,
-    const FiberTraceConstraintTracePairFilter& tracePairFilter)
+    const FiberTraceConstraintTracePairFilter& tracePairFilter,
+    const LasagnaNormalAlignmentField* alignedNormals)
 {
     validateConfig(config);
     FiberTraceConstraintReport report;
@@ -540,17 +607,25 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
 
     const auto windingStarted = std::chrono::steady_clock::now();
     std::vector<std::size_t> acceptedIndices;
+    std::vector<std::size_t> connectorOffsets;
     std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors;
     acceptedIndices.reserve(scored.size());
-    connectors.reserve(scored.size());
+    connectorOffsets.reserve(scored.size() + 1);
     for (std::size_t index = 0; index < scored.size(); ++index) {
         if (!scored[index].constraint.has_value())
             continue;
+        if (scored[index].parallelConnectors.empty()) {
+            throw std::logic_error(
+                "Scored fiber trace constraint has no parallel connectors");
+        }
         acceptedIndices.push_back(index);
-        connectors.emplace_back(
-            scored[index].constraint->pointABaseXYZ,
-            scored[index].constraint->pointBBaseXYZ);
+        connectorOffsets.push_back(connectors.size());
+        connectors.insert(
+            connectors.end(),
+            scored[index].parallelConnectors.begin(),
+            scored[index].parallelConnectors.end());
     }
+    connectorOffsets.push_back(connectors.size());
     std::vector<double> windings(connectors.size());
     if (!connectors.empty() && windingDistanceBatch) {
         windings = windingDistanceBatch(
@@ -587,14 +662,59 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     }
     for (std::size_t index = 0; index < acceptedIndices.size(); ++index) {
         auto& result = scored[acceptedIndices[index]];
-        if (std::isfinite(windings[index]) &&
-            (!config.enforceMaximumWindingDistance ||
-             windings[index] < config.maximumWindingDistance)) {
-            result.constraint->windingDistance = windings[index];
-        } else if (!std::isfinite(windings[index])) {
+        const std::size_t begin = connectorOffsets[index];
+        const std::size_t end = connectorOffsets[index + 1];
+        const double closestWinding = windings[begin];
+        if (!std::isfinite(closestWinding)) {
             result.constraint.reset();
             result.rejection = RejectReason::Winding;
-        } else {
+            continue;
+        }
+
+        std::vector<double> parallelWindings;
+        parallelWindings.reserve(end - begin);
+        for (std::size_t sample = begin; sample < end; ++sample) {
+            if (std::isfinite(windings[sample]))
+                parallelWindings.push_back(windings[sample]);
+        }
+        if (parallelWindings.empty()) {
+            result.constraint.reset();
+            result.rejection = RejectReason::Winding;
+            continue;
+        }
+
+        result.constraint->windingDistance = closestWinding;
+        result.constraint->parallelWindingDistance = median(parallelWindings);
+        if (alignedNormals != nullptr) {
+            const auto closestSigned = signedWindingSample(
+                connectors[begin], closestWinding, *alignedNormals);
+            if (closestSigned) {
+                result.constraint->signedWindingDelta = closestSigned->value;
+                result.constraint->windingNormalComponent =
+                    closestSigned->component;
+                std::vector<double> signedParallelWindings;
+                signedParallelWindings.reserve(end - begin);
+                for (std::size_t sample = begin; sample < end; ++sample) {
+                    const auto signedSample = signedWindingSample(
+                        connectors[sample], windings[sample], *alignedNormals);
+                    if (signedSample &&
+                        signedSample->component == closestSigned->component) {
+                        signedParallelWindings.push_back(signedSample->value);
+                    }
+                }
+                if (!signedParallelWindings.empty()) {
+                    result.constraint->signedParallelWindingDelta =
+                        median(signedParallelWindings);
+                    result.constraint->parallelWindingDistance = std::abs(
+                        *result.constraint->signedParallelWindingDelta);
+                }
+            }
+        }
+
+        if (config.enforceMaximumWindingDistance &&
+            (!(closestWinding < config.maximumWindingDistance) ||
+             !(result.constraint->parallelWindingDistance <
+               config.maximumWindingDistance))) {
             result.constraint.reset();
             result.rejection = RejectReason::WindingCutoff;
         }
@@ -603,9 +723,17 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         std::chrono::steady_clock::now() - windingStarted).count();
 
     for (auto& result : scored) {
-        if (result.constraint.has_value())
+        if (result.constraint.has_value()) {
+            if (alignedNormals != nullptr) {
+                if (result.constraint->signedWindingDelta &&
+                    result.constraint->signedParallelWindingDelta) {
+                    ++report.signedWindingConstraints;
+                } else {
+                    ++report.skippedSignedWindingConstraints;
+                }
+            }
             report.constraints.push_back(std::move(*result.constraint));
-        else if (result.rejection == RejectReason::Tangent)
+        } else if (result.rejection == RejectReason::Tangent)
             ++report.rejectedTangents;
         else if (result.rejection == RejectReason::Winding)
             ++report.rejectedWinding;
@@ -619,7 +747,24 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         });
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
+    if (alignedNormals != nullptr) {
+        for (auto& constraint : report.constraints) {
+            if (!constraint.hardContinuity)
+                continue;
+            constraint.signedWindingDelta = 0.0;
+            constraint.signedParallelWindingDelta = 0.0;
+            ++report.signedWindingConstraints;
+        }
+    }
     return report;
+}
+
+double dominantFiberTraceConstraintWindingDistance(
+    const FiberTraceConstraint& constraint) noexcept
+{
+    return constraint.parallelScore > constraint.perpendicularScore
+        ? constraint.parallelWindingDistance
+        : constraint.windingDistance;
 }
 
 std::vector<FiberTraceOrderedCrossSourceConstraint>
@@ -671,13 +816,16 @@ void orientFiberTraceConstraintWindings(
     report.skippedSignedWindingConstraints = 0;
     for (auto& constraint : report.constraints) {
         constraint.signedWindingDelta.reset();
+        constraint.signedParallelWindingDelta.reset();
         constraint.windingNormalComponent.reset();
         if (constraint.hardContinuity) {
             constraint.signedWindingDelta = 0.0;
+            constraint.signedParallelWindingDelta = 0.0;
             ++report.signedWindingConstraints;
             continue;
         }
-        if (!(constraint.perpendicularScore > 0.0))
+        if (!(constraint.perpendicularScore > 0.0) &&
+            !(constraint.parallelScore > 0.0))
             continue;
         const cv::Vec3d connector =
             constraint.pointBBaseXYZ - constraint.pointABaseXYZ;
@@ -710,6 +858,8 @@ void orientFiberTraceConstraintWindings(
         }
         constraint.signedWindingDelta = std::copysign(
             constraint.windingDistance, signedAlignment);
+        constraint.signedParallelWindingDelta = std::copysign(
+            constraint.parallelWindingDistance, signedAlignment);
         constraint.windingNormalComponent = atMidpoint->component;
         ++report.signedWindingConstraints;
     }
@@ -1228,7 +1378,7 @@ FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
             else
                 perpendicularSeparate.push_back(std::move(line));
         } else if (constraint.parallelScore > 0.5) {
-            if (constraint.windingDistance < 0.5)
+            if (constraint.parallelWindingDistance < 0.5)
                 parallelSame.push_back(std::move(line));
             else
                 parallelSeparate.push_back(std::move(line));

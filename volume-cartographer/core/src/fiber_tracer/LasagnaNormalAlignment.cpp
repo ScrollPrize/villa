@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <limits>
 #include <queue>
 #include <stdexcept>
@@ -13,6 +14,8 @@ namespace vc::fiber_tracer
 {
 namespace
 {
+
+constexpr std::size_t kProgressStride = 65536;
 
 cv::Vec3f normalized(const cv::Vec3f& value)
 {
@@ -32,6 +35,30 @@ std::size_t checkedProduct(const std::array<std::size_t, 3>& shape)
         result *= extent;
     }
     return result;
+}
+
+std::size_t checkedSum(std::initializer_list<std::size_t> values)
+{
+    std::size_t result = 0;
+    for (const std::size_t value : values) {
+        if (value > std::numeric_limits<std::size_t>::max() - result) {
+            throw std::invalid_argument(
+                "Normal alignment progress work exceeds size_t");
+        }
+        result += value;
+    }
+    return result;
+}
+
+void notifyProgress(
+    const LasagnaNormalAlignmentProgressCallback& progress,
+    LasagnaNormalAlignmentProgressPhase phase,
+    std::size_t completed,
+    std::size_t total,
+    double residual = 0.0)
+{
+    if (progress)
+        progress({phase, completed, total, residual});
 }
 
 }  // namespace
@@ -71,7 +98,11 @@ LasagnaNormalLattice makeLasagnaNormalLattice(const cv::Vec3d& minimumBaseXYZ, c
 }
 
 std::vector<BinaryPairwiseFactor> makeLasagnaNormalLatticeFactors(
-    const LasagnaNormalLattice& lattice, std::span<const std::size_t> nodeByLatticeSample, std::span<const cv::Vec3f> retainedNormals, int neighborRadius)
+    const LasagnaNormalLattice& lattice,
+    std::span<const std::size_t> nodeByLatticeSample,
+    std::span<const cv::Vec3f> retainedNormals,
+    int neighborRadius,
+    const LasagnaNormalAlignmentProgressCallback& progress)
 {
     const std::size_t sampleCount = checkedProduct(lattice.shapeXYZ);
     if (lattice.positionsBaseXYZ.size() != sampleCount || nodeByLatticeSample.size() != sampleCount) {
@@ -88,6 +119,12 @@ std::vector<BinaryPairwiseFactor> makeLasagnaNormalLatticeFactors(
     }
     const auto linear = [&](std::size_t x, std::size_t y, std::size_t z) { return (z * lattice.shapeXYZ[1] + y) * lattice.shapeXYZ[0] + x; };
     std::vector<BinaryPairwiseFactor> factors;
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Factors,
+        0,
+        sampleCount);
+    std::size_t nextProgress = std::min(kProgressStride, sampleCount);
     for (std::size_t z = 0; z < lattice.shapeXYZ[2]; ++z) {
         for (std::size_t y = 0; y < lattice.shapeXYZ[1]; ++y) {
             for (std::size_t x = 0; x < lattice.shapeXYZ[0]; ++x) {
@@ -120,6 +157,20 @@ std::vector<BinaryPairwiseFactor> makeLasagnaNormalLatticeFactors(
                 }
             }
         }
+        const std::size_t completed = std::min(
+            sampleCount,
+            (z + 1) * lattice.shapeXYZ[0] * lattice.shapeXYZ[1]);
+        if (completed >= nextProgress || completed == sampleCount) {
+            notifyProgress(
+                progress,
+                LasagnaNormalAlignmentProgressPhase::Factors,
+                completed,
+                sampleCount);
+            nextProgress = completed >
+                    std::numeric_limits<std::size_t>::max() - kProgressStride
+                ? sampleCount
+                : std::min(sampleCount, completed + kProgressStride);
+        }
     }
     return factors;
 }
@@ -142,15 +193,44 @@ std::optional<BinaryPairwiseFactor> makeLasagnaNormalAlignmentFactor(std::size_t
 }
 
 LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
-    std::span<const cv::Vec3f> normals, std::span<const BinaryPairwiseFactor> neighborhoodFactors, const LasagnaNormalAlignmentConfig& config)
+    std::span<const cv::Vec3f> normals,
+    std::span<const BinaryPairwiseFactor> neighborhoodFactors,
+    const LasagnaNormalAlignmentConfig& config,
+    const LasagnaNormalAlignmentProgressCallback& progress)
 {
     if (normals.empty())
         throw std::invalid_argument("Normal alignment requires samples");
 
+    const std::size_t componentWork = checkedSum({
+        normals.size(), neighborhoodFactors.size(), normals.size()});
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Components,
+        0,
+        componentWork);
+    std::size_t completedWork = 0;
+    std::size_t nextProgress = std::min(kProgressStride, componentWork);
+    const auto advanceProgress = [&](std::size_t amount) {
+        completedWork += amount;
+        if (completedWork >= nextProgress || completedWork == componentWork) {
+            notifyProgress(
+                progress,
+                LasagnaNormalAlignmentProgressPhase::Components,
+                completedWork,
+                componentWork);
+            nextProgress = completedWork >
+                    std::numeric_limits<std::size_t>::max() - kProgressStride
+                ? componentWork
+                : std::min(componentWork, completedWork + kProgressStride);
+        }
+    };
+
     std::vector<cv::Vec3f> normalizedNormals;
     normalizedNormals.reserve(normals.size());
-    for (const auto& normal : normals)
+    for (const auto& normal : normals) {
         normalizedNormals.push_back(normalized(normal));
+        advanceProgress(1);
+    }
 
     std::vector<std::vector<std::size_t>> adjacency(normals.size());
     for (std::size_t index = 0; index < neighborhoodFactors.size(); ++index) {
@@ -160,6 +240,7 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
         }
         adjacency[factor.a].push_back(index);
         adjacency[factor.b].push_back(index);
+        advanceProgress(1);
     }
 
     LasagnaNormalAlignmentReport report;
@@ -181,6 +262,7 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
         while (!pending.empty()) {
             const std::size_t node = pending.front();
             pending.pop();
+            advanceProgress(1);
             for (const std::size_t factorIndex : adjacency[node]) {
                 const auto& factor = neighborhoodFactors[factorIndex];
                 const std::size_t neighbor = factor.a == node ? factor.b : factor.a;
@@ -193,15 +275,65 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
         }
     }
 
-    report.beliefPropagation = solveBinaryPairwiseSumProduct(normals.size(), neighborhoodFactors, report.fixedStates, config.beliefPropagation);
+    BinaryBeliefPropagationProgressCallback binaryProgress;
+    if (progress) {
+        binaryProgress = [&](const BinaryBeliefPropagationProgress& current) {
+            if (current.complete)
+                return;
+            notifyProgress(
+                progress,
+                LasagnaNormalAlignmentProgressPhase::Messages,
+                current.messageIteration,
+                current.maximumMessageIterations,
+                current.messageResidual);
+        };
+    }
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Messages,
+        0,
+        config.beliefPropagation.maximumMessageIterations);
+    report.beliefPropagation = solveBinaryPairwiseSumProduct(
+        normals.size(),
+        neighborhoodFactors,
+        report.fixedStates,
+        config.beliefPropagation,
+        binaryProgress);
     report.flipProbability = report.beliefPropagation.probabilityOne;
     report.alignedNormals = std::move(normalizedNormals);
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Finalize,
+        0,
+        report.alignedNormals.size());
+    nextProgress = std::min(kProgressStride, report.alignedNormals.size());
     for (std::size_t node = 0; node < report.alignedNormals.size(); ++node) {
         if (report.flipProbability[node] > 0.5) {
             report.alignedNormals[node] *= -1.0F;
             ++report.flippedSamples;
         }
+        const std::size_t completed = node + 1;
+        if (completed >= nextProgress ||
+            completed == report.alignedNormals.size()) {
+            notifyProgress(
+                progress,
+                LasagnaNormalAlignmentProgressPhase::Finalize,
+                completed,
+                report.alignedNormals.size());
+            nextProgress = completed >
+                    std::numeric_limits<std::size_t>::max() - kProgressStride
+                ? report.alignedNormals.size()
+                : std::min(
+                      report.alignedNormals.size(),
+                      completed + kProgressStride);
+        }
     }
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Complete,
+        1,
+        1,
+        report.beliefPropagation.messageResidual);
     return report;
 }
 
@@ -260,7 +392,8 @@ LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
     double spacingBaseVoxels,
     int neighborRadius,
     int parallelThreads,
-    const LasagnaNormalAlignmentConfig& config)
+    const LasagnaNormalAlignmentConfig& config,
+    const LasagnaNormalAlignmentProgressCallback& progress)
 {
     if (parallelThreads < 1)
         throw std::invalid_argument("Normal alignment worker count must be positive");
@@ -268,11 +401,21 @@ LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
     field.lattice = makeLasagnaNormalLattice(
         minimumBaseXYZ, maximumBaseXYZ, spacingBaseVoxels);
     field.candidateSamples = field.lattice.positionsBaseXYZ.size();
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Sampling,
+        0,
+        field.candidateSamples);
     std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
     const auto sampling = sampler.sampleNormalBatch(
         field.lattice.positionsBaseXYZ, parallelThreads, sampled);
     field.prefetchMilliseconds = sampling.prefetchMs;
     field.materializeMilliseconds = sampling.materializeMs;
+    notifyProgress(
+        progress,
+        LasagnaNormalAlignmentProgressPhase::Sampling,
+        field.candidateSamples,
+        field.candidateSamples);
     field.nodeByLatticeSample.assign(
         field.candidateSamples, std::numeric_limits<std::size_t>::max());
     field.positionsBaseXYZ.reserve(field.candidateSamples);
@@ -290,12 +433,13 @@ LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
         field.lattice,
         field.nodeByLatticeSample,
         field.rawNormals,
-        neighborRadius);
+        neighborRadius,
+        progress);
     auto solveConfig = config;
     solveConfig.beliefPropagation.parallelWorkers =
         static_cast<std::size_t>(parallelThreads);
     field.alignment = alignLasagnaNormalSamples(
-        field.rawNormals, factors, solveConfig);
+        field.rawNormals, factors, solveConfig, progress);
     return field;
 }
 

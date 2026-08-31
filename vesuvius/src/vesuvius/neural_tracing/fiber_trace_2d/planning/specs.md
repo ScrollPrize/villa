@@ -5241,6 +5241,17 @@
   factors, synchronous Jacobi semantics, convergence, probabilities, or log
   odds. GCC uses OpenMP while the supported Clang/MSVC configurations fall
   back to one worker through the project shim.
+- Binary BP and crop normal alignment expose optional observational progress.
+  Binary BP emits one serialized event after each complete synchronous message
+  sweep and one success-only terminal event. Callback time is excluded from BP
+  phase timings; callback exceptions leave the OpenMP region before being
+  rethrown. Normal alignment reports sampling candidates at opaque batch
+  boundaries, lattice sites scanned while building factors, the sum of normal
+  normalization items plus factor-adjacency items plus component-visited nodes,
+  complete message sweeps, and retained nodes finalized. Preparation/finalize
+  callbacks are bounded to phase boundaries plus one per 65,536 work items.
+  Progress must not reorder factor or component traversal or change any
+  numerical report field.
 
 ## Interleaved-lattice signed crop winding BP
 
@@ -5249,17 +5260,35 @@
   side. Sampling uses the already open manifest sampler/cache. A nearest
   aligned lookup is usable only when A, midpoint, and B are present within
   `sqrt(3)/2 * spacing` and share one normal-alignment component.
-- The persisted/legacy `windingDistance` remains finite and nonnegative.
-  BP owns a separate optional signed target. For ordered pieces `A -> B`, its
+- The finite nonnegative `windingDistance` is the closest-connector observation
+  for the perpendicular hypothesis. For ordered pieces `A -> B`, its optional
   sign is `sign(dot(B-A, aligned_normal_midpoint))` and its meaning is exactly
   `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
-  Missing or cross-component normal evidence removes only the perpendicular
-  winding term, not the H/V factor.
+- Parallel constraints have an independent `parallelWindingDistance`. Reuse
+  exactly the matched connector pairs that contributed tangent-valid samples
+  to the parallel score in both walk directions, with the closest pair included
+  exactly once. Integrate all connectors in one existing batched Lasagna read.
+  The closest value is mandatory; omit nonfinite additional values. For an
+  unoriented report, use the sorted unsigned median, averaging the middle pair
+  for an even count.
+- For an oriented report, sign each parallel sample from its connector and
+  aligned midpoint normal. Its endpoint and midpoint normal samples must all
+  belong to the closest connector's normal-alignment component; omit samples
+  from another independently gauged component. The signed median is the
+  authoritative parallel target and its magnitude is
+  `parallelWindingDistance`. If the closest connector cannot be signed, expose
+  no signed parallel target. Missing aligned sign removes a nonzero parallel
+  winding term, not its H/V factor; exact zero distance remains sign-free.
+- The raw extraction cutoff is exclusive and applies to both the closest
+  perpendicular distance and final parallel median magnitude. Either reaching
+  the cutoff rejects the complete measured link as one winding-cutoff
+  rejection. Invalid additional walk samples do not reject the link.
 - H/V-aware interleaved winding BP converts every admitted nonnegative raw
-  `windingDistance` to the nearest integer distance for its parallel component:
+  `parallelWindingDistance` to the nearest signed integer target for its
+  parallel component:
   `[0,0.5) -> 0`, `[0.5,1.5) -> 1`, and so on. Its loss is
-  `parallel_weight*abs(abs(latent_delta)-integer_distance)`, independent of
-  measurement gain/scale and aligned-normal sign. It separately converts each
+  `parallel_weight*abs(latent_delta-signed_integer_target)`, independent of
+  measurement gain/scale. It separately converts each
   available raw signed observation to a signed half-integer interval center
   for its perpendicular component: `(0,1] -> 0.5`, `(1,2] -> 1.5`, and so on.
   Exact signed zero and hard continuity stay zero. The raw exclusive cutoff
@@ -5365,7 +5394,7 @@
 - A joint non-Mixed factor charges orientation and winding evidence once.
   Same classes cost the perpendicular score, different classes cost the
   parallel score, and every measurement additionally contributes
-  `parallel*abs(abs(delta)-integer_distance)` plus
+  `parallel*abs(delta-signed_integer_target)` plus
   `perpendicular*abs(gain*delta-signed_target)` when its signed target exists.
   Orientation and the Mixed unary retain `--bp-temperature`; winding retains
   its established temperature `0.25`. A Defect endpoint makes the complete

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -15,6 +16,26 @@
 
 namespace vc::fiber_tracer
 {
+
+enum class LasagnaNormalAlignmentProgressPhase : std::uint8_t {
+    Sampling,
+    Factors,
+    Components,
+    Messages,
+    Finalize,
+    Complete,
+};
+
+struct LasagnaNormalAlignmentProgress {
+    LasagnaNormalAlignmentProgressPhase phase =
+        LasagnaNormalAlignmentProgressPhase::Sampling;
+    std::size_t completed = 0;
+    std::size_t total = 0;
+    double messageResidual = 0.0;
+};
+
+using LasagnaNormalAlignmentProgressCallback =
+    std::function<void(const LasagnaNormalAlignmentProgress&)>;
 
 struct LasagnaNormalLattice {
     std::array<std::int64_t, 3> beginXYZ{};
@@ -26,7 +47,11 @@ struct LasagnaNormalLattice {
 [[nodiscard]] LasagnaNormalLattice makeLasagnaNormalLattice(const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ, double spacingBaseVoxels);
 
 [[nodiscard]] std::vector<BinaryPairwiseFactor> makeLasagnaNormalLatticeFactors(
-    const LasagnaNormalLattice& lattice, std::span<const std::size_t> nodeByLatticeSample, std::span<const cv::Vec3f> retainedNormals, int neighborRadius);
+    const LasagnaNormalLattice& lattice,
+    std::span<const std::size_t> nodeByLatticeSample,
+    std::span<const cv::Vec3f> retainedNormals,
+    int neighborRadius,
+    const LasagnaNormalAlignmentProgressCallback& progress = {});
 
 struct LasagnaNormalAlignmentConfig {
     BinaryBeliefPropagationConfig beliefPropagation;
@@ -66,7 +91,10 @@ struct LasagnaNormalAlignmentField {
 [[nodiscard]] std::optional<BinaryPairwiseFactor> makeLasagnaNormalAlignmentFactor(std::size_t a, std::size_t b, const cv::Vec3f& normalA, const cv::Vec3f& normalB);
 
 [[nodiscard]] LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
-    std::span<const cv::Vec3f> normals, std::span<const BinaryPairwiseFactor> neighborhoodFactors, const LasagnaNormalAlignmentConfig& config = {});
+    std::span<const cv::Vec3f> normals,
+    std::span<const BinaryPairwiseFactor> neighborhoodFactors,
+    const LasagnaNormalAlignmentConfig& config = {},
+    const LasagnaNormalAlignmentProgressCallback& progress = {});
 
 [[nodiscard]] LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
     const vc::lasagna::LasagnaNormalSampler& sampler,
@@ -75,7 +103,8 @@ struct LasagnaNormalAlignmentField {
     double spacingBaseVoxels,
     int neighborRadius,
     int parallelThreads,
-    const LasagnaNormalAlignmentConfig& config = {});
+    const LasagnaNormalAlignmentConfig& config = {},
+    const LasagnaNormalAlignmentProgressCallback& progress = {});
 
 struct NormalGlyphObjConfig {
     double baseRadius = 1.0;

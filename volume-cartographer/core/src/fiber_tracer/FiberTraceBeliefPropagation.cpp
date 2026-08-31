@@ -480,8 +480,12 @@ FiberTraceBeliefTopology prepareFiberTraceBeliefTopology(
                 constraint.perpendicularScore != 0.0 ||
                 !std::isfinite(constraint.windingDistance) ||
                 constraint.windingDistance != 0.0 ||
+                !std::isfinite(constraint.parallelWindingDistance) ||
+                constraint.parallelWindingDistance != 0.0 ||
                 (constraint.signedWindingDelta &&
                  *constraint.signedWindingDelta != 0.0) ||
+                (constraint.signedParallelWindingDelta &&
+                 *constraint.signedParallelWindingDelta != 0.0) ||
                 !std::isfinite(constraint.arcABaseVoxels) ||
                 !std::isfinite(constraint.arcBBaseVoxels) ||
                 constraint.arcABaseVoxels != constraint.arcBBaseVoxels ||
@@ -506,6 +510,13 @@ FiberTraceBeliefTopology prepareFiberTraceBeliefTopology(
             if (constraint.signedWindingDelta &&
                 !std::isfinite(*constraint.signedWindingDelta)) {
                 throw std::invalid_argument("BP signed winding delta is non-finite");
+            }
+            if (!std::isfinite(constraint.parallelWindingDistance) ||
+                constraint.parallelWindingDistance < 0.0 ||
+                (constraint.signedParallelWindingDelta &&
+                 !std::isfinite(*constraint.signedParallelWindingDelta))) {
+                throw std::invalid_argument(
+                    "BP parallel winding delta is invalid");
             }
             topology.softConstraintIndices.push_back(index);
         }

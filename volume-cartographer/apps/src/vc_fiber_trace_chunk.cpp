@@ -963,7 +963,9 @@ void printConstraintReport(
         distances.push_back(constraint.closestDistanceBaseVoxels);
         parallel.push_back(constraint.parallelScore);
         perpendicular.push_back(constraint.perpendicularScore);
-        winding.push_back(constraint.windingDistance);
+        winding.push_back(
+            vc::fiber_tracer::dominantFiberTraceConstraintWindingDistance(
+                constraint));
     }
     std::cout << std::setprecision(8)
               << "fiber trace constraint config\n"
@@ -1606,7 +1608,10 @@ void writeAndPrintBpReport(
            "effective_parallel_winding_weight,"
            "effective_perpendicular_winding_weight,"
            "original_signed_delta,canonical_raw_signed_delta,"
-           "effective_parallel_winding_distance,parallel_winding_retained,"
+           "original_signed_parallel_delta,"
+           "canonical_raw_signed_parallel_delta,"
+           "effective_parallel_winding_distance,"
+           "effective_signed_parallel_delta,parallel_winding_retained,"
            "effective_perpendicular_signed_delta,"
            "calibrated_perpendicular_signed_delta,normal_component,self_edge\n"
         << std::setprecision(17);
@@ -1636,7 +1641,16 @@ void writeAndPrintBpReport(
         writeOptionalDouble(factorOutput, factor.originalSignedDelta);
         factorOutput << ',';
         writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
-        factorOutput << ',' << factor.effectiveParallelWindingDistance << ','
+        factorOutput << ',';
+        writeOptionalDouble(
+            factorOutput, factor.originalSignedParallelDelta);
+        factorOutput << ',';
+        writeOptionalDouble(
+            factorOutput, factor.canonicalSignedParallelDelta);
+        factorOutput << ',' << factor.effectiveParallelWindingDistance << ',';
+        writeOptionalDouble(
+            factorOutput, factor.effectiveSignedParallelDelta);
+        factorOutput << ','
                      << (factor.parallelWindingRetained ? 1 : 0) << ',';
         writeOptionalDouble(
             factorOutput, factor.effectivePerpendicularSignedDelta);
@@ -2636,7 +2650,7 @@ std::string formatReferenceFiberConstraints(
     std::ostringstream output;
     output.imbue(std::locale::classic());
     vc::fiber_tracer::FiberTraceCanonicalConstraintCounts counts;
-    const auto printTable = [&output, &report, &counts](
+    const auto printTable = [&output, &report, &reference, &counts](
                                 std::string_view title,
                                 const std::vector<const Ordered*>& links,
                                 bool perpendicularTable) {
@@ -2656,8 +2670,25 @@ std::string formatReferenceFiberConstraints(
                 0.5 * static_cast<double>(link->targetSource);
             const double expected = 0.5 * static_cast<double>(
                 link->targetSource - link->ownerSource);
-            const double raw =
-                report.constraints.at(link->constraintIndex).windingDistance;
+            const auto& constraint =
+                report.constraints.at(link->constraintIndex);
+            const auto signedRaw = perpendicularTable
+                ? constraint.signedWindingDelta
+                : constraint.signedParallelWindingDelta;
+            double raw = perpendicularTable
+                ? constraint.windingDistance
+                : constraint.parallelWindingDistance;
+            if (signedRaw) {
+                const std::size_t traceA =
+                    report.pieces.at(constraint.pieceA).traceIndex;
+                if (traceA >= reference.sourceIds.size()) {
+                    throw std::invalid_argument(
+                        "Reference constraint piece source is out of range");
+                }
+                raw = reference.sourceIds[traceA] == link->ownerSource
+                    ? *signedRaw
+                    : -*signedRaw;
+            }
             const double canonical = perpendicularTable
                 ? vc::fiber_tracer::quantizedHalfWindingTarget(raw)
                 : vc::fiber_tracer::quantizedIntegerWindingTarget(raw);
@@ -2755,11 +2786,11 @@ ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
         },
         [referencePieces](std::size_t a, std::size_t b) {
             return (a < referencePieces) != (b < referencePieces);
-        });
+        },
+        &alignedNormals);
     if (report.pieces.size() != combined.size()) {
         throw std::logic_error("Reference/BP cross extraction did not preserve input pieces");
     }
-    vc::fiber_tracer::orientFiberTraceConstraintWindings(report, alignedNormals);
     return {std::move(report), referencePieces};
 }
 
@@ -3115,6 +3146,90 @@ std::string formatProgressDuration(double seconds)
     return output.str();
 }
 
+std::string_view normalAlignmentPhaseName(
+    vc::fiber_tracer::LasagnaNormalAlignmentProgressPhase phase)
+{
+    using Phase = vc::fiber_tracer::LasagnaNormalAlignmentProgressPhase;
+    switch (phase) {
+    case Phase::Sampling:
+        return "sampling";
+    case Phase::Factors:
+        return "factors";
+    case Phase::Components:
+        return "components";
+    case Phase::Messages:
+        return "messages";
+    case Phase::Finalize:
+        return "finalize";
+    case Phase::Complete:
+        return "complete";
+    }
+    return "unknown";
+}
+
+vc::fiber_tracer::LasagnaNormalAlignmentProgressCallback
+makeNormalAlignmentProgressPrinter()
+{
+    using Phase = vc::fiber_tracer::LasagnaNormalAlignmentProgressPhase;
+    return [started = std::chrono::steady_clock::now(),
+            phaseStarted = std::chrono::steady_clock::now(),
+            lastPrinted = std::chrono::steady_clock::time_point{},
+            lastPhase = Phase::Complete](
+               const vc::fiber_tracer::LasagnaNormalAlignmentProgress& p)
+               mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const bool transition = p.phase != lastPhase;
+        if (transition)
+            phaseStarted = now;
+        const bool phaseComplete = p.total != 0 && p.completed == p.total;
+        const bool intervalElapsed =
+            lastPrinted.time_since_epoch().count() == 0 ||
+            now - lastPrinted >= std::chrono::seconds(1);
+        if (!transition && !phaseComplete && !intervalElapsed)
+            return;
+
+        const double elapsed = std::chrono::duration<double>(
+            now - started).count();
+        const double phaseElapsed = std::chrono::duration<double>(
+            now - phaseStarted).count();
+        const double percent = p.total == 0
+            ? 0.0
+            : 100.0 * static_cast<double>(p.completed) /
+                  static_cast<double>(p.total);
+        double eta = std::numeric_limits<double>::infinity();
+        if (p.total != 0 && p.completed == p.total) {
+            eta = 0.0;
+        } else if (p.phase != Phase::Sampling && p.completed != 0 &&
+                   p.completed < p.total) {
+            eta = phaseElapsed * static_cast<double>(p.total - p.completed) /
+                static_cast<double>(p.completed);
+        }
+
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(1)
+             << "fiber normal alignment phase="
+             << normalAlignmentPhaseName(p.phase)
+             << " completed=" << p.completed << '/' << p.total
+             << " percent=" << percent
+             << " elapsed=" << formatProgressDuration(elapsed);
+        if (p.phase == Phase::Messages) {
+            line << std::scientific << std::setprecision(3)
+                 << " residual=" << p.messageResidual
+                 << std::fixed
+                 << " eta_to_limit=" << formatProgressDuration(eta);
+        } else if (p.phase == Phase::Sampling) {
+            line << " eta="
+                 << (phaseComplete ? "0s" : "n/a")
+                 << " eta_basis=opaque_batch";
+        } else if (p.phase != Phase::Complete) {
+            line << " eta_phase=" << formatProgressDuration(eta);
+        }
+        std::cout << line.str() << '\n' << std::flush;
+        lastPrinted = now;
+        lastPhase = p.phase;
+    };
+}
+
 std::string formatGraphMemoryProfile(
     double elapsedSeconds,
     const vc::fiber_tracer::FiberletGraphMaterializationDiagnostics& diagnostics,
@@ -3268,7 +3383,8 @@ int main(int argc, char** argv)
                         nx.spacing,
                         1,
                         options.threads,
-                        alignmentConfig));
+                        alignmentConfig,
+                        makeNormalAlignmentProgressPrinter()));
                 std::cout
                     << "fiber winding normal alignment"
                     << " spacing_base=" << nx.spacing
@@ -3332,7 +3448,11 @@ int main(int argc, char** argv)
                                 int threads) {
                                 return normals.normalAlignedWindingDistancesBatch(
                                     connectors, step, threads);
-                            });
+                            },
+                            {},
+                            alignedNormalField
+                                ? &*alignedNormalField
+                                : nullptr);
                     deferredReferenceDiagnostics.push_back(
                         formatReferenceFiberConstraints(
                             *referenceDiagnostics, referenceConstraints));
@@ -3427,11 +3547,11 @@ int main(int argc, char** argv)
                                 int threads) {
                                 return normals.normalAlignedWindingDistancesBatch(
                                     connectors, step, threads);
-                            });
-                    if (alignedNormalField) {
-                        vc::fiber_tracer::orientFiberTraceConstraintWindings(
-                            checkpointReport, *alignedNormalField);
-                    }
+                            },
+                            {},
+                            alignedNormalField
+                                ? &*alignedNormalField
+                                : nullptr);
                     const auto extractedConstraints =
                         checkpointReport.constraints;
                     std::optional<

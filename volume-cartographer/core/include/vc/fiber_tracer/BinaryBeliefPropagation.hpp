@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -43,10 +44,21 @@ struct BinaryBeliefPropagationReport {
     double elapsedMilliseconds = 0.0;
 };
 
+struct BinaryBeliefPropagationProgress {
+    std::size_t messageIteration = 0;
+    std::size_t maximumMessageIterations = 0;
+    double messageResidual = 0.0;
+    bool complete = false;
+};
+
+using BinaryBeliefPropagationProgressCallback =
+    std::function<void(const BinaryBeliefPropagationProgress&)>;
+
 [[nodiscard]] BinaryBeliefPropagationReport solveBinaryPairwiseSumProduct(
     std::size_t nodeCount,
     std::span<const BinaryPairwiseFactor> factors,
     std::span<const BinaryBeliefState> fixedStates,
-    const BinaryBeliefPropagationConfig& config = {});
+    const BinaryBeliefPropagationConfig& config = {},
+    const BinaryBeliefPropagationProgressCallback& progress = {});
 
 }  // namespace vc::fiber_tracer

@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -39,6 +40,25 @@ TEST_CASE("Binary pairwise sum-product supports either fixed state")
     CHECK(std::isinf(one.logOdds[0]));
     CHECK(one.logOdds[0] > 0.0);
     CHECK(one.probabilityOne[1] == doctest::Approx(1.0 / (1.0 + std::exp(-2.0))).epsilon(1.0e-12));
+
+    config.maximumMessageIterations = 1;
+    config.messageDamping = 0.5;
+    config.messageResidualTolerance = 0.0;
+    std::vector<BinaryBeliefPropagationProgress> progress;
+    const auto limited = solveBinaryPairwiseSumProduct(
+        2,
+        factors,
+        fixed,
+        config,
+        [&](const BinaryBeliefPropagationProgress& current) {
+            progress.push_back(current);
+        });
+    CHECK(limited.messageIterations == 1);
+    CHECK_FALSE(limited.messageConverged);
+    REQUIRE(progress.size() == 2);
+    CHECK_FALSE(progress.front().complete);
+    CHECK(progress.back().complete);
+    CHECK(progress.back().messageIteration == 1);
 }
 
 TEST_CASE("Binary pairwise sum-product rejects malformed problems")
@@ -70,18 +90,62 @@ TEST_CASE("Parallel binary BP preserves the serial report")
 
     auto parallelConfig = serialConfig;
     parallelConfig.parallelWorkers = 4;
-    const auto parallel = solveBinaryPairwiseSumProduct(fixed.size(), factors, fixed, parallelConfig);
+    const auto parallelWithoutProgress = solveBinaryPairwiseSumProduct(
+        fixed.size(), factors, fixed, parallelConfig);
+    std::vector<BinaryBeliefPropagationProgress> progressEvents;
+    std::atomic_flag callbackActive = ATOMIC_FLAG_INIT;
+    const auto parallel = solveBinaryPairwiseSumProduct(
+        fixed.size(),
+        factors,
+        fixed,
+        parallelConfig,
+        [&](const BinaryBeliefPropagationProgress& progress) {
+            CHECK_FALSE(callbackActive.test_and_set());
+            progressEvents.push_back(progress);
+            callbackActive.clear();
+        });
 
     CHECK(parallel.messageIterations == serial.messageIterations);
     CHECK(parallel.messageResidual == serial.messageResidual);
     CHECK(parallel.messageConverged == serial.messageConverged);
     CHECK(parallel.logOdds == serial.logOdds);
     CHECK(parallel.probabilityOne == serial.probabilityOne);
+    CHECK(parallel.messageIterations ==
+          parallelWithoutProgress.messageIterations);
+    CHECK(parallel.messageResidual ==
+          parallelWithoutProgress.messageResidual);
+    CHECK(parallel.messageConverged ==
+          parallelWithoutProgress.messageConverged);
+    CHECK(parallel.logOdds == parallelWithoutProgress.logOdds);
+    CHECK(parallel.probabilityOne ==
+          parallelWithoutProgress.probabilityOne);
+    REQUIRE(progressEvents.size() == parallel.messageIterations + 1);
+    for (std::size_t index = 0; index < parallel.messageIterations; ++index) {
+        CHECK(progressEvents[index].messageIteration == index + 1);
+        CHECK(progressEvents[index].maximumMessageIterations ==
+              parallelConfig.maximumMessageIterations);
+        CHECK_FALSE(progressEvents[index].complete);
+    }
+    CHECK(progressEvents.back().complete);
+    CHECK(progressEvents.back().messageIteration == parallel.messageIterations);
+    CHECK(progressEvents.back().messageResidual == parallel.messageResidual);
 #ifdef _OPENMP
     CHECK(parallel.effectiveWorkers > 1);
 #else
     CHECK(parallel.effectiveWorkers == 1);
 #endif
+
+    CHECK_THROWS_WITH_AS(
+        solveBinaryPairwiseSumProduct(
+            fixed.size(),
+            factors,
+            fixed,
+            parallelConfig,
+            [](const BinaryBeliefPropagationProgress&) {
+                throw std::runtime_error("progress failure");
+            }),
+        doctest::Contains("progress failure"),
+        std::runtime_error);
 }
 
 TEST_CASE("Lasagna normal factors preserve signed-dot evidence")
@@ -122,8 +186,23 @@ TEST_CASE("Lasagna normal lattice is globally anchored and de-duplicates neighbo
     std::vector<cv::Vec3f> compactNormals(7, {1.0F, 0.0F, 0.0F});
     for (std::size_t index = 4; index < nodes.size(); ++index)
         --nodes[index];
-    const auto withHole = makeLasagnaNormalLatticeFactors(first, nodes, compactNormals, 1);
+    std::vector<LasagnaNormalAlignmentProgress> progress;
+    const auto withHole = makeLasagnaNormalLatticeFactors(
+        first,
+        nodes,
+        compactNormals,
+        1,
+        [&](const LasagnaNormalAlignmentProgress& current) {
+            progress.push_back(current);
+        });
     CHECK(withHole.size() == 21);
+    REQUIRE(progress.size() == 2);
+    CHECK(progress.front().phase ==
+          LasagnaNormalAlignmentProgressPhase::Factors);
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.front().total == 8);
+    CHECK(progress.back().completed == 8);
+    CHECK(progress.back().total == 8);
 }
 
 TEST_CASE("Lasagna normal alignment resolves alternating signs per component")
@@ -140,7 +219,15 @@ TEST_CASE("Lasagna normal alignment resolves alternating signs per component")
     LasagnaNormalAlignmentConfig config;
     config.beliefPropagation.temperature = 0.1;
     config.beliefPropagation.messageDamping = 1.0;
-    const auto report = alignLasagnaNormalSamples(normals, factors, config);
+    const auto baseline = alignLasagnaNormalSamples(normals, factors, config);
+    std::vector<LasagnaNormalAlignmentProgress> progress;
+    const auto report = alignLasagnaNormalSamples(
+        normals,
+        factors,
+        config,
+        [&](const LasagnaNormalAlignmentProgress& current) {
+            progress.push_back(current);
+        });
 
     CHECK(report.connectedComponents == 2);
     CHECK(report.componentByNode == std::vector<std::size_t>{0, 0, 0, 1});
@@ -148,6 +235,32 @@ TEST_CASE("Lasagna normal alignment resolves alternating signs per component")
     CHECK(report.fixedStates[0] == BinaryBeliefState::Zero);
     CHECK(report.fixedStates[3] == BinaryBeliefState::Zero);
     CHECK(report.flippedSamples == 1);
+    CHECK(report.connectedComponents == baseline.connectedComponents);
+    CHECK(report.componentByNode == baseline.componentByNode);
+    CHECK(report.fixedStates == baseline.fixedStates);
+    CHECK(report.flipProbability == baseline.flipProbability);
+    CHECK(report.alignedNormals == baseline.alignedNormals);
+    CHECK(report.beliefPropagation.messageIterations ==
+          baseline.beliefPropagation.messageIterations);
+    CHECK(report.beliefPropagation.messageResidual ==
+          baseline.beliefPropagation.messageResidual);
+    CHECK(report.beliefPropagation.messageConverged ==
+          baseline.beliefPropagation.messageConverged);
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.front().phase ==
+          LasagnaNormalAlignmentProgressPhase::Components);
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.front().total == 10);
+    CHECK(progress.back().phase ==
+          LasagnaNormalAlignmentProgressPhase::Complete);
+    CHECK(progress.back().completed == 1);
+    CHECK(progress.back().total == 1);
+    CHECK(progress.size() <=
+          report.beliefPropagation.messageIterations + 6);
+    for (std::size_t index = 1; index < progress.size(); ++index) {
+        CHECK(static_cast<int>(progress[index - 1].phase) <=
+              static_cast<int>(progress[index].phase));
+    }
     for (std::size_t index = 0; index < 3; ++index) {
         CHECK(report.alignedNormals[index][0] == doctest::Approx(1.0));
         CHECK(report.alignedNormals[index][1] == doctest::Approx(0.0));
@@ -178,6 +291,7 @@ TEST_CASE("Aligned normal field orients winding without changing its magnitude")
     forward.parallelScore = 0.0;
     forward.perpendicularScore = 1.0;
     forward.windingDistance = 0.75;
+    forward.parallelWindingDistance = 1.25;
     report.constraints.push_back(forward);
     auto reverse = forward;
     std::swap(reverse.pointABaseXYZ, reverse.pointBBaseXYZ);
@@ -186,8 +300,12 @@ TEST_CASE("Aligned normal field orients winding without changing its magnitude")
     orientFiberTraceConstraintWindings(report, field);
     CHECK(report.constraints[0].windingDistance == doctest::Approx(0.75));
     CHECK(report.constraints[0].signedWindingDelta == doctest::Approx(0.75));
+    CHECK(report.constraints[0].signedParallelWindingDelta ==
+          doctest::Approx(1.25));
     CHECK(report.constraints[1].windingDistance == doctest::Approx(0.75));
     CHECK(report.constraints[1].signedWindingDelta == doctest::Approx(-0.75));
+    CHECK(report.constraints[1].signedParallelWindingDelta ==
+          doctest::Approx(-1.25));
     CHECK(report.signedWindingConstraints == 2);
     CHECK(report.skippedSignedWindingConstraints == 0);
 
@@ -197,6 +315,8 @@ TEST_CASE("Aligned normal field orients winding without changing its magnitude")
     orientFiberTraceConstraintWindings(report, field);
     CHECK_FALSE(report.constraints[0].signedWindingDelta.has_value());
     CHECK_FALSE(report.constraints[1].signedWindingDelta.has_value());
+    CHECK_FALSE(report.constraints[0].signedParallelWindingDelta.has_value());
+    CHECK_FALSE(report.constraints[1].signedParallelWindingDelta.has_value());
     CHECK(report.skippedSignedWindingConstraints == 2);
 }
 

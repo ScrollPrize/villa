@@ -1,53 +1,56 @@
-# Plan: penalize split-piece Defect boundaries
+# Plan: normal-alignment progress output
 
 ## Implementation
 
-- Add a nonnegative `pieceBreakCost` to both Defect-capable winding-BP
-  configurations, defaulting to zero so existing runs remain unchanged. Do not
-  expose it on the integer-only winding solver, which has no Defect state.
-- Preserve whether a prepared factor contains the existing same-trace hard
-  continuity constraint. Charge `pieceBreakCost` once per such prepared edge
-  when exactly one endpoint is active and the other is Defect. Multiple
-  measurements on the edge must not multiply the boundary cost.
-- Apply the term in both alternating and joint-grid pair potentials before the
-  existing Defect-neutral early return. Scale it by `orientationTemperature`,
-  like the Defect unary rather than the winding temperature. Use one shared
-  activity-boundary helper so both solvers implement the same truth table, and
-  include it in decoded-energy accounting and candidate ranking. It must not
-  modify active-active winding or H/V
-  costs, Defect-Defect pairs, measured cross-trace factors, continuous
-  initialization, constraint extraction, or hard-sign behavior.
-- Expose `--piece-break-cost F` on `direction-ablation`, validate that it is
-  finite and nonnegative, reject it outside the existing Defect-capable BP
-  mode, and pass it through both winding solver variants. Print it in the
-  winding summary and store it in the consistency CSV.
+- Add a shared, optional progress callback to binary pairwise BP. Emit one
+  event after every completed message iteration and a terminal event, outside
+  numerical loops except for the existing serial iteration boundary. Catch a
+  callback exception inside the OpenMP region, stop at the synchronized
+  boundary, and rethrow it after leaving the region. Exclude callback time from
+  BP phase timing attribution.
+- Add a normal-alignment progress event with explicit sampling, factor-build,
+  component-build, message-passing, and finalize phases. Thread the callback
+  through lattice sampling/alignment and map binary-BP iterations into the
+  message phase.
+- Emit bounded factor/component progress from the existing deterministic loops.
+  Sampling is one opaque batch read, so report its start and completion without
+  inventing intermediate completion counts. Factors count lattice sites
+  scanned. Component preparation counts normalization items, factor adjacency
+  insertions, and visited nodes. Finalization counts retained nodes. Core
+  preparation/finalization callbacks occur only at phase boundaries and every
+  65,536 work items; BP emits at most one event per configured iteration.
+- Add a rate-limited CLI formatter. Print phase, completed/total, percent,
+  elapsed time, ETA when derivable, and BP residual. ETAs are explicitly
+  phase-local; the message ETA is labeled as time to the configured iteration
+  limit rather than expected convergence. Sampling reports no intermediate
+  ETA. Always print phase transitions, phase completion, and one success-only
+  terminal completion event.
+- Keep every callback optional so all existing callers retain behavior and
+  avoid reporting overhead beyond an empty callback check.
 
 ## Tests
 
-- Add focused coverage for both solvers and fixed/joint orientation paths,
-  proving the active/Defect same-trace truth table, cross-trace neutrality,
-  one charge per prepared continuity edge, default-zero compatibility, and
-  decoded-energy accounting.
-- Cover invalid negative/non-finite configuration through both config
-  validators.
-- Build `vc_fiber_trace_chunk` and `test_fiber_trace_winding_bp` in the current
-  Release tree with 32 jobs and run the focused tests.
-- Run the exact established 1024-crop `--piece-length 512` benchmark at break costs 0,
-  1, and a stronger value selected from the first result. Compare total and
-  source-piece Defect rates, constraint-class tables, reference accuracy,
-  convergence/residual, and wall/CPU runtime.
+- Extend binary-BP tests above the real OpenMP factor threshold to verify
+  serialized monotonic callbacks, early/message-limit terminal state, safe
+  callback exception propagation, and exact numerical equality excluding
+  timing fields.
+- Extend normal-alignment tests to verify ordered phase transitions, terminal
+  completion, exact work totals on a lattice with holes/multiple components,
+  bounded event count, and exact output equivalence with and without the
+  callback. Preserve factor and component traversal order.
+- Build `vc_fiber_trace_chunk` and the focused BP/alignment tests, run them,
+  and run `git diff --check`.
 
 ## Spec update
 
-- Specify the exact activity-boundary truth table, orientation-temperature
-  scaling, one-cost-per-continuity-edge accounting, default-zero
-  compatibility, output provenance, and solver coverage.
+- Document the optional, observational normal-alignment progress contract and
+  its phase/completion semantics.
 
 ## Docs updates
 
-- Document `--piece-break-cost`, its units and intended use for discouraging
-  isolated Defect spans without weakening retained hard signs.
+- Document that the crop CLI now reports progress during normal-volume
+  sampling, factor/component preparation, and normal-sign BP.
 
 ## Changelog
 
-- Record the new configurable split-piece activity-boundary penalty.
+- Record live normal-alignment progress with message residual and ETA.

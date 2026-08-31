@@ -221,6 +221,9 @@ struct FiberTraceWindingFactorDiagnostic {
     std::optional<std::size_t> normalComponent;
     bool parallelWindingRetained = false;
     bool selfEdge = false;
+    std::optional<double> originalSignedParallelDelta;
+    std::optional<double> canonicalSignedParallelDelta;
+    std::optional<double> effectiveSignedParallelDelta;
 };
 
 enum class FiberTraceConstraintEvidenceClass : unsigned char {
