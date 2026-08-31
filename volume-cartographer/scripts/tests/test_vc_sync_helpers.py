@@ -3,6 +3,7 @@
 Pure-local: a temp directory stands in for the sync dir and tracked rows are
 written straight into the SQLite DB. No S3 or network access.
 """
+import copy
 import json
 import os
 import sqlite3
@@ -13,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fiber_merge
+import test_fiber_merge
 import vc_sync
 from vc_sync import S3SyncManager, SyncAction
 
@@ -768,6 +770,74 @@ class TestLinkConsistency:
         # Based on the remote doc (gen 5), bumped by the rewrite
         assert fixed['generation'] == 6
         assert fixed['branches'][0]['branch_file'] == 'a.json'
+
+    def test_v3_consistent_pair_needs_no_fix(self, manager):
+        """v3 control points are {'position': ...} dicts; the consistency
+        pass must unwrap them (regression: a TypeError here demoted every
+        conflicting linked v3 fiber to a manual conflict)."""
+        a, b = test_fiber_merge.make_v3_pair(
+            'a.json', 'b.json', test_fiber_merge.BASE_CPS,
+            test_fiber_merge.B_CPS_V3, 2, 1)
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+        plan = self.make_plan(manager, 'fibers/a.json', a,
+                              copy.deepcopy(a), ['b.json'])
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert demoted == []
+        assert peer_fixes == {}
+
+    def test_refresh_crash_demotes_with_location(self, manager, monkeypatch,
+                                                 capsys):
+        """A merge-machinery bug must read as a bug, not as undiagnosable
+        data: the demotion reason names the innermost frame. The full
+        traceback prints ONLY under VC_SYNC_DEBUG=1 — unconditional stacks
+        would bury the merge preview and the conflict prompt."""
+        a = self.fiber('a.json', self.CPS_A,
+                       branches=[self.entry('b.json', self.CPS_A, 1,
+                                            self.CPS_B, 0)])
+        b = self.fiber('b.json', self.CPS_B)
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+
+        def boom(*args, **kwargs):
+            raise TypeError('synthetic refresh crash')
+
+        monkeypatch.setattr(vc_sync.fiber_merge, 'refresh_pair_links', boom)
+        plan = self.make_plan(manager, 'fibers/a.json', a,
+                              self.fiber('a.json', self.CPS_A), ['b.json'])
+
+        monkeypatch.delenv('VC_SYNC_DEBUG', raising=False)
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert peer_fixes == {} and len(demoted) == 1
+        reason = demoted[0][1]
+        assert 'synthetic refresh crash' in reason
+        assert 'test_vc_sync_helpers.py' in reason and 'boom' in reason
+        assert 'Traceback' not in capsys.readouterr().out
+
+        monkeypatch.setenv('VC_SYNC_DEBUG', '1')
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert len(demoted) == 1
+        assert 'Traceback' in capsys.readouterr().out
+
+
+class TestExceptionLocation:
+    """_exception_location: the compact frame reference appended to
+    demotion reasons."""
+
+    def test_names_innermost_frame(self):
+        def inner():
+            raise ValueError('x')
+
+        try:
+            inner()
+        except ValueError as ex:
+            location = vc_sync._exception_location(ex)
+        assert location.startswith(' at test_vc_sync_helpers.py:')
+        assert location.endswith(' in inner')
+
+    def test_exception_without_traceback_is_empty(self):
+        assert vc_sync._exception_location(ValueError('x')) == ''
 
 
 class TestAnalyzeDeleteActions:

@@ -95,6 +95,7 @@ import sqlite3
 import hashlib
 import argparse
 import tempfile
+import traceback
 import subprocess
 from datetime import datetime, timezone
 from enum import Enum
@@ -140,6 +141,29 @@ ASH_DEFAULT_CREDS = '~/.vc_ash_sftp.json'
 # Tag the merge puts on fibers whose line it could not re-fit; mirrored here
 # so hfsync still recognizes them when fiber_merge is unavailable.
 REOPTIMIZE_TAG = getattr(fiber_merge, 'REOPTIMIZE_TAG', 'needs_reoptimization')
+
+
+def _exception_location(ex):
+    """' at file.py:123 in func' for the innermost frame of `ex`, or ''.
+
+    Demotion reasons carry this so a merge-machinery bug reads as a bug
+    (with a place to look) instead of as undiagnosable annotation data —
+    a bare str(ex) once hid a crash behind weeks of manual conflicts."""
+    frames = traceback.extract_tb(getattr(ex, '__traceback__', None))
+    if not frames:
+        return ''
+    frame = frames[-1]
+    return (f" at {os.path.basename(frame.filename)}:{frame.lineno} "
+            f"in {frame.name}")
+
+
+def _print_debug_traceback():
+    """Full traceback for the exception being handled, only when the user
+    opted in (VC_SYNC_DEBUG=1): unconditional stacks would bury the merge
+    preview and the interactive conflict prompt."""
+    if os.environ.get('VC_SYNC_DEBUG'):
+        for line in traceback.format_exc().rstrip().splitlines():
+            print(f"      {line}")
 
 class SyncAction(Enum):
     UPLOAD = "upload"
@@ -758,7 +782,9 @@ class S3SyncManager:
             try:
                 result = fiber_merge.merge_fibers(base_doc, local_doc, remote_doc)
             except Exception as ex:
-                print(f"  ⚠️  merge failed for {path} ({ex}); manual resolution")
+                print(f"  ⚠️  merge failed for {path} "
+                      f"({ex}{_exception_location(ex)}); manual resolution")
+                _print_debug_traceback()
                 return None
             summary = fiber_merge.summarize(result)
             if dry_run:
@@ -958,7 +984,9 @@ class S3SyncManager:
                         if refreshed['b_changed']:
                             json.dumps(refreshed['b_doc'], allow_nan=False)
                 except Exception as ex:
-                    failure = f"refresh against {peer_name} failed ({ex})"
+                    failure = (f"refresh against {peer_name} failed "
+                               f"({ex}{_exception_location(ex)})")
+                    _print_debug_traceback()
                     break
                 if not refreshed['ok']:
                     failure = '; '.join(refreshed['conflicts'])
