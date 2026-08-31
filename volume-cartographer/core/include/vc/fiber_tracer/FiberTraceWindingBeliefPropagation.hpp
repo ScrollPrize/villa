@@ -367,6 +367,9 @@ struct FiberTraceReferenceGaugeCalibration {
 struct FiberTraceReferenceSourceBenchmark {
     std::array<FiberTraceReferenceBenchmarkCounts, 3> classes;
     FiberTraceReferenceBenchmarkCounts sum;
+    std::optional<double> estimatedWinding;
+    std::size_t estimatedWindingSupport = 0;
+    std::size_t estimatedWindingObservations = 0;
 };
 
 struct FiberTraceReferenceWindingBenchmark {

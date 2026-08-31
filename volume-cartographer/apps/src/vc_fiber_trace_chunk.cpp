@@ -2837,6 +2837,7 @@ std::string formatReferenceBpWindingBenchmark(
         "perpendicular", "parallel_same", "parallel_other", "sum"};
     output << "reference fiber errors fraction=right/(right+wrong)\n"
            << std::setw(8) << "winding"
+           << std::setw(8) << "est_w"
            << std::setw(8) << "perp_r" << std::setw(8) << "perp_w" << std::setw(8) << "perp_f"
            << std::setw(8) << "same_r" << std::setw(8) << "same_w" << std::setw(8) << "same_f"
            << std::setw(8) << "other_r" << std::setw(8) << "other_w" << std::setw(8) << "other_f"
@@ -2848,6 +2849,11 @@ std::string formatReferenceBpWindingBenchmark(
             : empty;
         output << std::setw(8) << std::setprecision(1)
                << 0.5 * static_cast<double>(source);
+        if (referenceCounts.estimatedWinding)
+            output << std::setw(8) << std::setprecision(1)
+                   << *referenceCounts.estimatedWinding;
+        else
+            output << std::setw(8) << "NA";
         for (std::size_t index = 0; index < names.size(); ++index) {
             const auto& counts = index < referenceCounts.classes.size()
                 ? referenceCounts.classes[index]

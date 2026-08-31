@@ -503,6 +503,12 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.references[2].sum.right == 0);
     CHECK(benchmark.references[2].sum.wrong == 0);
     CHECK(benchmark.references[2].sum.total == 0);
+    CHECK_FALSE(benchmark.references[0].estimatedWinding.has_value());
+    REQUIRE(benchmark.references[1].estimatedWinding.has_value());
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(5.5));
+    CHECK(benchmark.references[1].estimatedWindingSupport == 1);
+    CHECK(benchmark.references[1].estimatedWindingObservations == 2);
+    CHECK_FALSE(benchmark.references[2].estimatedWinding.has_value());
     CHECK(std::accumulate(
               benchmark.references.begin(),
               benchmark.references.end(),
@@ -563,6 +569,31 @@ TEST_CASE("Reference winding calibration includes boundaries and stable ties")
     CHECK(allInvalid.sum.wrong == 0);
     CHECK(allInvalid.sum.total == 0);
     CHECK(calibrateFiberTraceReferenceWindings(std::span<const FiberTraceReferenceWindingObservation>{}).gauges.empty());
+}
+
+TEST_CASE("Reference winding benchmark estimates each source independently")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    const std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 2, 100.0, {2.1, 0.0}, 1, 0},
+        {Class::ParallelSameWinding, 2, -30.0, {2.4, 0.0}, 1, 0},
+        {Class::ParallelOtherWinding, 2, 7.0, {-4.0, 2.6}, 2, 0},
+        {Class::Perpendicular, 2, 0.0, {-1.2, 0.0}, 1, 1},
+        {Class::ParallelSameWinding, 2, 0.0, {-0.8, 0.0}, 1, 1},
+    };
+
+    const auto benchmark = calibrateFiberTraceReferenceWindings(
+        observations, 0.5);
+
+    REQUIRE(benchmark.references.size() == 2);
+    REQUIRE(benchmark.references[0].estimatedWinding.has_value());
+    CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(2.5));
+    CHECK(benchmark.references[0].estimatedWindingSupport == 3);
+    CHECK(benchmark.references[0].estimatedWindingObservations == 3);
+    REQUIRE(benchmark.references[1].estimatedWinding.has_value());
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(-1.0));
+    CHECK(benchmark.references[1].estimatedWindingSupport == 2);
+    CHECK(benchmark.references[1].estimatedWindingObservations == 2);
 }
 
 TEST_CASE("Reference observations use authoritative latent endpoint algebra")

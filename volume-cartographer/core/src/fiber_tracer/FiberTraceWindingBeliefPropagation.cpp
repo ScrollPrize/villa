@@ -11,6 +11,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -3136,6 +3137,78 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     FiberTraceReferenceWindingBenchmark result;
     result.tolerance = tolerance;
     result.references.resize(referenceSources);
+    std::vector<std::vector<std::size_t>> observationsByReference(
+        referenceSources);
+    for (std::size_t index = 0; index < observations.size(); ++index) {
+        if (observations[index].inferredReferenceWindingCount != 0) {
+            observationsByReference[observations[index].referenceSource]
+                .push_back(index);
+        }
+    }
+    for (std::size_t source = 0; source < observationsByReference.size();
+         ++source) {
+        const auto& indices = observationsByReference[source];
+        if (indices.empty())
+            continue;
+        const std::size_t gauge = observations[indices.front()].integerGauge;
+        if (std::any_of(
+                indices.begin(), indices.end(), [&](std::size_t index) {
+                    return observations[index].integerGauge != gauge;
+                })) {
+            continue;
+        }
+
+        std::set<double> candidates;
+        for (const std::size_t index : indices) {
+            const auto& observation = observations[index];
+            for (std::size_t candidate = 0;
+                 candidate < observation.inferredReferenceWindingCount;
+                 ++candidate) {
+                const double lower = std::floor(
+                    2.0 * observation.inferredReferenceWindings[candidate]);
+                for (int offset = -2; offset <= 3; ++offset)
+                    candidates.insert(0.5 * (lower + offset));
+            }
+        }
+
+        std::optional<double> bestWinding;
+        std::size_t bestSupport = 0;
+        double bestResidual = std::numeric_limits<double>::infinity();
+        for (const double candidateWinding : candidates) {
+            std::size_t support = 0;
+            double residual = 0.0;
+            for (const std::size_t index : indices) {
+                const auto& observation = observations[index];
+                double distance = std::numeric_limits<double>::infinity();
+                for (std::size_t candidate = 0;
+                     candidate < observation.inferredReferenceWindingCount;
+                     ++candidate) {
+                    distance = std::min(
+                        distance,
+                        std::abs(
+                            candidateWinding -
+                            observation.inferredReferenceWindings[candidate]));
+                }
+                support += distance <= tolerance + kEpsilon ? 1 : 0;
+                residual += distance * distance;
+            }
+            const bool better = !bestWinding || support > bestSupport ||
+                (support == bestSupport && residual < bestResidual) ||
+                (support == bestSupport && residual == bestResidual &&
+                 (std::abs(candidateWinding) < std::abs(*bestWinding) ||
+                  (std::abs(candidateWinding) == std::abs(*bestWinding) &&
+                   candidateWinding < *bestWinding)));
+            if (better) {
+                bestWinding = candidateWinding;
+                bestSupport = support;
+                bestResidual = residual;
+            }
+        }
+        auto& reference = result.references[source];
+        reference.estimatedWinding = bestWinding;
+        reference.estimatedWindingSupport = bestSupport;
+        reference.estimatedWindingObservations = indices.size();
+    }
     std::map<std::size_t, double> offsetByGauge;
     const auto isRight = [&](const FiberTraceReferenceWindingObservation& o, double offset) {
         const double expected = o.virtualReferenceWinding + offset;
