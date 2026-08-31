@@ -11,36 +11,44 @@ class QuadSurface;
 
 namespace vc::lasagna {
 
+inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
+inline constexpr int kLineViewCrossSampleCount = 7;
+
 struct LineViewConfig {
-    // Derived ribbons retain every control-point bend and subdivide each
-    // control-point segment as closely as possible to this spacing. This is a
-    // view parameter in level-0/base-volume voxels, independent of stored point
-    // or optimizer spacing.
-    double targetSpacingBaseVoxels = 50.0;
-    // Non-positive values retain the legacy automatic strip height: cross-row
-    // spacing matches the median optimized control-point step.
-    double surfaceHalfWidth = 0.0;
-    double sideSliceHalfDepth = 0.0;
-    int crossSamples = 21;
-    // Optional per-control-point oriented sheet normals, indexed like
+    // Derived ribbons retain every annotation control point and subdivide the
+    // optimized polyline between adjacent controls as closely as possible to
+    // this spacing. The declared along-strip scale always uses this target, so
+    // a shorter control-point span occupies one full display interval.
+    double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
+    // Fractional indices into LineModel::points. Line endpoints are always
+    // retained as additional supports. Empty retains every line point for
+    // callers that do not have separate annotation-control metadata.
+    std::vector<double> controlPointLinePositions;
+    // Optional per-line-point oriented sheet normals, indexed like
     // LineModel::points (entries may be NaN/zero where unavailable).
     // When non-empty and size-matched, one global sign flip is applied so the
     // frame mesh normals AND the display up vectors agree with these on a
     // cosine-weighted majority. Empty/mismatched/all-invalid -> legacy signs.
     std::vector<cv::Vec3f> orientedPointNormals;
+    // Build one PlaneSurface per line point into lineZSlices. VC3D's line
+    // annotation only consumes lineUpVectors, so it opts out - a 2000-point
+    // fiber otherwise allocates 2000 shared_ptr planes per view rebuild for
+    // nothing. Defaults on for the existing consumers/tests.
+    bool buildLineZSlices = true;
 };
 
 // Maps the original LineModel point-index coordinate to the ribbon grid and
-// back. Each distinct control point is a grid support, with segment-local
-// subdivisions between supports. Fractional original positions interpolate
-// within an original segment. Consecutive duplicate points share one arclength;
-// inversion at that arclength returns the first point in the duplicate run.
+// back. Each configured annotation control point and each line endpoint is a
+// grid support, with span-local subdivisions between supports. Fractional
+// original positions interpolate within an optimized-line segment. Consecutive
+// duplicate line points share one arclength; inversion at that arclength
+// returns the first point in the duplicate run.
 struct LineStripPositionMap {
     std::vector<double> originalArclengths;
     std::vector<double> stripGridArclengths;
     double totalArclength = 0.0;
-    // Nominal mean spacing used for the QuadSurface's scalar grid-density
-    // metadata. Exact mapping uses stripGridArclengths.
+    // Fixed target spacing used for the QuadSurface's scalar grid-density
+    // metadata. Exact source mapping uses stripGridArclengths.
     double stripGridSpacingBaseVoxels = 0.0;
     size_t stripGridColumnCount = 0;
 

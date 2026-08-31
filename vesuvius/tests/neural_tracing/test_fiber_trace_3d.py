@@ -439,6 +439,37 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["ome_compressor"] == "none"
 
 
+def test_fiber_inference_cli_forwards_live_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module, "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--live-fetch",
+        "--live-cache-gib", "12.5", "--live-fetch-ahead-tiles", "4321",
+        "--download-workers", "123",
+    ]) == 0
+    assert captured["live_fetch"] is True
+    assert captured["live_cache_gib"] == 12.5
+    assert captured["live_fetch_ahead_tiles"] == 4321
+    assert captured["download_workers"] == 123
+
+
+@pytest.mark.parametrize("extra", [
+    ["--live-fetch", "--no-download"],
+    ["--live-fetch", "--crop", "0", "0", "0", "1", "1", "1"],
+    ["--live-cache-gib", "1"],
+])
+def test_fiber_inference_cli_rejects_invalid_live_cache_combinations(extra) -> None:
+    with pytest.raises(SystemExit):
+        fiber_infer_module.main([
+            "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+            "--checkpoint", "model.pt", *extra,
+        ])
+
+
 def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setattr(

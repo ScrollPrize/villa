@@ -25,17 +25,18 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
-        src/CacheCompression.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp
         src/HttpFetch.cpp
+        src/S3AuthFallback.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
         src/surface_metrics.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/ScrollUmbilicus.cpp
         src/render/ChunkCache.cpp
         src/render/ChunkRequestScheduler.cpp
         src/render/DecodedChunkCacheBudget.cpp
@@ -72,6 +73,7 @@ target_link_libraries(vc_core
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
     $<BUILD_INTERFACE:utils_c3d_codec>
+    vc_delta3d::vc_delta3d
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc

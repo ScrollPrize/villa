@@ -1,19 +1,14 @@
-# Direct Zarr mirror disk-cache status
+# Public S3 Lasagna anonymous-first access status
 
-- [x] Capture task requirements.
-- [x] Inspect current remote opener, source keys, legacy cache precedence,
-      maintenance requests, settings, and persistent budget.
-- [x] Write implementation/test/spec/docs plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Review sharded storage-object semantics with the user.
-- [x] Implement immutable cache-layout detection.
-- [x] Mirror Zarr metadata and exact source chunk paths.
-- [x] Route ordinary and maintenance persistence through selected layout.
-- [x] Preserve legacy read/write compatibility.
-- [x] Remove remote-cache recompression production and UI/settings.
-- [x] Make redownload, prefill, and budget accounting layout-aware.
-- [x] Add/update regression tests.
-- [x] Update spec, docs, changelog, and task log.
+- [x] Capture the observed public-data failure and required behavior.
+- [x] Inspect manifest, remote-file-cache, and Lasagna Zarr authentication paths.
+- [x] Draft the implementation and validation plan.
+- [x] Complete independent plan review.
+- [x] Implement anonymous-first remote manifest access.
+- [x] Implement sticky anonymous-first Lasagna Zarr access.
+- [x] Preserve private and mixed-access authenticated fallback.
+- [x] Add regression tests.
+- [x] Update specification, documentation, changelog, and task log.
 - [x] Build and run focused tests.
-- [x] Run configured volume-cartographer CTest suite.
-- [x] Run `git diff --check` and review final diff.
+- [x] Validate against the real PHerc0139 manifest.
+- [x] Run final diff and whitespace checks.

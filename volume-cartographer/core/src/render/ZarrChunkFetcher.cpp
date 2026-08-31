@@ -1,12 +1,14 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
 #include <utils/zarr.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -55,12 +57,21 @@ bool hasSuffix(std::string_view value, std::string_view suffix)
            value.substr(value.size() - suffix.size()) == suffix;
 }
 
-bool isOptionalMetadataProbe(const std::string& key)
+bool isOptionalMetadataProbe(std::string_view key)
 {
     return key == ".zgroup" || key == ".zarray" || key == ".zattrs" ||
            key == ".zmetadata" || key == "zarr.json" ||
            hasSuffix(key, "/.zgroup") || hasSuffix(key, "/.zarray") ||
            hasSuffix(key, "/.zattrs") || hasSuffix(key, "/zarr.json");
+}
+
+std::string responseErrorDetail(const utils::HttpResponse& response)
+{
+    if (!response.error_message.empty())
+        return response.error_message;
+    constexpr std::size_t kMaxDetailLength = 1024;
+    const auto body = response.body_string();
+    return std::string(body.substr(0, kMaxDetailLength));
 }
 
 bool isZarrMetadataKey(std::string_view key)
@@ -75,16 +86,17 @@ bool isZarrMetadataKey(std::string_view key)
 bool isRemoteAuthError(const std::exception& error)
 {
     const std::string message = error.what();
-    return message.find("AWS credentials") != std::string::npos ||
+    return vc::hasExplicitAwsCredentialError(message) ||
+           message.find("AWS credentials") != std::string::npos ||
            message.find("Access denied") != std::string::npos ||
-           message.find("ExpiredToken") != std::string::npos ||
-           message.find("InvalidToken") != std::string::npos ||
-           message.find("TokenRefreshRequired") != std::string::npos ||
-           message.find("InvalidAccessKeyId") != std::string::npos ||
-           message.find("SignatureDoesNotMatch") != std::string::npos ||
-           message.find("HTTP 400") != std::string::npos ||
            message.find("HTTP 401") != std::string::npos ||
            message.find("HTTP 403") != std::string::npos;
+}
+
+bool isMissingZarrMetadataError(const std::exception& error)
+{
+    return std::string_view(error.what()).find("zarr: no metadata found") !=
+           std::string_view::npos;
 }
 
 class ClassifyingHttpStore final : public utils::Store {
@@ -102,9 +114,13 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string())) {
+            sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return false;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        }
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::vector<std::byte> get(const std::string& key) const override
@@ -124,9 +140,13 @@ public:
         }
         if (response.not_found())
             return std::nullopt;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string())) {
+            sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        }
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::optional<std::vector<std::byte>>
@@ -137,7 +157,8 @@ public:
             return std::move(response.body);
         if (response.not_found())
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -161,6 +182,11 @@ public:
             return lhs.key < rhs.key;
         });
         return result;
+    }
+
+    bool sawForbiddenMetadataMiss() const noexcept
+    {
+        return sawForbiddenMetadataMiss_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -195,6 +221,7 @@ private:
 
     std::string baseUrl_;
     utils::HttpClient client_;
+    mutable std::atomic<bool> sawForbiddenMetadataMiss_{false};
     mutable std::mutex metadataMutex_;
     mutable std::unordered_map<std::string, std::vector<std::byte>> metadata_;
 };
@@ -218,7 +245,8 @@ public:
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
             persistEncodedExtension_ = ".c3d";
-        else if (array_->stores_chunks_with_codec(vc::kVcz1CodecName))
+        else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
+                 array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
@@ -789,6 +817,15 @@ void addRemoteLevelFromKey(
 
 } // namespace
 
+bool isOptionalRemoteMetadataMiss(
+    long status,
+    std::string_view key,
+    std::string_view responseBody)
+{
+    return status == 403 && isOptionalMetadataProbe(key) &&
+           !vc::hasExplicitAwsCredentialError(responseBody);
+}
+
 std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,
     int firstLevel)
@@ -1023,6 +1060,11 @@ OpenedChunkedZarr openHttpZarrPyramid(
                 addRemoteLevelFromKey(opened, store, key, physicalLevel);
             }
         }
+        if (opened.fetchers.empty() && store->sawForbiddenMetadataMiss()) {
+            throw HttpStatusError(
+                403, spec.sourceUrl,
+                "access denied while discovering required array metadata");
+        }
         return finishOpen(validateAndRebaseVcPyramid(
             std::move(opened), baseScaleLevel));
     }
@@ -1046,17 +1088,35 @@ OpenedChunkedZarr openHttpZarrPyramid(
                 (e.status() == 403 && (!opened.fetchers.empty() || firstPhysicalLevel == 0)))
                 break;
             throw;
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (physicalLevel == firstPhysicalLevel &&
+                store->sawForbiddenMetadataMiss() &&
+                isMissingZarrMetadataError(error)) {
+                break;
+            }
             if (physicalLevel == firstPhysicalLevel)
                 throw;
             break;
         }
     }
     if (opened.fetchers.empty() && firstPhysicalLevel == 0) {
-        auto array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1));
-        if (array.metadata().dtype == utils::ZarrDtype::uint16)
-            array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(2));
-        addPhysicalLevel(opened, 0, std::move(array), true);
+        try {
+            auto array = utils::ZarrArray::open(
+                store, "", vc::buildZarrCodecRegistry(1));
+            if (array.metadata().dtype == utils::ZarrDtype::uint16) {
+                array = utils::ZarrArray::open(
+                    store, "", vc::buildZarrCodecRegistry(2));
+            }
+            addPhysicalLevel(opened, 0, std::move(array), true);
+        } catch (const std::exception& error) {
+            if (store->sawForbiddenMetadataMiss() &&
+                isMissingZarrMetadataError(error)) {
+                throw HttpStatusError(
+                    403, spec.sourceUrl,
+                    "access denied while discovering required array metadata");
+            }
+            throw;
+        }
     }
     return finishOpen(std::move(opened));
 }
@@ -1083,13 +1143,17 @@ OpenedRemoteChunkedZarr openRemoteZarrPyramid(
     }
 
     OpenedChunkedZarr opened;
-    try {
+    if (!spec.useAwsSigv4 || auth.empty()) {
         opened = openHttpZarrPyramid(spec.portableLocator, auth);
-    } catch (const std::exception& error) {
-        if (!spec.useAwsSigv4 || auth.empty() || !isRemoteAuthError(error))
-            throw;
-        auth = {};
-        opened = openHttpZarrPyramid(spec.portableLocator, auth);
+    } else {
+        try {
+            opened = openHttpZarrPyramid(spec.portableLocator, {});
+            auth = {};
+        } catch (const std::exception& error) {
+            if (!isRemoteAuthError(error))
+                throw;
+            opened = openHttpZarrPyramid(spec.portableLocator, auth);
+        }
     }
     return {std::move(opened), std::move(auth), std::move(spec)};
 }

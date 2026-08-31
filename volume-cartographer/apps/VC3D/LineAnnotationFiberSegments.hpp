@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -114,6 +116,68 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
 
+struct ControlPointCollapseResult {
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+
+    [[nodiscard]] bool replacedExisting() const noexcept
+    {
+        return !collapsedOldIndices.empty();
+    }
+};
+
+[[nodiscard]] ControlPointCollapseResult collapseControlPointsAtClick(
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint);
+
+struct PreparedControlPointEdit {
+    std::vector<cv::Vec3d> linePoints;
+    std::vector<LineControlPoint> controlPointsBeforeLineUpdate;
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+    bool lineReconstructed = false;
+    // See LineControlPointUpdateResult::replacedStart/replacedCount: the
+    // half-open linePoints range this edit rebuilt (-1/0 when unknown -
+    // treat the whole line as new). Only the geometric prepare fills it.
+    int replacedStart = -1;
+    int replacedCount = 0;
+};
+
+[[nodiscard]] PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config);
+
+// The interactive counterpart of prepareAutomaticControlPointEdit: identical
+// collapse/metadata bookkeeping, but the clicked spans are rebuilt by the
+// purely geometric line update (delta-blended resample through the control
+// points, no solver, no volume access), so it runs in microseconds on the
+// GUI thread. The result is provisional display geometry; the asynchronous
+// fiber-mode re-optimization that follows replaces it with solved spans.
+[[nodiscard]] PreparedControlPointEdit prepareGeometricControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    double segmentLength);
+
+[[nodiscard]] cv::Vec3d lineTangentAtPosition(
+    const std::vector<cv::Vec3d>& linePoints,
+    double linePosition);
+
 struct StoredControlPoint : cv::Vec3d {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
 
@@ -172,6 +236,11 @@ struct FiberModeOptimizationRequest {
     bool retraceAll = false;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
+    // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):
+    // when set and it becomes true, optimizeFiberWithNativeFallback throws
+    // vc::lasagna::LineOptimizationCancelled at the next checkpoint instead
+    // of demoting spans or completing. The pointee must outlive the call.
+    const std::atomic<bool>* cancelFlag = nullptr;
 };
 
 struct FiberModeOptimizationResult {
@@ -192,6 +261,72 @@ struct FiberModeOptimizationResult {
 [[nodiscard]] StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fiberVersion);
 
 void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls);
+
+// The loader's exact-membership scan (kControlPointMatchEpsilon in
+// core/src/Atlas.cpp): every control must be an exact member (1e-8) of
+// linePoints, in strictly increasing line order. Returns each control's line
+// index, or nullopt on the first violation. Split/merge planning and the
+// save-path geometry guard share this single implementation.
+[[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints);
+
+// Publish a superseded solve by span merge (render-job model: edits no
+// longer cancel the in-flight solve, and its landing must not be discarded
+// wholesale). The merged line keeps the CURRENT session's controls — their
+// identity, branches, and goals are authoritative — and adopts the solved
+// geometry for every span the edits did not touch: span i adopts solved
+// span j iff controlMap[j] == i && controlMap[j+1] == i+1 (no control was
+// inserted or collapsed inside), i is not in editedSpans, and the solved
+// span's endpoint controls sit exactly (1e-8, the loader tolerance) on the
+// current controls. The head/tail extrapolations are adopted only when the
+// outer controls are unchanged and no solver-input config changed mid-solve.
+// Pieces are copied as whole LinePoints — positions AND normals — from
+// either line; the helper is pure (no sampler, no I/O, deterministic).
+// Inputs and output are validated against the exact-ordered-subset contract;
+// a violation anywhere returns mergeable == false and the caller falls back
+// to the discard-and-redispatch path.
+struct MergedSupersededSolve {
+    bool mergeable = false;
+    vc::lasagna::LineModel line;
+    std::vector<LineControlPoint> controls;
+    // Current-numbering spans whose geometry was adopted from the solve.
+    std::vector<size_t> adoptedSpans;
+    // Solved spans NOT adopted but expressible in the current numbering —
+    // the caller folds them back into the pending union so their coverage
+    // is not silently dropped. Spans that straddle inserted controls or
+    // collapsed away need nothing here: the edits that reshaped them already
+    // recorded their own pending spans.
+    std::vector<size_t> rejectedSolvedSpans;
+};
+
+// The click path's provisional splice: replaces the dense line's
+// [replacedStart, replacedStart + replacedCount) range with the given points,
+// deriving the range's normals WITHOUT any volume access (the review-directed
+// contract: provisional geometry reuses/interpolates normals; authoritative
+// resampling belongs to the background solve). Prefix/suffix points carry the
+// previous model's LinePoints positionally. The replaced range re-indexes the
+// OLD replaced range's authoritative normals proportionally; a pure insertion
+// (no old points in the range) blends the nearest valid boundary normals,
+// hemisphere-aligned first (the LineViewBuilder display-interpolation
+// convention). Non-spliceable ranges fall back to 3D-nearest normal transfer.
+// The display anchor prefers carried/re-indexed normals over blended ones,
+// and a blended anchor must not be parallel to the local tangent. Throws when
+// `previous` is empty (nothing to interpolate from) or no anchor exists.
+[[nodiscard]] vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
+    const vc::lasagna::LineModel& previous,
+    const std::vector<cv::Vec3d>& points,
+    int replacedStart,
+    int replacedCount);
+
+[[nodiscard]] MergedSupersededSolve mergeSupersededSolveResult(
+    const vc::lasagna::LineModel& currentLine,
+    const std::vector<LineControlPoint>& currentControls,
+    const vc::lasagna::LineModel& solvedLine,
+    const std::vector<LineControlPoint>& solvedControls,
+    const std::vector<size_t>& controlMap,
+    const std::vector<size_t>& editedSpans,
+    bool configChanged);
 
 [[nodiscard]] std::vector<cv::Vec3d> storedControlPointPositions(const std::vector<StoredControlPoint>& controls);
 [[nodiscard]] std::vector<vc::lasagna::LineControlPoint> optimizerControlPoints(const std::vector<LineControlPoint>& controls);

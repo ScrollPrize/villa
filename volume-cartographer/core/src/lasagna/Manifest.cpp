@@ -131,6 +131,35 @@ const LasagnaChannelGroup* LasagnaDatasetManifest::groupForChannel(std::string_v
     return nullptr;
 }
 
+std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
+{
+    std::vector<std::string> prefixes;
+    if (groupForChannel("presence") != nullptr &&
+        groupForChannel("nx") != nullptr &&
+        groupForChannel("ny") != nullptr) {
+        prefixes.emplace_back();
+    }
+
+    constexpr std::string_view suffix = "_presence";
+    for (const auto& group : groups) {
+        for (const auto& channel : group.channels) {
+            if (channel.size() < suffix.size() ||
+                channel.compare(channel.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
+            if (groupForChannel(prefix + "_nx") != nullptr &&
+                groupForChannel(prefix + "_ny") != nullptr) {
+                prefixes.push_back(prefix);
+            }
+        }
+    }
+
+    std::sort(prefixes.begin(), prefixes.end());
+    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+    return prefixes;
+}
+
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
     std::ifstream input(manifestPath);

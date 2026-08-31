@@ -310,6 +310,23 @@ TEST_CASE("hasRemoteCacheRoot + remoteCacheRootOrEmpty round-trip")
     fs::remove_all(d);
 }
 
+TEST_CASE("open-data remote volume caches are grouped by sample")
+{
+    const fs::path root = "/cache/remote_cache";
+    const vc::project::Entry ordinary{
+        "https://example.test/ordinary.zarr", {}};
+    CHECK(vc::project::remoteVolumeCacheRootForEntry(root, ordinary) == root);
+
+    const vc::project::Entry catalog{
+        "https://example.test/catalog.zarr",
+        {"vc-open-data-sample-id:_Sample With Spaces"}};
+    const auto expected =
+        root / "open_data" / "volumes" / "Sample_With_Spaces";
+    CHECK(vc::project::remoteVolumeCacheRootForEntry(root, catalog) == expected);
+    CHECK(vc::project::remoteVolumeCacheRootForEntry(expected, catalog) ==
+          expected);
+}
+
 TEST_CASE("normalGridPaths + normal3dZarrPaths: empty without entries")
 {
     auto p = VolumePkg::newEmpty();

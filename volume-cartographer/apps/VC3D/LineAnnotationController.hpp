@@ -5,12 +5,15 @@
 #include <QPointer>
 #include <QString>
 #include <QFutureWatcher>
+#include <QThreadPool>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,11 +25,14 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
+#include "AnnotationFrame.hpp"
+#include "UmbilicusOrientationFreshness.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -63,6 +69,17 @@ public:
         vc::lasagna::LineOptimizationResult result;
         std::string error;
         std::string eventName;
+    };
+
+    // One fiber's polyline as the side-strip intersection query consumes
+    // it: an immutable shared snapshot plus a memoized hash of its points
+    // and control points. Snapshots are cached per fiber and rebuilt only
+    // when the fiber's geometry actually changed (stored generation, or the
+    // owning session's line revision/edit epoch), so a query no longer
+    // deep-copies and re-hashes every loaded fiber per placement.
+    struct SideStripFiberSnapshot {
+        std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
+        uint64_t geometryHash = 0;
     };
 
     struct FiberSummary {
@@ -115,6 +132,76 @@ public:
         // Interpolation provenance of the stored geometry (see deriveTraceState).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
+    };
+
+    // Read-only network snapshot for the Fiber Map workspace: every loaded
+    // fiber's unrolling inputs plus the scroll umbilicus, in one pass.
+    struct FiberMapLink {
+        int controlPointIndex = -1;
+        uint64_t branchFiberId = 0;
+        int branchControlPointIndex = -1;
+        // Mirrors FiberBranchRef::pending: the link still awaits reviewer
+        // approval, and the map colours it like the annotation views do.
+        bool pending = false;
+    };
+
+    struct FiberMapFiber {
+        // Runtime id, valid only for the generation this snapshot was taken in.
+        uint64_t id = 0;
+        // Stable identity across loads; the runtime id is reassigned per load,
+        // so anything acted on later must be resolved from this.
+        std::string fileName;
+        // "<file prefix>-<sequence>", e.g. "kb-604".
+        QString label;
+        char hvTag = '?';
+        std::vector<cv::Vec3d> controlPoints;
+        std::vector<cv::Vec3d> linePoints;
+        // Per control-point span; size max(0, controlPoints.size() - 1).
+        std::vector<bool> tracedSegments;
+        // Branch links resolving to a loaded fiber, pending included.
+        std::vector<FiberMapLink> links;
+    };
+
+    struct FiberMapSnapshot {
+        std::vector<FiberMapFiber> fibers;
+        // The frame this snapshot's geometry was derived in. Reported rather than
+        // left for a holder to re-derive: a second call to annotationFrame()
+        // reads live volume state and so could answer differently, which would
+        // tag a layout with a frame it was not built in.
+        vc3d::annotation::AnnotationFrame frame;
+        // fiberDataGeneration() when this snapshot was taken; a holder compares
+        // it to know whether what it built from this is still current.
+        uint64_t generation = 0;
+        // Umbilicus control points scaled into the fibers' frame, sorted by z;
+        // empty when no plausible umbilicus was found.
+        std::vector<cv::Vec3f> umbilicusCenters;
+        // Physical size of one voxel of the frame the fibers are annotated in,
+        // in µm. Unset when the package cannot say: no coordinate identity to
+        // read it from and no volume to fall back on. There is no default on
+        // purpose — a guessed voxel size turns every derived physical figure
+        // (cm, reference radii, scroll height) silently wrong, so consumers
+        // must handle the unset case and show voxels instead.
+        std::optional<double> voxelSizeUm;
+        // Scroll z extent in the fibers' frame, i.e. the current volume's slice
+        // count scaled back to the annotation (level 0) resolution; 0 when the
+        // volume is unknown.
+        int annotationZSlices = 0;
+        QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
+        // Ready-to-display description of the frame the scale maps from, for
+        // workspace status bars: the stamped volume and its level offset when
+        // the ratio is a power of two, the stamped grid size otherwise, or the
+        // bare guessed factor. Carries the stamp-mismatch and registered-volume
+        // notes when either check fires. Empty when no umbilicus was applied.
+        QString umbilicusLabel;
+    };
+
+    // One-line umbilicus availability summary for workspace status bars:
+    // "<fileName>" on success (with " (unstamped)" suffix when the file
+    // declares no voxelsize_um), empty when no package is loaded, and a
+    // shortened form of the resolver's error otherwise.
+    struct UmbilicusStatus {
+        bool available = false;
+        QString text;
     };
 
     struct FiberSnapshotWithPath {
@@ -218,7 +305,43 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
+    // Resolves the package's umbilicus for a status line only; nothing is
+    // cached, so call it on user-visible state changes rather than per frame.
+    [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
+    // The frame line points and control points are expressed in: the current
+    // volume's grid carried to the resolution the fibers were annotated at.
+    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
+    // Holders of derived geometry compare it to know whether what they built is
+    // still in a frame that means anything.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Cheap token over everything resolveScrollUmbilicus() depends on: the
+    // project's field plus a stat() of each path the resolver's own scan reports,
+    // and no JSON parse. Size and mtime, so it is a metadata token rather than a
+    // guarantee -- a same-size rewrite inside one timestamp tick is invisible to
+    // it. It covers the file changing underneath VC3D, which no counter reports;
+    // for attach and detach it overlaps umbilicusGeneration(), which holders
+    // still compare as the reviewer-prescribed mechanism for in-app changes.
+    [[nodiscard]] QString umbilicusFingerprint() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
+    // Bumped whenever the loaded fiber set changes (load, save, delete, and the
+    // edits that refresh the fiber summaries). Holders of derived data compare
+    // it to decide whether what they built is still current; runtime fiber ids
+    // are only meaningful within one generation. Deliberately an
+    // over-approximation: edits that a given holder's snapshot never reads
+    // (generic tag changes, say) still bump, because a needless rebuild prompt
+    // is bounded while a missed one shows a wrong picture.
+    [[nodiscard]] uint64_t fiberDataGeneration() const { return _fiberDataGeneration; }
+    // Bumped when the project is replaced. A counter rather than a signal so that
+    // a derived view which may never be opened costs nothing to keep informed:
+    // bumping is an integer store, and the holder decides when to look. Kept apart
+    // from umbilicusGeneration() because they mean different things to a holder —
+    // a new project invalidates its data outright, while a new umbilicus only
+    // moves where that data lands.
+    [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
+    // Runtime id of the loaded fiber with this file name, or 0 when the package
+    // no longer holds it. The stable way to act on a fiber recorded earlier.
+    [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
@@ -272,6 +395,21 @@ public:
     // not yet saved). Used by cross-panel actions such as adding a fiber to a
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
+
+    // Bumped whenever the project's umbilicus attachment changes. Cheap to
+    // read, so holders of geometry placed relative to the umbilicus can compare
+    // it lazily instead of being signalled.
+    [[nodiscard]] uint64_t umbilicusGeneration() const
+    {
+        return _umbilicusGeneration;
+    }
+
+    // Ends every session — saving through the normal close path — while the
+    // current package is still the one the work belongs to. The project-open
+    // flows call this before replacing the package, and must not replace it
+    // when this returns false: an optimization is running, or a finalization
+    // failed, and the workspace is left intact for the user to resolve.
+    [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
@@ -391,11 +529,14 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        // Cheap pre-snapshot staleness proxy (see sideStripQueryFingerprint);
+        // the hash-based cacheKey stays the precise layer underneath it.
+        QString fingerprint;
         std::string surfaceName;
         uint64_t sourceFiberId = 0;
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
-        std::vector<vc::atlas::FiberPolyline> fibers;
+        std::vector<SideStripFiberSnapshot> fibers;
         std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
     };
 
@@ -404,9 +545,16 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        QString fingerprint;
         std::string surfaceName;
         std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
         std::string error;
+        // The run painted partial (branch-link) markers before it finished;
+        // a FAILED run with this set corrupted the display, so the finish
+        // restores the surface's last known good set. Without it a failure
+        // keeps whatever was displayed (by-definition-fresher than any cache
+        // entry for a different fingerprint).
+        bool publishedPartial = false;
     };
 
     struct PaneRecord {
@@ -449,7 +597,27 @@ private:
                                            cv::Vec3f requestedLinkDirection);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
+    // Debouncing entry point (signal-connected): one placement triggers
+    // several overlay rebuilds, each re-requesting intersections; they
+    // coalesce into one dispatch per quiet window so the all-fiber snapshot
+    // is paid once, not per trigger.
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void dispatchSideStripIntersectionQuery(const std::string& surfaceName);
+    // Invalidate every side-strip query stamped so far (see the token-domain
+    // comment at the member declarations).
+    void invalidateSideStripQueries();
+    // Recompute the latest scheduling intent after erasing pending work: a
+    // stale latest token defeats the running-query dedupe and re-queues
+    // identical work.
+    void refreshLatestSideStripIntersectionToken();
+    // Cheap staleness proxy over everything the side-strip query reads (strip
+    // surface identity, fiber data generation, each pane session's line
+    // identity/epoch and branch count), computable without the all-fiber deep
+    // copy the precise hash needs. A false match only leaves cosmetic stale
+    // markers until the next trigger; a mismatch falls through to the hash.
+    [[nodiscard]] QString sideStripQueryFingerprint(
+        const std::string& surfaceName,
+        const cv::Mat_<cv::Vec3f>* stripPoints) const;
     void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
                                                  size_t firstControlPointIndex,
                                                  size_t secondControlPointIndex,
@@ -533,12 +701,57 @@ private:
                                     bool retraceAll,
                                     std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                     bool globalGoalsOnly = false);
+    // Debounced launch of the session's coalesced pending solve: control-point
+    // edits record dirty spans in the session's queue and call this; one solve
+    // over the union starts after a short quiet window (or, while a solve is
+    // in flight, from finishOptimization's epilogue).
+    void scheduleSolveDispatch(LineAnnotationSession& session);
+    void dispatchPendingSolve(const std::string& surfaceName);
     [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
         makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // Drops the cached scroll umbilicus and everything describing it, so the next
+    // use resolves again.
+    void invalidateScrollUmbilicus();
+    // Rebuilds the generated views of panes whose recorded orientation epoch is
+    // behind the controller's — which is what actually re-applies sheet normals
+    // after the umbilicus or the active volume changed — and the intersection
+    // inspection's strips, which have no generated-view sessions of their own.
+    // Failures are logged per pane and do not stop the others.
+    void refreshStaleGeneratedViews();
+    // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
+    // CState emits volumeChanged from inside ViewerManager::switchVolume(),
+    // before focus and navigation are restored, and materialization reads pane
+    // camera state. Also collapses rapid switching into one rebuild.
+    void scheduleStaleViewRefresh();
+    // Cheap fingerprint over everything the resolved umbilicus was read from: a
+    // stat() of every resolver candidate (the attached file when the project
+    // field is set, the discovery candidates otherwise) plus the registration
+    // transform the legacy reading would consult — no JSON parse. Part of the
+    // cached umbilicus's key, so fixing a refused file, editing a transform in
+    // place, or a new candidate appearing all reach the views.
+    [[nodiscard]] QString umbilicusCacheToken() const;
+    // The umbilicus half of fiberMapSnapshot(): the resolver's answer brought
+    // into the fibers' frame through the shared derivation, or the message
+    // saying why it could not be. Empty centers with an empty message mean the
+    // resolved file had no points, or no package is loaded.
+    struct SnapshotUmbilicus {
+        std::vector<cv::Vec3f> centers;  // scaled into the fibers' frame, z-sorted
+        QString label;                   // frame description; empty when refused
+        QString message;                 // resolver/frame error; empty on success
+    };
+    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(
+        const vc3d::annotation::AnnotationFrame& frame) const;
+    void onActiveVolumeChanged();
+    // Pushes _umbilicusNotice to every open pane's dialog.
+    void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
+    // Loads the volpkg's scroll umbilicus into the session frame on first use
+    // and caches the (possibly empty) result; re-attempted when the volpkg
+    // root changes.
+    const std::optional<vc::core::util::Umbilicus>& ensureScrollUmbilicusLoaded();
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
     // NaN entries mark invalid samples.
@@ -617,7 +830,7 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsForSideStripQuery() const;
+    [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery() const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
@@ -652,6 +865,10 @@ private:
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
+    [[nodiscard]] bool confirmLinkedControlPointEdits(
+        const LineAnnotationSession& session,
+        const std::vector<size_t>& controlPointIndices,
+        const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
@@ -672,6 +889,17 @@ private:
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
+    // Debounced autosave after a solve landing: consecutive landings coalesce
+    // into one saveSessionAsFiber (with its no-op probe, fiber summary
+    // rebuild, and linked-fiber sync) instead of paying it per landing. The
+    // flush never runs the synchronous finalize solve: a session mutated
+    // since the landing skips the save and relies on the next landing or the
+    // close paths (which finalize+save directly and supersede the pending
+    // flush). Cross-fiber operations and package switches flush explicitly
+    // so nothing reads a fiber whose newest geometry is still session-only.
+    void scheduleSessionAutoSave(LineAnnotationSession& session);
+    void flushSessionAutoSave(const std::string& surfaceName);
+    void flushAllPendingSessionAutoSaves();
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiberNow(const StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
@@ -705,6 +933,13 @@ private:
                                                           uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
+    // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
+    // callers: the scan is O(controls x linePoints) per fiber, and
+    // fiberSummaries() used to pay it for every loaded fiber on every
+    // emission (~90 ms at 666 fibers). Workers keep calling the static
+    // function directly.
+    [[nodiscard]] const std::vector<ControlSpanRecord>& cachedControlSpansForFiber(
+        const StoredFiber& fiber) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
         uint64_t fiberId) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(
@@ -793,7 +1028,49 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The resolver's dependencies as of the cached load — a stat of every
+    // candidate plus the legacy transform — so any of them changing underneath
+    // VC3D (fixed, replaced, removed, or newly appearing) is noticed.
+    QString _scrollUmbilicusToken;
+    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
+    // key because the cached value is not the file's contents: its points are
+    // already multiplied by a frame-dependent factor and its per-slice centres
+    // sized to that frame's extent. Keyed on the project directory alone, a
+    // volume switch handed the orientation vote geometry from the previous frame.
+    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
+    // The volume the cached umbilicus was read for. Deliberately conservative:
+    // the volume-centre fallback and the legacy reading depend on the volume's
+    // raw shape and its registration transform, not only on the annotation
+    // frame, so any volume switch re-resolves rather than proving the previous
+    // geometry equivalent. Re-resolution is a few stats and one JSON parse.
+    std::string _scrollUmbilicusVolumeId;
     bool _scrollUmbilicusLoadAttempted = false;
+    // Bumped whenever the orientation inputs change out from under built views
+    // (umbilicus attach/detach, active volume switch). Sessions record the
+    // value their generated views were built at; refreshStaleGeneratedViews()
+    // rebuilds the ones that are behind.
+    int _orientationEpoch = 0;
+    bool _staleViewRefreshQueued = false;
+    // Bumped on attach/detach only. Holders such as the Fiber Map read it to
+    // decide staleness of derived geometry; a volume switch is deliberately not
+    // an attachment change.
+    uint64_t _umbilicusGeneration = 0;
+    // The volumeId of the last volumeChanged this controller acted on, so a
+    // reselection of the current volume is not treated as a switch. Cleared on
+    // package change.
+    std::string _lastVolumeChangedId;
+    // Why the package's umbilicus could not be used, for the strip notice.
+    // Empty when one was applied, and when none exists to complain about.
+    // Orienting off the volume centre instead is exactly the silent degradation
+    // that hid a frame mismatch for a whole scroll, so it is said out loud.
+    QString _umbilicusNotice;
+    // See fiberDataGeneration(). Starts at 1 so a holder's default 0 always
+    // reads as stale. (_umbilicusGeneration above starts at 0 instead; holders
+    // gate every comparison behind having built something, so only these two
+    // rely on the never-matches-a-default property.)
+    uint64_t _fiberDataGeneration = 1;
+    // See packageGeneration(); starts at 1 for the same reason.
+    uint64_t _packageGeneration = 1;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
@@ -803,18 +1080,82 @@ private:
     // retirement) on the flushed saves having actually succeeded.
     uint64_t _fiberSaveFailureCount = 0;
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
+    // Side-strip query scheduling follows the render-job model: one active
+    // query (never cancelled by newer requests), one latest pending request,
+    // and results published even when superseded — they are fresher than
+    // what is displayed. All tokens are drawn from one monotonic sequence so
+    // they share a comparison domain:
+    // - _latestSideStripIntersectionToken: the newest scheduling intent
+    //   (dedupe of running/pending work).
+    // - _sideStripInvalidationWatermark: requests stamped BEFORE it are
+    //   invalid (pane closed, package switched, intentional clear) — the
+    //   only thing that cancels a running query or drops its result. The
+    //   shared atomic mirrors it for the worker's cancel callback.
+    // - _lastPublishedSideStripToken: monotonic publish guard.
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
-    std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
+    uint64_t _sideStripInvalidationWatermark = 0;
+    uint64_t _lastPublishedSideStripToken = 0;
+    std::shared_ptr<std::atomic<uint64_t>> _sideStripInvalidationWatermarkAtomic =
         std::make_shared<std::atomic<uint64_t>>(0);
     uint64_t _runningSideStripIntersectionToken = 0;
     uint64_t _runningSideStripIntersectionKey = 0;
     std::string _runningSideStripIntersectionSurfaceName;
-    uint64_t _lastSideStripIntersectionKey = 0;
-    std::string _lastSideStripIntersectionSurfaceName;
-    std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
+    // PER-SURFACE reuse cache of the last published result (a single global
+    // slot made two panes' unconditional catch-ups evict each other's entry
+    // and re-run their queries in a self-sustaining ping-pong).
+    struct SideStripReuseEntry {
+        uint64_t cacheKey = 0;
+        std::vector<SideStripMarker> markers;
+        QString fingerprint;
+    };
+    std::map<std::string, SideStripReuseEntry> _sideStripReuseCache;
+    QString _runningSideStripFingerprint;
+    // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
+    // stored fibers keyed by generation, open sessions keyed by
+    // (lineRevision, solve-queue epoch). Entries for fibers that vanished
+    // are swept on each rebuild.
+    struct SideStripSnapshotCacheEntry {
+        uint64_t validityA = 0;
+        uint64_t validityB = 0;
+        SideStripFiberSnapshot snapshot;
+    };
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripStoredSnapshotCache;
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripSessionSnapshotCache;
+    // Per-file cache behind fiberSnapshotsFromStorageWithPaths(): parsing a
+    // fiber JSON is the expensive step, so a file is reparsed only when its
+    // (size, mtime) token changes - the same metadata-token idiom as
+    // umbilicusFingerprint(), with the same caveat about a same-size rewrite
+    // inside one timestamp tick. CWindow refreshes the atlas search docks on
+    // every fiberSaved, which used to re-parse every fiber file in the
+    // package (seconds at ~666 fibers) ON THE GUI THREAD per save.
+    struct StorageSnapshotCacheEntry {
+        std::filesystem::file_time_type mtime{};
+        std::uintmax_t size = 0;
+        FiberSnapshotWithPath snapshot;
+    };
+    mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
+        _storageSnapshotCache;
+    // See cachedControlSpansForFiber: keyed by fiber id, valid while the
+    // fiber's save generation and the package generation match.
+    struct ControlSpanCacheEntry {
+        uint64_t generation = 0;
+        uint64_t packageGeneration = 0;
+        std::vector<ControlSpanRecord> spans;
+    };
+    mutable std::unordered_map<uint64_t, ControlSpanCacheEntry> _controlSpanCache;
     bool _sideStripIntersectionRunning = false;
-    std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
+    // One latest pending request PER SURFACE (a single global slot let a
+    // busy pane's refresh silently overwrite — and permanently starve — an
+    // unrelated pane's queued query). One query still runs at a time; the
+    // finish epilogue starts the queued request with the smallest token
+    // (FIFO across surfaces) after re-stamping it.
+    std::map<std::string, SideStripIntersectionRequest>
+        _pendingSideStripIntersectionRequests;
+    // Surfaces with a debounced side-strip dispatch scheduled.
+    std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
@@ -843,4 +1184,13 @@ private:
     };
     std::optional<LinkCandidate> _linkCandidate;
     std::optional<LinkCandidate> _splitCandidate;
+
+    // Private pool for line-optimization solves. Its own pool rather than the
+    // global one so teardown is bounded by waitForDone() in the destructor
+    // (after requesting cooperative cancellation) and so long solves cannot
+    // starve the global pool's other users. Two threads: one live editing
+    // session plus one intersection-inspection or merged-fiber reopt session
+    // can solve concurrently; solves within one session are serialized by the
+    // per-session coalescing queue.
+    QThreadPool _lineSolvePool;
 };

@@ -112,6 +112,22 @@ public:
         const std::filesystem::path& target,
         std::uint64_t newSize);
 
+    // Atomically retires an exact cache subtree and forgets every managed entry
+    // beneath it as one budget-coordinated operation. Recursive deletion and
+    // accounting refresh then run in the background. Overlapping reads/writes
+    // are drained, but an in-progress startup scan is restarted rather than
+    // blocking a format transition.
+    bool removeCacheSubtree(const std::filesystem::path& subtree,
+                            std::error_code& ec);
+
+    // Atomically moves an exact cache subtree within this budget root. Budget
+    // accounting is refreshed asynchronously, including when a startup scan is
+    // already running, so callers do not wait on a whole-root index walk. The
+    // destination must not exist.
+    bool moveCacheSubtree(const std::filesystem::path& source,
+                          const std::filesystem::path& destination,
+                          std::error_code& ec);
+
     // Primarily useful for deterministic tests and orderly shutdown checks.
     void waitForIdle();
     static void resetRegistryForTesting();
@@ -123,6 +139,8 @@ private:
                               SpaceProvider spaceProvider);
     void startScan();
     void startTrim();
+    void removeRetiredSubtreeAsync(std::filesystem::path retired,
+                                   bool alreadyRegistered = false);
     void releaseRead(const std::filesystem::path& path, bool touch);
     void finishWrite(const std::filesystem::path& target,
                      const std::vector<std::filesystem::path>& replacements,

@@ -1,61 +1,73 @@
-# Direct Zarr mirror disk-cache task log
+# Public S3 Lasagna authentication fallback task log
 
-## 2026-08-16
+## 2026-08-27 findings
 
-- Committed the preceding shared cache-service and persistence work as
-  `03fac62b9` before starting this layout change.
-- Confirmed legacy caches support per-chunk mixed representations. Legacy
-  `.zst` wins over `.bin`, corrupt `.zst` falls back to `.bin`, and `.empty` is
-  considered only when no data representation exists.
-- Confirmed `ZarrChunkFetcher::sourceChunkKey()` already exposes the physical
-  source-relative object key needed by a direct mirror.
-- Confirmed remote Zarr metadata is fetched during pyramid opening, before
-  normal chunk-cache work, so metadata mirroring must be integrated with the
-  remote opener rather than inferred from decoded chunks.
-- Independent review found that the first plan incorrectly treated an extracted
-  sharded inner payload as a complete source object. The revised plan separates
-  logical decode keys from physical storage-object keys and requires full-shard
-  download, persistence, read deduplication, and decode fanout.
-- The revised plan also makes physical download notifications distinct from
-  logical overlay/ready notifications, moves mirror bookkeeping outside the
-  Zarr root, requires explicit metadata collection, and makes prefill,
-  redownload, and budget accounting storage-object-aware.
-- Implemented immutable layout selection: a complete legacy cache footprint
-  retains legacy behavior, native/empty cache roots use direct mirrors, and
-  ambiguous nonempty roots fail rather than mixing representations.
-- Added exact metadata publication and source-relative object persistence with
-  validated store keys. Structural metadata is protected from eviction while
-  still respecting the disk free-space floor.
-- Separated logical decoded chunks from physical storage objects throughout
-  probe, persistent-read, source-download, write, and decode stages. Concurrent
-  inner-chunk requests now share one complete outer-shard transfer and exact
-  write, then decode independently from the shared payload.
-- Updated `.empty` handling so whole missing shards receive one outer marker,
-  while missing inner entries in present shards do not create false sidecars.
-- Made Open Data prefill and redownload enumerate physical storage objects in
-  mirror mode and retain the existing logical legacy scanners otherwise.
-- Removed VC3D remote-cache recompression controls and production writes while
-  retaining mixed legacy `.bin`, `.zst`, `.c3d`, `.source`, and `.empty`
-  decoding/writing compatibility.
-- Added regression coverage for mirror selection, exact-byte reopen, complete
-  shard coalescing and notifications, missing-shard semantics, unsafe metadata
-  paths, protected metadata accounting, and legacy selection.
-- Final concurrency review corrected physical-transfer activity retirement so
-  consumers joining during the post-download mirror write cannot retain stale
-  active notifications, and retired fetcher generations cannot decrement a
-  newer transfer's in-flight count.
-- Native budget discovery now parses v2/v3 array metadata and validates exact
-  chunk-key syntax. Unrelated files inside an array directory remain protected
-  and untracked rather than becoming eviction candidates.
-- Mirror layout selection now validates physical storage-object support before
-  admitting any request, so incompatible generic fetchers fail immediately
-  instead of leaving logical requests unresolved.
-- Validation:
-  - `cmake --build volume-cartographer/build -j 8`
-  - `ctest --test-dir volume-cartographer/build -j 8 --output-on-failure`
-    (`150/150` passed)
-  - `git diff --check`
-- The first aggregate rebuild exposed a corrupt generated `test_atlas.cpp.o`.
-  Forcing that target to rebuild cleared the build-tree artifact; the following
-  complete build and test run passed.
-- No implementation deviations from the reviewed full-shard mirror plan.
+- The public PHerc0139 manifest returns HTTP 200 to an unsigned request.
+- `resolveRemoteUrl()` intentionally classifies both `s3://` locators and
+  virtual-hosted `*.s3.amazonaws.com` HTTPS URLs as S3. Changing between those
+  forms therefore does not bypass signing.
+- Manual remote Lasagna attachment loads ambient AWS credentials before opening
+  the manifest. The observed credentials contain a rejected session token.
+- `RemoteFileCache` performs one credentialed request and reports
+  `InvalidToken`; it has no anonymous retry.
+- The ordinary remote Zarr opener already retries anonymously after a rejected
+  credentialed open.
+- Lasagna uses a separate exact-byte remote Zarr store. It also builds one
+  credentialed client and currently has no anonymous fallback for descriptor or
+  chunk reads.
+- Open-data catalogue Lasagna preparation avoids this failure by explicitly
+  disabling credential discovery, but manually attached manifests do not carry
+  that public-data knowledge.
+- A path-style `https://s3.amazonaws.com/<bucket>/<key>` locator works as an
+  immediate workaround because the current resolver does not classify that
+  hostname as S3, but it is not an acceptable permanent requirement.
+
+## 2026-08-28 review follow-up
+
+- Signed-first fallback scanned successful response bodies for AWS error words,
+  so private content containing a marker could be discarded.
+- S3 HEAD responses carry no error body. A stale session token therefore
+  produced an unclassified empty HTTP 400 before a fresh remote Zarr could open.
+- Anonymous-first access avoids both ambiguities: public data never uses ambient
+  credentials, while anonymous 401/403 responses still fall back to private
+  authenticated access.
+- A not-found or unrelated failure does not select a sticky mode. Concurrent
+  initial requests share one probe, and a later anonymous denial can upgrade a
+  mixed-access store.
+
+## Implementation result
+
+- `S3AuthFallback` now performs one synchronized anonymous-first probe while
+  retaining stable anonymous and authenticated HTTP clients.
+- Anonymous 2xx responses make anonymous mode sticky. Anonymous 401/403
+  responses retry with credentials, and authenticated 2xx/404 responses retain
+  authenticated mode. Other failures leave the mode undecided.
+- `RemoteFileCache` applies the policy to remote manifest GETs and preserves
+  both anonymous and authenticated status in diagnostics when both fail.
+- Lasagna's exact-byte remote Zarr store applies the policy to HEAD and GET
+  requests, so descriptor validation and later chunk reads share the selected
+  mode without changing cached bytes or source identity.
+- Ordinary remote Zarr opening now attempts the complete anonymous open before
+  retrying with credentials. Optional metadata 403s remain ignorable for
+  least-privilege stores; if discovery then finds no required array metadata,
+  the remembered denial triggers authenticated retry.
+- Successful responses are never classified from their content.
+
+## Validation
+
+- Built `test_http_fetch_errors`, `test_remote_file_cache`,
+  `test_lasagna_manifest`, `test_lasagna_project_volumes`, `test_remote_url`,
+  `test_zarr_chunk_fetcher`, `test_volume_live_s3`, and `VC3D` with 32-way
+  build parallelism.
+- The six focused deterministic tests passed together. The policy test passed
+  20 consecutive executions, including its coordinated eight-thread initial
+  transition case.
+- With `VC_TEST_REQUIRE_NETWORK=1`, `test_lasagna_manifest` passed all 17 cases
+  with a malformed session token configured. The real-data case downloaded the
+  reported PHerc0139 manifest anonymously and opened public `presence` metadata
+  with shape `[9620, 3314, 3314]`.
+- With required network access, `test_volume_live_s3` passed all 10 cases,
+  including its invalid-session-credential anonymous-open case.
+- The initial sandboxed live attempt could not resolve the public hostname;
+  rerunning with network access succeeded. This was an execution-environment
+  restriction, not a code failure.

@@ -20,7 +20,6 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -168,38 +167,6 @@ using TraceClock = std::chrono::steady_clock;
     if (length(ref) > kEpsilon && out.dot(ref) < 0.0)
         out *= -1.0;
     return out;
-}
-
-[[nodiscard]] bool endsWith(std::string_view value, std::string_view suffix)
-{
-    return value.size() >= suffix.size() &&
-           value.substr(value.size() - suffix.size()) == suffix;
-}
-
-[[nodiscard]] std::vector<std::string> fiberPredictionPrefixes(
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
-{
-    std::vector<std::string> prefixes;
-    if (manifest.groupForChannel("presence") != nullptr &&
-        manifest.groupForChannel("nx") != nullptr &&
-        manifest.groupForChannel("ny") != nullptr) {
-        prefixes.push_back({});
-    }
-    for (const auto& group : manifest.groups) {
-        for (const auto& channel : group.channels) {
-            constexpr std::string_view suffix = "_presence";
-            if (!endsWith(channel, suffix))
-                continue;
-            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
-            if (manifest.groupForChannel(prefix + "_nx") != nullptr &&
-                manifest.groupForChannel(prefix + "_ny") != nullptr) {
-                prefixes.push_back(prefix);
-            }
-        }
-    }
-    std::sort(prefixes.begin(), prefixes.end());
-    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
-    return prefixes;
 }
 
 [[nodiscard]] std::array<std::string, 3> predictionChannelNames(
@@ -3398,7 +3365,7 @@ FiberPredictionTraceScales resolveFiberPredictionTraceScales(
             "fiber inference manifest source_to_base must be positive and finite");
     }
 
-    const auto prefixes = fiberPredictionPrefixes(manifest);
+    const auto prefixes = manifest.fiberPredictionPrefixes();
     if (prefixes.empty()) {
         throw std::runtime_error(
             "fiber inference dataset must contain presence/nx/ny channels");
@@ -3493,7 +3460,7 @@ public:
         : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
         const auto& manifest = dataset.manifest();
-        const auto prefixes = fiberPredictionPrefixes(manifest);
+        const auto prefixes = manifest.fiberPredictionPrefixes();
         if (prefixes.empty())
             throw std::runtime_error(
                 "fiber inference dataset must contain presence/nx/ny channels");
