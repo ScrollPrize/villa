@@ -102,37 +102,61 @@ def _read_tiff(path: Path) -> np.ndarray:
         return tifffile.imread(path, out="memmap")
 
 
+def _load_tifxyz_mask(path: Path, xyz_shape: Sequence[int]) -> np.ndarray:
+    """Load a mask through the label-transfer implementation."""
+    try:
+        from vesuvius.tifxyz_label_transfer.io import load_tifxyz_mask
+    except ImportError as exc:  # pragma: no cover - depends on installation extras
+        raise RuntimeError(
+            "TIFXYZ preflight requires the label-transfer extra: "
+            "pip install 'vesuvius[label-transfer]'"
+        ) from exc
+    return load_tifxyz_mask(path, xyz_shape)
+
+
 def _resolve_volume_array(opened: Any, array_key: str | None) -> tuple[Any, str]:
     if hasattr(opened, "shape"):
         if array_key:
             raise ValueError("--array-key cannot be used when --volume is an array")
         return opened, ""
 
+    multiscales = opened.attrs.get("multiscales", [])
+    datasets = multiscales[0].get("datasets", []) if multiscales else []
+    base_key = ""
+    if datasets and isinstance(datasets[0], Mapping):
+        base_key = str(datasets[0].get("path", ""))
+    if not base_key and "0" in opened:
+        base_key = "0"
+    if not base_key:
+        array_keys = sorted(str(key) for key in opened.array_keys())
+        if len(array_keys) == 1:
+            base_key = array_keys[0]
+
     if array_key:
         try:
-            return opened[array_key], array_key
+            array = opened[array_key]
         except KeyError as exc:
             raise ValueError(f"OME-Zarr has no array at key {array_key!r}") from exc
+        if not base_key:
+            raise ValueError(
+                "cannot verify that --array-key selects the base-resolution "
+                "array; omit --array-key or provide OME-Zarr multiscales metadata"
+            )
+        if array_key != base_key:
+            raise ValueError(
+                "--array-key must select the base-resolution array because "
+                "surface coordinates are in base-resolution voxel space; "
+                f"expected {base_key!r}, got {array_key!r}"
+            )
+        return array, array_key
 
-    multiscales = opened.attrs.get("multiscales", [])
-    if multiscales:
-        datasets = multiscales[0].get("datasets", [])
-        if datasets and isinstance(datasets[0], Mapping):
-            path = str(datasets[0].get("path", ""))
-            if path:
-                try:
-                    return opened[path], path
-                except KeyError as exc:
-                    raise ValueError(
-                        f"OME-Zarr multiscales points to missing array {path!r}"
-                    ) from exc
-
-    if "0" in opened:
-        return opened["0"], "0"
-
-    array_keys = sorted(str(key) for key in opened.array_keys())
-    if len(array_keys) == 1:
-        return opened[array_keys[0]], array_keys[0]
+    if base_key:
+        try:
+            return opened[base_key], base_key
+        except KeyError as exc:
+            raise ValueError(
+                f"OME-Zarr multiscales points to missing array {base_key!r}"
+            ) from exc
     raise ValueError(
         "could not choose a volume array; pass --array-key for this OME-Zarr"
     )
@@ -448,18 +472,24 @@ def inspect_pair(
         mask = None
         mask_path = surface_path / "mask.tif"
         if mask_path.is_file():
-            mask = _read_tiff(mask_path)
-            mask_matches = mask.shape == x.shape
+            try:
+                mask = _load_tifxyz_mask(mask_path, x.shape)
+                mask_error = None
+            except ValueError as exc:
+                mask_error = str(exc)
+            mask_matches = mask_error is None
             gates.append(
                 _gate(
                     "tifxyz_mask_shape",
                     mask_matches,
-                    observed=list(mask.shape),
+                    observed=(
+                        list(mask.shape) if mask_matches else {"error": mask_error}
+                    ),
                     threshold=list(x.shape),
                     message=(
                         "mask shape matches coordinates"
                         if mask_matches
-                        else "mask shape does not match coordinates"
+                        else "mask shape is incompatible with coordinates"
                     ),
                 )
             )
@@ -617,7 +647,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--surface", required=True, type=Path, help="TIFXYZ directory")
     parser.add_argument("--volume", required=True, help="Zarr/OME-Zarr path or URI")
-    parser.add_argument("--array-key", help="OME-Zarr array key; defaults to level 0")
+    parser.add_argument(
+        "--array-key",
+        help="base-resolution OME-Zarr array key; defaults to the base level",
+    )
     parser.add_argument("--output", type=Path, help="JSON report path; defaults to stdout")
     parser.add_argument(
         "--margin",

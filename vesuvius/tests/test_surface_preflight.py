@@ -7,6 +7,7 @@ import numpy as np
 import tifffile
 
 from vesuvius import surface_preflight
+from vesuvius.tifxyz_label_transfer.io import load_surface
 
 
 class FakeVolume:
@@ -92,6 +93,56 @@ def test_inspect_pair_fails_nonfinite_selected_coordinate(tmp_path, monkeypatch)
     assert gates["finite_selected_coordinates"]["observed"] == 1
 
 
+def test_inspect_pair_accepts_integer_scaled_tifxyz_mask(tmp_path, monkeypatch) -> None:
+    mask = np.full((4, 4), 255, dtype=np.uint8)
+    surface = write_surface(tmp_path / "surface", mask=mask)
+    volume = FakeVolume(np.ones((4, 4, 4), dtype=np.uint16))
+    monkeypatch.setattr(surface_preflight, "_open_volume", lambda *_: (volume, "0"))
+
+    report = surface_preflight.inspect_pair(surface, "volume.zarr", max_samples=4)
+    gates = {gate["name"]: gate for gate in report["gates"]}
+    loaded = load_surface(surface)
+
+    assert report["status"] == "PASS"
+    np.testing.assert_array_equal(loaded.valid, np.ones((2, 2), dtype=bool))
+    assert gates["tifxyz_mask_shape"]["passed"] is True
+    assert gates["tifxyz_mask_shape"]["observed"] == [2, 2]
+
+
+def test_inspect_pair_accepts_multipage_tifxyz_mask(tmp_path, monkeypatch) -> None:
+    mask = np.full((2, 2, 2), 255, dtype=np.uint8)
+    surface = write_surface(tmp_path / "surface", mask=mask)
+    volume = FakeVolume(np.ones((4, 4, 4), dtype=np.uint16))
+    monkeypatch.setattr(surface_preflight, "_open_volume", lambda *_: (volume, "0"))
+
+    report = surface_preflight.inspect_pair(surface, "volume.zarr", max_samples=4)
+    gates = {gate["name"]: gate for gate in report["gates"]}
+    loaded = load_surface(surface)
+
+    assert report["status"] == "PASS"
+    np.testing.assert_array_equal(loaded.valid, np.ones((2, 2), dtype=bool))
+    assert gates["tifxyz_mask_shape"]["passed"] is True
+    assert gates["tifxyz_mask_shape"]["observed"] == [2, 2]
+
+
+def test_inspect_pair_rejects_incompatible_tifxyz_mask(tmp_path, monkeypatch) -> None:
+    surface = write_surface(
+        tmp_path / "surface", mask=np.full((3, 4), 255, dtype=np.uint8)
+    )
+    monkeypatch.setattr(
+        surface_preflight,
+        "_open_volume",
+        lambda *_: (_ for _ in ()).throw(AssertionError("volume must stay closed")),
+    )
+
+    report = surface_preflight.inspect_pair(surface, "volume.zarr", max_samples=4)
+    gates = {gate["name"]: gate for gate in report["gates"]}
+
+    assert report["status"] == "FAIL"
+    assert gates["tifxyz_mask_shape"]["passed"] is False
+    assert "incompatible with XYZ shape" in gates["tifxyz_mask_shape"]["observed"]["error"]
+
+
 def test_inspect_pair_fails_nonfinite_implicit_valid_coordinate(
     tmp_path, monkeypatch
 ) -> None:
@@ -156,6 +207,45 @@ def test_resolve_volume_array_prefers_multiscale_level_zero() -> None:
 
     assert array is expected
     assert key == "level0"
+
+
+def test_resolve_volume_array_accepts_explicit_base_key() -> None:
+    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+
+    class FakeGroup(dict):
+        attrs = {
+            "multiscales": [{"datasets": [{"path": "level0"}, {"path": "level1"}]}]
+        }
+
+        def array_keys(self):
+            return self.keys()
+
+    array, key = surface_preflight._resolve_volume_array(
+        FakeGroup(level0=expected, level1=expected), "level0"
+    )
+
+    assert array is expected
+    assert key == "level0"
+
+
+def test_resolve_volume_array_rejects_non_base_key() -> None:
+    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+
+    class FakeGroup(dict):
+        attrs = {
+            "multiscales": [{"datasets": [{"path": "level0"}, {"path": "level1"}]}]
+        }
+
+        def array_keys(self):
+            return self.keys()
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "must select the base-resolution array.*expected 'level0', got 'level1'",
+    ):
+        surface_preflight._resolve_volume_array(
+            FakeGroup(level0=expected, level1=expected), "level1"
+        )
 
 
 def test_main_writes_report_and_returns_fail_closed(tmp_path, monkeypatch) -> None:

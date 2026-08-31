@@ -14,13 +14,16 @@ vesuvius.surface_preflight \
   --output preflight.json
 ```
 
-For an OME-Zarr with a nonstandard hierarchy, pass `--array-key`. By default
-the command selects the first dataset declared by OME-Zarr `multiscales`, then
+For an OME-Zarr with a nonstandard hierarchy, `--array-key` may explicitly
+select its base-resolution array. Non-base arrays are rejected because TIFXYZ
+coordinates are expressed in base-resolution voxel space. By default the
+command selects the first dataset declared by OME-Zarr `multiscales`, then
 falls back to array `0` or the only array in the group.
 
 The command checks:
 
-- required TIFXYZ files, metadata, coordinate shapes, and optional mask shape;
+- required TIFXYZ files, metadata, coordinate shapes, and optional mask
+  compatibility, including canonical multipage and integer-scaled masks;
 - at least one valid vertex and connected quad;
 - finite selected coordinates;
 - exact valid-coordinate bounds in the selected CT array, including an
