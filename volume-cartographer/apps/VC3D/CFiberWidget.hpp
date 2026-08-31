@@ -142,6 +142,12 @@ public:
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
 
 private:
+    // Lazy span children: collapsed fibers carry one placeholder child; the
+    // real span rows are built on first expansion (see kSpanPlaceholderRole).
+    void buildSpanChildRows(QStandardItem* root, const FiberEntry& fiber);
+    bool spanChildrenArePlaceholder(QStandardItem* root) const;
+    void ensureSpanChildrenBuilt(const QModelIndex& index);
+
     bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();

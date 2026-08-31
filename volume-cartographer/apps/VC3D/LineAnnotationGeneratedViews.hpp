@@ -460,6 +460,114 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
            linePoints[static_cast<size_t>(upper)] * t;
 }
 
+// Content-anchored remap of a fractional line position across a line-geometry
+// change: re-optimization renumbers and moves the points, so the old numeric
+// position is ambiguous on the new line. The position's 3D point on the old
+// polyline is located on the new polyline instead (nearest vertex, refined by
+// projecting onto that vertex's adjacent segments), so the returned position
+// names the same fiber spot. Among near-ties in distance the vertex closest
+// to the old position in INDEX wins: a spiral fiber's adjacent wraps pass
+// within a few voxels of each other, and where the edit moved the local
+// geometry by a comparable amount, plain nearest-point could jump the anchor
+// onto the other wrap. Falls back to the clamped input position when either
+// polyline is unusable.
+inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
+                                            const std::vector<cv::Vec3f>& newLinePoints,
+                                            double oldPosition)
+{
+    if (newLinePoints.empty()) {
+        return 0.0;
+    }
+    const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
+    if (!std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
+    if (!std::isfinite(anchor[0]) || !std::isfinite(anchor[1]) || !std::isfinite(anchor[2])) {
+        return fallback;
+    }
+    std::optional<size_t> nearestIndex;
+    double nearestDistanceSq = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < newLinePoints.size(); ++i) {
+        const cv::Vec3f& point = newLinePoints[i];
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+            continue;
+        }
+        const cv::Vec3f delta = point - anchor;
+        const double distanceSq = static_cast<double>(delta.dot(delta));
+        if (distanceSq < nearestDistanceSq) {
+            nearestDistanceSq = distanceSq;
+            nearestIndex = i;
+        }
+    }
+    if (!nearestIndex) {
+        return fallback;
+    }
+    // Continuity tiebreak (see above): among vertices within twice the
+    // nearest distance, prefer the one whose index is closest to the old
+    // position. Outside edited regions the true match is at distance ~0, so
+    // the band is empty of impostors and this is a no-op.
+    {
+        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
+        const double tieThresholdSq =
+            nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
+        double chosenIndexDelta = std::abs(
+            static_cast<double>(*nearestIndex) - oldPosition);
+        for (size_t i = 0; i < newLinePoints.size(); ++i) {
+            const cv::Vec3f& point = newLinePoints[i];
+            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+                !std::isfinite(point[2])) {
+                continue;
+            }
+            const cv::Vec3f delta = point - anchor;
+            const double distanceSq = static_cast<double>(delta.dot(delta));
+            if (distanceSq > tieThresholdSq) {
+                continue;
+            }
+            const double indexDelta =
+                std::abs(static_cast<double>(i) - oldPosition);
+            if (indexDelta < chosenIndexDelta) {
+                chosenIndexDelta = indexDelta;
+                nearestIndex = i;
+                nearestDistanceSq = distanceSq;
+            }
+        }
+    }
+    double bestPosition = static_cast<double>(*nearestIndex);
+    double bestDistanceSq = nearestDistanceSq;
+    // Fractional refinement: project the anchor onto the two segments adjacent
+    // to the nearest vertex; each candidate segment must have both endpoints
+    // finite (the nearest vertex already is).
+    for (const size_t segmentStart :
+         {*nearestIndex > 0 ? *nearestIndex - 1 : *nearestIndex, *nearestIndex}) {
+        if (segmentStart + 1 >= newLinePoints.size()) {
+            continue;
+        }
+        const cv::Vec3f& a = newLinePoints[segmentStart];
+        const cv::Vec3f& b = newLinePoints[segmentStart + 1];
+        if (!std::isfinite(a[0]) || !std::isfinite(a[1]) || !std::isfinite(a[2]) ||
+            !std::isfinite(b[0]) || !std::isfinite(b[1]) || !std::isfinite(b[2])) {
+            continue;
+        }
+        const cv::Vec3f segment = b - a;
+        const double lengthSq = static_cast<double>(segment.dot(segment));
+        if (!(lengthSq > 0.0)) {
+            continue;
+        }
+        const double t = std::clamp(
+            static_cast<double>((anchor - a).dot(segment)) / lengthSq, 0.0, 1.0);
+        const cv::Vec3f projected = a + segment * static_cast<float>(t);
+        const cv::Vec3f delta = projected - anchor;
+        const double distanceSq = static_cast<double>(delta.dot(delta));
+        if (distanceSq < bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            bestPosition = static_cast<double>(segmentStart) + t;
+        }
+    }
+    return std::clamp(bestPosition, 0.0, maxNewPosition);
+}
+
 // One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
 // current-cut and side-cut planes. Stored line-point order never changes.
 // The current cut's screen x is (up x normal) with normal = sign * tangent, so
@@ -1012,29 +1120,6 @@ inline std::optional<double> generatedArrowPanStopTarget(
     }
     if (!best && haveMinimum) {
         best = minimumTarget;
-    }
-    return best;
-}
-
-inline std::optional<size_t> nearestGeneratedControlPointIndex(
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    const cv::Vec3f& point)
-{
-    if (!finiteGeneratedPoint(point)) {
-        return std::nullopt;
-    }
-    std::optional<size_t> best;
-    double bestDistanceSq = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < controlPoints.size(); ++i) {
-        if (!finiteGeneratedPoint(controlPoints[i].point)) {
-            continue;
-        }
-        const cv::Vec3f delta = controlPoints[i].point - point;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < bestDistanceSq) {
-            best = i;
-            bestDistanceSq = distanceSq;
-        }
     }
     return best;
 }

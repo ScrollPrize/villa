@@ -21,13 +21,13 @@ Usage:
 import argparse
 import csv
 import logging
+import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from scrollcase import mesh, case
 from meshlib import mrmeshpy as mm
 from tqdm import tqdm
-
-from scrollcase import mesh, case
 
 
 def pad_scroll_name(scroll_number: str) -> str:
@@ -169,7 +169,11 @@ def main():
     scroll_summary = []
 
     # Process scrolls concurrently using ProcessPoolExecutor with a tqdm progress bar
-    with ProcessPoolExecutor() as executor:
+    worker_count = max(1, min(len(tasks), os.cpu_count() or 1))
+    with ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as executor:
         future_to_scroll = {
             executor.submit(process_scroll, padded, mesh_file, out_dir): padded
             for padded, mesh_file, out_dir in tasks

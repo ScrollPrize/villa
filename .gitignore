@@ -59,10 +59,12 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/.ccache/
 /.ccache/
 /lasagna/snap_surf_objs
-/volume-cartographer/scripts/spiral/bench
+/spiral-fitting/bench
 /volume-cartographer/scripts/cache
 /volume-cartographer/docs/plans
-/volume-cartographer/scripts/spiral/scratch
-/volume-cartographer/scripts/spiral/out
+/spiral-fitting/scratch
+/spiral-fitting/out
 /vesuvius/experiments
 /vesuvius/src/vesuvius/neural_tracing/winding_models/runs
+/spiral-fitting/plans
+/volume-cartographer/scripts/spiral/out

@@ -80,45 +80,6 @@ set_target_properties(vc_surface_index PROPERTIES
 target_link_libraries(vc_surface_index PRIVATE vc_core)
 target_compile_features(vc_surface_index PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_track_crossings
-    NOMINSIZE
-    vc/track_crossings.cpp
-)
-set_target_properties(vc_track_crossings PROPERTIES
-    OUTPUT_NAME track_crossings
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_crossings PRIVATE cxx_std_23)
-target_compile_options(vc_track_crossings PRIVATE
-    $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
-)
-
-nanobind_add_module(vc_track_store
-    NOMINSIZE
-    vc/track_store.cpp
-)
-set_target_properties(vc_track_store PROPERTIES
-    OUTPUT_NAME track_store
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_track_store PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_store PRIVATE cxx_std_23)
-
-nanobind_add_module(vc_spiral_sampling
-    NOMINSIZE
-    vc/spiral_sampling.cpp
-)
-set_target_properties(vc_spiral_sampling PROPERTIES
-    OUTPUT_NAME spiral_sampling
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_spiral_sampling PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_spiral_sampling PRIVATE cxx_std_23)
-
 nanobind_add_module(vc_grid_raycast
     NOMINSIZE
     vc/grid_raycast.cpp
@@ -145,7 +106,7 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling vc_grid_raycast
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

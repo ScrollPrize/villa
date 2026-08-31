@@ -927,6 +927,18 @@ cv::Vec2d QuadSurface::surfaceToGrid(const cv::Vec2d& surface) const
     };
 }
 
+void QuadSurface::shiftSurfaceOrigin(const cv::Vec2d& delta)
+{
+    // ensureLoaded() first: lazy loading overwrites _center, which would
+    // silently drop a shift applied before the points materialize.
+    ensureLoaded();
+    if (!std::isfinite(delta[0]) || !std::isfinite(delta[1])) {
+        return;
+    }
+    _center[0] += static_cast<float>(delta[0]);
+    _center[1] += static_cast<float>(delta[1]);
+}
+
 cv::Vec2d QuadSurface::gridToSurface(const cv::Vec2d& grid) const
 {
     if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])

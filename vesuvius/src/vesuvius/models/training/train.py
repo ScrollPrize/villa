@@ -1314,20 +1314,29 @@ class BaseTrainer:
         scheduler_type = getattr(self.mgr, 'scheduler', 'poly')
         scheduler_kwargs = getattr(self.mgr, 'scheduler_kwargs', {})
 
+        # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
+        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup', 'diffusers_cosine_warmup']
+        is_per_iteration = scheduler_type.lower() in per_iter_schedulers
+
+        # These are stepped once per optimizer step, so their horizon is a step
+        # count; handing them max_epoch makes the schedule end steps_per_epoch
+        # times too early and then repeat.
+        steps_per_epoch = getattr(self, '_steps_per_epoch', None)
+        max_steps = self.mgr.max_epoch
+        if is_per_iteration and steps_per_epoch:
+            max_steps = self.mgr.max_epoch * steps_per_epoch
+
         scheduler = get_scheduler(
             scheduler_type=scheduler_type,
             optimizer=optimizer,
             initial_lr=self.mgr.initial_lr,
-            max_steps=self.mgr.max_epoch,
+            max_steps=max_steps,
             **scheduler_kwargs
         )
 
-        print(f"Using {scheduler_type} learning rate scheduler")
-        
-        # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
-        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup', 'diffusers_cosine_warmup']
-        is_per_iteration = scheduler_type.lower() in per_iter_schedulers
-        
+        print(f"Using {scheduler_type} learning rate scheduler over {max_steps} "
+              f"{'steps' if is_per_iteration else 'epochs'}")
+
         return scheduler, is_per_iteration
 
     # --- scaler --- #
@@ -1618,8 +1627,6 @@ class BaseTrainer:
         self._ds_weights = None
         stage_start = perf_counter()
         optimizer = self._get_optimizer(model)
-        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
-        self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
@@ -1668,6 +1675,15 @@ class BaseTrainer:
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
         self._record_startup_timing("dataloader_build", perf_counter() - stage_start)
+
+        # Built here rather than beside the optimizer: a per-iteration schedule
+        # needs to know how many optimizer steps an epoch actually takes.
+        steps_per_epoch = len(train_dataloader)
+        if getattr(self.mgr, 'max_steps_per_epoch', None):
+            steps_per_epoch = min(steps_per_epoch, self.mgr.max_steps_per_epoch)
+        self._steps_per_epoch = steps_per_epoch
+        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
+        self._is_per_iteration_scheduler = is_per_iteration_scheduler
 
         ckpt_out_base = str(self.mgr.ckpt_out_base)
         os.makedirs(ckpt_out_base, exist_ok=True)

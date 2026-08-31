@@ -3,6 +3,7 @@
 #include <opencv2/core/types.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -161,6 +162,13 @@ struct LineOptimizationConfig {
     // Optional previous line used to initialize control-point reoptimization.
     // Indices correspond to line positions.
     std::vector<cv::Vec3d> initialLinePoints;
+    // Cooperative cancellation: when set and it becomes true, solve entry
+    // points throw LineOptimizationCancelled and the Ceres iteration callback
+    // aborts the running solve within one iteration. The pointee must outlive
+    // the solve (the caller typically owns it through a shared_ptr captured
+    // by the worker). An aborted or thrown-out-of solve leaves no usable
+    // result; callers are expected to discard it.
+    const std::atomic<bool>* cancelFlag = nullptr;
 };
 
 } // namespace vc::lasagna
