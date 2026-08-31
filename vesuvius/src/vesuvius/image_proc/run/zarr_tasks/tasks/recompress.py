@@ -256,10 +256,18 @@ class RecompressTask(ZarrTask):
                         f"  Warning: {len(level_corrupted)} corrupted chunks filled with zeros"
                     )
             except Exception as e:
-                # Clean up temp on failure
-                if Path(temp_path).exists():
-                    shutil.rmtree(temp_path)
-                raise RuntimeError(f"Recompression failed for {level_path}: {e}") from e
+                # Deliberately do NOT delete temp_path here. Each worker removes
+                # a source chunk as soon as it has copied it (delete_source_path
+                # in _recompress_worker), so once the pool has started, the
+                # original is already incomplete and temp_path holds the only
+                # copy of everything processed so far. Removing it would turn a
+                # recoverable failure into permanent data loss.
+                raise RuntimeError(
+                    f"Recompression failed for {level_path}: {e}. "
+                    f"Partially recompressed data has been left at {temp_path}. "
+                    f"The chunks it contains were already deleted from the "
+                    f"original, so recover from it before removing anything."
+                ) from e
 
     def _run_to_output(self) -> None:
         """Run recompression to a new output location."""
