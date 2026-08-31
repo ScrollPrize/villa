@@ -8,7 +8,6 @@ from the file genuinely not being published.
 """
 
 import numpy as np
-import pytest
 
 from vesuvius.data import volume as volume_module
 from vesuvius.data.volume import Volume
@@ -33,6 +32,20 @@ def _fail_with(monkeypatch, exc):
     monkeypatch.setattr(volume_module.fsspec, "open", boom)
 
 
+class _ClientResponseErrorLike(Exception):
+    """Mirrors the attribute aiohttp.ClientResponseError exposes: .status.
+
+    A stand-in rather than the real class, because aiohttp's constructor requires a
+    request_info and history that carry no meaning here. The only attribute the code
+    under test reads is .status.
+    """
+
+    def __init__(self, status, message):
+        super().__init__(f"{status}, message={message!r}")
+        self.status = status
+        self.message = message
+
+
 def _absent_404():
     """What fsspec ACTUALLY raises for a label that is not published.
 
@@ -45,15 +58,6 @@ def _absent_404():
     err = FileNotFoundError(LABEL_URL)
     err.__cause__ = cause
     return err
-
-
-class _ClientResponseErrorLike(Exception):
-    """Mirrors the attribute aiohttp.ClientResponseError exposes: .status."""
-
-    def __init__(self, status, message):
-        super().__init__(f"{status}, message={message!r}")
-        self.status = status
-        self.message = message
 
 
 def _tls_failure():
@@ -116,6 +120,20 @@ class TestMissingIsDistinguishedFromFailed:
         assert "no ink label is published" in out
         assert "not real data" in out
         assert "Warning" not in out, "an absent label is not a failure"
+
+    def test_a_decode_failure_is_not_reported_as_absent(self, monkeypatch, capsys):
+        """A published-but-unreadable label is not the same as no label.
+
+        Only a missing file is "not published". If the download succeeds and Image.open
+        raises, there is no chained cause, so a naive `cause is None` check would announce
+        the label as absent when it is in fact there.
+        """
+        _fail_with(monkeypatch, ValueError("cannot identify image file"))
+        v = _bare_segment(verbose=False)
+        v.download_inklabel()
+        out = capsys.readouterr().out
+        assert "no ink label is published" not in out
+        assert "Warning" in out
 
     def test_failed_request_is_reported_as_a_warning(self, monkeypatch, capsys):
         v = _bare_segment(verbose=False)

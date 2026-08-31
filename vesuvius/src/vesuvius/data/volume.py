@@ -819,8 +819,11 @@ class Volume:
             # "not published" from "the request failed" - the HTTP status does.
             # Anything that is not a 404 (connection reset, TLS, 403, 5xx) means the
             # label may well exist and we simply could not reach it.
+            # Only a missing file is "not published". A decode error or any other
+            # failure means the label is there and we could not use it, so it must not
+            # be announced as absent.
             status = getattr(cause, "status", None)
-            absent = cause is None or status == 404
+            absent = isinstance(e, FileNotFoundError) and (cause is None or status == 404)
 
             # Create an empty/dummy ink label array based on data shape if possible
             if hasattr(self, 'data') and self.data:
@@ -839,10 +842,9 @@ class Volume:
             # Substituting a placeholder for real data is never silent: these messages are
             # not gated on self.verbose, which defaults to False.
             #
-            # Most published segments have no ink label at all, so "not published" is the
-            # normal case and is reported as information. A chained cause means the request
-            # itself failed (connection, TLS, permissions) and the label may well exist, so
-            # that is reported as a warning. fsspec raises FileNotFoundError for both.
+            # Most published segments have no ink label at all, so a 404 is the normal case
+            # and is reported as information. Anything else means the label may well exist
+            # and we could not reach it, so that is reported as a warning.
             if absent:
                 print(
                     f"Note: no ink label is published at {inklabel_url}. "
