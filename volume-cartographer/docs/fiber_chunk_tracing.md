@@ -343,13 +343,20 @@ each consecutive pair instead receives a hard parallel-continuity link with
 parallel score 1 and winding distance 0.
 
 For a measured pair, centered 32-voxel secants determine the initial tangent
-orientation. Both pieces are walked in both directions at the sample spacing.
-At each step a bounded counter-shift of one twentieth of the spacing may be
-retained when it decreases point distance, allowing a combined relative phase
-adjustment of one tenth of the spacing. The mean consistently oriented tangent
-dot is clamped to `[0,1]` as raw parallel evidence. Raw perpendicular evidence
-is `1 - abs(initial tangent dot)`; the two values are divided by their sum, so
-the reported normalized scores add to one.
+orientation. The closest sampled pair remains the seed and first winding
+connector. By default, both pieces are walked in both directions at the sample
+spacing and a bounded anti-correlated phase shift of one twentieth spacing is
+retained when it reduces connector distance. Pass
+`--parallel-correspondence perpendicular-grid` to instead walk incrementally
+from the last accepted pair and independently vary both advances in
+one-twentieth-spacing increments by up to one quarter of the spacing. The grid
+minimizes the sum of the two squared target-step-normalized advance residuals
+and the squared alignment of the unit connector with each centered tangent;
+connector length is not scored.
+The mean consistently oriented tangent dot is clamped to `[0,1]` as raw
+parallel evidence. Raw perpendicular evidence is `1 - abs(initial tangent
+dot)`; the two values are divided by their sum, so the reported normalized
+scores add to one.
 
 Winding distance uses the ordinary Lasagna straight-connector integral, but
 each endpoint density sample is multiplied by the absolute alignment between

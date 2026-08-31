@@ -168,6 +168,12 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         std::isfinite(config.phaseRefinementLimitFraction) &&
         config.phaseRefinementLimitFraction >=
             config.phaseRefinementStepFraction &&
+        std::isfinite(config.correspondenceGridStepFraction) &&
+        config.correspondenceGridStepFraction > 0.0 &&
+        std::isfinite(config.correspondenceGridLimitFraction) &&
+        config.correspondenceGridLimitFraction >=
+            config.correspondenceGridStepFraction &&
+        config.correspondenceGridLimitFraction < 1.0 &&
         std::isfinite(config.windingIntegrationStepBaseVoxels) &&
         config.windingIntegrationStepBaseVoxels > 0.0 &&
         std::isfinite(config.maximumWindingDistance) &&
@@ -257,7 +263,41 @@ bool betterCandidate(const PairCandidate& candidate, const PairCandidate& curren
         std::tie(current.globalSampleA, current.globalSampleB);
 }
 
-std::optional<std::pair<double, double>> refinedArcs(
+struct RefinedCorrespondence {
+    double arcA = 0.0;
+    double arcB = 0.0;
+    cv::Vec3d pointA{0.0, 0.0, 0.0};
+    cv::Vec3d pointB{0.0, 0.0, 0.0};
+    cv::Vec3d tangentA{0.0, 0.0, 0.0};
+    cv::Vec3d tangentB{0.0, 0.0, 0.0};
+    double energy = std::numeric_limits<double>::infinity();
+    double stepResidual = std::numeric_limits<double>::infinity();
+    double offsetMagnitude = std::numeric_limits<double>::infinity();
+    double offsetA = 0.0;
+    double offsetB = 0.0;
+};
+
+bool betterCorrespondence(
+    const RefinedCorrespondence& candidate,
+    const RefinedCorrespondence& current)
+{
+    if (candidate.energy < current.energy - kEpsilon)
+        return true;
+    if (std::abs(candidate.energy - current.energy) > kEpsilon)
+        return false;
+    if (candidate.stepResidual < current.stepResidual - kEpsilon)
+        return true;
+    if (std::abs(candidate.stepResidual - current.stepResidual) > kEpsilon)
+        return false;
+    if (candidate.offsetMagnitude < current.offsetMagnitude - kEpsilon)
+        return true;
+    if (std::abs(candidate.offsetMagnitude - current.offsetMagnitude) > kEpsilon)
+        return false;
+    return std::tie(candidate.offsetA, candidate.offsetB) <
+        std::tie(current.offsetA, current.offsetB);
+}
+
+std::optional<std::pair<double, double>> refinedDistanceArcs(
     const FiberTraceConstraintPiece& pieceA,
     const FiberTraceConstraintPiece& pieceB,
     const PolylineArcGeometry& geometryA,
@@ -306,6 +346,93 @@ std::optional<std::pair<double, double>> refinedArcs(
     return best;
 }
 
+std::optional<RefinedCorrespondence> refinedCorrespondence(
+    const FiberTraceConstraintPiece& pieceA,
+    const FiberTraceConstraintPiece& pieceB,
+    const PolylineArcGeometry& geometryA,
+    const PolylineArcGeometry& geometryB,
+    double previousA,
+    double previousB,
+    int walkDirection,
+    int orientation,
+    double targetStep,
+    double gridStep,
+    double gridLimit,
+    double tangentWindow)
+{
+    const int gridRadius = static_cast<int>(std::floor(
+        gridLimit / gridStep + kEpsilon));
+    std::optional<RefinedCorrespondence> best;
+    for (int indexA = -gridRadius; indexA <= gridRadius; ++indexA) {
+        const double offsetA = static_cast<double>(indexA) * gridStep;
+        const double advanceA = targetStep + offsetA;
+        if (!(advanceA > kEpsilon))
+            continue;
+        const double candidateArcA = previousA +
+            static_cast<double>(walkDirection) * advanceA;
+        if (candidateArcA < pieceA.beginArcBaseVoxels - kEpsilon ||
+            candidateArcA > pieceA.endArcBaseVoxels + kEpsilon) {
+            continue;
+        }
+        const auto tangentA = centeredTangent(
+            geometryA, candidateArcA, tangentWindow);
+        if (!tangentA.has_value())
+            continue;
+        const cv::Vec3d pointA =
+            samplePolylineArc(geometryA, candidateArcA).point;
+
+        for (int indexB = -gridRadius; indexB <= gridRadius; ++indexB) {
+            const double offsetB = static_cast<double>(indexB) * gridStep;
+            const double advanceB = targetStep + offsetB;
+            if (!(advanceB > kEpsilon))
+                continue;
+            const double candidateArcB = previousB +
+                static_cast<double>(orientation * walkDirection) * advanceB;
+            if (candidateArcB < pieceB.beginArcBaseVoxels - kEpsilon ||
+                candidateArcB > pieceB.endArcBaseVoxels + kEpsilon) {
+                continue;
+            }
+            const auto tangentB = centeredTangent(
+                geometryB, candidateArcB, tangentWindow);
+            if (!tangentB.has_value())
+                continue;
+            const cv::Vec3d pointB =
+                samplePolylineArc(geometryB, candidateArcB).point;
+            const cv::Vec3d connector = pointB - pointA;
+            const double connectorLength = length(connector);
+            if (!(connectorLength > kEpsilon))
+                continue;
+            const cv::Vec3d connectorDirection = connector / connectorLength;
+            const double normalizedOffsetA = offsetA / targetStep;
+            const double normalizedOffsetB = offsetB / targetStep;
+            const double stepResidual =
+                normalizedOffsetA * normalizedOffsetA +
+                normalizedOffsetB * normalizedOffsetB;
+            const double perpendicularA = connectorDirection.dot(*tangentA);
+            const double perpendicularB = connectorDirection.dot(*tangentB);
+
+            RefinedCorrespondence candidate;
+            candidate.arcA = candidateArcA;
+            candidate.arcB = candidateArcB;
+            candidate.pointA = pointA;
+            candidate.pointB = pointB;
+            candidate.tangentA = *tangentA;
+            candidate.tangentB = *tangentB;
+            candidate.stepResidual = stepResidual;
+            candidate.energy = stepResidual +
+                perpendicularA * perpendicularA +
+                perpendicularB * perpendicularB;
+            candidate.offsetMagnitude =
+                std::abs(offsetA) + std::abs(offsetB);
+            candidate.offsetA = offsetA;
+            candidate.offsetB = offsetB;
+            if (!best.has_value() || betterCorrespondence(candidate, *best))
+                best = candidate;
+        }
+    }
+    return best;
+}
+
 ScoredCandidate scoreCandidate(
     const PairCandidate& candidate,
     const std::vector<FiberTraceConstraintPiece>& pieces,
@@ -338,52 +465,91 @@ ScoredCandidate scoreCandidate(
         config.phaseRefinementStepFraction;
     const double refinementLimit = config.resampleSpacingBaseVoxels *
         config.phaseRefinementLimitFraction;
+    const double gridStep = config.resampleSpacingBaseVoxels *
+        config.correspondenceGridStepFraction;
+    const double gridLimit = config.resampleSpacingBaseVoxels *
+        config.correspondenceGridLimitFraction;
 
     for (const int walkDirection : {-1, 1}) {
-        double phase = 0.0;
-        for (std::size_t step = 1;; ++step) {
-            const double distance = static_cast<double>(step) *
-                config.resampleSpacingBaseVoxels;
-            const double nominalA = arcA + static_cast<double>(walkDirection) * distance;
-            const double nominalB = arcB +
-                static_cast<double>(orientation * walkDirection) * distance;
-            if (nominalA < pieceA.beginArcBaseVoxels - kEpsilon ||
-                nominalA > pieceA.endArcBaseVoxels + kEpsilon ||
-                nominalB < pieceB.beginArcBaseVoxels - kEpsilon ||
-                nominalB > pieceB.endArcBaseVoxels + kEpsilon) {
-                break;
+        if (config.parallelCorrespondence ==
+            FiberTraceParallelCorrespondence::Distance) {
+            double phase = 0.0;
+            for (std::size_t step = 1;; ++step) {
+                const double distance = static_cast<double>(step) *
+                    config.resampleSpacingBaseVoxels;
+                const double nominalA = arcA +
+                    static_cast<double>(walkDirection) * distance;
+                const double nominalB = arcB +
+                    static_cast<double>(orientation * walkDirection) * distance;
+                if (nominalA < pieceA.beginArcBaseVoxels - kEpsilon ||
+                    nominalA > pieceA.endArcBaseVoxels + kEpsilon ||
+                    nominalB < pieceB.beginArcBaseVoxels - kEpsilon ||
+                    nominalB > pieceB.endArcBaseVoxels + kEpsilon) {
+                    break;
+                }
+                double selectedPhase = phase;
+                const auto arcs = refinedDistanceArcs(
+                    pieceA,
+                    pieceB,
+                    geometryA,
+                    geometryB,
+                    nominalA,
+                    nominalB,
+                    walkDirection,
+                    orientation,
+                    phase,
+                    refinementStep,
+                    refinementLimit,
+                    selectedPhase);
+                if (!arcs.has_value())
+                    break;
+                phase = selectedPhase;
+                const auto tangentA = centeredTangent(
+                    geometryA, arcs->first, config.tangentWindowBaseVoxels);
+                const auto tangentB = centeredTangent(
+                    geometryB, arcs->second, config.tangentWindowBaseVoxels);
+                if (!tangentA.has_value() || !tangentB.has_value())
+                    continue;
+                parallelSum += std::clamp(
+                    tangentA->dot(*tangentB * static_cast<double>(orientation)),
+                    -1.0,
+                    1.0);
+                parallelConnectors.emplace_back(
+                    samplePolylineArc(geometryA, arcs->first).point,
+                    samplePolylineArc(geometryB, arcs->second).point);
+                ++parallelCount;
             }
-            double selectedPhase = phase;
-            const auto arcs = refinedArcs(
-                pieceA,
-                pieceB,
-                geometryA,
-                geometryB,
-                nominalA,
-                nominalB,
-                walkDirection,
-                orientation,
-                phase,
-                refinementStep,
-                refinementLimit,
-                selectedPhase);
-            if (!arcs.has_value())
-                break;
-            phase = selectedPhase;
-            const auto tangentA = centeredTangent(
-                geometryA, arcs->first, config.tangentWindowBaseVoxels);
-            const auto tangentB = centeredTangent(
-                geometryB, arcs->second, config.tangentWindowBaseVoxels);
-            if (!tangentA.has_value() || !tangentB.has_value())
-                continue;
-            parallelSum += std::clamp(
-                tangentA->dot(*tangentB * static_cast<double>(orientation)),
-                -1.0,
-                1.0);
-            parallelConnectors.emplace_back(
-                samplePolylineArc(geometryA, arcs->first).point,
-                samplePolylineArc(geometryB, arcs->second).point);
-            ++parallelCount;
+        } else {
+            double previousA = arcA;
+            double previousB = arcB;
+            for (;;) {
+                const auto correspondence = refinedCorrespondence(
+                    pieceA,
+                    pieceB,
+                    geometryA,
+                    geometryB,
+                    previousA,
+                    previousB,
+                    walkDirection,
+                    orientation,
+                    config.resampleSpacingBaseVoxels,
+                    gridStep,
+                    gridLimit,
+                    config.tangentWindowBaseVoxels);
+                if (!correspondence.has_value())
+                    break;
+                previousA = correspondence->arcA;
+                previousB = correspondence->arcB;
+                parallelSum += std::clamp(
+                    correspondence->tangentA.dot(
+                        correspondence->tangentB * static_cast<double>(orientation)),
+                    -1.0,
+                    1.0);
+                parallelConnectors.emplace_back(
+                    correspondence->pointA,
+                    correspondence->pointB);
+                ++parallelCount;
+            }
         }
     }
 

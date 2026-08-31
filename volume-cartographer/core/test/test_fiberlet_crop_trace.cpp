@@ -20,6 +20,7 @@
 #include <limits>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -1520,6 +1521,86 @@ TEST_CASE("Parallel trace constraints use signed median walk winding")
     const auto cutoff = extract(field);
     CHECK(cutoff.constraints.empty());
     CHECK(cutoff.rejectedWindingCutoff == 1);
+}
+
+TEST_CASE("Parallel trace correspondence grid keeps curved connectors transverse")
+{
+    const auto circularArc = [](double radius) {
+        FiberletCropTraceLine line;
+        for (int index = 0; index <= 128; ++index) {
+            const double angle = static_cast<double>(index) * 0.01;
+            line.pointsBaseXYZ.emplace_back(
+                radius * std::cos(angle),
+                radius * std::sin(angle),
+                0.0);
+        }
+        return line;
+    };
+
+    FiberTraceConstraintConfig config;
+    CHECK(config.parallelCorrespondence ==
+          FiberTraceParallelCorrespondence::Distance);
+    CHECK(config.correspondenceGridLimitFraction == 0.25);
+    config.parallelCorrespondence =
+        FiberTraceParallelCorrespondence::PerpendicularGrid;
+    config.maximumDistanceBaseVoxels = 16.0;
+    config.tangentWindowBaseVoxels = 16.0;
+    config.correspondenceGridLimitFraction = 0.05;
+    config.enforceMaximumWindingDistance = false;
+    config.parallelThreads = 1;
+
+    std::vector<std::pair<cv::Vec3d, cv::Vec3d>> sampledConnectors;
+    const auto report = extractFiberTraceConstraints(
+        {circularArc(100.0), circularArc(110.0)},
+        config,
+        {},
+        [&](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+            double,
+            int) {
+            sampledConnectors = connectors;
+            return std::vector<double>(connectors.size(), 0.0);
+        });
+
+    REQUIRE(report.constraints.size() == 1);
+    REQUIRE(sampledConnectors.size() >= 4);
+    double maximumTangentialAlignment = 0.0;
+    bool sawIndependentAdvance = false;
+    std::optional<double> previousArcA;
+    std::optional<double> previousArcB;
+    for (const auto& connector : sampledConnectors) {
+        const cv::Vec3d delta = connector.second - connector.first;
+        REQUIRE(cv::norm(delta) > 0.0);
+        const cv::Vec3d direction = delta / cv::norm(delta);
+        cv::Vec3d tangentA{
+            -connector.first[1], connector.first[0], 0.0};
+        cv::Vec3d tangentB{
+            -connector.second[1], connector.second[0], 0.0};
+        tangentA /= cv::norm(tangentA);
+        tangentB /= cv::norm(tangentB);
+        maximumTangentialAlignment = std::max({
+            maximumTangentialAlignment,
+            std::abs(direction.dot(tangentA)),
+            std::abs(direction.dot(tangentB)),
+        });
+        const double arcA = 100.0 * std::atan2(
+            connector.first[1], connector.first[0]);
+        const double arcB = 110.0 * std::atan2(
+            connector.second[1], connector.second[0]);
+        if (previousArcA.has_value() && previousArcB.has_value()) {
+            const double advanceA = arcA - *previousArcA;
+            const double advanceB = arcB - *previousArcB;
+            CHECK(advanceA >= 30.3);
+            CHECK(advanceA <= 33.7);
+            CHECK(advanceB >= 30.3);
+            CHECK(advanceB <= 33.7);
+            sawIndependentAdvance = sawIndependentAdvance ||
+                std::abs(advanceA - advanceB) > 0.5;
+        }
+        previousArcA = arcA;
+        previousArcB = arcB;
+    }
+    CHECK(maximumTangentialAlignment < 0.12);
+    CHECK(sawIndependentAdvance);
 }
 
 TEST_CASE("Reference constraint selection keeps measured cross-source links")

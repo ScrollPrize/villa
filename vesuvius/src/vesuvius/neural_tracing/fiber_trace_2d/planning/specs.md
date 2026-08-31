@@ -4837,11 +4837,22 @@
   with parallel score 1, perpendicular score 0, winding distance 0, and closest
   distance 0. Nonconsecutive pieces receive no implicit same-trace link.
 - A measured pair is oriented by the signed dot of centered secants at its
-  closest samples. Both pieces are walked forward and backward at the common
-  pitch. Each step may retain a strictly closer counter-shift of one twentieth
-  pitch per piece, bounded to that magnitude, for at most one tenth pitch
-  relative adjustment. The raw parallel score is the clamped `[0,1]` mean of
-  consistently oriented tangent dots. Raw perpendicular score is
+  closest samples. The closest sampled pair remains the unchanged walk seed,
+  reported closest connector, and first parallel-winding sample. The default
+  `distance` correspondence walks both pieces forward and backward at the
+  common pitch and retains a strictly closer anti-correlated phase shift of one
+  twentieth pitch, bounded to that magnitude. The optional
+  `perpendicular-grid` correspondence instead walks incrementally from the last
+  accepted pair. At each step, an independent deterministic 2D grid varies each
+  advance in increments of one twentieth pitch, bounded to one quarter pitch.
+  Grid candidates
+  minimize the sum of both squared target-step-normalized advance residuals and
+  the squared dot of the unit connector with each centered tangent. Zero-length
+  connectors are invalid; connector length is not part of the objective. Ties
+  prefer smaller step residual, smaller total absolute offset, then
+  lexicographic offsets. The grid limit must remain below one pitch so every
+  accepted step advances. The raw parallel score is the clamped `[0,1]` mean
+  of consistently oriented tangent dots. Raw perpendicular score is
   `1 - abs(initial tangent dot)`. Division by their sum produces complementary
   normalized scores.
 - Normal-aligned winding uses the existing Lasagna connector integral and

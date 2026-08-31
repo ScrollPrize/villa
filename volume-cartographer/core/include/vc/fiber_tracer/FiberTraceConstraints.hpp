@@ -18,14 +18,23 @@ namespace vc::fiber_tracer
 
 struct LasagnaNormalAlignmentField;
 
+enum class FiberTraceParallelCorrespondence {
+    Distance,
+    PerpendicularGrid,
+};
+
 struct FiberTraceConstraintConfig {
     double resampleSpacingBaseVoxels = 32.0;
     double targetPieceLengthBaseVoxels = 512.0;
     double pieceOverlapBaseVoxels = 128.0;
     double maximumDistanceBaseVoxels = 128.0;
     double tangentWindowBaseVoxels = 32.0;
+    FiberTraceParallelCorrespondence parallelCorrespondence =
+        FiberTraceParallelCorrespondence::Distance;
     double phaseRefinementStepFraction = 0.05;
     double phaseRefinementLimitFraction = 0.05;
+    double correspondenceGridStepFraction = 0.05;
+    double correspondenceGridLimitFraction = 0.25;
     double windingIntegrationStepBaseVoxels = 8.0;
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = true;

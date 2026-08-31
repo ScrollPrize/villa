@@ -1694,3 +1694,12 @@
   and final selected-result artifact output.
 - Promoted the locally selected `8,1,2,2,1` tuple to the shared and CLI default
   for H/V-aware winding solves; explicit all-ones retains neutral weighting.
+
+## 2026-08-31 - Parallel correspondence grid
+
+- Replaced closest-distance phase refinement with an incremental 2D arc-offset
+  grid that balances target step length against connector perpendicularity.
+- Expanded the optional grid's independent correction range from 5% to 25% of
+  the target step while retaining 5% grid resolution.
+- Kept the expanded grid behind `--parallel-correspondence perpendicular-grid`
+  and restored the established closest-distance walk as the default.

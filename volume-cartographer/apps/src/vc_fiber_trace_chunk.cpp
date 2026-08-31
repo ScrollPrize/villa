@@ -261,6 +261,8 @@ void usage(const char* executable)
               << "  --piece-overlap N          neighboring piece overlap [128]\n"
               << "  --max-distance N           closest-pair threshold [128]\n"
               << "  --tangent-window N         centered tangent secant length [32]\n"
+              << "  --parallel-correspondence MODE\n"
+              << "                              distance or perpendicular-grid [distance]\n"
               << "  --winding-step N           Lasagna connector integration step [8]\n"
               << "  --winding-cutoff N         exclusive finite winding cutoff [4 H/V; 1.5 parity]\n"
               << "  --no-winding-cutoff        retain every finite winding measurement\n"
@@ -737,6 +739,19 @@ Options parse(int argc, char** argv)
         } else if (argument == "--tangent-window") {
             options.constraints.tangentWindowBaseVoxels = number(index, argc, argv, "--tangent-window");
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-correspondence") {
+            const auto mode = value(
+                index, argc, argv, "--parallel-correspondence");
+            if (mode == "distance") {
+                options.constraints.parallelCorrespondence =
+                    vc::fiber_tracer::FiberTraceParallelCorrespondence::Distance;
+            } else if (mode == "perpendicular-grid") {
+                options.constraints.parallelCorrespondence =
+                    vc::fiber_tracer::FiberTraceParallelCorrespondence::PerpendicularGrid;
+            } else {
+                fail("--parallel-correspondence must be distance or perpendicular-grid");
+            }
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-step") {
             options.constraints.windingIntegrationStepBaseVoxels = number(index, argc, argv, "--winding-step");
             options.hasConstraintOnlyOption = true;
@@ -1059,12 +1074,17 @@ void printConstraintReport(
     }
     std::cout << std::setprecision(8)
               << "fiber trace constraint config\n"
-              << "sample_step  piece_length  piece_overlap  max_distance  tangent_window  winding_step  winding_cutoff  threads\n"
+              << "sample_step  piece_length  piece_overlap  max_distance  tangent_window  correspondence  winding_step  winding_cutoff  threads\n"
               << config.resampleSpacingBaseVoxels << "  "
               << config.targetPieceLengthBaseVoxels << "  "
               << config.pieceOverlapBaseVoxels << "  "
               << config.maximumDistanceBaseVoxels << "  "
               << config.tangentWindowBaseVoxels << "  "
+              << (config.parallelCorrespondence ==
+                          vc::fiber_tracer::FiberTraceParallelCorrespondence::Distance
+                      ? "distance"
+                      : "perpendicular-grid")
+              << "  "
               << config.windingIntegrationStepBaseVoxels << "  "
               << (config.enforceMaximumWindingDistance
                       ? std::to_string(config.maximumWindingDistance)

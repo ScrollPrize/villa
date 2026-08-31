@@ -1,18 +1,18 @@
-# Task: direct winding-factor weight search
+# Task: perpendicular parallel-fiber correspondence search
 
-Add independent multipliers for the five canonical winding-factor classes:
-`perp_0.5`, `perp_1.5+`, `parallel_0`, `parallel_1`, and `parallel_2+`.
-Allow a fixed tuple to be run normally and an exhaustive direct grid search to
-reuse the already extracted BP graph, topology, fixed orientation prepass, and
-reference cross-constraints. Report and rank each setting from the calibrated
-reference-fiber winding benchmark so robust next-winding perpendicular and
-same-winding parallel evidence can be tested at larger relative weights.
+Replace the closest-distance phase refinement used while walking a parallel
+fiber pair with a small, deterministic two-dimensional arc-offset search.
 
-Extend the search with multiplicative coordinate descent. Starting from an
-explicit tuple, evaluate each single-coordinate `/2` and `*2` neighbor, move to
-the best strict improvement, and repeat until the current tuple is a local
-optimum (minimum benchmark error) under that neighborhood.
+For each paired step, independently vary the advance on both fibers around the
+target step and minimize:
 
-Promote the resulting `8,1,2,2,1` tuple to the standard winding-factor default
-for CLI and shared-library runs, while retaining explicit override and search
-behavior.
+- deviation of both advances from the target step; and
+- non-perpendicularity of the connector to both local fiber tangents.
+
+Do not add a local regression/Gauss-Newton refinement and do not minimize
+connector length. Keep the existing closest sampled pair as the initial seed.
+Use a grid resolution of 5% of the target step and allow independent corrections
+up to 25% of the target step on each fiber.
+
+Preserve the grid as an explicit optional CLI variant and restore the original
+closest-distance phase walk as the default before real-data experimentation.
