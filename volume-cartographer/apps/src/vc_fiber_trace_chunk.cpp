@@ -2824,6 +2824,7 @@ std::string formatReferenceBpWindingBenchmark(
            << vc::fiber_tracer::fiberTraceWindingSolverName(winding.solver)
            << " status=" << winding.status
            << " tolerance=" << std::fixed << std::setprecision(3) << benchmark.tolerance << '\n'
+           << "global sign=" << benchmark.globalSign << '\n'
            << "gauge calibration\n"
            << std::left << std::setw(12) << "gauge" << std::setw(14) << "offset" << std::setw(12) << "right"
            << "total\n";

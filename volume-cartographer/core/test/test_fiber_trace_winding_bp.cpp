@@ -470,13 +470,14 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
         {Class::ParallelOtherWinding, 1, 0.5, {0.0, 0.0}, 0, 2},
     };
     const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    CHECK(benchmark.globalSign == 1);
     REQUIRE(benchmark.gauges.size() == 2);
     CHECK(benchmark.gauges[0].integerGauge == 0);
     CHECK(benchmark.gauges[0].offset == doctest::Approx(1.5));
     CHECK(benchmark.gauges[0].right == 3);
     CHECK(benchmark.gauges[0].observations == 4);
     CHECK(benchmark.gauges[1].integerGauge == 1);
-    CHECK(benchmark.gauges[1].offset == doctest::Approx(-2.75));
+    CHECK(benchmark.gauges[1].offset == doctest::Approx(-3.0));
     CHECK(benchmark.gauges[1].right == 1);
     CHECK(benchmark.gauges[1].observations == 1);
     CHECK(benchmark.classes[0].right == 2);
@@ -505,7 +506,7 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.references[2].sum.total == 0);
     CHECK_FALSE(benchmark.references[0].estimatedWinding.has_value());
     REQUIRE(benchmark.references[1].estimatedWinding.has_value());
-    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(5.5));
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(4.0));
     CHECK(benchmark.references[1].estimatedWindingSupport == 1);
     CHECK(benchmark.references[1].estimatedWindingObservations == 2);
     CHECK_FALSE(benchmark.references[2].estimatedWinding.has_value());
@@ -575,25 +576,54 @@ TEST_CASE("Reference winding benchmark estimates each source independently")
 {
     using Class = FiberTraceReferenceConstraintClass;
     const std::vector<FiberTraceReferenceWindingObservation> observations{
-        {Class::Perpendicular, 2, 100.0, {2.1, 0.0}, 1, 0},
-        {Class::ParallelSameWinding, 2, -30.0, {2.4, 0.0}, 1, 0},
-        {Class::ParallelOtherWinding, 2, 7.0, {-4.0, 2.6}, 2, 0},
-        {Class::Perpendicular, 2, 0.0, {-1.2, 0.0}, 1, 1},
-        {Class::ParallelSameWinding, 2, 0.0, {-0.8, 0.0}, 1, 1},
+        {Class::Perpendicular, 2, 0.0, {2.1, 0.0}, 1, 0},
+        {Class::ParallelSameWinding, 2, 0.0, {1.9, 0.0}, 1, 0},
+        {Class::ParallelOtherWinding, 2, 0.0, {-4.0, 2.2}, 2, 0},
+        {Class::Perpendicular, 2, 0.5, {2.3, 0.0}, 1, 1},
+        {Class::ParallelSameWinding, 2, 0.5, {2.7, 0.0}, 1, 1},
     };
 
     const auto benchmark = calibrateFiberTraceReferenceWindings(
         observations, 0.5);
 
+    CHECK(benchmark.globalSign == 1);
+    REQUIRE(benchmark.gauges.size() == 1);
+    CHECK(benchmark.gauges[0].offset == doctest::Approx(2.0));
     REQUIRE(benchmark.references.size() == 2);
     REQUIRE(benchmark.references[0].estimatedWinding.has_value());
-    CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(2.5));
+    CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(0.0));
     CHECK(benchmark.references[0].estimatedWindingSupport == 3);
     CHECK(benchmark.references[0].estimatedWindingObservations == 3);
     REQUIRE(benchmark.references[1].estimatedWinding.has_value());
-    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(-1.0));
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(0.5));
     CHECK(benchmark.references[1].estimatedWindingSupport == 2);
     CHECK(benchmark.references[1].estimatedWindingObservations == 2);
+}
+
+TEST_CASE("Reference winding benchmark corrects a global sign reversal")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    const std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 0, 0.0, {4.0, 0.0}, 1, 0},
+        {Class::Perpendicular, 0, 0.5, {3.5, 0.0}, 1, 1},
+        {Class::Perpendicular, 0, 1.0, {3.0, 0.0}, 1, 2},
+        {Class::Perpendicular, 0, 1.5, {2.5, 0.0}, 1, 3},
+    };
+
+    const auto benchmark = calibrateFiberTraceReferenceWindings(
+        observations, 0.1);
+
+    CHECK(benchmark.globalSign == -1);
+    REQUIRE(benchmark.gauges.size() == 1);
+    CHECK(benchmark.gauges[0].offset == doctest::Approx(4.0));
+    CHECK(benchmark.sum.right == observations.size());
+    REQUIRE(benchmark.references.size() == observations.size());
+    for (std::size_t source = 0; source < benchmark.references.size();
+         ++source) {
+        REQUIRE(benchmark.references[source].estimatedWinding.has_value());
+        CHECK(*benchmark.references[source].estimatedWinding ==
+              doctest::Approx(0.5 * static_cast<double>(source)));
+    }
 }
 
 TEST_CASE("Reference observations use authoritative latent endpoint algebra")

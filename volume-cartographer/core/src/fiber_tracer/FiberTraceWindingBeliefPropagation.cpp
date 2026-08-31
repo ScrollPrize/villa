@@ -3137,6 +3137,8 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     FiberTraceReferenceWindingBenchmark result;
     result.tolerance = tolerance;
     result.references.resize(referenceSources);
+    std::vector<std::optional<double>> rawEstimatedWindings(referenceSources);
+    std::vector<std::optional<std::size_t>> gaugeByReference(referenceSources);
     std::vector<std::vector<std::size_t>> observationsByReference(
         referenceSources);
     for (std::size_t index = 0; index < observations.size(); ++index) {
@@ -3205,13 +3207,16 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
             }
         }
         auto& reference = result.references[source];
-        reference.estimatedWinding = bestWinding;
+        rawEstimatedWindings[source] = bestWinding;
+        gaugeByReference[source] = gauge;
         reference.estimatedWindingSupport = bestSupport;
         reference.estimatedWindingObservations = indices.size();
     }
-    std::map<std::size_t, double> offsetByGauge;
-    const auto isRight = [&](const FiberTraceReferenceWindingObservation& o, double offset) {
-        const double expected = o.virtualReferenceWinding + offset;
+    const auto isRight = [&](const FiberTraceReferenceWindingObservation& o,
+                             int sign,
+                             double offset) {
+        const double expected =
+            static_cast<double>(sign) * o.virtualReferenceWinding + offset;
         for (std::size_t candidate = 0; candidate < o.inferredReferenceWindingCount; ++candidate) {
             if (std::abs(o.inferredReferenceWindings[candidate] - expected) <= tolerance + kEpsilon) {
                 return true;
@@ -3231,44 +3236,94 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         std::size_t starts = 0;
         std::size_t ends = 0;
     };
-    for (const auto& [gauge, indices] : observationsByGauge) {
-        std::map<double, OffsetEvents> events;
-        for (const std::size_t index : indices) {
-            const auto& observation = observations[index];
-            std::array<std::pair<double, double>, 2> intervals{};
-            std::size_t intervalCount = 0;
-            for (std::size_t candidate = 0; candidate < observation.inferredReferenceWindingCount; ++candidate) {
-                const double center = observation.inferredReferenceWindings[candidate] - observation.virtualReferenceWinding;
-                intervals[intervalCount++] = {center - tolerance, center + tolerance};
-            }
-            if (intervalCount == 2 && intervals[1].first < intervals[0].first) {
-                std::swap(intervals[0], intervals[1]);
-            }
-            if (intervalCount == 2 && intervals[1].first <= intervals[0].second + kEpsilon) {
-                intervals[0].second = std::max(intervals[0].second, intervals[1].second);
-                intervalCount = 1;
-            }
-            for (std::size_t interval = 0; interval < intervalCount; ++interval) {
-                ++events[intervals[interval].first].starts;
-                ++events[intervals[interval].second].ends;
-            }
-        }
 
-        double bestOffset = 0.0;
-        std::size_t bestRight = 0;
-        for (const std::size_t index : indices)
-            bestRight += isRight(observations[index], bestOffset) ? 1 : 0;
-        std::size_t active = 0;
-        for (const auto& [offset, event] : events) {
-            active += event.starts;
-            if (betterOffset(active, offset, bestRight, bestOffset)) {
-                bestRight = active;
-                bestOffset = offset;
+    struct SignCalibration {
+        int sign = 1;
+        std::vector<FiberTraceReferenceGaugeCalibration> gauges;
+        std::size_t right = 0;
+    };
+    const auto calibrateSign = [&](int sign) {
+        SignCalibration calibration;
+        calibration.sign = sign;
+        for (const auto& [gauge, indices] : observationsByGauge) {
+            std::map<double, OffsetEvents> events;
+            for (const std::size_t index : indices) {
+                const auto& observation = observations[index];
+                std::array<std::pair<double, double>, 2> intervals{};
+                std::size_t intervalCount = 0;
+                for (std::size_t candidate = 0;
+                     candidate < observation.inferredReferenceWindingCount;
+                     ++candidate) {
+                    const double center =
+                        observation.inferredReferenceWindings[candidate] -
+                        static_cast<double>(sign) *
+                            observation.virtualReferenceWinding;
+                    const double first =
+                        std::ceil(2.0 * (center - tolerance) - kEpsilon);
+                    const double last =
+                        std::floor(2.0 * (center + tolerance) + kEpsilon);
+                    if (first <= last)
+                        intervals[intervalCount++] = {first, last};
+                }
+                if (intervalCount == 2 &&
+                    intervals[1].first < intervals[0].first) {
+                    std::swap(intervals[0], intervals[1]);
+                }
+                if (intervalCount == 2 &&
+                    intervals[1].first <= intervals[0].second + 1.0) {
+                    intervals[0].second =
+                        std::max(intervals[0].second, intervals[1].second);
+                    intervalCount = 1;
+                }
+                for (std::size_t interval = 0; interval < intervalCount;
+                     ++interval) {
+                    ++events[intervals[interval].first].starts;
+                    ++events[intervals[interval].second].ends;
+                }
             }
-            active -= event.ends;
+
+            double bestOffset = 0.0;
+            std::size_t bestRight = 0;
+            for (const std::size_t index : indices) {
+                bestRight +=
+                    isRight(observations[index], sign, bestOffset) ? 1 : 0;
+            }
+            std::size_t active = 0;
+            for (const auto& [offsetTick, event] : events) {
+                active += event.starts;
+                const double offset = 0.5 * static_cast<double>(offsetTick);
+                if (betterOffset(active, offset, bestRight, bestOffset)) {
+                    bestRight = active;
+                    bestOffset = offset;
+                }
+                active -= event.ends;
+            }
+            calibration.gauges.push_back(
+                {gauge, bestOffset, indices.size(), bestRight});
+            calibration.right += bestRight;
         }
-        result.gauges.push_back({gauge, bestOffset, indices.size(), bestRight});
-        offsetByGauge.emplace(gauge, bestOffset);
+        return calibration;
+    };
+
+    SignCalibration calibration = calibrateSign(1);
+    const SignCalibration reversed = calibrateSign(-1);
+    if (reversed.right > calibration.right)
+        calibration = reversed;
+    result.globalSign = calibration.sign;
+    result.gauges = std::move(calibration.gauges);
+
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : result.gauges)
+        offsetByGauge.emplace(gauge.integerGauge, gauge.offset);
+    for (std::size_t source = 0; source < result.references.size(); ++source) {
+        if (!rawEstimatedWindings[source] || !gaugeByReference[source])
+            continue;
+        const auto offset = offsetByGauge.find(*gaugeByReference[source]);
+        if (offset == offsetByGauge.end())
+            continue;
+        result.references[source].estimatedWinding =
+            static_cast<double>(result.globalSign) *
+            (*rawEstimatedWindings[source] - offset->second);
     }
 
     for (const auto& observation : observations) {
@@ -3282,7 +3337,10 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         ++referenceCounts.total;
         ++reference.sum.total;
         ++result.sum.total;
-        const bool right = isRight(observation, offsetByGauge.at(observation.integerGauge));
+        const bool right = isRight(
+            observation,
+            result.globalSign,
+            offsetByGauge.at(observation.integerGauge));
         if (right) {
             ++counts.right;
             ++referenceCounts.right;

@@ -374,6 +374,7 @@ struct FiberTraceReferenceSourceBenchmark {
 
 struct FiberTraceReferenceWindingBenchmark {
     double tolerance = 0.5;
+    int globalSign = 1;
     std::vector<FiberTraceReferenceGaugeCalibration> gauges;
     std::array<FiberTraceReferenceBenchmarkCounts, 3> classes;
     std::vector<FiberTraceReferenceSourceBenchmark> references;
