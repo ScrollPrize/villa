@@ -6,6 +6,7 @@ from pathlib import Path
 import math
 
 import numpy as np
+from dtypes import numpy_float_hi
 import torch
 import tifffile
 
@@ -413,7 +414,7 @@ class InitShellIndex:
 		shell_index: int | None = None,
 		anchor_hw: tuple[float, float] | None = None,
 	) -> ShellClosestPoint:
-		seed_np = np.asarray(seed, dtype=np.floathi)
+		seed_np = np.asarray(seed, dtype=numpy_float_hi)
 		if seed_np.shape != (3,) or not np.all(np.isfinite(seed_np)):
 			raise ValueError(f"seed must be three finite coordinates, got {seed}")
 		if shell_index is not None and (int(shell_index) < 0 or int(shell_index) >= len(self.surfaces)):
@@ -653,7 +654,7 @@ def crop_shell_surface(
 ) -> tuple[torch.Tensor, torch.Tensor, ShellCropInfo]:
 	if closest.shell_id != surface.shell_id:
 		raise ValueError(f"closest point shell_id {closest.shell_id!r} does not match surface {surface.shell_id!r}")
-	seed_np = np.asarray(seed, dtype=np.floathi)
+	seed_np = np.asarray(seed, dtype=numpy_float_hi)
 	if seed_np.shape != (3,) or not np.all(np.isfinite(seed_np)):
 		raise ValueError(f"seed must be three finite coordinates, got {seed}")
 	step = float(mesh_step)

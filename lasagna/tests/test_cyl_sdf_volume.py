@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from dtypes import torch_float_hi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -33,7 +34,7 @@ class CylSdfVolumeTests(unittest.TestCase):
 		self.assertTrue(edges)
 		self.assertEqual(set(edges.values()), {2})
 
-		v = verts.to(dtype=torch.floathi)
+		v = verts.to(dtype=torch_float_hi)
 		f = faces.to(dtype=torch.long)
 		p0 = v[f[:, 0]]
 		p1 = v[f[:, 1]]

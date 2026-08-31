@@ -64,6 +64,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from dtypes import torch_float_hi, numpy_float_hi
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -104,7 +105,7 @@ def _allreduce_max(value: int, world_size: int, device) -> int:
 def _allreduce_mean(value: float, world_size: int, device) -> float:
     if world_size <= 1:
         return float(value)
-    t = torch.tensor([float(value)], device=device, dtype=torch.floathi)
+    t = torch.tensor([float(value)], device=device, dtype=torch_float_hi)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return float(t.item() / world_size)
 
@@ -1548,11 +1549,11 @@ def _pick_refine_mode(
     """
     # Weights: [m0, m1, m2, m3, m4, m5, m6]
     #           single-scale   chains        self-refine
-    base_weights = np.array([2, 2, 2, 3, 3, 3, 1], dtype=np.floathi)
+    base_weights = np.array([2, 2, 2, 3, 3, 3, 1], dtype=numpy_float_hi)
 
     def _draw():
         # Filter modes to those whose offsets are all available
-        feasible = np.zeros(7, dtype=np.floathi)
+        feasible = np.zeros(7, dtype=numpy_float_hi)
         for mi in range(6):
             needed = {off for off, _ in REFINE_MODES_FIXED[mi]}
             if needed.issubset(available_offsets):

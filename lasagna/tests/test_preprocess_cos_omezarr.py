@@ -1280,7 +1280,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			with self.assertRaisesRegex(ValueError, "float16 or float32"):
 				_CircularZBand(
 					name="bad", channel_count=1, z_size=1, y_size=1, x_size=1,
-					tmp_dir=td, prefix="unit_", dtype=np.floathi,
+					tmp_dir=td, prefix="unit_", dtype=np.float64,
 				)
 
 	def test_rolling_z_band_sparse_ranges_read_as_zero(self):

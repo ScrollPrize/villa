@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from dtypes import torch_float_hi
 
 
 DEFAULT_CYL_OUTSIDE_GRID_STEP = 64.0
@@ -115,9 +116,9 @@ def capped_shell_mesh(shell_xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 	W = int(shell_xyz.shape[1])
 	if H < 2 or W < 3:
 		raise ValueError(f"capped shell mesh requires H>=2 and W>=3, got H={H} W={W}")
-	verts = shell_xyz.detach().to(device="cpu", dtype=torch.floathi).contiguous().reshape(H * W, 3)
-	bottom_center = shell_xyz[0].detach().to(device="cpu", dtype=torch.floathi).mean(dim=0, keepdim=True)
-	top_center = shell_xyz[-1].detach().to(device="cpu", dtype=torch.floathi).mean(dim=0, keepdim=True)
+	verts = shell_xyz.detach().to(device="cpu", dtype=torch_float_hi).contiguous().reshape(H * W, 3)
+	bottom_center = shell_xyz[0].detach().to(device="cpu", dtype=torch_float_hi).mean(dim=0, keepdim=True)
+	top_center = shell_xyz[-1].detach().to(device="cpu", dtype=torch_float_hi).mean(dim=0, keepdim=True)
 	verts = torch.cat([verts, bottom_center, top_center], dim=0)
 	bottom_i = H * W
 	top_i = H * W + 1
@@ -145,7 +146,7 @@ def default_shell_bbox(
 ) -> tuple[float, float, float, float, float, float]:
 	_ = max(1.0e-6, float(grid_step))
 	pad = CYL_OUTSIDE_BARRIER_DEPTH_MAX if padding is None else max(0.0, float(padding))
-	shell_cpu = shell_xyz.detach().to(device="cpu", dtype=torch.floathi)
+	shell_cpu = shell_xyz.detach().to(device="cpu", dtype=torch_float_hi)
 	lo = shell_cpu.reshape(-1, 3).amin(dim=0) - pad
 	hi = shell_cpu.reshape(-1, 3).amax(dim=0) + pad
 	return (
@@ -234,8 +235,8 @@ def build_previous_shell_violation_depth_volume(
 	volume_cpu, depth_max = ext.build_violation_depth_volume(
 		verts.contiguous(),
 		faces.contiguous(),
-		torch.tensor(origin, dtype=torch.floathi),
-		torch.tensor((step, step, step), dtype=torch.floathi),
+		torch.tensor(origin, dtype=torch_float_hi),
+		torch.tensor((step, step, step), dtype=torch_float_hi),
 		torch.tensor(shape, dtype=torch.int64),
 		float(depth_max),
 		mode,
