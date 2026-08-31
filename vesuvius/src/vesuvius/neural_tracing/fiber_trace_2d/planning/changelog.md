@@ -1,3 +1,14 @@
+# 2026-08-31: weighted reference winding diagnostics
+
+- Added per-reference finite-L1 diagnostics split into perpendicular `0.5` and
+  `1.5+` and parallel `0`, `1`, and `2+` canonical-step groups, including raw
+  versus cutoff-admitted coefficient, loss at truth, and group-only inferred
+  winding.
+- Made measured BP factors mutually exclusive by retaining only their dominant
+  parallel or perpendicular hypothesis, and unified group inference and
+  `est_w` on that admitted factor. The combined row uses lexicographic
+  hard-sign violation handling for contradictory forced-active evidence.
+
 # 2026-08-28: constraint-scaled BP Defect costs
 
 - Restored per-constraint Mixed/Defect cost coefficients in orientation and

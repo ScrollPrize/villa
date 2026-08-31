@@ -881,22 +881,26 @@ share these conversions.
 The independent integer-only winding diagnostic remains raw because it has no
 half-offset H/V lattice.
 
-Each component is independently multiplied by
+The dominant hypothesis is multiplied by
 `2^-floor(abs(effective_target))`. Parallel integer distances `0`, `1`, `2`,
 and `3` therefore use multipliers `1`, `0.5`, `0.25`, and `0.125`, while
 perpendicular half-integer targets `0.5`, `1.5`, `2.5`, and `3.5` use the same
 sequence starting at `1`. It does not scale the separate H/V relation energy,
 hard same-trace continuity, or the strict sign requirement on a nonzero signed
 perpendicular observation. The formula continues for larger bins admitted by
-an explicit extraction-cutoff override. Factor CSV output records both targets,
-both multipliers, and both effective winding weights.
+an explicit extraction-cutoff override. Parallel and perpendicular hypotheses
+are mutually exclusive for winding: only the larger score contributes winding
+energy. Ties select perpendicular. The H/V relation potential still uses the
+complementary scores as alternative same/different costs. Factor CSV output
+retains the raw scores and targets while its effective weights identify the
+selected winding term.
 
 `--parallel-winding-cutoff N` applies an additional exclusive filter only to
-the H/V-aware solve's integer parallel component. For example, `0.5` retains
-only same-winding distance `0`. A filtered parallel component still contributes
-its ordinary H/V orientation score, and the perpendicular component of the
-same measured factor remains active. Extraction, reference diagnostics, and
-stored constraints are unchanged. The default is no additional filter.
+parallel-dominant integer winding evidence. For example, `0.5` retains only
+same-winding distance `0`. A filtered parallel factor still contributes its
+ordinary H/V orientation score. Perpendicular-dominant factors, extraction,
+and stored constraints are unchanged; reference diagnostics expose the
+suppression through `used_w`. The default is no additional filter.
 Factor/message connectivity remains intact after filtering. Each message
 component retains one H/V class gauge, while disconnected effective-winding
 subgraphs receive separate integer-zero gauges. An extra integer gauge does
@@ -1222,9 +1226,10 @@ BP runs without reference fibers.
 `BP admitted winding evidence by source-piece cohort` follows the state table.
 It reports the winding terms that survived preparation for the final solve:
 hard continuity, perpendicular, parallel-same, and parallel-other. A measured
-link can appear in both perpendicular and parallel rows because both weighted
-hypotheses are present in the BP factor. The `measurement` row counts each
-admitted link once and thus matches the degree basis used by the Defect unary.
+link appears in exactly one perpendicular or parallel row according to its
+dominant hypothesis. The `measurement` row counts each admitted link once and
+can be smaller than the degree basis used by the Defect unary when the parallel
+cutoff suppresses a parallel-dominant winding term.
 `inc` counts endpoint incidences. `act_i/p` and `def_i/p` first separate those
 incidences by final state and then normalize by the corresponding piece count;
 `act_c/p` and `def_c/p` do the same for finite coefficient.
@@ -1240,7 +1245,30 @@ independently gauged BP winding subgraph. Each offset is selected by exhaustive
 closed-interval event search to maximize matches within an inclusive `0.5`
 winding tolerance. Offset ties prefer the value closest to zero, then the lower
 signed value. Output first lists each gauge's offset and matched/total count,
-then one compact error row for every selected reference JSON in source order,
+then prints a weighted constraint-group diagnostic. For each reference winding
+it splits dominant perpendicular evidence into canonical step `0.5` and
+`1.5+`, and dominant parallel evidence into canonical step `0`, `1`, and
+`2+`. Every member contributes only its dominant BP winding term. `raw_w` sums
+the winning scores after fixed power-of-two winding-distance decay. `used_w` additionally reflects
+parallel-distance cutoff suppression. `true_h` and `infer_h` count violated hard
+signed-order constraints. Candidate selection first minimizes that count, then
+the admitted dominant-hypothesis BP winding energy. `true_L1`/`true_avg` give total
+and admitted-coefficient-mean energy at the globally calibrated true winding;
+`infer_w` and `infer_L1`/`infer_avg` give the half-integer winding and energy
+preferred by that group alone. Perpendicular coordinate residuals are divided
+by the solved measurement scale. Gauge-local candidates are transformed by the global sign
+and their gauge offset before aggregation, including when one reference source
+reaches multiple gauges. `NA` denotes a group with no positive raw coefficient.
+
+An additional `all` row evaluates every constraint for the reference with the
+same scorer. Its preferred winding is exactly the `est_w` printed in the next
+table. This removes the previous difference between weighted-L1 group inference
+and support-count/squared-residual reference inference. In BP, any hard-sign
+violation makes an active pair state impossible and Defect provides an escape.
+The forced-active reference diagnostic instead minimizes the number of hard
+violations before finite energy when hard evidence is contradictory.
+
+The command then prints one compact error row for every selected reference JSON in source order,
 identified only by its filename-ordered virtual winding. Each row
 contains right/wrong/right-fraction columns for perpendicular, parallel-same,
 parallel-other, and sum; a zero-total fraction is `NA`. Multiple cropped runs

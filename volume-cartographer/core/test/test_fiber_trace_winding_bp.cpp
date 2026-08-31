@@ -410,8 +410,7 @@ TEST_CASE("Interleaved winding uses signed half-integer observation bins")
         report, topology(source, report), config());
     REQUIRE(raw.factorDiagnostics.size() == expected.size());
     for (const auto& diagnostic : raw.factorDiagnostics) {
-        CHECK(diagnostic.effectiveSignedParallelDelta ==
-            diagnostic.canonicalSignedParallelDelta);
+        CHECK_FALSE(diagnostic.effectiveSignedParallelDelta.has_value());
         CHECK(diagnostic.effectivePerpendicularSignedDelta ==
             diagnostic.canonicalSignedDelta);
     }
@@ -507,9 +506,10 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.references[2].sum.right == 0);
     CHECK(benchmark.references[2].sum.wrong == 0);
     CHECK(benchmark.references[2].sum.total == 0);
-    CHECK_FALSE(benchmark.references[0].estimatedWinding.has_value());
+    REQUIRE(benchmark.references[0].estimatedWinding.has_value());
+    CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(0.5));
     REQUIRE(benchmark.references[1].estimatedWinding.has_value());
-    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(4.0));
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(3.5));
     CHECK(benchmark.references[1].estimatedWindingSupport == 1);
     CHECK(benchmark.references[1].estimatedWindingObservations == 2);
     CHECK_FALSE(benchmark.references[2].estimatedWinding.has_value());
@@ -678,6 +678,201 @@ TEST_CASE("Reference observations use authoritative latent endpoint algebra")
     CHECK(defect.inferredReferenceWindingCount == 0);
 }
 
+TEST_CASE("Reference observations retain canonical diagnostic weights")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1};
+    winding.mapLatentCoordinate = {4.0};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal};
+    winding.integerGaugeByPiece = {0};
+    winding.measurementScale = 2.0;
+
+    FiberTraceConstraint perpendicular;
+    perpendicular.parallelScore = 0.2;
+    perpendicular.perpendicularScore = 0.8;
+    perpendicular.signedWindingDelta = -1.0;
+    const auto next = makeFiberTraceReferenceWindingObservation(
+        perpendicular, true, 0.0, 0, winding, 0.5);
+    CHECK(next.canonicalWindingDistance == 0.5);
+    CHECK(next.rawCoefficient == doctest::Approx(0.8));
+    CHECK(next.admittedCoefficient == doctest::Approx(0.8));
+    CHECK(next.coordinateResidualScale == 2.0);
+
+    perpendicular.signedWindingDelta = 1.00001;
+    const auto far = makeFiberTraceReferenceWindingObservation(
+        perpendicular, false, 0.0, 0, winding, 0.5);
+    CHECK(far.canonicalWindingDistance == 1.5);
+    CHECK(far.rawCoefficient == doctest::Approx(0.4));
+    CHECK(far.admittedCoefficient == doctest::Approx(0.4));
+
+    FiberTraceConstraint parallel;
+    parallel.parallelScore = 0.75;
+    parallel.perpendicularScore = 0.25;
+    parallel.parallelWindingDistance = 0.49;
+    parallel.signedParallelWindingDelta = -0.49;
+    const auto same = makeFiberTraceReferenceWindingObservation(
+        parallel, true, 0.0, 0, winding, 0.5);
+    CHECK(same.canonicalWindingDistance == 0.0);
+    CHECK(same.rawCoefficient == doctest::Approx(0.75));
+    CHECK(same.admittedCoefficient == doctest::Approx(0.75));
+    CHECK(same.coordinateResidualScale == 2.0);
+
+    parallel.parallelWindingDistance = 0.5;
+    parallel.signedParallelWindingDelta = -0.5;
+    const auto one = makeFiberTraceReferenceWindingObservation(
+        parallel, false, 0.0, 0, winding, 0.5);
+    CHECK(one.canonicalWindingDistance == 1.0);
+    CHECK(one.rawCoefficient == doctest::Approx(0.375));
+    CHECK(one.admittedCoefficient == 0.0);
+
+    parallel.parallelWindingDistance = 1.5;
+    parallel.signedParallelWindingDelta = 1.5;
+    const auto two = makeFiberTraceReferenceWindingObservation(
+        parallel, true, 0.0, 0, winding, 3.0);
+    CHECK(two.canonicalWindingDistance == 2.0);
+    CHECK(two.rawCoefficient == doctest::Approx(0.1875));
+    CHECK(two.admittedCoefficient == doctest::Approx(0.1875));
+
+    CHECK_THROWS_AS(
+        makeFiberTraceReferenceWindingObservation(
+            parallel, true, 0.0, 0, winding, 0.0),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference constraint groups expose weighted calibrated inference")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    using Group = FiberTraceReferenceConstraintGroup;
+    FiberTraceReferenceWindingBenchmark calibration;
+    calibration.globalSign = -1;
+    calibration.gauges = {
+        {3, 4.0, 0, 0},
+        {7, -2.0, 0, 0},
+    };
+    calibration.references.resize(2);
+
+    const std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 3, 1.0, {3.0, 0.0}, 1, 0,
+         0.5, 2.0, 2.0, 2.0},
+        {Class::Perpendicular, 7, 1.0, {-4.0, 0.0}, 1, 0,
+         1.5, 1.0, 1.0, 2.0},
+        {Class::ParallelSameWinding, 3, 1.0, {3.0, 0.0}, 1, 0,
+         0.0, 3.0, 3.0, 1.0},
+        {Class::ParallelOtherWinding, 7, 1.0, {-2.5, 0.0}, 1, 0,
+         1.0, 4.0, 4.0, 1.0},
+        {Class::ParallelOtherWinding, 3, 1.0, {2.5, 0.0}, 1, 0,
+         2.0, 5.0, 0.0, 1.0},
+        {Class::ParallelSameWinding, 3, 0.5, {5.0, 0.0}, 1, 1,
+         0.0, 1.0, 1.0, 1.0},
+        {Class::ParallelSameWinding, 7, 0.5, {-3.0, 0.0}, 1, 1,
+         0.0, 1.0, 1.0, 1.0},
+    };
+
+    const auto summary = summarizeFiberTraceReferenceConstraintGroups(
+        observations, calibration);
+    REQUIRE(summary.size() == 2);
+    const auto& source = summary[0].groups;
+    const auto& next = source[static_cast<std::size_t>(Group::PerpendicularNext)];
+    CHECK(next.observations == 1);
+    CHECK(next.rawCoefficient == 2.0);
+    CHECK(next.truthLoss == 0.0);
+    REQUIRE(next.preferredWinding.has_value());
+    CHECK(*next.preferredWinding == 1.0);
+
+    const auto& far = source[static_cast<std::size_t>(Group::PerpendicularFar)];
+    CHECK(far.observations == 1);
+    CHECK(far.rawCoefficient == 1.0);
+    CHECK(far.truthLoss == doctest::Approx(0.5));
+    REQUIRE(far.preferredWinding.has_value());
+    CHECK(*far.preferredWinding == 2.0);
+    CHECK(far.preferredLoss == 0.0);
+
+    const auto& same = source[static_cast<std::size_t>(Group::ParallelSame)];
+    CHECK(same.rawCoefficient == 3.0);
+    REQUIRE(same.preferredWinding.has_value());
+    CHECK(*same.preferredWinding == 1.0);
+
+    const auto& one = source[static_cast<std::size_t>(Group::ParallelOne)];
+    CHECK(one.rawCoefficient == 4.0);
+    CHECK(one.truthLoss == doctest::Approx(2.0));
+    REQUIRE(one.preferredWinding.has_value());
+    CHECK(*one.preferredWinding == 0.5);
+
+    const auto& twoPlus = source[static_cast<std::size_t>(Group::ParallelTwoPlus)];
+    CHECK(twoPlus.rawCoefficient == 5.0);
+    CHECK(twoPlus.admittedCoefficient == 0.0);
+    CHECK_FALSE(twoPlus.preferredWinding.has_value());
+
+    const auto& flat = summary[1].groups[
+        static_cast<std::size_t>(Group::ParallelSame)];
+    CHECK(flat.observations == 2);
+    CHECK(flat.truthLoss == doctest::Approx(2.0));
+    REQUIRE(flat.preferredWinding.has_value());
+    CHECK(*flat.preferredWinding == 0.0);
+    CHECK(flat.preferredLoss == doctest::Approx(2.0));
+
+    CHECK(std::string(fiberTraceReferenceConstraintGroupName(
+              Group::PerpendicularNext)) == "perp_0.5");
+    CHECK(std::string(fiberTraceReferenceConstraintGroupName(
+              Group::PerpendicularFar)) == "perp_1.5+");
+    CHECK(std::string(fiberTraceReferenceConstraintGroupName(
+              Group::ParallelSame)) == "parallel_0");
+    CHECK(std::string(fiberTraceReferenceConstraintGroupName(
+              Group::ParallelOne)) == "parallel_1");
+    CHECK(std::string(fiberTraceReferenceConstraintGroupName(
+              Group::ParallelTwoPlus)) == "parallel_2+");
+
+    auto invalid = observations;
+    invalid.front().rawCoefficient =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        summarizeFiberTraceReferenceConstraintGroups(invalid, calibration),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference constraint inference minimizes hard violations first")
+{
+    FiberTraceReferenceWindingBenchmark calibration;
+    calibration.globalSign = 1;
+    calibration.gauges = {{0, 0.0, 0, 0}};
+    calibration.references.resize(1);
+
+    const auto observation = [](double target) {
+        FiberTraceReferenceWindingObservation result;
+        result.constraintClass =
+            FiberTraceReferenceConstraintClass::Perpendicular;
+        result.integerGauge = 0;
+        result.virtualReferenceWinding = 0.0;
+        result.inferredReferenceWindings[0] = -target;
+        result.inferredReferenceWindingCount = 1;
+        result.referenceSource = 0;
+        result.canonicalWindingDistance = 0.5;
+        result.rawCoefficient = 1.0;
+        result.admittedCoefficient = 1.0;
+        result.coordinateResidualScale = 1.0;
+        result.exactWindingFactor = true;
+        result.bpLatentCoordinate = 0.0;
+        result.referenceDeltaSign = -1.0;
+        result.perpendicularCoefficient = 1.0;
+        result.signedPerpendicularTarget = target;
+        return result;
+    };
+    const std::array observations{observation(0.5), observation(-0.5)};
+    const auto summary = summarizeFiberTraceReferenceConstraintGroups(
+        observations, calibration);
+    const auto& group = summary[0].groups[static_cast<std::size_t>(
+        FiberTraceReferenceConstraintGroup::PerpendicularNext)];
+    CHECK(group.truthHardViolations == 2);
+    REQUIRE(group.preferredWinding.has_value());
+    CHECK(*group.preferredWinding == -0.5);
+    CHECK(group.preferredHardViolations == 1);
+    CHECK(group.preferredLoss == doctest::Approx(1.0));
+    REQUIRE(summary[0].all.preferredWinding.has_value());
+    CHECK(*summary[0].all.preferredWinding ==
+          *group.preferredWinding);
+}
+
 TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
 {
     const auto source = lines(8);
@@ -707,8 +902,7 @@ TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
             parallelMultipliers[index]);
         CHECK(diagnostic.perpendicularWindingWeightMultiplier ==
             perpendicularMultipliers[index]);
-        CHECK(diagnostic.effectiveParallelWindingWeight ==
-            doctest::Approx(0.25 * parallelMultipliers[index]));
+        CHECK(diagnostic.effectiveParallelWindingWeight == 0.0);
         CHECK(diagnostic.effectivePerpendicularWindingWeight ==
             doctest::Approx(0.75 * perpendicularMultipliers[index]));
     }
@@ -719,7 +913,7 @@ TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
     for (const auto& diagnostic : raw.factorDiagnostics) {
         CHECK(diagnostic.parallelWindingWeightMultiplier == 1.0);
         CHECK(diagnostic.perpendicularWindingWeightMultiplier == 1.0);
-        CHECK(diagnostic.effectiveParallelWindingWeight == 0.25);
+        CHECK(diagnostic.effectiveParallelWindingWeight == 0.0);
         CHECK(diagnostic.effectivePerpendicularWindingWeight == 0.75);
     }
 }
@@ -967,8 +1161,8 @@ TEST_CASE("Winding BP keeps same-trace pieces as linked variables")
     CHECK_FALSE(solved.factorDiagnostics.front().selfEdge);
     CHECK(solved.factorDiagnostics.front().effectiveParallelWindingDistance ==
         0.0);
-    CHECK(solved.factorDiagnostics.front().effectivePerpendicularSignedDelta ==
-        0.0);
+    CHECK_FALSE(solved.factorDiagnostics.front()
+                    .effectivePerpendicularSignedDelta.has_value());
 }
 
 TEST_CASE("Winding BP rejects incomparable aligned-normal gauges")
@@ -1400,8 +1594,7 @@ TEST_CASE("Joint-grid winding matches exact single-factor marginals")
     double phaseWeight = 0.0;
     double scaleWeight = 0.0;
     const auto windingEnergy = [](double delta, double gain) {
-        return 0.25 * std::abs(delta) +
-            0.75 * std::abs(gain * delta - 0.50);
+        return 0.75 * std::abs(gain * delta - 0.50);
     };
     const int minimumGainIndex = static_cast<int>(std::llround(
         std::log(solved.minimumCalibrationGain) / joint.logGainStep));
@@ -1681,8 +1874,13 @@ TEST_CASE("Hard winding sign ignores zero and parallel-only evidence")
     const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
         report, topology(source, report), grid, {}, fixed);
 
-    CHECK(solved.windingValid ==
-        std::vector<unsigned char>{1, 1, 1, 1, 1, 1});
+    REQUIRE(solved.windingValid.size() == 6);
+    CHECK(static_cast<int>(solved.windingValid[0]) == 1);
+    CHECK(static_cast<int>(solved.windingValid[1]) == 1);
+    CHECK(static_cast<int>(solved.windingValid[2]) == 1);
+    CHECK(static_cast<int>(solved.windingValid[3]) == 1);
+    CHECK(static_cast<int>(solved.windingValid[4]) == 0);
+    CHECK(static_cast<int>(solved.windingValid[5]) == 0);
     CHECK(solved.hardSignProjectedDefects == 0);
 }
 

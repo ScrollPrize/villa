@@ -2798,7 +2798,8 @@ std::string formatReferenceBpWindingBenchmark(
     const ReferenceFiberDiagnostics& reference,
     const ReferenceBpCrossConstraints& cross,
     const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding,
-    vc::fiber_tracer::FiberTraceBalanceMode balanceMode)
+    vc::fiber_tracer::FiberTraceBalanceMode balanceMode,
+    std::optional<double> parallelWindingDistanceCutoff)
 {
     if (cross.report.inputTraces < cross.referencePieces) {
         throw std::invalid_argument("Reference/BP cross report has fewer traces than references");
@@ -2841,7 +2842,8 @@ std::string formatReferenceBpWindingBenchmark(
                 referenceIsA,
                 0.5 * static_cast<double>(referenceSource),
                 bpPiece,
-                winding);
+                winding,
+                parallelWindingDistanceCutoff);
         observation.referenceSource = referenceSource;
         observations.push_back(std::move(observation));
     }
@@ -2864,6 +2866,78 @@ std::string formatReferenceBpWindingBenchmark(
                << std::setw(14) << gauge.offset
                << std::setw(12) << gauge.right
                << gauge.observations << '\n';
+    }
+    const auto groupDiagnostics = vc::fiber_tracer::
+        summarizeFiberTraceReferenceConstraintGroups(
+            observations, benchmark);
+    constexpr auto groupCount = static_cast<std::size_t>(
+        vc::fiber_tracer::FiberTraceReferenceConstraintGroup::Count);
+    output << "reference constraint groups BP winding energy"
+           << " (dominant hypothesis; hard violations first)\n"
+           << std::setw(8) << "winding"
+           << std::setw(14) << "group"
+           << std::setw(7) << "n"
+           << std::setw(10) << "raw_w"
+           << std::setw(10) << "used_w"
+           << std::setw(9) << "true_h"
+           << std::setw(11) << "true_L1"
+           << std::setw(11) << "true_avg"
+           << std::setw(10) << "infer_w"
+           << std::setw(9) << "infer_h"
+           << std::setw(11) << "infer_L1"
+           << "infer_avg\n";
+    for (std::size_t source = 0;
+         source < reference.sourceNames.size();
+         ++source) {
+        for (std::size_t groupIndex = 0;
+             groupIndex <= groupCount;
+             ++groupIndex) {
+            const vc::fiber_tracer::
+                FiberTraceReferenceConstraintGroupDiagnostic empty;
+            const auto& diagnostic = source >= groupDiagnostics.size()
+                ? empty
+                : groupIndex == groupCount
+                ? groupDiagnostics[source].all
+                : groupDiagnostics[source].groups[groupIndex];
+            const char* groupName = groupIndex == groupCount
+                ? "all"
+                : vc::fiber_tracer::
+                      fiberTraceReferenceConstraintGroupName(
+                          static_cast<vc::fiber_tracer::
+                              FiberTraceReferenceConstraintGroup>(
+                                  groupIndex));
+            output << std::setw(8) << std::setprecision(1)
+                   << 0.5 * static_cast<double>(source)
+                   << std::setw(14) << groupName
+                   << std::setw(7) << diagnostic.observations
+                   << std::setw(10) << std::setprecision(3)
+                   << diagnostic.rawCoefficient
+                   << std::setw(10) << diagnostic.admittedCoefficient
+                   << std::setw(9) << diagnostic.truthHardViolations;
+            if (!(diagnostic.admittedCoefficient > 0.0) ||
+                !diagnostic.preferredWinding) {
+                output << std::setw(11) << "NA"
+                       << std::setw(11) << "NA"
+                       << std::setw(10) << "NA"
+                       << std::setw(9) << "NA"
+                       << std::setw(11) << "NA"
+                       << "NA\n";
+                continue;
+            }
+            output << std::setw(11) << diagnostic.truthLoss
+                   << std::setw(11)
+                   << diagnostic.truthLoss /
+                          diagnostic.admittedCoefficient
+                   << std::setw(10) << std::setprecision(1)
+                   << *diagnostic.preferredWinding
+                   << std::setw(9)
+                   << diagnostic.preferredHardViolations
+                   << std::setw(11) << std::setprecision(3)
+                   << diagnostic.preferredLoss
+                   << diagnostic.preferredLoss /
+                          diagnostic.admittedCoefficient
+                   << '\n';
+        }
     }
     constexpr std::array<const char*, 4> names{
         "perpendicular", "parallel_same", "parallel_other", "sum"};
@@ -3956,7 +4030,12 @@ int main(int argc, char** argv)
                                         bpSourcePieceOne,
                                         bpConstraints,
                                         *interleavedWinding) +
-                                    formatReferenceBpWindingBenchmark(*referenceDiagnostics, *referenceBpConstraints, *interleavedWinding, mode));
+                                    formatReferenceBpWindingBenchmark(
+                                        *referenceDiagnostics,
+                                        *referenceBpConstraints,
+                                        *interleavedWinding,
+                                        mode,
+                                        options.parallelWindingCutoff));
                             } else if (interleavedWinding) {
                                 deferredBpStateDiagnostics.push_back(
                                     formatBpFinalStateCohorts(

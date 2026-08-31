@@ -1,56 +1,65 @@
-# Plan: normal-alignment progress output
+# Plan: weighted reference winding diagnostics
 
 ## Implementation
 
-- Add a shared, optional progress callback to binary pairwise BP. Emit one
-  event after every completed message iteration and a terminal event, outside
-  numerical loops except for the existing serial iteration boundary. Catch a
-  callback exception inside the OpenMP region, stop at the synchronized
-  boundary, and rethrow it after leaving the region. Exclude callback time from
-  BP phase timing attribution.
-- Add a normal-alignment progress event with explicit sampling, factor-build,
-  component-build, message-passing, and finalize phases. Thread the callback
-  through lattice sampling/alignment and map binary-BP iterations into the
-  message phase.
-- Emit bounded factor/component progress from the existing deterministic loops.
-  Sampling is one opaque batch read, so report its start and completion without
-  inventing intermediate completion counts. Factors count lattice sites
-  scanned. Component preparation counts normalization items, factor adjacency
-  insertions, and visited nodes. Finalization counts retained nodes. Core
-  preparation/finalization callbacks occur only at phase boundaries and every
-  65,536 work items; BP emits at most one event per configured iteration.
-- Add a rate-limited CLI formatter. Print phase, completed/total, percent,
-  elapsed time, ETA when derivable, and BP residual. ETAs are explicitly
-  phase-local; the message ETA is labeled as time to the configured iteration
-  limit rather than expected convergence. Sampling reports no intermediate
-  ETA. Always print phase transitions, phase completion, and one success-only
-  terminal completion event.
-- Keep every callback optional so all existing callers retain behavior and
-  avoid reporting overhead beyond an empty callback check.
+- Extend the shared reference observation with its canonical absolute winding
+  distance, raw finite-L1 coefficient, cutoff-admitted coefficient, and
+  coordinate residual scale. Compute these in the existing observation
+  constructor using the dominant hypothesis score and the same power-of-two
+  distance multiplier as joint winding BP. Pass the active parallel-distance
+  cutoff explicitly; retain raw evidence even when the cutoff excludes it.
+- Add a shared core summarizer that groups active reference observations by
+  source and by `perp_0.5`, `perp_1.5+`, `parallel_0`, `parallel_1`, and
+  `parallel_2+`.
+- Make the prepared winding factor mutually exclusive: a measured constraint
+  retains only its dominant parallel or perpendicular hypothesis. Evaluate
+  that admitted term with its score, distance decay, cutoff suppression,
+  measurement scale, and signed ordering. Hard continuity remains parallel.
+- Rank candidate reference windings lexicographically by hard signed-order
+  violations and then finite winding energy. This mirrors BP's impossible-state
+  rule when a zero-violation active state exists; when hard constraints conflict,
+  it provides the requested forced-active fallback instead of selecting Defect.
+- Map every inferred candidate from its integer gauge into the globally
+  calibrated reference coordinate as
+  `globalSign * (candidate - gaugeOffset)`. This supports one reference source
+  observed in multiple gauges. Evaluate truth at the source's virtual winding.
+- Infer each group's preferred winding over the half-integer lattice near all
+  finite inferred candidates. Minimize admitted weighted L1, then prefer smaller
+  absolute winding and lower signed winding without consulting truth. A group
+  with no positive raw coefficient reports `NA`.
+- For each group, report observation count, raw coefficient sum, coefficient
+  admitted by the current cutoff, hard violations and admitted total and
+  coefficient-normalized energy at truth, preferred winding, and its hard
+  violations plus total and normalized energy. Add an `all` row and use its
+  preferred winding as `est_w`, eliminating the previous support-count/squared
+  residual estimator.
+- Insert a compact row-oriented table immediately before the existing
+  per-reference right/wrong table. The table, `est_w`, and prepared BP factors
+  must all use the same dominant-hypothesis semantics.
 
 ## Tests
 
-- Extend binary-BP tests above the real OpenMP factor threshold to verify
-  serialized monotonic callbacks, early/message-limit terminal state, safe
-  callback exception propagation, and exact numerical equality excluding
-  timing fields.
-- Extend normal-alignment tests to verify ordered phase transitions, terminal
-  completion, exact work totals on a lattice with holes/multiple components,
-  bounded event count, and exact output equivalence with and without the
-  callback. Preserve factor and component traversal order.
-- Build `vc_fiber_trace_chunk` and the focused BP/alignment tests, run them,
-  and run `git diff --check`.
+- Extend focused winding-BP tests for all five effective-canonical bucket
+  boundaries (including both signs and raw values on quantization boundaries),
+  exact score/distance and cutoff-admitted coefficients, non-unit perpendicular
+  measurement scale, weighted disagreement at truth, bucket-only inference,
+  deterministic flat-optimum ties, contradictory hard signs, same-source multi-gauge conversion with a
+  reversed global sign, empty/zero-weight groups, and invalid inputs.
+- Validate the rendered table through the established CLI smoke workload,
+  including bucket order, placement, precision, and `NA` output.
+- Build the production CLI and focused winding-BP test, run the test, and run
+  `git diff --check`.
 
 ## Spec update
 
-- Document the optional, observational normal-alignment progress contract and
-  its phase/completion semantics.
+- Specify the new pre-benchmark weighted disagreement table, bucket boundaries,
+  effective coefficient, loss, calibration, and empty-value semantics.
 
 ## Docs updates
 
-- Document that the crop CLI now reports progress during normal-volume
-  sampling, factor/component preparation, and normal-sign BP.
+- Document how to interpret the weighted group diagnostic and why it may
+  disagree with the existing unweighted right/wrong counts.
 
 ## Changelog
 
-- Record live normal-alignment progress with message residual and ETA.
+- Record the weighted per-reference constraint-group winding diagnostic.

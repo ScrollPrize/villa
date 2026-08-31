@@ -5302,18 +5302,20 @@
   retain their `<1.5` default. Independently multiply each component by
   `2^-floor(abs(effective_target))`: parallel distances `0`, `1`, `2`, and `3`
   and perpendicular targets `0.5`, `1.5`, `2.5`, and `3.5` each use
-  `1`, `0.5`, `0.25`, and `0.125`, respectively. This applies
-  to both parallel integer-distance and perpendicular signed-offset winding terms,
-  including continuous initialization and calibration. It must not change the
-  independent H/V orientation factor, continuity, the integer-only raw winding
-  diagnostic, or hard signed-order admissibility. The formula continues safely
-  for larger bins admitted by explicit cutoff overrides.
+  `1`, `0.5`, `0.25`, and `0.125`, respectively. Each measured
+  constraint retains only its dominant hypothesis: parallel dominance uses the
+  integer-distance term and perpendicular dominance uses the signed-offset
+  term. The selected term and decay apply consistently in continuous
+  initialization, calibration, and discrete inference. Hard continuity remains
+  a parallel zero-distance factor. The formula continues safely for larger bins
+  admitted by explicit cutoff overrides.
 - `--parallel-winding-cutoff N` is a finite positive exclusive cutoff on the
   quantized integer parallel distance in H/V-aware winding solves. `0.5` keeps
-  only same-winding distance zero. Filtering zeros only parallel winding
-  weight; it retains the factor's perpendicular winding evidence, H/V
-  orientation score, extracted/stored constraint, and reference diagnostic.
-  Filtered orientation-only factors do not join winding gauge components.
+  only same-winding distance zero. Filtering zeros the winding weight of a
+  parallel-dominant factor while retaining its H/V orientation score,
+  extracted/stored constraint, and reference diagnostic. Perpendicular-dominant
+  factors are unaffected. Filtered orientation-only factors do not join winding
+  gauge components.
   The default is no additional parallel cutoff.
 - In `sum-product-mixed`, orientation and winding are one joint state per split
   piece. Every piece remains a distinct variable. Same-trace continuity is its
@@ -5445,9 +5447,13 @@
   normalized A/Mixed/B posterior is the alternating winding stage's soft node
   prior. The
   winding stage must not repeat the same/different factor or the Mixed unary.
-- For latent coordinate difference `delta`, every measurement contributes
-  `p*abs(delta)` and, when signed target `d` is available,
-  `q*abs(delta/scale-d)`. `p` and `q` are its parallel and perpendicular scores.
+- For latent coordinate difference `delta`, a parallel-dominant measurement
+  contributes `p*abs(delta-target)`; a perpendicular-dominant measurement with
+  signed target `d` contributes `q*abs(delta/scale-d)`. `p` and `q` are its
+  parallel and perpendicular scores, but the losing hypothesis contributes
+  zero winding energy. The H/V relation potential continues to use the two
+  scores as alternative same/different assignment costs, preserving confidence
+  through their difference rather than treating both as winding evidence.
   The residual is expressed in the observed Lasagna-integral units, so fitting
   scale cannot reduce residual noise merely by shrinking scale. Repeated
   endpoint pairs sum complete measurement energies. A component may consume
@@ -5603,7 +5609,37 @@
   offset and then smaller signed offset. Gauges with no active candidates are
   absent.
   Print balance mode, solver/status, per-gauge offset/right/total rows, then one
-  compact row per original selected reference source in source order, identified
+  row-oriented `reference constraint groups finite weighted L1` diagnostic per
+  original reference source and evidence group. Groups are selected from the
+  same dominant-hypothesis projection as the reference accuracy benchmark:
+  canonical perpendicular distance `0.5`, canonical perpendicular distance
+  `1.5+`, canonical parallel distance `0`, canonical parallel distance `1`,
+  and canonical parallel distance `2+`. Canonical distances are absolute and
+  are assigned only after half-integer or integer target quantization.
+  Each group row reports valid observation count, raw finite-L1 coefficient,
+  coefficient admitted after the active parallel-distance cutoff, total and
+  admitted-coefficient-normalized loss at the calibrated true winding, the
+  half-integer winding preferred by that group alone, and its total and
+  normalized loss. Each categorized constraint contributes exactly its
+  dominant BP winding term: the winning hypothesis score times its
+  `2^-floor(abs(canonical_step))` distance multiplier. Perpendicular
+  loss divides latent-coordinate error by the solved measurement scale;
+  parallel loss uses latent-coordinate error directly. Parallel cutoff
+  suppression matches factor preparation. Inferred candidates are mapped from each independent gauge
+  with `globalSign * (candidate - gaugeOffset)`, allowing one reference source
+  to combine evidence from multiple gauges without another calibration.
+  Preferred winding first minimizes violated hard perpendicular signed-order
+  constraints and then minimizes admitted weighted L1 on the half-integer lattice;
+  exact ties prefer smaller absolute winding and then lower signed winding.
+  Empty and zero-admitted-coefficient groups print `NA` loss/inference values.
+  Print hard-violation counts at truth and at the preferred winding. Add an
+  `all` row containing every categorized constraint for that reference, and
+  use exactly its preferred winding as the following compact row's `est_w`.
+  This replaces support-count/squared-residual reference inference. BP makes a
+  hard-sign-violating active state impossible and may select Defect; because
+  the reference diagnostic is forced active, contradictory signs instead use
+  the minimum-violation lexicographic fallback before finite factor energy.
+  Then print one compact row per original selected reference source in source order, identified
   only by its virtual winding `0.5*i`. Each source row
   contains `right`, `wrong`, and `right_fraction` for `perpendicular`,
   `parallel_same`, `parallel_other`, and `sum`; zero-total fractions are `NA`.
@@ -5632,13 +5668,12 @@
   term rows. The perpendicular-value row reports the finite absolute-distance
   coefficient. The perpendicular-sign row reports the separate hard ordering
   restriction and has no finite coefficient.
-  A measured constraint contributes both perpendicular and parallel terms when
-  both finite coefficients are positive, matching the solver rather than a
-  dominant-class approximation. Each endpoint is one incidence: an internal
+  A measured constraint contributes to exactly one perpendicular or parallel
+  row according to its dominant hypothesis, matching the solver. Each endpoint is one incidence: an internal
   constraint contributes twice to one cohort and a cross-cohort constraint
-  once to each. The measurement row counts a constraint once even when both
-  hypothesis terms are present and therefore matches the degree basis of the
-  Defect unary. Report incidence and coefficient totals, incidence and
+  once to each. The measurement row counts admitted winding measurements; it
+  can be smaller than the Defect-unary degree when the parallel cutoff suppresses
+  a parallel-dominant winding term. Report incidence and coefficient totals, incidence and
   coefficient per final active and Defect piece. For the sign row, report hard
   signed-order incidence and incidence per final active and Defect piece.
   Active and Defect numerators are endpoint-stratified before division. A

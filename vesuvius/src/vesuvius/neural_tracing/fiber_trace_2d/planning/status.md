@@ -1,11 +1,11 @@
-# Status: normal-alignment progress output
+# Status: weighted reference winding diagnostics
 
 - [x] Capture the requested task.
-- [x] Inspect normal-alignment and binary-BP execution flow.
+- [x] Inspect reference calibration and winding-factor weighting.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Add core progress events and callback plumbing.
-- [x] Add rate-limited CLI progress and ETA.
+- [x] Add shared weighted group diagnostics.
+- [x] Add the CLI table before reference accuracy.
 - [x] Add regression coverage.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Build and run focused validation.
