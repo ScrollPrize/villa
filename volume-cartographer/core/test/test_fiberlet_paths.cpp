@@ -2998,16 +2998,11 @@ TEST_CASE("fiberlet multiplicative alignment changes the selected route")
     vc::fiber_tracer::FiberletPathCost decomposed;
     for (const auto& segment : selected.segmentCosts)
         decomposed += segment;
-    CHECK(decomposed.invalidPrediction ==
-          doctest::Approx(selected.cost.invalidPrediction).epsilon(1.0e-6));
-    CHECK(decomposed.alignment ==
-          doctest::Approx(selected.cost.alignment).epsilon(1.0e-6));
-    CHECK(decomposed.isotropicSmoothness ==
-          doctest::Approx(selected.cost.isotropicSmoothness).epsilon(1.0e-6));
-    CHECK(decomposed.tangentSmoothness ==
-          doctest::Approx(selected.cost.tangentSmoothness).epsilon(1.0e-6));
-    CHECK(decomposed.normalSmoothness ==
-          doctest::Approx(selected.cost.normalSmoothness).epsilon(1.0e-6));
+    CHECK(decomposed.invalidPrediction == selected.cost.invalidPrediction);
+    CHECK(decomposed.alignment == selected.cost.alignment);
+    CHECK(decomposed.isotropicSmoothness == selected.cost.isotropicSmoothness);
+    CHECK(decomposed.tangentSmoothness == selected.cost.tangentSmoothness);
+    CHECK(decomposed.normalSmoothness == selected.cost.normalSmoothness);
 }
 
 TEST_CASE("fiberlet local grid follows a narrow subvoxel corridor")
