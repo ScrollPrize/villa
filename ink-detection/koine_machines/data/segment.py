@@ -1,3 +1,5 @@
+import hashlib
+import os
 from pathlib import Path
 
 _LABEL_SUFFIXES = (
@@ -30,6 +32,52 @@ def _parse_label_asset_path(name):
                 "extension": extension,
             }
     return None
+
+
+def label_asset_fingerprint(paths):
+    """Return a short digest of the label assets' on-disk layout.
+
+    The patch cache identifies a segment's labels by *path*, which catches pointing at a
+    different tree and misses regenerating a mask in place -- the split is then silently
+    reused against labels it no longer describes. Hashing each asset's relative file names
+    and sizes catches that: rewriting a zarr changes chunk sizes, and dropping annotation
+    deletes chunks outright when the store does not write empty ones.
+
+    It reads no chunk contents, so it costs one directory walk (8 ms for a 6,429-file
+    label array here, via ``os.scandir``, which carries the size on Windows and Linux
+    alike) and it does not distinguish two different labels that compress to identical
+    sizes under identical names. A copied tree fingerprints the same as its source, which
+    is the wanted behaviour.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(str(p) for p in paths if p):
+        root = Path(path)
+        digest.update(root.name.encode())
+        if not root.exists():
+            digest.update(b"\0missing")
+            continue
+        stack = [("", str(root))]
+        entries = []
+        while stack:
+            relative, current = stack.pop()
+            try:
+                children = sorted(os.scandir(current), key=lambda entry: entry.name)
+            except OSError:
+                continue
+            for child in children:
+                name = f"{relative}/{child.name}" if relative else child.name
+                if child.is_dir(follow_symlinks=False):
+                    stack.append((name, child.path))
+                else:
+                    try:
+                        size = child.stat().st_size
+                    except OSError:
+                        size = -1
+                    entries.append((name, size))
+        for name, size in sorted(entries):
+            digest.update(name.encode())
+            digest.update(str(size).encode())
+    return digest.hexdigest()[:16]
 
 class Segment:
     def __init__(
@@ -147,6 +195,17 @@ class Segment:
         )
 
     @property
+    def label_fingerprint(self):
+        """Digest of the label assets as they are on disk right now (computed once)."""
+        cached = getattr(self, "_label_fingerprint", None)
+        if cached is None:
+            cached = label_asset_fingerprint(
+                (self.inklabels, self.supervision_mask, self.validation_mask)
+            )
+            object.__setattr__(self, "_label_fingerprint", cached)
+        return cached
+
+    @property
     def cache_key(self):
         return (
             int(self.dataset_idx),
@@ -155,6 +214,7 @@ class Segment:
             "" if self.inklabels is None else str(self.inklabels),
             "" if self.supervision_mask is None else str(self.supervision_mask),
             "" if self.validation_mask is None else str(self.validation_mask),
+            self.label_fingerprint,
         )
     
     def discover_labels(self, *, label_version=None, extension=".zarr", required=True):

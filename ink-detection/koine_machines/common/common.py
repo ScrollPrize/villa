@@ -98,6 +98,9 @@ def save_flat_patch_cache(path, patches):
                         "" if getattr(patch.segment, "validation_mask", None) is None
                         else str(patch.segment.validation_mask)
                     ),
+                    "label_fingerprint": str(
+                        getattr(patch.segment, "label_fingerprint", "")
+                    ),
                     "active_supervision_mask_path": (
                         "" if patch.supervision_mask is None else str(patch.supervision_mask)
                     ),

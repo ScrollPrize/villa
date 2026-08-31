@@ -1301,6 +1301,7 @@ class InkDataset(Dataset):
                         str(record.get('inklabels_path', '')),
                         str(record.get('supervision_mask_path', '')),
                         str(record.get('validation_mask_path', '')),
+                        str(record.get('label_fingerprint', '')),
                     )
                     segment = segments_by_key.get(cache_key)
                     if segment is None:
