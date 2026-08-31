@@ -7,8 +7,6 @@ look" indistinguishable from "it is not there" - and wait_for_zarr_creation()
 turns that into a five-minute wait followed by "the array was never created".
 """
 
-import os
-
 import pytest
 
 from vesuvius.utils.io import zarr_utils
@@ -41,7 +39,6 @@ class TestLocalPaths:
     def test_absent(self, tmp_path):
         assert zarr_array_exists(str(tmp_path)) is False
 
-
     def test_accepts_a_path_object(self, tmp_path):
         """os.PathLike must work. main caught the AttributeError and returned False
         for every Path, so this asserts we are not worse than main for that input."""
@@ -57,6 +54,20 @@ class TestS3Paths:
         """The open-data bucket is public-read; no credentials must still work."""
         _filesystems(monkeypatch, {
             False: _FS(raises=RuntimeError("Unable to locate credentials")),
+            True: _FS(result=True),
+        })
+        assert zarr_array_exists("s3://vesuvius-challenge-open-data/x.zarr") is True
+
+    def test_falls_back_when_credentials_are_present_but_rejected(self, monkeypatch):
+        """Stale or wrong credentials must not hide a public object.
+
+        This is the case #1624 fixed on the C++ side. Verified live on 2026-08-31:
+        with deliberately invalid AWS_* variables set, fsspec raises
+        PermissionError('Forbidden') rather than returning False, so the fallback
+        is what makes the public object reachable.
+        """
+        _filesystems(monkeypatch, {
+            False: _FS(raises=PermissionError("Forbidden")),
             True: _FS(result=True),
         })
         assert zarr_array_exists("s3://vesuvius-challenge-open-data/x.zarr") is True

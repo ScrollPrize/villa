@@ -87,7 +87,7 @@ def zarr_array_exists(zarr_path):
 
     Raises:
         RuntimeError: if existence could not be determined at all (credentials,
-            permissions, network). Previously this returned False, which is
+            permissions, network). Reporting that as False would be
             indistinguishable from the array being absent.
     """
     # Accept str or os.PathLike. The previous implementation caught the
