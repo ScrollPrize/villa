@@ -23,6 +23,7 @@
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -3090,6 +3091,23 @@ std::string_view materializationPhaseName(
     return "unknown";
 }
 
+std::string formatProgressDuration(double seconds)
+{
+    if (!(seconds >= 0.0) || !std::isfinite(seconds))
+        return "n/a";
+    const auto rounded = static_cast<std::uint64_t>(std::ceil(seconds));
+    const auto hours = rounded / 3600;
+    const auto minutes = (rounded % 3600) / 60;
+    const auto remainder = rounded % 60;
+    std::ostringstream output;
+    if (hours != 0)
+        output << hours << 'h';
+    if (hours != 0 || minutes != 0)
+        output << minutes << 'm';
+    output << remainder << 's';
+    return output.str();
+}
+
 std::string formatGraphMemoryProfile(
     double elapsedSeconds,
     const vc::fiber_tracer::FiberletGraphMaterializationDiagnostics& diagnostics,
@@ -4400,6 +4418,9 @@ int main(int argc, char** argv)
 
         const auto traceStarted = std::chrono::steady_clock::now();
         const auto traceCpuStarted = std::clock();
+        std::deque<std::pair<
+            std::chrono::steady_clock::time_point, std::size_t>>
+            traceProgressSamples{{traceStarted, 0}};
         graphDiagnostics.phase.store(
             vc::fiber_tracer::FiberletGraphMaterializationPhase::Tracing,
             std::memory_order_relaxed);
@@ -4409,9 +4430,49 @@ int main(int argc, char** argv)
             normals,
             dataset->metadata().predictionToBaseScale,
             options.trace,
-            [](const auto& current, std::size_t remaining) {
+            [&](const auto& current, std::size_t remaining) {
+                const auto now = std::chrono::steady_clock::now();
+                const std::size_t resolved =
+                    current.candidateAnchors >= remaining
+                    ? current.candidateAnchors - remaining
+                    : 0;
+                traceProgressSamples.emplace_back(now, resolved);
+                const auto currentWindowBegin = now - std::chrono::seconds(10);
+                while (traceProgressSamples.size() > 2 &&
+                       traceProgressSamples[1].first <= currentWindowBegin) {
+                    traceProgressSamples.pop_front();
+                }
+                const double elapsed = std::chrono::duration<double>(
+                    now - traceStarted).count();
+                const double averageRate = elapsed > 0.0
+                    ? static_cast<double>(resolved) / elapsed
+                    : 0.0;
+                const auto& currentBegin = traceProgressSamples.front();
+                const double currentSeconds = std::chrono::duration<double>(
+                    now - currentBegin.first).count();
+                const double currentRate = currentSeconds > 0.0 &&
+                        resolved >= currentBegin.second
+                    ? static_cast<double>(resolved - currentBegin.second) /
+                        currentSeconds
+                    : 0.0;
+                const double averageEta = remaining == 0
+                    ? 0.0
+                    : averageRate > 0.0
+                    ? static_cast<double>(remaining) / averageRate
+                    : std::numeric_limits<double>::infinity();
+                const double currentEta = remaining == 0
+                    ? 0.0
+                    : currentRate > 0.0
+                    ? static_cast<double>(remaining) / currentRate
+                    : std::numeric_limits<double>::infinity();
                 std::cout << "fiberlet crop attempted=" << current.attemptedAnchors << " accepted=" << current.lines.size()
-                          << " covered=" << current.coveredAnchors << " remaining=" << remaining << '\n';
+                          << " covered=" << current.coveredAnchors
+                          << " remaining=" << remaining
+                          << " elapsed=" << formatProgressDuration(elapsed)
+                          << " eta_current="
+                          << formatProgressDuration(currentEta)
+                          << " eta_avg="
+                          << formatProgressDuration(averageEta) << '\n';
             });
         const double traceSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStarted).count();
         const double traceCpuSeconds = static_cast<double>(std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
