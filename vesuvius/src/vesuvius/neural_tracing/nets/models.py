@@ -1,3 +1,5 @@
+import tempfile
+
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
@@ -22,7 +24,7 @@ _CHECKPOINT_SENTINELS = {
         "checkpoint_filename": "copy_displacement_latest.pth",
     },
 }
-_HF_CHECKPOINT_CACHE_ROOT = Path("/tmp/vesuvius_hf_models")
+_HF_CHECKPOINT_CACHE_ROOT = Path(tempfile.gettempdir()) / "vesuvius_hf_models"
 
 
 class SlotConditionedHead(nn.Module):
