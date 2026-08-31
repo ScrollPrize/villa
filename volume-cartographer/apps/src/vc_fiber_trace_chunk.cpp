@@ -94,6 +94,10 @@ struct Options {
     double windingDefectCost = 1.0;
     double pieceBreakCost = 0.0;
     std::optional<double> parallelWindingCutoff;
+    std::array<double, 5> windingWeights =
+        vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
+    std::optional<std::vector<double>> windingWeightSearch;
+    bool windingWeightSearchLocal = false;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
@@ -116,6 +120,9 @@ struct Options {
     bool hasWindingDefectCostOption = false;
     bool hasPieceBreakCostOption = false;
     bool hasParallelWindingCutoffOption = false;
+    bool hasWindingWeightOption = false;
+    bool hasWindingWeightSearchOption = false;
+    bool hasWindingWeightSearchLocalOption = false;
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
     bool hasFixedCalibrationOption = false;
@@ -233,6 +240,12 @@ void usage(const char* executable)
               << "  --piece-break-cost F      same-trace active/Defect boundary cost [0]\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
+              << "  --winding-weights P05,PFAR,P0,P1,P2\n"
+              << "                              five canonical factor multipliers [8,1,2,2,1]\n"
+              << "  --winding-weight-search V0,V1,...\n"
+              << "                              exhaustive five-class reference grid\n"
+              << "  --winding-weight-search-local\n"
+              << "                              repeat one-coordinate /2,*2 search to a local optimum\n"
               << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
               << "  --winding-fixed-scale F   disable calibration at positive scale F\n"
               << "  --winding-gain-cells N    initial joint gain cells [5]\n"
@@ -291,6 +304,36 @@ std::size_t count(int& index, int argc, char** argv, const char* option)
     if (parsed != text.size())
         fail(std::string(option) + " requires a non-negative integer");
     return static_cast<std::size_t>(result);
+}
+
+std::vector<double> numberList(
+    int& index, int argc, char** argv, const char* option)
+{
+    const std::string input = value(index, argc, argv, option);
+    std::vector<double> result;
+    std::size_t begin = 0;
+    while (begin <= input.size()) {
+        const std::size_t end = input.find(',', begin);
+        const std::string item = input.substr(
+            begin,
+            end == std::string::npos ? std::string::npos : end - begin);
+        if (item.empty())
+            fail(std::string(option) + " requires comma-separated numbers");
+        std::size_t parsed = 0;
+        const double parsedValue = std::stod(item, &parsed);
+        if (parsed != item.size() || !std::isfinite(parsedValue) ||
+            !(parsedValue > 0.0)) {
+            fail(std::string(option) +
+                 " requires finite positive comma-separated numbers");
+        }
+        result.push_back(parsedValue);
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    if (result.empty())
+        fail(std::string(option) + " requires at least one number");
+    return result;
 }
 
 Options parse(int argc, char** argv)
@@ -593,6 +636,36 @@ Options parse(int argc, char** argv)
             options.hasParallelWindingCutoffOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-weights") {
+            const auto values = numberList(
+                index, argc, argv, "--winding-weights");
+            if (values.size() != options.windingWeights.size()) {
+                fail("--winding-weights requires exactly five values");
+            }
+            std::copy(
+                values.begin(), values.end(), options.windingWeights.begin());
+            options.hasWindingWeightOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-weight-search") {
+            options.windingWeightSearch = numberList(
+                index, argc, argv, "--winding-weight-search");
+            std::sort(
+                options.windingWeightSearch->begin(),
+                options.windingWeightSearch->end());
+            options.windingWeightSearch->erase(
+                std::unique(
+                    options.windingWeightSearch->begin(),
+                    options.windingWeightSearch->end()),
+                options.windingWeightSearch->end());
+            options.hasWindingWeightSearchOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-weight-search-local") {
+            options.windingWeightSearchLocal = true;
+            options.hasWindingWeightSearchLocalOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-gain-cells") {
             options.jointGrid.initialGainCells = count(
                 index, argc, argv, "--winding-gain-cells");
@@ -851,11 +924,28 @@ Options parse(int argc, char** argv)
              options.hasWindingOrientationOption ||
              options.hasWindingDefectCostOption ||
              options.hasPieceBreakCostOption ||
-             options.hasParallelWindingCutoffOption) &&
+             options.hasParallelWindingCutoffOption ||
+             options.hasWindingWeightOption ||
+             options.hasWindingWeightSearchOption ||
+             options.hasWindingWeightSearchLocalOption) &&
             (!options.bpOnly ||
              options.bpInference != vc::fiber_tracer::
                  FiberTraceBeliefInference::SumProductMixed)) {
             fail("winding solver controls require --bp-only --bp-inference sum-product-mixed");
+        }
+        if (options.hasWindingWeightSearchOption &&
+            (options.hasWindingWeightOption ||
+             options.hasWindingWeightSearchLocalOption)) {
+            fail("--winding-weights conflicts with --winding-weight-search");
+        }
+        if (options.hasWindingWeightSearchLocalOption &&
+            !options.hasWindingWeightOption) {
+            fail("--winding-weight-search-local requires --winding-weights");
+        }
+        if ((options.hasWindingWeightSearchOption ||
+             options.hasWindingWeightSearchLocalOption) &&
+            !options.hasReferenceFiberDirectoryOption) {
+            fail("winding weight search requires reference fibers");
         }
         if (options.hasJointGridOption &&
             options.windingSolver != vc::fiber_tracer::
@@ -2753,6 +2843,17 @@ struct ReferenceBpCrossConstraints {
     std::size_t referencePieces = 0;
 };
 
+void setWindingClassWeights(
+    vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
+    const std::array<double, 5>& weights)
+{
+    config.perpendicularNextWeight = weights[0];
+    config.perpendicularFarWeight = weights[1];
+    config.parallelSameWeight = weights[2];
+    config.parallelOneWeight = weights[3];
+    config.parallelFarWeight = weights[4];
+}
+
 ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
     const ReferenceFiberDiagnostics& reference,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpPieceLines,
@@ -2794,42 +2895,52 @@ ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
     return {std::move(report), referencePieces};
 }
 
-std::string formatReferenceBpWindingBenchmark(
+std::vector<vc::fiber_tracer::FiberTraceReferenceWindingObservation>
+makeReferenceBpWindingObservations(
     const ReferenceFiberDiagnostics& reference,
     const ReferenceBpCrossConstraints& cross,
     const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding,
-    vc::fiber_tracer::FiberTraceBalanceMode balanceMode,
-    std::optional<double> parallelWindingDistanceCutoff)
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config)
 {
     if (cross.report.inputTraces < cross.referencePieces) {
-        throw std::invalid_argument("Reference/BP cross report has fewer traces than references");
+        throw std::invalid_argument(
+            "Reference/BP cross report has fewer traces than references");
     }
-    const std::size_t bpPieces = cross.report.inputTraces - cross.referencePieces;
+    const std::size_t bpPieces =
+        cross.report.inputTraces - cross.referencePieces;
     if (reference.sourceIdsByPiece.size() != cross.referencePieces ||
         winding.windingValid.size() != bpPieces ||
         winding.mapLatentCoordinate.size() != bpPieces ||
         winding.mapOrientationByPiece.size() != bpPieces ||
         winding.integerGaugeByPiece.size() != bpPieces) {
-        throw std::invalid_argument("Reference/BP benchmark inputs do not match represented pieces");
+        throw std::invalid_argument(
+            "Reference/BP benchmark inputs do not match represented pieces");
     }
 
-    std::vector<vc::fiber_tracer::FiberTraceReferenceWindingObservation> observations;
+    std::vector<vc::fiber_tracer::FiberTraceReferenceWindingObservation>
+        observations;
     observations.reserve(cross.report.constraints.size());
     for (const auto& constraint : cross.report.constraints) {
         if (constraint.hardContinuity)
             continue;
-        if (constraint.pieceA >= cross.report.pieces.size() || constraint.pieceB >= cross.report.pieces.size()) {
-            throw std::invalid_argument("Reference/BP constraint references an invalid piece");
+        if (constraint.pieceA >= cross.report.pieces.size() ||
+            constraint.pieceB >= cross.report.pieces.size()) {
+            throw std::invalid_argument(
+                "Reference/BP constraint references an invalid piece");
         }
-        const std::size_t traceA = cross.report.pieces[constraint.pieceA].traceIndex;
-        const std::size_t traceB = cross.report.pieces[constraint.pieceB].traceIndex;
+        const std::size_t traceA =
+            cross.report.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB =
+            cross.report.pieces[constraint.pieceB].traceIndex;
         const bool referenceIsA = traceA < cross.referencePieces;
         const bool referenceIsB = traceB < cross.referencePieces;
         if (referenceIsA == referenceIsB) {
-            throw std::logic_error("Reference/BP cross report contains a non-cross constraint");
+            throw std::logic_error(
+                "Reference/BP cross report contains a non-cross constraint");
         }
         const std::size_t referencePiece = referenceIsA ? traceA : traceB;
-        const std::size_t bpPiece = (referenceIsA ? traceB : traceA) - cross.referencePieces;
+        const std::size_t bpPiece =
+            (referenceIsA ? traceB : traceA) - cross.referencePieces;
         const std::size_t referenceSource =
             reference.sourceIdsByPiece[referencePiece];
         if (referenceSource >= reference.sourceNames.size()) {
@@ -2843,10 +2954,128 @@ std::string formatReferenceBpWindingBenchmark(
                 0.5 * static_cast<double>(referenceSource),
                 bpPiece,
                 winding,
-                parallelWindingDistanceCutoff);
+                config);
         observation.referenceSource = referenceSource;
         observations.push_back(std::move(observation));
     }
+    return observations;
+}
+
+struct WindingWeightSearchScore {
+    std::size_t exactReferences = 0;
+    std::size_t wrongReferences = 0;
+    std::size_t missingReferences = 0;
+    std::size_t rightConstraints = 0;
+    std::size_t wrongConstraints = 0;
+    bool converged = false;
+    double residual = std::numeric_limits<double>::infinity();
+};
+
+WindingWeightSearchScore scoreWindingWeightSearch(
+    const ReferenceFiberDiagnostics& reference,
+    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& benchmark,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding)
+{
+    constexpr double epsilon = 1.0e-12;
+    WindingWeightSearchScore result;
+    for (std::size_t source = 0; source < reference.sourceNames.size();
+         ++source) {
+        const auto estimated = source < benchmark.references.size()
+            ? benchmark.references[source].estimatedWinding
+            : std::nullopt;
+        if (!estimated) {
+            ++result.missingReferences;
+            continue;
+        }
+        const double truth = 0.5 * static_cast<double>(source);
+        if (std::abs(*estimated - truth) <= epsilon)
+            ++result.exactReferences;
+        else
+            ++result.wrongReferences;
+    }
+    result.rightConstraints = benchmark.sum.right;
+    result.wrongConstraints = benchmark.sum.wrong;
+    result.converged = winding.messageConverged;
+    result.residual = winding.messageResidual;
+    return result;
+}
+
+bool betterWindingWeightSearchResult(
+    const WindingWeightSearchScore& candidate,
+    const std::array<double, 5>& candidateWeights,
+    const WindingWeightSearchScore& current,
+    const std::array<double, 5>& currentWeights)
+{
+    if (candidate.converged != current.converged)
+        return candidate.converged;
+    if (candidate.exactReferences != current.exactReferences)
+        return candidate.exactReferences > current.exactReferences;
+    if (candidate.missingReferences != current.missingReferences)
+        return candidate.missingReferences < current.missingReferences;
+    if (candidate.wrongReferences != current.wrongReferences)
+        return candidate.wrongReferences < current.wrongReferences;
+    if (candidate.rightConstraints != current.rightConstraints)
+        return candidate.rightConstraints > current.rightConstraints;
+    const std::size_t candidateTotal =
+        candidate.rightConstraints + candidate.wrongConstraints;
+    const std::size_t currentTotal =
+        current.rightConstraints + current.wrongConstraints;
+    if (candidateTotal != currentTotal)
+        return candidateTotal > currentTotal;
+    if (candidate.wrongConstraints != current.wrongConstraints)
+        return candidate.wrongConstraints < current.wrongConstraints;
+    if (candidate.residual != current.residual)
+        return candidate.residual < current.residual;
+    return candidateWeights < currentWeights;
+}
+
+bool strictlyBetterWindingWeightSearchQuality(
+    const WindingWeightSearchScore& candidate,
+    const WindingWeightSearchScore& current)
+{
+    if (candidate.converged != current.converged)
+        return candidate.converged;
+    if (candidate.exactReferences != current.exactReferences)
+        return candidate.exactReferences > current.exactReferences;
+    if (candidate.missingReferences != current.missingReferences)
+        return candidate.missingReferences < current.missingReferences;
+    if (candidate.wrongReferences != current.wrongReferences)
+        return candidate.wrongReferences < current.wrongReferences;
+    if (candidate.rightConstraints != current.rightConstraints)
+        return candidate.rightConstraints > current.rightConstraints;
+    const std::size_t candidateTotal =
+        candidate.rightConstraints + candidate.wrongConstraints;
+    const std::size_t currentTotal =
+        current.rightConstraints + current.wrongConstraints;
+    if (candidateTotal != currentTotal)
+        return candidateTotal > currentTotal;
+    if (candidate.wrongConstraints != current.wrongConstraints)
+        return candidate.wrongConstraints < current.wrongConstraints;
+    return false;
+}
+
+std::string formatWindingWeights(const std::array<double, 5>& weights)
+{
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(6);
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+        if (index != 0)
+            output << ',';
+        output << weights[index];
+    }
+    return output.str();
+}
+
+std::string formatReferenceBpWindingBenchmark(
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding,
+    vc::fiber_tracer::FiberTraceBalanceMode balanceMode,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config)
+{
+    const auto observations = makeReferenceBpWindingObservations(
+        reference, cross, winding, config);
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
     std::ostringstream output;
@@ -2856,7 +3085,13 @@ std::string formatReferenceBpWindingBenchmark(
            << " solver="
            << vc::fiber_tracer::fiberTraceWindingSolverName(winding.solver)
            << " status=" << winding.status
-           << " tolerance=" << std::fixed << std::setprecision(3) << benchmark.tolerance << '\n'
+           << " tolerance=" << std::fixed << std::setprecision(3) << benchmark.tolerance
+           << " class_weights="
+           << config.perpendicularNextWeight << ','
+           << config.perpendicularFarWeight << ','
+           << config.parallelSameWeight << ','
+           << config.parallelOneWeight << ','
+           << config.parallelFarWeight << '\n'
            << "global sign=" << benchmark.globalSign << '\n'
            << "gauge calibration\n"
            << std::left << std::setw(12) << "gauge"
@@ -3688,6 +3923,8 @@ int main(int argc, char** argv)
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
                                 options.parallelWindingCutoff;
+                            setWindingClassWeights(
+                                windingConfig, options.windingWeights);
                             auto bpConstraints = selectedBpConstraints;
                             auto bpSourceLines = diagnosticLines;
                             auto bpSourceOriginalTraceIndices = diagnosticOriginalTraceIndices;
@@ -3849,155 +4086,478 @@ int main(int argc, char** argv)
                                 referenceBpConstraints =
                                     extractReferenceBpCrossConstraints(*referenceDiagnostics, bpPieceLines, options, normals, *alignedNormalField);
                             }
-                            if (jointGrid) {
-                                auto joint = options.jointGrid;
-                                static_cast<vc::fiber_tracer::
-                                    FiberTraceWindingBeliefPropagationConfig&>(joint) =
-                                        windingConfig;
-                                joint.mixedUnaryCost = options.windingDefectCost;
-                                joint.pieceBreakCost = options.pieceBreakCost;
-                                joint.orientationTemperature =
-                                    options.bp.horizontalnessTemperature;
-                                interleavedWinding = vc::fiber_tracer::
-                                    solveFiberTraceJointGridWindingBeliefPropagation(
-                                        bpConstraints,
-                                        bpTopology,
-                                        joint,
-                                        makeJointGridWindingProgressPrinter(),
-                                        fixedOrientations);
-                                if (!options.windingFixedOrientation) {
-                                    report.horizontalProbability =
-                                        interleavedWinding->classAProbability;
-                                    report.mixedProbability =
-                                        interleavedWinding->mixedProbability;
-                                    report.verticalProbability =
-                                        interleavedWinding->classBProbability;
-                                    report.normalizedArcWeights =
-                                        bpTopology.normalizedArcWeights;
-                                    report.seedPieceIndex =
-                                        bpTopology.centralSeedPiece;
-                                    report.factors = interleavedWinding->factors;
-                                    report.mergedMeasurements =
-                                        bpConstraints.constraints.size();
-                                    report.connectedComponents =
-                                        interleavedWinding->connectedComponents;
-                                    report.targetHorizontalFraction =
-                                        config.targetHorizontalFraction;
-                                    report.inference = vc::fiber_tracer::
-                                        FiberTraceBeliefInference::SumProductMixed;
-                                    report.inferenceTemperature =
-                                        joint.orientationTemperature;
-                                    report.mixedUnaryCost = joint.mixedUnaryCost;
-                                    report.messageIterations =
-                                        interleavedWinding->messageIterations;
-                                    report.messageResidual =
-                                        interleavedWinding->messageResidual;
-                                    report.messageConverged =
-                                        interleavedWinding->messageConverged;
-                                    report.solveSeconds =
-                                        interleavedWinding->continuousSolveSeconds +
-                                        interleavedWinding->discreteSolveSeconds;
-                                    report.status = interleavedWinding->status;
-                                    report.horizontalness.resize(
-                                        interleavedWinding->classAProbability.size());
-                                    std::vector<std::size_t> degree(
-                                        report.horizontalness.size(), 0);
-                                    for (std::size_t piece = 0;
-                                         piece < report.horizontalness.size();
-                                         ++piece) {
-                                        report.horizontalness[piece] =
-                                            orientationProjection(
-                                                report.horizontalProbability[piece],
-                                                report.mixedProbability[piece],
-                                                report.verticalProbability[piece],
-                                                piece);
-                                    }
-                                    for (const auto& factor :
-                                         interleavedWinding->factorDiagnostics) {
-                                        ++degree.at(factor.pieceA);
-                                        ++degree.at(factor.pieceB);
-                                        if (std::abs(
-                                                factor.parallelScore -
-                                                factor.perpendicularScore) <=
-                                            1.0e-12) {
-                                            ++report.neutralFactors;
-                                        }
-                                    }
-                                    report.neutralMeasurements =
-                                        report.neutralFactors;
-                                    report.isolatedPieces =
-                                        static_cast<std::size_t>(std::count(
-                                            degree.begin(), degree.end(), 0));
+                            const auto solveInterleaved = [&] (
+                                const std::array<double, 5>& weights,
+                                bool showProgress) {
+                                auto weightedConfig = windingConfig;
+                                setWindingClassWeights(weightedConfig, weights);
+                                if (jointGrid) {
+                                    auto joint = options.jointGrid;
+                                    static_cast<vc::fiber_tracer::
+                                        FiberTraceWindingBeliefPropagationConfig&>(joint) =
+                                            weightedConfig;
+                                    joint.mixedUnaryCost = options.windingDefectCost;
+                                    joint.pieceBreakCost = options.pieceBreakCost;
+                                    joint.orientationTemperature =
+                                        options.bp.horizontalnessTemperature;
+                                    return vc::fiber_tracer::
+                                        solveFiberTraceJointGridWindingBeliefPropagation(
+                                            bpConstraints,
+                                            bpTopology,
+                                            joint,
+                                            showProgress
+                                                ? makeJointGridWindingProgressPrinter()
+                                                : vc::fiber_tracer::
+                                                      FiberTraceJointGridProgressCallback{},
+                                            fixedOrientations);
                                 }
-                            }
-                            if (!jointGrid &&
-                                options.bpInference == vc::fiber_tracer::
-                                    FiberTraceBeliefInference::SumProductMixed) {
                                 vc::fiber_tracer::
                                     FiberTraceInterleavedWindingConfig joint;
                                 static_cast<vc::fiber_tracer::
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
-                                        windingConfig;
+                                        weightedConfig;
                                 joint.mixedUnaryCost = options.windingDefectCost;
                                 joint.pieceBreakCost = options.pieceBreakCost;
                                 joint.orientationTemperature =
                                     options.bp.horizontalnessTemperature;
                                 joint.temperature = 0.25;
-                                interleavedWinding = vc::fiber_tracer::
+                                return vc::fiber_tracer::
                                     solveFiberTraceInterleavedWindingBeliefPropagation(
                                         bpConstraints,
                                         bpTopology,
                                         report,
                                         joint,
-                                        makeInterleavedWindingProgressPrinter(),
+                                        showProgress
+                                            ? makeInterleavedWindingProgressPrinter()
+                                            : vc::fiber_tracer::
+                                                  FiberTraceInterleavedWindingProgressCallback{},
                                         fixedOrientations);
-                                if (!options.windingFixedOrientation) {
-                                    report.horizontalProbability =
-                                        interleavedWinding->classAProbability;
-                                    report.mixedProbability =
-                                        interleavedWinding->mixedProbability;
-                                    report.verticalProbability =
-                                        interleavedWinding->classBProbability;
-                                    report.horizontalness.resize(
-                                        interleavedWinding->classAProbability.size());
-                                    for (std::size_t piece = 0;
-                                         piece < report.horizontalness.size();
-                                         ++piece) {
-                                        report.horizontalness[piece] =
-                                            orientationProjection(
-                                                report.horizontalProbability[piece],
-                                                report.mixedProbability[piece],
-                                                report.verticalProbability[piece],
-                                                piece);
-                                    }
-                                    report.messageIterations =
-                                        interleavedWinding->messageIterations;
-                                    report.messageResidual =
-                                        interleavedWinding->messageResidual;
-                                    report.messageConverged =
-                                        interleavedWinding->messageConverged;
-                                    report.solveSeconds =
-                                        interleavedWinding->discreteSolveSeconds;
-                                    report.status = interleavedWinding->status;
-                                    const double arcWeight = std::accumulate(
-                                        report.normalizedArcWeights.begin(),
-                                        report.normalizedArcWeights.end(),
-                                        0.0);
-                                    report.achievedHorizontalFraction =
-                                        arcWeight > 0.0
-                                        ? std::inner_product(
-                                              report.horizontalness.begin(),
-                                              report.horizontalness.end(),
-                                              report.normalizedArcWeights.begin(),
-                                              0.0) /
-                                            arcWeight
-                                        : std::accumulate(
-                                        report.horizontalness.begin(),
-                                        report.horizontalness.end(),
-                                        0.0) / static_cast<double>(
-                                            report.horizontalness.size());
+                            };
+
+                            if (options.windingWeightSearch ||
+                                options.windingWeightSearchLocal) {
+                                if (!referenceDiagnostics ||
+                                    !referenceBpConstraints) {
+                                    throw std::logic_error(
+                                        "Winding weight search has no reference benchmark");
                                 }
-                            } else if (!jointGrid) {
+                                struct SearchRow {
+                                    std::array<double, 5> weights;
+                                    WindingWeightSearchScore score;
+                                    double seconds = 0.0;
+                                    std::string status;
+                                };
+                                std::vector<SearchRow> rows;
+                                std::optional<WindingWeightSearchScore> bestScore;
+                                std::array<double, 5> bestWeights{};
+                                const auto searchStarted =
+                                    std::chrono::steady_clock::now();
+                                std::size_t evaluatedScenarios = 0;
+
+                                const auto evaluate = [&] (
+                                    const std::array<double, 5>& weights,
+                                    const std::string& phase,
+                                    const std::size_t completed,
+                                    const std::size_t workTotal)
+                                    -> std::optional<std::size_t> {
+                                    const auto started =
+                                        std::chrono::steady_clock::now();
+                                    try {
+                                        auto candidate =
+                                            solveInterleaved(weights, false);
+                                        auto candidateConfig = windingConfig;
+                                        setWindingClassWeights(
+                                            candidateConfig, weights);
+                                        const auto observations =
+                                            makeReferenceBpWindingObservations(
+                                                *referenceDiagnostics,
+                                                *referenceBpConstraints,
+                                                candidate,
+                                                candidateConfig);
+                                        const auto benchmark = vc::fiber_tracer::
+                                            calibrateFiberTraceReferenceWindings(
+                                                observations);
+                                        const auto score =
+                                            scoreWindingWeightSearch(
+                                                *referenceDiagnostics,
+                                                benchmark,
+                                                candidate);
+                                        const double seconds =
+                                            std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                started).count();
+                                        rows.push_back({
+                                            weights, score, seconds,
+                                            candidate.status});
+                                        const std::size_t row = rows.size() - 1;
+                                        if (!bestScore ||
+                                            betterWindingWeightSearchResult(
+                                                score, weights, *bestScore,
+                                                bestWeights)) {
+                                            bestScore = score;
+                                            bestWeights = weights;
+                                        }
+                                        ++evaluatedScenarios;
+                                        const double elapsed =
+                                            std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                searchStarted).count();
+                                        const double eta = elapsed /
+                                            static_cast<double>(evaluatedScenarios) *
+                                            static_cast<double>(
+                                                workTotal - completed);
+                                        const std::size_t constraintTotal =
+                                            score.rightConstraints +
+                                            score.wrongConstraints;
+                                        std::cout
+                                            << "winding weight search phase="
+                                            << phase << ' ' << completed << '/'
+                                            << workTotal << " weights="
+                                            << formatWindingWeights(weights)
+                                            << " ref_exact="
+                                            << score.exactReferences << '/'
+                                            << referenceDiagnostics->sourceNames.size()
+                                            << " ref_wrong="
+                                            << score.wrongReferences
+                                            << " ref_missing="
+                                            << score.missingReferences
+                                            << " constraints="
+                                            << score.rightConstraints << '/'
+                                            << constraintTotal
+                                            << " fraction="
+                                            << (constraintTotal == 0 ? 0.0 :
+                                                static_cast<double>(
+                                                    score.rightConstraints) /
+                                                static_cast<double>(
+                                                    constraintTotal))
+                                            << " converged="
+                                            << std::boolalpha << score.converged
+                                            << std::noboolalpha
+                                            << " seconds=" << seconds
+                                            << " eta_seconds=" << eta << '\n'
+                                            << std::flush;
+                                        return row;
+                                    } catch (const std::exception& error) {
+                                        ++evaluatedScenarios;
+                                        const double seconds =
+                                            std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                started).count();
+                                        std::cout
+                                            << "winding weight search phase="
+                                            << phase << ' ' << completed << '/'
+                                            << workTotal << " weights="
+                                            << formatWindingWeights(weights)
+                                            << " status=failed seconds="
+                                            << seconds << " error="
+                                            << error.what() << '\n'
+                                            << std::flush;
+                                        return std::nullopt;
+                                    }
+                                };
+
+                                if (options.windingWeightSearch) {
+                                    constexpr std::size_t maximumScenarios =
+                                        100'000;
+                                    std::size_t scenarioCount = 1;
+                                    for (std::size_t dimension = 0;
+                                         dimension < 5;
+                                         ++dimension) {
+                                        if (scenarioCount > maximumScenarios /
+                                            options.windingWeightSearch->size()) {
+                                            throw std::invalid_argument(
+                                                "Winding weight search grid exceeds 100000 scenarios");
+                                        }
+                                        scenarioCount *=
+                                            options.windingWeightSearch->size();
+                                    }
+                                    rows.reserve(scenarioCount);
+                                    std::size_t scenario = 0;
+                                    for (const double p05 : *options.windingWeightSearch)
+                                    for (const double pFar : *options.windingWeightSearch)
+                                    for (const double p0 : *options.windingWeightSearch)
+                                    for (const double p1 : *options.windingWeightSearch)
+                                    for (const double pFarParallel : *options.windingWeightSearch) {
+                                        ++scenario;
+                                        (void)evaluate(
+                                            {p05, pFar, p0, p1, pFarParallel},
+                                            "grid", scenario, scenarioCount);
+                                    }
+                                } else {
+                                    constexpr int exponentLimit = 16;
+                                    constexpr std::size_t maximumIterations =
+                                        160;
+                                    using Exponents = std::array<int, 5>;
+                                    std::map<Exponents,
+                                             std::optional<std::size_t>> cache;
+                                    const auto weightsFor = [&] (
+                                        const Exponents& exponents) {
+                                        std::array<double, 5> weights{};
+                                        for (std::size_t dimension = 0;
+                                             dimension < weights.size();
+                                             ++dimension) {
+                                            weights[dimension] = std::ldexp(
+                                                options.windingWeights[dimension],
+                                                exponents[dimension]);
+                                            if (!std::isfinite(weights[dimension]) ||
+                                                !(weights[dimension] > 0.0)) {
+                                                throw std::overflow_error(
+                                                    "Local winding weight is outside the finite positive domain");
+                                            }
+                                        }
+                                        return weights;
+                                    };
+                                    const auto evaluateExponents = [&] (
+                                        const Exponents& exponents,
+                                        const std::string& phase,
+                                        const std::size_t completed,
+                                        const std::size_t workTotal) {
+                                        const auto found = cache.find(exponents);
+                                        if (found != cache.end()) {
+                                            std::cout
+                                                << "winding weight search phase="
+                                                << phase << ' ' << completed
+                                                << '/' << workTotal
+                                                << " weights="
+                                                << formatWindingWeights(
+                                                       weightsFor(exponents))
+                                                << " status=cached\n"
+                                                << std::flush;
+                                            return found->second;
+                                        }
+                                        const auto result = evaluate(
+                                            weightsFor(exponents), phase,
+                                            completed, workTotal);
+                                        cache.emplace(exponents, result);
+                                        return result;
+                                    };
+
+                                    Exponents currentExponents{};
+                                    const auto initial = evaluateExponents(
+                                        currentExponents, "local_start", 1, 1);
+                                    if (!initial) {
+                                        throw std::runtime_error(
+                                            "Initial local winding weight scenario failed");
+                                    }
+                                    std::size_t currentRow = *initial;
+                                    bool localOptimum = false;
+                                    for (std::size_t iteration = 1;
+                                         iteration <= maximumIterations;
+                                         ++iteration) {
+                                        std::vector<Exponents> neighbors;
+                                        neighbors.reserve(10);
+                                        for (std::size_t dimension = 0;
+                                             dimension < 5;
+                                             ++dimension) {
+                                            for (const int delta : {-1, 1}) {
+                                                Exponents neighbor =
+                                                    currentExponents;
+                                                neighbor[dimension] += delta;
+                                                if (neighbor[dimension] <
+                                                        -exponentLimit ||
+                                                    neighbor[dimension] >
+                                                        exponentLimit) {
+                                                    continue;
+                                                }
+                                                neighbors.push_back(neighbor);
+                                            }
+                                        }
+
+                                        std::optional<std::size_t> nextRow;
+                                        Exponents nextExponents{};
+                                        for (std::size_t neighbor = 0;
+                                             neighbor < neighbors.size();
+                                             ++neighbor) {
+                                            const auto candidate =
+                                                evaluateExponents(
+                                                    neighbors[neighbor],
+                                                    "local_" +
+                                                        std::to_string(iteration),
+                                                    neighbor + 1,
+                                                    neighbors.size());
+                                            if (!candidate ||
+                                                !strictlyBetterWindingWeightSearchQuality(
+                                                    rows[*candidate].score,
+                                                    rows[currentRow].score)) {
+                                                continue;
+                                            }
+                                            if (!nextRow ||
+                                                betterWindingWeightSearchResult(
+                                                    rows[*candidate].score,
+                                                    rows[*candidate].weights,
+                                                    rows[*nextRow].score,
+                                                    rows[*nextRow].weights)) {
+                                                nextRow = *candidate;
+                                                nextExponents =
+                                                    neighbors[neighbor];
+                                            }
+                                        }
+                                        if (!nextRow) {
+                                            localOptimum = true;
+                                            std::cout
+                                                << "winding weight search status=local_optimum iterations="
+                                                << iteration - 1
+                                                << " evaluated=" << rows.size()
+                                                << " selected="
+                                                << formatWindingWeights(
+                                                       rows[currentRow].weights)
+                                                << '\n';
+                                            break;
+                                        }
+                                        currentRow = *nextRow;
+                                        currentExponents = nextExponents;
+                                        const auto& selectedScore =
+                                            rows[currentRow].score;
+                                        const std::size_t selectedTotal =
+                                            selectedScore.rightConstraints +
+                                            selectedScore.wrongConstraints;
+                                        std::cout
+                                            << "winding weight search status=move iteration="
+                                            << iteration << " selected="
+                                            << formatWindingWeights(
+                                                   rows[currentRow].weights)
+                                            << " ref_exact="
+                                            << selectedScore.exactReferences
+                                            << '/'
+                                            << referenceDiagnostics->sourceNames.size()
+                                            << " constraints="
+                                            << selectedScore.rightConstraints
+                                            << '/' << selectedTotal
+                                            << " fraction="
+                                            << (selectedTotal == 0 ? 0.0 :
+                                                static_cast<double>(
+                                                    selectedScore.rightConstraints) /
+                                                static_cast<double>(
+                                                    selectedTotal))
+                                            << '\n';
+                                    }
+                                    if (!localOptimum) {
+                                        throw std::runtime_error(
+                                            "Local winding weight search reached its iteration limit before a local optimum");
+                                    }
+                                    bestScore = rows[currentRow].score;
+                                    bestWeights = rows[currentRow].weights;
+                                }
+
+                                if (!bestScore) {
+                                    throw std::runtime_error(
+                                        "Every winding weight search scenario failed");
+                                }
+                                std::sort(
+                                    rows.begin(), rows.end(),
+                                    [](const SearchRow& a, const SearchRow& b) {
+                                        return betterWindingWeightSearchResult(
+                                            a.score, a.weights,
+                                            b.score, b.weights);
+                                    });
+                                std::cout
+                                    << "winding weight search ranking\n"
+                                    << "rank  weights  ref_exact  ref_wrong  ref_missing  right  wrong  fraction  converged  seconds\n";
+                                for (std::size_t rank = 0;
+                                     rank < rows.size();
+                                     ++rank) {
+                                    const auto& row = rows[rank];
+                                    const std::size_t total =
+                                        row.score.rightConstraints +
+                                        row.score.wrongConstraints;
+                                    std::cout
+                                        << rank + 1 << "  "
+                                        << formatWindingWeights(row.weights)
+                                        << "  " << row.score.exactReferences
+                                        << "  " << row.score.wrongReferences
+                                        << "  " << row.score.missingReferences
+                                        << "  " << row.score.rightConstraints
+                                        << "  " << row.score.wrongConstraints
+                                        << "  " << (total == 0 ? 0.0 :
+                                            static_cast<double>(
+                                                row.score.rightConstraints) /
+                                            static_cast<double>(total))
+                                        << "  " << std::boolalpha
+                                        << row.score.converged
+                                        << std::noboolalpha
+                                        << "  " << row.seconds << '\n';
+                                }
+                                setWindingClassWeights(
+                                    windingConfig, bestWeights);
+                                interleavedWinding = solveInterleaved(
+                                    bestWeights, false);
+                                std::cout
+                                    << "winding weight search selected="
+                                    << formatWindingWeights(bestWeights)
+                                    << '\n';
+                            } else {
+                                interleavedWinding = solveInterleaved(
+                                    options.windingWeights, true);
+                            }
+
+                            if (interleavedWinding &&
+                                !options.windingFixedOrientation) {
+                                report.horizontalProbability =
+                                    interleavedWinding->classAProbability;
+                                report.mixedProbability =
+                                    interleavedWinding->mixedProbability;
+                                report.verticalProbability =
+                                    interleavedWinding->classBProbability;
+                                report.normalizedArcWeights =
+                                    bpTopology.normalizedArcWeights;
+                                report.seedPieceIndex =
+                                    bpTopology.centralSeedPiece;
+                                report.factors = interleavedWinding->factors;
+                                report.mergedMeasurements =
+                                    bpConstraints.constraints.size();
+                                report.connectedComponents =
+                                    interleavedWinding->connectedComponents;
+                                report.targetHorizontalFraction =
+                                    config.targetHorizontalFraction;
+                                report.inference = vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed;
+                                report.inferenceTemperature =
+                                    options.bp.horizontalnessTemperature;
+                                report.mixedUnaryCost = options.windingDefectCost;
+                                report.messageIterations =
+                                    interleavedWinding->messageIterations;
+                                report.messageResidual =
+                                    interleavedWinding->messageResidual;
+                                report.messageConverged =
+                                    interleavedWinding->messageConverged;
+                                report.solveSeconds =
+                                    interleavedWinding->continuousSolveSeconds +
+                                    interleavedWinding->discreteSolveSeconds;
+                                report.status = interleavedWinding->status;
+                                report.horizontalness.resize(
+                                    interleavedWinding->classAProbability.size());
+                                std::vector<std::size_t> degree(
+                                    report.horizontalness.size(), 0);
+                                for (std::size_t piece = 0;
+                                     piece < report.horizontalness.size();
+                                     ++piece) {
+                                    report.horizontalness[piece] =
+                                        orientationProjection(
+                                            report.horizontalProbability[piece],
+                                            report.mixedProbability[piece],
+                                            report.verticalProbability[piece],
+                                            piece);
+                                }
+                                for (const auto& factor :
+                                     interleavedWinding->factorDiagnostics) {
+                                    ++degree.at(factor.pieceA);
+                                    ++degree.at(factor.pieceB);
+                                    if (std::abs(
+                                            factor.parallelScore -
+                                            factor.perpendicularScore) <=
+                                        1.0e-12) {
+                                        ++report.neutralFactors;
+                                    }
+                                }
+                                report.neutralMeasurements =
+                                    report.neutralFactors;
+                                report.isolatedPieces =
+                                    static_cast<std::size_t>(std::count(
+                                        degree.begin(), degree.end(), 0));
+                            }
+                            if (!jointGrid &&
+                                options.bpInference != vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed) {
                                 independentWinding = vc::fiber_tracer::
                                     solveFiberTraceWindingBeliefPropagation(
                                         bpConstraints, bpTopology, windingConfig);
@@ -4037,7 +4597,7 @@ int main(int argc, char** argv)
                                         *referenceBpConstraints,
                                         *interleavedWinding,
                                         mode,
-                                        options.parallelWindingCutoff));
+                                        windingConfig));
                             } else if (interleavedWinding) {
                                 deferredBpStateDiagnostics.push_back(
                                     formatBpFinalStateCohorts(

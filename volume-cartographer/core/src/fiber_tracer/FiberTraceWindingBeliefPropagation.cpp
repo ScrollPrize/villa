@@ -88,6 +88,19 @@ void validateConfig(const FiberTraceWindingBeliefPropagationConfig& config)
         throw std::invalid_argument(
             "Winding BP parallel winding cutoff must be finite and positive");
     }
+    const std::array classWeights{
+        config.perpendicularNextWeight,
+        config.perpendicularFarWeight,
+        config.parallelSameWeight,
+        config.parallelOneWeight,
+        config.parallelFarWeight,
+    };
+    if (std::any_of(classWeights.begin(), classWeights.end(), [](double weight) {
+            return !std::isfinite(weight) || !(weight > 0.0);
+        })) {
+        throw std::invalid_argument(
+            "Winding BP class weights must be finite and positive");
+    }
 }
 
 double windingWeightMultiplier(double effectiveTarget)
@@ -101,6 +114,25 @@ double windingWeightMultiplier(double effectiveTarget)
     if (exponent > static_cast<double>(maximumSubnormalExponent))
         return 0.0;
     return std::ldexp(1.0, -static_cast<int>(exponent));
+}
+
+double windingClassWeight(
+    const FiberTraceWindingBeliefPropagationConfig& config,
+    bool perpendicular,
+    double effectiveTarget)
+{
+    constexpr double epsilon = 1.0e-12;
+    const double distance = std::abs(effectiveTarget);
+    if (perpendicular) {
+        return distance <= 0.5 + epsilon
+            ? config.perpendicularNextWeight
+            : config.perpendicularFarWeight;
+    }
+    if (distance <= epsilon)
+        return config.parallelSameWeight;
+    return distance <= 1.0 + epsilon
+        ? config.parallelOneWeight
+        : config.parallelFarWeight;
 }
 
 double parallelWindingWeight(const Measurement& measurement)
@@ -206,12 +238,16 @@ PreparedWinding prepareWinding(
         const bool parallelDominant = !perpendicularDominant;
         const double parallelMultiplier =
             quantizeComponentTargets && !continuity
-            ? windingWeightMultiplier(effectiveParallelDistance)
+            ? windingWeightMultiplier(effectiveParallelDistance) *
+                windingClassWeight(
+                    config, false, effectiveParallelDistance)
             : 1.0;
         const double perpendicularMultiplier =
             effectivePerpendicularSignedDelta && quantizeComponentTargets &&
                 !continuity
-            ? windingWeightMultiplier(*effectivePerpendicularSignedDelta)
+            ? windingWeightMultiplier(*effectivePerpendicularSignedDelta) *
+                windingClassWeight(
+                    config, true, *effectivePerpendicularSignedDelta)
             : 1.0;
         Measurement measurement{
             index,
@@ -3640,17 +3676,18 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
 
 FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
     const FiberTraceConstraint& constraint, bool referenceIsEndpointA, double virtualReferenceWinding, std::size_t bpPiece, const FiberTraceInterleavedWindingReport& winding,
-    std::optional<double> parallelWindingDistanceCutoff)
+    const FiberTraceWindingBeliefPropagationConfig& config)
 {
     if (!std::isfinite(virtualReferenceWinding) || bpPiece >= winding.windingValid.size() ||
         winding.mapLatentCoordinate.size() != winding.windingValid.size() || winding.mapOrientationByPiece.size() != winding.windingValid.size() ||
         winding.integerGaugeByPiece.size() != winding.windingValid.size() || !std::isfinite(winding.measurementScale) ||
         !(winding.measurementScale > 0.0) ||
-        (parallelWindingDistanceCutoff &&
-         (!std::isfinite(*parallelWindingDistanceCutoff) ||
-          !(*parallelWindingDistanceCutoff > 0.0)))) {
+        (config.parallelWindingDistanceCutoff &&
+         (!std::isfinite(*config.parallelWindingDistanceCutoff) ||
+          !(*config.parallelWindingDistanceCutoff > 0.0)))) {
         throw std::invalid_argument("Reference winding observation inputs are invalid");
     }
+    validateConfig(config);
 
     FiberTraceReferenceWindingObservation observation;
     observation.integerGauge = winding.integerGaugeByPiece[bpPiece];
@@ -3687,7 +3724,8 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
             *constraint.signedWindingDelta);
         observation.signedPerpendicularTarget = target;
         observation.perpendicularCoefficient =
-            constraint.perpendicularScore * windingWeightMultiplier(target);
+            constraint.perpendicularScore * windingWeightMultiplier(target) *
+            windingClassWeight(config, true, target);
         addCandidate(
             observation.bpLatentCoordinate +
             observation.referenceDeltaSign * winding.measurementScale *
@@ -3696,16 +3734,20 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
 
     const double parallelTarget = perpendicular
         ? 0.0
+        : constraint.signedParallelWindingDelta
+        ? std::abs(quantizedIntegerWindingTarget(
+              *constraint.signedParallelWindingDelta))
         : std::abs(quantizedIntegerWindingTarget(
               constraint.parallelWindingDistance));
     observation.parallelDistance = parallelTarget;
     observation.rawParallelCoefficient = perpendicular
         ? 0.0
-        : constraint.parallelScore * windingWeightMultiplier(parallelTarget);
+        : constraint.parallelScore * windingWeightMultiplier(parallelTarget) *
+            windingClassWeight(config, false, parallelTarget);
     const bool parallelAdmitted = !perpendicular &&
         (parallelTarget == 0.0 || constraint.signedParallelWindingDelta) &&
-        (!parallelWindingDistanceCutoff ||
-         parallelTarget < *parallelWindingDistanceCutoff);
+        (!config.parallelWindingDistanceCutoff ||
+         parallelTarget < *config.parallelWindingDistanceCutoff);
     observation.admittedParallelCoefficient = parallelAdmitted
         ? observation.rawParallelCoefficient
         : 0.0;

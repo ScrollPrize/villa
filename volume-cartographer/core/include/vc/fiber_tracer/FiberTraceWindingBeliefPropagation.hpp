@@ -86,6 +86,9 @@ enum class FiberTraceWindingCalibrationMode : unsigned char {
 [[nodiscard]] const char* fiberTraceWindingCalibrationModeName(
     FiberTraceWindingCalibrationMode mode) noexcept;
 
+inline constexpr std::array<double, 5>
+    kDefaultFiberTraceWindingClassWeights{8.0, 1.0, 2.0, 2.0, 1.0};
+
 struct FiberTraceWindingBeliefPropagationConfig {
     double temperature = 0.25;
     double messageDamping = 0.5;
@@ -95,6 +98,16 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::size_t maximumTotalCandidateStates = 4'000'000;
     std::size_t parallelWorkers = 1;
     std::optional<double> parallelWindingDistanceCutoff;
+    double perpendicularNextWeight =
+        kDefaultFiberTraceWindingClassWeights[0];
+    double perpendicularFarWeight =
+        kDefaultFiberTraceWindingClassWeights[1];
+    double parallelSameWeight =
+        kDefaultFiberTraceWindingClassWeights[2];
+    double parallelOneWeight =
+        kDefaultFiberTraceWindingClassWeights[3];
+    double parallelFarWeight =
+        kDefaultFiberTraceWindingClassWeights[4];
 };
 
 struct FiberTraceWindingComponentSelection {
@@ -438,7 +451,7 @@ struct FiberTraceReferenceSourceConstraintGroups {
 
 [[nodiscard]] FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
     const FiberTraceConstraint& constraint, bool referenceIsEndpointA, double virtualReferenceWinding, std::size_t bpPiece, const FiberTraceInterleavedWindingReport& winding,
-    std::optional<double> parallelWindingDistanceCutoff = std::nullopt);
+    const FiberTraceWindingBeliefPropagationConfig& config = {});
 
 [[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
     std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);

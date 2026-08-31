@@ -5731,3 +5731,32 @@
 - Published `N` is the solver's nonnegative display-offset integer label.
   Absolute winding and physical H/V identity are not comparable across
   independently gauged components; visualization must not imply otherwise.
+- Winding BP accepts one strictly positive finite multiplier for each canonical
+  dominant factor class in tuple order `perp_0.5`, `perp_1.5+`, `parallel_0`,
+  `parallel_1`, `parallel_2+`. The multiplier composes with the existing
+  canonical-distance decay. Signed parallel targets are authoritative for
+  integer class selection. These multipliers affect finite winding loss and
+  its diagnostics only; they never scale orientation loss, hard perpendicular
+  order, hard continuity, Defect unary cost, or piece-break cost.
+- Shared and CLI H/V-aware winding defaults are `8,1,2,2,1`. An explicit
+  `1,1,1,1,1` tuple restores neutral class weighting. The standalone
+  raw-integer solver retains unscaled measurements because it does not
+  quantize the H/V ladder targets used for canonical class selection.
+- `--winding-weights` runs one explicit five-value tuple.
+  `--winding-weight-search` takes one deduplicated positive value list and runs
+  its complete five-dimensional Cartesian product, capped at 100,000
+  scenarios. Search requires reference fibers and mixed BP, conflicts with a
+  fixed tuple, reuses all pre-winding geometry/orientation work, isolates failed
+  scenarios, and uses the selected tuple for every final artifact and
+  diagnostic. Converged scenarios rank before nonconverged scenarios, followed
+  by exact calibrated source estimates on the fixed reference-source
+  denominator, fewer missing and incorrect estimates, more right and evaluated
+  constraints, fewer wrong constraints, residual, and lexicographic tuple.
+- `--winding-weight-search-local` requires an explicit `--winding-weights`
+  start and is mutually exclusive with exhaustive search. It evaluates every
+  one-coordinate `/2` and `*2` neighbor, caches exact power-of-two exponent
+  tuples and failures, moves only on a strict benchmark-quality improvement,
+  and repeats to a local optimum. Residual and lexicographic tuple ordering may
+  select deterministically among improving neighbors but cannot turn a quality
+  tie into a move. Exponents remain in `[-16,16]` relative to the supplied
+  start, and an iteration-limit exit is an error rather than a local optimum.

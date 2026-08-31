@@ -998,6 +998,48 @@ parallel * abs(delta)
     + perpendicular * abs(gain * delta - signed_target)
 ```
 
+The five canonical winding terms can be scaled independently with
+`--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
+half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
+winding (`0`), parallel one winding (`1`), and parallel farther windings
+(`2+`). Standard runs default to `8,1,2,2,1`; pass `1,1,1,1,1` explicitly for
+neutral class weighting. Each value must be finite and strictly positive. The
+class multiplier is applied after the existing `2^-floor(abs(target))`
+distance decay and only to finite winding energy. It does not scale H/V
+orientation evidence, hard perpendicular order, hard continuity, the Defect
+unary, or piece-break cost.
+When a signed parallel target is available, its quantized magnitude selects
+the parallel class; the unsigned median distance is only the fallback.
+Reference group `raw_w` includes distance decay and this class multiplier
+before optional parallel-cutoff admission; `used_w` applies the cutoff.
+The class multipliers apply to the H/V-aware joint-grid and interleaved winding
+solvers. The standalone raw-integer winding solve does not quantize H/V ladder
+targets and therefore retains its existing unscaled measurement behavior.
+
+With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
+tests the Cartesian product of the listed values in all five tuple positions.
+It conflicts with `--winding-weights`. Constraint extraction, topology,
+positive-weight component selection, fixed orientation, and reference cross
+constraints are reused; only winding inference is repeated. Each scenario
+prints elapsed time, ETA, exact/wrong/missing calibrated reference estimates,
+constraint right/total accuracy, convergence, and the tuple. The final ranking
+uses the fixed reference-source denominator first, then constraint matches, so
+turning difficult endpoints into Defect cannot improve the primary score by
+abstaining. Failed scenarios are reported and skipped. The selected report and
+tuple drive the ordinary CSV, OBJ, and reference diagnostics.
+
+For iterative tuning, pass one starting tuple with `--winding-weights` and add
+`--winding-weight-search-local`. Each iteration evaluates the ten tuples made
+by multiplying exactly one coordinate by `0.5` or `2`, then moves to the best
+strict benchmark improvement. Exact power-of-two exponent tuples cache both
+successful and failed scenarios, so a previously visited neighbor is not
+solved again. Tied benchmark metrics do not cause a move; tuple ordering and
+message residual only make reporting deterministic. The search stops when no
+single-coordinate neighbor improves the benchmark. Exponents are bounded to
+`[-16,16]` relative to the supplied tuple; reaching the iteration guard before
+an optimum is an error rather than a successful termination. The selected
+tuple is solved once more to produce the ordinary output artifacts.
+
 where `gain=1/measurement_scale`. In alternating mode the equivalent stored
 parameterization is:
 

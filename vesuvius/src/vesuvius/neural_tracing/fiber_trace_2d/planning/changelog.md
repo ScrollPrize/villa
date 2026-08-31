@@ -1681,3 +1681,16 @@
 - Reused the dominant-factor scorer before and after calibration, separated
   global sign selection from arbitrary gauge-origin magnitude, and kept the
   `0.5` tolerance reporting-only.
+
+## 2026-08-31 - Direct winding-factor weight search
+
+- Added independent multipliers for the five canonical perpendicular/parallel
+  winding classes and kept solver/reference diagnostic coefficients identical.
+- Added one-command exhaustive reference grid search with reused preprocessing,
+  fixed-denominator ranking, ETA, failed-scenario isolation, and selected-result
+  artifact output.
+- Added cached `/2`, `*2` coordinate search from an explicit tuple, with strict
+  quality-only moves, bounded exact exponent keys, per-neighborhood progress,
+  and final selected-result artifact output.
+- Promoted the locally selected `8,1,2,2,1` tuple to the shared and CLI default
+  for H/V-aware winding solves; explicit all-ones retains neutral weighting.

@@ -70,14 +70,34 @@ FiberTraceBeliefTopology topology(
         source, report, {-5.0, -5.0, -5.0}, {5.0, 5.0, 5.0});
 }
 
+void useUnitClassWeights(FiberTraceWindingBeliefPropagationConfig& config)
+{
+    config.perpendicularNextWeight = 1.0;
+    config.perpendicularFarWeight = 1.0;
+    config.parallelSameWeight = 1.0;
+    config.parallelOneWeight = 1.0;
+    config.parallelFarWeight = 1.0;
+}
+
 FiberTraceWindingBeliefPropagationConfig config()
 {
     FiberTraceWindingBeliefPropagationConfig result;
+    useUnitClassWeights(result);
     result.temperature = 0.25;
     result.messageDamping = 1.0;
     result.messageResidualTolerance = 1.0e-12;
     result.maximumMessageIterations = 1000;
     return result;
+}
+
+TEST_CASE("Winding class production defaults use the selected reference tuple")
+{
+    const FiberTraceWindingBeliefPropagationConfig defaults;
+    CHECK(defaults.perpendicularNextWeight == 8.0);
+    CHECK(defaults.perpendicularFarWeight == 1.0);
+    CHECK(defaults.parallelSameWeight == 2.0);
+    CHECK(defaults.parallelOneWeight == 2.0);
+    CHECK(defaults.parallelFarWeight == 1.0);
 }
 
 FiberTraceBeliefPropagationReport orientationBeliefs(
@@ -740,8 +760,11 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
     perpendicular.parallelScore = 0.2;
     perpendicular.perpendicularScore = 0.8;
     perpendicular.signedWindingDelta = -1.0;
+    FiberTraceWindingBeliefPropagationConfig config;
+    useUnitClassWeights(config);
+    config.parallelWindingDistanceCutoff = 0.5;
     const auto next = makeFiberTraceReferenceWindingObservation(
-        perpendicular, true, 0.0, 0, winding, 0.5);
+        perpendicular, true, 0.0, 0, winding, config);
     CHECK(next.canonicalWindingDistance == 0.5);
     CHECK(next.rawCoefficient == doctest::Approx(0.8));
     CHECK(next.admittedCoefficient == doctest::Approx(0.8));
@@ -749,7 +772,7 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
 
     perpendicular.signedWindingDelta = 1.00001;
     const auto far = makeFiberTraceReferenceWindingObservation(
-        perpendicular, false, 0.0, 0, winding, 0.5);
+        perpendicular, false, 0.0, 0, winding, config);
     CHECK(far.canonicalWindingDistance == 1.5);
     CHECK(far.rawCoefficient == doctest::Approx(0.4));
     CHECK(far.admittedCoefficient == doctest::Approx(0.4));
@@ -760,7 +783,7 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
     parallel.parallelWindingDistance = 0.49;
     parallel.signedParallelWindingDelta = -0.49;
     const auto same = makeFiberTraceReferenceWindingObservation(
-        parallel, true, 0.0, 0, winding, 0.5);
+        parallel, true, 0.0, 0, winding, config);
     CHECK(same.canonicalWindingDistance == 0.0);
     CHECK(same.rawCoefficient == doctest::Approx(0.75));
     CHECK(same.admittedCoefficient == doctest::Approx(0.75));
@@ -769,22 +792,81 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
     parallel.parallelWindingDistance = 0.5;
     parallel.signedParallelWindingDelta = -0.5;
     const auto one = makeFiberTraceReferenceWindingObservation(
-        parallel, false, 0.0, 0, winding, 0.5);
+        parallel, false, 0.0, 0, winding, config);
     CHECK(one.canonicalWindingDistance == 1.0);
     CHECK(one.rawCoefficient == doctest::Approx(0.375));
     CHECK(one.admittedCoefficient == 0.0);
 
     parallel.parallelWindingDistance = 1.5;
     parallel.signedParallelWindingDelta = 1.5;
+    config.parallelWindingDistanceCutoff = 3.0;
     const auto two = makeFiberTraceReferenceWindingObservation(
-        parallel, true, 0.0, 0, winding, 3.0);
+        parallel, true, 0.0, 0, winding, config);
     CHECK(two.canonicalWindingDistance == 2.0);
     CHECK(two.rawCoefficient == doctest::Approx(0.1875));
     CHECK(two.admittedCoefficient == doctest::Approx(0.1875));
 
+    config.parallelWindingDistanceCutoff = 0.0;
     CHECK_THROWS_AS(
         makeFiberTraceReferenceWindingObservation(
-            parallel, true, 0.0, 0, winding, 0.0),
+            parallel, true, 0.0, 0, winding, config),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference observations apply all canonical class weights")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1};
+    winding.mapLatentCoordinate = {0.0};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal};
+    winding.integerGaugeByPiece = {0};
+    winding.measurementScale = 1.0;
+
+    FiberTraceWindingBeliefPropagationConfig config;
+    config.perpendicularNextWeight = 2.0;
+    config.perpendicularFarWeight = 3.0;
+    config.parallelSameWeight = 4.0;
+    config.parallelOneWeight = 5.0;
+    config.parallelFarWeight = 6.0;
+
+    FiberTraceConstraint constraint;
+    constraint.parallelScore = 0.2;
+    constraint.perpendicularScore = 0.8;
+    constraint.signedWindingDelta = 0.5;
+    CHECK(makeFiberTraceReferenceWindingObservation(
+              constraint, true, 0.0, 0, winding, config)
+              .admittedCoefficient == doctest::Approx(1.6));
+
+    constraint.signedWindingDelta = 1.5;
+    CHECK(makeFiberTraceReferenceWindingObservation(
+              constraint, true, 0.0, 0, winding, config)
+              .admittedCoefficient == doctest::Approx(1.2));
+
+    constraint.parallelScore = 0.8;
+    constraint.perpendicularScore = 0.2;
+    constraint.parallelWindingDistance = 0.0;
+    constraint.signedParallelWindingDelta = 0.0;
+    CHECK(makeFiberTraceReferenceWindingObservation(
+              constraint, true, 0.0, 0, winding, config)
+              .admittedCoefficient == doctest::Approx(3.2));
+
+    constraint.parallelWindingDistance = 1.0;
+    constraint.signedParallelWindingDelta = 1.0;
+    CHECK(makeFiberTraceReferenceWindingObservation(
+              constraint, true, 0.0, 0, winding, config)
+              .admittedCoefficient == doctest::Approx(2.0));
+
+    constraint.parallelWindingDistance = 0.1;
+    constraint.signedParallelWindingDelta = 2.0;
+    CHECK(makeFiberTraceReferenceWindingObservation(
+              constraint, true, 0.0, 0, winding, config)
+              .admittedCoefficient == doctest::Approx(1.2));
+
+    config.parallelFarWeight = 0.0;
+    CHECK_THROWS_AS(
+        makeFiberTraceReferenceWindingObservation(
+            constraint, true, 0.0, 0, winding, config),
         std::invalid_argument);
 }
 
@@ -964,6 +1046,71 @@ TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
         CHECK(diagnostic.effectiveParallelWindingWeight == 0.0);
         CHECK(diagnostic.effectivePerpendicularWindingWeight == 0.75);
     }
+}
+
+TEST_CASE("H/V-aware winding applies canonical class weights")
+{
+    const auto source = lines(10);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.25, 0.5);
+    addMeasured(report, 2, 3, 0.25, 1.5);
+    addMeasured(report, 4, 5, 0.75, 0.0);
+    addMeasured(report, 6, 7, 0.75, 1.0);
+    addMeasured(report, 8, 9, 0.75, 2.0);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.perpendicularNextWeight = 2.0;
+    joint.perpendicularFarWeight = 3.0;
+    joint.parallelSameWeight = 4.0;
+    joint.parallelOneWeight = 5.0;
+    joint.parallelFarWeight = 6.0;
+    joint.fixedPhaseMagnitude = 0.5;
+    joint.fixedMeasurementScale = 1.0;
+    joint.mixedUnaryCost = 5.0;
+    joint.stableIterations = 1;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), joint);
+    REQUIRE(solved.factorDiagnostics.size() == report.constraints.size());
+    std::vector<const FiberTraceWindingFactorDiagnostic*> byConstraint(
+        report.constraints.size());
+    for (const auto& diagnostic : solved.factorDiagnostics)
+        byConstraint.at(diagnostic.constraintIndex) = &diagnostic;
+
+    CHECK(byConstraint[0]->perpendicularWindingWeightMultiplier ==
+          doctest::Approx(2.0));
+    CHECK(byConstraint[0]->effectivePerpendicularWindingWeight ==
+          doctest::Approx(1.5));
+    CHECK(byConstraint[1]->perpendicularWindingWeightMultiplier ==
+          doctest::Approx(1.5));
+    CHECK(byConstraint[1]->effectivePerpendicularWindingWeight ==
+          doctest::Approx(1.125));
+    CHECK(byConstraint[2]->parallelWindingWeightMultiplier ==
+          doctest::Approx(4.0));
+    CHECK(byConstraint[2]->effectiveParallelWindingWeight ==
+          doctest::Approx(3.0));
+    CHECK(byConstraint[3]->parallelWindingWeightMultiplier ==
+          doctest::Approx(2.5));
+    CHECK(byConstraint[3]->effectiveParallelWindingWeight ==
+          doctest::Approx(1.875));
+    CHECK(byConstraint[4]->parallelWindingWeightMultiplier ==
+          doctest::Approx(1.5));
+    CHECK(byConstraint[4]->effectiveParallelWindingWeight ==
+          doctest::Approx(1.125));
+    auto signedTargetWins = report;
+    signedTargetWins.constraints[4].parallelWindingDistance = 0.1;
+    const auto signedSolved =
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            signedTargetWins, topology(source, signedTargetWins), joint);
+    const auto found = std::find_if(
+        signedSolved.factorDiagnostics.begin(),
+        signedSolved.factorDiagnostics.end(),
+        [](const FiberTraceWindingFactorDiagnostic& diagnostic) {
+            return diagnostic.constraintIndex == 4;
+        });
+    REQUIRE(found != signedSolved.factorDiagnostics.end());
+    CHECK(found->effectiveParallelWindingDistance == 2.0);
+    CHECK(found->parallelWindingWeightMultiplier == doctest::Approx(1.5));
 }
 
 TEST_CASE("H/V-aware winding uses signed parallel targets and cutoff")
