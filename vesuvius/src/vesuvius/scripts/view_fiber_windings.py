@@ -314,8 +314,36 @@ def rotate_winding_layer_visibility(
     visible = tuple(key for key, layer in layers.items() if layer.visible)
     rotated = rotate_visible_winding_mask(tuple(layers), visible, delta)
     for key, layer in layers.items():
-        layer.visible = key in rotated
+        target = key in rotated
+        if layer.visible != target:
+            layer.visible = target
     return rotated
+
+
+def format_visible_windings(windings: Sequence[int]) -> str:
+    """Format a winding selection compactly without an unbounded label."""
+    values = tuple(sorted(set(windings)))
+    if not values:
+        return "No visible winding"
+
+    ranges: list[tuple[int, int]] = []
+    first = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append((first, previous))
+        first = previous = value
+    ranges.append((first, previous))
+
+    def render(item: tuple[int, int]) -> str:
+        return str(item[0]) if item[0] == item[1] else f"{item[0]}-{item[1]}"
+
+    rendered = [render(item) for item in ranges]
+    if len(rendered) > 5:
+        rendered = [*rendered[:2], "...", *rendered[-2:]]
+    prefix = "Winding" if len(values) == 1 else "Windings"
+    return f"{prefix} {', '.join(rendered)}"
 
 
 def animation_interval_milliseconds(seconds: float) -> int:
@@ -323,6 +351,43 @@ def animation_interval_milliseconds(seconds: float) -> int:
     if not np.isfinite(seconds) or seconds <= 0:
         raise ValueError("animation interval must be finite and positive")
     return max(1, round(seconds * 1000.0))
+
+
+def _configure_napari_notification_timer(notification: object) -> None:
+    """Apply the timer state intended by Napari's notification show path."""
+    timer = notification.timer
+    dismiss_after = int(notification.DISMISS_AFTER)
+    was_active = timer.isActive()
+    if was_active:
+        timer.stop()
+    if dismiss_after <= 0:
+        return
+    timer.setInterval(max(1, dismiss_after))
+    timer.setSingleShot(True)
+    if was_active:
+        timer.start()
+
+
+def _install_napari_notification_timer_guard(notification_type=None) -> None:
+    """Prevent an unconfigured notification timer from spinning at 0 ms."""
+    if notification_type is None:
+        from napari._qt.dialogs.qt_notification import NapariQtNotification
+
+        notification_type = NapariQtNotification
+
+    marker = "_fiber_winding_timer_guard_installed"
+    if not getattr(notification_type, marker, False):
+        original_timer_start = notification_type.timer_start
+
+        def guarded_timer_start(notification) -> None:
+            _configure_napari_notification_timer(notification)
+            original_timer_start(notification)
+
+        notification_type.timer_start = guarded_timer_start
+        setattr(notification_type, marker, True)
+
+    for notification in tuple(notification_type._instances):
+        _configure_napari_notification_timer(notification)
 
 
 def add_winding_controls(
@@ -337,6 +402,7 @@ def add_winding_controls(
         QHBoxLayout,
         QLabel,
         QPushButton,
+        QSizePolicy,
         QVBoxLayout,
         QWidget,
     )
@@ -355,6 +421,12 @@ def add_winding_controls(
     navigation_row = QHBoxLayout()
     animation_row = QHBoxLayout()
     winding_label = QLabel()
+    winding_label.setMinimumWidth(80)
+    winding_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    label_update_timer = QTimer(widget)
+    label_update_timer.setObjectName("fiber_winding_label_update")
+    label_update_timer.setSingleShot(True)
+    label_update_timer.setInterval(0)
 
     def update_label() -> None:
         visible_windings = sorted(
@@ -364,19 +436,26 @@ def add_winding_controls(
                 if layer.visible
             }
         )
-        if not visible_windings:
-            winding_label.setText("No visible winding")
-            return
-        prefix = "Winding" if len(visible_windings) == 1 else "Windings"
-        winding_label.setText(
-            f"{prefix} {', '.join(str(value) for value in visible_windings)}"
+        winding_label.setText(format_visible_windings(visible_windings))
+        winding_label.setToolTip(
+            "No visible winding"
+            if not visible_windings
+            else ", ".join(str(value) for value in visible_windings)
         )
+
+    label_update_timer.timeout.connect(update_label)
+
+    def schedule_label_update(_event=None) -> None:
+        if not label_update_timer.isActive():
+            label_update_timer.start()
 
     def apply(preset: str, winding: int | None = None) -> None:
         selected = visible_winding_layers(keys, preset, winding=winding)
         for key, layer in layers.items():
-            layer.visible = key in selected
-        update_label()
+            target = key in selected
+            if layer.visible != target:
+                layer.visible = target
+        schedule_label_update()
 
     for label, preset in (
         ("H", "h"),
@@ -398,7 +477,7 @@ def add_winding_controls(
 
     def move(delta: int) -> None:
         rotate_winding_layer_visibility(layers, delta)
-        update_label()
+        schedule_label_update()
 
     previous_button.clicked.connect(lambda _checked=False: move(-1))
     next_button.clicked.connect(lambda _checked=False: move(1))
@@ -418,6 +497,7 @@ def add_winding_controls(
     animation_interval.setValue(_DEFAULT_ANIMATION_INTERVAL_SECONDS)
     animation_interval.setToolTip("Time between winding-mask steps")
     animation_timer = QTimer(widget)
+    animation_timer.setObjectName("fiber_winding_animation")
     animation_timer.setInterval(
         animation_interval_milliseconds(animation_interval.value())
     )
@@ -446,7 +526,7 @@ def add_winding_controls(
     for layer in layers.values():
         visible_event = getattr(getattr(layer, "events", None), "visible", None)
         if visible_event is not None:
-            visible_event.connect(lambda _event=None: update_label())
+            visible_event.connect(schedule_label_update)
     update_label()
     if not initial_windings:
         apply("all")
@@ -475,7 +555,7 @@ def add_winding_layers(
             layers[key] = _EmptyWindingLayer()
             continue
         color = np.asarray(winding_layer_color(key), dtype=np.float32)
-        layers[key] = viewer.add_shapes(
+        layer = viewer.add_shapes(
             list(paths),
             ndim=3,
             shape_type="path",
@@ -483,8 +563,11 @@ def add_winding_layers(
             edge_color=np.broadcast_to(color, (len(paths), 4)).copy(),
             edge_width=edge_width,
             face_color="transparent",
+            blending="opaque",
             visible=False,
         )
+        layer.editable = False
+        layers[key] = layer
         fiber_count += len(paths)
     return layers, fiber_count
 
@@ -497,7 +580,7 @@ def add_reference_layer(viewer, geometry: ReferenceGeometry | None, edge_width: 
         np.asarray(_REFERENCE_COLOR, dtype=np.float32),
         (len(geometry.paths_zyx), 4),
     ).copy()
-    return viewer.add_shapes(
+    layer = viewer.add_shapes(
         list(geometry.paths_zyx),
         ndim=3,
         shape_type="path",
@@ -505,8 +588,11 @@ def add_reference_layer(viewer, geometry: ReferenceGeometry | None, edge_width: 
         edge_color=colors,
         edge_width=edge_width,
         face_color="transparent",
+        blending="opaque",
         visible=True,
     )
+    layer.editable = False
+    return layer
 
 
 def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
@@ -519,6 +605,8 @@ def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
         raise RuntimeError(
             "napari is not installed; install the vesuvius GUI extra"
         ) from exc
+
+    _install_napari_notification_timer_guard()
 
     base = normalize_winding_output_base(path)
     geometry = load_winding_geometry(base)

@@ -16,6 +16,7 @@ from vesuvius.scripts.view_fiber_windings import (
     complete_winding_layer_keys,
     discover_reference_artifact,
     discover_winding_artifacts,
+    format_visible_windings,
     load_reference_geometry,
     navigable_windings,
     nonempty_layer_keys,
@@ -268,13 +269,16 @@ def test_winding_layer_colors_are_explicit_per_shape_rgba_arrays():
 
 
 def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
+    class FakeLayer:
+        editable = True
+
     class FakeViewer:
         def __init__(self):
             self.calls = []
 
         def add_shapes(self, data, **kwargs):
             self.calls.append((data, kwargs))
-            return object()
+            return FakeLayer()
 
     key = WindingLayerKey(2, "v")
     paths = (
@@ -300,6 +304,8 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     assert kwargs["edge_color"].shape == (2, 4)
     assert kwargs["edge_color"].dtype == np.float32
     assert kwargs["edge_width"] == 3.0
+    assert kwargs["blending"] == "opaque"
+    assert all(not getattr(layer, "editable", False) for layer in layers.values())
     np.testing.assert_array_equal(
         viewer.calls[0][1]["edge_color"][0], kwargs["edge_color"][0]
     )
@@ -399,6 +405,8 @@ def test_reference_layer_is_independent_bright_and_visible(tmp_path):
     assert kwargs["name"] == "Reference fibers"
     assert kwargs["visible"] is True
     assert kwargs["edge_width"] == 4.0
+    assert kwargs["blending"] == "opaque"
+    assert reference_layer.editable is False
     assert kwargs["edge_color"].shape == (1, 4)
     assert np.max(kwargs["edge_color"][0, :3]) == 1.0
 
@@ -568,6 +576,66 @@ def test_animation_interval_uses_seconds_and_rejects_invalid_values():
     for invalid in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="finite and positive"):
             animation_interval_milliseconds(invalid)
+
+
+def test_visible_winding_label_compacts_ranges_and_bounds_sparse_lists():
+    assert format_visible_windings(()) == "No visible winding"
+    assert format_visible_windings((4,)) == "Winding 4"
+    assert format_visible_windings(range(18)) == "Windings 0-17"
+    assert format_visible_windings((0, 1, 3, 5, 6, 7)) == (
+        "Windings 0-1, 3, 5-7"
+    )
+    assert format_visible_windings((0, 2, 4, 6, 8, 10, 12)) == (
+        "Windings 0, 2, ..., 10, 12"
+    )
+
+
+def test_notification_timer_guard_configures_existing_and_future_instances():
+    class Timer:
+        def __init__(self):
+            self.interval = 0
+            self.single_shot = False
+            self.active = False
+
+        def isActive(self):  # noqa: N802 - Qt API
+            return self.active
+
+        def stop(self):
+            self.active = False
+
+        def start(self):
+            self.active = True
+
+        def setInterval(self, value):  # noqa: N802 - Qt API
+            self.interval = value
+
+        def setSingleShot(self, value):  # noqa: N802 - Qt API
+            self.single_shot = value
+
+    class Notification:
+        DISMISS_AFTER = 4000
+        _instances = []
+
+        def __init__(self):
+            self.timer = Timer()
+
+        def timer_start(self):
+            if self.DISMISS_AFTER > 0:
+                self.timer.start()
+
+    existing = Notification()
+    Notification._instances.append(existing)
+    viewer_module._install_napari_notification_timer_guard(Notification)
+
+    assert existing.timer.interval == 4000
+    assert existing.timer.single_shot is True
+    assert existing.timer.active is False
+
+    future = Notification()
+    future.timer_start()
+    assert future.timer.interval == 4000
+    assert future.timer.single_shot is True
+    assert future.timer.active is True
 
 
 def test_module_import_is_gui_independent_and_cli_accepts_obj_base():
