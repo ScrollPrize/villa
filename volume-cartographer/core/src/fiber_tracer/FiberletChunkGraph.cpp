@@ -15,6 +15,7 @@
 #include <queue>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 
 namespace vc::fiber_tracer
@@ -31,8 +32,14 @@ void indexedParallelFor(
     const std::size_t workerCount = std::min(
         count, std::max<std::size_t>(1, requestedThreads));
     if (workerCount == 1) {
-        for (std::size_t index = 0; index < count; ++index)
-            function(index);
+        for (std::size_t index = 0; index < count; ++index) {
+            if constexpr (std::is_invocable_v<
+                              Function&, std::size_t, std::size_t>) {
+                function(index, 0);
+            } else {
+                function(index);
+            }
+        }
         return;
     }
 
@@ -47,7 +54,11 @@ void indexedParallelFor(
         return *pool;
     };
 
-    std::vector<std::exception_ptr> failures(count);
+    struct IndexedFailure {
+        std::size_t index = std::numeric_limits<std::size_t>::max();
+        std::exception_ptr error;
+    };
+    std::vector<IndexedFailure> failures(workerCount);
     poolFor(std::max<std::size_t>(1, requestedThreads))
         .run_indexed_batch(workerCount, [&](std::size_t worker) {
             // Each worker owns a fixed strided partition. The hot loop has no
@@ -55,16 +66,26 @@ void indexedParallelFor(
             for (std::size_t index = worker; index < count;
                  index += workerCount) {
                 try {
-                    function(index);
+                    if constexpr (std::is_invocable_v<
+                                      Function&, std::size_t, std::size_t>) {
+                        function(index, worker);
+                    } else {
+                        function(index);
+                    }
                 } catch (...) {
-                    failures[index] = std::current_exception();
+                    if (!failures[worker].error) {
+                        failures[worker] = {
+                            index, std::current_exception()};
+                    }
                 }
             }
         });
-    for (const auto& failure : failures) {
-        if (failure)
-            std::rethrow_exception(failure);
-    }
+    const auto firstFailure = std::min_element(
+        failures.begin(), failures.end(), [](const auto& left, const auto& right) {
+            return left.index < right.index;
+        });
+    if (firstFailure != failures.end() && firstFailure->error)
+        std::rethrow_exception(firstFailure->error);
 }
 
 std::int64_t floorDiv(std::int64_t numerator, std::int64_t denominator)
@@ -188,7 +209,7 @@ FiberletReplaySourceArc directedStoredArc(
     return result;
 }
 
-std::optional<FiberletReplaySourceTransition> storedTransition(
+std::optional<FiberletPathCost> storedTransitionCost(
     const FiberletReplaySourceArc& incomingArc,
     const FiberletReplaySourceArc& outgoingArc,
     const FiberletStoredAnchor& sharedAnchor,
@@ -234,8 +255,7 @@ std::optional<FiberletReplaySourceTransition> storedTransition(
                 pathConfig.smoothnessTangentWeight,
                 pathConfig.smoothnessFreeAngleDegrees *
                     static_cast<float>(3.14159265358979323846 / 180.0)}});
-    return FiberletReplaySourceTransition{
-        incoming, outgoing, pathCost(local)};
+    return pathCost(local);
 }
 
 std::vector<cv::Vec3f> reconstructedStoredRoutePoints(
@@ -935,6 +955,24 @@ FiberletChunkGraphSource::transitionAtAnchor(
     float maximumJoinAngleDegrees) const
 {
     FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> result;
+    const auto cost = transitionCostAtAnchor(
+        incoming, outgoing, sharedAnchor, maximumJoinAngleDegrees);
+    result.status = cost.status;
+    result.error = cost.error;
+    if (cost.status == FiberletGraphQueryStatus::Ready && cost.value)
+        result.value = FiberletReplaySourceTransition{
+            incoming.id, outgoing.id, *cost.value};
+    return result;
+}
+
+FiberletGraphQuery<std::optional<FiberletPathCost>>
+FiberletChunkGraphSource::transitionCostAtAnchor(
+    const FiberletReplaySourceArc& incoming,
+    const FiberletReplaySourceArc& outgoing,
+    const FiberletStoredAnchor& sharedAnchor,
+    float maximumJoinAngleDegrees) const
+{
+    FiberletGraphQuery<std::optional<FiberletPathCost>> result;
     if (!(maximumJoinAngleDegrees >= 0.0F) ||
         !(maximumJoinAngleDegrees <= 180.0F) ||
         !std::isfinite(maximumJoinAngleDegrees)) {
@@ -943,7 +981,7 @@ FiberletChunkGraphSource::transitionAtAnchor(
         return result;
     }
     result.status = FiberletGraphQueryStatus::Ready;
-    result.value = storedTransition(
+    result.value = storedTransitionCost(
         incoming, outgoing, sharedAnchor,
         static_cast<float>(fiberletDataset_->metadata().predictionToBaseScale),
         pathConfig_, maximumJoinAngleDegrees);
@@ -1278,7 +1316,7 @@ struct ChunkRouteLocalGraph {
     std::size_t exits = 0;
     std::size_t admissibleTransitions = 0;
     std::vector<FiberletImmutableReplayEdge> replayEdges;
-    std::vector<FiberletReplaySourceTransition> replayTransitions;
+    FiberletImmutableReplayTransitionCsr replayTransitions;
 };
 
 bool pointInsideChunk(
@@ -1411,13 +1449,42 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
     const FiberletChunkRouteAnalysisConfig& config,
     std::vector<vc::render::ChunkKey>& seedChunks,
     bool buildTransitions,
-    bool buildReplayGeometry)
+    bool buildReplayGeometry,
+    FiberletGraphMaterializationDiagnostics* diagnostics = nullptr)
 {
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::SeedChunks,
+            std::memory_order_relaxed);
+        diagnostics->seedChunksTotal.store(0, std::memory_order_relaxed);
+        diagnostics->seedChunksLoaded.store(0, std::memory_order_relaxed);
+        diagnostics->prefixChunksTotal.store(0, std::memory_order_relaxed);
+        diagnostics->prefixChunksLoaded.store(0, std::memory_order_relaxed);
+        diagnostics->endpointChunksTotal.store(0, std::memory_order_relaxed);
+        diagnostics->endpointChunksLoaded.store(0, std::memory_order_relaxed);
+        diagnostics->insideAnchors.store(0, std::memory_order_relaxed);
+        diagnostics->requiredAnchors.store(0, std::memory_order_relaxed);
+        diagnostics->materializedAnchors.store(0, std::memory_order_relaxed);
+        diagnostics->physicalFiberlets.store(0, std::memory_order_relaxed);
+        diagnostics->directedArcs.store(0, std::memory_order_relaxed);
+        diagnostics->routePoints.store(0, std::memory_order_relaxed);
+        diagnostics->profileSegments.store(0, std::memory_order_relaxed);
+        diagnostics->transitionInputArcsTotal.store(0, std::memory_order_relaxed);
+        diagnostics->transitionInputArcsProcessed.store(0, std::memory_order_relaxed);
+        diagnostics->successors.store(0, std::memory_order_relaxed);
+        diagnostics->replayTransitions.store(0, std::memory_order_relaxed);
+        diagnostics->finalAnchors.store(0, std::memory_order_relaxed);
+        diagnostics->finalEdges.store(0, std::memory_order_relaxed);
+        diagnostics->finalTransitions.store(0, std::memory_order_relaxed);
+    }
     const float predictionToBaseScale =
         static_cast<float>(graph.metadata().predictionToBaseScale);
     ChunkRouteLocalGraph result;
     std::map<FiberletStorageKey, FiberletStoredAnchor> insideAnchors;
     seedChunks = analysisAnchorChunks(graph.metadata(), config);
+    if (diagnostics != nullptr)
+        diagnostics->seedChunksTotal.store(
+            seedChunks.size(), std::memory_order_relaxed);
     graph.prefetchAnchorChunks(seedChunks, true);
     for (const auto& chunk : seedChunks) {
         const auto loaded = graph.anchorsInChunk(chunk, true);
@@ -1430,6 +1497,12 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
                 anchor.positionPredictionXYZ * predictionToBaseScale);
             if (pointInsideChunk(position, config))
                 insideAnchors.emplace(anchor.key, anchor);
+        }
+        if (diagnostics != nullptr) {
+            diagnostics->seedChunksLoaded.fetch_add(
+                1, std::memory_order_relaxed);
+            diagnostics->insideAnchors.store(
+                insideAnchors.size(), std::memory_order_relaxed);
         }
     }
 
@@ -1447,6 +1520,13 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
     const auto prefixOwners = buildReplayGeometry
         ? analysisPrefixOwnerChunks(graph.metadata(), config)
         : graph.incidentPrefixChunks(insideKeys);
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::PrefixChunks,
+            std::memory_order_relaxed);
+        diagnostics->prefixChunksTotal.store(
+            prefixOwners.size(), std::memory_order_relaxed);
+    }
     std::vector<vc::render::ChunkKey> pathChunks = prefixOwners;
     if (buildReplayGeometry) {
         pathChunks.reserve(prefixOwners.size() * 2);
@@ -1491,6 +1571,12 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
             if (buildReplayGeometry)
                 physicalRoutes.emplace(prefix.id, StoredRouteReference{routes, index});
         }
+        if (diagnostics != nullptr) {
+            diagnostics->prefixChunksLoaded.fetch_add(
+                1, std::memory_order_relaxed);
+            diagnostics->physicalFiberlets.store(
+                physicalPrefixes.size(), std::memory_order_relaxed);
+        }
     }
 
     std::set<FiberletStorageKey> requiredAnchorKeys;
@@ -1510,6 +1596,15 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
     endpointOwnerChunks.reserve(requiredAnchorOwners.size());
     for (const auto& [z, y, x] : requiredAnchorOwners)
         endpointOwnerChunks.push_back({0, z, y, x});
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::EndpointChunks,
+            std::memory_order_relaxed);
+        diagnostics->requiredAnchors.store(
+            requiredAnchorKeys.size(), std::memory_order_relaxed);
+        diagnostics->endpointChunksTotal.store(
+            endpointOwnerChunks.size(), std::memory_order_relaxed);
+    }
     graph.prefetchAnchorChunks(endpointOwnerChunks, true);
     for (const auto& [z, y, x] : requiredAnchorOwners) {
         const auto loaded = graph.anchorsInChunk({0, z, y, x}, true);
@@ -1526,6 +1621,9 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
                     "fiberlet graph contains a duplicate endpoint anchor");
             }
         }
+        if (diagnostics != nullptr)
+            diagnostics->endpointChunksLoaded.fetch_add(
+                1, std::memory_order_relaxed);
     }
     if (buildReplayGeometry) {
         for (auto iterator = physicalPrefixes.begin();
@@ -1567,6 +1665,9 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
             result.anchors.push_back(
                 {anchor.key, anchor, position,
                  pointInsideChunk(position, config)});
+            if (diagnostics != nullptr)
+                diagnostics->materializedAnchors.store(
+                    result.anchors.size(), std::memory_order_relaxed);
         } else if (cv::norm(result.anchors[found->second].positionBaseXYZ -
                             position) > 1.0e-5) {
             throw std::runtime_error(
@@ -1591,6 +1692,13 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
         result.physicalFiberlets.push_back(id);
     }
     result.arcs.reserve(result.physicalFiberlets.size() * 2);
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::Edges,
+            std::memory_order_relaxed);
+        diagnostics->physicalFiberlets.store(
+            result.physicalFiberlets.size(), std::memory_order_relaxed);
+    }
     if (buildReplayGeometry)
         result.replayEdges.reserve(result.physicalFiberlets.size());
     for (const auto& id : result.physicalFiberlets) {
@@ -1664,7 +1772,17 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
             }
             result.replayEdges.push_back({
                 directed[0], std::move(profile), std::move(pointsBase)});
+            if (diagnostics != nullptr) {
+                diagnostics->routePoints.fetch_add(
+                    pointsPrediction.size(), std::memory_order_relaxed);
+                diagnostics->profileSegments.fetch_add(
+                    pointsPrediction.size() - 1,
+                    std::memory_order_relaxed);
+            }
         }
+        if (diagnostics != nullptr)
+            diagnostics->directedArcs.store(
+                result.arcs.size(), std::memory_order_relaxed);
     }
 
     result.outgoing.resize(result.anchors.size());
@@ -1675,53 +1793,150 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
 
     if (!buildTransitions)
         return result;
-    result.successors.resize(result.arcs.size());
-    std::vector<std::vector<FiberletReplaySourceTransition>>
-        replayTransitionsByArc;
-    if (buildReplayGeometry)
-        replayTransitionsByArc.resize(result.arcs.size());
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::Transitions,
+            std::memory_order_relaxed);
+        diagnostics->transitionInputArcsTotal.store(
+            result.arcs.size(), std::memory_order_relaxed);
+    }
+    if (buildReplayGeometry &&
+        result.arcs.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error(
+            "materialized Fiberlet graph has too many directed arcs");
+    }
+    const std::size_t transitionWorkerCount = std::min(
+        result.arcs.size(),
+        std::max<std::size_t>(1, config.parallelThreads));
+    if (!buildReplayGeometry)
+        result.successors.resize(result.arcs.size());
+    std::vector<std::vector<FiberletImmutableReplayTransition>>
+        replayTransitionsByWorker;
+    std::vector<std::uint32_t> replayTransitionCounts;
+    if (buildReplayGeometry) {
+        replayTransitionsByWorker.resize(transitionWorkerCount);
+        replayTransitionCounts.resize(result.arcs.size(), 0);
+    }
+    struct TransitionProgressShard {
+        std::size_t processed = 0;
+        std::size_t accepted = 0;
+    };
+    std::vector<TransitionProgressShard> transitionProgress(
+        transitionWorkerCount);
+    const auto flushTransitionProgress = [&](TransitionProgressShard& shard) {
+        if (diagnostics != nullptr && shard.processed != 0) {
+            diagnostics->transitionInputArcsProcessed.fetch_add(
+                shard.processed, std::memory_order_relaxed);
+            diagnostics->successors.fetch_add(
+                shard.accepted, std::memory_order_relaxed);
+            if (buildReplayGeometry) {
+                diagnostics->replayTransitions.fetch_add(
+                    shard.accepted, std::memory_order_relaxed);
+            }
+        }
+        shard = {};
+    };
     indexedParallelFor(
         result.arcs.size(), config.parallelThreads,
-        [&](std::size_t incoming) {
+        [&](std::size_t incoming, std::size_t worker) {
             const auto& incomingArc = result.arcs[incoming];
-            if (!result.anchors[incomingArc.targetAnchor].inside)
-                return;
-            auto& successors = result.successors[incoming];
-            for (const std::size_t outgoing :
-                 result.outgoing[incomingArc.targetAnchor]) {
-                const auto transition = graph.transitionAtAnchor(
-                    incomingArc.source, result.arcs[outgoing].source,
-                    result.anchors[incomingArc.targetAnchor].stored,
-                    config.maximumJoinAngleDegrees);
-                if (transition.status != FiberletGraphQueryStatus::Ready) {
-                    throw std::runtime_error(
-                        "fiberlet chunk-route transition failed: " +
-                        transition.error);
-                }
-                if (!transition.value.has_value())
-                    continue;
-                const double joinLoss =
-                    static_cast<double>(transition.value->cost.total());
-                if (!(joinLoss >= 0.0) || !std::isfinite(joinLoss)) {
-                    throw std::runtime_error(
-                        "fiberlet chunk-route join objective is invalid");
-                }
-                successors.push_back({outgoing, joinLoss});
-                if (buildReplayGeometry) {
-                    replayTransitionsByArc[incoming].push_back(
-                        *transition.value);
+            const std::size_t compactBegin = buildReplayGeometry
+                ? replayTransitionsByWorker[worker].size()
+                : 0;
+            if (result.anchors[incomingArc.targetAnchor].inside) {
+                for (const std::size_t outgoing :
+                     result.outgoing[incomingArc.targetAnchor]) {
+                    const auto transition = graph.transitionCostAtAnchor(
+                        incomingArc.source, result.arcs[outgoing].source,
+                        result.anchors[incomingArc.targetAnchor].stored,
+                        config.maximumJoinAngleDegrees);
+                    if (transition.status != FiberletGraphQueryStatus::Ready) {
+                        throw std::runtime_error(
+                            "fiberlet chunk-route transition failed: " +
+                            transition.error);
+                    }
+                    if (!transition.value.has_value())
+                        continue;
+                    const double joinLoss =
+                        static_cast<double>(transition.value->total());
+                    if (!(joinLoss >= 0.0) || !std::isfinite(joinLoss)) {
+                        throw std::runtime_error(
+                            "fiberlet chunk-route join objective is invalid");
+                    }
+                    if (buildReplayGeometry) {
+                        replayTransitionsByWorker[worker].push_back(
+                            {static_cast<std::uint32_t>(outgoing),
+                             *transition.value});
+                    } else {
+                        result.successors[incoming].push_back(
+                            {outgoing, joinLoss});
+                    }
                 }
             }
+            const std::size_t accepted = buildReplayGeometry
+                ? replayTransitionsByWorker[worker].size() - compactBegin
+                : result.successors[incoming].size();
+            if (buildReplayGeometry) {
+                if (accepted > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::runtime_error(
+                        "materialized Fiberlet arc has too many transitions");
+                }
+                replayTransitionCounts[incoming] =
+                    static_cast<std::uint32_t>(accepted);
+            }
+            if (diagnostics != nullptr) {
+                auto& progress = transitionProgress[worker];
+                ++progress.processed;
+                progress.accepted += accepted;
+                if (progress.processed == 256)
+                    flushTransitionProgress(progress);
+            }
         });
-    for (const auto& successors : result.successors)
-        result.admissibleTransitions += successors.size();
+    for (auto& progress : transitionProgress)
+        flushTransitionProgress(progress);
     if (buildReplayGeometry) {
-        for (auto& transitions : replayTransitionsByArc) {
-            result.replayTransitions.insert(
-                result.replayTransitions.end(),
-                std::make_move_iterator(transitions.begin()),
-                std::make_move_iterator(transitions.end()));
+        result.replayTransitions.offsets.resize(result.arcs.size() + 1, 0);
+        for (std::size_t incoming = 0; incoming < result.arcs.size(); ++incoming) {
+            result.replayTransitions.offsets[incoming + 1] =
+                result.replayTransitions.offsets[incoming] +
+                replayTransitionCounts[incoming];
         }
+        result.replayTransitions.entries.resize(
+            result.replayTransitions.offsets.back());
+        indexedParallelFor(
+            transitionWorkerCount, config.parallelThreads,
+            [&](std::size_t worker) {
+                auto& source = replayTransitionsByWorker[worker];
+                std::size_t sourceOffset = 0;
+                for (std::size_t incoming = worker;
+                     incoming < result.arcs.size();
+                     incoming += transitionWorkerCount) {
+                    const std::size_t count =
+                        replayTransitionCounts[incoming];
+                    std::move(
+                        source.begin() +
+                            static_cast<std::ptrdiff_t>(sourceOffset),
+                        source.begin() + static_cast<std::ptrdiff_t>(
+                            sourceOffset + count),
+                        result.replayTransitions.entries.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                result.replayTransitions.offsets[incoming]));
+                    sourceOffset += count;
+                }
+                if (sourceOffset != source.size()) {
+                    throw std::runtime_error(
+                        "materialized Fiberlet transition worker layout is invalid");
+                }
+                std::vector<FiberletImmutableReplayTransition>().swap(source);
+            });
+        std::vector<std::vector<FiberletImmutableReplayTransition>>().swap(
+            replayTransitionsByWorker);
+        std::vector<std::uint32_t>().swap(replayTransitionCounts);
+        result.admissibleTransitions =
+            result.replayTransitions.entries.size();
+    } else {
+        for (const auto& successors : result.successors)
+            result.admissibleTransitions += successors.size();
     }
 
     for (std::size_t arc = 0; arc < result.arcs.size(); ++arc) {
@@ -1921,14 +2136,16 @@ FiberletMaterializedReplayGraph
 FiberletStoredReplayGraphSource::materializeBaseBox(
     const cv::Vec3d& minimumBaseXYZ,
     const cv::Vec3d& maximumBaseXYZ,
-    std::size_t parallelThreads) const
+    std::size_t parallelThreads,
+    FiberletGraphMaterializationDiagnostics* diagnostics) const
 {
     return materializeBaseBoxForSeeds(
         minimumBaseXYZ,
         maximumBaseXYZ,
         minimumBaseXYZ,
         maximumBaseXYZ,
-        parallelThreads);
+        parallelThreads,
+        diagnostics);
 }
 
 FiberletMaterializedReplayGraph
@@ -1937,7 +2154,8 @@ FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
     const cv::Vec3d& graphMaximumBaseXYZ,
     const cv::Vec3d& seedMinimumBaseXYZ,
     const cv::Vec3d& seedMaximumBaseXYZ,
-    std::size_t parallelThreads) const
+    std::size_t parallelThreads,
+    FiberletGraphMaterializationDiagnostics* diagnostics) const
 {
     if (parallelThreads == 0)
         throw std::invalid_argument(
@@ -1968,7 +2186,7 @@ FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
     config.parallelThreads = parallelThreads;
     std::vector<vc::render::ChunkKey> seeds;
     auto local = materializeChunkRouteGraph(
-        chunks_, config, seeds, true, true);
+        chunks_, config, seeds, true, true, diagnostics);
 
     std::vector<FiberletReplaySourceAnchor> replayAnchors;
     replayAnchors.reserve(local.anchors.size());
@@ -1986,12 +2204,56 @@ FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
     for (const auto& anchor : local.anchors) {
         replayAnchors.push_back({anchor.key, anchor.positionBaseXYZ});
     }
+    if (diagnostics != nullptr) {
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::ImmutableGraph,
+            std::memory_order_relaxed);
+        diagnostics->finalAnchors.store(
+            replayAnchors.size(), std::memory_order_relaxed);
+        diagnostics->finalEdges.store(
+            local.replayEdges.size(), std::memory_order_relaxed);
+        diagnostics->finalTransitions.store(
+            local.replayTransitions.entries.size(),
+            std::memory_order_relaxed);
+    }
+    std::vector<ChunkRouteAnchor>().swap(local.anchors);
+    std::vector<FiberletStoredAnchor>().swap(local.seedAnchors);
+    std::vector<FiberletStorageId>().swap(local.physicalFiberlets);
+    std::vector<ChunkRouteArc>().swap(local.arcs);
+    std::vector<std::vector<std::size_t>>().swap(local.outgoing);
+    std::vector<std::vector<ChunkRouteSuccessor>>().swap(local.successors);
+    std::vector<std::size_t>().swap(local.entries);
     result.graph = std::make_shared<FiberletImmutableReplayGraphSource>(
         predictionToBaseScale(), anchorCellSizePredictionVoxels(),
         maximumJoinAngleDegrees_, std::move(replayAnchors),
         std::move(local.replayEdges),
         std::move(local.replayTransitions));
+    if (diagnostics != nullptr)
+        diagnostics->phase.store(
+            FiberletGraphMaterializationPhase::Complete,
+            std::memory_order_relaxed);
     return result;
+}
+
+FiberletStoredReplayCacheStats FiberletStoredReplayGraphSource::cacheStats()
+    const
+{
+    const auto anchors = anchorCache_->stats();
+    const auto paths = pathCache_->stats();
+    const auto unresolved = [](const auto& levels) {
+        return std::accumulate(
+            levels.begin(), levels.end(), std::size_t{0});
+    };
+    return {
+        anchors.localDecodedBytes,
+        anchors.decodedByteCapacity,
+        anchors.pendingDecodeTasks,
+        unresolved(anchors.unresolvedFetchesByLevel),
+        paths.localDecodedBytes,
+        paths.decodedByteCapacity,
+        paths.pendingDecodeTasks,
+        unresolved(paths.unresolvedFetchesByLevel),
+    };
 }
 
 FiberletChunkRoutePopulation collectFiberletChunkRoutePopulation(

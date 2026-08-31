@@ -434,6 +434,21 @@ attempts, while `--max-fibers` counts accepted lines. Seeds are attempted from
 highest prediction presence to lowest, with storage key as the deterministic
 tie break.
 
+Pass `--profile-memory` to print a profiling sample approximately once per
+second throughout graph preparation and tracing. Each sample reports current
+and peak process RSS on Linux, the live/capacity bytes and pending work for the
+independent anchor, path, and normal caches, chunk-loading progress, and the
+current anchor, Fiberlet, route-point, profile-segment, successor, and replay-
+transition counts. On platforms without `/proc/self/status`, RSS fields are
+reported as `NA`; the portable structure and cache counters remain available.
+
+The materialized crop graph stores admissible joins as CSR adjacency keyed by
+dense directed-arc indices. Each entry contains the outgoing 32-bit arc index
+and the original `FiberletPathCost`; it does not quantize or recompute costs.
+This avoids retaining duplicate successor and full storage-ID transition
+records and lets tracing search only the contiguous transitions for its current
+incoming arc.
+
 Seed graph traversal over the materialized graph is read-only and concurrent.
 The canonical seed set is unchanged; additional endpoint anchors needed to
 close crop traversal do not become new starts. Results are integrated

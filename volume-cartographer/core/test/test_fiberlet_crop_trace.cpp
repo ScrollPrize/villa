@@ -322,6 +322,46 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(limited.noEdgeAnchors == 1);
 }
 
+TEST_CASE("Fiberlet crop tracing accepts an immediate minimum-face exit")
+{
+    TestGraph graph;
+    const auto outsideLeft = key(-10);
+    const auto seed = key(0);
+    const auto right = key(40);
+    const auto outsideRight = key(110);
+    graph.addAnchor(outsideLeft, {-10, 0, 0});
+    graph.addAnchor(seed, {0, 0, 0});
+    graph.addAnchor(right, {40, 0, 0});
+    graph.addAnchor(outsideRight, {110, 0, 0});
+    graph.connect(outsideLeft, seed);
+    graph.connect(seed, right);
+    graph.connect(right, outsideRight);
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, -100, -100};
+    config.maximumBaseXYZ = {100, 100, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.maximumAttempts = 1;
+    ZNormalSampler normals;
+    const auto result = traceFiberletCrop(
+        graph,
+        {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals,
+        1.0,
+        config);
+
+    REQUIRE(result.lines.size() == 1);
+    const auto& line = result.lines.front();
+    CHECK(line.negativeTermination == "crop_boundary");
+    CHECK(line.positiveTermination == "crop_boundary");
+    CHECK(line.negativeFiberlets == 1);
+    CHECK(line.positiveFiberlets == 2);
+    CHECK(line.pathLengthPredictionVoxels == doctest::Approx(100.0));
+    REQUIRE(line.pointsBaseXYZ.size() == 3);
+    CHECK(line.pointsBaseXYZ.front() == cv::Vec3d{0, 0, 0});
+    CHECK(line.pointsBaseXYZ.back() == cv::Vec3d{100, 0, 0});
+}
+
 TEST_CASE("Fiberlet crop lookahead ranks beyond output boundary but clips output")
 {
     TestGraph graph;

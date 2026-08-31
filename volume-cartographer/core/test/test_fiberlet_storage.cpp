@@ -1037,6 +1037,7 @@ TEST_CASE("Whole-volume scheduler prioritizes anchors that unblock incomplete ou
 
 TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
 {
+    static_assert(sizeof(FiberletImmutableReplayTransition) == 24);
     std::mt19937_64 random(std::random_device{}());
     const auto root = std::filesystem::temp_directory_path() / ("vc_fiberlet_combined_" + std::to_string(random()));
     FiberletDatasetMetadata metadata;
@@ -1166,10 +1167,41 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
         options.service.fetchConcurrency.maxConcurrentReads = 4;
         FiberletStoredReplayGraphSource stored(reopened, options);
         CHECK_FALSE(stored.supportsConcurrentQueries());
+        FiberletGraphMaterializationDiagnostics diagnostics;
         auto materializedGraph = stored.materializeBaseBox(
-            {0.0, 0.0, 0.0}, {10.0, 10.0, 10.0}, 4);
+            {0.0, 0.0, 0.0}, {10.0, 10.0, 10.0}, 4,
+            &diagnostics);
         REQUIRE(materializedGraph.graph);
         REQUIRE(materializedGraph.insideAnchors.size() == 4);
+        CHECK(diagnostics.phase.load() ==
+              FiberletGraphMaterializationPhase::Complete);
+        CHECK(diagnostics.seedChunksLoaded.load() ==
+              diagnostics.seedChunksTotal.load());
+        CHECK(diagnostics.prefixChunksLoaded.load() ==
+              diagnostics.prefixChunksTotal.load());
+        CHECK(diagnostics.endpointChunksLoaded.load() ==
+              diagnostics.endpointChunksTotal.load());
+        CHECK(diagnostics.insideAnchors.load() == 4);
+        CHECK(diagnostics.physicalFiberlets.load() > 0);
+        CHECK(diagnostics.directedArcs.load() ==
+              diagnostics.physicalFiberlets.load() * 2);
+        CHECK(diagnostics.routePoints.load() >=
+              diagnostics.physicalFiberlets.load() * 2);
+        CHECK(diagnostics.profileSegments.load() ==
+              diagnostics.routePoints.load() -
+                  diagnostics.physicalFiberlets.load());
+        CHECK(diagnostics.transitionInputArcsProcessed.load() ==
+              diagnostics.transitionInputArcsTotal.load());
+        CHECK(diagnostics.successors.load() ==
+              diagnostics.replayTransitions.load());
+        CHECK(diagnostics.finalAnchors.load() >= 4);
+        CHECK(diagnostics.finalEdges.load() ==
+              diagnostics.physicalFiberlets.load());
+        CHECK(diagnostics.finalTransitions.load() ==
+              diagnostics.replayTransitions.load());
+        const auto cacheStats = stored.cacheStats();
+        CHECK(cacheStats.anchorDecodedBytes > 0);
+        CHECK(cacheStats.pathDecodedBytes > 0);
         CHECK(materializedGraph.graph->supportsConcurrentQueries());
         CHECK(materializedGraph.graph->outgoing(orphan).empty());
         const auto expectedOutgoing = stored.outgoing(second);
@@ -1228,6 +1260,19 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
         CHECK(actualTransition->incoming == expectedTransition->incoming);
         CHECK(actualTransition->outgoing == expectedTransition->outgoing);
         CHECK(actualTransition->cost.total() == expectedTransition->cost.total());
+        const auto indexedIncoming =
+            materializedGraph.graph->arc({{first, second}, false});
+        const auto indexedOutgoing =
+            materializedGraph.graph->arc({{second, third}, false});
+        CHECK(indexedIncoming.graphArcIndex !=
+              std::numeric_limits<std::size_t>::max());
+        CHECK(indexedOutgoing.graphArcIndex !=
+              std::numeric_limits<std::size_t>::max());
+        const auto indexedTransition = materializedGraph.graph->transition(
+            indexedIncoming, indexedOutgoing);
+        REQUIRE(indexedTransition.has_value());
+        CHECK(indexedTransition->cost.total() ==
+              expectedTransition->cost.total());
         std::vector<std::future<std::vector<cv::Vec3d>>> queries;
         for (int query = 0; query < 16; ++query) {
             queries.push_back(std::async(std::launch::async, [&materializedGraph, second] {

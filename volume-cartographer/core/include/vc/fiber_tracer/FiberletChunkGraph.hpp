@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -132,6 +133,12 @@ public:
         const FiberletReplaySourceArc& outgoing,
         const FiberletStoredAnchor& sharedAnchor,
         float maximumJoinAngleDegrees) const;
+    [[nodiscard]] FiberletGraphQuery<std::optional<FiberletPathCost>>
+    transitionCostAtAnchor(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing,
+        const FiberletStoredAnchor& sharedAnchor,
+        float maximumJoinAngleDegrees) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
     [[nodiscard]] const FiberletPathConfig& pathConfig() const noexcept;
 
@@ -156,6 +163,53 @@ private:
 struct FiberletMaterializedReplayGraph {
     std::shared_ptr<FiberletImmutableReplayGraphSource> graph;
     std::vector<FiberletStoredAnchor> insideAnchors;
+};
+
+enum class FiberletGraphMaterializationPhase : std::uint8_t {
+    SeedChunks,
+    PrefixChunks,
+    EndpointChunks,
+    Edges,
+    Transitions,
+    ImmutableGraph,
+    Complete,
+    Tracing,
+};
+
+struct FiberletGraphMaterializationDiagnostics {
+    std::atomic<FiberletGraphMaterializationPhase> phase{
+        FiberletGraphMaterializationPhase::SeedChunks};
+    std::atomic_size_t seedChunksTotal{0};
+    std::atomic_size_t seedChunksLoaded{0};
+    std::atomic_size_t prefixChunksTotal{0};
+    std::atomic_size_t prefixChunksLoaded{0};
+    std::atomic_size_t endpointChunksTotal{0};
+    std::atomic_size_t endpointChunksLoaded{0};
+    std::atomic_size_t insideAnchors{0};
+    std::atomic_size_t requiredAnchors{0};
+    std::atomic_size_t materializedAnchors{0};
+    std::atomic_size_t physicalFiberlets{0};
+    std::atomic_size_t directedArcs{0};
+    std::atomic_size_t routePoints{0};
+    std::atomic_size_t profileSegments{0};
+    std::atomic_size_t transitionInputArcsTotal{0};
+    std::atomic_size_t transitionInputArcsProcessed{0};
+    std::atomic_size_t successors{0};
+    std::atomic_size_t replayTransitions{0};
+    std::atomic_size_t finalAnchors{0};
+    std::atomic_size_t finalEdges{0};
+    std::atomic_size_t finalTransitions{0};
+};
+
+struct FiberletStoredReplayCacheStats {
+    std::size_t anchorDecodedBytes = 0;
+    std::size_t anchorDecodedByteCapacity = 0;
+    std::size_t anchorPendingDecodes = 0;
+    std::size_t anchorUnresolvedFetches = 0;
+    std::size_t pathDecodedBytes = 0;
+    std::size_t pathDecodedByteCapacity = 0;
+    std::size_t pathPendingDecodes = 0;
+    std::size_t pathUnresolvedFetches = 0;
 };
 
 // Blocking stored-graph adapter. Missing sparse chunks are empty; all edge,
@@ -195,13 +249,16 @@ public:
     [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBox(
         const cv::Vec3d& minimumBaseXYZ,
         const cv::Vec3d& maximumBaseXYZ,
-        std::size_t parallelThreads) const;
+        std::size_t parallelThreads,
+        FiberletGraphMaterializationDiagnostics* diagnostics = nullptr) const;
     [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBoxForSeeds(
         const cv::Vec3d& graphMinimumBaseXYZ,
         const cv::Vec3d& graphMaximumBaseXYZ,
         const cv::Vec3d& seedMinimumBaseXYZ,
         const cv::Vec3d& seedMaximumBaseXYZ,
-        std::size_t parallelThreads) const;
+        std::size_t parallelThreads,
+        FiberletGraphMaterializationDiagnostics* diagnostics = nullptr) const;
+    [[nodiscard]] FiberletStoredReplayCacheStats cacheStats() const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
 private:

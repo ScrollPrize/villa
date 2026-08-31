@@ -6,6 +6,8 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -261,6 +263,9 @@ struct FiberletReplaySourceArc {
     FiberletPathCost cost;
     std::optional<size_t> diagnosticCandidateIndex;
     std::optional<size_t> diagnosticArcIndex;
+    // Dense index assigned by an immutable graph. This is independent of the
+    // optional source-data diagnostic index above.
+    size_t graphArcIndex = std::numeric_limits<size_t>::max();
 };
 
 struct FiberletReplaySourceCostProfile {
@@ -443,6 +448,17 @@ struct FiberletImmutableReplayEdge {
     std::vector<cv::Vec3d> routePointsBaseXYZ;
 };
 
+struct FiberletImmutableReplayTransition {
+    std::uint32_t outgoingArc = 0;
+    FiberletPathCost cost;
+};
+
+struct FiberletImmutableReplayTransitionCsr {
+    // One range per directed incoming arc. The final offset equals entries.size().
+    std::vector<size_t> offsets;
+    std::vector<FiberletImmutableReplayTransition> entries;
+};
+
 // Fully materialized replay graph. All queries are immutable and lock-free;
 // this is the graph boundary used by parallel tracing.
 class FiberletImmutableReplayGraphSource final
@@ -456,6 +472,13 @@ public:
         std::vector<FiberletReplaySourceAnchor> anchors,
         std::vector<FiberletImmutableReplayEdge> edges,
         std::vector<FiberletReplaySourceTransition> transitions);
+    FiberletImmutableReplayGraphSource(
+        float predictionToBaseScale,
+        int anchorCellSizePredictionVoxels,
+        float maximumJoinAngleDegrees,
+        std::vector<FiberletReplaySourceAnchor> anchors,
+        std::vector<FiberletImmutableReplayEdge> edges,
+        FiberletImmutableReplayTransitionCsr transitions);
     explicit FiberletImmutableReplayGraphSource(const FiberletGraph& graph);
     ~FiberletImmutableReplayGraphSource() override;
 

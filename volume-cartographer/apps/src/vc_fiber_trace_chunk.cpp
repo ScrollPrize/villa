@@ -17,6 +17,7 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -98,6 +99,7 @@ struct Options {
     bool hasConstraintOnlyOption = false;
     bool hasSolverOnlyOption = false;
     bool hasSharedRuntimeOption = false;
+    bool profileMemory = false;
     bool hasDirectionVisualizationOption = false;
     bool hasHvOnlyOption = false;
     bool hasAblationOnlyOption = false;
@@ -198,6 +200,7 @@ void usage(const char* executable)
               << "  --remote-cache-dir PATH    cache for a remote normal manifest\n"
               << "  --threads N                graph preparation and trace workers [host CPUs]\n"
               << "  --cache-gib N              decoded graph/normal cache [8]\n"
+              << "  --profile-memory          print graph/cache memory counters every second\n"
               << "  --beam N                   retained lookahead candidates [16]\n"
               << "  --lookahead N              lookahead in base voxels [384]\n"
               << "  --coverage N               normal coverage radius in base voxels [20]\n"
@@ -364,6 +367,9 @@ Options parse(int argc, char** argv)
                 fail("--cache-gib must be positive");
             options.cacheBytes = static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0);
             options.hasSharedRuntimeOption = true;
+        } else if (argument == "--profile-memory") {
+            options.profileMemory = true;
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--beam") {
             options.trace.beamWidth = count(index, argc, argv, "--beam");
             options.hasTraceOnlyOption = true;
@@ -3031,6 +3037,142 @@ std::string formatBpConstraintEvidenceCohorts(
     return output.str();
 }
 
+struct ProcessMemoryStats {
+    std::optional<std::size_t> residentBytes;
+    std::optional<std::size_t> peakResidentBytes;
+};
+
+ProcessMemoryStats processMemoryStats()
+{
+    ProcessMemoryStats result;
+    std::ifstream input("/proc/self/status");
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto parseKilobytes = [&](std::string_view prefix) {
+            if (!line.starts_with(prefix))
+                return std::optional<std::size_t>{};
+            std::istringstream field(line.substr(prefix.size()));
+            std::size_t kilobytes = 0;
+            if (!(field >> kilobytes))
+                return std::optional<std::size_t>{};
+            return std::optional<std::size_t>{kilobytes * 1024ULL};
+        };
+        if (const auto value = parseKilobytes("VmRSS:"))
+            result.residentBytes = value;
+        else if (const auto value = parseKilobytes("VmHWM:"))
+            result.peakResidentBytes = value;
+    }
+    return result;
+}
+
+std::string_view materializationPhaseName(
+    vc::fiber_tracer::FiberletGraphMaterializationPhase phase)
+{
+    using Phase = vc::fiber_tracer::FiberletGraphMaterializationPhase;
+    switch (phase) {
+    case Phase::SeedChunks:
+        return "seed_chunks";
+    case Phase::PrefixChunks:
+        return "prefix_chunks";
+    case Phase::EndpointChunks:
+        return "endpoint_chunks";
+    case Phase::Edges:
+        return "edges";
+    case Phase::Transitions:
+        return "transitions";
+    case Phase::ImmutableGraph:
+        return "immutable_graph";
+    case Phase::Complete:
+        return "complete";
+    case Phase::Tracing:
+        return "tracing";
+    }
+    return "unknown";
+}
+
+std::string formatGraphMemoryProfile(
+    double elapsedSeconds,
+    const vc::fiber_tracer::FiberletGraphMaterializationDiagnostics& diagnostics,
+    const vc::fiber_tracer::FiberletStoredReplayCacheStats& caches,
+    const vc::lasagna::LasagnaChannelChunkCache::Stats& normalCache,
+    const ProcessMemoryStats& memory)
+{
+    constexpr double bytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+    const auto gib = [](std::size_t bytes) {
+        return static_cast<double>(bytes) / bytesPerGiB;
+    };
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(2)
+           << "fiberlet graph profile elapsed=" << elapsedSeconds
+           << "s phase="
+           << materializationPhaseName(
+                  diagnostics.phase.load(std::memory_order_relaxed));
+    if (memory.residentBytes)
+        output << " rss_gib=" << gib(*memory.residentBytes);
+    else
+        output << " rss_gib=NA";
+    if (memory.peakResidentBytes)
+        output << " peak_gib=" << gib(*memory.peakResidentBytes);
+    else
+        output << " peak_gib=NA";
+    output << '\n'
+           << "  cache_gib anchor=" << gib(caches.anchorDecodedBytes)
+           << '/' << gib(caches.anchorDecodedByteCapacity)
+           << " path=" << gib(caches.pathDecodedBytes)
+           << '/' << gib(caches.pathDecodedByteCapacity)
+           << " normal=" << gib(normalCache.cachedBytes)
+           << '/' << gib(normalCache.capacityBytes)
+           << " pending anchor="
+           << caches.anchorPendingDecodes + caches.anchorUnresolvedFetches
+           << " path="
+           << caches.pathPendingDecodes + caches.pathUnresolvedFetches
+           << " normal=" << normalCache.loadsInFlight << '\n'
+           << "  chunks seed="
+           << diagnostics.seedChunksLoaded.load(std::memory_order_relaxed)
+           << '/'
+           << diagnostics.seedChunksTotal.load(std::memory_order_relaxed)
+           << " prefix="
+           << diagnostics.prefixChunksLoaded.load(std::memory_order_relaxed)
+           << '/'
+           << diagnostics.prefixChunksTotal.load(std::memory_order_relaxed)
+           << " endpoint="
+           << diagnostics.endpointChunksLoaded.load(std::memory_order_relaxed)
+           << '/'
+           << diagnostics.endpointChunksTotal.load(std::memory_order_relaxed)
+           << " anchors inside="
+           << diagnostics.insideAnchors.load(std::memory_order_relaxed)
+           << " required="
+           << diagnostics.requiredAnchors.load(std::memory_order_relaxed)
+           << " materialized="
+           << diagnostics.materializedAnchors.load(std::memory_order_relaxed)
+           << '\n'
+           << "  graph fiberlets="
+           << diagnostics.physicalFiberlets.load(std::memory_order_relaxed)
+           << " arcs="
+           << diagnostics.directedArcs.load(std::memory_order_relaxed)
+           << " route_points="
+           << diagnostics.routePoints.load(std::memory_order_relaxed)
+           << " profile_segments="
+           << diagnostics.profileSegments.load(std::memory_order_relaxed)
+           << " transition_arcs="
+           << diagnostics.transitionInputArcsProcessed.load(
+                  std::memory_order_relaxed)
+           << '/'
+           << diagnostics.transitionInputArcsTotal.load(
+                  std::memory_order_relaxed)
+           << " successors="
+           << diagnostics.successors.load(std::memory_order_relaxed)
+           << " replay_transitions="
+           << diagnostics.replayTransitions.load(std::memory_order_relaxed)
+           << " final="
+           << diagnostics.finalAnchors.load(std::memory_order_relaxed)
+           << ',' << diagnostics.finalEdges.load(std::memory_order_relaxed)
+           << ','
+           << diagnostics.finalTransitions.load(std::memory_order_relaxed)
+           << '\n';
+    return output.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -4207,6 +4349,32 @@ int main(int argc, char** argv)
         vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(dataset->metadata(), normalDataset);
         const vc::lasagna::LasagnaNormalSampler normals(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
 
+        vc::fiber_tracer::FiberletGraphMaterializationDiagnostics
+            graphDiagnostics;
+        const auto normalChunkCache =
+            vc::lasagna::sharedLasagnaChannelChunkCache(
+                options.cacheBytes);
+        const auto profileStarted = std::chrono::steady_clock::now();
+        std::jthread profileThread;
+        if (options.profileMemory) {
+            profileThread = std::jthread([&](std::stop_token stop) {
+                while (!stop.stop_requested()) {
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - profileStarted)
+                                               .count();
+                    const auto line = formatGraphMemoryProfile(
+                        elapsed, graphDiagnostics, graph.cacheStats(),
+                        normalChunkCache->stats(), processMemoryStats());
+                    std::cout << line << std::flush;
+                    for (int tenth = 0;
+                         tenth < 10 && !stop.stop_requested(); ++tenth) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(100));
+                    }
+                }
+            });
+        }
+
         const auto graphStarted = std::chrono::steady_clock::now();
         const auto graphCpuStarted = std::clock();
         const auto searchBox =
@@ -4217,7 +4385,8 @@ int main(int argc, char** argv)
                 searchBox.maximumBaseXYZ,
                 options.trace.minimumBaseXYZ,
                 options.trace.maximumBaseXYZ,
-                static_cast<std::size_t>(options.threads));
+                static_cast<std::size_t>(options.threads),
+                options.profileMemory ? &graphDiagnostics : nullptr);
         const double graphSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - graphStarted).count();
         const double graphCpuSeconds = static_cast<double>(std::clock() - graphCpuStarted) / CLOCKS_PER_SEC;
         std::cout << "fiberlet crop graph prepared"
@@ -4231,6 +4400,9 @@ int main(int argc, char** argv)
 
         const auto traceStarted = std::chrono::steady_clock::now();
         const auto traceCpuStarted = std::clock();
+        graphDiagnostics.phase.store(
+            vc::fiber_tracer::FiberletGraphMaterializationPhase::Tracing,
+            std::memory_order_relaxed);
         const auto result = vc::fiber_tracer::traceFiberletCrop(
             *materialized.graph,
             std::move(materialized.insideAnchors),
@@ -4275,6 +4447,10 @@ int main(int argc, char** argv)
                   << " candidate_task_max_seconds=" << result.maximumCandidateTaskSeconds
                   << " lookahead_route_nodes_max=" << result.maximumLookaheadRouteNodes << " lookahead_route_bytes_max=" << result.maximumLookaheadRouteBytes
                   << " integration_seconds=" << result.integrationSeconds << '\n';
+        if (profileThread.joinable()) {
+            profileThread.request_stop();
+            profileThread.join();
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "vc_fiber_trace_chunk: " << error.what() << '\n';

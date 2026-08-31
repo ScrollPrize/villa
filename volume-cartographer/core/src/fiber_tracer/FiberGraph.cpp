@@ -624,11 +624,12 @@ std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
     const auto anchor = persistentRouteAnchor(route);
     const auto incomingId = persistentRouteIncoming(route);
     const auto incoming = incomingId.has_value() ? std::make_optional(graph.arc(*incomingId)) : std::nullopt;
-    auto outgoing = graph.outgoing(anchor);
-    std::sort(outgoing.begin(), outgoing.end());
+    const auto outgoing = graph.outgoingArcs(anchor);
     result.reserve(outgoing.size());
-    for (const auto& outgoingId : outgoing) {
-        const auto edge = graph.arc(outgoingId);
+    for (size_t outgoingIndex = 0; outgoingIndex < outgoing.size();
+         ++outgoingIndex) {
+        const auto& edge = outgoing[outgoingIndex];
+        const auto& outgoingId = edge.id;
         if (persistentVisitedContains(route.visitedNodes, edge.target)) {
             ++rejectedStates;
             continue;
@@ -1390,10 +1391,10 @@ private:
             horizonFromCheckpointPredictionVoxels_ - targetDistance);
         const auto incoming = graph_.arc(incomingId);
         double best = std::numeric_limits<double>::infinity();
-        auto outgoingIds = graph_.outgoing(incoming.target);
-        std::sort(outgoingIds.begin(), outgoingIds.end());
-        for (const auto& outgoingId : outgoingIds) {
-            const auto outgoing = graph_.arc(outgoingId);
+        const auto outgoingArcs = graph_.outgoingArcs(incoming.target);
+        for (size_t outgoingIndex = 0;
+             outgoingIndex < outgoingArcs.size(); ++outgoingIndex) {
+            const auto& outgoing = outgoingArcs[outgoingIndex];
             const auto transition = graph_.transition(incoming, outgoing);
             if (!transition.has_value())
                 continue;
@@ -1438,7 +1439,7 @@ private:
                         targetDistance -
                         outgoing.pathLengthPredictionVoxels));
                 const double continuation = solve(
-                    outgoingId, continuationBins);
+                    outgoing.id, continuationBins);
                 candidate += continuation;
             }
             best = std::min(best, candidate);
@@ -2249,6 +2250,9 @@ FiberletReplayOutgoingArcView FiberletReplayGraphSource::outgoingArcs(
     arcs.reserve(ids.size());
     for (const auto& id : ids)
         arcs.push_back(arc(id));
+    std::sort(arcs.begin(), arcs.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
     return FiberletReplayOutgoingArcView::owned(std::move(arcs));
 }
 
@@ -2271,19 +2275,15 @@ struct FiberletImmutableReplayGraphSource::Impl {
         std::size_t outgoingCount = 0;
     };
 
-    struct EdgeData {
-        FiberletReplaySourceArc arc;
-        FiberletReplaySourceCostProfile profile;
-        std::vector<cv::Vec3d> points;
-    };
-
     float predictionToBaseScale = 1.0F;
     int anchorCellSizePredictionVoxels = 0;
     float maximumJoinAngleDegrees = 45.0F;
     std::vector<AnchorData> anchors;
     std::vector<FiberletReplaySourceArc> outgoing;
-    std::vector<EdgeData> edges;
-    std::vector<FiberletReplaySourceTransition> transitions;
+    std::vector<FiberletImmutableReplayEdge> edges;
+    std::vector<size_t> transitionOffsets;
+    std::vector<FiberletImmutableReplayTransition> transitions;
+    std::vector<size_t> transitionDiagnosticIndices;
 
     [[nodiscard]] const AnchorData* findAnchor(
         const FiberletStorageKey& id) const
@@ -2298,17 +2298,27 @@ struct FiberletImmutableReplayGraphSource::Impl {
             : nullptr;
     }
 
-    [[nodiscard]] const EdgeData* findEdge(
+    [[nodiscard]] const FiberletImmutableReplayEdge* findEdge(
         const FiberletStorageId& id) const
     {
         const auto found = std::lower_bound(
             edges.begin(), edges.end(), id,
-            [](const EdgeData& value, const FiberletStorageId& key) {
+            [](const FiberletImmutableReplayEdge& value,
+               const FiberletStorageId& key) {
                 return value.arc.id.fiberlet < key;
             });
         return found != edges.end() && found->arc.id.fiberlet == id
             ? &*found
             : nullptr;
+    }
+
+    [[nodiscard]] size_t arcIndex(const DirectedFiberletStorageId& id) const
+    {
+        const auto* found = findEdge(id.fiberlet);
+        if (!found)
+            throw std::out_of_range("fiberlet replay arc is absent");
+        return static_cast<size_t>(found - edges.data()) * 2 +
+            static_cast<size_t>(id.reverse);
     }
 };
 
@@ -2348,10 +2358,15 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
     std::sort(edges.begin(), edges.end(), [](const auto& left, const auto& right) {
         return left.arc.id.fiberlet < right.arc.id.fiberlet;
     });
-    impl_->edges.reserve(edges.size());
-    std::vector<std::vector<FiberletReplaySourceArc>> outgoingByAnchor(
-        impl_->anchors.size());
-    for (auto& edge : edges) {
+    if (impl_->anchors.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "immutable Fiberlet replay graph has too many anchors");
+    }
+    std::vector<std::array<std::uint32_t, 2>> edgeAnchorIndices(
+        edges.size());
+    std::vector<size_t> outgoingCounts(impl_->anchors.size(), 0);
+    for (size_t edgeIndex = 0; edgeIndex < edges.size(); ++edgeIndex) {
+        auto& edge = edges[edgeIndex];
         const auto id = edge.arc.id.fiberlet;
         if (edge.arc.id.reverse || edge.arc.source != id.first ||
             edge.arc.target != id.second ||
@@ -2376,17 +2391,37 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
             throw std::invalid_argument(
                 "immutable Fiberlet replay edge endpoint is absent");
         }
-        if (!impl_->edges.empty() &&
-            impl_->edges.back().arc.id.fiberlet == id) {
+        if (edgeIndex != 0 &&
+            edges[edgeIndex - 1].arc.id.fiberlet == id) {
             throw std::invalid_argument(
                 "immutable Fiberlet replay graph contains duplicate edges");
         }
-        Impl::EdgeData data{
-            std::move(edge.arc), std::move(edge.costProfile),
-            std::move(edge.routePointsBaseXYZ)};
-        auto forward = data.arc;
-        auto reverse = data.arc;
+        const size_t firstIndex = static_cast<size_t>(
+            first - impl_->anchors.begin());
+        const size_t secondIndex = static_cast<size_t>(
+            second - impl_->anchors.begin());
+        edgeAnchorIndices[edgeIndex] = {
+            static_cast<std::uint32_t>(firstIndex),
+            static_cast<std::uint32_t>(secondIndex)};
+        ++outgoingCounts[firstIndex];
+        ++outgoingCounts[secondIndex];
+        edge.arc.graphArcIndex = edgeIndex * 2;
+    }
+    size_t outgoingOffset = 0;
+    for (size_t anchor = 0; anchor < impl_->anchors.size(); ++anchor) {
+        impl_->anchors[anchor].outgoingBegin = outgoingOffset;
+        impl_->anchors[anchor].outgoingCount = outgoingCounts[anchor];
+        outgoingOffset += outgoingCounts[anchor];
+    }
+    impl_->outgoing.resize(outgoingOffset);
+    std::vector<size_t> outgoingCursors(impl_->anchors.size(), 0);
+    for (size_t anchor = 0; anchor < impl_->anchors.size(); ++anchor)
+        outgoingCursors[anchor] = impl_->anchors[anchor].outgoingBegin;
+    for (size_t edgeIndex = 0; edgeIndex < edges.size(); ++edgeIndex) {
+        auto forward = edges[edgeIndex].arc;
+        auto reverse = forward;
         reverse.id.reverse = true;
+        reverse.graphArcIndex = edgeIndex * 2 + 1;
         std::swap(reverse.source, reverse.target);
         std::swap(
             reverse.sourcePositionBaseXYZ,
@@ -2394,40 +2429,124 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
         const auto start = reverse.startStepBaseXYZ;
         reverse.startStepBaseXYZ = -reverse.endStepBaseXYZ;
         reverse.endStepBaseXYZ = -start;
-        outgoingByAnchor[static_cast<std::size_t>(
-            first - impl_->anchors.begin())].push_back(std::move(forward));
-        outgoingByAnchor[static_cast<std::size_t>(
-            second - impl_->anchors.begin())].push_back(std::move(reverse));
-        impl_->edges.push_back(std::move(data));
+        const auto [firstIndex, secondIndex] = edgeAnchorIndices[edgeIndex];
+        impl_->outgoing[outgoingCursors[firstIndex]++] = std::move(forward);
+        impl_->outgoing[outgoingCursors[secondIndex]++] = std::move(reverse);
     }
-    for (std::size_t index = 0; index < impl_->anchors.size(); ++index) {
-        auto& outgoing = outgoingByAnchor[index];
-        std::sort(outgoing.begin(), outgoing.end(), [](const auto& left, const auto& right) {
-            return left.id < right.id;
+    for (const auto& anchor : impl_->anchors) {
+        auto begin = impl_->outgoing.begin() +
+            static_cast<std::ptrdiff_t>(anchor.outgoingBegin);
+        std::sort(
+            begin,
+            begin + static_cast<std::ptrdiff_t>(anchor.outgoingCount),
+            [](const auto& left, const auto& right) {
+                return left.id < right.id;
+            });
+    }
+    impl_->edges = std::move(edges);
+    struct IndexedTransition {
+        std::uint32_t incoming = 0;
+        std::uint32_t outgoing = 0;
+        FiberletPathCost cost;
+        std::optional<size_t> diagnosticIndex;
+    };
+    if (impl_->edges.size() * 2 >
+        std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "immutable Fiberlet replay graph has too many directed arcs");
+    }
+    std::vector<IndexedTransition> indexedTransitions;
+    indexedTransitions.reserve(transitions.size());
+    for (const auto& transition : transitions) {
+        validateReplayCost(
+            transition.cost,
+            "immutable Fiberlet replay transition cost is invalid");
+        indexedTransitions.push_back({
+            static_cast<std::uint32_t>(impl_->arcIndex(transition.incoming)),
+            static_cast<std::uint32_t>(impl_->arcIndex(transition.outgoing)),
+            transition.cost,
+            transition.diagnosticTransitionIndex,
         });
-        impl_->anchors[index].outgoingBegin = impl_->outgoing.size();
-        impl_->anchors[index].outgoingCount = outgoing.size();
-        impl_->outgoing.insert(
-            impl_->outgoing.end(),
-            std::make_move_iterator(outgoing.begin()),
-            std::make_move_iterator(outgoing.end()));
     }
-    std::sort(transitions.begin(), transitions.end(), [](const auto& left, const auto& right) {
-        return std::pair{left.incoming, left.outgoing} <
-            std::pair{right.incoming, right.outgoing};
-    });
-    impl_->transitions.reserve(transitions.size());
-    for (auto& transition : transitions) {
-        const auto key = std::pair{
-            transition.incoming, transition.outgoing};
-        if (!impl_->transitions.empty() &&
-            std::pair{impl_->transitions.back().incoming,
-                      impl_->transitions.back().outgoing} == key) {
+    std::sort(
+        indexedTransitions.begin(), indexedTransitions.end(),
+        [](const auto& left, const auto& right) {
+            return std::pair{left.incoming, left.outgoing} <
+                std::pair{right.incoming, right.outgoing};
+        });
+    impl_->transitionOffsets.assign(impl_->edges.size() * 2 + 1, 0);
+    impl_->transitions.reserve(indexedTransitions.size());
+    const size_t noDiagnostic = std::numeric_limits<size_t>::max();
+    bool hasDiagnostics = false;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> previousKey;
+    for (const auto& transition : indexedTransitions) {
+        const auto key = std::pair{transition.incoming, transition.outgoing};
+        if (previousKey == key) {
             throw std::invalid_argument(
                 "immutable Fiberlet replay graph contains duplicate transitions");
         }
-        impl_->transitions.push_back(std::move(transition));
+        previousKey = key;
+        ++impl_->transitionOffsets[transition.incoming + 1];
+        impl_->transitions.push_back({transition.outgoing, transition.cost});
+        impl_->transitionDiagnosticIndices.push_back(
+            transition.diagnosticIndex.value_or(noDiagnostic));
+        hasDiagnostics = hasDiagnostics || transition.diagnosticIndex.has_value();
     }
+    std::partial_sum(
+        impl_->transitionOffsets.begin(), impl_->transitionOffsets.end(),
+        impl_->transitionOffsets.begin());
+    if (!hasDiagnostics)
+        impl_->transitionDiagnosticIndices.clear();
+}
+
+FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
+    float predictionToBaseScale,
+    int anchorCellSizePredictionVoxels,
+    float maximumJoinAngleDegrees,
+    std::vector<FiberletReplaySourceAnchor> anchors,
+    std::vector<FiberletImmutableReplayEdge> edges,
+    FiberletImmutableReplayTransitionCsr transitions)
+    : FiberletImmutableReplayGraphSource(
+          predictionToBaseScale,
+          anchorCellSizePredictionVoxels,
+          maximumJoinAngleDegrees,
+          std::move(anchors),
+          std::move(edges),
+          std::vector<FiberletReplaySourceTransition>{})
+{
+    const size_t directedArcCount = impl_->edges.size() * 2;
+    if (transitions.offsets.size() != directedArcCount + 1 ||
+        transitions.offsets.front() != 0 ||
+        transitions.offsets.back() != transitions.entries.size()) {
+        throw std::invalid_argument(
+            "immutable Fiberlet replay transition CSR shape is invalid");
+    }
+    for (size_t incoming = 0; incoming < directedArcCount; ++incoming) {
+        const size_t begin = transitions.offsets[incoming];
+        const size_t end = transitions.offsets[incoming + 1];
+        if (begin > end || end > transitions.entries.size()) {
+            throw std::invalid_argument(
+                "immutable Fiberlet replay transition CSR offsets are invalid");
+        }
+        std::uint32_t previousOutgoing = 0;
+        bool first = true;
+        for (size_t index = begin; index < end; ++index) {
+            const auto& transition = transitions.entries[index];
+            if (transition.outgoingArc >= directedArcCount ||
+                (!first && transition.outgoingArc <= previousOutgoing)) {
+                throw std::invalid_argument(
+                    "immutable Fiberlet replay transition CSR entries are invalid");
+            }
+            validateReplayCost(
+                transition.cost,
+                "immutable Fiberlet replay transition cost is invalid");
+            previousOutgoing = transition.outgoingArc;
+            first = false;
+        }
+    }
+    impl_->transitionOffsets = std::move(transitions.offsets);
+    impl_->transitions = std::move(transitions.entries);
+    impl_->transitionDiagnosticIndices.clear();
 }
 
 FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
@@ -2579,6 +2698,9 @@ FiberletReplaySourceArc FiberletImmutableReplayGraphSource::arc(
         throw std::out_of_range("fiberlet replay arc is absent");
     auto result = found->arc;
     result.id = id;
+    result.graphArcIndex =
+        static_cast<size_t>(found - impl_->edges.data()) * 2 +
+        static_cast<size_t>(id.reverse);
     if (id.reverse) {
         std::swap(result.source, result.target);
         std::swap(
@@ -2619,8 +2741,8 @@ FiberletImmutableReplayGraphSource::costProfileView(
         throw std::out_of_range(
             "fiberlet replay cost-profile arc is absent");
     }
-    return {found->profile.segmentLengthsPredictionVoxels,
-            found->profile.segmentCostDensities, {}, id.reverse};
+    return {found->costProfile.segmentLengthsPredictionVoxels,
+            found->costProfile.segmentCostDensities, {}, id.reverse};
 }
 
 std::vector<cv::Vec3d> FiberletImmutableReplayGraphSource::routePoints(
@@ -2641,7 +2763,7 @@ FiberletImmutableReplayGraphSource::routePointView(
     const auto* found = impl_->findEdge(id.fiberlet);
     if (!found)
         throw std::out_of_range("fiberlet replay route is absent");
-    return {found->points, {}, id.reverse};
+    return {found->routePointsBaseXYZ, {}, id.reverse};
 }
 
 std::optional<FiberletReplaySourceTransition>
@@ -2649,17 +2771,45 @@ FiberletImmutableReplayGraphSource::transition(
     const FiberletReplaySourceArc& incoming,
     const FiberletReplaySourceArc& outgoing) const
 {
-    const auto key = std::pair{incoming.id, outgoing.id};
+    const auto resolveArcIndex = [&](const FiberletReplaySourceArc& arc) {
+        if (arc.graphArcIndex < impl_->edges.size() * 2) {
+            const auto& stored =
+                impl_->edges[arc.graphArcIndex / 2].arc.id.fiberlet;
+            if (stored == arc.id.fiberlet &&
+                static_cast<bool>(arc.graphArcIndex % 2) == arc.id.reverse) {
+                return arc.graphArcIndex;
+            }
+        }
+        return impl_->arcIndex(arc.id);
+    };
+    const size_t incomingIndex = resolveArcIndex(incoming);
+    const size_t outgoingIndex = resolveArcIndex(outgoing);
+    const size_t begin = impl_->transitionOffsets.at(incomingIndex);
+    const size_t end = impl_->transitionOffsets.at(incomingIndex + 1);
     const auto found = std::lower_bound(
-        impl_->transitions.begin(), impl_->transitions.end(), key,
-        [](const FiberletReplaySourceTransition& value,
-           const auto& expected) {
-            return std::pair{value.incoming, value.outgoing} < expected;
+        impl_->transitions.begin() + static_cast<std::ptrdiff_t>(begin),
+        impl_->transitions.begin() + static_cast<std::ptrdiff_t>(end),
+        outgoingIndex,
+        [](const FiberletImmutableReplayTransition& value,
+           size_t expected) {
+            return value.outgoingArc < expected;
         });
-    return found == impl_->transitions.end() ||
-            std::pair{found->incoming, found->outgoing} != key
-        ? std::nullopt
-        : std::optional<FiberletReplaySourceTransition>{*found};
+    if (found == impl_->transitions.begin() +
+                     static_cast<std::ptrdiff_t>(end) ||
+        found->outgoingArc != outgoingIndex) {
+        return std::nullopt;
+    }
+    std::optional<size_t> diagnosticIndex;
+    if (!impl_->transitionDiagnosticIndices.empty()) {
+        const size_t compactIndex = static_cast<size_t>(
+            found - impl_->transitions.begin());
+        const size_t stored =
+            impl_->transitionDiagnosticIndices[compactIndex];
+        if (stored != std::numeric_limits<size_t>::max())
+            diagnosticIndex = stored;
+    }
+    return FiberletReplaySourceTransition{
+        incoming.id, outgoing.id, found->cost, diagnosticIndex};
 }
 
 FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees)

@@ -157,8 +157,16 @@ ClippedRoute clipAtFirstExit(
         }
         const auto clipped = clipLineSegmentToHalfOpenBox(
             start, finish, minimumBaseXYZ, maximumBaseXYZ);
-        if (!clipped)
+        if (!clipped) {
+            // A minimum face belongs to the half-open crop. A segment that
+            // starts on that face and points out has only a zero-length
+            // intersection, which the general clipper intentionally rejects.
+            if (pointInHalfOpenBox(start, minimumBaseXYZ, maximumBaseXYZ)) {
+                result.exited = true;
+                break;
+            }
             throw std::logic_error("Fiberlet crop exit segment missed crop");
+        }
         const double t = clipped->endFraction;
         if (appendedPoints)
             appendedPoints->push_back(clipped->finish);

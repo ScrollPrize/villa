@@ -869,6 +869,13 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchInterleaved(
     return report;
 }
 
+LasagnaChannelChunkCache::Stats LasagnaChannelChunkCache::stats() const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return {
+        cachedBytes_, capacityBytes_, entries_.size(), inFlight_.size()};
+}
+
 std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
     const LasagnaChannelBinding& binding,
     const utils::ZarrArray& array,
