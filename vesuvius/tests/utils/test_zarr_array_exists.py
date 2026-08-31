@@ -42,6 +42,16 @@ class TestLocalPaths:
         assert zarr_array_exists(str(tmp_path)) is False
 
 
+    def test_accepts_a_path_object(self, tmp_path):
+        """os.PathLike must work. main caught the AttributeError and returned False
+        for every Path, so this asserts we are not worse than main for that input."""
+        arr = tmp_path / "present.zarr"
+        arr.mkdir()
+        (arr / ".zarray").write_text("{}")
+        assert zarr_array_exists(arr) is True
+        assert zarr_array_exists(tmp_path / "absent.zarr") is False
+
+
 class TestS3Paths:
     def test_falls_back_to_anonymous_when_credentials_are_missing(self, monkeypatch):
         """The open-data bucket is public-read; no credentials must still work."""

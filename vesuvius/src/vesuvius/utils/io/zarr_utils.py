@@ -90,6 +90,10 @@ def zarr_array_exists(zarr_path):
             permissions, network). Previously this returned False, which is
             indistinguishable from the array being absent.
     """
+    # Accept str or os.PathLike. The previous implementation caught the
+    # AttributeError this would otherwise raise and returned False for every
+    # Path argument, so coercing here keeps that input working and answers it.
+    zarr_path = os.fspath(zarr_path)
     marker = os.path.join(zarr_path, '.zarray')
 
     if not zarr_path.startswith('s3://'):
