@@ -789,8 +789,9 @@ class TestLinkConsistency:
     def test_refresh_crash_demotes_with_location(self, manager, monkeypatch,
                                                  capsys):
         """A merge-machinery bug must read as a bug, not as undiagnosable
-        data: the demotion reason names the innermost frame, and
-        VC_SYNC_DEBUG=1 prints the full traceback."""
+        data: the demotion reason names the innermost frame. The full
+        traceback prints ONLY under VC_SYNC_DEBUG=1 — unconditional stacks
+        would bury the merge preview and the conflict prompt."""
         a = self.fiber('a.json', self.CPS_A,
                        branches=[self.entry('b.json', self.CPS_A, 1,
                                             self.CPS_B, 0)])
@@ -801,15 +802,22 @@ class TestLinkConsistency:
             raise TypeError('synthetic refresh crash')
 
         monkeypatch.setattr(vc_sync.fiber_merge, 'refresh_pair_links', boom)
-        monkeypatch.setenv('VC_SYNC_DEBUG', '1')
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               self.fiber('a.json', self.CPS_A), ['b.json'])
+
+        monkeypatch.delenv('VC_SYNC_DEBUG', raising=False)
         peer_fixes, demoted = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {} and len(demoted) == 1
         reason = demoted[0][1]
         assert 'synthetic refresh crash' in reason
         assert 'test_vc_sync_helpers.py' in reason and 'boom' in reason
+        assert 'Traceback' not in capsys.readouterr().out
+
+        monkeypatch.setenv('VC_SYNC_DEBUG', '1')
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert len(demoted) == 1
         assert 'Traceback' in capsys.readouterr().out
 
 

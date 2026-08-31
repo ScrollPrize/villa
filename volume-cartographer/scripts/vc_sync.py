@@ -107,10 +107,10 @@ def _exception_location(ex):
     Demotion reasons carry this so a merge-machinery bug reads as a bug
     (with a place to look) instead of as undiagnosable annotation data —
     a bare str(ex) once hid a crash behind weeks of manual conflicts."""
-    tb = getattr(ex, '__traceback__', None)
-    if tb is None:
+    frames = traceback.extract_tb(getattr(ex, '__traceback__', None))
+    if not frames:
         return ''
-    frame = traceback.extract_tb(tb)[-1]
+    frame = frames[-1]
     return (f" at {os.path.basename(frame.filename)}:{frame.lineno} "
             f"in {frame.name}")
 
