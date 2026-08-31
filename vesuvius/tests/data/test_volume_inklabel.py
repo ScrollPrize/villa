@@ -33,6 +33,29 @@ def _fail_with(monkeypatch, exc):
     monkeypatch.setattr(volume_module.fsspec, "open", boom)
 
 
+def _absent_404():
+    """What fsspec ACTUALLY raises for a label that is not published.
+
+    Verified live against dl.ash2txt.org on 2026-08-31: a real 404 surfaces as
+    FileNotFoundError chained from aiohttp's ClientResponseError with status 404.
+    An earlier version of this test used a bare FileNotFoundError with no cause,
+    which no real 404 ever produces, so it could not catch a wrong split.
+    """
+    cause = _ClientResponseErrorLike(404, "Not Found")
+    err = FileNotFoundError(LABEL_URL)
+    err.__cause__ = cause
+    return err
+
+
+class _ClientResponseErrorLike(Exception):
+    """Mirrors the attribute aiohttp.ClientResponseError exposes: .status."""
+
+    def __init__(self, status, message):
+        super().__init__(f"{status}, message={message!r}")
+        self.status = status
+        self.message = message
+
+
 def _tls_failure():
     """What fsspec actually raises for a certificate problem: the URL, cause buried."""
     cause = OSError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
@@ -87,7 +110,7 @@ class TestMissingIsDistinguishedFromFailed:
 
     def test_absent_label_is_reported_as_a_note(self, monkeypatch, capsys):
         v = _bare_segment(verbose=False)
-        _fail_with(monkeypatch, FileNotFoundError(LABEL_URL))  # no chained cause = a real 404
+        _fail_with(monkeypatch, _absent_404())  # a real 404: cause present, status 404
         v.download_inklabel()
         out = capsys.readouterr().out
         assert "no ink label is published" in out

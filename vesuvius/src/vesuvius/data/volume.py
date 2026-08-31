@@ -813,6 +813,15 @@ class Volume:
             if cause is not None:
                 detail += f" (caused by {type(cause).__name__}: {cause})"
 
+            # A genuine 404 does NOT arrive without a chained cause: aiohttp raises
+            # ClientResponseError with status 404 and fsspec re-raises it as
+            # FileNotFoundError. So whether a cause exists does not separate
+            # "not published" from "the request failed" - the HTTP status does.
+            # Anything that is not a 404 (connection reset, TLS, 403, 5xx) means the
+            # label may well exist and we simply could not reach it.
+            status = getattr(cause, "status", None)
+            absent = cause is None or status == 404
+
             # Create an empty/dummy ink label array based on data shape if possible
             if hasattr(self, 'data') and self.data:
                 try:
@@ -834,7 +843,7 @@ class Volume:
             # normal case and is reported as information. A chained cause means the request
             # itself failed (connection, TLS, permissions) and the label may well exist, so
             # that is reported as a warning. fsspec raises FileNotFoundError for both.
-            if cause is None:
+            if absent:
                 print(
                     f"Note: no ink label is published at {inklabel_url}. "
                     f"self.inklabel is a blank {self.inklabel.shape} placeholder, "
