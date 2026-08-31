@@ -1,11 +1,10 @@
-# Status: weighted reference winding diagnostics
+# Status: estimate-first reference winding calibration
 
 - [x] Capture the requested task.
-- [x] Inspect reference calibration and winding-factor weighting.
+- [x] Inspect the current calibration and shared scorer.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Add shared weighted group diagnostics.
-- [x] Add the CLI table before reference accuracy.
-- [x] Add regression coverage.
+- [x] Implement raw estimate calibration.
+- [x] Update regression coverage.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Build and run focused validation.
+- [x] Build and run focused and production validation.

@@ -1240,19 +1240,26 @@ the prepared problem that Defect can neutralize, not realized final pair
 energy. These statistics identify associations for tuning; they do not alone
 establish which constraint caused a Defect decision.
 
-The filename-ordered reference stack is calibrated separately against every
-independently gauged BP winding subgraph. Each offset is selected by exhaustive
-closed-interval event search to maximize matches within an inclusive `0.5`
-winding tolerance. Offset ties prefer the value closest to zero, then the lower
-signed value. Output first lists each gauge's offset and matched/total count,
-then prints a weighted constraint-group diagnostic. For each reference winding
+The filename-ordered reference stack is calibrated only after the dominant-factor
+scorer has inferred one raw winding for every `(reference, gauge)` pair with
+admitted evidence. Raw inference does not use the filename-order label, a gauge
+mapping, or the reporting tolerance, and every pair contributes one calibration
+vote regardless of its constraint degree. A single global sign and one
+half-integer offset per gauge maximize exact raw-estimate matches; residual
+error breaks match-count ties. Remaining global-sign ties prefer `+1`, while
+offset ties prefer the value closest to zero and then the lower value. Gauges
+without admitted raw estimates are omitted. Output first lists each gauge's
+offset, exact matches, and estimate votes, then prints a weighted
+constraint-group diagnostic. The later constraint-accuracy rows retain their
+inclusive `0.5` reporting tolerance, which does not affect calibration. For each reference winding
 it splits dominant perpendicular evidence into canonical step `0.5` and
 `1.5+`, and dominant parallel evidence into canonical step `0`, `1`, and
 `2+`. Every member contributes only its dominant BP winding term. `raw_w` sums
 the winning scores after fixed power-of-two winding-distance decay. `used_w` additionally reflects
 parallel-distance cutoff suppression. `true_h` and `infer_h` count violated hard
 signed-order constraints. Candidate selection first minimizes that count, then
-the admitted dominant-hypothesis BP winding energy. `true_L1`/`true_avg` give total
+the admitted dominant-hypothesis BP winding energy; exact ties prefer the lower
+signed half-integer winding. `true_L1`/`true_avg` give total
 and admitted-coefficient-mean energy at the globally calibrated true winding;
 `infer_w` and `infer_L1`/`infer_avg` give the half-integer winding and energy
 preferred by that group alone. Perpendicular coordinate residuals are divided

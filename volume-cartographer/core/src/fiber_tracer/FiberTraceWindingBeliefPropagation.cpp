@@ -3164,39 +3164,317 @@ void FiberTraceCanonicalConstraintCounts::add(
         ++falseCount;
 }
 
+namespace
+{
+
+struct ReferenceScoredObservation {
+    const FiberTraceReferenceWindingObservation* source = nullptr;
+    int rawFromWindingSign = 1;
+    double rawFromWindingOffset = 0.0;
+    std::array<double, 2> candidates{0.0, 0.0};
+    std::size_t candidateCount = 0;
+};
+
+struct ReferenceScore {
+    std::size_t hardViolations = 0;
+    double loss = 0.0;
+};
+
+void validateReferenceObservation(
+    const FiberTraceReferenceWindingObservation& observation)
+{
+    constexpr double epsilon = 1.0e-12;
+    const auto classIndex =
+        static_cast<std::size_t>(observation.constraintClass);
+    if (classIndex >= 3 ||
+        observation.referenceSource ==
+            std::numeric_limits<std::size_t>::max() ||
+        observation.inferredReferenceWindingCount >
+            observation.inferredReferenceWindings.size() ||
+        !std::isfinite(observation.canonicalWindingDistance) ||
+        observation.canonicalWindingDistance < 0.0 ||
+        !std::isfinite(observation.rawCoefficient) ||
+        observation.rawCoefficient < 0.0 ||
+        !std::isfinite(observation.admittedCoefficient) ||
+        observation.admittedCoefficient < 0.0 ||
+        observation.admittedCoefficient >
+            observation.rawCoefficient + epsilon ||
+        !std::isfinite(observation.coordinateResidualScale) ||
+        !(observation.coordinateResidualScale > 0.0) ||
+        (observation.exactWindingFactor &&
+         (!std::isfinite(observation.bpLatentCoordinate) ||
+          !std::isfinite(observation.referenceDeltaSign) ||
+          std::abs(observation.referenceDeltaSign) != 1.0 ||
+          !std::isfinite(observation.rawParallelCoefficient) ||
+          observation.rawParallelCoefficient < 0.0 ||
+          !std::isfinite(observation.admittedParallelCoefficient) ||
+          observation.admittedParallelCoefficient < 0.0 ||
+          !std::isfinite(observation.perpendicularCoefficient) ||
+          observation.perpendicularCoefficient < 0.0 ||
+          !std::isfinite(observation.parallelDistance) ||
+          observation.parallelDistance < 0.0))) {
+        throw std::invalid_argument(
+            "Reference winding benchmark observation is invalid");
+    }
+    for (std::size_t candidate = 0;
+         candidate < observation.inferredReferenceWindingCount;
+         ++candidate) {
+        if (!std::isfinite(observation.inferredReferenceWindings[candidate])) {
+            throw std::invalid_argument(
+                "Reference winding benchmark candidate is invalid");
+        }
+    }
+}
+
+ReferenceScoredObservation makeReferenceScoredObservation(
+    const FiberTraceReferenceWindingObservation& observation,
+    int rawFromWindingSign,
+    double rawFromWindingOffset)
+{
+    validateReferenceObservation(observation);
+    if ((rawFromWindingSign != -1 && rawFromWindingSign != 1) ||
+        !std::isfinite(rawFromWindingOffset)) {
+        throw std::invalid_argument(
+            "Reference winding observation mapping is invalid");
+    }
+    ReferenceScoredObservation scored;
+    scored.source = &observation;
+    scored.rawFromWindingSign = rawFromWindingSign;
+    scored.rawFromWindingOffset = rawFromWindingOffset;
+    scored.candidateCount = observation.inferredReferenceWindingCount;
+    for (std::size_t candidate = 0; candidate < scored.candidateCount;
+         ++candidate) {
+        scored.candidates[candidate] =
+            static_cast<double>(rawFromWindingSign) *
+            (observation.inferredReferenceWindings[candidate] -
+             rawFromWindingOffset);
+    }
+    return scored;
+}
+
+ReferenceScore scoreReferenceObservation(
+    const ReferenceScoredObservation& scored,
+    double winding)
+{
+    const auto& observation = *scored.source;
+    const double rawWinding =
+        static_cast<double>(scored.rawFromWindingSign) * winding +
+        scored.rawFromWindingOffset;
+    if (!observation.exactWindingFactor) {
+        double distance = std::numeric_limits<double>::infinity();
+        for (std::size_t candidate = 0;
+             candidate < observation.inferredReferenceWindingCount;
+             ++candidate) {
+            distance = std::min(
+                distance,
+                std::abs(
+                    rawWinding -
+                    observation.inferredReferenceWindings[candidate]));
+        }
+        return {
+            0,
+            observation.admittedCoefficient * distance /
+                observation.coordinateResidualScale};
+    }
+
+    const double delta = observation.referenceDeltaSign *
+        (rawWinding - observation.bpLatentCoordinate);
+    const double predictedPerpendicular =
+        delta / observation.coordinateResidualScale;
+    ReferenceScore score;
+    if (observation.signedPerpendicularTarget &&
+        *observation.signedPerpendicularTarget != 0.0 &&
+        observation.perpendicularCoefficient > 0.0 &&
+        *observation.signedPerpendicularTarget * predictedPerpendicular <=
+            0.0) {
+        score.hardViolations = 1;
+    }
+    if (observation.admittedParallelCoefficient > 0.0) {
+        const double residual = observation.signedParallelTarget
+            ? delta - *observation.signedParallelTarget
+            : std::abs(delta) - observation.parallelDistance;
+        score.loss += observation.admittedParallelCoefficient *
+            std::abs(residual);
+    }
+    if (observation.signedPerpendicularTarget) {
+        score.loss += observation.perpendicularCoefficient *
+            std::abs(
+                predictedPerpendicular -
+                *observation.signedPerpendicularTarget);
+    }
+    return score;
+}
+
+FiberTraceReferenceConstraintGroupDiagnostic summarizeReferenceObservations(
+    std::span<const ReferenceScoredObservation> observations,
+    std::optional<double> truth)
+{
+    constexpr double epsilon = 1.0e-12;
+    FiberTraceReferenceConstraintGroupDiagnostic summary;
+    summary.observations = observations.size();
+    for (const auto& observation : observations) {
+        summary.rawCoefficient += observation.source->rawCoefficient;
+        summary.admittedCoefficient +=
+            observation.source->admittedCoefficient;
+    }
+    if (observations.empty() || !(summary.admittedCoefficient > 0.0))
+        return summary;
+
+    const auto scoreAt = [&](double winding) {
+        ReferenceScore score;
+        for (const auto& observation : observations) {
+            const auto current =
+                scoreReferenceObservation(observation, winding);
+            score.hardViolations += current.hardViolations;
+            score.loss += current.loss;
+        }
+        return score;
+    };
+    if (truth) {
+        const auto score = scoreAt(*truth);
+        summary.truthHardViolations = score.hardViolations;
+        summary.truthLoss = score.loss;
+    }
+
+    std::set<long long> candidateTicks{0};
+    const auto addBreakpoint = [&](double breakpoint) {
+        const double tick = 2.0 * breakpoint;
+        if (tick < static_cast<double>(
+                       std::numeric_limits<long long>::min() + 4) ||
+            tick > static_cast<double>(
+                       std::numeric_limits<long long>::max() - 4)) {
+            throw std::invalid_argument(
+                "Reference winding candidate is out of range");
+        }
+        const auto lower = static_cast<long long>(std::floor(tick));
+        for (long long offset = -1; offset <= 2; ++offset)
+            candidateTicks.insert(lower + offset);
+    };
+    for (const auto& observation : observations) {
+        for (std::size_t candidate = 0;
+             candidate < observation.candidateCount;
+             ++candidate) {
+            addBreakpoint(observation.candidates[candidate]);
+        }
+        if (observation.source->exactWindingFactor &&
+            observation.source->signedPerpendicularTarget &&
+            observation.source->perpendicularCoefficient > 0.0) {
+            addBreakpoint(
+                static_cast<double>(observation.rawFromWindingSign) *
+                (observation.source->bpLatentCoordinate -
+                 observation.rawFromWindingOffset));
+        }
+        for (std::size_t first = 0;
+             first < observation.candidateCount;
+             ++first) {
+            for (std::size_t second = first + 1;
+                 second < observation.candidateCount;
+                 ++second) {
+                addBreakpoint(0.5 *
+                    (observation.candidates[first] +
+                     observation.candidates[second]));
+            }
+        }
+    }
+
+    double bestWinding = 0.0;
+    ReferenceScore best{std::numeric_limits<std::size_t>::max(),
+                        std::numeric_limits<double>::infinity()};
+    for (const long long tick : candidateTicks) {
+        const double winding = 0.5 * static_cast<double>(tick);
+        const auto score = scoreAt(winding);
+        const bool better =
+            score.hardViolations < best.hardViolations ||
+            (score.hardViolations == best.hardViolations &&
+             (score.loss < best.loss - epsilon ||
+              (std::abs(score.loss - best.loss) <= epsilon &&
+               winding < bestWinding)));
+        if (better) {
+            bestWinding = winding;
+            best = score;
+        }
+    }
+    summary.preferredWinding = bestWinding;
+    summary.preferredHardViolations = best.hardViolations;
+    summary.preferredLoss = best.loss;
+    return summary;
+}
+
+FiberTraceReferenceConstraintGroup groupForReferenceObservation(
+    const FiberTraceReferenceWindingObservation& observation)
+{
+    constexpr double epsilon = 1.0e-12;
+    if (observation.constraintClass ==
+        FiberTraceReferenceConstraintClass::Perpendicular) {
+        return observation.canonicalWindingDistance <= 0.5 + epsilon
+            ? FiberTraceReferenceConstraintGroup::PerpendicularNext
+            : FiberTraceReferenceConstraintGroup::PerpendicularFar;
+    }
+    if (observation.constraintClass ==
+        FiberTraceReferenceConstraintClass::ParallelSameWinding) {
+        return FiberTraceReferenceConstraintGroup::ParallelSame;
+    }
+    return observation.canonicalWindingDistance <= 1.0 + epsilon
+        ? FiberTraceReferenceConstraintGroup::ParallelOne
+        : FiberTraceReferenceConstraintGroup::ParallelTwoPlus;
+}
+
+}  // namespace
+
+std::vector<FiberTraceReferenceRawWindingEstimate>
+inferFiberTraceReferenceRawWindings(
+    std::span<const FiberTraceReferenceWindingObservation> observations)
+{
+    using Key = std::pair<std::size_t, std::size_t>;
+    std::map<Key, std::vector<ReferenceScoredObservation>> grouped;
+    for (const auto& observation : observations) {
+        validateReferenceObservation(observation);
+        if (observation.inferredReferenceWindingCount == 0 ||
+            !(observation.admittedCoefficient > 0.0)) {
+            continue;
+        }
+        grouped[{observation.referenceSource, observation.integerGauge}]
+            .push_back(makeReferenceScoredObservation(observation, 1, 0.0));
+    }
+
+    std::vector<FiberTraceReferenceRawWindingEstimate> result;
+    result.reserve(grouped.size());
+    for (const auto& [key, scored] : grouped) {
+        const auto summary =
+            summarizeReferenceObservations(scored, std::nullopt);
+        if (!summary.preferredWinding)
+            continue;
+        result.push_back({key.first,
+                          key.second,
+                          *summary.preferredWinding,
+                          summary.observations,
+                          summary.admittedCoefficient});
+    }
+    return result;
+}
+
 FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance)
 {
     if (!std::isfinite(tolerance) || tolerance < 0.0) {
         throw std::invalid_argument("Reference winding benchmark tolerance must be finite and nonnegative");
     }
 
-    std::map<std::size_t, std::vector<std::size_t>> observationsByGauge;
     std::size_t referenceSources = 0;
-    for (std::size_t index = 0; index < observations.size(); ++index) {
-        const auto& observation = observations[index];
-        if (!std::isfinite(observation.virtualReferenceWinding) ||
-            observation.inferredReferenceWindingCount > observation.inferredReferenceWindings.size()) {
-            throw std::invalid_argument("Reference winding benchmark observation is invalid");
-        }
-        for (std::size_t candidate = 0; candidate < observation.inferredReferenceWindingCount; ++candidate) {
-            if (!std::isfinite(observation.inferredReferenceWindings[candidate])) {
-                throw std::invalid_argument("Reference winding benchmark candidate is invalid");
-            }
-        }
-        const auto classIndex = static_cast<std::size_t>(observation.constraintClass);
-        if (classIndex >= 3) {
-            throw std::invalid_argument("Reference winding benchmark class is invalid");
-        }
-        if (observation.referenceSource ==
-            std::numeric_limits<std::size_t>::max()) {
-            throw std::invalid_argument(
-                "Reference winding benchmark source is invalid");
-        }
+    std::vector<std::optional<double>> truthBySource;
+    for (const auto& observation : observations) {
+        validateReferenceObservation(observation);
+        if (!std::isfinite(observation.virtualReferenceWinding))
+            throw std::invalid_argument("Reference winding truth is invalid");
         referenceSources = std::max(
             referenceSources, observation.referenceSource + 1);
-        if (observation.inferredReferenceWindingCount == 0)
-            continue;
-        observationsByGauge[observation.integerGauge].push_back(index);
+        if (truthBySource.size() < referenceSources)
+            truthBySource.resize(referenceSources);
+        auto& truth = truthBySource[observation.referenceSource];
+        if (truth && *truth != observation.virtualReferenceWinding) {
+            throw std::invalid_argument(
+                "Reference winding truth is inconsistent for one source");
+        }
+        truth = observation.virtualReferenceWinding;
     }
 
     FiberTraceReferenceWindingBenchmark result;
@@ -3214,91 +3492,75 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         }
         return false;
     };
-    const auto betterOffset = [](std::size_t right, double offset, std::size_t bestRight, double bestOffset) {
-        if (right != bestRight)
-            return right > bestRight;
-        if (std::abs(offset) != std::abs(bestOffset))
-            return std::abs(offset) < std::abs(bestOffset);
-        return offset < bestOffset;
-    };
-
-    struct OffsetEvents {
-        std::size_t starts = 0;
-        std::size_t ends = 0;
-    };
+    const auto rawEstimates = inferFiberTraceReferenceRawWindings(observations);
+    std::map<
+        std::size_t,
+        std::vector<const FiberTraceReferenceRawWindingEstimate*>>
+        estimatesByGauge;
+    for (const auto& estimate : rawEstimates)
+        estimatesByGauge[estimate.integerGauge].push_back(&estimate);
 
     struct SignCalibration {
         int sign = 1;
         std::vector<FiberTraceReferenceGaugeCalibration> gauges;
-        std::size_t right = 0;
+        std::size_t exactMatches = 0;
+        double residual = 0.0;
     };
     const auto calibrateSign = [&](int sign) {
         SignCalibration calibration;
         calibration.sign = sign;
-        for (const auto& [gauge, indices] : observationsByGauge) {
-            std::map<double, OffsetEvents> events;
-            for (const std::size_t index : indices) {
-                const auto& observation = observations[index];
-                std::array<std::pair<double, double>, 2> intervals{};
-                std::size_t intervalCount = 0;
-                for (std::size_t candidate = 0;
-                     candidate < observation.inferredReferenceWindingCount;
-                     ++candidate) {
-                    const double center =
-                        observation.inferredReferenceWindings[candidate] -
-                        static_cast<double>(sign) *
-                            observation.virtualReferenceWinding;
-                    const double first =
-                        std::ceil(2.0 * (center - tolerance) - kEpsilon);
-                    const double last =
-                        std::floor(2.0 * (center + tolerance) + kEpsilon);
-                    if (first <= last)
-                        intervals[intervalCount++] = {first, last};
-                }
-                if (intervalCount == 2 &&
-                    intervals[1].first < intervals[0].first) {
-                    std::swap(intervals[0], intervals[1]);
-                }
-                if (intervalCount == 2 &&
-                    intervals[1].first <= intervals[0].second + 1.0) {
-                    intervals[0].second =
-                        std::max(intervals[0].second, intervals[1].second);
-                    intervalCount = 1;
-                }
-                for (std::size_t interval = 0; interval < intervalCount;
-                     ++interval) {
-                    ++events[intervals[interval].first].starts;
-                    ++events[intervals[interval].second].ends;
-                }
+        for (const auto& [gauge, estimates] : estimatesByGauge) {
+            std::set<double> candidateOffsets;
+            for (const auto* estimate : estimates) {
+                candidateOffsets.insert(
+                    estimate->winding - static_cast<double>(sign) *
+                        *truthBySource[estimate->referenceSource]);
             }
-
             double bestOffset = 0.0;
-            std::size_t bestRight = 0;
-            for (const std::size_t index : indices) {
-                bestRight +=
-                    isRight(observations[index], sign, bestOffset) ? 1 : 0;
-            }
-            std::size_t active = 0;
-            for (const auto& [offsetTick, event] : events) {
-                active += event.starts;
-                const double offset = 0.5 * static_cast<double>(offsetTick);
-                if (betterOffset(active, offset, bestRight, bestOffset)) {
-                    bestRight = active;
-                    bestOffset = offset;
+            std::size_t bestExact = 0;
+            double bestResidual = std::numeric_limits<double>::infinity();
+            bool haveBest = false;
+            for (const double offset : candidateOffsets) {
+                std::size_t exact = 0;
+                double residual = 0.0;
+                for (const auto* estimate : estimates) {
+                    const double expected =
+                        static_cast<double>(sign) *
+                            *truthBySource[estimate->referenceSource] +
+                        offset;
+                    exact += estimate->winding == expected ? 1 : 0;
+                    residual += std::abs(estimate->winding - expected);
                 }
-                active -= event.ends;
+                const bool better =
+                    !haveBest || exact > bestExact ||
+                    (exact == bestExact &&
+                     (residual < bestResidual - kEpsilon ||
+                      (std::abs(residual - bestResidual) <= kEpsilon &&
+                       (std::abs(offset) < std::abs(bestOffset) ||
+                        (std::abs(offset) == std::abs(bestOffset) &&
+                         offset < bestOffset)))));
+                if (better) {
+                    bestOffset = offset;
+                    bestExact = exact;
+                    bestResidual = residual;
+                    haveBest = true;
+                }
             }
-            calibration.gauges.push_back(
-                {gauge, bestOffset, indices.size(), bestRight});
-            calibration.right += bestRight;
+            calibration.gauges.push_back({
+                gauge, bestOffset, estimates.size(), bestExact});
+            calibration.exactMatches += bestExact;
+            calibration.residual += bestResidual;
         }
         return calibration;
     };
 
     SignCalibration calibration = calibrateSign(1);
     const SignCalibration reversed = calibrateSign(-1);
-    if (reversed.right > calibration.right)
+    if (reversed.exactMatches > calibration.exactMatches ||
+        (reversed.exactMatches == calibration.exactMatches &&
+         reversed.residual < calibration.residual - kEpsilon)) {
         calibration = reversed;
+    }
     result.globalSign = calibration.sign;
     result.gauges = std::move(calibration.gauges);
 
@@ -3307,6 +3569,9 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         offsetByGauge.emplace(gauge.integerGauge, gauge.offset);
     for (const auto& observation : observations) {
         if (observation.inferredReferenceWindingCount == 0)
+            continue;
+        const auto offset = offsetByGauge.find(observation.integerGauge);
+        if (offset == offsetByGauge.end())
             continue;
         auto& counts = result.classes[static_cast<std::size_t>(observation.constraintClass)];
         auto& reference = result.references[observation.referenceSource];
@@ -3319,7 +3584,7 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         const bool right = isRight(
             observation,
             result.globalSign,
-            offsetByGauge.at(observation.integerGauge));
+            offset->second);
         if (right) {
             ++counts.right;
             ++referenceCounts.right;
@@ -3506,7 +3771,6 @@ summarizeFiberTraceReferenceConstraintGroups(
     std::span<const FiberTraceReferenceWindingObservation> observations,
     const FiberTraceReferenceWindingBenchmark& calibration)
 {
-    constexpr double epsilon = 1.0e-12;
     const std::size_t sourceCount = calibration.references.size();
     std::map<std::size_t, double> offsetByGauge;
     for (const auto& gauge : calibration.gauges) {
@@ -3521,248 +3785,49 @@ summarizeFiberTraceReferenceConstraintGroups(
         const FiberTraceReferenceWindingObservation* source = nullptr;
         double gaugeOffset = 0.0;
         double truth = 0.0;
-        std::array<double, 4> candidates{0.0, 0.0, 0.0, 0.0};
-        std::size_t candidateCount = 0;
-    };
-    struct Score {
-        std::size_t hardViolations = 0;
-        double loss = 0.0;
     };
     using GroupObservations = std::array<
         std::vector<WeightedObservation>,
         static_cast<std::size_t>(FiberTraceReferenceConstraintGroup::Count)>;
     std::vector<GroupObservations> grouped(sourceCount);
 
-    const auto groupFor = [epsilon](const FiberTraceReferenceWindingObservation& observation) {
-        if (observation.constraintClass ==
-            FiberTraceReferenceConstraintClass::Perpendicular) {
-            return observation.canonicalWindingDistance <= 0.5 + epsilon
-                ? FiberTraceReferenceConstraintGroup::PerpendicularNext
-                : FiberTraceReferenceConstraintGroup::PerpendicularFar;
-        }
-        if (observation.constraintClass ==
-            FiberTraceReferenceConstraintClass::ParallelSameWinding) {
-            return FiberTraceReferenceConstraintGroup::ParallelSame;
-        }
-        return observation.canonicalWindingDistance <= 1.0 + epsilon
-            ? FiberTraceReferenceConstraintGroup::ParallelOne
-            : FiberTraceReferenceConstraintGroup::ParallelTwoPlus;
-    };
-
     for (const auto& observation : observations) {
-        const auto classIndex =
-            static_cast<std::size_t>(observation.constraintClass);
+        validateReferenceObservation(observation);
         if ((calibration.globalSign != -1 && calibration.globalSign != 1) ||
-            classIndex >= 3 ||
             observation.referenceSource >= sourceCount ||
-            observation.inferredReferenceWindingCount >
-                observation.inferredReferenceWindings.size() ||
-            !std::isfinite(observation.virtualReferenceWinding) ||
-            !std::isfinite(observation.canonicalWindingDistance) ||
-            observation.canonicalWindingDistance < 0.0 ||
-            !std::isfinite(observation.rawCoefficient) ||
-            observation.rawCoefficient < 0.0 ||
-            !std::isfinite(observation.admittedCoefficient) ||
-            observation.admittedCoefficient < 0.0 ||
-            observation.admittedCoefficient >
-                observation.rawCoefficient + epsilon ||
-            !std::isfinite(observation.coordinateResidualScale) ||
-            !(observation.coordinateResidualScale > 0.0) ||
-            (observation.exactWindingFactor &&
-             (!std::isfinite(observation.bpLatentCoordinate) ||
-              !std::isfinite(observation.referenceDeltaSign) ||
-              std::abs(observation.referenceDeltaSign) != 1.0 ||
-              !std::isfinite(observation.rawParallelCoefficient) ||
-              observation.rawParallelCoefficient < 0.0 ||
-              !std::isfinite(observation.admittedParallelCoefficient) ||
-              observation.admittedParallelCoefficient < 0.0 ||
-              !std::isfinite(observation.perpendicularCoefficient) ||
-              observation.perpendicularCoefficient < 0.0 ||
-              !std::isfinite(observation.parallelDistance) ||
-              observation.parallelDistance < 0.0))) {
+            !std::isfinite(observation.virtualReferenceWinding)) {
             throw std::invalid_argument(
                 "Reference constraint-group observation is invalid");
         }
-        const std::size_t candidateCount =
-            observation.inferredReferenceWindingCount;
-        if (candidateCount == 0)
+        if (observation.inferredReferenceWindingCount == 0)
             continue;
         const auto offset = offsetByGauge.find(observation.integerGauge);
-        if (offset == offsetByGauge.end()) {
-            throw std::invalid_argument(
-                "Reference constraint-group observation has no calibrated gauge");
-        }
+        if (offset == offsetByGauge.end())
+            continue;
         WeightedObservation weighted;
         weighted.source = &observation;
         weighted.gaugeOffset = offset->second;
         weighted.truth = observation.virtualReferenceWinding;
-        weighted.candidateCount = candidateCount;
-        for (std::size_t candidate = 0;
-             candidate < weighted.candidateCount;
-             ++candidate) {
-            if (!std::isfinite(
-                    observation.inferredReferenceWindings[candidate])) {
-                throw std::invalid_argument(
-                    "Reference constraint-group candidate is invalid");
-            }
-            weighted.candidates[candidate] =
-                static_cast<double>(calibration.globalSign) *
-                (observation.inferredReferenceWindings[candidate] -
-                 offset->second);
-        }
         grouped[observation.referenceSource]
-            [static_cast<std::size_t>(groupFor(observation))]
+            [static_cast<std::size_t>(
+                groupForReferenceObservation(observation))]
                 .push_back(weighted);
     }
 
-    const auto observationScore = [&](const WeightedObservation& weighted,
-                                      double winding) {
-        const auto& observation = *weighted.source;
-        const double rawWinding =
-            static_cast<double>(calibration.globalSign) * winding +
-            weighted.gaugeOffset;
-        if (!observation.exactWindingFactor) {
-            double distance = std::numeric_limits<double>::infinity();
-            for (std::size_t candidate = 0;
-                 candidate < observation.inferredReferenceWindingCount;
-                 ++candidate) {
-                distance = std::min(
-                    distance,
-                    std::abs(
-                        rawWinding -
-                        observation.inferredReferenceWindings[candidate]));
-            }
-            return Score{
-                0,
-                observation.admittedCoefficient * distance /
-                    observation.coordinateResidualScale};
-        }
-
-        const double delta = observation.referenceDeltaSign *
-            (rawWinding - observation.bpLatentCoordinate);
-        const double predictedPerpendicular =
-            delta / observation.coordinateResidualScale;
-        Score score;
-        if (observation.signedPerpendicularTarget &&
-            *observation.signedPerpendicularTarget != 0.0 &&
-            observation.perpendicularCoefficient > 0.0 &&
-            *observation.signedPerpendicularTarget *
-                    predictedPerpendicular <=
-                0.0) {
-            score.hardViolations = 1;
-        }
-        if (observation.admittedParallelCoefficient > 0.0) {
-            const double residual = observation.signedParallelTarget
-                ? delta - *observation.signedParallelTarget
-                : std::abs(delta) - observation.parallelDistance;
-            score.loss += observation.admittedParallelCoefficient *
-                std::abs(residual);
-        }
-        if (observation.signedPerpendicularTarget) {
-            score.loss += observation.perpendicularCoefficient *
-                std::abs(
-                    predictedPerpendicular -
-                    *observation.signedPerpendicularTarget);
-        }
-        return score;
-    };
-    const auto scoreAt = [&](std::span<const WeightedObservation> group,
-                             double winding) {
-        Score score;
-        for (const auto& observation : group) {
-            const auto current = observationScore(observation, winding);
-            score.hardViolations += current.hardViolations;
-            score.loss += current.loss;
-        }
-        return score;
-    };
-
-    const auto betterScore = [epsilon](
-                                 const Score& score,
-                                 double winding,
-                                 const Score& best,
-                                 double bestWinding) {
-        if (score.hardViolations != best.hardViolations)
-            return score.hardViolations < best.hardViolations;
-        if (score.loss < best.loss - epsilon)
-            return true;
-        if (std::abs(score.loss - best.loss) > epsilon)
-            return false;
-        return std::abs(winding) < std::abs(bestWinding) ||
-            (std::abs(winding) == std::abs(bestWinding) &&
-             winding < bestWinding);
-    };
-
     const auto summarize = [&](std::span<const WeightedObservation> group) {
-        FiberTraceReferenceConstraintGroupDiagnostic summary;
-        summary.observations = group.size();
-        for (const auto& weighted : group) {
-            summary.rawCoefficient += weighted.source->rawCoefficient;
-            summary.admittedCoefficient +=
-                weighted.source->admittedCoefficient;
-        }
-        if (group.empty() || !(summary.admittedCoefficient > 0.0))
-            return summary;
-        const Score truth = scoreAt(group, group.front().truth);
-        summary.truthHardViolations = truth.hardViolations;
-        summary.truthLoss = truth.loss;
-
-        std::set<long long> candidateTicks{0};
-        const auto addBreakpoint = [&](double breakpoint) {
-            const double tick = 2.0 * breakpoint;
-            if (tick < static_cast<double>(
-                           std::numeric_limits<long long>::min() + 4) ||
-                tick > static_cast<double>(
-                           std::numeric_limits<long long>::max() - 4)) {
-                throw std::invalid_argument(
-                    "Reference constraint-group candidate is out of range");
-            }
-            const auto lower = static_cast<long long>(std::floor(tick));
-            for (long long offset = -1; offset <= 2; ++offset)
-                candidateTicks.insert(lower + offset);
-        };
+        std::vector<ReferenceScoredObservation> scored;
+        scored.reserve(group.size());
         for (const auto& observation : group) {
-            for (std::size_t candidate = 0;
-                 candidate < observation.candidateCount;
-                 ++candidate) {
-                addBreakpoint(observation.candidates[candidate]);
-            }
-            if (observation.source->exactWindingFactor &&
-                observation.source->signedPerpendicularTarget &&
-                observation.source->perpendicularCoefficient > 0.0) {
-                addBreakpoint(
-                    static_cast<double>(calibration.globalSign) *
-                    (observation.source->bpLatentCoordinate -
-                     observation.gaugeOffset));
-            }
-            for (std::size_t first = 0;
-                 first < observation.candidateCount;
-                 ++first) {
-                for (std::size_t second = first + 1;
-                     second < observation.candidateCount;
-                     ++second) {
-                    addBreakpoint(0.5 *
-                        (observation.candidates[first] +
-                         observation.candidates[second]));
-                }
-            }
+            scored.push_back(makeReferenceScoredObservation(
+                *observation.source,
+                calibration.globalSign,
+                observation.gaugeOffset));
         }
-
-        double bestWinding = 0.0;
-        Score best{std::numeric_limits<std::size_t>::max(),
-                   std::numeric_limits<double>::infinity()};
-        for (const long long tick : candidateTicks) {
-            const double winding = 0.5 * static_cast<double>(tick);
-            const Score score = scoreAt(group, winding);
-            if (betterScore(score, winding, best, bestWinding)) {
-                bestWinding = winding;
-                best = score;
-            }
-        }
-        summary.preferredWinding = bestWinding;
-        summary.preferredHardViolations = best.hardViolations;
-        summary.preferredLoss = best.loss;
-        return summary;
+        return summarizeReferenceObservations(
+            scored,
+            group.empty()
+                ? std::nullopt
+                : std::optional<double>{group.front().truth});
     };
 
     std::vector<FiberTraceReferenceSourceConstraintGroups> result(sourceCount);

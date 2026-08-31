@@ -5601,14 +5601,25 @@
   calibration and all benchmark totals. An unsigned perpendicular observation
   from an otherwise active endpoint remains a non-candidate and is likewise
   excluded.
-- Reference source `i` retains virtual winding `0.5*i`. Calibration is
-  independent for every effective-winding gauge ID. For each gauge, brute-force
-  the finite closed-interval event offsets induced by every candidate's
-  `inferred-virtual +/- 0.5`, also considering zero. Select the offset with the
-  greatest number of inclusive-tolerance matches; ties prefer smaller absolute
-  offset and then smaller signed offset. Gauges with no active candidates are
-  absent.
-  Print balance mode, solver/status, per-gauge offset/right/total rows, then one
+- Reference source `i` retains virtual winding `0.5*i`. Before calibration,
+  infer one raw half-integer winding per `(reference source, effective-winding
+  gauge)` using the same dominant-factor scorer as the final `all` row, with an
+  identity gauge mapping. Raw inference uses admitted evidence but must not read
+  the virtual reference winding, reporting tolerance, or calibration state.
+  Every raw estimate is one calibration vote regardless of constraint degree.
+  Fit one global sign and one half-integer offset per gauge from candidate
+  offsets `raw - sign*virtual`. For each sign and gauge, maximize literal exact
+  estimate matches, then minimize summed absolute estimate residual; remaining
+  offset ties prefer smaller absolute offset and then smaller signed offset.
+  Across signs maximize total exact matches, then minimize total residual, then
+  prefer sign `+1`. Gauge-offset magnitude must not choose global sign. Gauges
+  with no admitted raw estimate are absent. The later inclusive `0.5` tolerance
+  applies only to constraint accuracy and estimated-winding support; it cannot
+  affect calibration. Candidate-bearing observations from calibrated gauges
+  remain in those final accuracy totals even when their coefficient was
+  suppressed, preserving the broader diagnostic population.
+  Print balance mode, solver/status, per-gauge
+  offset/exact-match/estimate-vote rows, then one
   row-oriented `reference constraint groups finite weighted L1` diagnostic per
   original reference source and evidence group. Groups are selected from the
   same dominant-hypothesis projection as the reference accuracy benchmark:
@@ -5630,7 +5641,7 @@
   to combine evidence from multiple gauges without another calibration.
   Preferred winding first minimizes violated hard perpendicular signed-order
   constraints and then minimizes admitted weighted L1 on the half-integer lattice;
-  exact ties prefer smaller absolute winding and then lower signed winding.
+  exact ties prefer lower signed winding.
   Empty and zero-admitted-coefficient groups print `NA` loss/inference values.
   Print hard-violation counts at truth and at the preferred winding. Add an
   `all` row containing every categorized constraint for that reference, and

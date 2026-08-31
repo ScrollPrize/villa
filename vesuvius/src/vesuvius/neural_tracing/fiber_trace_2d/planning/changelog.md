@@ -1673,3 +1673,11 @@
   preparation, normal-sign message passing, and finalization.
 - Added serialized binary-BP iteration callbacks with residuals, safe OpenMP
   exception propagation, and CLI phase-local/message-limit ETAs.
+
+## 2026-08-31 - Estimate-first reference winding calibration
+
+- Replaced tolerance-based per-constraint gauge calibration with one exact
+  half-step vote per raw `(reference, gauge)` winding estimate.
+- Reused the dominant-factor scorer before and after calibration, separated
+  global sign selection from arbitrary gauge-origin magnitude, and kept the
+  `0.5` tolerance reporting-only.

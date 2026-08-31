@@ -2859,13 +2859,15 @@ std::string formatReferenceBpWindingBenchmark(
            << " tolerance=" << std::fixed << std::setprecision(3) << benchmark.tolerance << '\n'
            << "global sign=" << benchmark.globalSign << '\n'
            << "gauge calibration\n"
-           << std::left << std::setw(12) << "gauge" << std::setw(14) << "offset" << std::setw(12) << "right"
-           << "total\n";
+           << std::left << std::setw(12) << "gauge"
+           << std::setw(14) << "offset"
+           << std::setw(16) << "exact_matches"
+           << "estimate_votes\n";
     for (const auto& gauge : benchmark.gauges) {
         output << std::setw(12) << gauge.integerGauge
                << std::setw(14) << gauge.offset
-               << std::setw(12) << gauge.right
-               << gauge.observations << '\n';
+               << std::setw(16) << gauge.exactMatches
+               << gauge.estimateVotes << '\n';
     }
     const auto groupDiagnostics = vc::fiber_tracer::
         summarizeFiberTraceReferenceConstraintGroups(

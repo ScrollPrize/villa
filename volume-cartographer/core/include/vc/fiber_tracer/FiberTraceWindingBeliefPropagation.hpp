@@ -388,8 +388,16 @@ struct FiberTraceReferenceBenchmarkCounts {
 struct FiberTraceReferenceGaugeCalibration {
     std::size_t integerGauge = 0;
     double offset = 0.0;
+    std::size_t estimateVotes = 0;
+    std::size_t exactMatches = 0;
+};
+
+struct FiberTraceReferenceRawWindingEstimate {
+    std::size_t referenceSource = 0;
+    std::size_t integerGauge = 0;
+    double winding = 0.0;
     std::size_t observations = 0;
-    std::size_t right = 0;
+    double admittedCoefficient = 0.0;
 };
 
 struct FiberTraceReferenceSourceBenchmark {
@@ -434,6 +442,10 @@ struct FiberTraceReferenceSourceConstraintGroups {
 
 [[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
     std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);
+
+[[nodiscard]] std::vector<FiberTraceReferenceRawWindingEstimate>
+inferFiberTraceReferenceRawWindings(
+    std::span<const FiberTraceReferenceWindingObservation> observations);
 
 [[nodiscard]] std::vector<FiberTraceReferenceSourceConstraintGroups>
 summarizeFiberTraceReferenceConstraintGroups(

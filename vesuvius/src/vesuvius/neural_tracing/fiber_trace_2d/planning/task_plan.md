@@ -1,65 +1,57 @@
-# Plan: weighted reference winding diagnostics
+# Plan: estimate-first reference winding calibration
 
 ## Implementation
 
-- Extend the shared reference observation with its canonical absolute winding
-  distance, raw finite-L1 coefficient, cutoff-admitted coefficient, and
-  coordinate residual scale. Compute these in the existing observation
-  constructor using the dominant hypothesis score and the same power-of-two
-  distance multiplier as joint winding BP. Pass the active parallel-distance
-  cutoff explicitly; retain raw evidence even when the cutoff excludes it.
-- Add a shared core summarizer that groups active reference observations by
-  source and by `perp_0.5`, `perp_1.5+`, `parallel_0`, `parallel_1`, and
-  `parallel_2+`.
-- Make the prepared winding factor mutually exclusive: a measured constraint
-  retains only its dominant parallel or perpendicular hypothesis. Evaluate
-  that admitted term with its score, distance decay, cutoff suppression,
-  measurement scale, and signed ordering. Hard continuity remains parallel.
-- Rank candidate reference windings lexicographically by hard signed-order
-  violations and then finite winding energy. This mirrors BP's impossible-state
-  rule when a zero-violation active state exists; when hard constraints conflict,
-  it provides the requested forced-active fallback instead of selecting Defect.
-- Map every inferred candidate from its integer gauge into the globally
-  calibrated reference coordinate as
-  `globalSign * (candidate - gaugeOffset)`. This supports one reference source
-  observed in multiple gauges. Evaluate truth at the source's virtual winding.
-- Infer each group's preferred winding over the half-integer lattice near all
-  finite inferred candidates. Minimize admitted weighted L1, then prefer smaller
-  absolute winding and lower signed winding without consulting truth. A group
-  with no positive raw coefficient reports `NA`.
-- For each group, report observation count, raw coefficient sum, coefficient
-  admitted by the current cutoff, hard violations and admitted total and
-  coefficient-normalized energy at truth, preferred winding, and its hard
-  violations plus total and normalized energy. Add an `all` row and use its
-  preferred winding as `est_w`, eliminating the previous support-count/squared
-  residual estimator.
-- Insert a compact row-oriented table immediately before the existing
-  per-reference right/wrong table. The table, `est_w`, and prepared BP factors
-  must all use the same dominant-hypothesis semantics.
+- Group active admitted reference observations by integer gauge and infer one
+  raw winding per `(reference source, gauge)` with the existing dominant-factor
+  scorer, hard violations first and finite energy second, in an identity frame.
+- Fit global sign `+1/-1` and one half-integer offset per gauge from those raw
+  estimates only. Each estimate is one vote. Candidate offsets are the exact
+  half-step differences between a raw estimate and the signed reference label.
+  Maximize exact matches and then minimize total absolute residual. Prefer
+  global sign `+1` on a remaining sign tie; choose per-gauge offset ties by
+  smaller absolute offset and then lower offset.
+- Exclude gauges with no raw admitted estimate. Apply the selected mapping to
+  individual observation accuracy, group truth losses, and final calibrated
+  estimates. Retain `+/-0.5` only in the final per-constraint right/wrong count.
+- Keep the post-calibration `all` scorer as the displayed estimate so references
+  spanning multiple calibrated gauges combine all admitted evidence.
+- Extract one calibration-independent dominant-factor scorer and use it for
+  both raw and calibrated inference. Raw inference must not read reference
+  truth, reporting tolerance, or any calibration state.
+- Preserve the diagnostic population after calibration: calibration itself
+  uses admitted observations only, while right/wrong tables continue to report
+  all candidate-bearing observations from calibrated gauges. Rename gauge
+  columns to make their estimate-vote/exact-match meaning explicit.
 
 ## Tests
 
-- Extend focused winding-BP tests for all five effective-canonical bucket
-  boundaries (including both signs and raw values on quantization boundaries),
-  exact score/distance and cutoff-admitted coefficients, non-unit perpendicular
-  measurement scale, weighted disagreement at truth, bucket-only inference,
-  deterministic flat-optimum ties, contradictory hard signs, same-source multi-gauge conversion with a
-  reversed global sign, empty/zero-weight groups, and invalid inputs.
-- Validate the rendered table through the established CLI smoke workload,
-  including bucket order, placement, precision, and `NA` output.
-- Build the production CLI and focused winding-BP test, run the test, and run
+- Replace observation-level calibration expectations with estimate-level
+  fixtures showing that high-degree references receive one calibration vote,
+  half-step offsets resolve the H/V ambiguity exactly, the tolerance cannot
+  influence calibration, reversed sign remains supported, and uncalibrated
+  gauges are excluded.
+- Verify group `all.infer_w` still equals `est_w`, build the production CLI,
+  run focused winding tests, run the established 1024-crop smoke, and run
   `git diff --check`.
+- Cover multiple gauges with different nonzero offsets, a separate source that
+  resolves global sign, a source spanning gauges whose final combined estimate
+  differs from an individual raw vote, and zero-admitted gauges.
+- Verify raw estimates are unchanged when only reference truth or reporting
+  tolerance changes, and verify a half-step miss is excluded from exact
+  calibration matching but can still count as right in the reporting table.
 
-## Spec update
+## Spec Update
 
-- Specify the new pre-benchmark weighted disagreement table, bucket boundaries,
-  effective coefficient, loss, calibration, and empty-value semantics.
+- Specify raw per-reference/gauge inference, exact half-step calibration votes,
+  tie-breaking, uncalibrated-gauge exclusion, and reporting-only tolerance.
 
-## Docs updates
+## Docs Updates
 
-- Document how to interpret the weighted group diagnostic and why it may
-  disagree with the existing unweighted right/wrong counts.
+- Replace the observation-interval calibration description and explain the new
+  estimate-first order and equal weighting per reference/gauge.
 
 ## Changelog
 
-- Record the weighted per-reference constraint-group winding diagnostic.
+- Record the estimate-first winding calibration and removal of tolerance from
+  calibration.
