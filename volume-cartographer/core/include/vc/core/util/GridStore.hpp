@@ -41,6 +41,10 @@ public:
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const;
     cv::Size size() const;
     size_t get_memory_usage() const;
+    // Bytes this store is responsible for keeping resident: the size of the
+    // .grid file it maps plus whatever it has decoded into its own caches.
+    // Used by the byte-budgeted cache in NormalGridVolume.
+    size_t residentBytes() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
     CacheStats cacheStats() const;
