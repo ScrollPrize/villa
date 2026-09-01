@@ -330,6 +330,123 @@ TEST_CASE("line annotation generated runtime surfaces register and clean up")
     }
 }
 
+TEST_CASE("focus bounds state distinguishes configured and active bounds")
+{
+    CState state;
+    int changes = 0;
+    QObject::connect(&state, &CState::focusBoundsChanged, [&changes]() {
+        ++changes;
+    });
+
+    const Rect3D reversed{{20.0f, 30.0f, 40.0f}, {10.0f, 15.0f, 25.0f}};
+    state.setFocusBounds(reversed);
+    REQUIRE(state.focusBounds());
+    CHECK(state.focusBounds()->low == cv::Vec3f(10.0f, 15.0f, 25.0f));
+    CHECK(state.focusBounds()->high == cv::Vec3f(20.0f, 30.0f, 40.0f));
+    CHECK_FALSE(state.activeFocusBounds());
+    CHECK(changes == 1);
+
+    state.setFocusBounds(reversed);
+    CHECK(changes == 1);
+    state.setFocusBoundsEnabled(true);
+    REQUIRE(state.activeFocusBounds());
+    CHECK(changes == 2);
+    const uint64_t activeRevision = state.focusBoundsRevision();
+    state.setFocusBoundsEnabled(true);
+    CHECK(state.focusBoundsRevision() == activeRevision);
+    CHECK(changes == 2);
+
+    state.clearFocusBounds();
+    CHECK_FALSE(state.focusBounds());
+    CHECK_FALSE(state.activeFocusBounds());
+    CHECK_FALSE(state.focusBoundsEnabled());
+    CHECK(changes == 3);
+    state.clearFocusBounds();
+    CHECK(changes == 3);
+}
+
+TEST_CASE("focus bounds trim only open line tails and rebase indices")
+{
+    vc::lasagna::LineModel line;
+    for (int x = -20; x <= 40; x += 10) {
+        vc::lasagna::LinePoint point;
+        point.position = cv::Vec3d{x == 10 ? 10.0 : static_cast<double>(x),
+                                   x == 10 ? 100.0 : 0.0,
+                                   0.0};
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = 4;
+    line.segmentSamples.resize(line.points.size() - 1);
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {4.0, {20.0, 0.0, 0.0}, false, 4},
+    };
+    const Rect3D bounds{{-5.0f, -5.0f, -5.0f}, {25.0f, 5.0f, 5.0f}};
+
+    CHECK(vc3d::line_annotation::constrainLineOpenTailsToBounds(
+        line, controls, bounds));
+    REQUIRE(line.points.size() == 5);
+    CHECK(line.points.front().position == cv::Vec3d(-10.0, 0.0, 0.0));
+    CHECK(line.points[2].position == cv::Vec3d(10.0, 100.0, 0.0));
+    CHECK(line.points.back().position == cv::Vec3d(30.0, 0.0, 0.0));
+    CHECK(line.segmentSamples.size() == 4);
+    CHECK(line.displayFrameAnchorIndex == 3);
+    CHECK(controls[0].optimizedIndex == 1);
+    CHECK(controls[0].linePosition == doctest::Approx(1.0));
+    CHECK(controls[1].optimizedIndex == 3);
+    CHECK(controls[1].linePosition == doctest::Approx(3.0));
+}
+
+TEST_CASE("focus bounds keep a two-point line for one outside control")
+{
+    vc::lasagna::LineModel line;
+    for (int x : {0, 10, 20}) {
+        vc::lasagna::LinePoint point;
+        point.position = cv::Vec3d{static_cast<double>(x), 0.0, 0.0};
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = 1;
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {1.0, {10.0, 0.0, 0.0}, true, 1},
+    };
+    const Rect3D bounds{{100.0f, -1.0f, -1.0f}, {200.0f, 1.0f, 1.0f}};
+
+    CHECK(vc3d::line_annotation::constrainLineOpenTailsToBounds(
+        line, controls, bounds));
+    REQUIRE(line.points.size() == 2);
+    CHECK(line.points[0].position == cv::Vec3d(0.0, 0.0, 0.0));
+    CHECK(line.points[1].position == cv::Vec3d(10.0, 0.0, 0.0));
+    CHECK(controls[0].optimizedIndex == 1);
+    CHECK(controls[0].linePosition == doctest::Approx(1.0));
+    CHECK(line.displayFrameAnchorIndex == 1);
+}
+
+TEST_CASE("focus bounds keep paths from one outside control into the box")
+{
+    vc::lasagna::LineModel line;
+    for (int x : {240, 210, 170, 140, 110, 80, 50, 20,
+                  50, 80, 110, 140, 170, 210, 240}) {
+        vc::lasagna::LinePoint point;
+        point.position = cv::Vec3d{static_cast<double>(x), 0.0, 0.0};
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = 7;
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {7.0, {20.0, 0.0, 0.0}, true, 7},
+    };
+    const Rect3D bounds{{100.0f, -1.0f, -1.0f}, {200.0f, 1.0f, 1.0f}};
+
+    CHECK(vc3d::line_annotation::constrainLineOpenTailsToBounds(
+        line, controls, bounds));
+    REQUIRE(line.points.size() == 13);
+    CHECK(line.points.front().position == cv::Vec3d(210.0, 0.0, 0.0));
+    CHECK(line.points[6].position == cv::Vec3d(20.0, 0.0, 0.0));
+    CHECK(line.points.back().position == cv::Vec3d(210.0, 0.0, 0.0));
+    CHECK(controls[0].optimizedIndex == 6);
+    CHECK(controls[0].linePosition == doctest::Approx(6.0));
+    CHECK(line.displayFrameAnchorIndex == 6);
+}
+
 TEST_CASE("line annotation shift scroll uses viewer slice step size")
 {
     CHECK(vc3d::line_annotation::shiftScrollLineStepSize(0) == 1);
