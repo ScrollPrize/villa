@@ -265,3 +265,19 @@ volume-cartographer = { path = "../volume-cartographer", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }
+# PyPI serves a CPU-only torch wheel on Windows, so `uv sync --extra models`
+# there ends with torch.cuda.is_available() False and the tutorial's own check
+# printing "cuda: False". Route torch to a CUDA index on Windows, the way
+# spiral-fitting/pyproject.toml already does for its own torch.
+#
+# Not cu128, which spiral-fitting uses: that index stops at torch 2.11 for
+# cp314/win_amd64, and this package requires >=2.12. cu126 and cu130 both
+# carry 2.12; cu130 matches the CUDA 13 line.
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
