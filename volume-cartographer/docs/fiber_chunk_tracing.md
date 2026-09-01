@@ -939,10 +939,11 @@ filtered winding component.
 
 Fixed phase `0.5` and measurement scale `0.822` are the joint-grid CLI
 defaults. The scale comes from the combined continuous reference/reference
-constraint fit; the perpendicular model predicts measured winding delta as
-`latent / 0.822`. Pass `--winding-adaptive-calibration` to infer phase and
-scale instead. Adaptive calibration can move latent phase or measurement scale
-even though the observations are quantized.
+constraint fit. The solver first multiplies every raw signed or unsigned
+winding measurement by `0.822`, then performs half-integer or integer
+quantization. Target class, distance decay, parallel cutoff, and sign
+activation are all derived from that scaled canonical target. Pass
+`--winding-adaptive-calibration` to infer phase and scale instead.
 
 For `sum-product-mixed`, `--winding-solver joint-grid` is the default. It runs
 one inference over `(H,k)`, `(V,k)`, one winding-free Defect state, the global calibration grid, and one local
@@ -1032,22 +1033,25 @@ does not retain winding connectivity.
 For latent difference `delta`, a joint-grid measurement contributes:
 
 ```text
-parallel * abs(delta)
-    + perpendicular * abs(gain * delta - signed_target)
+parallel * abs(delta - integer(raw_parallel * measurement_scale))
+    + perpendicular * abs(
+        delta - half_integer(raw_perpendicular * measurement_scale))
 ```
 
 The five canonical winding terms can be scaled independently with
 `--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
-(`2+`). Standard runs default to `0,2,2,2,1`; pass `1,1,1,1,1` explicitly for
+(`2+`). Standard runs default to `0,4,2,2,1`; pass `1,1,1,1,1` explicitly for
 neutral class weighting. Each value must be finite and nonnegative. A zero
 value removes that class's finite winding magnitude loss. If its dominant
 signed observation also has an enabled hard-sign rule, the sign remains an
 active winding constraint; otherwise the observation remains orientation-only
 and does not join winding components or contribute winding Defect incidence.
-The class multiplier is applied after the existing `2^-floor(abs(target))`
-distance decay and only to finite winding energy. It does not scale H/V
+Measurement scale is applied before canonical target quantization. The
+canonical target then selects the class and parallel cutoff, followed by the
+existing `2^-floor(abs(target))` distance decay and the class multiplier. These
+weights apply only to finite winding energy. They do not scale H/V
 orientation evidence, hard perpendicular order, hard continuity, the Defect
 unary, or piece-break cost.
 When a signed parallel target is available, its quantized magnitude selects
@@ -1117,13 +1121,16 @@ An active factor is infringed once when any required H/V relation, enabled sign,
 or canonical winding bin is wrong. Neutralized factors are shown explicitly and
 are not silently counted as correct or included in the percentage denominator.
 
-The hard-continuation 1024-crop sweep selected linear normal confidence,
-cosine decision confidence, and class weights `0,2,2,2,1`. With both hard sign
-classes at the 30-degree gate, finite sign cost 44, Defect cost 100, and
-temperature 1.25, it retained 8/8 exact reference windings and matched
-1,369/2,100 evaluated reference constraints. These measured settings are the
-standard defaults. Explicit confidence, weight, sign, Defect, and temperature
-options reproduce prior modes.
+The initial hard-continuation 1024-crop sweep selected linear normal confidence,
+cosine decision confidence, and class weights `0,2,2,2,1` under the former
+post-quantization measurement-scale semantics. After correcting scale to act
+before canonical quantization, zero-aware local refinement selected
+`0,4,2,2,1`: with both hard-sign classes at the 30-degree gate, finite sign
+cost 44, Defect cost 100, and temperature 1.25, it retained 6/8 exact reference
+windings and matched 1,491/2,128 evaluated reference constraints (70.066%).
+These corrected measured settings are the standard defaults. Explicit
+confidence, weight, sign, Defect, and temperature options reproduce prior
+modes.
 
 With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
 tests the Cartesian product of the listed values in all five tuple positions.
@@ -1138,24 +1145,30 @@ abstaining. Failed scenarios are reported and skipped. The selected report and
 tuple drive the ordinary CSV, OBJ, and reference diagnostics.
 
 For iterative tuning, pass one starting tuple with `--winding-weights` and add
-`--winding-weight-search-local`. Each iteration evaluates the ten tuples made
-by multiplying exactly one coordinate by `0.5` or `2`, then moves to the best
-strict benchmark improvement. Exact power-of-two exponent tuples cache both
-successful and failed scenarios, so a previously visited neighbor is not
-solved again. Tied benchmark metrics do not cause a move; tuple ordering and
-message residual only make reporting deterministic. The search stops when no
-single-coordinate neighbor improves the benchmark. Exponents are bounded to
-`[-16,16]` relative to the supplied tuple; reaching the iteration guard before
-an optimum is an error rather than a successful termination. The selected
-tuple is solved once more to produce the ordinary output artifacts.
+`--winding-weight-search-local`. Each iteration visits dimensions `0..4` and
+evaluates zero, `0.5x`, and `2x` for exactly one coordinate, then moves to the
+best strict benchmark improvement. A zero coordinate is reversible: its next
+neighborhood contains `base/2`, `base`, and `base*2`, where base is the
+immutable positive starting value (or one for an initially zero coordinate).
+Canonical tagged zero/exponent tuples cache both successful and failed
+scenarios, so a previously visited neighbor is not solved again. Tied benchmark
+metrics do not cause a move; tuple ordering and message residual only make
+reporting deterministic. The search stops when no single-coordinate neighbor
+improves the benchmark. Positive exponents are bounded to `[-16,16]`; reaching
+the iteration guard before an optimum is an error rather than a successful
+termination. The selected tuple is solved once more to produce the ordinary
+output artifacts.
 
-where `gain=1/measurement_scale`. In alternating mode the equivalent stored
-parameterization is:
+On the fixed 1024 reference crop with scale-first targets, the zero-aware
+search moved `1,2,2,2,1 -> 0,2,2,2,1 -> 0,4,2,2,1`. The final tuple retained
+6/8 exact reference windings and improved reference constraint agreement from
+1239/2117 (58.526%) at the start to 1491/2128 (70.066%). A complete subsequent
+zero/half/double neighborhood produced no strict improvement.
 
-```text
-parallel * abs(delta)
-    + perpendicular * abs(delta / measurement_scale - signed_target)
-```
+The adaptive grid stores `gain=1/measurement_scale`, but gain selects the
+scale-specific canonical target before factor evaluation; it no longer scales
+the predicted latent delta after target quantization. Alternating mode uses the
+same scale-first target construction.
 
 An admitted enabled nonzero dominant sign promoted by the alignment gate, or by
 global hard-sign mode, requires:
@@ -1189,14 +1202,12 @@ invariants. The CLI treats
 `winding_valid=0` as authoritative for H/V/Mixed OBJ output and reports the
 number of `hard_sign_projected_defects` in the winding calibration table.
 
-The perpendicular residual stays in the raw Lasagna-integral units. This is
-important: multiplying the observed target by scale would also scale its noise
-and spuriously favor the minimum scale. Alternating calibration fits inverse
-scale `g=1/scale` and `h=g*phase` from oriented pair beliefs, solves the exact
-bounded `(g,h)` wedge, and accepts updates only when expected L1 energy does
-not increase. Rank-deficient evidence retains the previous parameters.
-Deterministic phase/scale starts are ranked by the complete decoded assignment
-score.
+Finite residuals are evaluated in latent winding coordinates after scaling and
+canonicalizing the observed Lasagna integral. Alternating calibration may use
+its continuous inverse-scale proposal, but proposal acceptance and decoded
+ranking use the scale-first canonical factor energy. Rank-deficient evidence
+retains the previous parameters. Deterministic phase/scale starts are ranked by
+the complete decoded assignment score.
 
 Joint-grid progress reports one coherent warm-started lifecycle: message
 iteration/residual, calibration-posterior residual, candidate-state count,
@@ -1353,13 +1364,12 @@ snapping. The `canonical` rows describe the exact targets consumed by current
 inference; because snapping can place more than half the weighted observations
 at an exact target/GT ratio of one, their L1 optimum can be exactly one without
 implying a statistically exact physical calibration.
-Canonical `perpendicular_all` is directly compatible with the current
-measurement-scale parameter. The report also includes `parallel_all` and
+Canonical `perpendicular_all` and `parallel_all` are both compatible with the
+current measurement-scale parameter. The report also includes
 `all_constraints` aggregates plus the five class rows for perpendicular `0.5`,
 perpendicular `1.5+`, parallel `0`, parallel `1`, and parallel `2+`. All
-parallel-containing aggregates and class rows are explicitly counterfactual:
-current winding inference does not apply measurement scale to its integer
-parallel residual. With the displayed
+groups describe the scale-one source population; the actual solver
+reclassifies each observation after applying its selected scale. With the displayed
 objective, fitted scale below one means the selected raw or canonical targets
 are larger than the known latent reference separation; scale above one means they are smaller.
 The scale table is diagnostic only and does not alter inference or artifacts.
@@ -1377,8 +1387,8 @@ inside one fitted phase.
 `reference constraint phase calibration` then fits all signed dominant
 perpendicular opposite-parity rows with unit weight. It enumerates increasing
 and decreasing winding direction and both even-reference H/V assignments, and
-minimizes `sum(abs(predicted/scale-raw_signed))` over phase `[0,0.5]` at the
-run's fixed positive measurement scale. Production class, confidence, and sign
+minimizes the equivalent continuous physical residual over phase `[0,0.5]` at
+the run's fixed positive measurement scale. Production class, confidence, and sign
 weights do not enter this physical reference diagnostic. The fit is diagnostic
 only and does not alter solver phase or output artifacts.
 
@@ -1413,9 +1423,10 @@ filtering. Equal sizes prefer the crop-central piece and then the lowest piece
 index.
 
 The benchmark uses each BP piece's authoritative post-projection MAP latent
-coordinate. Perpendicular constraints infer the reference coordinate from the
-signed canonical half-step and solved measurement scale. Parallel constraints
-use the scale-independent canonical integer distance and test both signs;
+coordinate. Both perpendicular and parallel measurements are multiplied by
+the solved measurement scale before half-integer or integer quantization.
+Perpendicular constraints use the resulting signed half-step. Parallel
+constraints use the resulting signed or unsigned integer distance;
 distance zero and nonzero are reported separately. Constraints ending at a
 final Defect/Mixed or otherwise winding-invalid BP piece are excluded from both
 offset calibration and right/wrong totals. Unsigned perpendicular observations
@@ -1471,8 +1482,8 @@ the admitted dominant-hypothesis BP winding energy; exact ties prefer the lower
 signed half-integer winding. `true_L1`/`true_avg` give total
 and admitted-coefficient-mean energy at the globally calibrated true winding;
 `infer_w` and `infer_L1`/`infer_avg` give the half-integer winding and energy
-preferred by that group alone. Perpendicular coordinate residuals are divided
-by the solved measurement scale. Gauge-local candidates are transformed by the global sign
+preferred by that group alone. Coordinate residuals are evaluated directly
+against the scaled canonical targets in latent winding units. Gauge-local candidates are transformed by the global sign
 and their gauge offset before aggregation, including when one reference source
 reaches multiple gauges. `NA` denotes a group with no positive raw coefficient.
 

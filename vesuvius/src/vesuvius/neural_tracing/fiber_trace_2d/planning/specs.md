@@ -5488,15 +5488,20 @@
   normalized A/Mixed/B posterior is the alternating winding stage's soft node
   prior. The
   winding stage must not repeat the same/different factor or the Mixed unary.
-- For latent coordinate difference `delta`, a parallel-dominant measurement
-  contributes `p*abs(delta-target)`; a perpendicular-dominant measurement with
-  signed target `d` contributes `q*abs(delta/scale-d)`. `p` and `q` are its
+- For positive measurement scale `s`, raw perpendicular and parallel winding
+  observations are first transformed by `s`. Perpendicular targets are then
+  signed-half-integer quantized and parallel targets are coherently signed- or
+  unsigned-integer quantized. Canonical class, power-of-two distance decay,
+  parallel cutoff, and sign activation are derived only after that transform.
+  For latent coordinate difference `delta`, a parallel-dominant measurement
+  contributes `p*abs(delta-integer(raw_parallel*s))`; a
+  perpendicular-dominant measurement contributes
+  `q*abs(delta-half_integer(raw_perpendicular*s))`. `p` and `q` are its
   parallel and perpendicular scores, but the losing hypothesis contributes
   zero winding energy. The H/V relation potential continues to use the two
   scores as alternative same/different assignment costs, preserving confidence
   through their difference rather than treating both as winding evidence.
-  The residual is expressed in the observed Lasagna-integral units, so fitting
-  scale cannot reduce residual noise merely by shrinking scale. Repeated
+  The residual is expressed in latent winding units. Repeated
   endpoint pairs sum complete measurement energies. A component may consume
   signed evidence from only one aligned-normal component.
 - Mixed remains a piece-local error state with one unary cost and no integer
@@ -5515,7 +5520,8 @@
   `g=1/scale` and `h=g*phase`. The bounded fit uses the exact wedge induced by
   phase `[0,0.5]` and scale `[0.5,2]`; a rank-deficient normal matrix retains the
   previous unidentifiable values. Backtracking accepts the proposal only when
-  the authoritative fixed-belief expected L1 winding energy does not increase.
+  the authoritative scale-first, re-quantized fixed-belief expected L1 winding
+  energy does not increase.
   Both component-sign selection and phase/scale backtracking reject candidates
   that reverse any contributing nonzero signed perpendicular observation.
   Mixed pair mass does not calibrate phase or scale.
@@ -5706,10 +5712,11 @@
   measurements are not deduplicated by source fiber.
 - Cross constraints are evaluated only after BP and never enter its graph.
   Exact parallel/perpendicular score ties are perpendicular. For signed
-  perpendicular target `d`, measurement scale `s`, and BP MAP latent `z`, a
-  reference at endpoint A of `A -> B` is inferred as `z-s*d`; at endpoint B it
-  is `z+s*d`. The target uses the canonical signed half-integer rule. A
-  parallel constraint with canonical nonnegative integer distance `n` infers
+  perpendicular raw target `d`, measurement scale `s`, and BP MAP latent `z`,
+  first compute the signed half-integer target `q=half_integer(s*d)`. A
+  reference at endpoint A of `A -> B` is inferred as `z-q`; at endpoint B it
+  is `z+q`. A parallel constraint similarly scales before integer
+  canonicalization; a canonical nonnegative integer distance `n` infers
   both `z-n` and `z+n`; `n=0` is `parallel_same`, otherwise it is
   `parallel_other`. A Defect/invalid BP endpoint or unsigned perpendicular
   observation has no inferred candidate. Constraints whose BP endpoint is
@@ -5749,9 +5756,9 @@
   half-integer winding preferred by that group alone, and its total and
   normalized loss. Each categorized constraint contributes exactly its
   dominant BP winding term: the winning hypothesis score times its
-  `2^-floor(abs(canonical_step))` distance multiplier. Perpendicular
-  loss divides latent-coordinate error by the solved measurement scale;
-  parallel loss uses latent-coordinate error directly. Parallel cutoff
+  `2^-floor(abs(canonical_step))` distance multiplier. Perpendicular and
+  parallel loss both use latent-coordinate error directly against their
+  scale-first canonical target. Parallel cutoff
   suppression matches factor preparation. Inferred candidates are mapped from each independent gauge
   with `globalSign * (candidate - gaugeOffset)`, allowing one reference source
   to combine evidence from multiple gauges without another calibration.
@@ -5916,7 +5923,7 @@
   winding factor temperature remains `0.25`. These defaults, both sign classes,
   finite sign cost `44`, decision `cosine`, and normal confidence `linear` are
   the selected fixed-1024-crop benchmark row.
-- Shared and CLI H/V-aware winding defaults are `0,2,2,2,1`. An explicit
+- Shared and CLI H/V-aware winding defaults are `0,4,2,2,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not
   quantize the H/V ladder targets used for canonical class selection.
@@ -5931,10 +5938,16 @@
   denominator, fewer missing and incorrect estimates, more right and evaluated
   constraints, fewer wrong constraints, residual, and lexicographic tuple.
 - `--winding-weight-search-local` requires an explicit `--winding-weights`
-  start and is mutually exclusive with exhaustive search. It evaluates every
-  one-coordinate `/2` and `*2` neighbor, caches exact power-of-two exponent
-  tuples and failures, moves only on a strict benchmark-quality improvement,
-  and repeats to a local optimum. Residual and lexicographic tuple ordering may
+  start and is mutually exclusive with exhaustive search. Each coordinate has
+  a canonical tagged state: zero or an integer power-of-two exponent relative
+  to its immutable positive starting base; an initially zero coordinate uses
+  base one. In dimension order `0..4`, a positive coordinate proposes zero,
+  `/2`, and `*2`, while zero proposes `base/2`, `base`, and `base*2`. The search
+  deduplicates these at most 15 tuples, caches successes and failures by exact
+  tagged tuple, moves only on a strict benchmark-quality improvement, and
+  repeats to a local optimum. Residual and lexicographic tuple ordering may
   select deterministically among improving neighbors but cannot turn a quality
-  tie into a move. Exponents remain in `[-16,16]` relative to the supplied
-  start, and an iteration-limit exit is an error rather than a local optimum.
+  tie into a move. Positive exponents remain in `[-16,16]`; out-of-range
+  candidates are omitted, zero remains available at either bound, and the
+  printed progress denominator is the deduplicated in-range candidate count.
+  An iteration-limit exit is an error rather than a local optimum.

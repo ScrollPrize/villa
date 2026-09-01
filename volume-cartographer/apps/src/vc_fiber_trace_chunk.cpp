@@ -270,7 +270,7 @@ void usage(const char* executable)
               << "  --winding-hard-sign-angle DEG|off\n"
               << "                              promote signs within DEG of normal to hard [30]\n"
               << "  --winding-weights P05,PFAR,P0,P1,P2\n"
-              << "                              five nonnegative factor multipliers [0,2,2,2,1]\n"
+              << "                              five nonnegative factor multipliers [0,4,2,2,1]\n"
               << "  --winding-weight-search V0,V1,...\n"
               << "                              exhaustive five-class reference grid\n"
               << "  --winding-weight-search-local\n"
@@ -3033,7 +3033,12 @@ std::string formatReferenceFiberConstraints(
     }
     const auto factorDiagnostics = vc::fiber_tracer::
         diagnoseFiberTraceWindingFactors(
-            report, *reference.windingTopology, config);
+            report,
+            *reference.windingTopology,
+            config,
+            {},
+            true,
+            measurementScale);
     const auto scaleCalibration = vc::fiber_tracer::
         calibrateFiberTraceReferenceConstraintScales(
             diagnostics, factorDiagnostics);
@@ -4664,7 +4669,12 @@ int main(int argc, char** argv)
                                         fixedOrientations,
                                         options.bpInference == vc::fiber_tracer::
                                             FiberTraceBeliefInference::SumProductMixed,
-                                        bpTopology.centralSeedPiece);
+                                        bpTopology.centralSeedPiece,
+                                        jointGrid
+                                            ? options.jointGrid
+                                                  .fixedMeasurementScale
+                                                  .value_or(1.0)
+                                            : 1.0);
                                 if (component.components <= 1)
                                     break;
                                 const auto subset = vc::fiber_tracer::
@@ -4937,34 +4947,49 @@ int main(int argc, char** argv)
                                     }
                                 } else {
                                     constexpr int exponentLimit = 16;
+                                    constexpr int zeroCoordinate =
+                                        exponentLimit + 1;
                                     constexpr std::size_t maximumIterations =
                                         160;
-                                    using Exponents = std::array<int, 5>;
-                                    std::map<Exponents,
+                                    using WeightTuple = std::array<double, 5>;
+                                    using SearchState = std::array<int, 5>;
+                                    std::map<SearchState,
                                              std::optional<std::size_t>> cache;
+                                    WeightTuple positiveAnchor{};
+                                    for (std::size_t dimension = 0;
+                                         dimension < positiveAnchor.size();
+                                         ++dimension) {
+                                        positiveAnchor[dimension] =
+                                            options.windingWeights[dimension] > 0.0
+                                            ? options.windingWeights[dimension]
+                                            : 1.0;
+                                    }
                                     const auto weightsFor = [&] (
-                                        const Exponents& exponents) {
-                                        std::array<double, 5> weights{};
+                                        const SearchState& state) {
+                                        WeightTuple weights{};
                                         for (std::size_t dimension = 0;
                                              dimension < weights.size();
                                              ++dimension) {
-                                            weights[dimension] = std::ldexp(
-                                                options.windingWeights[dimension],
-                                                exponents[dimension]);
+                                            weights[dimension] =
+                                                state[dimension] == zeroCoordinate
+                                                ? 0.0
+                                                : std::ldexp(
+                                                      positiveAnchor[dimension],
+                                                      state[dimension]);
                                             if (!std::isfinite(weights[dimension]) ||
-                                                !(weights[dimension] > 0.0)) {
+                                                weights[dimension] < 0.0) {
                                                 throw std::overflow_error(
-                                                    "Local winding weight is outside the finite positive domain");
+                                                    "Local winding weight is outside the finite nonnegative domain");
                                             }
                                         }
                                         return weights;
                                     };
-                                    const auto evaluateExponents = [&] (
-                                        const Exponents& exponents,
+                                    const auto evaluateState = [&] (
+                                        const SearchState& state,
                                         const std::string& phase,
                                         const std::size_t completed,
                                         const std::size_t workTotal) {
-                                        const auto found = cache.find(exponents);
+                                        const auto found = cache.find(state);
                                         if (found != cache.end()) {
                                             std::cout
                                                 << "winding weight search phase="
@@ -4972,21 +4997,32 @@ int main(int argc, char** argv)
                                                 << '/' << workTotal
                                                 << " weights="
                                                 << formatWindingWeights(
-                                                       weightsFor(exponents))
+                                                       weightsFor(state))
                                                 << " status=cached\n"
                                                 << std::flush;
                                             return found->second;
                                         }
+                                        const WeightTuple weights =
+                                            weightsFor(state);
                                         const auto result = evaluate(
-                                            weightsFor(exponents), phase,
+                                            weights, phase,
                                             completed, workTotal);
-                                        cache.emplace(exponents, result);
+                                        cache.emplace(state, result);
                                         return result;
                                     };
 
-                                    Exponents currentExponents{};
-                                    const auto initial = evaluateExponents(
-                                        currentExponents, "local_start", 1, 1);
+                                    SearchState currentState{};
+                                    for (std::size_t dimension = 0;
+                                         dimension < currentState.size();
+                                         ++dimension) {
+                                        if (options.windingWeights[dimension] ==
+                                            0.0) {
+                                            currentState[dimension] =
+                                                zeroCoordinate;
+                                        }
+                                    }
+                                    const auto initial = evaluateState(
+                                        currentState, "local_start", 1, 1);
                                     if (!initial) {
                                         throw std::runtime_error(
                                             "Initial local winding weight scenario failed");
@@ -4996,32 +5032,57 @@ int main(int argc, char** argv)
                                     for (std::size_t iteration = 1;
                                          iteration <= maximumIterations;
                                          ++iteration) {
-                                        std::vector<Exponents> neighbors;
-                                        neighbors.reserve(10);
+                                        std::vector<SearchState> neighbors;
+                                        neighbors.reserve(15);
+                                        const auto appendNeighbor = [&] (
+                                            const SearchState& candidate) {
+                                            if (candidate == currentState ||
+                                                std::find(
+                                                    neighbors.begin(),
+                                                    neighbors.end(),
+                                                    candidate) != neighbors.end()) {
+                                                return;
+                                            }
+                                            neighbors.push_back(candidate);
+                                        };
                                         for (std::size_t dimension = 0;
                                              dimension < 5;
                                              ++dimension) {
-                                            for (const int delta : {-1, 1}) {
-                                                Exponents neighbor =
-                                                    currentExponents;
-                                                neighbor[dimension] += delta;
-                                                if (neighbor[dimension] <
-                                                        -exponentLimit ||
-                                                    neighbor[dimension] >
-                                                        exponentLimit) {
-                                                    continue;
+                                            if (currentState[dimension] !=
+                                                zeroCoordinate) {
+                                                SearchState zero = currentState;
+                                                zero[dimension] = zeroCoordinate;
+                                                appendNeighbor(zero);
+                                                for (const int delta : {-1, 1}) {
+                                                    SearchState neighbor =
+                                                        currentState;
+                                                    neighbor[dimension] += delta;
+                                                    if (neighbor[dimension] <
+                                                            -exponentLimit ||
+                                                        neighbor[dimension] >
+                                                            exponentLimit) {
+                                                        continue;
+                                                    }
+                                                    appendNeighbor(neighbor);
                                                 }
-                                                neighbors.push_back(neighbor);
+                                            } else {
+                                                for (const int exponent :
+                                                     {-1, 0, 1}) {
+                                                    SearchState neighbor =
+                                                        currentState;
+                                                    neighbor[dimension] = exponent;
+                                                    appendNeighbor(neighbor);
+                                                }
                                             }
                                         }
 
                                         std::optional<std::size_t> nextRow;
-                                        Exponents nextExponents{};
+                                        SearchState nextState{};
                                         for (std::size_t neighbor = 0;
                                              neighbor < neighbors.size();
                                              ++neighbor) {
                                             const auto candidate =
-                                                evaluateExponents(
+                                                evaluateState(
                                                     neighbors[neighbor],
                                                     "local_" +
                                                         std::to_string(iteration),
@@ -5040,7 +5101,7 @@ int main(int argc, char** argv)
                                                     rows[*nextRow].score,
                                                     rows[*nextRow].weights)) {
                                                 nextRow = *candidate;
-                                                nextExponents =
+                                                nextState =
                                                     neighbors[neighbor];
                                             }
                                         }
@@ -5057,7 +5118,7 @@ int main(int argc, char** argv)
                                             break;
                                         }
                                         currentRow = *nextRow;
-                                        currentExponents = nextExponents;
+                                        currentState = nextState;
                                         const auto& selectedScore =
                                             rows[currentRow].score;
                                         const std::size_t selectedTotal =

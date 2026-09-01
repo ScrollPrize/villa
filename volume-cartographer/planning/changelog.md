@@ -192,3 +192,15 @@
 - BP-only winding now retains and remaps only its largest exact effective
   winding component. Reference tables print at command end, and the benchmark
   excludes final Defect/Mixed or invalid-winding endpoints.
+
+## 2026-09-01
+
+- Changed winding measurement calibration to scale raw perpendicular and
+  parallel observations before canonical quantization. Canonical class,
+  distance decay, parallel cutoff, sign activation, solver energy, agreement,
+  and reference inference now consume the same scale-first target.
+- Made local winding-weight refinement test reversible zero-valued coordinates
+  alongside `/2` and `*2`, with canonical tagged cache states and deterministic
+  re-entry from an immutable positive base.
+- Promoted the resulting scale-first 1024 local optimum `0,4,2,2,1` to the
+  shared library and CLI winding-class default.

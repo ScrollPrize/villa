@@ -1,3 +1,13 @@
+# 2026-09-01: reversible zero-weight refinement
+
+- Extended local winding-class weight refinement so every coordinate tests
+  zero alongside `/2` and `*2`; zero coordinates can later re-enter their
+  immutable positive starting ladder after other weights change.
+- Canonical tagged zero/exponent states now identify cached successful and
+  failed scenarios deterministically.
+- Promoted the resulting `0,4,2,2,1` scale-first 1024 local optimum to the
+  shared and CLI defaults.
+
 # 2026-09-01: hard split continuity and aligned hard signs
 
 - Made source-fiber split continuity exact and edge-local by default across the

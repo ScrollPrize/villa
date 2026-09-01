@@ -104,7 +104,7 @@ enum class FiberTraceWindingCalibrationMode : unsigned char {
     FiberTraceWindingCalibrationMode mode) noexcept;
 
 inline constexpr std::array<double, 5>
-    kDefaultFiberTraceWindingClassWeights{0.0, 2.0, 2.0, 2.0, 1.0};
+    kDefaultFiberTraceWindingClassWeights{0.0, 4.0, 2.0, 2.0, 1.0};
 
 enum class FiberTraceWindingDecisionConfidence : unsigned char {
     Legacy,
@@ -168,7 +168,8 @@ struct FiberTraceWindingComponentSelection {
     const FiberTraceWindingBeliefPropagationConfig& config,
     std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
     bool quantizeComponentTargets = true,
-    std::optional<std::size_t> preferredPiece = std::nullopt);
+    std::optional<std::size_t> preferredPiece = std::nullopt,
+    double measurementScale = 1.0);
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
     double mixedUnaryCost = 100.0;
@@ -300,7 +301,8 @@ diagnoseFiberTraceWindingFactors(
     const FiberTraceBeliefTopology& topology,
     const FiberTraceWindingBeliefPropagationConfig& config = {},
     std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
-    bool quantizeComponentTargets = true);
+    bool quantizeComponentTargets = true,
+    double measurementScale = 1.0);
 
 enum class FiberTraceConstraintEvidenceClass : unsigned char {
     Continuity,
