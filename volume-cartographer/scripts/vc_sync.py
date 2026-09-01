@@ -48,7 +48,10 @@ SFTP sync (the ash-* commands):
     server. SFTP has no ETags or object versioning, so remote change
     detection uses one batched server-side `rclone md5sum` for
     annotation-sized JSON files (mtime+size for everything else), and merge
-    bases come only from the local .ashsync-base shadow copies.
+    bases come only from the local .ashsync-base shadow copies. The remote
+    shell type is pinned to unix with GNU md5sum/sha1sum (the ash server is
+    a Linux box); on a server without those commands, change detection
+    falls back to size+mtime with a one-time warning.
 
     Credentials live in a JSON file OUTSIDE the sync tree (default
     ~/.vc_ash_sftp.json, override at ash-init time with --creds). Keep it
@@ -2518,6 +2521,19 @@ class SftpSyncManager(S3SyncManager):
         env['RCLONE_SFTP_USER'] = self._creds['user']
         env['RCLONE_SFTP_PORT'] = str(self._creds['port'])
         env['RCLONE_SFTP_PASS'] = self._sftp_pass_obscured
+        # Pin the server shell type and hash commands instead of letting
+        # rclone probe for them. The probe is lazy and per-connection, and
+        # an on-the-fly :sftp: backend has no config section to persist its
+        # result into (rclone's "Can't save config" notices) — so a batched
+        # `rclone md5sum` over N --checkers connections races the probe and
+        # most files come back "hash unsupported" (seen live: 1/70 hashed),
+        # degrading change detection to size+mtime. On a server without
+        # md5sum the pinned command fails cleanly per file and the
+        # server-side-hashing-unavailable fallback in _remote_md5sums
+        # still applies.
+        env['RCLONE_SFTP_SHELL_TYPE'] = 'unix'
+        env['RCLONE_SFTP_MD5SUM_COMMAND'] = 'md5sum'
+        env['RCLONE_SFTP_SHA1SUM_COMMAND'] = 'sha1sum'
         # Only set when a real path is configured (host-key pinning).
         # The "none" default must leave the variable UNSET: older rclone
         # treats any value as a literal path and fails to open "none";
