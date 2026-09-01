@@ -104,9 +104,9 @@ enum class FiberTraceWindingCalibrationMode : unsigned char {
     FiberTraceWindingCalibrationMode mode) noexcept;
 
 inline constexpr std::array<double, 5>
-    kDefaultFiberTraceWindingClassWeights{0.5, 0.0, 1.0, 2.0, 1.0};
+    kDefaultFiberTraceWindingClassWeights{0.0, 0.0, 0.5, 4.0, 1.0};
 inline constexpr std::array<double, 2>
-    kDefaultFiberTraceWindingSignWeights{0.5, 1.0};
+    kDefaultFiberTraceWindingSignWeights{1.0, 0.5};
 
 enum class FiberTraceWindingDecisionConfidence : unsigned char {
     Legacy,

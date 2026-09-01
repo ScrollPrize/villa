@@ -112,13 +112,13 @@ FiberTraceWindingBeliefPropagationConfig config()
 TEST_CASE("Winding class production defaults use the selected reference tuple")
 {
     const FiberTraceWindingBeliefPropagationConfig defaults;
-    CHECK(defaults.perpendicularNextWeight == 0.5);
+    CHECK(defaults.perpendicularNextWeight == 0.0);
     CHECK(defaults.perpendicularFarWeight == 0.0);
-    CHECK(defaults.parallelSameWeight == 1.0);
-    CHECK(defaults.parallelOneWeight == 2.0);
+    CHECK(defaults.parallelSameWeight == 0.5);
+    CHECK(defaults.parallelOneWeight == 4.0);
     CHECK(defaults.parallelFarWeight == 1.0);
-    CHECK(defaults.perpendicularSignWeight == 0.5);
-    CHECK(defaults.parallelSignWeight == 1.0);
+    CHECK(defaults.perpendicularSignWeight == 1.0);
+    CHECK(defaults.parallelSignWeight == 0.5);
     CHECK(defaults.enforcePerpendicularWindingSign);
     CHECK(defaults.enforceParallelWindingSign);
     CHECK(defaults.decisionConfidence ==

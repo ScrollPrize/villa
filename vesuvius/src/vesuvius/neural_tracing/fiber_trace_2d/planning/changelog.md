@@ -1,3 +1,9 @@
+# 2026-09-01: promote complete-stack 1024 winding tune
+
+- Promoted winding class weights `0,0,0.5,4,1` and sign weights `1,0.5` to the
+  shared solver and CLI defaults after the zero-aware 1024 search improved the
+  complete 26-reference result from 13/26 to 16/26 exact inferred windings.
+
 # 2026-09-01: separate winding value and sign hardness
 
 - Preserved signed winding-value residuals while adding independently weighted

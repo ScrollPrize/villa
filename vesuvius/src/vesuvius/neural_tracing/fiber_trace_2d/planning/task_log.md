@@ -1,61 +1,69 @@
-# Task log: retain complete reference fibers in diagnostics
+# Task log: promote the best 1024 winding tune
 
-## Starting point
+## Inputs
 
-- `updateReferenceFiberArtifact` clips every selected dense annotation line to
-  the stored trace artifact's half-open crop.
-- The clipped runs are used by both `<base>_reference.obj` and all reference
-  constraint/benchmark diagnostics.
-- On the 2026-09-01 stack this retained 24 of 26 selected fibers; annotations
-  `...000010.json` and `...000026.json` were outside the 1024 crop, while two
-  other annotations appeared as short boundary fragments.
+- Tuning artifact: `data/workdir3/crop_traces.zarr` (1024 crop)
+- Normal manifest: `data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json`
+- Reference directory: `data/test_datasets/2026-09-01_fiber_stack2`
+- Reference tag: `hendrik_crop1`
+- Complete-reference implementation: `f89346f33`
+- Starting winding weights: `0.5,0,1,2,1`
+- Starting sign weights: `0.5,1`
+- Quality fraction: `0.25`
+- Piece length: `512` base voxels
 
 ## Plan review
 
-- The complete JSON lines are already validated and deterministically sorted by
-  `loadTaggedVc3dFiberJsonDirectory`; no parser or ordering change is needed.
-- Reference geometry is diagnostic-only. Keeping it complete does not expand
-  or alter the traced/BP fiber population.
-- The existing constraint extractor and full-volume normal sampler can consume
-  points outside the stored trace crop.
+- Use the existing zero-aware local search so zero coordinates can become
+  positive and positive coordinates can move to zero, `/2`, or `*2`.
+- Run one process only. The command reuses pre-winding constraint extraction and
+  topology across all candidate weight scenarios.
+- Rank with the existing deterministic objective: convergence, exact reference
+  estimates, missing/wrong references, correct items, evaluated items, wrong
+  items, residual, then tuple.
 
 ## Deviations
 
 - An independent subagent review was not run because the active orchestration
   instruction prohibits spawning subagents unless the user explicitly requests
-  delegation. The plan was reviewed locally against `AGENTS.md`, `specs.md`,
-  the reference CLI flow, and the current documentation.
+  delegation. The plan was reviewed locally against the current specification,
+  previous tuning log, and CLI validation rules.
+
+## 1024 result
+
+The initial local search was run against the established 1024 trace artifact.
+It reached a local optimum after 129 scenarios and six accepted moves:
+
+- Start: winding `0.5,0,1,2,1`, sign `0.5,1`, exact references `13/26`,
+  constraint accuracy `8016/10713` (`74.825%`).
+- Selected: winding `0,0,0.5,4,1`, sign `1,0.5`, exact references `16/26`,
+  constraint accuracy `8009/10703` (`74.829%`).
+
+The selected 1024 tuple is promoted at the user's request for direct checking.
+The fixed reference denominator includes one missing estimate because that
+reference has no usable cross constraint in this crop.
 
 ## Implementation
 
-- `updateReferenceFiberArtifact` now emits one OBJ line and one diagnostic trace
-  from every selected JSON fiber's complete dense line.
-- Removed the crop bounds from that helper's interface and renamed its status
-  field from `retained_runs` to `retained_fibers`.
-- Kept the trace artifact crop bounds for BP topology and all crop-produced
-  fibers; only diagnostic reference geometry changed.
+- Shared class defaults: `0,0,0.5,4,1`.
+- Shared sign defaults: `1,0.5`.
+- CLI options continue to override both tuples explicitly.
+- Updated CLI help, focused regression expectations, user documentation,
+  specification, and changelog.
+
+## Deviation
+
+Before the promotion request, a 2048 baseline and part of a 2048 local-search
+neighborhood were run after misinterpreting the intended workload. The user
+stopped that work; no 2048 candidate was promoted, and this change contains
+only the completed 1024 optimum.
 
 ## Validation
 
-- Release build completed for `vc_fiber_trace_chunk`, `test_fiber_json`, and
-  `test_fiber_trace_winding_bp`.
-- `test_fiber_json`: 2 cases passed.
-- `test_fiber_trace_winding_bp`: 70 cases passed.
-- The real 2026-09-01 stack retained all 26 selected fibers and all 7,797 dense
-  points. The previous crop-clipped path retained only 24 sources.
-- With reference splitting disabled, all 25 adjacent filename pairs produced a
-  dominant perpendicular constraint. After the standard scale-first factor
-  `0.822`, 23 quantized to the expected `0.5` step. Pair `3.5->4.0` measured
-  `1.272` after scaling and quantized to `1.5`; pair `6.5->7.0` measured
-  `1.004` and crossed the same boundary by only `0.004`.
-- The final `12.0->12.5` pair is perpendicular, with raw step `0.601`, scaled
-  step `0.494`, and canonical step `0.5`. The preceding `11.5->12.5`
-  skip-one relation is parallel with raw step `1.094`, consistent with the
-  same orientation one winding apart rather than the same winding.
-
-## Execution note
-
-- The first complete-line validation used `direction-ablation`, whose existing
-  control flow continued into an unnecessary BP solve after reference
-  extraction. No BP result was used for the adjacent-pair evaluation, and no
-  further optimizer run was started after the user correction.
+- Built optimized targets `vc_fiber_trace_chunk` and
+  `test_fiber_trace_winding_bp` with `cmake --build volume-cartographer/build
+  --target vc_fiber_trace_chunk test_fiber_trace_winding_bp -j 16`.
+- `volume-cartographer/build/bin/test_fiber_trace_winding_bp`: 70 cases passed.
+- `volume-cartographer/build/bin/vc_fiber_trace_chunk --help` reports winding
+  defaults `[0,0,0.5,4,1]` and sign defaults `[1,0.5]`.
+- `git diff --check` passed.

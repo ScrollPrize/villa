@@ -1042,7 +1042,7 @@ The five canonical winding terms can be scaled independently with
 `--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
-(`2+`). Standard runs default to `0.5,0,1,2,1`; pass `1,1,1,1,1` explicitly for
+(`2+`). Standard runs default to `0,0,0.5,4,1`; pass `1,1,1,1,1` explicitly for
 neutral class weighting. Each value must be finite and nonnegative. A zero
 value removes that class's ordinary signed winding-value loss. If its dominant
 signed observation also has an enabled sign-hardness rule, that extra rule remains an
@@ -1074,7 +1074,7 @@ Same-trace hard continuity is unchanged in both cases.
 
 Use `--winding-sign-weights PERP,PARALLEL` to scale the additional sign-hardness
 rule independently for dominant perpendicular and parallel observations. The
-default is `0.5,1`. A zero entry disables both the finite sign penalty and the
+default is `1,0.5`. A zero entry disables both the finite sign penalty and the
 aligned hard-sign promotion for that relation. It does not make reversal
 acceptable to the ordinary winding-value term, which continues to compare the
 signed predicted and canonical winding deltas.
@@ -1180,6 +1180,14 @@ parallel-other winding 600/773, and parallel sign 757/773. No additional
 parallel cutoff is enabled by default. The zero perpendicular-far winding weight
 is a selected class weight, not an extraction cutoff; far observations and their
 separate sign items remain present in diagnostics and benchmark denominators.
+
+A subsequent zero-aware local search on the 1024 crop used the complete
+26-fiber `2026-09-01_fiber_stack2` reference set. It started from winding
+`0.5,0,1,2,1`, sign `0.5,1` at 13/26 exact inferred windings and selected
+winding `0,0,0.5,4,1`, sign `1,0.5` at 16/26 exact inferred windings after 129
+scenarios. Those selected tuples are the shared and CLI defaults. One reference
+had no usable cross constraint in this crop; the fixed reference denominator
+therefore reports 16 exact, 9 wrong, and 1 missing.
 
 The adaptive grid stores `gain=1/measurement_scale`, but gain selects the
 scale-specific canonical target before factor evaluation; it no longer scales

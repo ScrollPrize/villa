@@ -5910,7 +5910,7 @@
   zero under weighted modes. The default is `linear`.
 - `--winding-sign-weights PERP,PARALLEL` supplies finite nonnegative multipliers
   for the additional perpendicular and parallel sign-hardness rules, default
-  `0.5,1`. Zero disables that relation's extra finite penalty and aligned hard
+  `1,0.5`. Zero disables that relation's extra finite penalty and aligned hard
   promotion but does not remove the ordinary signed winding-value residual.
 - `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
   zero predicted delta adds
@@ -5929,9 +5929,9 @@
 - Standard fixed-orientation crop evaluation defaults to orientation BP
   temperature `1.25` and winding-stage Defect cost `100`. The underlying
   winding factor temperature remains `0.25`. The default sign multipliers are
-  perpendicular zero and parallel one; finite sign cost remains `44`, decision
+  perpendicular one and parallel one-half; finite sign cost remains `44`, decision
   confidence `cosine`, and normal confidence `linear`.
-- Shared and CLI H/V-aware winding defaults are `0.5,0,1,2,1`. An explicit
+- Shared and CLI H/V-aware winding defaults are `0,0,0.5,4,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not
   quantize the H/V ladder targets used for canonical class selection.
@@ -5970,6 +5970,12 @@
   be populated during this tuning protocol. No parallel cutoff is enabled by
   default. A zero selected winding-class weight suppresses that energy term but
   does not remove its structural diagnostic or benchmark item.
+- The subsequent zero-aware 1024 refinement against the complete 26-fiber
+  `2026-09-01_fiber_stack2` reference set evaluated 129 scenarios. It moved
+  from winding `0.5,0,1,2,1`, sign `0.5,1`, with 13 exact, 12 wrong, and 1
+  missing inferred winding to winding `0,0,0.5,4,1`, sign `1,0.5`, with 16
+  exact, 9 wrong, and 1 missing. The selected tuple is the shared and CLI
+  default.
 - Tagged VC3D reference fibers are diagnostic inputs independent of the traced
   crop. Reference OBJ export, reference-to-reference extraction, and
   reference-to-BP benchmarking must use each selected JSON fiber's complete

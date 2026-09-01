@@ -1,9 +1,5 @@
-# Task: retain complete reference fibers in diagnostics
+# Task: promote the best 1024 winding tune
 
-Reference fibers loaded by `vc_fiber_trace_chunk direction-ablation` must be
-used and visualized as complete annotated polylines. They must not be clipped
-to the traced crop before reference-to-reference constraint extraction or
-reference-to-BP benchmarking.
-
-Rerun the new 2026-09-01 reference-stack evaluation after the correction and
-report the adjacent-fiber perpendicular/parallel relations and winding steps.
+Promote the completed 1024 zero-aware local-search result to the shared and CLI
+defaults so it can be checked without explicit weight flags. Commit the default,
+documentation, and focused regression updates.
