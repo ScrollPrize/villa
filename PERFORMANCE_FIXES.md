@@ -276,6 +276,22 @@ disk the same comparison measured 1.88x wall and 1.90x fewer CPU-seconds.
 All three growth arms produced `md5(x,y,z,generations.tif)` identical and
 `area_cm2 = 10.66587924071438` to every digit.
 
+The budget is the causal variable, and it is transparent. Same segment, same
+seed, only `VC_GRID_CACHE_BYTES` changed:
+
+| budget | CPU-s | user | sys | wall | maxRSS |
+|--------|------:|-----:|----:|-----:|-------:|
+| 256 MiB | 61.9 | 38.33 | 23.58 | 69.76 s | 207 MB |
+| 4 GiB (default) | 44.2 | 33.50 | 10.69 | 51.94 s | 1563 MB |
+| 8 GiB | **31.2** | 28.13 | **3.04** | **31.55 s** | 2319 MB |
+
+At 256 MiB the patched build reproduces the unpatched behaviour, as it should.
+Every budget gave byte-identical output and the same `area_cm2` to 16 digits.
+On this segment 8 GiB is a further 1.42x over the 4 GiB default and reduces
+system time to 3.04 s, so the shipped default is deliberately conservative —
+it is a memory-safety choice for hosts running many tracers at once, not the
+throughput optimum. Raise it with `VC_GRID_CACHE_BYTES` where RAM allows.
+
 ---
 
 ## Measurement methodology
