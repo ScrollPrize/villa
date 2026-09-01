@@ -263,16 +263,19 @@
   different render job.
 - New line seeds, branch-fiber seeds, and control-point placements are accepted
   only inside an active box. Validation occurs before pane creation, dataset
-  access, autosave flushing, or persistence.
+  access, autosave flushing, or persistence. Existing controls remain valid
+  outside the box; in particular, an already-saved seed-only fiber can be
+  reopened and resumed after the box is enabled or moved.
 - Every trace or reoptimization uses the box state captured when that work was
   launched. Changing the box does not cancel, restart, or retroactively mutate
   existing or in-flight annotation geometry.
 - For work launched with an active box, the entire optimized path between the
   outer controls is retained, including temporary excursions outside the box.
-  Open tails stop after their first outside sample. An already-outside outer
-  control keeps no farther tail, except that a one-control line retains one
-  adjacent sample to remain valid. Manual provisional edits follow the same
-  tail rule.
+  Open tails stop after their first outside sample. A lone outside control
+  retains each contiguous connector that reaches the box, the in-box run, and
+  its first sample after exiting. If neither tail reaches the box, it retains
+  one adjacent sample to remain valid. Manual provisional edits follow the
+  same tail rule.
 
 ## Download label
 

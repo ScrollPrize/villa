@@ -441,6 +441,11 @@ private:
         Optimized,
     };
 
+    enum class SeedOrigin {
+        NewPlacement,
+        StoredFiber,
+    };
+
     // Intentionally opaque outside LineAnnotationController.cpp. Keeping session
     // state private prevents external code from mutating controlPoints/branches
     // without the branch metadata synchronization hook.
@@ -585,7 +590,8 @@ private:
                                    std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
-                        InitialDirectionMode directionMode);
+                        InitialDirectionMode directionMode,
+                        SeedOrigin seedOrigin = SeedOrigin::NewPlacement);
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
                                      double linePosition);

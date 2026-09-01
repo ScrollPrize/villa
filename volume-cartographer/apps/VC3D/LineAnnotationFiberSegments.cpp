@@ -1526,7 +1526,44 @@ bool constrainLineOpenTailsToBounds(
     size_t keepBegin = firstControl;
     size_t keepEnd = lastControl;
 
-    if (contains_point(focusBounds, line.points[firstControl].position)) {
+    const bool singleOutsideControl = firstControl == lastControl &&
+        !contains_point(focusBounds, line.points[firstControl].position);
+    if (singleOutsideControl) {
+        bool enteredBounds = false;
+        for (size_t i = firstControl; i > 0;) {
+            --i;
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepBegin = i;
+                continue;
+            }
+            keepBegin = i;
+            if (!inside) {
+                break;
+            }
+        }
+
+        enteredBounds = false;
+        for (size_t i = lastControl + 1; i < line.points.size(); ++i) {
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepEnd = i;
+                continue;
+            }
+            keepEnd = i;
+            if (!inside) {
+                break;
+            }
+        }
+    } else if (contains_point(focusBounds, line.points[firstControl].position)) {
         while (keepBegin > 0) {
             --keepBegin;
             if (!contains_point(focusBounds, line.points[keepBegin].position)) {
@@ -1534,7 +1571,8 @@ bool constrainLineOpenTailsToBounds(
             }
         }
     }
-    if (contains_point(focusBounds, line.points[lastControl].position)) {
+    if (!singleOutsideControl &&
+        contains_point(focusBounds, line.points[lastControl].position)) {
         while (keepEnd + 1 < line.points.size()) {
             ++keepEnd;
             if (!contains_point(focusBounds, line.points[keepEnd].position)) {

@@ -62,13 +62,16 @@ and attached-volume composition and does not dim control markers. The main
 segmentation surface view is not covered by this version of the feature.
 
 New seeds, linked branch seeds, and control points must be inside the active
-box. A trace or reoptimization captures the box when it starts; later box
-changes do not cancel that work or alter untouched fibers. After a solve, the
-path between the outer control points is preserved even if it briefly leaves
-the box. Only open tails are shortened: they retain the first sample outside
-the box as a small overshoot. A lone control also retains one neighboring line
-sample so the resulting fiber remains valid. Manual/no-reoptimization edits use
-the same open-tail rule.
+box. Existing controls remain valid outside it, so a saved seed-only fiber can
+still be reopened after the box is enabled or moved. A trace or reoptimization
+captures the box when it starts; later box changes do not cancel that work or
+alter untouched fibers. After a solve, the path between the outer control
+points is preserved even if it briefly leaves the box. Only open tails are
+shortened: they retain the first sample outside the box as a small overshoot. A
+lone outside control retains any connector that reaches the box and its in-box
+run; if neither tail reaches the box, one neighboring line sample is kept so
+the fiber remains valid. Manual/no-reoptimization edits use the same open-tail
+rule.
 
 The rendered strips are derived views, not stored line geometry. Their columns
 retain every annotation control point and both line endpoints. The optimized

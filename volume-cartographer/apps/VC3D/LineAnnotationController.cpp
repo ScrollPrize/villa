@@ -2856,10 +2856,6 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     if (seedOnlyPoint) {
         const cv::Vec3d seedPoint = *seedOnlyPoint;
-        if (!placementAllowedByFocusBounds(
-                seedPoint, session->suppressErrorDialogs)) {
-            return;
-        }
         session->seedPoint = seedPoint;
         session->focusedLinePosition = 0.0;
         session->focusedControlPoint = seedPoint;
@@ -2886,7 +2882,10 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                            true)) {
             return;
         }
-        handleLineSeed(surfaceName, toVec3f(seedPoint), InitialDirectionMode::ZInOut);
+        handleLineSeed(surfaceName,
+                       toVec3f(seedPoint),
+                       InitialDirectionMode::ZInOut,
+                       SeedOrigin::StoredFiber);
         return;
     }
 
@@ -7184,7 +7183,8 @@ bool LineAnnotationController::placementAllowedByFocusBounds(
 
 void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
                                               cv::Vec3f volumePoint,
-                                              InitialDirectionMode directionMode)
+                                              InitialDirectionMode directionMode,
+                                              SeedOrigin seedOrigin)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -7198,7 +7198,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
         return;
     }
 
-    if (!placementAllowedByFocusBounds(
+    if (seedOrigin == SeedOrigin::NewPlacement &&
+        !placementAllowedByFocusBounds(
             toVec3d(volumePoint), session.suppressErrorDialogs)) {
         return;
     }

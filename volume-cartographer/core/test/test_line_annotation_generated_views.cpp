@@ -421,6 +421,32 @@ TEST_CASE("focus bounds keep a two-point line for one outside control")
     CHECK(line.displayFrameAnchorIndex == 1);
 }
 
+TEST_CASE("focus bounds keep paths from one outside control into the box")
+{
+    vc::lasagna::LineModel line;
+    for (int x : {240, 210, 170, 140, 110, 80, 50, 20,
+                  50, 80, 110, 140, 170, 210, 240}) {
+        vc::lasagna::LinePoint point;
+        point.position = cv::Vec3d{static_cast<double>(x), 0.0, 0.0};
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = 7;
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {7.0, {20.0, 0.0, 0.0}, true, 7},
+    };
+    const Rect3D bounds{{100.0f, -1.0f, -1.0f}, {200.0f, 1.0f, 1.0f}};
+
+    CHECK(vc3d::line_annotation::constrainLineOpenTailsToBounds(
+        line, controls, bounds));
+    REQUIRE(line.points.size() == 13);
+    CHECK(line.points.front().position == cv::Vec3d(210.0, 0.0, 0.0));
+    CHECK(line.points[6].position == cv::Vec3d(20.0, 0.0, 0.0));
+    CHECK(line.points.back().position == cv::Vec3d(210.0, 0.0, 0.0));
+    CHECK(controls[0].optimizedIndex == 6);
+    CHECK(controls[0].linePosition == doctest::Approx(6.0));
+    CHECK(line.displayFrameAnchorIndex == 6);
+}
+
 TEST_CASE("line annotation shift scroll uses viewer slice step size")
 {
     CHECK(vc3d::line_annotation::shiftScrollLineStepSize(0) == 1);
