@@ -16,7 +16,11 @@ import numpy as np
 import scipy.ndimage
 import torch
 from skimage.restoration import unwrap_phase
-from vc.grid_raycast import GridRaycaster
+
+try:
+    from vc.grid_raycast import GridRaycaster
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    GridRaycaster = None
 
 import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
@@ -26,6 +30,20 @@ from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
 from vesuvius.neural_tracing.winding_models.winding_targets import (
     render_column_targets_batched,
 )
+
+_VC_MISSING = (
+    "seeding a winding model casts rays through the volume-cartographer "
+    "bindings (vc), which are not installed. They come with the "
+    "`neural-tracing` extra, which builds volume-cartographer from the monorepo "
+    "and needs its C++ toolchain; `models` alone does not pull them in."
+)
+
+
+def _grid_raycaster(xyz, quads):
+    if GridRaycaster is None:
+        raise ImportError(_VC_MISSING)
+    return GridRaycaster(xyz, quads)
+
 
 _WINDING_NAME = re.compile(r"(?:^|-)w(?P<index>\d+)(?:_|$)")
 
@@ -494,7 +512,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
         return Segment(
             winding_idx=winding_idx,
             xyz=xyz,
-            raycaster=GridRaycaster(xyz, valid_quads) if build_raycaster else None,
+            raycaster=_grid_raycaster(xyz, valid_quads) if build_raycaster else None,
             valid_quads=valid_quads,
             sample_cells=np.argwhere(valid_quads),
             vertex_turns=vertex_turns,
@@ -545,7 +563,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 segment,
                 xyz=xyz,
                 valid_quads=quads,
-                raycaster=GridRaycaster(xyz, quads),
+                raycaster=_grid_raycaster(xyz, quads),
                 sample_cells=np.argwhere(quads),
             )
         return segment

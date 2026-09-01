@@ -11,7 +11,17 @@ from scipy import ndimage
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-import vc
+try:
+    import vc
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    vc = None
+
+_VC_MISSING = (
+    "this module reads volumes through the volume-cartographer bindings (vc), "
+    "which are not installed. They come with the `neural-tracing` extra, which "
+    "builds volume-cartographer from the monorepo and needs its C++ toolchain; "
+    "`models` alone does not pull them in."
+)
 
 try:
     import trimesh
@@ -129,6 +139,8 @@ class _VcVolumeLevel:
 
 
 def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
+    if vc is None:
+        raise ImportError(_VC_MISSING)
     path = str(volume_path)
     cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
     vc.set_chunk_cache_budget(cache_bytes)
