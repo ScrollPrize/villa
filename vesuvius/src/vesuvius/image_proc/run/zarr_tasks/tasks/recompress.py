@@ -29,6 +29,47 @@ from ..utils import (
     write_multiscales_metadata,
 )
 
+_ZARR_MAJOR_VERSION = int(zarr.__version__.split(".")[0])
+
+
+def _create_recompressed_array(
+    path: str,
+    *,
+    shape: Tuple[int, ...],
+    chunks: Tuple[int, ...],
+    dtype: Any,
+    compression_level: int,
+    zarr_format: int,
+) -> zarr.Array:
+    """Create a new zarr array at ``path``, compressed to match ``zarr_format``.
+
+    zarr-python 2.x arrays are always on-disk format 2 and take a numcodecs
+    ``compressor=``. zarr-python 3.x defaults new arrays to format 3, which
+    rejects ``compressor=`` and instead wants a bytes-to-bytes codec passed
+    as ``compressors=``. Branching here lets the destination array mirror
+    the source array's format instead of failing under 3.x (see #1670).
+    """
+    if _ZARR_MAJOR_VERSION < 3 or zarr_format == 2:
+        compressor = Blosc(cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE)
+        kwargs: dict = {"compressor": compressor}
+        if _ZARR_MAJOR_VERSION >= 3:
+            kwargs["zarr_format"] = 2
+        return zarr.open(path, mode="w", shape=shape, chunks=chunks, dtype=dtype, **kwargs)
+
+    from zarr.codecs import BloscCodec, BloscShuffle
+
+    return zarr.open(
+        path,
+        mode="w",
+        shape=shape,
+        chunks=chunks,
+        dtype=dtype,
+        compressors=[
+            BloscCodec(cname="zstd", clevel=compression_level, shuffle=BloscShuffle.bitshuffle)
+        ],
+        zarr_format=3,
+    )
+
 
 @dataclass
 class RecompressConfig(TaskConfig):
@@ -197,14 +238,16 @@ class RecompressTask(ZarrTask):
             read_z = zarr.open(level_path, mode="r")
             print(f"  Shape: {read_z.shape}, Chunks: {read_z.chunks}")
 
-            # Create temp zarr with new compressor
-            temp_z = zarr.open(
+            # Create temp zarr with new compressor, matching the source's
+            # on-disk zarr format (v2 vs v3 use incompatible compressor APIs)
+            zarr_format = getattr(getattr(read_z, "metadata", None), "zarr_format", 2)
+            temp_z = _create_recompressed_array(
                 temp_path,
-                mode="w",
                 shape=read_z.shape,
                 chunks=read_z.chunks,
                 dtype=read_z.dtype,
-                compressor=self._compressor,
+                compression_level=self.config.compression_level,
+                zarr_format=zarr_format,
             )
 
             # Copy .zattrs if it exists
