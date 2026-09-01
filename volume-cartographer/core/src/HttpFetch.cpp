@@ -25,13 +25,17 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     return utils::HttpClient(std::move(cfg));
 }
 
-// Binary payloads (100+ MB mesh bands) need longer than makeTextClient's 30s.
+// Binary payloads (100+ MB mesh bands) can legitimately take minutes or hours
+// while still making progress. Use a connection timeout plus curl's low-speed
+// policy instead of imposing a hard wall-clock deadline on the transfer.
 utils::HttpClient makeBinaryClient(const HttpAuth& auth)
 {
     utils::HttpClient::Config cfg;
     cfg.aws_auth = auth;
-    cfg.transfer_timeout = std::chrono::seconds{300};
+    cfg.transfer_timeout = std::chrono::seconds{0};
     cfg.connect_timeout = std::chrono::seconds{5};
+    cfg.low_speed_limit_bytes_per_second = 1;
+    cfg.low_speed_time = std::chrono::seconds{10};
     cfg.max_retries = 2;
     return utils::HttpClient(std::move(cfg));
 }
@@ -121,6 +125,10 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
             throw std::runtime_error(
                 "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
         }
+    }
+    if (resp.status_code == 0 && !resp.error_message.empty()) {
+        throw std::runtime_error(
+            "HTTP transport error fetching " + url + ": " + resp.error_message);
     }
     return {};
 }
