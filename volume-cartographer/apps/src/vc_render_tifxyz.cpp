@@ -5,6 +5,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
+#include "vc/core/util/OpenMPConfig.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
@@ -1079,6 +1080,12 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
 
 int main(int argc, char *argv[])
 {
+    // Must happen before the first parallel region. See OpenMPConfig.hpp:
+    // a static initializer in OpenCV turns on dynamic team sizing, which
+    // makes libgomp shrink every team -- to a single thread once the load
+    // average reaches the thread cap -- regardless of OMP_NUM_THREADS.
+    vc::core::util::disableOpenMPDynamicTeams();
+
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
