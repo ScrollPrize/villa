@@ -1,85 +1,107 @@
-# Plan: hard split continuity and aligned winding signs
+# Plan: retune hard continuation and alignment falloff
 
-## Implementation
+## Experiment contract
 
-1. Extend the shared H/V-aware winding configuration with:
-   - a hard split-continuity switch, enabled by default;
-   - an optional minimum absolute Lasagna-normal alignment for promoting an
-     enabled signed factor to hard, defaulting to `cos(30 degrees)`.
-2. Apply edge-local hard split continuity in the H/V/Mixed orientation prepass
-   and in both joint-grid and alternating winding solvers. Two active endpoints
-   on one continuation edge must have the same H/V and winding state. Either
-   endpoint may instead be Defect, which neutralizes that edge and splits the
-   source into independent active runs. Enforce active segments in pair
-   potentials and deterministic final decoding so independent node MAP values
-   cannot publish an active-active mismatch. Preserve existing finite pair
-   behavior when disabled.
-3. Centralize sign-mode selection. An enabled nonzero dominant sign is hard
-   when global sign cost is `hard`, or when its measured absolute normal
-   raw absolute alignment reaches the configured threshold (inclusive), even
-   when transformed decision confidence or finite sign cost is zero. Otherwise it retains the
-   existing finite confidence-weighted sign penalty. Use this identical rule
-   in solver preparation, factor diagnostics, and reference inference. Global
-   `hard` overrides the gate; missing alignment cannot be promoted; parallel
-   cutoff and dominant/nonzero/enabled admission still apply first.
-4. Add `--split-continuity hard|finite` and
-   `--winding-hard-sign-angle DEG|off`. Validate degrees in `[0,90]` and convert
-   to `cos(DEG)`. Defaults implement hard split continuity and 30 degrees;
-   `finite` plus `off` exactly recover the previous finite-only behavior.
-5. Add a shared final-solution constraint-agreement summary over prepared
-   dominant factor diagnostics after fixed-orientation removal, parallel
-   cutoff, and confidence/sign admission. Classify each measurement as
-   continuity, perpendicular 0.5/far, or parallel 0/1/far; report prepared,
-   active/evaluated, Defect-neutralized, infringed, and
-   `infringed/evaluated` percent (`NA` for zero evaluated). Count a measurement
-   once as infringed when any of these fail: expected H/V relation; enabled
-   sign (`target*predicted <= 0`); or canonical target bin. Perpendicular bins
-   use `delta/measurement_scale` and half-integer nearest-bin boundaries;
-   parallel bins use unscaled latent delta and integer nearest-bin boundaries.
-   Continuity requires identical full state only when both endpoints are
-   active; any Defect endpoint neutralizes the edge.
-6. Print the compact table for every final winding solution before reference
-   benchmark output.
+1. Keep `--split-continuity hard`, fixed orientation, phase `0.5`, scale
+   `0.822`, 512-base-voxel pieces, quality fraction `0.25`, both sign classes,
+   parallel cutoff `0.5`, and 500 maximum winding messages in every scenario.
+2. Treat `normal=none`, `normal=linear`, and `normal=cosine` as three separate
+   model families. Give each family its own complete refinement from the same
+   current defaults; never transfer a selected scalar/weight tuple and call the
+   receiving family tuned.
+3. Tune and compare on `data/workdir3/crop_traces.zarr` (1024). Do not run the
+   2048 crop in this task; larger-context validation is explicitly deferred.
+4. Establish one fixed pre-solve eligible-reference denominator and retained
+   piece population from the common 1024 extraction. Report right, wrong,
+   neutralized/abstained, and missing observations against that fixed
+   denominator for every candidate. A candidate is ranking-eligible only when
+   it evaluates at least 90% of eligible reference observations and leaves at
+   least 90% of retained pieces active. This coverage gate is declared before
+   the search and must not move in response to results.
+5. Rank coverage-eligible deterministic tuning results lexicographically by:
+   - converged before message-limit;
+   - more exact reference windings;
+   - fewer missing, then fewer wrong reference windings;
+   - more right reference constraints against the fixed denominator;
+   - more evaluated reference constraints and active pieces, then fewer wrong
+     constraints;
+   - lower continuation and aggregate active-constraint infringement rates.
+   Exact metric ties retain the earlier tuple instead of optimizing numerical
+   message-residual noise.
+   Coverage-ineligible rows remain in the report but cannot be selected.
 
-## Tests
+## Per-family refinement
 
-- Unit-test hard split continuation for allowed active/Defect and Defect/Defect
-  pairs, forbidden active-active H/V and winding mismatches, and valid identical
-  active states.
-- Unit-test a three-piece active/Defect/active chain whose two active runs have
-  different H/V and winding states, plus deterministic final enforcement of
-  each uninterrupted active segment after inconsistent nodewise MAP states.
-- Unit-test finite compatibility mode and existing piece-break cost.
-- Unit-test perpendicular and parallel sign promotion above/equal/below the
-  30-degree alignment threshold, missing alignment, disabled threshold, and
-  globally hard signs.
-- Unit-test zero decision confidence/cost promotion, zero targets/weights,
-  cutoff-suppressed parallel signs, and endpoint reversal.
-- Unit-test reference observations use the same promoted-hard rule.
-- Unit-test constraint infringement grouping, exclusions, repeated prepared
-  measurements, Defect neutralization, H/V mismatch, sign
-  mismatch, target-bin boundaries, aggregate percentages, and zero denominator.
-- Build the optimized winding test and CLI targets; run focused winding tests,
-  relevant crop-constraint tests, and `git diff --check`.
-- Run the approved 1024 and 2048 direction-ablation workloads as a four-way
-  attribution matrix on each artifact using the optimized build:
-  `finite/off`, `hard/off`, `finite/30 degrees`, and `hard/30 degrees`.
-  Compare prepared/excluded
-  factor totals, active/Defect pieces, infringements, reference metrics,
-  convergence/residual, runtime, and generated visualization artifacts.
+1. Establish the family baseline with current class weights `8,1,2,2,1`, sign
+   cost `44`, Defect cost `100`, BP temperature `1.25`, decision confidence
+   `legacy`, and hard-sign angle 30 degrees.
+2. Record the mandatory hard/30-degree controlled anchor before tuning.
+3. Coarsely scan decision mode `legacy,linear,cosine`, holding the other
+   starting parameters fixed. Retain the best deterministic row for that family.
+4. Refine one complete tuple with bounded deterministic best-improvement
+   coordinate descent. Evaluate blocks in this fixed order: decision mode,
+   five class weights, sign cost, Defect cost, then BP temperature. After
+   any accepted move, begin a new complete block pass. Stop only after one full
+   pass accepts no move.
+5. Use finite absolute candidate sets:
+   - decision modes from step 3;
+   - each class weight at zero or original-seed times powers of two with
+     exponents `[-4,+4]`; a zero coordinate reactivates at its original seed;
+   - sign cost `0` or `44 * 2^e`, `e in [-3,+3]`;
+   - Defect cost `100 * 2^e`, `e in [-3,+3]`;
+   - BP temperature `1.25 * 2^e`, `e in [-2,+2]`.
+   Cache every complete tuple globally per family, evaluate neighbors in the
+   stated order, select the deterministic best improvement rather than the
+   first, and fail at 500 unique scenarios per family instead of silently
+   returning a partial optimum. The zero-weight cases cover the previously
+   promising disabled far-magnitude factors; the built-in positive-only local
+   weight search is insufficient by itself.
+6. This remains path-dependent local optimization from the declared common
+   seed after the coarse structural scan; do not claim a global optimum.
+7. Repeat the selected 1024 row once and require identical solver/reference
+   metrics before treating the family as tuned.
+
+## Family comparison
+
+1. Freeze all three independently selected family tuples on the 1024 crop.
+2. Also retain the common hard/30-degree current-default row as the untuned anchor.
+3. Compare convergence, exact references, right/evaluated reference
+   constraints, active/Defect pieces, continuation and total infringements,
+   winding solve seconds, and runner wall seconds on the 1024 crop.
+4. Repeat the three selected tuples three times in rotated order.
+   Require deterministic quality metrics and report winding-solve and runner
+   wall min/median/max. Timing repetitions are distinct from the earlier
+   quality-determinism repeat.
+5. Leave final 1024 visualization artifacts for the selected families under
+   the tuning output root; retain all logs under `/tmp`.
+
+## Validation
+
+- Use the Release `vc_fiber_trace_chunk` binary and the previously approved
+  `/tmp/vc_direction_ablation_runner.sh` command surface.
+- Record exact commands, revision, inputs, build type, and all accepted/rejected
+  results in `planning/task_log.md`.
+- Log the complete tuple and fixed-orientation prepass output for every
+  candidate. `--bp-temperature` controls the H/V/Mixed prepass and scales the
+  winding Defect unary; do not describe it as only a winding temperature.
+- If the experiment requires code changes, rebuild the CLI and run the focused
+  winding/crop tests plus `git diff --check`; otherwise state explicitly that
+  the task changed only experiment records.
 
 ## Spec Update
 
-Specify exact hard split-continuity state compatibility, the finite fallback,
-alignment-gated hard sign semantics and defaults, and final-solution
-constraint-infringement accounting.
+No solver-semantics change is planned. If a tuned result is later promoted to a
+default, update `planning/specs.md` with the selected complete tuple; otherwise
+leave the specification unchanged.
 
 ## Docs Update
 
-Document the two CLI controls, interaction with finite sign and piece-break
-costs, alignment convention, and the new solution-agreement table.
+Record the reproducible tuning protocol and results in
+`volume-cartographer/docs/fiber_chunk_tracing.md` only if they establish a new
+recommended tuple. Do not present an unvalidated 1024-only optimum as a general
+default.
 
-## Changelog
+## Changelog Update
 
-Record hard split continuity, alignment-gated hard signs, and final constraint
-infringement diagnostics.
+Add a concise tuning-result entry after held-out validation. Mention a default
+change only if one is actually selected after the comparison.

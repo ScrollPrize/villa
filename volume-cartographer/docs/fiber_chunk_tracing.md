@@ -1040,7 +1040,7 @@ The five canonical winding terms can be scaled independently with
 `--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
-(`2+`). Standard runs default to `8,1,2,2,1`; pass `1,1,1,1,1` explicitly for
+(`2+`). Standard runs default to `0,2,2,2,1`; pass `1,1,1,1,1` explicitly for
 neutral class weighting. Each value must be finite and nonnegative. A zero
 value removes that class's finite winding magnitude loss. If its dominant
 signed observation also has an enabled hard-sign rule, the sign remains an
@@ -1117,14 +1117,13 @@ An active factor is infringed once when any required H/V relation, enabled sign,
 or canonical winding bin is wrong. Neutralized factors are shown explicitly and
 are not silently counted as correct or included in the percentage denominator.
 
-The fixed 1024-crop sweep found no improvement from decision or normal
-confidence attenuation alone. The best experimental row retained
-`legacy`/`none`, enabled both sign classes with finite cost 44, and used Defect
-cost 100 plus temperature 1.25. It retained 8/8 exact reference windings and
-raised matched constraints from 1,784 to 1,875 while evaluating 2,992 rather
-than 2,839 constraints. These measured settings are now the standard defaults;
-the legacy row remains available with `--winding-hard-signs perpendicular
---winding-sign-cost hard --winding-defect-cost 50 --bp-temperature 2.5`.
+The hard-continuation 1024-crop sweep selected linear normal confidence,
+cosine decision confidence, and class weights `0,2,2,2,1`. With both hard sign
+classes at the 30-degree gate, finite sign cost 44, Defect cost 100, and
+temperature 1.25, it retained 8/8 exact reference windings and matched
+1,369/2,100 evaluated reference constraints. These measured settings are the
+standard defaults. Explicit confidence, weight, sign, Defect, and temperature
+options reproduce prior modes.
 
 With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
 tests the Cartesian product of the listed values in all five tuple positions.

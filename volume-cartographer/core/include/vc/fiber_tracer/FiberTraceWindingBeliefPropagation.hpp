@@ -104,7 +104,7 @@ enum class FiberTraceWindingCalibrationMode : unsigned char {
     FiberTraceWindingCalibrationMode mode) noexcept;
 
 inline constexpr std::array<double, 5>
-    kDefaultFiberTraceWindingClassWeights{8.0, 1.0, 2.0, 2.0, 1.0};
+    kDefaultFiberTraceWindingClassWeights{0.0, 2.0, 2.0, 2.0, 1.0};
 
 enum class FiberTraceWindingDecisionConfidence : unsigned char {
     Legacy,
@@ -139,9 +139,9 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::optional<double> hardSignMinimumNormalAlignment =
         0.8660254037844386;
     FiberTraceWindingDecisionConfidence decisionConfidence =
-        FiberTraceWindingDecisionConfidence::Legacy;
+        FiberTraceWindingDecisionConfidence::Cosine;
     FiberTraceWindingNormalConfidence normalConfidence =
-        FiberTraceWindingNormalConfidence::None;
+        FiberTraceWindingNormalConfidence::Linear;
     std::optional<double> finiteSignInfringementCost = 44.0;
     double perpendicularNextWeight =
         kDefaultFiberTraceWindingClassWeights[0];

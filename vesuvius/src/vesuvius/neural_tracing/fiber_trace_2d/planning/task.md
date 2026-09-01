@@ -1,16 +1,21 @@
-# Task: hard split continuity and aligned winding signs
+# Task: retune hard continuation and alignment falloff
 
-The 2048-voxel crop admits too many visibly invalid active fiber pieces.
+Keep edge-local hard split continuity and retune the winding solver around it.
 
-Make consecutive pieces created by splitting one source fiber a configurable
-edge-local hard continuation: when both endpoints are active they must have the
-same H/V and winding state, while a Defect endpoint neutralizes that edge and
-may separate two independently active runs. Make dominant perpendicular and parallel signed winding
-constraints hard when their connector is sufficiently aligned with the aligned
-Lasagna normal, with a configurable threshold defaulting to 30 degrees. Less
-reliable signs retain the configured finite sign penalty.
+Compare the three normal-alignment confidence families (`none`, `linear`, and
+`cosine`) only after independently refining each family's decision-confidence
+mode, class weights, finite sign cost, Defect cost, and BP
+temperature to a local optimum. Do not compare an untuned falloff variant with
+parameters selected for another variant.
 
-Also report, for every solve, the number and percentage of final constraints
-infringed overall and by canonical constraint class, while distinguishing
-constraints neutralized by a Defect endpoint. Re-run the 1024 and 2048 crops and
-compare the result with the prior behavior.
+Hard continuation and both hard sign classes at a fixed 30-degree alignment
+threshold are mandatory in every scenario. Disabled hard signs and alternative
+thresholds are outside the valid search space.
+
+Use only the 1024 crop for this tuning pass. Defer the overlapping 2048
+larger-context validation until explicitly requested. Report
+convergence, exact reference windings, reference-constraint accuracy,
+active/Defect counts, continuation and aggregate infringement, solve time, and
+total wall time. Do not promote a new default until the tuned comparison is
+available. Do not reward a setting merely for disabling difficult reference
+constraints.

@@ -96,6 +96,9 @@ FiberTraceWindingBeliefPropagationConfig config()
     useUnitClassWeights(result);
     result.enforcePerpendicularWindingSign = true;
     result.enforceParallelWindingSign = false;
+    result.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    result.normalConfidence = FiberTraceWindingNormalConfidence::None;
     result.finiteSignInfringementCost.reset();
     result.temperature = 0.25;
     result.messageDamping = 1.0;
@@ -107,17 +110,17 @@ FiberTraceWindingBeliefPropagationConfig config()
 TEST_CASE("Winding class production defaults use the selected reference tuple")
 {
     const FiberTraceWindingBeliefPropagationConfig defaults;
-    CHECK(defaults.perpendicularNextWeight == 8.0);
-    CHECK(defaults.perpendicularFarWeight == 1.0);
+    CHECK(defaults.perpendicularNextWeight == 0.0);
+    CHECK(defaults.perpendicularFarWeight == 2.0);
     CHECK(defaults.parallelSameWeight == 2.0);
     CHECK(defaults.parallelOneWeight == 2.0);
     CHECK(defaults.parallelFarWeight == 1.0);
     CHECK(defaults.enforcePerpendicularWindingSign);
     CHECK(defaults.enforceParallelWindingSign);
     CHECK(defaults.decisionConfidence ==
-          FiberTraceWindingDecisionConfidence::Legacy);
+          FiberTraceWindingDecisionConfidence::Cosine);
     CHECK(defaults.normalConfidence ==
-          FiberTraceWindingNormalConfidence::None);
+          FiberTraceWindingNormalConfidence::Linear);
     REQUIRE(defaults.finiteSignInfringementCost.has_value());
     CHECK(*defaults.finiteSignInfringementCost == 44.0);
     CHECK(defaults.enforceHardSplitContinuity);
@@ -125,9 +128,9 @@ TEST_CASE("Winding class production defaults use the selected reference tuple")
     CHECK(*defaults.hardSignMinimumNormalAlignment ==
           doctest::Approx(std::cos(std::numbers::pi / 6.0)));
     CHECK(std::string(fiberTraceWindingDecisionConfidenceName(
-              defaults.decisionConfidence)) == "legacy");
+              defaults.decisionConfidence)) == "cosine");
     CHECK(std::string(fiberTraceWindingNormalConfidenceName(
-              defaults.normalConfidence)) == "none");
+              defaults.normalConfidence)) == "linear");
     const FiberTraceJointGridWindingConfig jointDefaults;
     CHECK(jointDefaults.mixedUnaryCost == 100.0);
     const FiberTraceInterleavedWindingConfig interleavedDefaults;
@@ -1467,6 +1470,9 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
     perpendicular.signedWindingDelta = -1.0;
     FiberTraceWindingBeliefPropagationConfig config;
     useUnitClassWeights(config);
+    config.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    config.normalConfidence = FiberTraceWindingNormalConfidence::None;
     config.enforcePerpendicularWindingSign = false;
     config.enforceParallelWindingSign = false;
     config.finiteSignInfringementCost.reset();
@@ -1533,6 +1539,9 @@ TEST_CASE("Reference observations apply all canonical class weights")
     winding.measurementScale = 1.0;
 
     FiberTraceWindingBeliefPropagationConfig config;
+    config.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    config.normalConfidence = FiberTraceWindingNormalConfidence::None;
     config.enforcePerpendicularWindingSign = false;
     config.enforceParallelWindingSign = false;
     config.finiteSignInfringementCost.reset();

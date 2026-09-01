@@ -1762,3 +1762,16 @@
   retained 8/8 exact reference windings and increased matched constraints from
   1,784 to 1,875. These parameters are now the standard defaults; the former
   hard-sign behavior remains available with `--winding-sign-cost hard`.
+
+## 2026-09-01 - Hard-sign falloff retuning
+
+- Retuned the none, linear, and cosine normal-confidence families independently
+  on the 1024 crop with hard continuation and both hard signs fixed at 30
+  degrees; disabled and alternative hard-sign thresholds were excluded.
+- All selected families reached 8/8 exact reference windings and reproduced
+  deterministic quality counts. Linear confidence with decision cosine and
+  weights `0,2,2,2,1` maximized correct reference constraints at 1369/2100;
+  cosine confidence with decision legacy and weights `0,0.5,2,2,1` retained
+  more active pieces and had lower aggregate infringement.
+- Promoted the reference-objective winner to the shared and CLI defaults.
+  Deferred 2048 larger-context validation.

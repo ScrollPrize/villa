@@ -105,10 +105,10 @@ struct Options {
     bool enforceParallelWindingSign = true;
     vc::fiber_tracer::FiberTraceWindingDecisionConfidence
         windingDecisionConfidence =
-            vc::fiber_tracer::FiberTraceWindingDecisionConfidence::Legacy;
+        vc::fiber_tracer::FiberTraceWindingDecisionConfidence::Cosine;
     vc::fiber_tracer::FiberTraceWindingNormalConfidence
         windingNormalConfidence =
-            vc::fiber_tracer::FiberTraceWindingNormalConfidence::None;
+        vc::fiber_tracer::FiberTraceWindingNormalConfidence::Linear;
     std::optional<double> windingSignCost = 44.0;
     std::array<double, 5> windingWeights =
         vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
@@ -263,14 +263,14 @@ void usage(const char* executable)
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
               << "  --winding-decision-confidence MODE\n"
-              << "                              legacy, linear, or cosine [legacy]\n"
+              << "                              legacy, linear, or cosine [cosine]\n"
               << "  --winding-normal-confidence MODE\n"
-              << "                              none, linear, or cosine [none]\n"
+              << "                              none, linear, or cosine [linear]\n"
               << "  --winding-sign-cost F|hard finite enabled-sign infringement cost [44]\n"
               << "  --winding-hard-sign-angle DEG|off\n"
               << "                              promote signs within DEG of normal to hard [30]\n"
               << "  --winding-weights P05,PFAR,P0,P1,P2\n"
-              << "                              five nonnegative factor multipliers [8,1,2,2,1]\n"
+              << "                              five nonnegative factor multipliers [0,2,2,2,1]\n"
               << "  --winding-weight-search V0,V1,...\n"
               << "                              exhaustive five-class reference grid\n"
               << "  --winding-weight-search-local\n"

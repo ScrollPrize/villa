@@ -5869,7 +5869,7 @@
 - `--winding-decision-confidence legacy|linear|cosine` scales only the selected
   dominant winding factor. For selected normalized score `s` in `[0.5,1]`,
   `legacy` uses `s`, `linear` uses `2s-1`, and `cosine` uses
-  `(1-cos(pi*(2s-1)))/2`. The default is `legacy`.
+  `(1-cos(pi*(2s-1)))/2`. The default is `cosine`.
 - `--winding-normal-confidence none|linear|cosine` additionally scales that
   factor from the connector's absolute alignment with the aligned normal.
   `none` uses one; `linear` uses `1-2*acos(abs_dot)/pi`; `cosine` uses
@@ -5877,7 +5877,7 @@
   Parallel evidence uses the deterministic median over every admitted signed
   connector sample, averaging the central pair for an even count. Missing,
   invalid, or component-incompatible alignment is neutral under `none` and
-  zero under weighted modes. The default is `none`.
+  zero under weighted modes. The default is `linear`.
 - `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
   zero predicted delta adds
   `sign_cost * decision_confidence * normal_confidence` per measurement.
@@ -5894,9 +5894,9 @@
 - Standard fixed-orientation crop evaluation defaults to orientation BP
   temperature `1.25` and winding-stage Defect cost `100`. The underlying
   winding factor temperature remains `0.25`. These defaults, both sign classes,
-  finite sign cost `44`, decision `legacy`, and normal confidence `none` are
+  finite sign cost `44`, decision `cosine`, and normal confidence `linear` are
   the selected fixed-1024-crop benchmark row.
-- Shared and CLI H/V-aware winding defaults are `8,1,2,2,1`. An explicit
+- Shared and CLI H/V-aware winding defaults are `0,2,2,2,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not
   quantize the H/V ladder targets used for canonical class selection.
