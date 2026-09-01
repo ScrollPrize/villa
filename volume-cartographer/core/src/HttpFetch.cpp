@@ -115,10 +115,6 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
                 "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
         }
     }
-    if (resp.status_code == 0 && !resp.error_message.empty()) {
-        throw std::runtime_error(
-            "HTTP transport error fetching " + url + ": " + resp.error_message);
-    }
     return {};
 }
 
@@ -138,6 +134,10 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
             throw std::runtime_error(
                 "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
         }
+    }
+    if (resp.status_code == 0 && !resp.error_message.empty()) {
+        throw std::runtime_error(
+            "HTTP transport error fetching " + url + ": " + resp.error_message);
     }
     return {};
 }
