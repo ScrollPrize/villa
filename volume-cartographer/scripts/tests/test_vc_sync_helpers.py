@@ -1277,6 +1277,29 @@ class TestSftpManagerState:
         assert env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] == os.path.expanduser(
             '~/.ssh/known_hosts')
 
+    def test_shell_type_and_hash_commands_are_pinned(self, sftp_manager):
+        """Detection must not run at all: rclone's lazy per-connection
+        shell/hash probe cannot be persisted for an on-the-fly :sftp:
+        backend, and racing it across --checkers connections makes a
+        batched md5sum report "hash unsupported" for most files —
+        silently degrading change detection to size+mtime."""
+        env = sftp_manager._rclone_env()
+        assert env['RCLONE_SFTP_SHELL_TYPE'] == 'unix'
+        assert env['RCLONE_SFTP_MD5SUM_COMMAND'] == 'md5sum'
+        assert env['RCLONE_SFTP_SHA1SUM_COMMAND'] == 'sha1sum'
+
+    def test_pins_override_a_polluted_caller_environment(self, sftp_manager,
+                                                         monkeypatch):
+        """Like host/user/pass, the pins are enforced, not defaults: a
+        stray RCLONE_SFTP_* in the caller's shell must not reintroduce
+        the probe race. (Deliberate overrides go through
+        VC_SYNC_RCLONE_FLAGS — rclone flags beat its env vars.)"""
+        monkeypatch.setenv('RCLONE_SFTP_SHELL_TYPE', 'powershell')
+        monkeypatch.setenv('RCLONE_SFTP_MD5SUM_COMMAND', 'certutil')
+        env = sftp_manager._rclone_env()
+        assert env['RCLONE_SFTP_SHELL_TYPE'] == 'unix'
+        assert env['RCLONE_SFTP_MD5SUM_COMMAND'] == 'md5sum'
+
     def test_display_url(self, sftp_manager):
         assert sftp_manager._get_s3_url('a/b.json') == (
             'sftp://user1@ash.example.org:2022/srv/backup/a/b.json')
@@ -1429,16 +1452,19 @@ class TestSftpScanAndHashes:
         assert sftp_manager._remote_hashing_works is True
 
     def test_md5sums_unsupported_server_disables_hashing(self, sftp_manager,
-                                                         monkeypatch):
+                                                         monkeypatch, capsys):
         ran = []
         monkeypatch.setattr(
             sftp_manager, '_run_rclone_capture',
             lambda args, timeout=None: ran.append(args) or completed(stdout=''))
         assert sftp_manager._remote_md5sums(['a.json']) == {}
         assert sftp_manager._remote_hashing_works is False
+        # The user is told why hashing degraded — once, on first detection
+        assert 'hashing unavailable' in capsys.readouterr().out
         # Later calls short-circuit instead of re-probing the server
         assert sftp_manager._remote_md5sums(['b.json']) == {}
         assert len(ran) == 1
+        assert 'hashing unavailable' not in capsys.readouterr().out
 
 
 class TestSftpAnalyzeIntegration:
