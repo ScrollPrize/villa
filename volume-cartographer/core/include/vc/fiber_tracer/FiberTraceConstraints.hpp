@@ -35,6 +35,11 @@ struct FiberTraceConstraintConfig {
     double phaseRefinementLimitFraction = 0.05;
     double correspondenceGridStepFraction = 0.05;
     double correspondenceGridLimitFraction = 0.25;
+    double correspondenceGridStepWeight = 1.0;
+    double correspondenceGridPerpendicularWeight = 1.0;
+    double correspondenceGridDirectionWeight = 0.0;
+    double correspondenceGridLengthWeight = 0.0;
+    bool collectParallelCorrespondenceDiagnostics = false;
     double windingIntegrationStepBaseVoxels = 8.0;
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = true;
@@ -64,9 +69,17 @@ struct FiberTraceConstraint {
     double windingDistance = 0.0;
     bool hardContinuity = false;
     std::optional<double> signedWindingDelta;
+    std::optional<double> perpendicularNormalAlignment;
     std::optional<std::size_t> windingNormalComponent;
     double parallelWindingDistance = 0.0;
     std::optional<double> signedParallelWindingDelta;
+    std::optional<double> parallelNormalAlignment;
+    std::size_t parallelCorrespondenceSamples = 0;
+    double parallelMeanAdvanceResidualFraction = 0.0;
+    double parallelMeanConnectorTangentAbsDot = 0.0;
+    double parallelMeanConnectorLengthChangeFraction = 0.0;
+    double parallelMeanConnectorDirectionChange = 0.0;
+    double parallelLimitHitFraction = 0.0;
 };
 
 struct FiberTraceConstraintReport {

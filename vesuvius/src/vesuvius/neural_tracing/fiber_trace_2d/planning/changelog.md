@@ -1703,3 +1703,33 @@
   the target step while retaining 5% grid resolution.
 - Kept the expanded grid behind `--parallel-correspondence perpendicular-grid`
   and restored the established closest-distance walk as the default.
+- Added experimental grid range/objective controls and correspondence geometry
+  columns to winding-factor CSV diagnostics. A fixed 1024-crop reference sweep
+  found no grid setting above the distance baseline: independent grid steps
+  improve perpendicularity but perturb signed winding estimates across hard
+  integer-bin boundaries.
+
+## 2026-09-01 - Winding sign and zero-weight controls
+
+- Allowed individual canonical winding magnitude classes to be disabled with
+  zero weights while keeping zero/no-sign observations out of winding
+  connectivity and Defect incidence.
+- Added independent dominant perpendicular and parallel hard-sign controls,
+  including sign-only inference, with matching solver and reference benchmark
+  semantics.
+- On the fixed 1024 crop, the existing perpendicular-sign configuration
+  (`8,1,2,2,1`, Defect cost 50, piece-break cost 0, BP temperature 2.5)
+  remained the best converged result and reproduced exactly on a second run.
+
+## 2026-09-01 - Confidence-weighted winding evidence
+
+- Added linear and cosine post-decision confidence, linear-angle and raw-dot
+  normal confidence, and deterministic median parallel-normal alignment.
+- Added optional finite sign-infringement penalties with matching solver,
+  connectivity, Defect-incidence, diagnostics, and reference semantics while
+  preserving legacy defaults.
+- The fixed 1024-crop sweep found confidence attenuation harmful, but a finite
+  cost of 44 for both sign classes with Defect cost 100 and temperature 1.25
+  retained 8/8 exact reference windings and increased matched constraints from
+  1,784 to 1,875. These parameters are now the standard defaults; the former
+  hard-sign behavior remains available with `--winding-sign-cost hard`.

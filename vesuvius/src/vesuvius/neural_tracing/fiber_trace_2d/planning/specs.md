@@ -4845,16 +4845,25 @@
   `perpendicular-grid` correspondence instead walks incrementally from the last
   accepted pair. At each step, an independent deterministic 2D grid varies each
   advance in increments of one twentieth pitch, bounded to one quarter pitch.
-  Grid candidates
-  minimize the sum of both squared target-step-normalized advance residuals and
-  the squared dot of the unit connector with each centered tangent. Zero-length
-  connectors are invalid; connector length is not part of the objective. Ties
+  Grid candidates minimize configurable nonnegative weights of both squared
+  target-step-normalized advance residuals and the squared dot of the unit
+  connector with each centered tangent. Optional nonnegative terms penalize
+  connector-direction change and squared target-step-normalized connector-
+  length change from the previous accepted pair; both default to zero.
+  Zero-length connectors are invalid; absolute connector length is not part of
+  the objective. Ties
   prefer smaller step residual, smaller total absolute offset, then
   lexicographic offsets. The grid limit must remain below one pitch so every
   accepted step advances. The raw parallel score is the clamped `[0,1]` mean
   of consistently oriented tangent dots. Raw perpendicular score is
   `1 - abs(initial tangent dot)`. Division by their sum produces complementary
   normalized scores.
+- Grid step, range, and all four objective weights are explicit CLI controls.
+  The distance default ignores them. Each measured link records diagnostic-only
+  sample count, advance residual, connector/tangent residual, connector-length
+  change, connector-direction change, and limit-hit fraction; winding-factor
+  CSV output exposes those values when explicitly enabled. Collection defaults
+  off and does not change BP inputs.
 - Normal-aligned winding uses the existing Lasagna connector integral and
   trapezoidal sampling. Each endpoint winding-density sample is multiplied by
   `abs(dot(unit connector, decoded unit normal))`. Missing required normal or
@@ -5742,13 +5751,50 @@
 - Published `N` is the solver's nonnegative display-offset integer label.
   Absolute winding and physical H/V identity are not comparable across
   independently gauged components; visualization must not imply otherwise.
-- Winding BP accepts one strictly positive finite multiplier for each canonical
+- Winding BP accepts one finite nonnegative multiplier for each canonical
   dominant factor class in tuple order `perp_0.5`, `perp_1.5+`, `parallel_0`,
   `parallel_1`, `parallel_2+`. The multiplier composes with the existing
   canonical-distance decay. Signed parallel targets are authoritative for
   integer class selection. These multipliers affect finite winding loss and
   its diagnostics only; they never scale orientation loss, hard perpendicular
   order, hard continuity, Defect unary cost, or piece-break cost.
+- `--winding-hard-signs none|perpendicular|parallel|both` independently enables
+  signed ordering for the dominant perpendicular and parallel hypotheses. The
+  default enables both. A zero magnitude weight
+  removes the corresponding finite loss. If that dominant observation has an
+  enabled nonzero sign, it remains in winding connectivity, Defect incidence,
+  BP, projection, and reference inference; without an enabled sign it remains
+  orientation-only and is absent from all winding calculations. Zero/same-
+  winding and unsigned observations never impose hard signs, and parallel
+  signs obey the parallel winding cutoff. Canonical class weights do not alter
+  same-trace hard continuity.
+- `--winding-decision-confidence legacy|linear|cosine` scales only the selected
+  dominant winding factor. For selected normalized score `s` in `[0.5,1]`,
+  `legacy` uses `s`, `linear` uses `2s-1`, and `cosine` uses
+  `(1-cos(pi*(2s-1)))/2`. The default is `legacy`.
+- `--winding-normal-confidence none|linear|cosine` additionally scales that
+  factor from the connector's absolute alignment with the aligned normal.
+  `none` uses one; `linear` uses `1-2*acos(abs_dot)/pi`; `cosine` uses
+  `abs_dot`. Perpendicular evidence uses the closest connector alignment.
+  Parallel evidence uses the deterministic median over every admitted signed
+  connector sample, averaging the central pair for an even count. Missing,
+  invalid, or component-incompatible alignment is neutral under `none` and
+  zero under weighted modes. The default is `none`.
+- `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
+  zero predicted delta adds
+  `sign_cost * decision_confidence * normal_confidence` per measurement.
+  Magnitude class weights and distance decay do not scale this term. Zero cost
+  or zero confidence removes the sign factor from energy, connectivity, and
+  Defect incidence. The literal value `hard` restores strict rejection
+  regardless of confidence. Solver, decoded energy, factor diagnostics, and reference
+  inference must use identical coefficients. These controls never alter H/V
+  orientation evidence, same-trace hard continuity, or the discrete Defect
+  unary.
+- Standard fixed-orientation crop evaluation defaults to orientation BP
+  temperature `1.25` and winding-stage Defect cost `100`. The underlying
+  winding factor temperature remains `0.25`. These defaults, both sign classes,
+  finite sign cost `44`, decision `legacy`, and normal confidence `none` are
+  the selected fixed-1024-crop benchmark row.
 - Shared and CLI H/V-aware winding defaults are `8,1,2,2,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not

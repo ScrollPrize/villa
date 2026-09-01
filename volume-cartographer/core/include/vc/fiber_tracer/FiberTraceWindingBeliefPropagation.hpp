@@ -89,6 +89,24 @@ enum class FiberTraceWindingCalibrationMode : unsigned char {
 inline constexpr std::array<double, 5>
     kDefaultFiberTraceWindingClassWeights{8.0, 1.0, 2.0, 2.0, 1.0};
 
+enum class FiberTraceWindingDecisionConfidence : unsigned char {
+    Legacy,
+    Linear,
+    Cosine,
+};
+
+enum class FiberTraceWindingNormalConfidence : unsigned char {
+    None,
+    Linear,
+    Cosine,
+};
+
+[[nodiscard]] const char* fiberTraceWindingDecisionConfidenceName(
+    FiberTraceWindingDecisionConfidence mode) noexcept;
+
+[[nodiscard]] const char* fiberTraceWindingNormalConfidenceName(
+    FiberTraceWindingNormalConfidence mode) noexcept;
+
 struct FiberTraceWindingBeliefPropagationConfig {
     double temperature = 0.25;
     double messageDamping = 0.5;
@@ -98,6 +116,13 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::size_t maximumTotalCandidateStates = 4'000'000;
     std::size_t parallelWorkers = 1;
     std::optional<double> parallelWindingDistanceCutoff;
+    bool enforcePerpendicularWindingSign = true;
+    bool enforceParallelWindingSign = true;
+    FiberTraceWindingDecisionConfidence decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    FiberTraceWindingNormalConfidence normalConfidence =
+        FiberTraceWindingNormalConfidence::None;
+    std::optional<double> finiteSignInfringementCost = 44.0;
     double perpendicularNextWeight =
         kDefaultFiberTraceWindingClassWeights[0];
     double perpendicularFarWeight =
@@ -126,7 +151,7 @@ struct FiberTraceWindingComponentSelection {
     std::optional<std::size_t> preferredPiece = std::nullopt);
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
-    double mixedUnaryCost = 1.0;
+    double mixedUnaryCost = 100.0;
     double pieceBreakCost = 0.0;
     double orientationTemperature = 0.25;
     double minimumMeasurementScale = 0.5;
@@ -136,7 +161,7 @@ struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationCo
 };
 
 struct FiberTraceJointGridWindingConfig : FiberTraceWindingBeliefPropagationConfig {
-    double mixedUnaryCost = 1.0;
+    double mixedUnaryCost = 100.0;
     double pieceBreakCost = 0.0;
     double orientationTemperature = 0.25;
     std::optional<double> fixedPhaseMagnitude;
@@ -227,6 +252,12 @@ struct FiberTraceWindingFactorDiagnostic {
     double perpendicularWindingWeightMultiplier = 1.0;
     double effectiveParallelWindingWeight = 0.0;
     double effectivePerpendicularWindingWeight = 0.0;
+    double decisionConfidenceMultiplier = 1.0;
+    double normalConfidenceMultiplier = 1.0;
+    double effectiveParallelSignPenalty = 0.0;
+    double effectivePerpendicularSignPenalty = 0.0;
+    std::optional<double> perpendicularNormalAlignment;
+    std::optional<double> parallelNormalAlignment;
     std::optional<double> originalSignedDelta;
     std::optional<double> canonicalSignedDelta;
     double effectiveParallelWindingDistance = 0.0;
@@ -237,6 +268,8 @@ struct FiberTraceWindingFactorDiagnostic {
     std::optional<double> originalSignedParallelDelta;
     std::optional<double> canonicalSignedParallelDelta;
     std::optional<double> effectiveSignedParallelDelta;
+    bool hardPerpendicularSign = false;
+    bool hardParallelSign = false;
 };
 
 enum class FiberTraceConstraintEvidenceClass : unsigned char {
@@ -387,9 +420,15 @@ struct FiberTraceReferenceWindingObservation {
     double rawParallelCoefficient = 0.0;
     double admittedParallelCoefficient = 0.0;
     double perpendicularCoefficient = 0.0;
+    double decisionConfidenceMultiplier = 1.0;
+    double normalConfidenceMultiplier = 1.0;
+    double parallelSignPenalty = 0.0;
+    double perpendicularSignPenalty = 0.0;
     double parallelDistance = 0.0;
     std::optional<double> signedParallelTarget;
     std::optional<double> signedPerpendicularTarget;
+    bool hardParallelSign = false;
+    bool hardPerpendicularSign = false;
 };
 
 struct FiberTraceReferenceBenchmarkCounts {

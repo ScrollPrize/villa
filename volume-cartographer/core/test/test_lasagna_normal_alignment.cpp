@@ -302,10 +302,16 @@ TEST_CASE("Aligned normal field orients winding without changing its magnitude")
     CHECK(report.constraints[0].signedWindingDelta == doctest::Approx(0.75));
     CHECK(report.constraints[0].signedParallelWindingDelta ==
           doctest::Approx(1.25));
+    CHECK(report.constraints[0].perpendicularNormalAlignment ==
+          doctest::Approx(1.0));
+    CHECK_FALSE(report.constraints[0].parallelNormalAlignment.has_value());
     CHECK(report.constraints[1].windingDistance == doctest::Approx(0.75));
     CHECK(report.constraints[1].signedWindingDelta == doctest::Approx(-0.75));
     CHECK(report.constraints[1].signedParallelWindingDelta ==
           doctest::Approx(-1.25));
+    CHECK(report.constraints[1].perpendicularNormalAlignment ==
+          doctest::Approx(1.0));
+    CHECK_FALSE(report.constraints[1].parallelNormalAlignment.has_value());
     CHECK(report.signedWindingConstraints == 2);
     CHECK(report.skippedSignedWindingConstraints == 0);
 

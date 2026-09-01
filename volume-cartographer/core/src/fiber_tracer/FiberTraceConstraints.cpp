@@ -75,6 +75,7 @@ struct ScoredCandidate {
 
 struct SignedWindingSample {
     double value = 0.0;
+    double absoluteAlignment = 0.0;
     std::size_t component = 0;
 };
 
@@ -134,6 +135,7 @@ std::optional<SignedWindingSample> signedWindingSample(
     }
     return SignedWindingSample{
         std::copysign(windingDistance, signedAlignment),
+        std::clamp(std::abs(signedAlignment), 0.0, 1.0),
         atMidpoint->component,
     };
 }
@@ -174,6 +176,19 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         config.correspondenceGridLimitFraction >=
             config.correspondenceGridStepFraction &&
         config.correspondenceGridLimitFraction < 1.0 &&
+        std::isfinite(config.correspondenceGridStepWeight) &&
+        config.correspondenceGridStepWeight >= 0.0 &&
+        std::isfinite(config.correspondenceGridPerpendicularWeight) &&
+        config.correspondenceGridPerpendicularWeight >= 0.0 &&
+        std::isfinite(config.correspondenceGridDirectionWeight) &&
+        config.correspondenceGridDirectionWeight >= 0.0 &&
+        std::isfinite(config.correspondenceGridLengthWeight) &&
+        config.correspondenceGridLengthWeight >= 0.0 &&
+        config.correspondenceGridStepWeight +
+                config.correspondenceGridPerpendicularWeight +
+                config.correspondenceGridDirectionWeight +
+                config.correspondenceGridLengthWeight >
+            0.0 &&
         std::isfinite(config.windingIntegrationStepBaseVoxels) &&
         config.windingIntegrationStepBaseVoxels > 0.0 &&
         std::isfinite(config.maximumWindingDistance) &&
@@ -358,11 +373,21 @@ std::optional<RefinedCorrespondence> refinedCorrespondence(
     double targetStep,
     double gridStep,
     double gridLimit,
-    double tangentWindow)
+    double tangentWindow,
+    double stepWeight,
+    double perpendicularWeight,
+    double directionWeight,
+    double lengthWeight)
 {
     const int gridRadius = static_cast<int>(std::floor(
         gridLimit / gridStep + kEpsilon));
     std::optional<RefinedCorrespondence> best;
+    const cv::Vec3d previousConnector =
+        samplePolylineArc(geometryB, previousB).point -
+        samplePolylineArc(geometryA, previousA).point;
+    const double previousConnectorLength = length(previousConnector);
+    const cv::Vec3d previousConnectorDirection =
+        normalizedOrZero(previousConnector);
     for (int indexA = -gridRadius; indexA <= gridRadius; ++indexA) {
         const double offsetA = static_cast<double>(indexA) * gridStep;
         const double advanceA = targetStep + offsetA;
@@ -410,6 +435,15 @@ std::optional<RefinedCorrespondence> refinedCorrespondence(
                 normalizedOffsetB * normalizedOffsetB;
             const double perpendicularA = connectorDirection.dot(*tangentA);
             const double perpendicularB = connectorDirection.dot(*tangentB);
+            const double directionChange =
+                length(previousConnectorDirection) > kEpsilon
+                ? 1.0 - std::clamp(
+                      previousConnectorDirection.dot(connectorDirection),
+                      -1.0,
+                      1.0)
+                : 0.0;
+            const double normalizedLengthChange =
+                (connectorLength - previousConnectorLength) / targetStep;
 
             RefinedCorrespondence candidate;
             candidate.arcA = candidateArcA;
@@ -419,9 +453,12 @@ std::optional<RefinedCorrespondence> refinedCorrespondence(
             candidate.tangentA = *tangentA;
             candidate.tangentB = *tangentB;
             candidate.stepResidual = stepResidual;
-            candidate.energy = stepResidual +
-                perpendicularA * perpendicularA +
-                perpendicularB * perpendicularB;
+            candidate.energy = stepWeight * stepResidual +
+                perpendicularWeight * (
+                    perpendicularA * perpendicularA +
+                    perpendicularB * perpendicularB) +
+                directionWeight * directionChange +
+                lengthWeight * normalizedLengthChange * normalizedLengthChange;
             candidate.offsetMagnitude =
                 std::abs(offsetA) + std::abs(offsetB);
             candidate.offsetA = offsetA;
@@ -461,6 +498,61 @@ ScoredCandidate scoreCandidate(
     parallelConnectors.emplace_back(
         pieceA.samplePointsBaseXYZ[candidate.sampleA],
         pieceB.samplePointsBaseXYZ[candidate.sampleB]);
+    double advanceResidualSum = 0.0;
+    double perpendicularResidualSum = 0.0;
+    double lengthChangeSum = 0.0;
+    double directionChangeSum = 0.0;
+    std::size_t diagnosticSteps = 0;
+    std::size_t perpendicularSamples = 0;
+    std::size_t limitHits = 0;
+    const auto recordPerpendicular = [&](
+                                         const cv::Vec3d& connector,
+                                         const cv::Vec3d& tangentA,
+                                         const cv::Vec3d& tangentB) {
+        const cv::Vec3d direction = normalizedOrZero(connector);
+        if (length(direction) <= kEpsilon)
+            return;
+        perpendicularResidualSum += 0.5 * (
+            std::abs(direction.dot(tangentA)) +
+            std::abs(direction.dot(tangentB)));
+        ++perpendicularSamples;
+    };
+    if (config.collectParallelCorrespondenceDiagnostics) {
+        recordPerpendicular(
+            parallelConnectors.front().second - parallelConnectors.front().first,
+            *initialA,
+            *initialB);
+    }
+    const auto recordStep = [&](
+                                double previousA,
+                                double previousB,
+                                double nextA,
+                                double nextB,
+                                const cv::Vec3d& tangentA,
+                                const cv::Vec3d& tangentB,
+                                const std::pair<cv::Vec3d, cv::Vec3d>& previous,
+                                const std::pair<cv::Vec3d, cv::Vec3d>& next,
+                                bool hitLimit) {
+        const double target = config.resampleSpacingBaseVoxels;
+        advanceResidualSum += 0.5 * (
+            std::abs(std::abs(nextA - previousA) - target) +
+            std::abs(std::abs(nextB - previousB) - target)) / target;
+        const cv::Vec3d previousConnector = previous.second - previous.first;
+        const cv::Vec3d nextConnector = next.second - next.first;
+        const double previousLength = length(previousConnector);
+        const double nextLength = length(nextConnector);
+        lengthChangeSum += std::abs(nextLength - previousLength) / target;
+        const cv::Vec3d previousDirection = normalizedOrZero(previousConnector);
+        const cv::Vec3d nextDirection = normalizedOrZero(nextConnector);
+        if (length(previousDirection) > kEpsilon &&
+            length(nextDirection) > kEpsilon) {
+            directionChangeSum += 1.0 - std::clamp(
+                previousDirection.dot(nextDirection), -1.0, 1.0);
+        }
+        recordPerpendicular(nextConnector, tangentA, tangentB);
+        limitHits += hitLimit;
+        ++diagnosticSteps;
+    };
     const double refinementStep = config.resampleSpacingBaseVoxels *
         config.phaseRefinementStepFraction;
     const double refinementLimit = config.resampleSpacingBaseVoxels *
@@ -474,6 +566,9 @@ ScoredCandidate scoreCandidate(
         if (config.parallelCorrespondence ==
             FiberTraceParallelCorrespondence::Distance) {
             double phase = 0.0;
+            double previousA = arcA;
+            double previousB = arcB;
+            auto previousConnector = parallelConnectors.front();
             for (std::size_t step = 1;; ++step) {
                 const double distance = static_cast<double>(step) *
                     config.resampleSpacingBaseVoxels;
@@ -514,14 +609,31 @@ ScoredCandidate scoreCandidate(
                     tangentA->dot(*tangentB * static_cast<double>(orientation)),
                     -1.0,
                     1.0);
-                parallelConnectors.emplace_back(
+                const std::pair connector{
                     samplePolylineArc(geometryA, arcs->first).point,
-                    samplePolylineArc(geometryB, arcs->second).point);
+                    samplePolylineArc(geometryB, arcs->second).point};
+                if (config.collectParallelCorrespondenceDiagnostics) {
+                    recordStep(
+                        previousA,
+                        previousB,
+                        arcs->first,
+                        arcs->second,
+                        *tangentA,
+                        *tangentB,
+                        previousConnector,
+                        connector,
+                        std::abs(selectedPhase) >= refinementLimit - kEpsilon);
+                }
+                previousA = arcs->first;
+                previousB = arcs->second;
+                previousConnector = connector;
+                parallelConnectors.push_back(connector);
                 ++parallelCount;
             }
         } else {
             double previousA = arcA;
             double previousB = arcB;
+            auto previousConnector = parallelConnectors.front();
             for (;;) {
                 const auto correspondence = refinedCorrespondence(
                     pieceA,
@@ -535,20 +647,39 @@ ScoredCandidate scoreCandidate(
                     config.resampleSpacingBaseVoxels,
                     gridStep,
                     gridLimit,
-                    config.tangentWindowBaseVoxels);
+                    config.tangentWindowBaseVoxels,
+                    config.correspondenceGridStepWeight,
+                    config.correspondenceGridPerpendicularWeight,
+                    config.correspondenceGridDirectionWeight,
+                    config.correspondenceGridLengthWeight);
                 if (!correspondence.has_value())
                     break;
-                previousA = correspondence->arcA;
-                previousB = correspondence->arcB;
                 parallelSum += std::clamp(
                     correspondence->tangentA.dot(
                         correspondence->tangentB * static_cast<double>(orientation)),
                     -1.0,
                     1.0);
-                parallelConnectors.emplace_back(
+                const std::pair connector{
                     correspondence->pointA,
-                    correspondence->pointB);
+                    correspondence->pointB};
+                if (config.collectParallelCorrespondenceDiagnostics) {
+                    recordStep(
+                        previousA,
+                        previousB,
+                        correspondence->arcA,
+                        correspondence->arcB,
+                        correspondence->tangentA,
+                        correspondence->tangentB,
+                        previousConnector,
+                        connector,
+                        std::abs(correspondence->offsetA) >= gridLimit - kEpsilon ||
+                            std::abs(correspondence->offsetB) >= gridLimit - kEpsilon);
+                }
                 ++parallelCount;
+                previousA = correspondence->arcA;
+                previousB = correspondence->arcB;
+                previousConnector = connector;
+                parallelConnectors.push_back(connector);
             }
         }
     }
@@ -573,6 +704,24 @@ ScoredCandidate scoreCandidate(
     constraint.parallelScore = rawParallel / evidence;
     constraint.perpendicularScore = rawPerpendicular / evidence;
     constraint.windingDistance = 0.0;
+    constraint.parallelCorrespondenceSamples =
+        config.collectParallelCorrespondenceDiagnostics ? parallelCount : 0;
+    if (diagnosticSteps != 0) {
+        const double inverse = 1.0 / static_cast<double>(diagnosticSteps);
+        constraint.parallelMeanAdvanceResidualFraction =
+            advanceResidualSum * inverse;
+        constraint.parallelMeanConnectorLengthChangeFraction =
+            lengthChangeSum * inverse;
+        constraint.parallelMeanConnectorDirectionChange =
+            directionChangeSum * inverse;
+        constraint.parallelLimitHitFraction =
+            static_cast<double>(limitHits) * inverse;
+    }
+    if (perpendicularSamples != 0) {
+        constraint.parallelMeanConnectorTangentAbsDot =
+            perpendicularResidualSum /
+            static_cast<double>(perpendicularSamples);
+    }
     if (constraint.parallelScore <= constraint.perpendicularScore)
         parallelConnectors.resize(1);
     return {
@@ -856,16 +1005,22 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 connectors[begin], closestWinding, *alignedNormals);
             if (closestSigned) {
                 result.constraint->signedWindingDelta = closestSigned->value;
+                result.constraint->perpendicularNormalAlignment =
+                    closestSigned->absoluteAlignment;
                 result.constraint->windingNormalComponent =
                     closestSigned->component;
                 std::vector<double> signedParallelWindings;
+                std::vector<double> parallelAlignments;
                 signedParallelWindings.reserve(end - begin);
+                parallelAlignments.reserve(end - begin);
                 for (std::size_t sample = begin; sample < end; ++sample) {
                     const auto signedSample = signedWindingSample(
                         connectors[sample], windings[sample], *alignedNormals);
                     if (signedSample &&
                         signedSample->component == closestSigned->component) {
                         signedParallelWindings.push_back(signedSample->value);
+                        parallelAlignments.push_back(
+                            signedSample->absoluteAlignment);
                     }
                 }
                 if (!signedParallelWindings.empty()) {
@@ -873,6 +1028,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                         median(signedParallelWindings);
                     result.constraint->parallelWindingDistance = std::abs(
                         *result.constraint->signedParallelWindingDelta);
+                    result.constraint->parallelNormalAlignment =
+                        median(parallelAlignments);
                 }
             }
         }
@@ -983,10 +1140,14 @@ void orientFiberTraceConstraintWindings(
     for (auto& constraint : report.constraints) {
         constraint.signedWindingDelta.reset();
         constraint.signedParallelWindingDelta.reset();
+        constraint.perpendicularNormalAlignment.reset();
+        constraint.parallelNormalAlignment.reset();
         constraint.windingNormalComponent.reset();
         if (constraint.hardContinuity) {
             constraint.signedWindingDelta = 0.0;
             constraint.signedParallelWindingDelta = 0.0;
+            constraint.perpendicularNormalAlignment = 1.0;
+            constraint.parallelNormalAlignment = 1.0;
             ++report.signedWindingConstraints;
             continue;
         }
@@ -1024,6 +1185,8 @@ void orientFiberTraceConstraintWindings(
         }
         constraint.signedWindingDelta = std::copysign(
             constraint.windingDistance, signedAlignment);
+        constraint.perpendicularNormalAlignment =
+            std::clamp(std::abs(signedAlignment), 0.0, 1.0);
         constraint.signedParallelWindingDelta = std::copysign(
             constraint.parallelWindingDistance, signedAlignment);
         constraint.windingNormalComponent = atMidpoint->component;

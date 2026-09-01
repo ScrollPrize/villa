@@ -91,9 +91,18 @@ struct Options {
     vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
-    double windingDefectCost = 1.0;
+    double windingDefectCost = 100.0;
     double pieceBreakCost = 0.0;
     std::optional<double> parallelWindingCutoff;
+    bool enforcePerpendicularWindingSign = true;
+    bool enforceParallelWindingSign = true;
+    vc::fiber_tracer::FiberTraceWindingDecisionConfidence
+        windingDecisionConfidence =
+            vc::fiber_tracer::FiberTraceWindingDecisionConfidence::Legacy;
+    vc::fiber_tracer::FiberTraceWindingNormalConfidence
+        windingNormalConfidence =
+            vc::fiber_tracer::FiberTraceWindingNormalConfidence::None;
+    std::optional<double> windingSignCost = 44.0;
     std::array<double, 5> windingWeights =
         vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
     std::optional<std::vector<double>> windingWeightSearch;
@@ -121,6 +130,10 @@ struct Options {
     bool hasPieceBreakCostOption = false;
     bool hasParallelWindingCutoffOption = false;
     bool hasWindingWeightOption = false;
+    bool hasWindingSignOption = false;
+    bool hasWindingDecisionConfidenceOption = false;
+    bool hasWindingNormalConfidenceOption = false;
+    bool hasWindingSignCostOption = false;
     bool hasWindingWeightSearchOption = false;
     bool hasWindingWeightSearchLocalOption = false;
     bool hasJointGridOption = false;
@@ -228,7 +241,7 @@ void usage(const char* executable)
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
-              << "  --bp-temperature F        min-marginal decoding temperature [0.25]\n"
+              << "  --bp-temperature F        min-marginal decoding temperature [1.25]\n"
               << "  --bp-message-iterations N message update limit [500]\n"
               << "  --bp-balance-iterations N field update limit [64]\n"
               << "  --bp-damping F            message damping in (0,1] [0.5]\n"
@@ -236,12 +249,18 @@ void usage(const char* executable)
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
-              << "  --winding-defect-cost F   winding-stage Defect cost per constraint [1]\n"
+              << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
               << "  --piece-break-cost F      same-trace active/Defect boundary cost [0]\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
+              << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
+              << "  --winding-decision-confidence MODE\n"
+              << "                              legacy, linear, or cosine [legacy]\n"
+              << "  --winding-normal-confidence MODE\n"
+              << "                              none, linear, or cosine [none]\n"
+              << "  --winding-sign-cost F|hard finite enabled-sign infringement cost [44]\n"
               << "  --winding-weights P05,PFAR,P0,P1,P2\n"
-              << "                              five canonical factor multipliers [8,1,2,2,1]\n"
+              << "                              five nonnegative factor multipliers [8,1,2,2,1]\n"
               << "  --winding-weight-search V0,V1,...\n"
               << "                              exhaustive five-class reference grid\n"
               << "  --winding-weight-search-local\n"
@@ -263,6 +282,14 @@ void usage(const char* executable)
               << "  --tangent-window N         centered tangent secant length [32]\n"
               << "  --parallel-correspondence MODE\n"
               << "                              distance or perpendicular-grid [distance]\n"
+              << "  --parallel-grid-step F     grid step as sample-step fraction [0.05]\n"
+              << "  --parallel-grid-limit F    per-step grid range as sample-step fraction [0.25]\n"
+              << "  --parallel-step-weight F   nonnegative advance-residual weight [1]\n"
+              << "  --parallel-perp-weight F   nonnegative perpendicularity weight [1]\n"
+              << "  --parallel-direction-weight F\n"
+              << "                              nonnegative connector continuity weight [0]\n"
+              << "  --parallel-length-weight F nonnegative length continuity weight [0]\n"
+              << "  --parallel-diagnostics     collect correspondence geometry CSV fields\n"
               << "  --winding-step N           Lasagna connector integration step [8]\n"
               << "  --winding-cutoff N         exclusive finite winding cutoff [4 H/V; 1.5 parity]\n"
               << "  --no-winding-cutoff        retain every finite winding measurement\n"
@@ -309,7 +336,11 @@ std::size_t count(int& index, int argc, char** argv, const char* option)
 }
 
 std::vector<double> numberList(
-    int& index, int argc, char** argv, const char* option)
+    int& index,
+    int argc,
+    char** argv,
+    const char* option,
+    bool allowZero = false)
 {
     const std::string input = value(index, argc, argv, option);
     std::vector<double> result;
@@ -324,9 +355,11 @@ std::vector<double> numberList(
         std::size_t parsed = 0;
         const double parsedValue = std::stod(item, &parsed);
         if (parsed != item.size() || !std::isfinite(parsedValue) ||
-            !(parsedValue > 0.0)) {
+            (allowZero ? parsedValue < 0.0 : !(parsedValue > 0.0))) {
             fail(std::string(option) +
-                 " requires finite positive comma-separated numbers");
+                 (allowZero
+                      ? " requires finite nonnegative comma-separated numbers"
+                      : " requires finite positive comma-separated numbers"));
         }
         result.push_back(parsedValue);
         if (end == std::string::npos)
@@ -640,13 +673,91 @@ Options parse(int argc, char** argv)
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-weights") {
             const auto values = numberList(
-                index, argc, argv, "--winding-weights");
+                index, argc, argv, "--winding-weights", true);
             if (values.size() != options.windingWeights.size()) {
                 fail("--winding-weights requires exactly five values");
             }
             std::copy(
                 values.begin(), values.end(), options.windingWeights.begin());
             options.hasWindingWeightOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-hard-signs") {
+            const std::string mode = value(
+                index, argc, argv, "--winding-hard-signs");
+            if (mode == "none") {
+                options.enforcePerpendicularWindingSign = false;
+                options.enforceParallelWindingSign = false;
+            } else if (mode == "perpendicular") {
+                options.enforcePerpendicularWindingSign = true;
+                options.enforceParallelWindingSign = false;
+            } else if (mode == "parallel") {
+                options.enforcePerpendicularWindingSign = false;
+                options.enforceParallelWindingSign = true;
+            } else if (mode == "both") {
+                options.enforcePerpendicularWindingSign = true;
+                options.enforceParallelWindingSign = true;
+            } else {
+                fail("--winding-hard-signs must be none, perpendicular, parallel, or both");
+            }
+            options.hasWindingSignOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-decision-confidence") {
+            const std::string mode = value(
+                index, argc, argv, "--winding-decision-confidence");
+            if (mode == "legacy") {
+                options.windingDecisionConfidence = vc::fiber_tracer::
+                    FiberTraceWindingDecisionConfidence::Legacy;
+            } else if (mode == "linear") {
+                options.windingDecisionConfidence = vc::fiber_tracer::
+                    FiberTraceWindingDecisionConfidence::Linear;
+            } else if (mode == "cosine") {
+                options.windingDecisionConfidence = vc::fiber_tracer::
+                    FiberTraceWindingDecisionConfidence::Cosine;
+            } else {
+                fail("--winding-decision-confidence must be legacy, linear, or cosine");
+            }
+            options.hasWindingDecisionConfidenceOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-normal-confidence") {
+            const std::string mode = value(
+                index, argc, argv, "--winding-normal-confidence");
+            if (mode == "none") {
+                options.windingNormalConfidence = vc::fiber_tracer::
+                    FiberTraceWindingNormalConfidence::None;
+            } else if (mode == "linear") {
+                options.windingNormalConfidence = vc::fiber_tracer::
+                    FiberTraceWindingNormalConfidence::Linear;
+            } else if (mode == "cosine") {
+                options.windingNormalConfidence = vc::fiber_tracer::
+                    FiberTraceWindingNormalConfidence::Cosine;
+            } else {
+                fail("--winding-normal-confidence must be none, linear, or cosine");
+            }
+            options.hasWindingNormalConfidenceOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-sign-cost") {
+            const std::string signCost = value(
+                index, argc, argv, "--winding-sign-cost");
+            if (signCost == "hard") {
+                options.windingSignCost.reset();
+            } else {
+                std::size_t parsed = 0;
+                try {
+                    options.windingSignCost = std::stod(signCost, &parsed);
+                } catch (const std::exception&) {
+                    fail("--winding-sign-cost must be hard or finite and nonnegative");
+                }
+                if (parsed != signCost.size() ||
+                    !std::isfinite(*options.windingSignCost) ||
+                    *options.windingSignCost < 0.0) {
+                    fail("--winding-sign-cost must be hard or finite and nonnegative");
+                }
+            }
+            options.hasWindingSignCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-weight-search") {
@@ -751,6 +862,33 @@ Options parse(int argc, char** argv)
             } else {
                 fail("--parallel-correspondence must be distance or perpendicular-grid");
             }
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-grid-step") {
+            options.constraints.correspondenceGridStepFraction =
+                number(index, argc, argv, "--parallel-grid-step");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-grid-limit") {
+            options.constraints.correspondenceGridLimitFraction =
+                number(index, argc, argv, "--parallel-grid-limit");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-step-weight") {
+            options.constraints.correspondenceGridStepWeight =
+                number(index, argc, argv, "--parallel-step-weight");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-perp-weight") {
+            options.constraints.correspondenceGridPerpendicularWeight =
+                number(index, argc, argv, "--parallel-perp-weight");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-direction-weight") {
+            options.constraints.correspondenceGridDirectionWeight =
+                number(index, argc, argv, "--parallel-direction-weight");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-length-weight") {
+            options.constraints.correspondenceGridLengthWeight =
+                number(index, argc, argv, "--parallel-length-weight");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-diagnostics") {
+            options.constraints.collectParallelCorrespondenceDiagnostics = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-step") {
             options.constraints.windingIntegrationStepBaseVoxels = number(index, argc, argv, "--winding-step");
@@ -941,6 +1079,10 @@ Options parse(int argc, char** argv)
              options.hasPieceBreakCostOption ||
              options.hasParallelWindingCutoffOption ||
              options.hasWindingWeightOption ||
+             options.hasWindingSignOption ||
+             options.hasWindingDecisionConfidenceOption ||
+             options.hasWindingNormalConfidenceOption ||
+             options.hasWindingSignCostOption ||
              options.hasWindingWeightSearchOption ||
              options.hasWindingWeightSearchLocalOption) &&
             (!options.bpOnly ||
@@ -1717,13 +1859,21 @@ void writeAndPrintBpReport(
            "perpendicular_winding_weight_multiplier,"
            "effective_parallel_winding_weight,"
            "effective_perpendicular_winding_weight,"
+           "decision_confidence,normal_confidence,"
+           "effective_parallel_sign_penalty,"
+           "effective_perpendicular_sign_penalty,"
+           "perpendicular_normal_alignment,parallel_normal_alignment,"
            "original_signed_delta,canonical_raw_signed_delta,"
            "original_signed_parallel_delta,"
            "canonical_raw_signed_parallel_delta,"
            "effective_parallel_winding_distance,"
            "effective_signed_parallel_delta,parallel_winding_retained,"
            "effective_perpendicular_signed_delta,"
-           "calibrated_perpendicular_signed_delta,normal_component,self_edge\n"
+           "calibrated_perpendicular_signed_delta,normal_component,self_edge,"
+           "hard_parallel_sign,hard_perpendicular_sign,"
+           "correspondence_samples,advance_residual_fraction,"
+           "connector_tangent_abs_dot,connector_length_change_fraction,"
+           "connector_direction_change,limit_hit_fraction\n"
         << std::setprecision(17);
     const auto writeOptionalDouble = [](std::ostream& stream,
                                         const std::optional<double>& value) {
@@ -1747,7 +1897,16 @@ void writeAndPrintBpReport(
                      << factor.parallelWindingWeightMultiplier << ','
                      << factor.perpendicularWindingWeightMultiplier << ','
                      << factor.effectiveParallelWindingWeight << ','
-                     << factor.effectivePerpendicularWindingWeight << ',';
+                     << factor.effectivePerpendicularWindingWeight << ','
+                     << factor.decisionConfidenceMultiplier << ','
+                     << factor.normalConfidenceMultiplier << ','
+                     << factor.effectiveParallelSignPenalty << ','
+                     << factor.effectivePerpendicularSignPenalty << ',';
+        writeOptionalDouble(
+            factorOutput, factor.perpendicularNormalAlignment);
+        factorOutput << ',';
+        writeOptionalDouble(factorOutput, factor.parallelNormalAlignment);
+        factorOutput << ',';
         writeOptionalDouble(factorOutput, factor.originalSignedDelta);
         factorOutput << ',';
         writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
@@ -1773,7 +1932,17 @@ void writeAndPrintBpReport(
                 factorOutput, factor.effectivePerpendicularSignedDelta);
         factorOutput << ',';
         writeOptionalSize(factorOutput, factor.normalComponent);
-        factorOutput << ',' << (factor.selfEdge ? 1 : 0) << '\n';
+        const auto& sourceConstraint =
+            constraints.constraints.at(factor.constraintIndex);
+        factorOutput << ',' << (factor.selfEdge ? 1 : 0) << ','
+                     << (factor.hardParallelSign ? 1 : 0) << ','
+                     << (factor.hardPerpendicularSign ? 1 : 0) << ','
+                     << sourceConstraint.parallelCorrespondenceSamples << ','
+                     << sourceConstraint.parallelMeanAdvanceResidualFraction << ','
+                     << sourceConstraint.parallelMeanConnectorTangentAbsDot << ','
+                     << sourceConstraint.parallelMeanConnectorLengthChangeFraction << ','
+                     << sourceConstraint.parallelMeanConnectorDirectionChange << ','
+                     << sourceConstraint.parallelLimitHitFraction << '\n';
     }
     if (!factorOutput)
         throw std::runtime_error(
@@ -3943,6 +4112,16 @@ int main(int argc, char** argv)
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
                                 options.parallelWindingCutoff;
+                            windingConfig.enforcePerpendicularWindingSign =
+                                options.enforcePerpendicularWindingSign;
+                            windingConfig.enforceParallelWindingSign =
+                                options.enforceParallelWindingSign;
+                            windingConfig.decisionConfidence =
+                                options.windingDecisionConfidence;
+                            windingConfig.normalConfidence =
+                                options.windingNormalConfidence;
+                            windingConfig.finiteSignInfringementCost =
+                                options.windingSignCost;
                             setWindingClassWeights(
                                 windingConfig, options.windingWeights);
                             auto bpConstraints = selectedBpConstraints;
@@ -4834,6 +5013,16 @@ int main(int argc, char** argv)
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
                                 options.parallelWindingCutoff;
+                            windingConfig.enforcePerpendicularWindingSign =
+                                options.enforcePerpendicularWindingSign;
+                            windingConfig.enforceParallelWindingSign =
+                                options.enforceParallelWindingSign;
+                            windingConfig.decisionConfidence =
+                                options.windingDecisionConfidence;
+                            windingConfig.normalConfidence =
+                                options.windingNormalConfidence;
+                            windingConfig.finiteSignInfringementCost =
+                                options.windingSignCost;
                             const auto winding = vc::fiber_tracer::
                                 solveFiberTraceWindingBeliefPropagation(
                                     comparisonReport,

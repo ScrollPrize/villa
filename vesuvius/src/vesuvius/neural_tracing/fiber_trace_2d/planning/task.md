@@ -1,18 +1,22 @@
-# Task: perpendicular parallel-fiber correspondence search
+# Task: confidence-weighted winding evidence refinement
 
-Replace the closest-distance phase refinement used while walking a parallel
-fiber pair with a small, deterministic two-dimensional arc-offset search.
+Extend the current winding-BP hyperparameter search with neutral-by-default
+variants for evidence confidence and sign handling:
 
-For each paired step, independently vary the advance on both fibers around the
-target step and minimize:
+- after choosing the dominant parallel/perpendicular hypothesis, optionally
+  remap its score from `[0.5, 1]` to `[0, 1]` with linear and cosine variants;
+- optionally weight winding evidence by Lasagna-normal alignment, with
+  linear-in-angle and cosine/dot-product variants;
+- optionally replace enabled hard winding-sign rejection with a finite
+  sign-infringement cost; and
+- test the new controls individually and in combinations against the fixed
+  baseline, then refine the combined hyperparameters.
 
-- deviation of both advances from the target step; and
-- non-perpendicularity of the connector to both local fiber tangents.
+Variants that do not improve immediately must remain available but disabled or
+behaviorally neutral by default.
 
-Do not add a local regression/Gauss-Newton refinement and do not minimize
-connector length. Keep the existing closest sampled pair as the initial seed.
-Use a grid resolution of 5% of the target step and allow independent corrections
-up to 25% of the target step on each fiber.
-
-Preserve the grid as an explicit optional CLI variant and restore the original
-closest-distance phase walk as the default before real-data experimentation.
+Follow-up: promote the selected fixed-crop result to the standard defaults and
+commit the completed implementation. The promoted row uses both sign classes,
+finite sign cost `44`, winding Defect cost `100`, and orientation BP
+temperature `1.25`; decision confidence remains `legacy` and normal confidence
+remains `none`. The old hard-sign behavior must remain explicitly selectable.

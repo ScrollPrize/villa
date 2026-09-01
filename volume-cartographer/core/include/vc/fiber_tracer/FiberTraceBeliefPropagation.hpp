@@ -37,7 +37,7 @@ struct FiberTraceBeliefPropagationConfig {
     FiberTraceBalanceMode balanceMode = FiberTraceBalanceMode::None;
     double targetHorizontalFraction = 0.5;
     double softBalanceStrength = 1.0;
-    double horizontalnessTemperature = 0.25;
+    double horizontalnessTemperature = 1.25;
     double mixedUnaryCost = 1.0;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;

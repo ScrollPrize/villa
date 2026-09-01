@@ -353,6 +353,27 @@ one-twentieth-spacing increments by up to one quarter of the spacing. The grid
 minimizes the sum of the two squared target-step-normalized advance residuals
 and the squared alignment of the unit connector with each centered tangent;
 connector length is not scored.
+The experimental grid can be swept without recompilation using
+`--parallel-grid-step`, `--parallel-grid-limit`, `--parallel-step-weight`, and
+`--parallel-perp-weight`. Optional `--parallel-direction-weight` and
+`--parallel-length-weight` terms penalize changes from the previous connector;
+both default to zero. Fractions are relative to `--sample-step`; objective
+weights are nonnegative and cannot all be zero. These options do not affect the
+default `distance` correspondence.
+The winding-factor CSV includes correspondence sample count, normalized
+advance residual, connector/tangent absolute dot, normalized connector-length
+change, connector-direction change, and grid-limit hit fraction. These columns
+are populated when `--parallel-diagnostics` is passed. They do not affect
+candidate selection, winding integration, or BP; collection is off by default
+to avoid adding work to the normal distance path.
+
+On the fixed 1024-crop, eight-reference diagnostic, the distance mode retained
+the best measured result (`1784/2839`, 62.839%, with 8/8 exact reference
+windings). Tested perpendicular grids ranged from 62.359% to 62.698%. The best
+grid improved mean connector perpendicularity from 0.266 to 0.254, but changed
+261 quantized parallel-winding bins; 246 of those baseline measurements were
+within 0.10 winding of a half-integer boundary. This threshold sensitivity is
+why the distance mode remains the default.
 The mean consistently oriented tangent dot is clamped to `[0,1]` as raw
 parallel evidence. Raw perpendicular evidence is `1 - abs(initial tangent
 dot)`; the two values are divided by their sum, so the reported normalized
@@ -934,8 +955,9 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 
 `--winding-fixed-orientation` runs the ordinary H/V/Mixed sum-product BP first.
 Set its Mixed coefficient with `--bp-mixed-cost`. Set the later winding-stage
-Defect coefficient independently with `--winding-defect-cost`; both default to `1` and
-neither inherits an explicitly changed value from the other.
+Defect coefficient independently with `--winding-defect-cost`. The orientation
+Mixed coefficient defaults to `1`; the winding-stage Defect coefficient defaults
+to `100`. Neither inherits an explicitly changed value from the other.
 Each piece's unique MAP direction is then fixed; an exact class tie becomes
 Defect. During winding, a fixed H piece can be H or Defect and a fixed V piece
 can be V or Defect, but neither can switch to the opposite direction. A
@@ -1010,8 +1032,12 @@ The five canonical winding terms can be scaled independently with
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
 (`2+`). Standard runs default to `8,1,2,2,1`; pass `1,1,1,1,1` explicitly for
-neutral class weighting. Each value must be finite and strictly positive. The
-class multiplier is applied after the existing `2^-floor(abs(target))`
+neutral class weighting. Each value must be finite and nonnegative. A zero
+value removes that class's finite winding magnitude loss. If its dominant
+signed observation also has an enabled hard-sign rule, the sign remains an
+active winding constraint; otherwise the observation remains orientation-only
+and does not join winding components or contribute winding Defect incidence.
+The class multiplier is applied after the existing `2^-floor(abs(target))`
 distance decay and only to finite winding energy. It does not scale H/V
 orientation evidence, hard perpendicular order, hard continuity, the Defect
 unary, or piece-break cost.
@@ -1023,10 +1049,53 @@ The class multipliers apply to the H/V-aware joint-grid and interleaved winding
 solvers. The standalone raw-integer winding solve does not quantize H/V ladder
 targets and therefore retains its existing unscaled measurement behavior.
 
+Use `--winding-hard-signs none|perpendicular|parallel|both` to select which
+dominant signed observations impose nonzero ordering. The default is `both`.
+A constraint contributes
+at most one sign: its dominant perpendicular or parallel hypothesis. Unsigned
+and zero-target observations never impose a sign. Parallel signs also respect
+`--parallel-winding-cutoff`. Passing `--winding-weights 0,0,0,0,0
+--winding-hard-signs both` therefore runs sign-only winding inference; passing
+the same weights with `none` removes all measured cross-trace winding terms.
+Same-trace hard continuity is unchanged in both cases.
+
+Finite winding evidence can additionally be confidence-weighted with
+`--winding-decision-confidence legacy|linear|cosine` and
+`--winding-normal-confidence none|linear|cosine`. Let `s` be the selected
+dominant normalized parallel/perpendicular score in `[0.5,1]` and
+`x=2s-1`. `legacy` uses `s`, `linear` uses `x`, and `cosine` uses
+`(1-cos(pi*x))/2`. Normal `none` contributes one. Normal `linear` uses
+`1-2*acos(abs_dot)/pi`, while normal `cosine` uses `abs_dot`. Perpendicular
+alignment comes from the closest connector. Parallel alignment is the median
+over all component-compatible signed connector samples. Missing alignment is
+neutral for `none` and contributes zero confidence for weighted modes.
+
+Pass `--winding-sign-cost F` to assign each enabled sign a finite
+penalty. A nonzero signed target whose predicted delta has the wrong sign or is
+exactly zero adds `F * decision_confidence * normal_confidence`. This term is
+independent of magnitude class weights and distance decay; the ordinary BP
+temperature still scales its log potential. The default is `44`; pass
+`--winding-sign-cost hard` for strict rejection, or `F=0` to remove the enabled
+sign. These confidence controls only
+change the dominant winding factor; they do not change H/V orientation evidence,
+same-trace hard continuity, or the discrete Defect cost.
+The winding-factor CSV records both raw alignments, the transformed decision
+and normal multipliers, and the effective finite sign penalties for each
+factor.
+
+The fixed 1024-crop sweep found no improvement from decision or normal
+confidence attenuation alone. The best experimental row retained
+`legacy`/`none`, enabled both sign classes with finite cost 44, and used Defect
+cost 100 plus temperature 1.25. It retained 8/8 exact reference windings and
+raised matched constraints from 1,784 to 1,875 while evaluating 2,992 rather
+than 2,839 constraints. These measured settings are now the standard defaults;
+the legacy row remains available with `--winding-hard-signs perpendicular
+--winding-sign-cost hard --winding-defect-cost 50 --bp-temperature 2.5`.
+
 With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
 tests the Cartesian product of the listed values in all five tuple positions.
 It conflicts with `--winding-weights`. Constraint extraction, topology,
-positive-weight component selection, fixed orientation, and reference cross
+effective-winding component selection, fixed orientation, and reference cross
 constraints are reused; only winding inference is repeated. Each scenario
 prints elapsed time, ETA, exact/wrong/missing calibrated reference estimates,
 constraint right/total accuracy, convergence, and the tuple. The final ranking

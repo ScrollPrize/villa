@@ -1492,6 +1492,10 @@ TEST_CASE("Parallel trace constraints use signed median walk winding")
           doctest::Approx(5.0));
     CHECK(positive.constraints[0].signedParallelWindingDelta ==
           doctest::Approx(5.0));
+    CHECK(positive.constraints[0].perpendicularNormalAlignment ==
+          doctest::Approx(1.0));
+    CHECK(positive.constraints[0].parallelNormalAlignment ==
+          doctest::Approx(1.0));
 
     auto negativeField = field;
     for (auto& normal : negativeField.alignment.alignedNormals)
@@ -1541,8 +1545,14 @@ TEST_CASE("Parallel trace correspondence grid keeps curved connectors transverse
     CHECK(config.parallelCorrespondence ==
           FiberTraceParallelCorrespondence::Distance);
     CHECK(config.correspondenceGridLimitFraction == 0.25);
+    CHECK(config.correspondenceGridStepWeight == 1.0);
+    CHECK(config.correspondenceGridPerpendicularWeight == 1.0);
+    CHECK(config.correspondenceGridDirectionWeight == 0.0);
+    CHECK(config.correspondenceGridLengthWeight == 0.0);
+    CHECK_FALSE(config.collectParallelCorrespondenceDiagnostics);
     config.parallelCorrespondence =
         FiberTraceParallelCorrespondence::PerpendicularGrid;
+    config.collectParallelCorrespondenceDiagnostics = true;
     config.maximumDistanceBaseVoxels = 16.0;
     config.tangentWindowBaseVoxels = 16.0;
     config.correspondenceGridLimitFraction = 0.05;
@@ -1563,6 +1573,14 @@ TEST_CASE("Parallel trace correspondence grid keeps curved connectors transverse
 
     REQUIRE(report.constraints.size() == 1);
     REQUIRE(sampledConnectors.size() >= 4);
+    CHECK(report.constraints[0].parallelCorrespondenceSamples ==
+          sampledConnectors.size());
+    CHECK(report.constraints[0].parallelMeanAdvanceResidualFraction >= 0.0);
+    CHECK(report.constraints[0].parallelMeanConnectorTangentAbsDot >= 0.0);
+    CHECK(report.constraints[0].parallelMeanConnectorLengthChangeFraction >= 0.0);
+    CHECK(report.constraints[0].parallelMeanConnectorDirectionChange >= 0.0);
+    CHECK(report.constraints[0].parallelLimitHitFraction >= 0.0);
+    CHECK(report.constraints[0].parallelLimitHitFraction <= 1.0);
     double maximumTangentialAlignment = 0.0;
     bool sawIndependentAdvance = false;
     std::optional<double> previousArcA;

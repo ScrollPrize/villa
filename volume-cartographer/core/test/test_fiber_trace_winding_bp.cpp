@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace
@@ -79,10 +81,22 @@ void useUnitClassWeights(FiberTraceWindingBeliefPropagationConfig& config)
     config.parallelFarWeight = 1.0;
 }
 
+void useZeroClassWeights(FiberTraceWindingBeliefPropagationConfig& config)
+{
+    config.perpendicularNextWeight = 0.0;
+    config.perpendicularFarWeight = 0.0;
+    config.parallelSameWeight = 0.0;
+    config.parallelOneWeight = 0.0;
+    config.parallelFarWeight = 0.0;
+}
+
 FiberTraceWindingBeliefPropagationConfig config()
 {
     FiberTraceWindingBeliefPropagationConfig result;
     useUnitClassWeights(result);
+    result.enforcePerpendicularWindingSign = true;
+    result.enforceParallelWindingSign = false;
+    result.finiteSignInfringementCost.reset();
     result.temperature = 0.25;
     result.messageDamping = 1.0;
     result.messageResidualTolerance = 1.0e-12;
@@ -98,6 +112,163 @@ TEST_CASE("Winding class production defaults use the selected reference tuple")
     CHECK(defaults.parallelSameWeight == 2.0);
     CHECK(defaults.parallelOneWeight == 2.0);
     CHECK(defaults.parallelFarWeight == 1.0);
+    CHECK(defaults.enforcePerpendicularWindingSign);
+    CHECK(defaults.enforceParallelWindingSign);
+    CHECK(defaults.decisionConfidence ==
+          FiberTraceWindingDecisionConfidence::Legacy);
+    CHECK(defaults.normalConfidence ==
+          FiberTraceWindingNormalConfidence::None);
+    REQUIRE(defaults.finiteSignInfringementCost.has_value());
+    CHECK(*defaults.finiteSignInfringementCost == 44.0);
+    CHECK(std::string(fiberTraceWindingDecisionConfidenceName(
+              defaults.decisionConfidence)) == "legacy");
+    CHECK(std::string(fiberTraceWindingNormalConfidenceName(
+              defaults.normalConfidence)) == "none");
+    const FiberTraceJointGridWindingConfig jointDefaults;
+    CHECK(jointDefaults.mixedUnaryCost == 100.0);
+    const FiberTraceInterleavedWindingConfig interleavedDefaults;
+    CHECK(interleavedDefaults.mixedUnaryCost == 100.0);
+    const FiberTraceBeliefPropagationConfig orientationDefaults;
+    CHECK(orientationDefaults.horizontalnessTemperature == 1.25);
+}
+
+TEST_CASE("Winding confidence transforms affect only dominant winding weight")
+{
+    const auto source = lines(2);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0.625, 1.0);
+    report.constraints.front().parallelNormalAlignment = 0.5;
+
+    const auto solve = [&](FiberTraceWindingDecisionConfidence decision,
+                           FiberTraceWindingNormalConfidence normal) {
+        FiberTraceJointGridWindingConfig joint;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) =
+            config();
+        joint.decisionConfidence = decision;
+        joint.normalConfidence = normal;
+        joint.enforcePerpendicularWindingSign = false;
+        joint.fixedPhaseMagnitude = 0.5;
+        joint.fixedMeasurementScale = 1.0;
+        joint.stableIterations = 1;
+        return solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint, {}, fixed);
+    };
+
+    const auto legacy = solve(
+        FiberTraceWindingDecisionConfidence::Legacy,
+        FiberTraceWindingNormalConfidence::None);
+    const auto linear = solve(
+        FiberTraceWindingDecisionConfidence::Linear,
+        FiberTraceWindingNormalConfidence::None);
+    const auto cosine = solve(
+        FiberTraceWindingDecisionConfidence::Cosine,
+        FiberTraceWindingNormalConfidence::None);
+    const auto normalLinear = solve(
+        FiberTraceWindingDecisionConfidence::Legacy,
+        FiberTraceWindingNormalConfidence::Linear);
+    const auto normalCosine = solve(
+        FiberTraceWindingDecisionConfidence::Legacy,
+        FiberTraceWindingNormalConfidence::Cosine);
+    REQUIRE(legacy.factorDiagnostics.size() == 1);
+    CHECK(legacy.factorDiagnostics[0].decisionConfidenceMultiplier ==
+          doctest::Approx(0.625));
+    CHECK(linear.factorDiagnostics[0].decisionConfidenceMultiplier ==
+          doctest::Approx(0.25));
+    CHECK(cosine.factorDiagnostics[0].decisionConfidenceMultiplier ==
+          doctest::Approx(0.5 - 0.5 * std::cos(0.25 * std::numbers::pi)));
+    CHECK(normalLinear.factorDiagnostics[0].normalConfidenceMultiplier ==
+          doctest::Approx(1.0 / 3.0));
+    CHECK(normalCosine.factorDiagnostics[0].normalConfidenceMultiplier ==
+          doctest::Approx(0.5));
+    CHECK(legacy.factorDiagnostics[0].parallelScore ==
+          linear.factorDiagnostics[0].parallelScore);
+    CHECK(legacy.factorDiagnostics[0].perpendicularScore ==
+          linear.factorDiagnostics[0].perpendicularScore);
+
+    report.constraints.front().parallelNormalAlignment.reset();
+    const auto missing = solve(
+        FiberTraceWindingDecisionConfidence::Legacy,
+        FiberTraceWindingNormalConfidence::Cosine);
+    CHECK(missing.factorDiagnostics[0].normalConfidenceMultiplier == 0.0);
+    CHECK(missing.factorDiagnostics[0].effectiveParallelWindingWeight == 0.0);
+    CHECK(missing.integerGaugeByPiece[0] != missing.integerGaugeByPiece[1]);
+    CHECK_THROWS_AS(
+        solve(
+            static_cast<FiberTraceWindingDecisionConfidence>(255),
+            FiberTraceWindingNormalConfidence::None),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        solve(
+            FiberTraceWindingDecisionConfidence::Legacy,
+            static_cast<FiberTraceWindingNormalConfidence>(255)),
+        std::invalid_argument);
+}
+
+TEST_CASE("Finite winding sign costs replace hard rejection and preserve zero-confidence removal")
+{
+    const auto source = lines(2);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 1.0, 1.0);
+    report.constraints.front().parallelNormalAlignment = 1.0;
+
+    const auto solve = [&](std::optional<double> signCost,
+                           FiberTraceWindingDecisionConfidence decision =
+                               FiberTraceWindingDecisionConfidence::Legacy) {
+        FiberTraceJointGridWindingConfig joint;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) =
+            config();
+        useZeroClassWeights(joint);
+        joint.enforcePerpendicularWindingSign = false;
+        joint.enforceParallelWindingSign = true;
+        joint.finiteSignInfringementCost = signCost;
+        joint.decisionConfidence = decision;
+        joint.fixedPhaseMagnitude = 0.5;
+        joint.fixedMeasurementScale = 1.0;
+        joint.mixedUnaryCost = 100.0;
+        joint.stableIterations = 1;
+        return solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint, {}, fixed);
+    };
+
+    const auto hard = solve(std::nullopt);
+    CHECK(hard.factorDiagnostics[0].hardParallelSign);
+    CHECK(hard.factorDiagnostics[0].effectiveParallelSignPenalty == 0.0);
+
+    const auto finite = solve(16.0);
+    CHECK_FALSE(finite.factorDiagnostics[0].hardParallelSign);
+    CHECK(finite.factorDiagnostics[0].effectiveParallelSignPenalty ==
+          doctest::Approx(16.0));
+    CHECK(finite.integerGaugeByPiece[0] == finite.integerGaugeByPiece[1]);
+    CHECK(finite.mapLatentCoordinate[1] > finite.mapLatentCoordinate[0]);
+
+    const auto zero = solve(0.0);
+    CHECK_FALSE(zero.factorDiagnostics[0].hardParallelSign);
+    CHECK(zero.factorDiagnostics[0].effectiveParallelSignPenalty == 0.0);
+    CHECK(zero.integerGaugeByPiece[0] != zero.integerGaugeByPiece[1]);
+
+    report.constraints.front().parallelScore = 0.5;
+    report.constraints.front().perpendicularScore = 0.5;
+    report.constraints.front().signedWindingDelta = 0.5;
+    report.constraints.front().perpendicularNormalAlignment = 1.0;
+    FiberTraceJointGridWindingConfig tiedConfig;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(tiedConfig) =
+        config();
+    useZeroClassWeights(tiedConfig);
+    tiedConfig.enforcePerpendicularWindingSign = true;
+    tiedConfig.enforceParallelWindingSign = false;
+    tiedConfig.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Linear;
+    tiedConfig.fixedPhaseMagnitude = 0.5;
+    tiedConfig.fixedMeasurementScale = 1.0;
+    tiedConfig.stableIterations = 1;
+    const auto tiedHard = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), tiedConfig, {}, fixed);
+    CHECK(tiedHard.factorDiagnostics[0].decisionConfidenceMultiplier == 0.0);
+    CHECK(tiedHard.factorDiagnostics[0].hardPerpendicularSign);
 }
 
 FiberTraceBeliefPropagationReport orientationBeliefs(
@@ -219,6 +390,7 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     both.effectiveParallelWindingWeight = 0.25;
     both.effectivePerpendicularWindingWeight = 0.75;
     both.effectivePerpendicularSignedDelta = 0.5;
+    both.hardPerpendicularSign = true;
     diagnostics.push_back(both);
 
     auto other = diagnostic(2, 1, 2);
@@ -229,6 +401,7 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     other.effectivePerpendicularWindingWeight = 0.2;
     other.effectiveParallelWindingDistance = 2.0;
     other.effectivePerpendicularSignedDelta = 1.5;
+    other.hardPerpendicularSign = true;
     diagnostics.push_back(other);
 
     auto suppressed = diagnostic(3, 0, 1);
@@ -762,6 +935,9 @@ TEST_CASE("Reference observations retain canonical diagnostic weights")
     perpendicular.signedWindingDelta = -1.0;
     FiberTraceWindingBeliefPropagationConfig config;
     useUnitClassWeights(config);
+    config.enforcePerpendicularWindingSign = false;
+    config.enforceParallelWindingSign = false;
+    config.finiteSignInfringementCost.reset();
     config.parallelWindingDistanceCutoff = 0.5;
     const auto next = makeFiberTraceReferenceWindingObservation(
         perpendicular, true, 0.0, 0, winding, config);
@@ -824,6 +1000,9 @@ TEST_CASE("Reference observations apply all canonical class weights")
     winding.measurementScale = 1.0;
 
     FiberTraceWindingBeliefPropagationConfig config;
+    config.enforcePerpendicularWindingSign = false;
+    config.enforceParallelWindingSign = false;
+    config.finiteSignInfringementCost.reset();
     config.perpendicularNextWeight = 2.0;
     config.perpendicularFarWeight = 3.0;
     config.parallelSameWeight = 4.0;
@@ -864,10 +1043,10 @@ TEST_CASE("Reference observations apply all canonical class weights")
               .admittedCoefficient == doctest::Approx(1.2));
 
     config.parallelFarWeight = 0.0;
-    CHECK_THROWS_AS(
-        makeFiberTraceReferenceWindingObservation(
-            constraint, true, 0.0, 0, winding, config),
-        std::invalid_argument);
+    const auto disabledMagnitude = makeFiberTraceReferenceWindingObservation(
+        constraint, true, 0.0, 0, winding, config);
+    CHECK(disabledMagnitude.rawCoefficient == 0.0);
+    CHECK(disabledMagnitude.admittedCoefficient == 0.0);
 }
 
 TEST_CASE("Reference constraint groups expose weighted calibrated inference")
@@ -986,6 +1165,7 @@ TEST_CASE("Reference constraint inference minimizes hard violations first")
         result.referenceDeltaSign = -1.0;
         result.perpendicularCoefficient = 1.0;
         result.signedPerpendicularTarget = target;
+        result.hardPerpendicularSign = true;
         return result;
     };
     const std::array observations{observation(0.5), observation(-0.5)};
@@ -1308,6 +1488,174 @@ TEST_CASE("Signed parallel winding distinguishes opposite ladder directions")
     CHECK_FALSE(unsignedSolved.factorDiagnostics[0].parallelWindingRetained);
     CHECK(unsignedSolved.factorDiagnostics[0]
               .effectiveParallelWindingWeight == 0.0);
+}
+
+TEST_CASE("Zero magnitude weights retain only enabled dominant hard signs")
+{
+    const auto source = lines(2);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    const auto solve = [&] (
+        double parallel,
+        double signedDelta,
+        bool perpendicularSign,
+        bool parallelSign,
+        std::optional<double> cutoff = std::nullopt) {
+        auto report = pieces(2);
+        addMeasured(report, 0, 1, parallel, signedDelta);
+        FiberTraceJointGridWindingConfig joint;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) =
+            config();
+        useZeroClassWeights(joint);
+        joint.enforcePerpendicularWindingSign = perpendicularSign;
+        joint.enforceParallelWindingSign = parallelSign;
+        joint.parallelWindingDistanceCutoff = cutoff;
+        joint.fixedPhaseMagnitude = 0.5;
+        joint.fixedMeasurementScale = 1.0;
+        joint.mixedUnaryCost = 100.0;
+        joint.stableIterations = 1;
+        return solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint, {}, fixed);
+    };
+
+    const auto disabled = solve(1.0, 1.0, false, false);
+    REQUIRE(disabled.factorDiagnostics.size() == 1);
+    CHECK_FALSE(disabled.factorDiagnostics[0].hardParallelSign);
+    CHECK_FALSE(disabled.factorDiagnostics[0].hardPerpendicularSign);
+    CHECK(disabled.factorDiagnostics[0].effectiveParallelWindingWeight == 0.0);
+    CHECK(disabled.integerGaugeByPiece[0] !=
+          disabled.integerGaugeByPiece[1]);
+    CHECK(disabled.incidentSignedConstraints ==
+          std::vector<std::size_t>{0, 0});
+
+    const auto parallel = solve(1.0, 1.0, false, true);
+    REQUIRE(parallel.factorDiagnostics.size() == 1);
+    CHECK(parallel.factorDiagnostics[0].hardParallelSign);
+    CHECK_FALSE(parallel.factorDiagnostics[0].hardPerpendicularSign);
+    CHECK(parallel.integerGaugeByPiece[0] ==
+          parallel.integerGaugeByPiece[1]);
+    CHECK(parallel.incidentSignedConstraints ==
+          std::vector<std::size_t>{1, 1});
+    CHECK(parallel.mapLatentCoordinate[1] >
+          parallel.mapLatentCoordinate[0]);
+
+    const auto reversed = solve(1.0, -1.0, false, true);
+    CHECK(reversed.mapLatentCoordinate[1] <
+          reversed.mapLatentCoordinate[0]);
+
+    const auto perpendicular = solve(0.0, 0.5, true, true);
+    REQUIRE(perpendicular.factorDiagnostics.size() == 1);
+    CHECK(perpendicular.factorDiagnostics[0].hardPerpendicularSign);
+    CHECK_FALSE(perpendicular.factorDiagnostics[0].hardParallelSign);
+
+    const auto sameWinding = solve(1.0, 0.0, true, true);
+    REQUIRE(sameWinding.factorDiagnostics.size() == 1);
+    CHECK_FALSE(sameWinding.factorDiagnostics[0].hardPerpendicularSign);
+    CHECK_FALSE(sameWinding.factorDiagnostics[0].hardParallelSign);
+
+    const auto cutoff = solve(1.0, 2.0, false, true, 1.5);
+    REQUIRE(cutoff.factorDiagnostics.size() == 1);
+    CHECK_FALSE(cutoff.factorDiagnostics[0].hardParallelSign);
+    CHECK(cutoff.integerGaugeByPiece[0] != cutoff.integerGaugeByPiece[1]);
+}
+
+TEST_CASE("Contradictory parallel hard signs escape through Defect")
+{
+    const auto source = lines(3);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 1.0, 1.0);
+    addMeasured(report, 1, 2, 1.0, 1.0);
+    addMeasured(report, 0, 2, 1.0, -1.0);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    useZeroClassWeights(joint);
+    joint.enforcePerpendicularWindingSign = false;
+    joint.enforceParallelWindingSign = true;
+    joint.fixedPhaseMagnitude = 0.5;
+    joint.fixedMeasurementScale = 1.0;
+    joint.mixedUnaryCost = 100.0;
+    joint.stableIterations = 1;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), joint, {}, fixed);
+    CHECK(std::count(
+        solved.windingValid.begin(),
+        solved.windingValid.end(),
+        static_cast<unsigned char>(0)) >= 1);
+    CHECK(solved.hardSignProjectedDefects >= 1);
+}
+
+TEST_CASE("Reference inference admits zero-weight parallel hard signs")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1};
+    winding.mapLatentCoordinate = {0.0};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal};
+    winding.integerGaugeByPiece = {0};
+    winding.measurementScale = 1.0;
+
+    FiberTraceConstraint constraint;
+    constraint.pieceA = 0;
+    constraint.pieceB = 1;
+    constraint.parallelScore = 1.0;
+    constraint.signedParallelWindingDelta = 1.0;
+    constraint.parallelWindingDistance = 1.0;
+    auto zero = config();
+    useZeroClassWeights(zero);
+    zero.enforcePerpendicularWindingSign = false;
+    zero.enforceParallelWindingSign = true;
+    const auto observation = makeFiberTraceReferenceWindingObservation(
+        constraint, false, 0.0, 0, winding, zero);
+    CHECK(observation.rawCoefficient == 0.0);
+    CHECK(observation.admittedCoefficient == 0.0);
+    CHECK(observation.hardParallelSign);
+    CHECK_FALSE(observation.hardPerpendicularSign);
+    const auto estimates = inferFiberTraceReferenceRawWindings({&observation, 1});
+    REQUIRE(estimates.size() == 1);
+    CHECK(estimates[0].observations == 1);
+}
+
+TEST_CASE("Reference inference uses the solver confidence and finite sign weight")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1};
+    winding.mapLatentCoordinate = {0.0};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal};
+    winding.integerGaugeByPiece = {0};
+    winding.measurementScale = 1.0;
+
+    FiberTraceConstraint constraint;
+    constraint.pieceA = 0;
+    constraint.pieceB = 1;
+    constraint.parallelScore = 0.75;
+    constraint.perpendicularScore = 0.25;
+    constraint.signedParallelWindingDelta = 1.0;
+    constraint.parallelWindingDistance = 1.0;
+    constraint.parallelNormalAlignment = 0.5;
+    auto finite = config();
+    useZeroClassWeights(finite);
+    finite.enforcePerpendicularWindingSign = false;
+    finite.enforceParallelWindingSign = true;
+    finite.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Linear;
+    finite.normalConfidence = FiberTraceWindingNormalConfidence::Cosine;
+    finite.finiteSignInfringementCost = 4.0;
+    const auto observation = makeFiberTraceReferenceWindingObservation(
+        constraint, false, 0.0, 0, winding, finite);
+    CHECK(observation.decisionConfidenceMultiplier == doctest::Approx(0.5));
+    CHECK(observation.normalConfidenceMultiplier == doctest::Approx(0.5));
+    CHECK(observation.parallelSignPenalty == doctest::Approx(1.0));
+    CHECK(observation.admittedCoefficient == doctest::Approx(1.0));
+    CHECK_FALSE(observation.hardParallelSign);
+    const auto estimates = inferFiberTraceReferenceRawWindings({&observation, 1});
+    REQUIRE(estimates.size() == 1);
+    REQUIRE(observation.inferredReferenceWindingCount == 1);
+    CHECK(observation.inferredReferenceWindings[0] == doctest::Approx(1.0));
+    CHECK(estimates[0].observations == 1);
 }
 
 TEST_CASE("Winding BP fixes an independent crop-central gauge per component")
