@@ -1,119 +1,61 @@
-# Task log: separate winding value and sign-hardness constraints
+# Task log: retain complete reference fibers in diagnostics
 
 ## Starting point
 
-- Dominant signed observations already have a separately configured hard or
-  finite sign penalty. The signed `abs(delta-target)` residual is intentional;
-  the extra sign term is the separately weighted high/hard reversal rule.
-- Final agreement collapses H/V relation, magnitude, and sign into one
-  infringement bit per physical observation.
-- Reference benchmarking collapses magnitude and sign into one candidate match
-  and changes behavior when the tested magnitude weight is zero, so the recent
-  five-weight tuning objective is not comparable across scenarios.
-- Current defaults are magnitude `0,4,2,2,1`, finite sign cost `44`, and aligned
-  hard signs for both dominant relation types within 30 degrees.
-
-## Deviations
-
-- None.
+- `updateReferenceFiberArtifact` clips every selected dense annotation line to
+  the stored trace artifact's half-open crop.
+- The clipped runs are used by both `<base>_reference.obj` and all reference
+  constraint/benchmark diagnostics.
+- On the 2026-09-01 stack this retained 24 of 26 selected fibers; annotations
+  `...000010.json` and `...000026.json` were outside the 1024 crop, while two
+  other annotations appeared as short boundary fragments.
 
 ## Plan review
 
-- Separate structural evidence presence from weight-dependent BP enablement;
-  benchmark denominators use the former and BP connectivity uses the latter.
-- Retain a dominant-parallel winding value when a signed estimate is absent,
-  using the available unsigned target without adding sign hardness.
-- Use exact finite sign coefficient `cost * relation_weight * decision_conf *
-  normal_conf`; zero disables both finite and promoted-hard sign evidence.
-- Audit all solver paths, not only final pairwise energy, for signed winding
-  value plus separately weighted sign hardness.
-- Generate the BP-consistent reference candidate from the signed winding target
-  and list the extra sign-hardness judgment independently.
-- Keep degree-scaled Defect incidence at one physical measurement.
-- Extend deterministic local search from five to seven tagged coordinates and
-  report the corrected baseline before tuning because old totals are not
-  directly comparable.
+- The complete JSON lines are already validated and deterministically sorted by
+  `loadTaggedVc3dFiberJsonDirectory`; no parser or ordering change is needed.
+- Reference geometry is diagnostic-only. Keeping it complete does not expand
+  or alter the traced/BP fiber population.
+- The existing constraint extractor and full-volume normal sampler can consume
+  points outside the stored trace crop.
 
-## User clarification
+## Deviations
 
-- A sign flip must remain an error in the ordinary winding-value constraint.
-- The separate sign constraint is the additional high/hard loss that makes a
-  reversal forbidden or substantially more expensive.
+- An independent subagent review was not run because the active orchestration
+  instruction prohibits spawning subagents unless the user explicitly requests
+  delegation. The plan was reviewed locally against `AGENTS.md`, `specs.md`,
+  the reference CLI flow, and the current documentation.
 
 ## Implementation
 
-- Preserved the signed winding-value residual in fixed, adaptive, alternating,
-  decoded-energy, projection, gauge, and reference-inference paths.
-- Added independent perpendicular and parallel sign-hardness multipliers and
-  structural-presence flags. Zero sign weight disables only the additional
-  finite/hard term, not the ordinary signed winding residual.
-- Split solver agreement, evidence summaries, reference accuracy, and factor
-  CSV output into winding-value and sign-hardness items.
-- Extended exhaustive and zero-aware local weight search from five to seven
-  dimensions.
+- `updateReferenceFiberArtifact` now emits one OBJ line and one diagnostic trace
+  from every selected JSON fiber's complete dense line.
+- Removed the crop bounds from that helper's interface and renamed its status
+  field from `retained_runs` to `retained_fibers`.
+- Kept the trace artifact crop bounds for BP topology and all crop-produced
+  fibers; only diagnostic reference geometry changed.
 
 ## Validation
 
-- Release build: `vc_fiber_trace_chunk` and
-  `test_fiber_trace_winding_bp` completed successfully.
-- Focused winding BP tests: 70 cases passed.
-- The focused tests cover signed reversal with independent sign weight, zero
-  sign weight, finite sign scaling, hard promotion, unsigned parallel fallback,
-  split agreement, and fixed benchmark denominators.
+- Release build completed for `vc_fiber_trace_chunk`, `test_fiber_json`, and
+  `test_fiber_trace_winding_bp`.
+- `test_fiber_json`: 2 cases passed.
+- `test_fiber_trace_winding_bp`: 70 cases passed.
+- The real 2026-09-01 stack retained all 26 selected fibers and all 7,797 dense
+  points. The previous crop-clipped path retained only 24 sources.
+- With reference splitting disabled, all 25 adjacent filename pairs produced a
+  dominant perpendicular constraint. After the standard scale-first factor
+  `0.822`, 23 quantized to the expected `0.5` step. Pair `3.5->4.0` measured
+  `1.272` after scaling and quantized to `1.5`; pair `6.5->7.0` measured
+  `1.004` and crossed the same boundary by only `0.004`.
+- The final `12.0->12.5` pair is perpendicular, with raw step `0.601`, scaled
+  step `0.494`, and canonical step `0.5`. The preceding `11.5->12.5`
+  skip-one relation is parallel with raw step `1.094`, consistent with the
+  same orientation one winding apart rather than the same winding.
 
-## 1024 tuning result
+## Execution note
 
-- Release command:
-
-  ```bash
-  volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/crop_traces.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /tmp/winding-sign-split-tune/fibers --direction-dominance 0.9 --piece-length 512 --bp-only --bp-inference sum-product-mixed --quality-fraction 0.25 --winding-fixed-phase 0.5 --winding-fixed-scale 0.822 --winding-fixed-orientation --bp-message-iterations 500 --reference-fiber-dir /home/hendrik/business/aiconsulting/vesuviuschallenge/data/test_datasets/2026-08-28_fiber_stack --reference-fiber-tag hendrik_crop1 --parallel-winding-cutoff 0.5 --split-continuity hard --winding-hard-signs both --winding-hard-sign-angle 30 --winding-normal-confidence linear --winding-decision-confidence cosine --winding-weights 0,4,2,2,1 --winding-sign-weights 1,1 --winding-weight-search-local --winding-sign-cost 44 --winding-defect-cost 100 --bp-temperature 1.25
-  ```
-
-- Dataset: `data/workdir3/crop_traces.zarr`, retained quality fraction `0.25`,
-  reference tag `hendrik_crop1`, fixed phase `0.5`, fixed scale `0.822`, hard
-  split continuity, 30-degree aligned hard-sign gate, cosine decision
-  confidence, linear normal confidence, sign cost `44`, Defect cost `100`, and
-  temperature `1.25`.
-- Corrected starting tuple: winding `0,4,2,2,1`, sign `1,1`; result `6/8`
-  exact reference windings and `3141/3953 = 79.4586%` reference items.
-- Zero-aware local search evaluated 111 scenarios and accepted five moves:
-  sign perpendicular `1 -> 0`, perpendicular next `0 -> 1`, perpendicular far
-  `4 -> 2`, perpendicular next `1 -> 0.5`, and parallel same `2 -> 1`.
-- Provisional cutoff result: winding `0.5,2,1,2,1`, sign hardness `0,1`; result `8/8`
-  exact reference windings and `3562/4061 = 87.7124%` reference items.
-- Its class accuracy was perpendicular winding `1456/1875 = 77.653%`,
-  perpendicular sign `1828/1875 = 97.493%`, and parallel-same winding
-  `278/311 = 89.389%`. The `0.5` parallel cutoff admitted no parallel-other or
-  parallel-sign reference items, so the parallel sign default remains `1` and
-  was not identified by this run.
-- The provisional perpendicular sign weight `0` removes only its additional
-  high/hard penalty. Perpendicular winding weights remain positive, so the
-  ordinary signed residual still penalizes every reversal.
-
-## No-cutoff correction
-
-- Corrected Release command:
-
-  ```bash
-  volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/crop_traces.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /tmp/winding-sign-full-tune/fibers --direction-dominance 0.9 --piece-length 512 --bp-only --bp-inference sum-product-mixed --quality-fraction 0.25 --winding-fixed-phase 0.5 --winding-fixed-scale 0.822 --winding-fixed-orientation --bp-message-iterations 500 --reference-fiber-dir /home/hendrik/business/aiconsulting/vesuviuschallenge/data/test_datasets/2026-08-28_fiber_stack --reference-fiber-tag hendrik_crop1 --split-continuity hard --winding-hard-signs both --winding-hard-sign-angle 30 --winding-normal-confidence linear --winding-decision-confidence cosine --winding-weights 0.5,2,1,2,1 --winding-sign-weights 0,1 --winding-weight-search-local --winding-sign-cost 44 --winding-defect-cost 100 --bp-temperature 1.25
-  ```
-
-- The provisional search was invalid as a general default-selection run because
-  `--parallel-winding-cutoff 0.5` removed all parallel-other and parallel-sign
-  benchmark items. The cutoff remains disabled by default.
-- The corrected Release run removed that option and started local refinement at
-  winding `0.5,2,1,2,1`, sign `0,1`. Its baseline was `6/8` exact and
-  `4366/5655 = 77.206%` correct reference items.
-- The search evaluated 58 scenarios and selected winding `0.5,0,1,2,1`, sign
-  hardness `0.5,1`. It converged with `8/8` exact and
-  `4835/5446 = 88.7808%` correct items.
-- Final class accuracy: perpendicular winding `1420/1797 = 79.021%`,
-  perpendicular sign `1775/1797 = 98.776%`, parallel-same winding
-  `283/306 = 92.484%`, parallel-other winding `600/773 = 77.620%`, and
-  parallel sign `757/773 = 97.930%`.
-- A separate ordinary default run, with neither explicit weight tuple nor
-  parallel cutoff, reproduced the selected converged `8/8` and
-  `4835/5446 = 88.781%` result exactly.
-- The selected zero perpendicular-far winding weight disables that energy class,
-  not extraction. Those structural winding items and their independent sign
-  items remain present in agreement and benchmark denominators.
+- The first complete-line validation used `direction-ablation`, whose existing
+  control flow continued into an unnecessary BP solve after reference
+  extraction. No BP result was used for the adjacent-pair evaluation, and no
+  further optimizer run was started after the user correction.

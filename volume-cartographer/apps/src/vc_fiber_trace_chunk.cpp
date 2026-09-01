@@ -2982,9 +2982,7 @@ struct ReferenceFiberDiagnostics {
 };
 
 std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
-    const Options& options,
-    const cv::Vec3d& minimumBaseXYZ,
-    const cv::Vec3d& maximumBaseXYZ)
+    const Options& options)
 {
     const auto outputPath = referenceFiberObjPath(options.output);
     removeReferenceFiberArtifact(outputPath);
@@ -3008,31 +3006,24 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
     for (std::size_t index = 0; index < selection.fibers.size(); ++index) {
         const auto& selected = selection.fibers[index];
         diagnostics.sourceNames.push_back(selected.path.stem().string());
-        auto runs = vc::fiber_tracer::clipPolylineToHalfOpenBox(
-            selected.fiber.linePoints, minimumBaseXYZ, maximumBaseXYZ);
-        for (std::size_t run = 0; run < runs.size(); ++run) {
-            const std::string name =
-                "reference_" + std::to_string(index) + "_run_" +
-                std::to_string(run) + "_" + selected.path.stem().string();
-            retainedPoints += runs[run].size();
-            objLines.push_back({name, runs[run]});
-            vc::fiber_tracer::FiberletCropTraceLine diagnostic;
-            diagnostic.seedBaseXYZ = runs[run].front();
-            diagnostic.pointsBaseXYZ = std::move(runs[run]);
-            diagnostics.lines.push_back(std::move(diagnostic));
-            diagnostics.sourceIds.push_back(index);
-        }
-    }
-    if (objLines.empty()) {
-        throw std::runtime_error(
-            "tagged VC3D reference fibers do not intersect the trace crop");
+        const auto& points = selected.fiber.linePoints;
+        const std::string name =
+            "reference_" + std::to_string(index) + "_" +
+            selected.path.stem().string();
+        retainedPoints += points.size();
+        objLines.push_back({name, points});
+        vc::fiber_tracer::FiberletCropTraceLine diagnostic;
+        diagnostic.seedBaseXYZ = points.front();
+        diagnostic.pointsBaseXYZ = points;
+        diagnostics.lines.push_back(std::move(diagnostic));
+        diagnostics.sourceIds.push_back(index);
     }
     vc::core::io::writePolylinesObj(
         objLines, outputPath, "VC3D tagged reference fibers");
     std::cout << "fiber reference export"
               << " scanned_json=" << selection.scannedJsonFiles
               << " selected=" << selection.fibers.size()
-              << " retained_runs=" << objLines.size()
+              << " retained_fibers=" << objLines.size()
               << " retained_points=" << retainedPoints
               << " tag=" << std::quoted(options.referenceFiberTag)
               << " directory=" << std::quoted(
@@ -3400,7 +3391,7 @@ void prepareReferenceFiberPieces(
     if (report.inputTraces != reference.lines.size() ||
         reference.sourceIds.size() != reference.lines.size()) {
         throw std::invalid_argument(
-            "Reference constraint report does not match cropped runs");
+            "Reference constraint report does not match complete fibers");
     }
     reference.pieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(reference.lines, report);
     reference.sourceIdsByPiece.clear();
@@ -4442,10 +4433,7 @@ int main(int argc, char** argv)
                     : options.output.parent_path();
                 std::filesystem::create_directories(outputDirectory);
                 if (options.mode == Mode::DirectionAblation) {
-                    referenceDiagnostics = updateReferenceFiberArtifact(
-                        options,
-                        artifact.minimumBaseXYZ,
-                        artifact.maximumBaseXYZ);
+                    referenceDiagnostics = updateReferenceFiberArtifact(options);
                 }
                 if (referenceDiagnostics) {
                     const auto referenceConstraints =

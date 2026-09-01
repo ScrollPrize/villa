@@ -1,12 +1,9 @@
-# Status: separate winding value and sign-hardness constraints
+# Status: retain complete reference fibers in diagnostics
 
-- [x] Capture the corrected constraint and benchmark requirements.
-- [x] Write implementation, validation, documentation, and tuning plan.
-- [x] Complete independent plan review.
-- [x] Preserve signed winding-value loss and add independent sign-hardness weights.
-- [x] Split agreement, reference benchmark, and CSV diagnostics.
-- [x] Extend CLI and zero-aware local tuning.
-- [x] Add focused regression coverage.
+- [x] Capture the complete-reference requirement.
+- [x] Write the implementation, validation, spec, and documentation plan.
+- [x] Review the plan against the current specification and CLI flow.
+- [x] Remove reference crop clipping.
 - [x] Update specification, docs, changelog, and task log.
 - [x] Build and run focused validation.
-- [x] Run the 1024 tuning search and report the selected defaults.
+- [x] Rerun and report the 2026-09-01 adjacency evaluation.

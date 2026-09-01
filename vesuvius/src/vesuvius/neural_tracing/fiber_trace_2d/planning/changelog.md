@@ -1812,3 +1812,10 @@
   value and sign-hardness items with weight-independent structural denominators.
 - Extended exhaustive and local reference tuning from five winding coordinates
   to five winding plus two sign coordinates.
+
+## 2026-09-01 - Complete reference-fiber diagnostics
+
+- Stopped clipping tagged VC3D reference annotations to the traced crop before
+  visualization, reference constraint extraction, and BP benchmarking.
+- Reference diagnostics now retain one complete dense line per selected JSON
+  fiber in deterministic filename order.

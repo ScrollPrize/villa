@@ -5970,3 +5970,8 @@
   be populated during this tuning protocol. No parallel cutoff is enabled by
   default. A zero selected winding-class weight suppresses that energy term but
   does not remove its structural diagnostic or benchmark item.
+- Tagged VC3D reference fibers are diagnostic inputs independent of the traced
+  crop. Reference OBJ export, reference-to-reference extraction, and
+  reference-to-BP benchmarking must use each selected JSON fiber's complete
+  dense line exactly once in deterministic filename order; they must not clip
+  or split that line at the stored trace artifact bounds.

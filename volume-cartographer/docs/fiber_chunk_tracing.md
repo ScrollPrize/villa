@@ -1334,18 +1334,16 @@ options to the `direction-ablation` command:
 
 The tag match is exact and case-sensitive. The command scans only regular JSON
 files directly in that directory, validates selected files with the normal
-VC3D fiber parser, and clips their dense base-XYZ lines to the stored trace
-artifact's crop before writing `<base>_reference.obj`. A fiber that leaves and
-re-enters the half-open crop becomes multiple ordered OBJ paths; boundary
-crossings are retained, while geometry merely lying on the exclusive maximum
-face is not. The reference fibers are diagnostic only and do not affect BP.
-The same cropped runs are also passed once through the normal constraint
-extractor. Selected source-fiber filename order defines diagnostic virtual
-winding values `0.0, 0.5, 1.0, ...`; all crop runs from a source inherit its
-value, and a selected source without crop geometry still occupies its slot.
-Generated within-run continuity links and links between separate crop runs of
-the same source fiber are excluded. Every remaining link is presented exactly
-once under its lower-winding source and only points to a higher winding.
+VC3D fiber parser, and writes every complete dense base-XYZ line to
+`<base>_reference.obj`. Reference annotations are not clipped to the stored
+trace artifact's crop: geometry outside that crop remains available to both
+visual comparison and constraint diagnostics. The reference fibers are
+diagnostic only and do not affect BP. The same complete lines are passed once
+through the normal constraint extractor. Selected source-fiber filename order
+defines diagnostic virtual winding values `0.0, 0.5, 1.0, ...`, with one
+complete diagnostic trace per source. Generated within-source continuity links
+are excluded. Every remaining link is presented exactly once under its
+lower-winding source and only points to a higher winding.
 
 For each source and matching BP benchmark, the command prints a perpendicular
 table followed by a parallel table. Dominant score determines the table, with

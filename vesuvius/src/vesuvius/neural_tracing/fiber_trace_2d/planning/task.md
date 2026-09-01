@@ -1,15 +1,9 @@
-# Task: separate winding value and sign-hardness constraints
+# Task: retain complete reference fibers in diagnostics
 
-Separate signed winding observations into independently weighted winding-value
-and sign-hardness constraints throughout extraction-to-BP materialization,
-scoring, diagnostics, and reference benchmarking for both dominant
-perpendicular and parallel relations.
+Reference fibers loaded by `vc_fiber_trace_chunk direction-ablation` must be
+used and visualized as complete annotated polylines. They must not be clipped
+to the traced crop before reference-to-reference constraint extraction or
+reference-to-BP benchmarking.
 
-The ordinary winding-value residual remains signed. Sign hardness adds the
-separately tunable high or hard reversal penalty. All
-constraint listings, agreement checks, and reference benchmark counts must
-report winding value and sign hardness separately, without allowing a zero solver weight to
-remove the corresponding item from the benchmark denominator.
-
-After validation, tune the seven weights on the established 1024 reference
-benchmark and promote the selected defaults.
+Rerun the new 2026-09-01 reference-stack evaluation after the correction and
+report the adjacent-fiber perpendicular/parallel relations and winding steps.
