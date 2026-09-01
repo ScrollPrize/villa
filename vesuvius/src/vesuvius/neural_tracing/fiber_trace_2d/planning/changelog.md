@@ -6,9 +6,11 @@
 - Split agreement, evidence, CSV, and reference benchmark output into structural
   winding-value and sign-hardness items whose benchmark denominators do not
   disappear at zero solver weight.
-- Extended winding-weight searches to seven coordinates and promoted the 1024
-  local optimum: winding `0.5,2,1,2,1`, sign hardness `0,1`, with `8/8` exact
-  reference windings and `3562/4061` correct reference items.
+- Extended winding-weight searches to seven coordinates. A first cutoff-based
+  result was rejected because it excluded parallel-other and parallel-sign
+  items; the corrected no-cutoff 1024 optimum is winding `0.5,0,1,2,1`, sign
+  hardness `0.5,1`, with `8/8` exact reference windings and `4835/5446` correct
+  reference items.
 
 # 2026-09-01: reversible zero-weight refinement
 

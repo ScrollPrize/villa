@@ -5910,7 +5910,7 @@
   zero under weighted modes. The default is `linear`.
 - `--winding-sign-weights PERP,PARALLEL` supplies finite nonnegative multipliers
   for the additional perpendicular and parallel sign-hardness rules, default
-  `0,1`. Zero disables that relation's extra finite penalty and aligned hard
+  `0.5,1`. Zero disables that relation's extra finite penalty and aligned hard
   promotion but does not remove the ordinary signed winding-value residual.
 - `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
   zero predicted delta adds
@@ -5931,7 +5931,7 @@
   winding factor temperature remains `0.25`. The default sign multipliers are
   perpendicular zero and parallel one; finite sign cost remains `44`, decision
   confidence `cosine`, and normal confidence `linear`.
-- Shared and CLI H/V-aware winding defaults are `0.5,2,1,2,1`. An explicit
+- Shared and CLI H/V-aware winding defaults are `0.5,0,1,2,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not
   quantize the H/V ladder targets used for canonical class selection.
@@ -5961,12 +5961,12 @@
   candidates are omitted, zero remains available at either bound, and the
   printed progress denominator is the deduplicated in-range candidate count.
   An iteration-limit exit is an error rather than a local optimum.
-- The fixed 1024 reference-crop seven-coordinate refinement evaluated 111
-  scenarios from winding `0,4,2,2,1`, sign `1,1` and selected winding
-  `0.5,2,1,2,1`, sign `0,1`. Exact reference windings improved from `6/8` to
-  `8/8`; correct fixed-denominator reference items improved from `3141/3953`
-  (79.459%) to `3562/4061` (87.712%). A zero perpendicular sign-hardness weight
-  removes only the extra finite/hard reversal term: positive perpendicular
-  winding-value weights continue to apply the signed residual. The configured
-  `0.5` parallel cutoff admitted no parallel-sign reference items, so this run
-  did not identify the retained parallel sign default of one.
+- A cutoff-based seven-coordinate experiment was rejected because a `0.5`
+  parallel cutoff excluded parallel-other and parallel-sign benchmark items.
+  The corrected no-cutoff 1024 refinement evaluated 58 scenarios from winding
+  `0.5,2,1,2,1`, sign `0,1` and selected winding `0.5,0,1,2,1`, sign `0.5,1`.
+  It converged with `8/8` exact reference windings and `4835/5446` correct
+  fixed-denominator reference items (88.781%). All five reference classes must
+  be populated during this tuning protocol. No parallel cutoff is enabled by
+  default. A zero selected winding-class weight suppresses that energy term but
+  does not remove its structural diagnostic or benchmark item.

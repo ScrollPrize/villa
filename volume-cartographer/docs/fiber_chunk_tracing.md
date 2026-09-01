@@ -1042,7 +1042,7 @@ The five canonical winding terms can be scaled independently with
 `--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
-(`2+`). Standard runs default to `0.5,2,1,2,1`; pass `1,1,1,1,1` explicitly for
+(`2+`). Standard runs default to `0.5,0,1,2,1`; pass `1,1,1,1,1` explicitly for
 neutral class weighting. Each value must be finite and nonnegative. A zero
 value removes that class's ordinary signed winding-value loss. If its dominant
 signed observation also has an enabled sign-hardness rule, that extra rule remains an
@@ -1074,7 +1074,7 @@ Same-trace hard continuity is unchanged in both cases.
 
 Use `--winding-sign-weights PERP,PARALLEL` to scale the additional sign-hardness
 rule independently for dominant perpendicular and parallel observations. The
-default is `0,1`. A zero entry disables both the finite sign penalty and the
+default is `0.5,1`. A zero entry disables both the finite sign penalty and the
 aligned hard-sign promotion for that relation. It does not make reversal
 acceptable to the ordinary winding-value term, which continues to compare the
 signed predicted and canonical winding deltas.
@@ -1169,18 +1169,17 @@ the iteration guard before an optimum is an error rather than a successful
 termination. The selected tuple is solved once more to produce the ordinary
 output artifacts.
 
-On the fixed 1024 reference crop with scale-first targets and separate
-winding/sign items, the corrected baseline was winding `0,4,2,2,1`, sign
-`1,1`: 6/8 exact reference windings and 3141/3953 correct items (79.459%). The
-seven-coordinate zero-aware search evaluated 111 scenarios and selected winding
-`0.5,2,1,2,1`, sign `0,1`: 8/8 exact and 3562/4061 correct (87.712%). Its five
-accepted moves disabled only the extra perpendicular sign-hardness term, raised
-then refined perpendicular-next winding weight, halved perpendicular-far, and
-halved parallel-same. The positive perpendicular winding weights retain signed
-value loss, so a reversal remains a winding-value error even though its second
-high/hard penalty defaults to zero. The `0.5` parallel cutoff admitted no
-parallel-other or parallel-sign reference items, so this run did not identify
-the retained parallel sign default of one.
+The first seven-coordinate run used a `0.5` parallel cutoff and selected winding
+`0.5,2,1,2,1`, sign `0,1`, but that result excluded parallel-other and
+parallel-sign items and is not a production default. The corrected no-cutoff
+search started there, evaluated 58 scenarios, and selected winding
+`0.5,0,1,2,1`, sign `0.5,1`: 8/8 exact reference windings and 4835/5446 correct
+items (88.781%). All five reference classes were populated: perpendicular
+winding 1420/1797, perpendicular sign 1775/1797, parallel-same winding 283/306,
+parallel-other winding 600/773, and parallel sign 757/773. No additional
+parallel cutoff is enabled by default. The zero perpendicular-far winding weight
+is a selected class weight, not an extraction cutoff; far observations and their
+separate sign items remain present in diagnostics and benchmark denominators.
 
 The adaptive grid stores `gain=1/measurement_scale`, but gain selects the
 scale-specific canonical target before factor evaluation; it no longer scales

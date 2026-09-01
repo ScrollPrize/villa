@@ -79,13 +79,41 @@
 - Zero-aware local search evaluated 111 scenarios and accepted five moves:
   sign perpendicular `1 -> 0`, perpendicular next `0 -> 1`, perpendicular far
   `4 -> 2`, perpendicular next `1 -> 0.5`, and parallel same `2 -> 1`.
-- Selected defaults: winding `0.5,2,1,2,1`, sign hardness `0,1`; result `8/8`
+- Provisional cutoff result: winding `0.5,2,1,2,1`, sign hardness `0,1`; result `8/8`
   exact reference windings and `3562/4061 = 87.7124%` reference items.
-- Final class accuracy was perpendicular winding `1456/1875 = 77.653%`,
+- Its class accuracy was perpendicular winding `1456/1875 = 77.653%`,
   perpendicular sign `1828/1875 = 97.493%`, and parallel-same winding
   `278/311 = 89.389%`. The `0.5` parallel cutoff admitted no parallel-other or
   parallel-sign reference items, so the parallel sign default remains `1` and
   was not identified by this run.
-- The selected perpendicular sign weight `0` removes only its additional
+- The provisional perpendicular sign weight `0` removes only its additional
   high/hard penalty. Perpendicular winding weights remain positive, so the
   ordinary signed residual still penalizes every reversal.
+
+## No-cutoff correction
+
+- Corrected Release command:
+
+  ```bash
+  volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/crop_traces.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /tmp/winding-sign-full-tune/fibers --direction-dominance 0.9 --piece-length 512 --bp-only --bp-inference sum-product-mixed --quality-fraction 0.25 --winding-fixed-phase 0.5 --winding-fixed-scale 0.822 --winding-fixed-orientation --bp-message-iterations 500 --reference-fiber-dir /home/hendrik/business/aiconsulting/vesuviuschallenge/data/test_datasets/2026-08-28_fiber_stack --reference-fiber-tag hendrik_crop1 --split-continuity hard --winding-hard-signs both --winding-hard-sign-angle 30 --winding-normal-confidence linear --winding-decision-confidence cosine --winding-weights 0.5,2,1,2,1 --winding-sign-weights 0,1 --winding-weight-search-local --winding-sign-cost 44 --winding-defect-cost 100 --bp-temperature 1.25
+  ```
+
+- The provisional search was invalid as a general default-selection run because
+  `--parallel-winding-cutoff 0.5` removed all parallel-other and parallel-sign
+  benchmark items. The cutoff remains disabled by default.
+- The corrected Release run removed that option and started local refinement at
+  winding `0.5,2,1,2,1`, sign `0,1`. Its baseline was `6/8` exact and
+  `4366/5655 = 77.206%` correct reference items.
+- The search evaluated 58 scenarios and selected winding `0.5,0,1,2,1`, sign
+  hardness `0.5,1`. It converged with `8/8` exact and
+  `4835/5446 = 88.7808%` correct items.
+- Final class accuracy: perpendicular winding `1420/1797 = 79.021%`,
+  perpendicular sign `1775/1797 = 98.776%`, parallel-same winding
+  `283/306 = 92.484%`, parallel-other winding `600/773 = 77.620%`, and
+  parallel sign `757/773 = 97.930%`.
+- A separate ordinary default run, with neither explicit weight tuple nor
+  parallel cutoff, reproduced the selected converged `8/8` and
+  `4835/5446 = 88.781%` result exactly.
+- The selected zero perpendicular-far winding weight disables that energy class,
+  not extraction. Those structural winding items and their independent sign
+  items remain present in agreement and benchmark denominators.
