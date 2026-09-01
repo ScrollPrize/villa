@@ -45,9 +45,9 @@ def _create_recompressed_array(
 
     zarr-python 2.x arrays are always on-disk format 2 and take a numcodecs
     ``compressor=``. zarr-python 3.x defaults new arrays to format 3, which
-    rejects ``compressor=`` and instead wants a bytes-to-bytes codec passed
-    as ``compressors=``. Branching here lets the destination array mirror
-    the source array's format instead of failing under 3.x (see #1670).
+    rejects ``compressor=`` (v2-only) and instead wants a bytes-to-bytes
+    codec passed as ``codecs=``. Branching here lets the destination array
+    mirror the source array's format instead of failing under 3.x (see #1670).
     """
     if _ZARR_MAJOR_VERSION < 3 or zarr_format == 2:
         compressor = Blosc(cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE)
@@ -64,7 +64,7 @@ def _create_recompressed_array(
         shape=shape,
         chunks=chunks,
         dtype=dtype,
-        compressors=[
+        codecs=[
             BloscCodec(cname="zstd", clevel=compression_level, shuffle=BloscShuffle.bitshuffle)
         ],
         zarr_format=3,
