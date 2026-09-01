@@ -39,6 +39,7 @@ struct FiberTraceBeliefPropagationConfig {
     double softBalanceStrength = 1.0;
     double horizontalnessTemperature = 1.25;
     double mixedUnaryCost = 1.0;
+    bool enforceHardSplitContinuity = true;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
     double balanceTolerance = 1.0e-3;

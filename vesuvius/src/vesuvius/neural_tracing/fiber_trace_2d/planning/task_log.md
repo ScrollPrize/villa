@@ -1,159 +1,92 @@
-# Task Log
+# Task log: hard split continuity and aligned winding signs
 
-- Starting revision: `c375b1977` plus the uncommitted completed winding-sweep
-  implementation and correspondence diagnostics in the working tree.
-- This task continues the fixed 1024-crop hyperparameter evaluation. The
-  unchanged baseline is class weights `8,1,2,2,1`, perpendicular hard sign,
-  piece-break cost `0`, Defect cost `50`, orientation BP temperature `2.5`,
-  fixed winding phase `0.5`, fixed scale `1.0`, fixed orientation, and 500
-  messages.
-- Previous baseline result: converged, 8/8 exact reference windings,
-  1,784/2,839 matched admitted reference constraints, 1,313 active pieces, and
-  47 Defect pieces. It repeated exactly.
-- Previous interaction result motivating this task: adding parallel hard signs
-  consistently worsened distant-magnitude variants. Audit found that selected
-  hypothesis scores remain in `[0.5,1]`, normal alignment changes target
-  magnitude but not confidence, and hard signs are infinite even for barely
-  dominant or weakly aligned evidence.
-- Independent plan review required explicit transient parallel-alignment data
-  flow, missing-alignment behavior, exact finite-sign energy and zero-delta
-  semantics, hard-sign behavior at zero confidence, discrete incidence rules,
-  fixed-denominator reporting, a mandatory experiment matrix, and broader
-  default/extraction/reference tests. The plan was updated before implementation.
+## Findings
+
+- Existing `hardContinuity` edges used finite pair costs and allowed an
+  active/Defect boundary with default piece-break cost zero. Independent
+  nodewise marginal MAP decoding could also publish different H/V or winding
+  states across one active source-fiber continuation edge.
+- The required invariant is edge-local, not a whole-source chain state. A
+  continuation edge is neutral when either endpoint is Defect. When both
+  endpoints are active, they must have identical H/V and integer winding. A
+  Defect gap may therefore separate independently labeled active runs.
+- Existing sign configuration was global: finite `--winding-sign-cost 44`
+  made every enabled sign finite, while `hard` made every enabled sign exact.
+  Extraction already retained the raw absolute aligned-normal agreement needed
+  for a local reliability gate.
+- The requested 30-degree gate is the inclusive raw-alignment comparison
+  `abs(dot(connector, aligned_normal)) >= cos(30 degrees)`.
+- Exact pair potentials alone do not guarantee a feasible published assignment
+  after independent nodewise marginal MAP decoding. Deterministic final
+  projection must therefore enforce the same edge-local invariant.
 
 ## Implementation
 
-- Added post-decision confidence modes `legacy`, `linear`, and `cosine`.
-  `legacy` retains the selected normalized hypothesis score `s`; `linear` uses
-  `2s-1`; `cosine` applies `(1-cos(pi*(2s-1)))/2`.
-- Added normal-confidence modes `none`, `linear`, and `cosine`. `linear` maps
-  alignment angle to `[0,1]`; `cosine` uses the absolute normal dot directly.
-  Missing alignment is neutral under `none` and zero-confidence under either
-  weighted mode.
-- Perpendicular constraints retain the closest connector's absolute normal
-  alignment. Parallel constraints use the deterministic median alignment over
-  all accepted connector samples, including an even-count central-pair mean.
-- Added optional finite sign-infringement energy. A wrong or zero predicted
-  sign costs `sign_cost * decision_confidence * normal_confidence`; absent cost
-  retains the legacy hard incompatibility. Zero cost removes the sign factor.
-- Applied identical coefficient/sign semantics to winding BP, decoded energy,
-  component connectivity, Defect incidence, diagnostics, and reference-fiber
-  inference. Orientation/prepass energy and hard continuity are unchanged.
-- Added CLI controls, documentation, and focused extraction, solver,
-  reference-inference, missing-alignment, zero-confidence, and default
-  compatibility tests.
+- Added hard split continuity, enabled by default, to orientation BP and both
+  H/V-aware winding solvers. Defect neutralizes a continuation edge; two active
+  endpoints must share H/V and integer winding.
+- Deterministic final projection preserves the orientation seed or winding
+  gauge, otherwise disables the lower-confidence endpoint, and uses the larger
+  node index as the exact tie-break. It never copies a state through an entire
+  source chain.
+- Added `--split-continuity hard|finite`. `finite` retains the previous
+  pairwise behavior and makes `--piece-break-cost` effective; `hard` is the
+  default.
+- Added `--winding-hard-sign-angle DEG|off`, default 30 degrees. An admitted,
+  enabled, nonzero dominant perpendicular or parallel sign is exact when its
+  raw normal alignment reaches the threshold. Weaker signs retain the existing
+  finite confidence-weighted cost. Global `--winding-sign-cost hard` remains an
+  unconditional override.
+- Applied identical sign promotion in solver preparation, factor diagnostics,
+  reference observations, and final hard-sign feasibility projection. Added
+  promotion flags to the factor CSV.
+- Added `fiber winding constraint agreement` output. It reports prepared,
+  active/evaluated, Defect-neutralized, infringed, and
+  `infringed/evaluated` percentage for continuity, perpendicular `0.5`/`1.5+`,
+  parallel `0`/`1`/`2+`, and the sum.
 
-## Fixed benchmark
+## Superseded run
 
-All rows use the Release `vc_fiber_trace_chunk`, the fixed 1024 crop, 500
-quality-filtered fibers split at 512 base voxels, eight `hendrik_crop1`
-references, fixed phase `0.5`, fixed scale `1`, and fixed orientation. The
-approved `/tmp/vc_direction_ablation_runner.sh` records complete logs under
-`/tmp/winding_sweep`. Columns are solver status, exact reference windings,
-matched/evaluated constraints, active pieces, and Defect pieces.
-
-Baseline: `converged`, `8/8`, `1784/2839`, `1313`, `47`.
-
-### Confidence matrix with legacy hard perpendicular sign
-
-| Decision | Normal | Status | Exact | Right/total | Active | Defect |
-| --- | --- | --- | --- | --- | --- | --- |
-| legacy | none | converged | 8/8 | 1784/2839 | 1313 | 47 |
-| legacy | linear | converged | 6/8 | 1559/2856 | 1310 | 50 |
-| legacy | cosine | converged | 8/8 | 1637/2847 | 1309 | 51 |
-| linear | none | converged | 8/8 | 1641/2858 | 1313 | 47 |
-| linear | linear | converged | 8/8 | 1630/2847 | 1311 | 49 |
-| linear | cosine | converged | 8/8 | 1637/2847 | 1309 | 51 |
-| cosine | none | converged | 8/8 | 1641/2858 | 1313 | 47 |
-| cosine | linear | converged | 8/8 | 1630/2847 | 1310 | 50 |
-| cosine | cosine | converged | 8/8 | 1637/2847 | 1309 | 51 |
-
-No confidence remapping beat the baseline. Normal attenuation was especially
-harmful on this crop, so both controls remain neutral by default.
-
-### Sign matrix at legacy/no-confidence weighting
-
-| Signs | Cost | Status | Exact | Right/total | Active | Defect |
-| --- | ---: | --- | --- | --- | ---: | ---: |
-| perpendicular | 0 | converged | 6/8 | 1731/2992 | 1360 | 0 |
-| perpendicular | 0.25 | converged | 7/8 | 1758/2992 | 1360 | 0 |
-| perpendicular | 1 | converged | 7/8 | 1758/2992 | 1360 | 0 |
-| perpendicular | 4 | converged | 7/8 | 1758/2992 | 1360 | 0 |
-| perpendicular | 16 | converged | 7/8 | 1832/2992 | 1360 | 0 |
-| perpendicular | 64 | converged | 8/8 | 1863/2977 | 1352 | 8 |
-| parallel | 0 | converged | 6/8 | 1731/2992 | 1360 | 0 |
-| parallel | 0.25 | converged | 6/8 | 1731/2992 | 1360 | 0 |
-| parallel | 1 | converged | 6/8 | 1734/2992 | 1360 | 0 |
-| parallel | 4 | converged | 6/8 | 1739/2992 | 1360 | 0 |
-| parallel | 16 | converged | 6/8 | 1812/2992 | 1360 | 0 |
-| parallel | 64 | converged | 5/8 | 1790/2983 | 1354 | 6 |
-| both | 0 | converged | 6/8 | 1731/2992 | 1360 | 0 |
-| both | 0.25 | converged | 6/8 | 1731/2992 | 1360 | 0 |
-| both | 1 | converged | 7/8 | 1762/2992 | 1360 | 0 |
-| both | 4 | converged | 8/8 | 1815/2992 | 1360 | 0 |
-| both | 16 | converged | 8/8 | 1874/2992 | 1360 | 0 |
-| both | 64 | converged | 8/8 | 1826/2899 | 1328 | 32 |
-| parallel | hard | converged | 4/8 | 1725/2930 | 1328 | 32 |
-| both | hard | message_limit | 7/8 | 1568/2502 | 1226 | 134 |
-
-### Coordinate refinement
-
-- Finite perpendicular costs `32,128,256,512` gave respectively
-  `1865/2992`, `1828/2932`, `1801/2874`, and `1792/2850`, all at 8/8 exact.
-- Finite-both costs `32,128,256,512` gave `1867/2989`, `1774/2808`,
-  `1665/2647`, and `1634/2599`; the last two reached the message limit.
-- Around finite-both cost 32, halving/doubling each class weight, Defect cost,
-  temperature, both confidence modes, and the parallel-only sign mode produced
-  no better authoritative row. The only nontrivial improvements were Defect
-  cost 100 or temperature 1.25, each `1870/2992` at 8/8.
-- With Defect cost 100 and temperature 1.25, sign costs
-  `16,24,32,40,44,48,52,56,64` produced matched counts
-  `1874,1870,1870,1875,1875,1875,1873,1873,1873` from the same 2,992 evaluated
-  constraints, all converged at 8/8 exact. Defect costs `75,100,150` were
-  identical on this plateau. Temperatures `0.625,0.9375,1.25,1.875,2.5` were
-  also identical at sign cost 48.
-
-Selected experimental row: decision `legacy`, normal `none`, finite signs
-`both`, sign cost `44`, weights `8,1,2,2,1`, piece-break cost `0`, Defect cost
-`100`, and temperature `1.25`. It converged with 8/8 exact references,
-`1875/2992` matched constraints, 1,360 active pieces, and zero Defect pieces.
-Two repeat runs reproduced the same solver state counts, residual, objective,
-reference estimates, and benchmark totals. Legacy CLI defaults remain unchanged;
-the selected row must be requested explicitly.
+An initial 2048 comparison accidentally implemented whole-chain propagation:
+one Defect forced every connected source piece to Defect. Its quality numbers
+are invalid for the requested behavior and are intentionally not retained as a
+result. The corrected attribution matrix separates continuity mode and hard
+sign promotion on both the 1024 and 2048 crops.
 
 ## Validation
 
-- Release build:
-  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiber_trace_winding_bp test_fiberlet_crop_trace test_lasagna_normal_alignment -j 16`
-- `volume-cartographer/build/bin/test_fiber_trace_winding_bp`: 55 cases passed.
+- Optimized build:
+  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiber_trace_winding_bp test_fiberlet_crop_trace -j 16`
+- `volume-cartographer/build/bin/test_fiber_trace_winding_bp`: 63 cases passed.
 - `volume-cartographer/build/bin/test_fiberlet_crop_trace`: 81 cases passed.
-- `volume-cartographer/build/bin/test_lasagna_normal_alignment`: 8 cases passed.
-- `volume-cartographer/build/bin/vc_fiber_trace_chunk --help`: new controls
-  advertised with the intended neutral defaults.
-- Final-build baseline and selected benchmark reruns reproduced
-  `1784/2839` and `1875/2992`, respectively.
 - `git diff --check`: clean.
 
-No implementation requirement was deferred. The confidence modes remain
-experimental and neutral by default because neither attenuation variant beat
-legacy confidence on this single fixed crop.
+## Crop comparisons
 
-## Follow-up default promotion
+All runs used the Release build, quality fraction `0.25`, 512-base-voxel
+pieces, fixed phase `0.5`, fixed scale `0.822`, fixed orientation, 500 maximum
+winding messages, parallel cutoff `0.5`, and the current default winding
+weights, temperatures, Defect cost, and finite sign cost. Only continuation
+mode and the hard-sign alignment gate changed. Runner wall time includes input,
+normal alignment, constraint extraction, solve, diagnostics, and artifact
+output; solve time is joint-grid winding only.
 
-- At user request, promoted the selected row to the shared/CLI defaults: both
-  sign classes, finite sign cost `44`, winding Defect cost `100`, and
-  orientation BP temperature `1.25`. Decision `legacy`, normal confidence
-  `none`, class weights `8,1,2,2,1`, and piece-break cost `0` remain unchanged.
-- Added `--winding-sign-cost hard` so the former strict sign behavior remains
-  directly selectable after finite cost `44` becomes the omission default.
-- A Release benchmark with all promoted parameters omitted reproduced the
-  selected row: converged, 8/8 exact reference windings, `1875/2992` matched
-  constraints, 1,360 active pieces, and zero Defect pieces. One of the original
-  1,361 pieces was removed as disconnected before inference; it was not marked
-  Defect.
-- The explicit legacy override (`perpendicular`, `hard`, Defect cost `50`,
-  temperature `2.5`) reproduced `1784/2839`, confirming the old behavior
-  remains selectable.
-- Rebuilt the Release app and focused tests after promotion. Winding BP passed
-  55 cases, crop tracing passed 81, and normal alignment passed 8. CLI help
-  reports the promoted values.
+| Crop | Continuity/sign | Status | Messages | Solve | Active | Defect | Continuity infringed | All infringed | Exact refs | Ref accuracy | Wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | finite/off | message limit | 500 | 13.6 s | 1,360 | 0 (0.00%) | 128/861 (14.87%) | 32,389/69,172 (46.82%) | 5/8 | 890/2,177 (40.88%) | 19 s |
+| 1024 | hard/off | converged | 115 | 3.0 s | 1,357 | 3 (0.22%) | 0/855 (0.00%) | 23,380/68,855 (33.96%) | 8/8 | 1,313/2,175 (60.37%) | 9 s |
+| 1024 | finite/30 deg | converged | 196 | 4.9 s | 1,354 | 6 (0.44%) | 92/853 (10.79%) | 22,734/68,531 (33.17%) | 8/8 | 1,340/2,148 (62.38%) | 11 s |
+| 1024 | hard/30 deg | converged | 221 | 5.5 s | 1,294 | 66 (4.85%) | 0/809 (0.00%) | 24,075/62,615 (38.45%) | 7/8 | 1,175/2,050 (57.32%) | 11 s |
+| 2048 | finite/off | message limit | 500 | 9.6 s | 2,523 | 0 (0.00%) | 533/2,028 (26.28%) | 16,373/46,600 (35.14%) | 5/8 | 411/953 (43.13%) | 82 s |
+| 2048 | hard/off | converged | 398 | 7.8 s | 2,488 | 35 (1.39%) | 0/1,963 (0.00%) | 10,865/45,363 (23.95%) | 6/8 | 551/952 (57.88%) | 79 s |
+| 2048 | finite/30 deg | message limit | 500 | 9.5 s | 2,474 | 49 (1.94%) | 423/1,966 (21.52%) | 14,220/44,591 (31.89%) | 5/8 | 413/934 (44.22%) | 81 s |
+| 2048 | hard/30 deg | message limit | 500 | 9.4 s | 2,469 | 54 (2.14%) | 0/1,942 (0.00%) | 11,130/44,460 (25.03%) | 5/8 | 521/953 (54.67%) | 80 s |
+
+Hard continuation alone is the strongest tested setting on both crops. It
+eliminates all active continuation mismatches while disabling only 0.22% of
+1024 pieces and 1.39% of 2048 pieces. The 30-degree hard-sign gate accounts for
+most additional Defects and lowers exact-reference and aggregate reference
+accuracy relative to hard/off on both crops. The requested default remains
+hard/30 degrees; those final artifacts overwrite
+`data/workdir3/fiber-crop-{1024,2048}/fibers*`. Complete logs and comparison
+artifacts are under `/tmp/hard-continuity-matrix`.

@@ -1,22 +1,16 @@
-# Task: confidence-weighted winding evidence refinement
+# Task: hard split continuity and aligned winding signs
 
-Extend the current winding-BP hyperparameter search with neutral-by-default
-variants for evidence confidence and sign handling:
+The 2048-voxel crop admits too many visibly invalid active fiber pieces.
 
-- after choosing the dominant parallel/perpendicular hypothesis, optionally
-  remap its score from `[0.5, 1]` to `[0, 1]` with linear and cosine variants;
-- optionally weight winding evidence by Lasagna-normal alignment, with
-  linear-in-angle and cosine/dot-product variants;
-- optionally replace enabled hard winding-sign rejection with a finite
-  sign-infringement cost; and
-- test the new controls individually and in combinations against the fixed
-  baseline, then refine the combined hyperparameters.
+Make consecutive pieces created by splitting one source fiber a configurable
+edge-local hard continuation: when both endpoints are active they must have the
+same H/V and winding state, while a Defect endpoint neutralizes that edge and
+may separate two independently active runs. Make dominant perpendicular and parallel signed winding
+constraints hard when their connector is sufficiently aligned with the aligned
+Lasagna normal, with a configurable threshold defaulting to 30 degrees. Less
+reliable signs retain the configured finite sign penalty.
 
-Variants that do not improve immediately must remain available but disabled or
-behaviorally neutral by default.
-
-Follow-up: promote the selected fixed-crop result to the standard defaults and
-commit the completed implementation. The promoted row uses both sign classes,
-finite sign cost `44`, winding Defect cost `100`, and orientation BP
-temperature `1.25`; decision confidence remains `legacy` and normal confidence
-remains `none`. The old hard-sign behavior must remain explicitly selectable.
+Also report, for every solve, the number and percentage of final constraints
+infringed overall and by canonical constraint class, while distinguishing
+constraints neutralized by a Defect endpoint. Re-run the 1024 and 2048 crops and
+compare the result with the prior behavior.

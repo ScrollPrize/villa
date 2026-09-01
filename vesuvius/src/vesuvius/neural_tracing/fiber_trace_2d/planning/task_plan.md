@@ -1,142 +1,85 @@
-# Plan: confidence-weighted winding evidence refinement
+# Plan: hard split continuity and aligned winding signs
 
-## Semantics and data flow
+## Implementation
 
-1. Retain the existing dominant-hypothesis decision. Add a decision-confidence
-   transform used only after that decision:
-   - `legacy`: retain the selected normalized score in `[0.5,1]`;
-   - `linear`: map `s` to `x = clamp(2*s-1,0,1)`;
-   - `cosine`: map `x` to `(1-cos(pi*x))/2`, the standard cosine interpolation
-     between zero and one.
-2. Record signed connector alignment confidence inside the existing batched
-   extraction path while its connector pairs are still available, without
-   additional volume reads:
-   - perpendicular evidence uses the absolute aligned-normal dot product at
-     its closest connector;
-   - parallel evidence uses the median absolute aligned-normal dot product over
-     all admitted, component-compatible connector samples used to form the
-     signed parallel-target sample set. Even medians average the two central
-     values, matching winding-target median behavior.
-   The later public reorientation helper cannot reconstruct the parallel walk;
-   it records closest-connector perpendicular confidence and leaves parallel
-   confidence unavailable rather than silently substituting it.
-3. Add a normal-confidence transform:
-   - `none`: multiplier one;
-   - `linear`: linearly map alignment angle from perpendicular to aligned,
-     `1 - 2*acos(clamp(abs_dot,0,1))/pi`;
-   - `cosine`: use the absolute dot product directly.
-   With `none`, missing alignment retains legacy finite magnitude. With either
-   weighted mode, missing, invalid, or component-incompatible alignment maps to
-   zero confidence.
-4. Apply decision and normal confidence identically to the selected finite
-   magnitude coefficient and finite sign-infringement coefficient in solver
-   diagnostics and reference-fiber inference. Hard continuity remains
-   unaffected. Connectivity and per-constraint Defect incidence stay discrete:
-   positive effective magnitude, positive finite-sign weight, or a hard sign
-   admits one factor incidence; exact zero does not. Confidence never
-   fractionally scales the Defect unary itself.
-5. Preserve existing enabled-sign behavior by default. Add an optional finite
-   nonnegative sign-infringement cost. When absent, enabled signs remain hard
-   incompatibilities regardless of confidence, including at a decision tie or
-   missing alignment, so legacy hard-sign semantics remain exact. When present,
-   each enabled nonzero signed measurement adds
-   `I[target*predicted_delta <= 0] * sign_cost * decision_confidence * normal_confidence`.
-   Class weights and distance decay do not multiply this term. It is added per
-   measurement to winding energy and divided by winding temperature through
-   the ordinary BP log potential; decoded and reference energy use the same
-   untempered term. Repeated measurements add independently, and a Defect state
-   neutralizes the complete pair factor. A zero configured cost or zero
-   effective confidence contributes no finite sign factor, graph connectivity,
-   or Defect incidence.
-6. Keep magnitude class weights, distance decay, target quantization, dominant
-   hypothesis selection, H/V orientation costs, and extraction geometry
-   unchanged.
-
-## CLI and diagnostics
-
-1. Add explicit CLI modes for decision-confidence and normal-confidence
-   transforms and a finite sign-infringement cost.
-2. Reject invalid modes and nonfinite/negative costs.
-3. Extend factor/reference diagnostics with raw alignment confidence,
-   transformed decision/normal multipliers, and effective finite sign weight,
-   so benchmark changes can be attributed to the intended control.
-4. Keep the extracted reference-constraint denominator fixed in reporting and
-   report admitted versus zero-confidence factors per class. Continue to rank
-   with the existing comparator only: convergence, exact references, missing
-   references, wrong references, right constraints, evaluated constraints,
-   wrong constraints, and residual. Active/Defect population is reported but
-   is not an added ordering key.
-5. Preserve current CLI defaults and output behavior when no new option is
-   passed.
-
-## Experiment sequence
-
-1. Re-run the unchanged fixed baseline on the 1024 crop and eight tagged
-   reference fibers.
-2. Run the complete hard-perpendicular confidence matrix: decision mode in
-   `{legacy,linear,cosine}` crossed with normal mode in
-   `{none,linear,cosine}` (nine rows total).
-3. At the best authoritative confidence row, run sign modes
-   `{perpendicular,parallel,both}` with finite sign costs
-   `{0,0.25,1,4,16,64}`. Also run the corresponding three hard-sign controls.
-   Log failed and nonconverged rows; do not skip a mode based on an earlier row.
-4. Continue coordinate refinement from the best authoritative row across the
-   new transform categories, sign penalty, five class weights, Defect cost,
-   and BP temperature. Categorical neighbors are every other decision mode,
-   normal mode, hard/finite sign treatment, and enabled sign mode. Positive
-   numeric parameters use `/2,*2`; sign cost is bounded to `[0.125,512]`, class
-   weights to `[0.125,64]` with explicit zero neighbors retained, Defect cost to
-   `[0.125,400]`, and temperature to `[0.25,20]`. Use the established comparator
-   defined above.
-5. Re-run the selected row for determinism and report every attempted row in
-   `planning/task_log.md`; do not silently select by percentage while dropping
-   reference support.
+1. Extend the shared H/V-aware winding configuration with:
+   - a hard split-continuity switch, enabled by default;
+   - an optional minimum absolute Lasagna-normal alignment for promoting an
+     enabled signed factor to hard, defaulting to `cos(30 degrees)`.
+2. Apply edge-local hard split continuity in the H/V/Mixed orientation prepass
+   and in both joint-grid and alternating winding solvers. Two active endpoints
+   on one continuation edge must have the same H/V and winding state. Either
+   endpoint may instead be Defect, which neutralizes that edge and splits the
+   source into independent active runs. Enforce active segments in pair
+   potentials and deterministic final decoding so independent node MAP values
+   cannot publish an active-active mismatch. Preserve existing finite pair
+   behavior when disabled.
+3. Centralize sign-mode selection. An enabled nonzero dominant sign is hard
+   when global sign cost is `hard`, or when its measured absolute normal
+   raw absolute alignment reaches the configured threshold (inclusive), even
+   when transformed decision confidence or finite sign cost is zero. Otherwise it retains the
+   existing finite confidence-weighted sign penalty. Use this identical rule
+   in solver preparation, factor diagnostics, and reference inference. Global
+   `hard` overrides the gate; missing alignment cannot be promoted; parallel
+   cutoff and dominant/nonzero/enabled admission still apply first.
+4. Add `--split-continuity hard|finite` and
+   `--winding-hard-sign-angle DEG|off`. Validate degrees in `[0,90]` and convert
+   to `cos(DEG)`. Defaults implement hard split continuity and 30 degrees;
+   `finite` plus `off` exactly recover the previous finite-only behavior.
+5. Add a shared final-solution constraint-agreement summary over prepared
+   dominant factor diagnostics after fixed-orientation removal, parallel
+   cutoff, and confidence/sign admission. Classify each measurement as
+   continuity, perpendicular 0.5/far, or parallel 0/1/far; report prepared,
+   active/evaluated, Defect-neutralized, infringed, and
+   `infringed/evaluated` percent (`NA` for zero evaluated). Count a measurement
+   once as infringed when any of these fail: expected H/V relation; enabled
+   sign (`target*predicted <= 0`); or canonical target bin. Perpendicular bins
+   use `delta/measurement_scale` and half-integer nearest-bin boundaries;
+   parallel bins use unscaled latent delta and integer nearest-bin boundaries.
+   Continuity requires identical full state only when both endpoints are
+   active; any Defect endpoint neutralizes the edge.
+6. Print the compact table for every final winding solution before reference
+   benchmark output.
 
 ## Tests
 
-- Unit-test transform endpoints, midpoint behavior, validation, and default
-  legacy equivalence.
-- Unit-test perpendicular and parallel alignment confidence extraction,
-  endpoint reversal, even median, and serial/parallel/batched equivalence.
-- Unit-test finite sign reversal cost versus hard rejection, correct-sign zero
-  penalty, exact-zero predicted-delta penalty, sign-cost-zero removal, zero
-  confidence, Defect escape, and connectivity/incidence.
-- Unit-test missing-alignment policy, dominant-only application, and unchanged
-  H/V orientation/prepass costs.
-- Unit-test reference inference and diagnostics against identical solver
-  multipliers and finite-sign semantics.
-- Assert complete default topology, incidence, diagnostics, reference result,
-  and decoded output equivalence, not only transform-function equivalence.
-- Build Release `vc_fiber_trace_chunk`, run focused winding/crop tests, and run
-  `git diff --check`.
-- Benchmark with the fixed approved runner and record exact inputs/settings.
+- Unit-test hard split continuation for allowed active/Defect and Defect/Defect
+  pairs, forbidden active-active H/V and winding mismatches, and valid identical
+  active states.
+- Unit-test a three-piece active/Defect/active chain whose two active runs have
+  different H/V and winding states, plus deterministic final enforcement of
+  each uninterrupted active segment after inconsistent nodewise MAP states.
+- Unit-test finite compatibility mode and existing piece-break cost.
+- Unit-test perpendicular and parallel sign promotion above/equal/below the
+  30-degree alignment threshold, missing alignment, disabled threshold, and
+  globally hard signs.
+- Unit-test zero decision confidence/cost promotion, zero targets/weights,
+  cutoff-suppressed parallel signs, and endpoint reversal.
+- Unit-test reference observations use the same promoted-hard rule.
+- Unit-test constraint infringement grouping, exclusions, repeated prepared
+  measurements, Defect neutralization, H/V mismatch, sign
+  mismatch, target-bin boundaries, aggregate percentages, and zero denominator.
+- Build the optimized winding test and CLI targets; run focused winding tests,
+  relevant crop-constraint tests, and `git diff --check`.
+- Run the approved 1024 and 2048 direction-ablation workloads as a four-way
+  attribution matrix on each artifact using the optimized build:
+  `finite/off`, `hard/off`, `finite/30 degrees`, and `hard/30 degrees`.
+  Compare prepared/excluded
+  factor totals, active/Defect pieces, infringements, reference metrics,
+  convergence/residual, runtime, and generated visualization artifacts.
 
-## Spec update
+## Spec Update
 
-- Document post-decision score transforms, normal-alignment confidence fields
-  and transforms, and hard versus finite enabled-sign semantics.
-- State that all new controls are neutral by default and the legacy coefficient
-  and hard perpendicular sign remain unchanged.
+Specify exact hard split-continuity state compatibility, the finite fallback,
+alignment-gated hard sign semantics and defaults, and final-solution
+constraint-infringement accounting.
 
-## Docs update
+## Docs Update
 
-- Document the three new CLI controls, formulas, interaction with dominant
-  hypothesis/class weights, and benchmark interpretation.
+Document the two CLI controls, interaction with finite sign and piece-break
+costs, alignment convention, and the new solution-agreement table.
 
 ## Changelog
 
-- Record confidence-weighted winding evidence, finite sign penalties, and the
-  selected measured parameter result.
-
-## Follow-up default promotion
-
-1. Promote the selected CLI/shared defaults: both sign classes, finite sign
-   cost `44`, winding Defect cost `100`, and orientation BP temperature `1.25`.
-   Keep decision `legacy`, normal confidence `none`, class weights
-   `8,1,2,2,1`, and piece-break cost `0`.
-2. Preserve access to strict hard signs by accepting the literal `hard` for
-   `--winding-sign-cost`.
-3. Update help, specs, docs, changelog, and production-default tests.
-4. Rebuild Release targets, run focused tests, and run the approved benchmark
-   without the newly defaulted flags. Compare it to the explicit selected row.
-5. Commit the complete current task state after validation.
+Record hard split continuity, alignment-gated hard signs, and final constraint
+infringement diagnostics.

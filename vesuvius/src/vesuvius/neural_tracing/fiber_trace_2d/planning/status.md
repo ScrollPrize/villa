@@ -1,22 +1,12 @@
-# Status: confidence-weighted winding evidence refinement
+# Status: hard split continuity and aligned winding signs
 
-- [x] Capture the user task in `task.md`.
-- [x] Audit current dominant score, normal alignment, sign, solver, and reference paths.
-- [x] Write `task_plan.md`, including tests, specs, docs, and changelog.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Implement decision-confidence transforms.
-- [x] Record and apply normal-alignment confidence.
-- [x] Implement finite sign-infringement costs.
-- [x] Keep solver, connectivity, diagnostics, and reference inference consistent.
-- [x] Add CLI controls and documentation.
-- [x] Add focused regression tests.
-- [x] Build and run final Release validation.
-- [x] Run the fixed baseline and new-parameter sweep.
-- [x] Refine combined parameters and verify the selected result.
-- [x] Complete task log, specs, changelog, and final review.
-- [x] Record the requested default-promotion follow-up.
-- [x] Promote the selected shared and CLI defaults.
-- [x] Preserve explicit hard-sign selection.
-- [x] Verify the promoted no-override benchmark and focused tests.
-- [x] Update final documentation.
-- [x] Commit the completed task state.
+- [x] Capture the current task in `task.md`.
+- [x] Inspect current continuation, sign, alignment, and reporting semantics.
+- [x] Write the implementation/test/docs/spec/changelog plan.
+- [x] Complete independent plan review and incorporate its corrections.
+- [x] Correct hard continuity to edge-local active-active equality.
+- [x] Update regression tests for Defect-separated active runs.
+- [x] Correct spec, docs, changelog, and task log semantics.
+- [x] Build and run focused tests.
+- [x] Run and compare the 1024 workload.
+- [x] Run and compare the 2048 workload.

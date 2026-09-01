@@ -21,12 +21,15 @@ namespace vc::fiber_tracer
 namespace
 {
 
+constexpr double kHardContinuityCost = 1.0e12;
+
 struct Factor {
     std::size_t a = 0;
     std::size_t b = 0;
     double sameCost = 0.0;
     double differentCost = 0.0;
     std::size_t measurements = 0;
+    bool hardContinuity = false;
 };
 
 struct Graph {
@@ -98,7 +101,8 @@ void validateConfig(const FiberTraceBeliefPropagationConfig& config)
 
 Graph buildGraph(
     std::size_t pieceCount,
-    const FiberTraceConstraintReport& constraints)
+    const FiberTraceConstraintReport& constraints,
+    bool enforceHardSplitContinuity = false)
 {
     if (pieceCount != constraints.pieces.size())
         throw std::logic_error("BP graph size does not match constraints");
@@ -133,6 +137,8 @@ Graph buildGraph(
         factor.sameCost += 1.0 - constraint.parallelScore;
         factor.differentCost += constraint.parallelScore;
         ++factor.measurements;
+        factor.hardContinuity = factor.hardContinuity ||
+            (enforceHardSplitContinuity && constraint.hardContinuity);
     }
 
     Graph graph;
@@ -141,16 +147,22 @@ Graph buildGraph(
     graph.factors.reserve(merged.size());
     for (const auto& [key, factor] : merged) {
         (void)key;
-        if (factor.sameCost == factor.differentCost) {
+        if (!factor.hardContinuity &&
+            factor.sameCost == factor.differentCost) {
             ++graph.neutralFactors;
             graph.neutralMeasurements += factor.measurements;
             continue;
         }
         auto normalized = factor;
-        const double commonCost = std::min(
-            normalized.sameCost, normalized.differentCost);
-        normalized.sameCost -= commonCost;
-        normalized.differentCost -= commonCost;
+        if (normalized.hardContinuity) {
+            normalized.sameCost = 0.0;
+            normalized.differentCost = kHardContinuityCost;
+        } else {
+            const double commonCost = std::min(
+                normalized.sameCost, normalized.differentCost);
+            normalized.sameCost -= commonCost;
+            normalized.differentCost -= commonCost;
+        }
         const std::size_t index = graph.factors.size();
         graph.factors.push_back(normalized);
         graph.adjacency[normalized.a].push_back(index);
@@ -200,9 +212,148 @@ PreparedProblem prepareProblem(
 
     PreparedProblem problem;
     problem.seed = topology.centralSeedPiece;
-    problem.graph = buildGraph(topology.pieceLines.size(), constraints);
+    problem.graph = buildGraph(
+        topology.pieceLines.size(),
+        constraints,
+        config.enforceHardSplitContinuity);
     problem.normalizedArcWeights = topology.normalizedArcWeights;
     return problem;
+}
+
+std::vector<std::vector<std::size_t>> hardContinuityComponents(
+    const Graph& graph)
+{
+    std::vector<std::vector<std::size_t>> adjacency(graph.adjacency.size());
+    for (const auto& factor : graph.factors) {
+        if (!factor.hardContinuity)
+            continue;
+        adjacency[factor.a].push_back(factor.b);
+        adjacency[factor.b].push_back(factor.a);
+    }
+    std::vector<std::vector<std::size_t>> result;
+    std::vector<unsigned char> visited(adjacency.size(), 0);
+    for (std::size_t start = 0; start < adjacency.size(); ++start) {
+        if (visited[start] != 0 || adjacency[start].empty())
+            continue;
+        result.emplace_back();
+        std::queue<std::size_t> pending;
+        pending.push(start);
+        visited[start] = 1;
+        while (!pending.empty()) {
+            const std::size_t node = pending.front();
+            pending.pop();
+            result.back().push_back(node);
+            for (const std::size_t neighbor : adjacency[node]) {
+                if (visited[neighbor] == 0) {
+                    visited[neighbor] = 1;
+                    pending.push(neighbor);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+void projectBinaryHardContinuity(
+    FiberTraceBeliefPropagationReport& report,
+    const PreparedProblem& problem)
+{
+    for (const auto& component : hardContinuityComponents(problem.graph)) {
+        double horizontal = 0.0;
+        double vertical = 0.0;
+        for (const std::size_t piece : component) {
+            const double probability = std::clamp(
+                report.horizontalness[piece], 0.0, 1.0);
+            horizontal += std::log(std::max(probability, 1.0e-300));
+            vertical += std::log(std::max(1.0 - probability, 1.0e-300));
+        }
+        const double probability =
+            std::find(component.begin(), component.end(), problem.seed) !=
+                    component.end()
+            ? 1.0
+            : horizontal >= vertical ? 1.0 : 0.0;
+        for (const std::size_t piece : component)
+            report.horizontalness[piece] = probability;
+    }
+}
+
+void projectMixedHardContinuity(
+    FiberTraceBeliefPropagationReport& report,
+    const PreparedProblem& problem)
+{
+    const std::size_t pieceCount = problem.graph.adjacency.size();
+    std::vector<unsigned char> touchesContinuity(pieceCount, 0);
+    for (const auto& factor : problem.graph.factors) {
+        if (!factor.hardContinuity)
+            continue;
+        touchesContinuity[factor.a] = 1;
+        touchesContinuity[factor.b] = 1;
+    }
+    std::vector<unsigned char> state(pieceCount, 1);
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        const std::array probability{
+            report.verticalProbability[piece],
+            report.mixedProbability[piece],
+            report.horizontalProbability[piece],
+        };
+        state[piece] = static_cast<unsigned char>(std::distance(
+            probability.begin(),
+            std::max_element(probability.begin(), probability.end())));
+    }
+    for (const auto& factor : problem.graph.factors) {
+        if (!factor.hardContinuity || state[factor.a] == 1 ||
+            state[factor.b] == 1 || state[factor.a] == state[factor.b]) {
+            continue;
+        }
+        const auto activeConfidence = [&](std::size_t piece) {
+            return state[piece] == 0
+                ? report.verticalProbability[piece]
+                : report.horizontalProbability[piece];
+        };
+        std::size_t disable = factor.b;
+        if (factor.a == problem.seed) {
+            disable = factor.b;
+        } else if (factor.b == problem.seed) {
+            disable = factor.a;
+        } else if (activeConfidence(factor.a) <
+                   activeConfidence(factor.b)) {
+            disable = factor.a;
+        } else if (activeConfidence(factor.b) <
+                   activeConfidence(factor.a)) {
+            disable = factor.b;
+        } else {
+            disable = std::max(factor.a, factor.b);
+        }
+        state[disable] = 1;
+    }
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        if (touchesContinuity[piece] == 0)
+            continue;
+        report.verticalProbability[piece] = state[piece] == 0 ? 1.0 : 0.0;
+        report.mixedProbability[piece] = state[piece] == 1 ? 1.0 : 0.0;
+        report.horizontalProbability[piece] = state[piece] == 2 ? 1.0 : 0.0;
+        report.horizontalness[piece] = state[piece] == 0
+            ? 0.0
+            : state[piece] == 1 ? 0.5 : 1.0;
+    }
+}
+
+void updateAchievedHorizontalFraction(
+    FiberTraceBeliefPropagationReport& report)
+{
+    if (report.horizontalness.size() != report.normalizedArcWeights.size())
+        throw std::logic_error("BP projected output size mismatch");
+    const double totalWeight = std::accumulate(
+        report.normalizedArcWeights.begin(),
+        report.normalizedArcWeights.end(),
+        0.0);
+    report.achievedHorizontalFraction = totalWeight > 0.0
+        ? std::inner_product(
+              report.horizontalness.begin(),
+              report.horizontalness.end(),
+              report.normalizedArcWeights.begin(),
+              0.0) / totalWeight
+        : 0.0;
 }
 
 FiberTraceBeliefPropagationReport initializeReport(
@@ -649,6 +800,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
     if (config.balanceMode == FiberTraceBalanceMode::None) {
         auto solution = solveField(graph, weights, seed, 0.0, config);
         assignFieldSolution(report, std::move(solution), 0.0);
+        if (config.enforceHardSplitContinuity)
+            projectBinaryHardContinuity(report, problem);
+        updateAchievedHorizontalFraction(report);
         report.balanceConverged = true;
         report.status = report.messageConverged
             ? "converged"
@@ -681,6 +835,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
         }
         const std::size_t accumulatedIterations = report.messageIterations;
         assignFieldSolution(report, std::move(best), bestField);
+        if (config.enforceHardSplitContinuity)
+            projectBinaryHardContinuity(report, problem);
+        updateAchievedHorizontalFraction(report);
         report.messageIterations = accumulatedIterations;
         report.balanceConverged = balanceConverged;
         report.status = !report.messageConverged
@@ -779,6 +936,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
         }
         const std::size_t accumulatedIterations = report.messageIterations;
         assignFieldSolution(report, std::move(best), bestField);
+        if (config.enforceHardSplitContinuity)
+            projectBinaryHardContinuity(report, problem);
+        updateAchievedHorizontalFraction(report);
         report.messageIterations = accumulatedIterations;
         report.balanceConverged = balanceConverged;
         report.status = infeasible
@@ -832,6 +992,8 @@ FiberTraceBeliefPropagationReport solveFiberTraceSumProduct(
     report.messageResidual = binary.messageResidual;
     report.messageConverged = binary.messageConverged;
     report.horizontalness = binary.probabilityOne;
+    if (config.enforceHardSplitContinuity)
+        projectBinaryHardContinuity(report, problem);
     report.logOdds = binary.logOdds;
     double weightedHorizontal = 0.0;
     double totalWeight = 0.0;
@@ -874,7 +1036,11 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
         for (std::size_t source = 0; source < 3; ++source) {
             for (std::size_t target = 0; target < 3; ++target) {
                 double energy = 0.0;
-                if (source != 1 && target != 1) {
+                if (factor.hardContinuity) {
+                    energy = source == 1 || target == 1 || source == target
+                        ? 0.0
+                        : kHardContinuityCost;
+                } else if (source != 1 && target != 1) {
                     energy = source == target
                         ? factor.sameCost
                         : factor.differentCost;
@@ -887,7 +1053,8 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
             for (std::size_t target = 0; target < 3; ++target) {
                 logPotential[index][source][target] =
                     -(energies[source][target] - minimum) / temperature;
-                if (!std::isfinite(logPotential[index][source][target])) {
+                if (std::isnan(logPotential[index][source][target]) ||
+                    logPotential[index][source][target] > 0.0) {
                     throw std::invalid_argument(
                         "Mixed-state sum-product BP temperature is too small for factor costs");
                 }
@@ -1047,7 +1214,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
             report.horizontalness[node];
         totalWeight += problem.normalizedArcWeights[node];
     }
-    report.achievedHorizontalFraction = weightedHorizontalness / totalWeight;
+    if (config.enforceHardSplitContinuity)
+        projectMixedHardContinuity(report, problem);
+    updateAchievedHorizontalFraction(report);
     report.status = report.messageConverged
         ? "converged"
         : "message_limit";

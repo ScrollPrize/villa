@@ -1,3 +1,32 @@
+# 2026-09-01: hard split continuity and aligned hard signs
+
+- Made source-fiber split continuity exact and edge-local by default across the
+  orientation prepass and final winding assignment. Two active endpoints must
+  share H/V and winding, while a Defect endpoint neutralizes that edge and may
+  split the source into independent active runs. An explicit finite
+  compatibility mode retains the prior behavior.
+- Promoted enabled dominant perpendicular and parallel signs to exact
+  constraints when their raw aligned-normal agreement is within 30 degrees by
+  default, while retaining finite sign penalties for weaker evidence.
+- Added per-class and aggregate final-solution constraint infringement counts
+  and percentages, with Defect-neutralized factors reported separately.
+
+# 2026-09-01: calibrated reference constraint diagnostics
+
+- Unified reference winding diagnostics under the reference-to-BP benchmark's
+  fitted global sign. Signed reference/reference steps are calibrated before
+  quantization and summary counting, while gauge offsets correctly cancel from
+  pairwise differences.
+- Added solver-weighted raw and canonical reference/reference measurement-scale
+  fits for perpendicular, parallel, combined, and per-class scopes, separating
+  continuous integration bias from quantized solver behavior and explicitly
+  labeling parallel-containing diagnostics as counterfactual.
+- Changed the `direction-ablation` joint-grid default to fixed phase `0.5` and
+  reference-calibrated measurement scale `0.822`; adaptive calibration remains
+  available through `--winding-adaptive-calibration`.
+- Added per-reference inferred half-step parity checks and component-gauged H/V
+  endpoint consistency diagnostics for active reference-to-BP constraints.
+
 # 2026-08-31: weighted reference winding diagnostics
 
 - Added per-reference finite-L1 diagnostics split into perpendicular `0.5` and

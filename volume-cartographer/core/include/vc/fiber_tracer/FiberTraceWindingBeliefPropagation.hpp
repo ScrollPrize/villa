@@ -25,6 +25,23 @@ struct FiberTraceCanonicalConstraintCounts {
     void add(double canonicalStep, double groundTruthStep) noexcept;
 };
 
+struct FiberTraceReferenceConstraintDiagnosticRow {
+    std::size_t constraintIndex = 0;
+    std::size_t ownerSource = 0;
+    std::size_t targetSource = 0;
+    bool perpendicularDominant = false;
+    bool signedMeasurement = false;
+    double rawStep = 0.0;
+    double calibratedStep = 0.0;
+    double canonicalStep = 0.0;
+    double groundTruthStep = 0.0;
+};
+
+struct FiberTraceReferenceConstraintDiagnosticReport {
+    std::vector<FiberTraceReferenceConstraintDiagnosticRow> rows;
+    FiberTraceCanonicalConstraintCounts counts;
+};
+
 enum class FiberTraceWindingSolver : unsigned char {
     JointGrid,
     Alternating,
@@ -118,6 +135,9 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::optional<double> parallelWindingDistanceCutoff;
     bool enforcePerpendicularWindingSign = true;
     bool enforceParallelWindingSign = true;
+    bool enforceHardSplitContinuity = true;
+    std::optional<double> hardSignMinimumNormalAlignment =
+        0.8660254037844386;
     FiberTraceWindingDecisionConfidence decisionConfidence =
         FiberTraceWindingDecisionConfidence::Legacy;
     FiberTraceWindingNormalConfidence normalConfidence =
@@ -270,7 +290,17 @@ struct FiberTraceWindingFactorDiagnostic {
     std::optional<double> effectiveSignedParallelDelta;
     bool hardPerpendicularSign = false;
     bool hardParallelSign = false;
+    bool perpendicularSignPromotedByAlignment = false;
+    bool parallelSignPromotedByAlignment = false;
 };
+
+[[nodiscard]] std::vector<FiberTraceWindingFactorDiagnostic>
+diagnoseFiberTraceWindingFactors(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceWindingBeliefPropagationConfig& config = {},
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
+    bool quantizeComponentTargets = true);
 
 enum class FiberTraceConstraintEvidenceClass : unsigned char {
     Continuity,
@@ -308,6 +338,34 @@ struct FiberTraceConstraintEvidenceSummary {
     FiberTraceConstraintEvidenceCohort selected;
     FiberTraceConstraintEvidenceCohort other;
     FiberTraceConstraintEvidenceCohort total;
+};
+
+enum class FiberTraceConstraintAgreementClass : unsigned char {
+    Continuity,
+    PerpendicularNext,
+    PerpendicularFar,
+    ParallelSame,
+    ParallelOne,
+    ParallelFar,
+    Count,
+};
+
+[[nodiscard]] const char* fiberTraceConstraintAgreementClassName(
+    FiberTraceConstraintAgreementClass agreementClass) noexcept;
+
+struct FiberTraceConstraintAgreementCounts {
+    std::size_t prepared = 0;
+    std::size_t evaluated = 0;
+    std::size_t defectNeutralized = 0;
+    std::size_t infringed = 0;
+};
+
+struct FiberTraceConstraintAgreementSummary {
+    std::array<
+        FiberTraceConstraintAgreementCounts,
+        static_cast<std::size_t>(FiberTraceConstraintAgreementClass::Count)>
+        classes;
+    FiberTraceConstraintAgreementCounts total;
 };
 
 [[nodiscard]] FiberTraceConstraintEvidenceSummary
@@ -385,6 +443,11 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     bool calibrationConverged = false;
 };
 
+[[nodiscard]] FiberTraceConstraintAgreementSummary
+summarizeFiberTraceConstraintAgreement(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceInterleavedWindingReport& winding);
+
 enum class FiberTraceReferenceConstraintClass : unsigned char {
     Perpendicular,
     ParallelSameWinding,
@@ -429,6 +492,10 @@ struct FiberTraceReferenceWindingObservation {
     std::optional<double> signedPerpendicularTarget;
     bool hardParallelSign = false;
     bool hardPerpendicularSign = false;
+    FiberTraceFixedOrientation bpEndpointOrientation =
+        FiberTraceFixedOrientation::Mixed;
+    std::size_t bpOrientationComponent = 0;
+    bool bpEndpointActive = false;
 };
 
 struct FiberTraceReferenceBenchmarkCounts {
@@ -458,6 +525,7 @@ struct FiberTraceReferenceSourceBenchmark {
     std::optional<double> estimatedWinding;
     std::size_t estimatedWindingSupport = 0;
     std::size_t estimatedWindingObservations = 0;
+    std::optional<bool> estimatedParityMatches;
 };
 
 struct FiberTraceReferenceWindingBenchmark {
@@ -468,6 +536,104 @@ struct FiberTraceReferenceWindingBenchmark {
     std::vector<FiberTraceReferenceSourceBenchmark> references;
     FiberTraceReferenceBenchmarkCounts sum;
 };
+
+enum class FiberTraceReferenceOrientationRelation : unsigned char {
+    Perpendicular,
+    Parallel,
+    Count,
+};
+
+struct FiberTraceReferenceOrientationCounts {
+    std::size_t right = 0;
+    std::size_t wrong = 0;
+
+    [[nodiscard]] std::size_t total() const noexcept
+    {
+        return right + wrong;
+    }
+};
+
+struct FiberTraceReferenceOrientationSourceBenchmark {
+    std::array<
+        FiberTraceReferenceOrientationCounts,
+        static_cast<std::size_t>(
+            FiberTraceReferenceOrientationRelation::Count)>
+        relations;
+    FiberTraceReferenceOrientationCounts sum;
+};
+
+struct FiberTraceReferenceOrientationComponentCalibration {
+    std::size_t component = 0;
+    bool evenReferenceIsHorizontal = true;
+    std::size_t evenHorizontalRight = 0;
+    std::size_t evenVerticalRight = 0;
+};
+
+struct FiberTraceReferenceOrientationBenchmark {
+    std::vector<FiberTraceReferenceOrientationComponentCalibration>
+        components;
+    std::array<
+        FiberTraceReferenceOrientationCounts,
+        static_cast<std::size_t>(
+            FiberTraceReferenceOrientationRelation::Count)>
+        relations;
+    std::vector<FiberTraceReferenceOrientationSourceBenchmark> references;
+    FiberTraceReferenceOrientationCounts sum;
+    std::size_t excludedInactive = 0;
+};
+
+[[nodiscard]] std::optional<bool> fiberTraceReferenceEstimateParityMatches(
+    std::size_t referenceSource,
+    std::optional<double> estimatedWinding);
+
+[[nodiscard]] FiberTraceReferenceOrientationBenchmark
+benchmarkFiberTraceReferenceOrientations(
+    std::span<const FiberTraceReferenceWindingObservation> observations);
+
+[[nodiscard]] FiberTraceReferenceConstraintDiagnosticReport
+makeFiberTraceReferenceConstraintDiagnosticReport(
+    const FiberTraceConstraintReport& constraints,
+    const std::vector<std::size_t>& sourceIdsByTrace,
+    const FiberTraceReferenceWindingBenchmark& calibration);
+
+struct FiberTraceReferenceScaleFit {
+    std::size_t observations = 0;
+    std::size_t admittedObservations = 0;
+    std::size_t informativeObservations = 0;
+    double effectiveWeight = 0.0;
+    double reciprocalScaleWeight = 0.0;
+    double unitScaleLoss = 0.0;
+    std::optional<double> fittedScale;
+    double fittedLoss = 0.0;
+    bool atLowerBound = false;
+    bool atUpperBound = false;
+};
+
+struct FiberTraceReferenceScaleCalibrationReport {
+    double minimumScale = 0.5;
+    double maximumScale = 2.0;
+    FiberTraceReferenceScaleFit rawPerpendicular;
+    FiberTraceReferenceScaleFit canonicalPerpendicular;
+    FiberTraceReferenceScaleFit rawParallel;
+    FiberTraceReferenceScaleFit canonicalParallel;
+    FiberTraceReferenceScaleFit rawAll;
+    FiberTraceReferenceScaleFit canonicalAll;
+    std::array<
+        FiberTraceReferenceScaleFit,
+        static_cast<std::size_t>(FiberTraceReferenceConstraintGroup::Count)>
+        rawGroups;
+    std::array<
+        FiberTraceReferenceScaleFit,
+        static_cast<std::size_t>(FiberTraceReferenceConstraintGroup::Count)>
+        canonicalGroups;
+};
+
+[[nodiscard]] FiberTraceReferenceScaleCalibrationReport
+calibrateFiberTraceReferenceConstraintScales(
+    const FiberTraceReferenceConstraintDiagnosticReport& reference,
+    std::span<const FiberTraceWindingFactorDiagnostic> factors,
+    double minimumScale = 0.5,
+    double maximumScale = 2.0);
 
 struct FiberTraceReferenceConstraintGroupDiagnostic {
     std::size_t observations = 0;

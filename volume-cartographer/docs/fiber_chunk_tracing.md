@@ -681,13 +681,15 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 ```
 
 Every extracted piece is one BP node. Consecutive overlapping pieces from one
-source fiber retain their canonical parallel-score-1 continuity link as finite
-strong same-label evidence; it is not an equality constraint. The established
-central-straight rule still selects a source fiber, then the exact clipped piece
-of that source closest to the crop center is fixed to H. Optional balance uses
-piece arc lengths, including overlap. The Mixed coefficient is multiplied by
-each piece's retained incident measurement count and applied once as a
-node-local unary.
+source fiber have exact edge-local continuity by default: two active endpoints
+must share H/V, while either endpoint may be Defect and thereby split the
+source into independent active runs. Pass `--split-continuity finite` to
+restore their canonical parallel-score-1 finite same-label evidence. The
+established central-straight rule still selects a
+source fiber, then the exact clipped piece of that source closest to the crop
+center is fixed to H. Optional balance uses piece arc lengths, including
+overlap. The Mixed coefficient is multiplied by each piece's retained incident
+measurement count and applied once as a node-local unary.
 
 `--ablation-limit N` selects a ranked prefix; omission admits every Mixed
 fiber. Natural BP fixes the established central straight seed to H and emits
@@ -935,9 +937,12 @@ subgraphs receive separate integer-zero gauges. An extra integer gauge does
 not fix H or V, so orientation-only evidence continues to propagate across a
 filtered winding component.
 
-Fixed phase `0.5` and scale `1.0` provide the exact half-step experiment.
-Adaptive calibration remains available for comparison and can move latent
-phase or measurement scale even though the observations are quantized.
+Fixed phase `0.5` and measurement scale `0.822` are the joint-grid CLI
+defaults. The scale comes from the combined continuous reference/reference
+constraint fit; the perpendicular model predicts measured winding delta as
+`latent / 0.822`. Pass `--winding-adaptive-calibration` to infer phase and
+scale instead. Adaptive calibration can move latent phase or measurement scale
+even though the observations are quantized.
 
 For `sum-product-mixed`, `--winding-solver joint-grid` is the default. It runs
 one inference over `(H,k)`, `(V,k)`, one winding-free Defect state, the global calibration grid, and one local
@@ -973,14 +978,17 @@ same/different orientation factor. A Defect assignment makes every incident
 pair factor neutral, disabling orientation, winding, calibration, and component
 sign evidence. Constraints attached to a pre-pass Defect are also removed from
 the continuous initializer and component graph.
-Use `--piece-break-cost F` to additionally discourage a late Defect boundary
-between consecutive pieces of the same source trace. The nonnegative cost is
-charged once when exactly one side of the existing hard-continuity edge is
-active, and is divided by `--bp-temperature` in the BP log potential. It is not
-charged for active/active or Defect/Defect pairs and never applies to measured
-cross-trace constraints. The default is `0`, preserving prior behavior. Large
-values can replace local Defect gaps with entire disabled runs, so tune this
-separately from the degree-scaled Defect unary.
+Split-piece continuity is exact and edge-local by default. Two active endpoints
+of a same-source continuation edge must have the same H/V class and integer
+winding. A Defect endpoint neutralizes that edge, so an active run may resume
+with a different state after a Defect gap. The orientation prepass and final
+winding decode enforce this pairwise invariant so independently decoded
+loopy-BP marginals cannot publish an active-active mismatch. Pass
+`--split-continuity finite` to recover the previous pairwise behavior. In that
+compatibility mode, `--piece-break-cost F` discourages a late Defect boundary:
+the nonnegative cost is charged once when exactly one endpoint is active and is
+divided by `--bp-temperature`. It is not charged for active/active,
+Defect/Defect, or measured cross-trace pairs. Its default is `0`.
 The consistency CSV preserves the soft pre-pass `p_v`, `p_mixed`, and `p_h`
 columns and records `winding_prepass_class`, `winding_final_class`, and final
 H/Defect/V probabilities. It writes `winding_valid=0` and `NA` for numeric
@@ -1000,11 +1008,12 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 In joint-grid mode, a non-Mixed pair factor charges orientation and winding
 evidence once. Orientation and the Mixed unary retain `--bp-temperature`;
 winding retains its established temperature `0.25`. A Mixed endpoint disables
-the complete pair factor. Consequently, Mixed-cost tuning from the alternating model
-is not expected to produce identical posteriors in the joint model. Every split
-piece remains a distinct variable. Same-trace continuity contributes its
-existing parallel-score-1, zero-difference factor, so other evidence can
-override it at the corresponding cost.
+the complete pair factor. Consequently, Mixed-cost tuning from the alternating
+model is not expected to produce identical posteriors in the joint model. Every
+split piece remains a distinct variable. Default hard continuity permits a
+Defect boundary, but forbids an H/V or winding change across a continuation
+edge whose endpoints are both active. `--split-continuity finite` restores the former parallel-score-1,
+zero-difference factor that other evidence can override.
 
 Without fixed orientation, joint-grid uses `--winding-defect-cost` as its only
 Defect unary. Non-fixed alternating uses the orientation BP posterior as its
@@ -1076,12 +1085,37 @@ exactly zero adds `F * decision_confidence * normal_confidence`. This term is
 independent of magnitude class weights and distance decay; the ordinary BP
 temperature still scales its log potential. The default is `44`; pass
 `--winding-sign-cost hard` for strict rejection, or `F=0` to remove the enabled
-sign. These confidence controls only
+sign at weak normal alignment.
+
+`--winding-hard-sign-angle DEG` promotes an admitted, enabled, nonzero dominant
+sign to exact rejection when its connector lies within `DEG` of the aligned
+Lasagna normal. The comparison is inclusive and uses the raw absolute dot
+product, before decision- or normal-confidence transforms. Perpendicular uses
+the closest connector alignment; parallel uses the median alignment over its
+accepted signed connector samples. The default is 30 degrees. Missing alignment
+is not promoted, and `--winding-hard-sign-angle off` leaves all signs under the
+configured finite cost. Global `--winding-sign-cost hard` remains stricter and
+makes every admitted enabled sign exact. Dominant-hypothesis admission, nonzero
+target, sign enablement, and the parallel cutoff are evaluated before this
+alignment gate.
+
+These confidence controls only
 change the dominant winding factor; they do not change H/V orientation evidence,
 same-trace hard continuity, or the discrete Defect cost.
 The winding-factor CSV records both raw alignments, the transformed decision
-and normal multipliers, and the effective finite sign penalties for each
-factor.
+and normal multipliers, effective finite sign penalties, and whether each sign
+was promoted by alignment.
+
+After every winding solve, `fiber winding constraint agreement` reports
+continuity, perpendicular `0.5`/`1.5+`, and parallel `0`/`1`/`2+` rows plus a
+sum. `prepared` is the final solver factor population after dominant selection,
+cutoffs, fixed-orientation removal, and component filtering. `active` means both
+endpoints have an active winding and is the denominator for `infringed_%`.
+`neutralized` counts factors disabled by at least one Defect endpoint, including
+hard continuation edges split by a Defect.
+An active factor is infringed once when any required H/V relation, enabled sign,
+or canonical winding bin is wrong. Neutralized factors are shown explicitly and
+are not silently counted as correct or included in the percentage denominator.
 
 The fixed 1024-crop sweep found no improvement from decision or normal
 confidence attenuation alone. The best experimental row retained
@@ -1124,18 +1158,20 @@ parallel * abs(delta)
     + perpendicular * abs(delta / measurement_scale - signed_target)
 ```
 
-For every accepted nonzero signed perpendicular target, the corresponding
-predicted delta must also satisfy the strict order constraint:
+An admitted enabled nonzero dominant sign promoted by the alignment gate, or by
+global hard-sign mode, requires:
 
 ```text
 signed_target * predicted_delta > 0
 ```
 
 Zero and reversed deltas have exactly zero active-active factor probability;
-they are not approximated by a large finite penalty. Exact signed zero,
-parallel-only evidence, missing signed targets, and zero-difference continuity
-do not activate this rule. A Defect endpoint remains neutral, so contradictory
-order evidence is resolved by disabling at least one involved piece.
+they are not approximated by a large finite penalty. Exact signed zero, missing
+signed targets, disabled sign classes, cutoff-suppressed parallel targets, and
+zero-difference continuity do not activate this rule. A Defect endpoint remains
+neutral, so contradictory order evidence is resolved by disabling at least one
+involved piece. Admitted non-promoted signs use the finite penalty described
+above.
 
 The log-space message implementation tracks finite sums and counts of
 negative-infinite terms separately. This permits exact exclusions with damped
@@ -1145,9 +1181,12 @@ same hard compatibility rule as the pair factors.
 
 Loopy BP reports retain their soft node marginals. Because independently
 selected node-marginal MAP states need not form a feasible edge assignment,
-publication performs one deterministic, monotone feasibility decode: for each
-remaining reversed active-active edge, the lower-confidence endpoint becomes
-Defect, preserving a gauge endpoint when possible. The CLI treats
+publication performs deterministic feasibility decoding. Reversed hard-sign
+edges disable the lower-confidence endpoint while preserving a gauge endpoint
+when possible. Each mismatched active-active hard-continuity edge similarly
+disables one endpoint; existing Defect endpoints split the chain. Sign and
+continuity projection repeat once so the published assignment satisfies both
+invariants. The CLI treats
 `winding_valid=0` as authoritative for H/V/Mixed OBJ output and reports the
 number of `hard_sign_projected_defects` in the winding calibration table.
 
@@ -1192,15 +1231,16 @@ Defaults are 5 gain cells, 6 phase cells, `log(1.1)` log-gain spacing, 0.25
 boundary pressure, 17 maximum gain cells, and 32 one-cell shifts. Phase always
 spans the canonical `[0,0.5]` interval.
 
-Calibration can instead be disabled and hardcoded:
+The fixed defaults can be overridden explicitly:
 
 ```text
 --winding-fixed-phase 0.5 --winding-fixed-scale 1.0
 ```
 
 Both flags are required together. Phase must be finite and in `[0,0.5]`; scale
-must be finite and positive. Fixed flags cannot be combined with explicitly
-supplied adaptive-grid controls or `--winding-solver alternating`. Fixed mode
+must be finite and positive. Fixed flags cannot be combined with
+`--winding-adaptive-calibration`, explicitly supplied adaptive-grid controls,
+or `--winding-solver alternating`. Fixed mode
 uses the same joint H/V/Mixed, integer-winding, and component-sign model, but
 the supplied values are scalar factor parameters: there is no latent
 calibration variable, calibration message, posterior, or gain-window update.
@@ -1281,16 +1321,49 @@ Generated within-run continuity links and links between separate crop runs of
 the same source fiber are excluded. Every remaining link is presented exactly
 once under its lower-winding source and only points to a higher winding.
 
-For each source the command prints a perpendicular table followed by a parallel
-table. Dominant score determines the table, with exact ties assigned to
-perpendicular. Rows contain only raw nonnegative normal-aligned winding step,
-the target fiber's virtual winding, the solver's canonical half-integer step
-for perpendicular links or nearest-integer step for parallel links,
-the virtual ground-truth step, and `raw - GT`, where GT is the difference
-between the two virtual windings. These raw diagnostics use the active
-constraint extraction geometry
+For each source and matching BP benchmark, the command prints a perpendicular
+table followed by a parallel table. Dominant score determines the table, with
+exact ties assigned to perpendicular. The raw signed step is first oriented
+from the lower virtual winding to the higher one. The benchmark's fitted global
+sign then produces `calibrated_step`; the per-gauge additive offset cancels from
+a difference and is not applied. A constraint lacking a signed observation
+retains its nonnegative magnitude rather than receiving a fabricated sign.
+The calibrated step is quantized with the same signed half-integer or integer
+rule used by the winding solver, and both `calibrated_minus_gt` and the
+canonical summary use that value. Thus these rows, `est_w`, and the reference
+accuracy table share one sign convention. These diagnostics use the active constraint extraction geometry
 and distance settings, but not downstream constraint pruning,
 perpendicular-only selection, or labeling filters.
+
+Before those detailed tables, `reference constraint measurement-scale
+calibration` fits the filename-ordered reference differences against both the
+globally signed continuous raw steps and the canonical targets. Both use the
+matching winding configuration's dominant-factor admission and effective
+class, distance-decay, decision-confidence, and normal-confidence weights. Its magnitude-only objective is
+`sum(w*abs(gt/scale-target))`; finite and hard sign penalties are omitted
+because they do not vary with positive scale. In reciprocal scale the exact L1
+fit is a weighted median of `target/gt` with weights `w*abs(gt)`. The reported
+`[0.5,2.0]` range is a fixed diagnostic convention, not the joint-grid
+adaptive gain support. `used` counts positive effective weights, `fit_n`
+counts rows with positive `w*abs(gt)`, `sum_w` sums solver magnitude weights,
+and `fit_w` sums the reciprocal-scale median weights. `loss_s1`, `fit_scale`,
+`fit_loss`, `reduce_%`, and `bound` compare scale one with the bounded fit.
+
+The `raw` rows estimate continuous integration bias before half/integer target
+snapping. The `canonical` rows describe the exact targets consumed by current
+inference; because snapping can place more than half the weighted observations
+at an exact target/GT ratio of one, their L1 optimum can be exactly one without
+implying a statistically exact physical calibration.
+Canonical `perpendicular_all` is directly compatible with the current
+measurement-scale parameter. The report also includes `parallel_all` and
+`all_constraints` aggregates plus the five class rows for perpendicular `0.5`,
+perpendicular `1.5+`, parallel `0`, parallel `1`, and parallel `2+`. All
+parallel-containing aggregates and class rows are explicitly counterfactual:
+current winding inference does not apply measurement scale to its integer
+parallel residual. With the displayed
+objective, fitted scale below one means the selected raw or canonical targets
+are larger than the known latent reference separation; scale above one means they are smaller.
+The scale table is diagnostic only and does not alter inference or artifacts.
 After the last source table, `reference constraint canonical summary` reports
 `correct`, `false`, and `total`. Every displayed measured row contributes once,
 including repeated piece-pair measurements between the same source fibers. A
@@ -1395,7 +1468,7 @@ violations before finite energy when hard evidence is contradictory.
 
 The command then prints one compact error row for every selected reference JSON in source order,
 identified only by its filename-ordered virtual winding. Each row
-contains right/wrong/right-fraction columns for perpendicular, parallel-same,
+contains `est_w`, `parity_ok`, and right/wrong/right-fraction columns for perpendicular, parallel-same,
 parallel-other, and sum; a zero-total fraction is `NA`. Multiple cropped runs
 and pieces accumulate into the same row. These rows reuse the one global gauge
 calibration and each class and sum count agrees with its aggregate. The command
@@ -1408,6 +1481,28 @@ parallel_same  ...
 parallel_other  ...
 sum  ...
 ```
+
+`parity_ok` compares the normalized parity of `round(2*est_w)` with the
+reference source index. It is `NA` when no winding was estimated. A whole
+winding insertion or deletion preserves parity, while a half-step H/V switch
+does not. The already calibrated winding coordinate is used directly; the H/V
+gauge described below does not enter this field.
+
+Before the winding-error table, `reference H/V component calibration` fits the
+otherwise arbitrary mapping between even/odd reference parity and published
+H/V names independently for every BP component. It prints how many active
+reference-to-BP endpoints agree under even-to-H and even-to-V, choosing the
+larger count and choosing even-to-H on an exact tie. The following
+`reference H/V endpoint consistency` table reports perpendicular, parallel,
+and combined correct/wrong/fraction counts per reference plus a sum row.
+Parallel dominance expects the same H/V class; perpendicular dominance,
+including an exact score tie, expects the opposite class. Repeated cross
+measurements count separately. Final Mixed/Defect or otherwise inactive BP
+endpoints are excluded, but an active endpoint remains in this orientation
+diagnostic even if its winding target is unsigned, suppressed by a cutoff, or
+has zero magnitude weight. Consequently a mismatch demonstrates inconsistent
+solved orientation and dominant geometric relation, but cannot alone identify
+which of those two inputs is wrong.
 
 Exact orientation-score ties are perpendicular. Every accepted measured cross
 piece pair contributes once, including repeated constraints involving the same

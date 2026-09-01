@@ -3603,6 +3603,7 @@ TEST_CASE("All BP modes solve source fibers as split piece nodes")
     const auto lines = bpLines(2);
     const auto constraints = bpSplitConstraints();
     auto config = bpConfig();
+    config.enforceHardSplitContinuity = false;
     config.horizontalnessTemperature = 0.5;
     config.messageDamping = 1.0;
     config.mixedUnaryCost = 0.4;
@@ -3718,7 +3719,7 @@ TEST_CASE("BP rejects malformed split continuity topology")
     }
 }
 
-TEST_CASE("BP continuity is finite same-label evidence")
+TEST_CASE("BP continuity supports hard and finite compatibility modes")
 {
     const auto lines = bpLines(1);
     FiberTraceConstraintReport constraints;
@@ -3737,13 +3738,23 @@ TEST_CASE("BP continuity is finite same-label evidence")
     auto config = bpConfig();
     config.horizontalnessTemperature = 0.5;
     config.messageDamping = 1.0;
-    const auto report = solveFiberTraceSumProduct(
+    config.enforceHardSplitContinuity = false;
+    const auto finite = solveFiberTraceSumProduct(
         lines, constraints, config);
-    REQUIRE(report.seedPieceIndex == 0);
-    CHECK(report.horizontalness[0] == doctest::Approx(1.0));
-    CHECK(report.horizontalness[1] ==
+    REQUIRE(finite.seedPieceIndex == 0);
+    CHECK(finite.horizontalness[0] == doctest::Approx(1.0));
+    CHECK(finite.horizontalness[1] ==
           doctest::Approx(1.0 / (1.0 + std::exp(-2.0))).epsilon(1.0e-12));
-    CHECK(report.horizontalness[1] < 1.0);
+    CHECK(finite.horizontalness[1] < 1.0);
+
+    config.enforceHardSplitContinuity = true;
+    const auto hard = solveFiberTraceSumProduct(lines, constraints, config);
+    CHECK(hard.horizontalness == std::vector<double>{1.0, 1.0});
+
+    const auto mixed = solveFiberTraceMixedSumProduct(
+        lines, constraints, config);
+    CHECK(mixed.horizontalProbability == std::vector<double>{1.0, 1.0});
+    CHECK(mixed.mixedProbability == std::vector<double>{0.0, 0.0});
 }
 
 TEST_CASE("Binary sum-product BP matches exact seeded tree marginals")

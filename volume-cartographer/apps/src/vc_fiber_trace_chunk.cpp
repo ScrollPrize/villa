@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <numbers>
 #include <optional>
 #include <sstream>
 #include <span>
@@ -58,6 +59,9 @@ enum class BpBalanceSelection {
     Tight,
     Both,
 };
+
+constexpr double kDefaultWindingPhase = 0.5;
+constexpr double kDefaultWindingMeasurementScale = 0.822;
 
 struct Options {
     Mode mode = Mode::Trace;
@@ -93,6 +97,9 @@ struct Options {
     bool windingFixedOrientation = false;
     double windingDefectCost = 100.0;
     double pieceBreakCost = 0.0;
+    bool hardSplitContinuity = true;
+    std::optional<double> hardSignMinimumNormalAlignment =
+        0.8660254037844386;
     std::optional<double> parallelWindingCutoff;
     bool enforcePerpendicularWindingSign = true;
     bool enforceParallelWindingSign = true;
@@ -250,7 +257,8 @@ void usage(const char* executable)
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
-              << "  --piece-break-cost F      same-trace active/Defect boundary cost [0]\n"
+              << "  --split-continuity MODE   hard or finite [hard]\n"
+              << "  --piece-break-cost F      finite-mode same-trace boundary cost [0]\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
@@ -259,14 +267,18 @@ void usage(const char* executable)
               << "  --winding-normal-confidence MODE\n"
               << "                              none, linear, or cosine [none]\n"
               << "  --winding-sign-cost F|hard finite enabled-sign infringement cost [44]\n"
+              << "  --winding-hard-sign-angle DEG|off\n"
+              << "                              promote signs within DEG of normal to hard [30]\n"
               << "  --winding-weights P05,PFAR,P0,P1,P2\n"
               << "                              five nonnegative factor multipliers [8,1,2,2,1]\n"
               << "  --winding-weight-search V0,V1,...\n"
               << "                              exhaustive five-class reference grid\n"
               << "  --winding-weight-search-local\n"
               << "                              repeat one-coordinate /2,*2 search to a local optimum\n"
-              << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
-              << "  --winding-fixed-scale F   disable calibration at positive scale F\n"
+              << "  --winding-fixed-phase F   fixed phase in [0,0.5] [0.5]\n"
+              << "  --winding-fixed-scale F   fixed positive measurement scale [0.822]\n"
+              << "  --winding-adaptive-calibration\n"
+              << "                              infer phase and scale instead of fixed defaults\n"
               << "  --winding-gain-cells N    initial joint gain cells [5]\n"
               << "  --winding-phase-cells N   joint canonical phase cells [6]\n"
               << "  --winding-log-gain-step F joint log-gain lattice spacing [log(1.1)]\n"
@@ -661,6 +673,17 @@ Options parse(int argc, char** argv)
             options.hasPieceBreakCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--split-continuity") {
+            const std::string mode = value(
+                index, argc, argv, "--split-continuity");
+            if (mode == "hard")
+                options.hardSplitContinuity = true;
+            else if (mode == "finite")
+                options.hardSplitContinuity = false;
+            else
+                fail("--split-continuity must be hard or finite");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--parallel-winding-cutoff") {
             options.parallelWindingCutoff = number(
                 index, argc, argv, "--parallel-winding-cutoff");
@@ -760,6 +783,28 @@ Options parse(int argc, char** argv)
             options.hasWindingSignCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-hard-sign-angle") {
+            const std::string angle = value(
+                index, argc, argv, "--winding-hard-sign-angle");
+            if (angle == "off") {
+                options.hardSignMinimumNormalAlignment.reset();
+            } else {
+                std::size_t parsed = 0;
+                double degrees = 0.0;
+                try {
+                    degrees = std::stod(angle, &parsed);
+                } catch (const std::exception&) {
+                    fail("--winding-hard-sign-angle must be off or in [0, 90]");
+                }
+                if (parsed != angle.size() || !std::isfinite(degrees) ||
+                    degrees < 0.0 || degrees > 90.0) {
+                    fail("--winding-hard-sign-angle must be off or in [0, 90]");
+                }
+                options.hardSignMinimumNormalAlignment =
+                    std::cos(degrees * std::numbers::pi / 180.0);
+            }
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-weight-search") {
             options.windingWeightSearch = numberList(
                 index, argc, argv, "--winding-weight-search");
@@ -833,6 +878,11 @@ Options parse(int argc, char** argv)
                 index, argc, argv, "--winding-fixed-scale");
             options.hasJointGridOption = true;
             options.hasFixedCalibrationOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-adaptive-calibration") {
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
@@ -1109,16 +1159,28 @@ Options parse(int argc, char** argv)
                 FiberTraceWindingSolver::JointGrid) {
             fail("joint-grid controls require --winding-solver joint-grid");
         }
-        const bool hasFixedPhase =
+        const bool hasExplicitFixedPhase =
             options.jointGrid.fixedPhaseMagnitude.has_value();
-        const bool hasFixedScale =
+        const bool hasExplicitFixedScale =
             options.jointGrid.fixedMeasurementScale.has_value();
-        if (hasFixedPhase != hasFixedScale) {
+        if (hasExplicitFixedPhase != hasExplicitFixedScale) {
             fail("--winding-fixed-phase and --winding-fixed-scale must be supplied together");
         }
         if (options.hasFixedCalibrationOption && options.hasAdaptiveGridOption) {
             fail("fixed winding calibration cannot be combined with adaptive-grid controls");
         }
+        if (!hasExplicitFixedPhase && !options.hasAdaptiveGridOption &&
+            options.mode == Mode::DirectionAblation &&
+            options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::JointGrid) {
+            options.jointGrid.fixedPhaseMagnitude = kDefaultWindingPhase;
+            options.jointGrid.fixedMeasurementScale =
+                kDefaultWindingMeasurementScale;
+        }
+        const bool hasFixedPhase =
+            options.jointGrid.fixedPhaseMagnitude.has_value();
+        const bool hasFixedScale =
+            options.jointGrid.fixedMeasurementScale.has_value();
         if (hasFixedPhase &&
             (!std::isfinite(*options.jointGrid.fixedPhaseMagnitude) ||
              *options.jointGrid.fixedPhaseMagnitude < 0.0 ||
@@ -1871,6 +1933,8 @@ void writeAndPrintBpReport(
            "effective_perpendicular_signed_delta,"
            "calibrated_perpendicular_signed_delta,normal_component,self_edge,"
            "hard_parallel_sign,hard_perpendicular_sign,"
+           "parallel_sign_promoted_by_alignment,"
+           "perpendicular_sign_promoted_by_alignment,"
            "correspondence_samples,advance_residual_fraction,"
            "connector_tangent_abs_dot,connector_length_change_fraction,"
            "connector_direction_change,limit_hit_fraction\n"
@@ -1937,6 +2001,8 @@ void writeAndPrintBpReport(
         factorOutput << ',' << (factor.selfEdge ? 1 : 0) << ','
                      << (factor.hardParallelSign ? 1 : 0) << ','
                      << (factor.hardPerpendicularSign ? 1 : 0) << ','
+                     << (factor.parallelSignPromotedByAlignment ? 1 : 0) << ','
+                     << (factor.perpendicularSignPromotedByAlignment ? 1 : 0) << ','
                      << sourceConstraint.parallelCorrespondenceSamples << ','
                      << sourceConstraint.parallelMeanAdvanceResidualFraction << ','
                      << sourceConstraint.parallelMeanConnectorTangentAbsDot << ','
@@ -2229,6 +2295,47 @@ void writeAndPrintBpReport(
                 << interleaved->decodedEnergy << "  "
                 << interleaved->hardSignProjectedDefects << '\n';
         }
+        const auto agreement = vc::fiber_tracer::
+            summarizeFiberTraceConstraintAgreement(
+                constraints, *interleaved);
+        std::cout
+            << "fiber winding constraint agreement\n"
+            << std::left << std::setw(16) << "class"
+            << std::right << std::setw(10) << "prepared"
+            << std::setw(10) << "active"
+            << std::setw(12) << "neutralized"
+            << std::setw(12) << "infringed"
+            << std::setw(12) << "infringed_%" << '\n';
+        const auto row = [](std::string_view name,
+                            const vc::fiber_tracer::
+                                FiberTraceConstraintAgreementCounts& counts) {
+            std::cout << std::left << std::setw(16) << name
+                      << std::right << std::setw(10) << counts.prepared
+                      << std::setw(10) << counts.evaluated
+                      << std::setw(12) << counts.defectNeutralized
+                      << std::setw(12) << counts.infringed;
+            if (counts.evaluated == 0) {
+                std::cout << std::setw(12) << "NA";
+            } else {
+                std::ostringstream percent;
+                percent << std::fixed << std::setprecision(2)
+                        << 100.0 * static_cast<double>(counts.infringed) /
+                               static_cast<double>(counts.evaluated)
+                        << '%';
+                std::cout << std::setw(12) << percent.str();
+            }
+            std::cout << '\n';
+        };
+        for (std::size_t index = 0;
+             index < agreement.classes.size();
+             ++index) {
+            row(
+                vc::fiber_tracer::fiberTraceConstraintAgreementClassName(
+                    static_cast<vc::fiber_tracer::
+                        FiberTraceConstraintAgreementClass>(index)),
+                agreement.classes[index]);
+        }
+        row("sum", agreement.total);
     }
     std::cout << std::fixed << std::setprecision(6);
     if (mixedState) {
@@ -2838,6 +2945,10 @@ struct ReferenceFiberDiagnostics {
     std::vector<std::string> sourceNames;
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> pieceLines;
     std::vector<std::size_t> sourceIdsByPiece;
+    std::optional<vc::fiber_tracer::FiberTraceConstraintReport>
+        constraintReport;
+    std::optional<vc::fiber_tracer::FiberTraceBeliefTopology>
+        windingTopology;
     std::size_t sourceFibers = 0;
 };
 
@@ -2903,85 +3014,195 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
 
 std::string formatReferenceFiberConstraints(
     const ReferenceFiberDiagnostics& reference,
-    const vc::fiber_tracer::FiberTraceConstraintReport& report)
+    const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config)
 {
-    const auto ordered =
-        vc::fiber_tracer::orderMeasuredCrossSourceFiberTraceConstraints(
-            report, reference.sourceIds);
     if (reference.sourceNames.size() != reference.sourceFibers) {
         throw std::invalid_argument(
             "Reference fiber names do not match selected sources");
     }
 
-    using Ordered = vc::fiber_tracer::FiberTraceOrderedCrossSourceConstraint;
-    std::vector<std::vector<const Ordered*>> perpendicular(
+    const auto diagnostics = vc::fiber_tracer::
+        makeFiberTraceReferenceConstraintDiagnosticReport(
+            report, reference.sourceIds, calibration);
+    if (!reference.windingTopology) {
+        throw std::logic_error(
+            "Reference constraint scale calibration has no BP topology");
+    }
+    const auto factorDiagnostics = vc::fiber_tracer::
+        diagnoseFiberTraceWindingFactors(
+            report, *reference.windingTopology, config);
+    const auto scaleCalibration = vc::fiber_tracer::
+        calibrateFiberTraceReferenceConstraintScales(
+            diagnostics, factorDiagnostics);
+    using Row = vc::fiber_tracer::FiberTraceReferenceConstraintDiagnosticRow;
+    std::vector<std::vector<const Row*>> perpendicular(
         reference.sourceFibers);
-    std::vector<std::vector<const Ordered*>> parallel(reference.sourceFibers);
-    for (const auto& link : ordered) {
-        if (link.targetSource >= reference.sourceFibers) {
+    std::vector<std::vector<const Row*>> parallel(reference.sourceFibers);
+    for (const auto& row : diagnostics.rows) {
+        if (row.targetSource >= reference.sourceFibers) {
             throw std::invalid_argument(
                 "Reference constraint source is out of range");
         }
-        auto& group = link.perpendicularDominant ? perpendicular : parallel;
-        group[link.ownerSource].push_back(&link);
+        auto& group = row.perpendicularDominant ? perpendicular : parallel;
+        group[row.ownerSource].push_back(&row);
     }
 
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    vc::fiber_tracer::FiberTraceCanonicalConstraintCounts counts;
-    const auto printTable = [&output, &report, &reference, &counts](
+    output << "reference constraint calibration global_sign="
+           << calibration.globalSign << '\n';
+    output << "reference constraint measurement-scale calibration"
+           << " objective=sum(w*abs(gt/scale-target))"
+           << " range=" << std::fixed << std::setprecision(2)
+           << scaleCalibration.minimumScale << ':'
+           << scaleCalibration.maximumScale << '\n'
+           << "raw targets diagnose continuous measurement bias; canonical"
+              " perpendicular_all is solver-compatible; parallel rows are"
+              " counterfactual because current solver scale does not affect"
+              " parallel integer targets\n"
+           << std::left
+           << std::setw(11) << "target"
+           << std::setw(19) << "scope"
+           << std::setw(15) << "scale_use"
+           << std::right
+           << std::setw(7) << "n"
+           << std::setw(7) << "used"
+           << std::setw(7) << "fit_n"
+           << std::setw(11) << "sum_w"
+           << std::setw(11) << "fit_w"
+           << std::setw(12) << "loss_s1"
+           << std::setw(11) << "fit_scale"
+           << std::setw(12) << "fit_loss"
+           << std::setw(11) << "reduce_%"
+           << std::setw(9) << "bound" << '\n';
+    const auto printScale = [&](
+                                std::string_view target,
+                                std::string_view scope,
+                                std::string_view use,
+                                const vc::fiber_tracer::
+                                    FiberTraceReferenceScaleFit& fit) {
+        output << std::left
+               << std::setw(11) << target
+               << std::setw(19) << scope
+               << std::setw(15) << use
+               << std::right
+               << std::setw(7) << fit.observations
+               << std::setw(7) << fit.admittedObservations
+               << std::setw(7) << fit.informativeObservations
+               << std::fixed << std::setprecision(3)
+               << std::setw(11) << fit.effectiveWeight
+               << std::setw(11) << fit.reciprocalScaleWeight
+               << std::setw(12) << fit.unitScaleLoss;
+        if (fit.fittedScale) {
+            output << std::setw(11) << *fit.fittedScale
+                   << std::setw(12) << fit.fittedLoss;
+            if (fit.unitScaleLoss > 0.0) {
+                output << std::setw(11)
+                       << 100.0 *
+                              (fit.unitScaleLoss - fit.fittedLoss) /
+                              fit.unitScaleLoss;
+            } else {
+                output << std::setw(11) << "NA";
+            }
+            output << std::setw(9)
+                   << (fit.atLowerBound ? "lower"
+                       : fit.atUpperBound ? "upper"
+                                          : "-");
+        } else {
+            output << std::setw(11) << "NA"
+                   << std::setw(12) << "NA"
+                   << std::setw(11) << "NA"
+                   << std::setw(9) << "NA";
+        }
+        output << '\n';
+    };
+    printScale(
+        "raw",
+        "perpendicular_all",
+        "measurement",
+        scaleCalibration.rawPerpendicular);
+    printScale(
+        "canonical",
+        "perpendicular_all",
+        "solver",
+        scaleCalibration.canonicalPerpendicular);
+    printScale(
+        "raw",
+        "parallel_all",
+        "counterfactual",
+        scaleCalibration.rawParallel);
+    printScale(
+        "canonical",
+        "parallel_all",
+        "counterfactual",
+        scaleCalibration.canonicalParallel);
+    printScale(
+        "raw",
+        "all_constraints",
+        "counterfactual",
+        scaleCalibration.rawAll);
+    printScale(
+        "canonical",
+        "all_constraints",
+        "counterfactual",
+        scaleCalibration.canonicalAll);
+    constexpr std::size_t scaleGroupCount = static_cast<std::size_t>(
+        vc::fiber_tracer::FiberTraceReferenceConstraintGroup::Count);
+    for (std::size_t group = 0; group < scaleGroupCount; ++group) {
+        const auto kind = static_cast<vc::fiber_tracer::
+            FiberTraceReferenceConstraintGroup>(group);
+        const bool parallel =
+            kind == vc::fiber_tracer::
+                        FiberTraceReferenceConstraintGroup::ParallelSame ||
+            kind == vc::fiber_tracer::
+                        FiberTraceReferenceConstraintGroup::ParallelOne ||
+            kind == vc::fiber_tracer::
+                        FiberTraceReferenceConstraintGroup::ParallelTwoPlus;
+        printScale(
+            "raw",
+            vc::fiber_tracer::fiberTraceReferenceConstraintGroupName(kind),
+            parallel ? "counterfactual" : "measurement",
+            scaleCalibration.rawGroups[group]);
+        printScale(
+            "canonical",
+            vc::fiber_tracer::fiberTraceReferenceConstraintGroupName(kind),
+            parallel ? "counterfactual" : "class_diag",
+            scaleCalibration.canonicalGroups[group]);
+    }
+    output << "scale<1 means selected targets exceed known latent separation;"
+              " scale>1 means selected targets are smaller\n\n";
+    const auto printTable = [&output](
                                 std::string_view title,
-                                const std::vector<const Ordered*>& links,
-                                bool perpendicularTable) {
+                                const std::vector<const Row*>& rows) {
         output << title << '\n'
                << std::left
                << std::setw(16) << "target_winding"
                << std::setw(14) << "raw_step"
+               << std::setw(18) << "calibrated_step"
                << std::setw(17) << "canonical_step"
                << std::setw(12) << "gt_step"
-               << "raw_minus_gt" << '\n';
-        if (links.empty()) {
+               << "calibrated_minus_gt" << '\n';
+        if (rows.empty()) {
             output << "(none)\n";
             return;
         }
-        for (const Ordered* link : links) {
+        for (const Row* row : rows) {
             const double targetWinding =
-                0.5 * static_cast<double>(link->targetSource);
-            const double expected = 0.5 * static_cast<double>(
-                link->targetSource - link->ownerSource);
-            const auto& constraint =
-                report.constraints.at(link->constraintIndex);
-            const auto signedRaw = perpendicularTable
-                ? constraint.signedWindingDelta
-                : constraint.signedParallelWindingDelta;
-            double raw = perpendicularTable
-                ? constraint.windingDistance
-                : constraint.parallelWindingDistance;
-            if (signedRaw) {
-                const std::size_t traceA =
-                    report.pieces.at(constraint.pieceA).traceIndex;
-                if (traceA >= reference.sourceIds.size()) {
-                    throw std::invalid_argument(
-                        "Reference constraint piece source is out of range");
-                }
-                raw = reference.sourceIds[traceA] == link->ownerSource
-                    ? *signedRaw
-                    : -*signedRaw;
-            }
-            const double canonical = perpendicularTable
-                ? vc::fiber_tracer::quantizedHalfWindingTarget(raw)
-                : vc::fiber_tracer::quantizedIntegerWindingTarget(raw);
-            counts.add(canonical, expected);
+                0.5 * static_cast<double>(row->targetSource);
             output << std::fixed
                    << std::setprecision(1)
                    << std::setw(16) << targetWinding
                    << std::setprecision(3)
-                   << std::setw(14) << raw
+                   << std::setw(14) << row->rawStep
+                   << std::setw(18) << row->calibratedStep
                    << std::setprecision(1)
-                   << std::setw(17) << canonical
-                   << std::setw(12) << expected
+                   << std::setw(17) << row->canonicalStep
+                   << std::setw(12) << row->groundTruthStep
                    << std::setprecision(3)
-                   << raw - expected << '\n';
+                   << row->calibratedStep - row->groundTruthStep
+                   << '\n';
         }
     };
 
@@ -2991,9 +3212,8 @@ std::string formatReferenceFiberConstraints(
                       reference.sourceNames[source])
                << " winding=" << std::fixed << std::setprecision(1)
                << 0.5 * static_cast<double>(source) << '\n';
-        printTable(
-            "perpendicular constraints", perpendicular[source], true);
-        printTable("parallel constraints", parallel[source], false);
+        printTable("perpendicular constraints", perpendicular[source]);
+        printTable("parallel constraints", parallel[source]);
     }
     output << '\n'
            << "reference constraint canonical summary\n"
@@ -3001,9 +3221,9 @@ std::string formatReferenceFiberConstraints(
            << std::setw(12) << "correct"
            << std::setw(12) << "false"
            << "total\n"
-           << std::setw(12) << counts.correct
-           << std::setw(12) << counts.falseCount
-           << counts.total << '\n';
+           << std::setw(12) << diagnostics.counts.correct
+           << std::setw(12) << diagnostics.counts.falseCount
+           << diagnostics.counts.total << '\n';
     return output.str();
 }
 
@@ -3267,9 +3487,21 @@ std::string formatReferenceBpWindingBenchmark(
         reference, cross, winding, config);
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
+    const auto orientationBenchmark = vc::fiber_tracer::
+        benchmarkFiberTraceReferenceOrientations(observations);
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << "reference-to-BP winding benchmark"
+    if (!reference.constraintReport) {
+        throw std::logic_error(
+            "Reference/BP benchmark has no reference constraint report");
+    }
+    output << formatReferenceFiberConstraints(
+                  reference,
+                  *reference.constraintReport,
+                  benchmark,
+                  config)
+           << '\n'
+           << "reference-to-BP winding benchmark"
            << " balance=" << vc::fiber_tracer::fiberTraceBalanceModeName(balanceMode)
            << " solver="
            << vc::fiber_tracer::fiberTraceWindingSolverName(winding.solver)
@@ -3365,11 +3597,82 @@ std::string formatReferenceBpWindingBenchmark(
                    << '\n';
         }
     }
+    const auto printOrientationCounts = [&output](
+                                            const vc::fiber_tracer::
+                                                FiberTraceReferenceOrientationCounts&
+                                                    counts) {
+        output << std::setw(8) << counts.right
+               << std::setw(8) << counts.wrong;
+        if (counts.total() == 0) {
+            output << std::setw(8) << "NA";
+        } else {
+            output << std::setw(8) << std::setprecision(3)
+                   << static_cast<double>(counts.right) /
+                          static_cast<double>(counts.total());
+        }
+    };
+    output << "reference H/V component calibration\n"
+           << std::setw(12) << "component"
+           << std::setw(14) << "even_ref"
+           << std::setw(12) << "even_H_r"
+           << "even_V_r\n";
+    if (orientationBenchmark.components.empty()) {
+        output << "(none)\n";
+    } else {
+        for (const auto& component : orientationBenchmark.components) {
+            output << std::setw(12) << component.component
+                   << std::setw(14)
+                   << (component.evenReferenceIsHorizontal ? "H" : "V")
+                   << std::setw(12) << component.evenHorizontalRight
+                   << component.evenVerticalRight << '\n';
+        }
+    }
+    output << "reference H/V endpoint consistency"
+           << " excluded_inactive="
+           << orientationBenchmark.excludedInactive << '\n'
+           << std::setw(8) << "winding"
+           << std::setw(8) << "perp_r"
+           << std::setw(8) << "perp_w"
+           << std::setw(8) << "perp_f"
+           << std::setw(8) << "para_r"
+           << std::setw(8) << "para_w"
+           << std::setw(8) << "para_f"
+           << std::setw(8) << "sum_r"
+           << std::setw(8) << "sum_w"
+           << "sum_f\n";
+    constexpr std::size_t orientationRelationCount = static_cast<std::size_t>(
+        vc::fiber_tracer::FiberTraceReferenceOrientationRelation::Count);
+    for (std::size_t source = 0; source < reference.sourceNames.size(); ++source) {
+        const vc::fiber_tracer::FiberTraceReferenceOrientationSourceBenchmark
+            empty;
+        const auto& current = source < orientationBenchmark.references.size()
+            ? orientationBenchmark.references[source]
+            : empty;
+        output << std::setw(8) << std::setprecision(1)
+               << 0.5 * static_cast<double>(source);
+        for (std::size_t relation = 0;
+             relation < orientationRelationCount;
+             ++relation) {
+            printOrientationCounts(current.relations[relation]);
+        }
+        printOrientationCounts(current.sum);
+        output << '\n';
+    }
+    output << std::setw(8) << "sum";
+    for (std::size_t relation = 0;
+         relation < orientationRelationCount;
+         ++relation) {
+        printOrientationCounts(orientationBenchmark.relations[relation]);
+    }
+    printOrientationCounts(orientationBenchmark.sum);
+    output << "\n\n";
+
     constexpr std::array<const char*, 4> names{
         "perpendicular", "parallel_same", "parallel_other", "sum"};
     output << "reference fiber errors fraction=right/(right+wrong)\n"
            << std::setw(8) << "winding"
            << std::setw(8) << "est_w"
+           << std::setw(10) << "parity_ok"
            << std::setw(8) << "perp_r" << std::setw(8) << "perp_w" << std::setw(8) << "perp_f"
            << std::setw(8) << "same_r" << std::setw(8) << "same_w" << std::setw(8) << "same_f"
            << std::setw(8) << "other_r" << std::setw(8) << "other_w" << std::setw(8) << "other_f"
@@ -3386,6 +3689,12 @@ std::string formatReferenceBpWindingBenchmark(
                    << *referenceCounts.estimatedWinding;
         else
             output << std::setw(8) << "NA";
+        if (referenceCounts.estimatedParityMatches) {
+            output << std::setw(10)
+                   << (*referenceCounts.estimatedParityMatches ? "yes" : "no");
+        } else {
+            output << std::setw(10) << "NA";
+        }
         for (std::size_t index = 0; index < names.size(); ++index) {
             const auto& counts = index < referenceCounts.classes.size()
                 ? referenceCounts.classes[index]
@@ -3953,11 +4262,16 @@ int main(int argc, char** argv)
                             alignedNormalField
                                 ? &*alignedNormalField
                                 : nullptr);
-                    deferredReferenceDiagnostics.push_back(
-                        formatReferenceFiberConstraints(
-                            *referenceDiagnostics, referenceConstraints));
+                    referenceDiagnostics->windingTopology =
+                        vc::fiber_tracer::prepareFiberTraceBeliefTopology(
+                            referenceDiagnostics->lines,
+                            referenceConstraints,
+                            artifact.minimumBaseXYZ,
+                            artifact.maximumBaseXYZ);
                     prepareReferenceFiberPieces(
                         *referenceDiagnostics, referenceConstraints);
+                    referenceDiagnostics->constraintReport =
+                        std::move(referenceConstraints);
                 }
                 const std::filesystem::path initialOutput = outputDirectory /
                     (options.output.stem().string() + "_initial.obj");
@@ -4090,6 +4404,8 @@ int main(int argc, char** argv)
                                                vc::fiber_tracer::
                                                    FiberTraceBalanceMode mode) {
                             auto config = options.bp;
+                            config.enforceHardSplitContinuity =
+                                options.hardSplitContinuity;
                             config.balanceMode = mode;
                             config.cropMinimumBaseXYZ = artifact.minimumBaseXYZ;
                             config.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
@@ -4116,6 +4432,10 @@ int main(int argc, char** argv)
                                 options.enforcePerpendicularWindingSign;
                             windingConfig.enforceParallelWindingSign =
                                 options.enforceParallelWindingSign;
+                            windingConfig.enforceHardSplitContinuity =
+                                options.hardSplitContinuity;
+                            windingConfig.hardSignMinimumNormalAlignment =
+                                options.hardSignMinimumNormalAlignment;
                             windingConfig.decisionConfidence =
                                 options.windingDecisionConfidence;
                             windingConfig.normalConfidence =
@@ -5017,6 +5337,10 @@ int main(int argc, char** argv)
                                 options.enforcePerpendicularWindingSign;
                             windingConfig.enforceParallelWindingSign =
                                 options.enforceParallelWindingSign;
+                            windingConfig.enforceHardSplitContinuity =
+                                options.hardSplitContinuity;
+                            windingConfig.hardSignMinimumNormalAlignment =
+                                options.hardSignMinimumNormalAlignment;
                             windingConfig.decisionConfidence =
                                 options.windingDecisionConfidence;
                             windingConfig.normalConfidence =
@@ -5032,6 +5356,8 @@ int main(int argc, char** argv)
                                                    vc::fiber_tracer::
                                                        FiberTraceBalanceMode mode) {
                                 auto config = options.bp;
+                                config.enforceHardSplitContinuity =
+                                    options.hardSplitContinuity;
                                 config.balanceMode = mode;
                                 config.cropMinimumBaseXYZ =
                                     artifact.minimumBaseXYZ;
