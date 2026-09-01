@@ -1973,6 +1973,22 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     return task;
 }
 
+void applyFocusBoundsToOptimizationTask(
+    LineAnnotationController::OptimizationTaskResult& task)
+{
+    if (!task.ok || !task.focusBoundsBase || task.focusBoundsApplied) {
+        return;
+    }
+    try {
+        vc3d::line_annotation::constrainLineOpenTailsToBounds(
+            task.result.line, task.controlPoints, *task.focusBoundsBase);
+        task.focusBoundsApplied = true;
+    } catch (const std::exception& ex) {
+        task.ok = false;
+        task.error = std::string("Could not apply focus bounding box: ") + ex.what();
+    }
+}
+
 } // namespace
 
 LineAnnotationController::LineAnnotationController(CState* state,
@@ -2225,6 +2241,9 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
 
     const auto sample = viewer->sampleSceneVolume(scenePoint);
     if (!sample) {
+        return;
+    }
+    if (!placementAllowedByFocusBounds(toVec3d(sample->position), false)) {
         return;
     }
     cv::Vec3f normal = sample->normal;
@@ -2837,6 +2856,10 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     if (seedOnlyPoint) {
         const cv::Vec3d seedPoint = *seedOnlyPoint;
+        if (!placementAllowedByFocusBounds(
+                seedPoint, session->suppressErrorDialogs)) {
+            return;
+        }
         session->seedPoint = seedPoint;
         session->focusedLinePosition = 0.0;
         session->focusedControlPoint = seedPoint;
@@ -7146,6 +7169,19 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     loadFibersForCurrentPackage();
 }
 
+bool LineAnnotationController::placementAllowedByFocusBounds(
+    const cv::Vec3d& point,
+    bool suppressErrorDialogs) const
+{
+    const auto bounds = _state ? _state->activeFocusBounds() : std::nullopt;
+    if (!bounds || contains_point(*bounds, point)) {
+        return true;
+    }
+    showError(tr("The point is outside the active focus bounding box."),
+              suppressErrorDialogs);
+    return false;
+}
+
 void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
                                               cv::Vec3f volumePoint,
                                               InitialDirectionMode directionMode)
@@ -7159,6 +7195,11 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."),
                   session.suppressErrorDialogs);
+        return;
+    }
+
+    if (!placementAllowedByFocusBounds(
+            toVec3d(volumePoint), session.suppressErrorDialogs)) {
         return;
     }
 
@@ -7219,6 +7260,10 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // coalesced dirty spans follows. Only a seed solve still excludes edits,
     // via the empty-line check below.
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+        return;
+    }
+    if (!placementAllowedByFocusBounds(
+            toVec3d(volumePoint), session.suppressErrorDialogs)) {
         return;
     }
     // A debounced autosave still holds the LAST landing's geometry; once
@@ -7333,6 +7378,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                   prepared.replacedStart,
                   prepared.replacedCount)
             : session.optimizedLine;
+        if (const auto focusBounds = _state ? _state->activeFocusBounds()
+                                            : std::nullopt) {
+            vc3d::line_annotation::constrainLineOpenTailsToBounds(
+                preparedLine, prepared.controlPoints, *focusBounds);
+        }
     } catch (const std::exception& ex) {
         showError(tr("Could not update line control point: %1")
                       .arg(QString::fromStdString(ex.what())),
@@ -7523,12 +7573,22 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
                   parentSession.suppressErrorDialogs);
         return;
     }
-    // Cross-fiber operation: make sure no participating fiber's newest
-    // geometry is still session-only behind a debounced autosave.
-    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= parentSession.controlPoints.size()) {
         return;
     }
+    const cv::Vec3d linkedPoint = toVec3d(linkedControlPoint);
+    if (!finitePoint(linkedPoint)) {
+        showError(tr("Could not determine a finite linked-fiber point from the clicked location."),
+                  parentSession.suppressErrorDialogs);
+        return;
+    }
+    if (!placementAllowedByFocusBounds(
+            linkedPoint, parentSession.suppressErrorDialogs)) {
+        return;
+    }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointHasBranchLink(parentSession.branches, controlPointIndex)) {
         showError(tr("This control point is already linked; unlink it first."));
         return;
@@ -7545,12 +7605,6 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     const std::string parentFileName = parentSession.fiberFileName;
     const cv::Vec3d branchPoint = parentSession.controlPoints[controlPointIndex].volumePoint;
     if (!finitePoint(branchPoint)) {
-        return;
-    }
-    const cv::Vec3d linkedPoint = toVec3d(linkedControlPoint);
-    if (!finitePoint(linkedPoint)) {
-        showError(tr("Could not determine a finite linked-fiber point from the clicked location."),
-                  parentSession.suppressErrorDialogs);
         return;
     }
     cv::Vec3d linkDirection = toVec3d(requestedLinkDirection);
@@ -9725,6 +9779,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                                                            bool fireSuccessCallback,
                                                            bool allowFiberSave)
 {
+    applyFocusBoundsToOptimizationTask(task);
     if (!task.ok) {
         session.taskState = LineAnnotationSession::TaskState::Failed;
         session.error = task.error;
@@ -9947,6 +10002,8 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
                   session.suppressErrorDialogs);
         return false;
     }
+    const auto focusBoundsBase = _state ? _state->activeFocusBounds()
+                                        : std::nullopt;
 
     if (session.controlPoints.size() >= 2) {
         const bool needsTrace = session.fiberOptimizationMode ==
@@ -9965,6 +10022,7 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         OptimizationTaskResult task;
         task.manifestPath = session.selectedManifestPath;
         task.eventName = "segment_interpolation_final_full_line_opt";
+        task.focusBoundsBase = focusBoundsBase;
         try {
             auto optimized =
                 vc3d::line_annotation::optimizeFiberWithNativeFallback(
@@ -10024,6 +10082,7 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
                                                           -1,
                                                           -1,
                                                           *session.normalSampler);
+    task.focusBoundsBase = focusBoundsBase;
     const bool applied = applyOptimizationTaskResult(session,
                                                      std::move(task),
                                                      false,
@@ -10171,6 +10230,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     auto dataset = session.dataset;
     auto normalSampler = session.normalSampler;
     auto cancelFlag = session.runningSolveCancel;
+    const auto focusBoundsBase = _state ? _state->activeFocusBounds()
+                                        : std::nullopt;
     watcher->setFuture(QtConcurrent::run(&_lineSolvePool,
                                           [factory,
                                            manifestPath,
@@ -10185,9 +10246,11 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            workingToBaseScale,
                                            dataset,
                                            normalSampler,
-                                           cancelFlag]() mutable {
+                                           cancelFlag,
+                                           focusBoundsBase]() mutable {
+        OptimizationTaskResult task;
         if (factory) {
-            return factory(manifestPath,
+            task = factory(manifestPath,
                            std::move(controlPoints),
                            std::move(initialLinePoints),
                            sourceSliceNormal,
@@ -10196,10 +10259,9 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                            forceFullOptimization,
                            activeStart,
                            activeEnd);
-        }
-        if (normalSampler) {
+        } else if (normalSampler) {
             (void)dataset;
-            return optimizeLineWithSampler(manifestPath,
+            task = optimizeLineWithSampler(manifestPath,
                                            std::move(controlPoints),
                                            std::move(initialLinePoints),
                                            sourceSliceNormal,
@@ -10210,18 +10272,21 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            activeEnd,
                                            *normalSampler,
                                            cancelFlag.get());
+        } else {
+            task = optimizeLineFromManifest(manifestPath,
+                                            workingToBaseScale,
+                                            std::move(controlPoints),
+                                            std::move(initialLinePoints),
+                                            sourceSliceNormal,
+                                            directionMode,
+                                            initialCenterlineLengthVx,
+                                            forceFullOptimization,
+                                            activeStart,
+                                            activeEnd,
+                                            cancelFlag.get());
         }
-        return optimizeLineFromManifest(manifestPath,
-                                        workingToBaseScale,
-                                        std::move(controlPoints),
-                                        std::move(initialLinePoints),
-                                        sourceSliceNormal,
-                                        directionMode,
-                                        initialCenterlineLengthVx,
-                                        forceFullOptimization,
-                                        activeStart,
-                                        activeEnd,
-                                        cancelFlag.get());
+        task.focusBoundsBase = focusBoundsBase;
+        return task;
     }));
 }
 
@@ -10491,6 +10556,8 @@ void LineAnnotationController::startFiberModeOptimization(
     auto predictionField = session.fiberPredictionField;
     auto normalSampler = session.normalSampler;
     auto traceNormalSampler = session.traceNormalSampler;
+    const auto focusBoundsBase = _state ? _state->activeFocusBounds()
+                                        : std::nullopt;
     // cancelToken keeps the flag the request points at alive for the whole
     // solve, even after the session replaces runningSolveCancel for a
     // successor solve.
@@ -10501,10 +10568,12 @@ void LineAnnotationController::startFiberModeOptimization(
          predictionField,
          normalSampler,
          traceNormalSampler,
+         focusBoundsBase,
          cancelToken = session.runningSolveCancel]() mutable {
             OptimizationTaskResult task;
             task.manifestPath = manifestPath;
             task.eventName = "native_fiber_trace3d_fiber_mode";
+            task.focusBoundsBase = focusBoundsBase;
             try {
                 (void)predictionField;
                 (void)normalSampler;
@@ -10548,6 +10617,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
     session.runningSolveCancel.reset();
+    applyFocusBoundsToOptimizationTask(task);
 
     if (!session.solveQueue.mayPublish(session.runningSolveEpoch)) {
         // The session was mutated (or began shutdown) while this solve ran:

@@ -2157,6 +2157,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     cv::Mat_<uint8_t> overlayTargetCoverage;
+    cv::Mat_<uint8_t> focusBoundsInside;
+    if (ctx.renderJob.focusBoundsBase) {
+        focusBoundsInside = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+    }
     const bool continuingSameGeometry =
         ctx.prevResult && !ctx.genCacheDirty &&
         renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob);
@@ -2939,6 +2943,17 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                + n * ctx.zOff;
         const cv::Vec3f vxStep = vx / ctx.scale;
         const cv::Vec3f vyStep = vy / ctx.scale;
+        if (!focusBoundsInside.empty()) {
+            for (int y = 0; y < ctx.fbH; ++y) {
+                auto* inside = focusBoundsInside.ptr<uint8_t>(y);
+                const cv::Vec3f rowOrigin = origin + vyStep * static_cast<float>(y);
+                for (int x = 0; x < ctx.fbW; ++x) {
+                    inside[x] = contains_point(
+                        *ctx.renderJob.focusBoundsBase,
+                        rowOrigin + vxStep * static_cast<float>(x));
+                }
+            }
+        }
         if (profilePhases) phaseTimer.restart();
         samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
         if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
@@ -3011,9 +3026,21 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // With both channels cached and an in-band w there is no gen() and no 3D
         // volume sampling in the frame at all. GeneratedSurfaceCache is still
         // needed whenever either channel falls back.
-        const bool needGen = !baseCacheUsable || (overlayActive && !overlayCacheUsable);
+        const bool needGen = !baseCacheUsable ||
+            (overlayActive && !overlayCacheUsable) ||
+            ctx.renderJob.focusBoundsBase.has_value();
         if (needGen)
             std::tie(coords, normals) = generatedSurfaceCoords(needSurfaceNormals);
+        if (!focusBoundsInside.empty() && !coords.empty()) {
+            for (int y = 0; y < ctx.fbH; ++y) {
+                auto* inside = focusBoundsInside.ptr<uint8_t>(y);
+                const auto* coord = coords.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < ctx.fbW; ++x) {
+                    inside[x] = contains_point(
+                        *ctx.renderJob.focusBoundsBase, coord[x]);
+                }
+            }
+        }
         if (baseCacheUsable) {
             if (profilePhases) phaseTimer.restart();
             if (flattenedVolumetricActive) {
@@ -3206,6 +3233,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto* colorSrc = hasColorValues ? colorValues.ptr<cv::Vec3b>(y) : nullptr;
         const auto* overlaySrc = hasOverlay ? overlayValues.ptr<uint8_t>(y) : nullptr;
         const auto* overlayCov = hasOverlay ? overlayCoverage.ptr<uint8_t>(y) : nullptr;
+        const auto* focusInside = !focusBoundsInside.empty()
+            ? focusBoundsInside.ptr<uint8_t>(y)
+            : nullptr;
         for (int x = 0; x < ctx.fbW; ++x) {
             uint32_t pixel = !cov[x] ? uncoveredPixel
                 : hasColorValues
@@ -3215,6 +3245,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             if (hasOverlay && overlayCov[x] &&
                 overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
                 pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+            }
+            if (focusInside && !focusInside[x]) {
+                pixel = (pixel & 0xFF000000u) |
+                        ((pixel & 0x00FEFEFEu) >> 1);
             }
             row[x] = pixel;
         }
@@ -3280,6 +3314,12 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.surfaceCache = _surfaceCache;
     job.overlaySurfaceCache = _overlaySurfaceCache;
     job.surfaceCacheEpoch = _surfaceCacheEpoch;
+    const bool focusBoundsSupported =
+        dynamic_cast<PlaneSurface*>(surf.get()) != nullptr ||
+        property("vc_viewer_role").toString() == QStringLiteral("annotation");
+    if (focusBoundsSupported && _state) {
+        job.focusBoundsBase = _state->activeFocusBounds();
+    }
     job.genCache = _genSurfaceCache;
     job.genCacheDirty = _genCacheDirty;
     job.profileReason = reason ? reason : "";
@@ -3294,9 +3334,17 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
 bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob& a,
                                                           const PendingRenderJob& b)
 {
+    const auto boundsEqual = [](const std::optional<Rect3D>& lhs,
+                                const std::optional<Rect3D>& rhs) {
+        if (lhs.has_value() != rhs.has_value()) {
+            return false;
+        }
+        return !lhs || (lhs->low == rhs->low && lhs->high == rhs->high);
+    };
     return renderJobsSameGeometry(a, b) &&
            a.chunkContentEpoch == b.chunkContentEpoch &&
-           a.genCacheDirty == b.genCacheDirty;
+           a.genCacheDirty == b.genCacheDirty &&
+           boundsEqual(a.focusBoundsBase, b.focusBoundsBase);
 }
 
 bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,

@@ -67,6 +67,8 @@ public:
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
+        std::optional<Rect3D> focusBoundsBase;
+        bool focusBoundsApplied = false;
         std::string error;
         std::string eventName;
     };
@@ -685,6 +687,8 @@ private:
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
+    bool placementAllowedByFocusBounds(const cv::Vec3d& point,
+                                       bool suppressErrorDialogs) const;
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,

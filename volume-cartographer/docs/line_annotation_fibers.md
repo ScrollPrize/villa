@@ -49,6 +49,27 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
+The main window's **BBox** checkbox beneath **Focus** enables an annotation
+focus region. The adjacent minimum and maximum fields use inclusive absolute
+base-volume `x, y, z` coordinates. An unset box starts at the current volume
+extent; edited coordinates are normalized and clamped to that extent. The box
+is session-only, survives volume/channel changes in the current package, and is
+cleared when the project is replaced or closed.
+
+When enabled, ordinary plane views and all line-annotation cut/strip views show
+the area outside the box at half brightness. The dimming is applied after base
+and attached-volume composition and does not dim control markers. The main
+segmentation surface view is not covered by this version of the feature.
+
+New seeds, linked branch seeds, and control points must be inside the active
+box. A trace or reoptimization captures the box when it starts; later box
+changes do not cancel that work or alter untouched fibers. After a solve, the
+path between the outer control points is preserved even if it briefly leaves
+the box. Only open tails are shortened: they retain the first sample outside
+the box as a small overshoot. A lone control also retains one neighboring line
+sample so the resulting fiber remains valid. Manual/no-reoptimization edits use
+the same open-tail rule.
+
 The rendered strips are derived views, not stored line geometry. Their columns
 retain every annotation control point and both line endpoints. The optimized
 line points between adjacent controls define the polyline path but are not

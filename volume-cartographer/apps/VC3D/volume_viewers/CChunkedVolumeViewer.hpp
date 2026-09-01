@@ -34,6 +34,7 @@
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
@@ -409,6 +410,9 @@ private:
         std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
         std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
         std::uint64_t surfaceCacheEpoch = 0;
+        // Effective launch-time bounds. Null for disabled bounds and for view
+        // types outside the supported plane/annotation scope.
+        std::optional<Rect3D> focusBoundsBase;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;

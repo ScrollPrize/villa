@@ -319,6 +319,8 @@ private slots:
     void onEditMaskPressed(const QString& segmentId);
     void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
+    void onFocusBoundsEdited();
+    void onFocusBoundsToggled(bool enabled);
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
@@ -331,6 +333,7 @@ private slots:
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
+    void refreshFocusBoundsUi();
 
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;

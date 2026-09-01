@@ -41,6 +41,16 @@ TEST_CASE("Rect3D default-construction is zero box")
     CHECK(r.high == cv::Vec3f(0, 0, 0));
 }
 
+TEST_CASE("Rect3D containment is inclusive in base XYZ")
+{
+    const Rect3D bounds{{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}};
+    CHECK(contains_point(bounds, cv::Vec3f(1.0f, 2.0f, 3.0f)));
+    CHECK(contains_point(bounds, cv::Vec3d(4.0, 5.0, 6.0)));
+    CHECK(contains_point(bounds, cv::Vec3d(2.5, 3.5, 4.5)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3f(0.99f, 3.0f, 4.0f)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3d(2.0, 5.01, 4.0)));
+}
+
 TEST_CASE("expand_rect grows box to include a new point")
 {
     Rect3D a;

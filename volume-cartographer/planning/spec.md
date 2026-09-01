@@ -246,6 +246,34 @@
   render probes the shared `SurfaceGeometryTileCache`; subsequent tile fills
   reuse those geometry tiles and do not allocate a second full-frame matrix.
 
+## Annotation focus bounds
+
+- VC3D may hold one optional session focus bounding box in inclusive
+  base-volume XYZ coordinates. It is preserved across volume/channel switches
+  within one package, cleared when the package is replaced or closed, and is
+  not serialized into project data.
+- While enabled, ordinary plane views and annotation-role strip/cut views draw
+  the final composed framebuffer outside the box at half RGB brightness without
+  a boundary line. Base and attached-volume pixels are dimmed together; Qt
+  control markers and other scene items remain full brightness.
+- Standard segmentation QuadSurface/SurfaceCache views are outside the current
+  display scope. Focus-bounds rendering uses coordinates already generated for
+  sampling and must not add volume reads, surface intersections, or render
+  resubmission loops. Editing configured bounds while disabled must not start a
+  different render job.
+- New line seeds, branch-fiber seeds, and control-point placements are accepted
+  only inside an active box. Validation occurs before pane creation, dataset
+  access, autosave flushing, or persistence.
+- Every trace or reoptimization uses the box state captured when that work was
+  launched. Changing the box does not cancel, restart, or retroactively mutate
+  existing or in-flight annotation geometry.
+- For work launched with an active box, the entire optimized path between the
+  outer controls is retained, including temporary excursions outside the box.
+  Open tails stop after their first outside sample. An already-outside outer
+  control keeps no farther tail, except that a one-control line retains one
+  adjacent sample to remain valid. Manual provisional edits follow the same
+  tail rule.
+
 ## Download label
 
 The main window uses one permanent status label for cache diagnostics and
