@@ -2612,7 +2612,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2621,7 +2621,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 for (uint64_t fiberId : fiberIds) {
                     _fiberIntersectionCache.pruneFiber(fiberId);
                 }
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
@@ -5116,6 +5116,18 @@ void CWindow::updateAtlasFiberDocks()
 
     tree->collapseAll();
     updateOptimizeEnabled();
+}
+
+void CWindow::scheduleAtlasSearchDockRefresh()
+{
+    if (_atlasSearchDockRefreshQueued) {
+        return;
+    }
+    _atlasSearchDockRefreshQueued = true;
+    QTimer::singleShot(50, this, [this]() {
+        _atlasSearchDockRefreshQueued = false;
+        updateAtlasSearchDocks();
+    });
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -8230,6 +8242,17 @@ void CWindow::CreateWidgets(void)
         QSignalBlocker blocker(chkAxisOverlays);
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
+    }
+    // Deliberately not persisted: the coordinate frame gizmo is on by default
+    // every session, matching the checkbox's designer state.
+    if (auto* chkCoordinateFrames = ui.chkCoordinateFrames) {
+        connect(chkCoordinateFrames, &QCheckBox::toggled, this, [](bool show) {
+            for (auto* manager : ViewerManager::allManagers()) {
+                if (manager) {
+                    manager->setShowCoordinateFrames(show);
+                }
+            }
+        });
     }
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);

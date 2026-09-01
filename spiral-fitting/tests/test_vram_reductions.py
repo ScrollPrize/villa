@@ -147,6 +147,7 @@ def _make_small_spiral_model(seed, flow_field_type):
     cfg = Config().as_dict()
     cfg['model_flow_field_type'] = flow_field_type
     cfg['model_gap_expander_num_windings'] = 10
+    cfg['model_gap_expander_capacity_windings'] = 10
     z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution
     flow_min = torch.tensor([0, -96, -96], dtype=torch.int64)
     flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64)

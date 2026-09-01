@@ -3,6 +3,7 @@
 Pure-local: a temp directory stands in for the sync dir and tracked rows are
 written straight into the SQLite DB. No S3 or network access.
 """
+import copy
 import json
 import os
 import sqlite3
@@ -13,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fiber_merge
+import test_fiber_merge
 import vc_sync
 from vc_sync import S3SyncManager, SyncAction
 
@@ -769,6 +771,74 @@ class TestLinkConsistency:
         assert fixed['generation'] == 6
         assert fixed['branches'][0]['branch_file'] == 'a.json'
 
+    def test_v3_consistent_pair_needs_no_fix(self, manager):
+        """v3 control points are {'position': ...} dicts; the consistency
+        pass must unwrap them (regression: a TypeError here demoted every
+        conflicting linked v3 fiber to a manual conflict)."""
+        a, b = test_fiber_merge.make_v3_pair(
+            'a.json', 'b.json', test_fiber_merge.BASE_CPS,
+            test_fiber_merge.B_CPS_V3, 2, 1)
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+        plan = self.make_plan(manager, 'fibers/a.json', a,
+                              copy.deepcopy(a), ['b.json'])
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert demoted == []
+        assert peer_fixes == {}
+
+    def test_refresh_crash_demotes_with_location(self, manager, monkeypatch,
+                                                 capsys):
+        """A merge-machinery bug must read as a bug, not as undiagnosable
+        data: the demotion reason names the innermost frame. The full
+        traceback prints ONLY under VC_SYNC_DEBUG=1 — unconditional stacks
+        would bury the merge preview and the conflict prompt."""
+        a = self.fiber('a.json', self.CPS_A,
+                       branches=[self.entry('b.json', self.CPS_A, 1,
+                                            self.CPS_B, 0)])
+        b = self.fiber('b.json', self.CPS_B)
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+
+        def boom(*args, **kwargs):
+            raise TypeError('synthetic refresh crash')
+
+        monkeypatch.setattr(vc_sync.fiber_merge, 'refresh_pair_links', boom)
+        plan = self.make_plan(manager, 'fibers/a.json', a,
+                              self.fiber('a.json', self.CPS_A), ['b.json'])
+
+        monkeypatch.delenv('VC_SYNC_DEBUG', raising=False)
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert peer_fixes == {} and len(demoted) == 1
+        reason = demoted[0][1]
+        assert 'synthetic refresh crash' in reason
+        assert 'test_vc_sync_helpers.py' in reason and 'boom' in reason
+        assert 'Traceback' not in capsys.readouterr().out
+
+        monkeypatch.setenv('VC_SYNC_DEBUG', '1')
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert len(demoted) == 1
+        assert 'Traceback' in capsys.readouterr().out
+
+
+class TestExceptionLocation:
+    """_exception_location: the compact frame reference appended to
+    demotion reasons."""
+
+    def test_names_innermost_frame(self):
+        def inner():
+            raise ValueError('x')
+
+        try:
+            inner()
+        except ValueError as ex:
+            location = vc_sync._exception_location(ex)
+        assert location.startswith(' at test_vc_sync_helpers.py:')
+        assert location.endswith(' in inner')
+
+    def test_exception_without_traceback_is_empty(self):
+        assert vc_sync._exception_location(ValueError('x')) == ''
+
 
 class TestAnalyzeDeleteActions:
     """The tracked delete-vs-download decision — historically the dangerous
@@ -1092,3 +1162,336 @@ class TestClassifyFibers:
         assert vc_sync.unpublishable_reason({'tags': None})
         assert vc_sync.unpublishable_reason({'tags': 'unreviewed'})
         assert vc_sync.unpublishable_reason([1, 2, 3])
+
+
+# --- SFTP (ash) sync -------------------------------------------------------
+
+import subprocess
+
+
+def completed(returncode=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess(args=[], returncode=returncode,
+                                       stdout=stdout, stderr=stderr)
+
+
+@pytest.fixture
+def sftp_manager(tmp_path, monkeypatch):
+    """An SftpSyncManager over a temp dir; rclone probing/obscuring stubbed
+    out so construction touches no network and needs no rclone binary."""
+    creds_file = tmp_path / 'creds.json'
+    creds_file.write_text(json.dumps(
+        {'host': 'ash.example.org', 'user': 'user1',
+         'pass': 'secret', 'port': 2022}))
+    os.chmod(creds_file, 0o600)
+    local = tmp_path / 'data'
+    local.mkdir()
+    (local / vc_sync.ASH_CONFIG_NAME).write_text(json.dumps({
+        'remote_path': '/srv/backup',
+        'creds_file': str(creds_file),
+        'last_updated': '2026-01-01T00:00:00',
+    }))
+    monkeypatch.setattr(vc_sync.S3SyncManager, '_detect_rclone',
+                        lambda self: True)
+    monkeypatch.setattr(vc_sync.SftpSyncManager, '_rclone_obscure',
+                        staticmethod(lambda password: 'obscured:' + password))
+    return vc_sync.SftpSyncManager(str(local))
+
+
+class TestSftpCredentials:
+    def write_creds(self, tmp_path, data):
+        path = tmp_path / 'creds.json'
+        path.write_text(json.dumps(data))
+        os.chmod(path, 0o600)
+        return str(path)
+
+    def test_valid_with_default_port(self, tmp_path):
+        path = self.write_creds(tmp_path, {'host': 'h', 'user': 'u', 'pass': 'p'})
+        creds = vc_sync.load_sftp_credentials(path)
+        assert creds == {'host': 'h', 'user': 'u', 'pass': 'p', 'port': 22,
+                         'known_hosts_file': 'none'}
+
+    def test_known_hosts_file_passthrough(self, tmp_path):
+        path = self.write_creds(tmp_path,
+                                {'host': 'h', 'user': 'u', 'pass': 'p',
+                                 'known_hosts_file': '~/.ssh/known_hosts'})
+        creds = vc_sync.load_sftp_credentials(path)
+        assert creds['known_hosts_file'] == '~/.ssh/known_hosts'
+
+    def test_explicit_port(self, tmp_path):
+        path = self.write_creds(tmp_path,
+                                {'host': 'h', 'user': 'u', 'pass': 'p', 'port': 2022})
+        assert vc_sync.load_sftp_credentials(path)['port'] == 2022
+
+    def test_missing_file_exits(self, tmp_path):
+        with pytest.raises(SystemExit):
+            vc_sync.load_sftp_credentials(str(tmp_path / 'nope.json'))
+
+    def test_missing_key_exits(self, tmp_path):
+        path = self.write_creds(tmp_path, {'host': 'h', 'user': 'u'})
+        with pytest.raises(SystemExit):
+            vc_sync.load_sftp_credentials(path)
+
+    def test_non_string_pass_exits(self, tmp_path):
+        path = self.write_creds(tmp_path,
+                                {'host': 'h', 'user': 'u', 'pass': 12345})
+        with pytest.raises(SystemExit):
+            vc_sync.load_sftp_credentials(path)
+
+    def test_non_int_port_exits(self, tmp_path):
+        path = self.write_creds(tmp_path,
+                                {'host': 'h', 'user': 'u', 'pass': 'p', 'port': '22'})
+        with pytest.raises(SystemExit):
+            vc_sync.load_sftp_credentials(path)
+
+
+class TestSftpManagerState:
+    def test_state_files_are_independent_of_s3_sync(self, sftp_manager):
+        assert sftp_manager.config_file.endswith(vc_sync.ASH_CONFIG_NAME)
+        assert sftp_manager.db_file.endswith(vc_sync.ASH_DB_NAME)
+        assert sftp_manager.BASE_DIR == vc_sync.ASH_BASE_DIR_NAME
+        assert sftp_manager.CONFLICT_DIR == vc_sync.ASH_CONFLICT_DIR_NAME
+        assert vc_sync.ASH_BASE_DIR_NAME != vc_sync.BASE_DIR_NAME
+
+    def test_ash_state_files_are_ignored_by_scans(self):
+        # Load-bearing: the ash sync's own state must never be synced,
+        # by either the S3 sync or the ash sync itself
+        for name in (vc_sync.ASH_CONFIG_NAME, vc_sync.ASH_DB_NAME):
+            assert S3SyncManager._is_ignored(name)
+        for dirname in (vc_sync.ASH_BASE_DIR_NAME, vc_sync.ASH_CONFLICT_DIR_NAME):
+            assert S3SyncManager._is_ignored(f'{dirname}/fibers/f1.json')
+
+    def test_rclone_remote_and_env(self, sftp_manager):
+        assert sftp_manager._rclone_remote() == ':sftp:/srv/backup'
+        env = sftp_manager._rclone_env()
+        assert env['RCLONE_SFTP_HOST'] == 'ash.example.org'
+        assert env['RCLONE_SFTP_USER'] == 'user1'
+        assert env['RCLONE_SFTP_PORT'] == '2022'
+        assert env['RCLONE_SFTP_PASS'] == 'obscured:secret'
+        # The "none" default must leave the variable UNSET: older rclone
+        # treats any value as a literal path and fails to open "none"
+        assert 'RCLONE_SFTP_KNOWN_HOSTS_FILE' not in env
+
+    def test_known_hosts_path_reaches_rclone_env(self, sftp_manager):
+        sftp_manager._creds['known_hosts_file'] = '~/.ssh/known_hosts'
+        env = sftp_manager._rclone_env()
+        assert env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] == os.path.expanduser(
+            '~/.ssh/known_hosts')
+
+    def test_display_url(self, sftp_manager):
+        assert sftp_manager._get_s3_url('a/b.json') == (
+            'sftp://user1@ash.example.org:2022/srv/backup/a/b.json')
+
+    def test_no_versioning_and_no_history_base(self, sftp_manager):
+        assert sftp_manager._bucket_versioning_enabled() is False
+        assert sftp_manager._fetch_base_from_history(
+            'a.json', 'd41d8cd98f00b204e9800998ecf8427e') is None
+
+    def test_aws_cli_calls_are_a_bug(self, sftp_manager):
+        with pytest.raises(RuntimeError):
+            sftp_manager._run_aws_command(['aws', 's3', 'ls'])
+
+    def test_init_writes_config_roundtrip(self, tmp_path, monkeypatch):
+        creds_file = tmp_path / 'creds.json'
+        creds_file.write_text(json.dumps(
+            {'host': 'h', 'user': 'u', 'pass': 'p'}))
+        os.chmod(creds_file, 0o600)
+        monkeypatch.setattr(vc_sync.S3SyncManager, '_detect_rclone',
+                            lambda self: True)
+        monkeypatch.setattr(vc_sync.SftpSyncManager, '_rclone_obscure',
+                            staticmethod(lambda password: 'x'))
+        local = tmp_path / 'newdir'
+        first = vc_sync.SftpSyncManager(str(local), 'backup/scrolls/',
+                                        str(creds_file))
+        assert first.remote_path == 'backup/scrolls'  # trailing slash stripped
+        reloaded = vc_sync.SftpSyncManager(str(local))
+        assert reloaded.remote_path == 'backup/scrolls'
+        assert reloaded.creds_file == str(creds_file)
+
+
+class TestSftpRemoteChanged:
+    MD5_A = 'a' * 32
+    MD5_B = 'b' * 32
+
+    def test_size_change_wins(self, sftp_manager):
+        assert sftp_manager._remote_changed(
+            {'s3_size': 10, 's3_etag': self.MD5_A, 's3_mtime': 0.0},
+            {'s3_size': 11, 's3_etag': self.MD5_A, 's3_mtime': 0.0})
+
+    def test_matching_md5s_beat_mtime_drift(self, sftp_manager):
+        assert not sftp_manager._remote_changed(
+            {'s3_size': 10, 's3_etag': self.MD5_A, 's3_mtime': 0.0},
+            {'s3_size': 10, 's3_etag': self.MD5_A, 's3_mtime': 9999.0})
+
+    def test_differing_md5s_detected_despite_same_mtime(self, sftp_manager):
+        assert sftp_manager._remote_changed(
+            {'s3_size': 10, 's3_etag': self.MD5_A, 's3_mtime': 0.0},
+            {'s3_size': 10, 's3_etag': self.MD5_B, 's3_mtime': 0.0})
+
+    def test_mtime_fallback_without_hashes(self, sftp_manager):
+        tracked = {'s3_size': 10, 's3_etag': None, 's3_mtime': 100.0}
+        assert not sftp_manager._remote_changed(
+            tracked, {'s3_size': 10, 's3_etag': None, 's3_mtime': 101.0})
+        assert sftp_manager._remote_changed(
+            tracked, {'s3_size': 10, 's3_etag': None, 's3_mtime': 105.0})
+
+    def test_one_sided_hash_falls_back_to_mtime(self, sftp_manager):
+        # tracked before server-side hashing was available
+        tracked = {'s3_size': 10, 's3_etag': None, 's3_mtime': 100.0}
+        assert sftp_manager._remote_changed(
+            tracked, {'s3_size': 10, 's3_etag': self.MD5_A, 's3_mtime': 105.0})
+
+    def test_untracked_mtime_is_not_a_change(self, sftp_manager):
+        assert not sftp_manager._remote_changed(
+            {'s3_size': 10}, {'s3_size': 10, 's3_etag': None, 's3_mtime': 5.0})
+
+
+class TestSftpTimeParsing:
+    def test_nanosecond_rfc3339(self, sftp_manager):
+        ts = sftp_manager._parse_rclone_time('2026-08-27T10:00:00.123456789Z')
+        assert abs(ts - 1787824800.123456) < 0.001
+
+    def test_offset_and_no_fraction(self, sftp_manager):
+        assert (sftp_manager._parse_rclone_time('2026-08-27T12:00:00+02:00') ==
+                sftp_manager._parse_rclone_time('2026-08-27T10:00:00Z'))
+
+
+class TestSftpContentMatch:
+    MD5_A = 'a' * 32
+    MD5_B = 'b' * 32
+
+    def test_hash_match_is_proof(self, sftp_manager):
+        assert sftp_manager._content_matches_remote('f.json', self.MD5_A,
+                                                    self.MD5_A)
+
+    def test_hash_mismatch_is_proof_and_seeds_cache(self, sftp_manager):
+        assert not sftp_manager._content_matches_remote('f.json', self.MD5_A,
+                                                        self.MD5_B)
+        # The remote hash is now known without any download
+        assert sftp_manager._remote_md5('f.json') == self.MD5_B
+
+    def test_no_remote_hash_downloads(self, sftp_manager, monkeypatch):
+        monkeypatch.setattr(sftp_manager, '_remote_md5',
+                            lambda path: self.MD5_A)
+        assert sftp_manager._content_matches_remote('f.json', self.MD5_A, None)
+
+
+class TestSftpScanAndHashes:
+    def test_scan_parses_listing_applies_ignores_and_attaches_md5s(
+            self, sftp_manager, monkeypatch):
+        listing = [
+            {'Path': 'fibers/f1.json', 'Size': 100,
+             'ModTime': '2026-08-27T10:00:00.5Z'},
+            {'Path': '.hidden/skipme.json', 'Size': 5,
+             'ModTime': '2026-08-27T10:00:00Z'},
+            {'Path': 'layers_full/x.tif', 'Size': 5,
+             'ModTime': '2026-08-27T10:00:00Z'},
+            {'Path': 'volumes/big.tif', 'Size': 12345,
+             'ModTime': '2026-08-27T10:00:00Z'},
+        ]
+        md5 = 'c' * 32
+        calls = {}
+
+        def fake_capture(args, timeout=None):
+            assert args[0] == 'lsjson'
+            return completed(stdout=json.dumps(listing))
+
+        def fake_md5sums(paths):
+            calls['paths'] = paths
+            return {'fibers/f1.json': md5}
+
+        monkeypatch.setattr(sftp_manager, '_run_rclone_capture', fake_capture)
+        monkeypatch.setattr(sftp_manager, '_remote_md5sums', fake_md5sums)
+
+        files = sftp_manager.scan_s3_files()
+        assert sorted(files) == ['fibers/f1.json', 'volumes/big.tif']
+        assert files['fibers/f1.json']['s3_etag'] == md5
+        assert files['fibers/f1.json']['s3_size'] == 100
+        assert files['volumes/big.tif']['s3_etag'] is None
+        # Only hash-scoped files were sent for hashing
+        assert calls['paths'] == ['fibers/f1.json']
+
+    def test_scan_missing_remote_dir_is_empty(self, sftp_manager, monkeypatch):
+        monkeypatch.setattr(
+            sftp_manager, '_run_rclone_capture',
+            lambda args, timeout=None: completed(
+                returncode=3, stderr='2026/08/27 error: directory not found'))
+        assert sftp_manager.scan_s3_files() == {}
+
+    def test_md5sums_parses_and_skips_unsupported(self, sftp_manager,
+                                                  monkeypatch):
+        stdout = ('d41d8cd98f00b204e9800998ecf8427e  a.json\n'
+                  'UNSUPPORTED  b.json\n'
+                  '                                  c.json\n')
+        monkeypatch.setattr(sftp_manager, '_run_rclone_capture',
+                            lambda args, timeout=None: completed(stdout=stdout))
+        md5s = sftp_manager._remote_md5sums(['a.json', 'b.json', 'c.json'])
+        assert md5s == {'a.json': 'd41d8cd98f00b204e9800998ecf8427e'}
+        assert sftp_manager._remote_hashing_works is True
+
+    def test_md5sums_unsupported_server_disables_hashing(self, sftp_manager,
+                                                         monkeypatch):
+        ran = []
+        monkeypatch.setattr(
+            sftp_manager, '_run_rclone_capture',
+            lambda args, timeout=None: ran.append(args) or completed(stdout=''))
+        assert sftp_manager._remote_md5sums(['a.json']) == {}
+        assert sftp_manager._remote_hashing_works is False
+        # Later calls short-circuit instead of re-probing the server
+        assert sftp_manager._remote_md5sums(['b.json']) == {}
+        assert len(ran) == 1
+
+
+class TestSftpAnalyzeIntegration:
+    """analyze_changes over the SFTP manager: the md5-in-the-etag-slot and
+    mtime-fallback semantics drive the same engine decisions ETags do on S3."""
+
+    def test_remote_content_change_same_size_is_download(self, sftp_manager):
+        path = 'fibers/f1.json'
+        write_local(sftp_manager, path, '{"a": 1}')
+        info = local_info(sftp_manager, path)
+        track_row(sftp_manager, path, info['local_size'], info['local_mtime'],
+                  info['local_size'], 'a' * 32, local_md5=info['local_md5'])
+        remote = {path: {'path': path, 's3_size': info['local_size'],
+                         's3_mtime': 0.0, 's3_etag': 'b' * 32,
+                         'is_backup': False}}
+        actions = sftp_manager.analyze_changes({path: info}, remote)
+        assert actions[path][0] == SyncAction.DOWNLOAD
+
+    def test_unhashed_remote_mtime_change_is_download(self, sftp_manager):
+        path = 'volumes/meta.bin'
+        write_local(sftp_manager, path, 'binary')
+        info = local_info(sftp_manager, path)
+        with sqlite3.connect(sftp_manager.db_file) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO files '
+                '(path, local_size, local_mtime, s3_size, s3_mtime, s3_etag) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (path, info['local_size'], info['local_mtime'],
+                 info['local_size'], 100.0, None))
+        remote = {path: {'path': path, 's3_size': info['local_size'],
+                         's3_mtime': 200.0, 's3_etag': None,
+                         'is_backup': False}}
+        actions = sftp_manager.analyze_changes({path: info}, remote)
+        assert actions[path][0] == SyncAction.DOWNLOAD
+
+    def test_both_changed_identical_content_converges(self, sftp_manager):
+        path = 'fibers/f1.json'
+        write_local(sftp_manager, path, '{"a": 2}')
+        info = local_info(sftp_manager, path)
+        track_row(sftp_manager, path, 1, 0.0, 1, 'a' * 32, local_md5='b' * 32)
+        remote = {path: {'path': path, 's3_size': info['local_size'],
+                         's3_mtime': 0.0, 's3_etag': info['local_md5'],
+                         'is_backup': False}}
+        actions = sftp_manager.analyze_changes({path: info}, remote)
+        assert actions[path][0] == SyncAction.SKIP
+
+    def test_both_changed_different_content_is_conflict(self, sftp_manager):
+        path = 'fibers/f1.json'
+        write_local(sftp_manager, path, '{"a": 2}')
+        info = local_info(sftp_manager, path)
+        track_row(sftp_manager, path, 1, 0.0, 1, 'a' * 32, local_md5='b' * 32)
+        remote = {path: {'path': path, 's3_size': info['local_size'],
+                         's3_mtime': 0.0, 's3_etag': 'c' * 32,
+                         'is_backup': False}}
+        actions = sftp_manager.analyze_changes({path: info}, remote)
+        assert actions[path][0] == SyncAction.CONFLICT

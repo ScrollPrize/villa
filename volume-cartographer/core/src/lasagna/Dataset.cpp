@@ -4,6 +4,7 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 #include "utils/http_fetch.hpp"
 #include "utils/zarr.hpp"
 
@@ -65,7 +66,14 @@ namespace {
     return resolved;
 }
 
-[[nodiscard]] utils::HttpClient makeRemoteClient(
+struct RemoteClients {
+    std::unique_ptr<utils::HttpClient> authenticated;
+    std::unique_ptr<utils::HttpClient> anonymous;
+    bool isS3 = false;
+    bool credentialsLoaded = false;
+};
+
+[[nodiscard]] RemoteClients makeRemoteClients(
     const vc::ResolvedUrl& endpoint,
     const vc::HttpAuth& explicitAuth,
     bool discoverAwsCredentials)
@@ -79,7 +87,17 @@ namespace {
         if (!endpoint.awsRegion.empty())
             config.aws_auth.region = endpoint.awsRegion;
     }
-    return utils::HttpClient(std::move(config));
+    RemoteClients clients;
+    clients.isS3 = endpoint.useAwsSigv4;
+    clients.credentialsLoaded = !config.aws_auth.empty();
+    clients.authenticated = std::make_unique<utils::HttpClient>(
+        std::move(config));
+
+    utils::HttpClient::Config anonymousConfig;
+    anonymousConfig.transfer_timeout = std::chrono::seconds{60};
+    clients.anonymous = std::make_unique<utils::HttpClient>(
+        std::move(anonymousConfig));
+    return clients;
 }
 
 [[nodiscard]] std::string remoteParentUrl(const std::string& normalizedRemoteUrl)
@@ -217,8 +235,12 @@ public:
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
-        client_ = std::make_unique<utils::HttpClient>(
-            makeRemoteClient(endpoint, remoteAuth, discoverAwsCredentials));
+        auto clients = makeRemoteClients(
+            endpoint, remoteAuth, discoverAwsCredentials);
+        client_ = std::move(clients.authenticated);
+        anonymousClient_ = std::move(clients.anonymous);
+        authFallback_ = std::make_unique<vc::S3AuthFallback>(
+            clients.isS3, clients.credentialsLoaded);
     }
 
     bool exists(const std::string& key) const override
@@ -240,8 +262,10 @@ public:
             std::filesystem::is_regular_file(cacheRoot_ / relative)) {
             return true;
         }
-        const auto response = client_->head(makeUrl(key));
-        return response.ok();
+        auto result = authFallback_->request([&](bool anonymous) {
+            return (anonymous ? anonymousClient_ : client_)->head(makeUrl(key));
+        });
+        return result.response.ok();
     }
 
     std::vector<std::byte> get(const std::string& key) const override
@@ -306,13 +330,23 @@ public:
         std::optional<std::vector<std::byte>> bytes;
         std::exception_ptr error;
         try {
-            const auto response = client_->get(makeUrl(key));
+            auto requestResult = authFallback_->request([&](bool anonymous) {
+                return (anonymous ? anonymousClient_ : client_)->get(makeUrl(key));
+            });
+            auto& response = requestResult.response;
             if (response.ok()) {
                 bytes = std::move(response.body);
             } else if (!response.not_found()) {
-                throw std::runtime_error(
+                std::string message =
                     "Remote Lasagna Zarr fetch failed HTTP " +
-                    std::to_string(response.status_code) + ": " + key);
+                    std::to_string(response.status_code) + ": " + key;
+                if (requestResult.anonymousFailure) {
+                    message += " after anonymous request failed HTTP " +
+                        std::to_string(
+                            requestResult.anonymousFailure->status_code) +
+                        " and authenticated fallback failed";
+                }
+                throw std::runtime_error(std::move(message));
             }
             if (bytes)
                 // Preserve the source object byte-for-byte. Do not decode and
@@ -472,6 +506,8 @@ private:
     }
 
     std::unique_ptr<utils::HttpClient> client_;
+    std::unique_ptr<utils::HttpClient> anonymousClient_;
+    std::unique_ptr<vc::S3AuthFallback> authFallback_;
     std::string baseUrl_;
     std::filesystem::path cacheRoot_;
     std::shared_ptr<vc::render::PersistentZarrCacheBudget> budget_;

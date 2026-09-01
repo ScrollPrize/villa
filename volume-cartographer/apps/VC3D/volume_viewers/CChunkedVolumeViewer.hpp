@@ -141,6 +141,7 @@ public:
     bool isShowDirectionHints() const override { return _showDirectionHints; }
     void setShowSurfaceNormals(bool on) override { if (_closing) return; _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
+    void setShowCoordinateFrame(bool show);
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
     void setNormalArrowLengthScale(float scale) override { if (_closing) return; _normalArrowLengthScale = scale; emit overlaysUpdated(); }
@@ -352,6 +353,8 @@ private:
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
+    // Push the displayed plane's basis to the view's coordinate frame gizmo.
+    void updateCoordinateFrame();
     // Build/drop the base and overlay SurfaceCache to match the current
     // (volume, surface, geometry epoch) identity and the configured budgets.
     void ensureSurfaceCaches();
@@ -491,6 +494,13 @@ private:
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
     ViewerStatsBar* _statsBarRight = nullptr;
+    // Shared cache/scheduler statistics are refreshed at most every 250 ms:
+    // updateStatusLabel runs per mouse move and ChunkCache::stats() takes the
+    // cache-state and scheduler mutexes that every fetch/decode worker hammers
+    // while a solve streams chunks - polling them at input rate stalls the GUI
+    // thread and the workers alike.
+    QElapsedTimer _sharedCacheStatsThrottle;
+    QStringList _cachedSharedCacheItems;
     CameraGizmoWidget* _cameraGizmo = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.
@@ -616,6 +626,7 @@ private:
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
+    bool _showCoordinateFrame = true;
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
     bool _surfaceOverlayEnabled = false;

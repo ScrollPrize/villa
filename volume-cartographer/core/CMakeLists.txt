@@ -29,6 +29,7 @@ add_library(vc_core
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp
         src/HttpFetch.cpp
+        src/S3AuthFallback.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/PointCollections.cpp

@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 
 
+DEFAULT_GAP_EXPANDER_CAPACITY = 144
+
+
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical"],
@@ -34,6 +37,7 @@ _PREPARED_INPUT_FIELDS = {
     "track_crossing_mode",
     "track_exclusion_radius",
     "dense_spacing_mode",
+    "loss_weight_fiber_directions",
     "output_first_winding",
     "output_winding_margin",
     "output_step_size",
@@ -57,6 +61,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_unattached_pcls_per_step",
     "sample_count_tracks_per_step",
     "sample_count_dense_normal_points",
+    "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
     "sample_count_dense_spacing_pairs",
     "sample_count_dense_spacing_density_extra_pairs",
@@ -99,6 +104,8 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
         "Load tracks and allow track sampling and losses.",
     "input_use_fibers":
         "Load fiber annotations into the point-collection supervision pools.",
+    "input_use_fiber_directions":
+        "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute":
         "Load absolute-winding point-collection inputs.",
     "input_use_pcl_relative":
@@ -126,6 +133,29 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
 BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    # Historical checkpoints used an unbounded exponential gap map and used
+    # model_gap_expander_num_windings for both the physical estimate and the
+    # allocated lattice extent.  The checkpoint loader migrates their tensors;
+    # these defaults make the added semantic fields schema-compatible too.
+    "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
+    "model_gap_expander_min_gap": 1.0,
+    "model_gap_expander_softplus_bias": 4.0,
+})
+
+_GAP_EXPANDER_DESCRIPTIONS = {
+    "model_gap_expander_num_windings": (
+        "Legacy/fallback physical winding-count estimate used by exporters; "
+        "it does not allocate the gap lattice."),
+    "model_gap_expander_capacity_windings": (
+        "Allocated gap-lattice capacity, not a claim about the physical "
+        "winding count. Must be at least shell_outer_winding_idx + 3."),
+    "model_gap_expander_min_gap": (
+        "Hard numerical inter-winding gap floor in working voxels. The "
+        "minimum-spacing loss remains the separate geological preference."),
+    "model_gap_expander_softplus_bias": (
+        "Bias of the stable lower-bounded softplus gap parameterisation."),
+}
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
@@ -137,7 +167,10 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_num_flow_timesteps", "model_flow_bounds_z_margin",
     "model_flow_bounds_radius", "model_flow_voxel_resolution",
     "model_flow_field_type", "model_gap_expander_logit_resolution",
-    "model_gap_expander_num_windings", "model_linear_z_resolution",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_lr_scale",
+    "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
+    "model_initial_dr_per_winding", "model_linear_z_resolution",
 )
 
 
@@ -170,6 +203,9 @@ MODEL_STAGE_KEYS = frozenset({
     "model_flow_field_direct_lr",
     "model_gap_expander_logit_resolution",
     "model_gap_expander_num_windings",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_min_gap",
+    "model_gap_expander_softplus_bias",
     "model_gap_expander_lr_scale",
     "model_linear_z_resolution",
     "model_initial_dr_per_winding",
@@ -233,6 +269,7 @@ def _field_spec(key, default):
                 1 if key in {
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
+                    "dt_target_update_interval",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
@@ -254,6 +291,8 @@ def _field_spec(key, default):
         spec["ui_owner"] = "run"
     elif key in _INPUT_TOGGLE_DESCRIPTIONS:
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
+    elif key in _GAP_EXPANDER_DESCRIPTIONS:
+        spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
     return spec
 
 
@@ -284,8 +323,16 @@ class Config:
         self.model_flow_field_high_res_lr_ramp_steps = 1
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
+        # The physical winding estimate and the allocated transform capacity
+        # are deliberately separate.  shell_outer_winding_idx is the active
+        # hypothesis; num_windings remains the legacy/fallback physical
+        # estimate used by exporters, while capacity only shapes the lattice.
         self.model_gap_expander_num_windings = 130
+        self.model_gap_expander_capacity_windings = \
+            DEFAULT_GAP_EXPANDER_CAPACITY
         self.model_gap_expander_lr_scale = 0.3
+        self.model_gap_expander_min_gap = 1.0
+        self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
         # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
@@ -314,6 +361,7 @@ class Config:
         self.sample_count_tracks_per_step = 48000
         self.sample_count_track_points_per_step = 96
         self.sample_count_dense_normal_points = 60000
+        self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500
         self.sample_count_dense_spacing_pairs = 12000
         self.sample_count_dense_spacing_count_extra_pairs = 0
@@ -340,8 +388,9 @@ class Config:
         # re-enabling a source restores its previous tuning.
         self.input_use_verified_patches = True
         self.input_use_unverified_patches = True
-        self.input_use_tracks = True
+        self.input_use_tracks = False
         self.input_use_fibers = True
+        self.input_use_fiber_directions = False
         self.input_use_pcl_absolute = True
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True
@@ -457,6 +506,7 @@ class Config:
         self.loss_weight_track_dt = 10.0
         self.loss_weight_sym_dirichlet = 10.0
         self.loss_weight_dense_normals = 100.0
+        self.loss_weight_fiber_directions = 0.0
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
         self.loss_weight_shell_outer = 1.0
@@ -469,11 +519,12 @@ class Config:
         self.dense_attachment_warmup_steps = 3000
         self.dense_attachment_ramp_steps = 3000
         self.dense_normals_finite_difference_epsilon = 8.0
+        self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
-        self.loss_start_track_dt = 10000
+        self.loss_start_track_dt = 25000
         self.loss_start_unverified_patch_dt = None
         self.dt_progressive_windings = False
         self.dt_progressive_inner_winding = 20
@@ -481,6 +532,9 @@ class Config:
         self.dt_progressive_exponent = 1.0
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
+        # Backward-compatible alias. FitContext phase-locks whole-object DT
+        # targets to theta_crossing_map_update_interval and keeps both values
+        # synchronized when either setting is changed.
         self.dt_target_update_interval = 100
         self.dt_target_max_stride = 128
         self.output_first_winding = 10
@@ -544,6 +598,14 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        if values["model_gap_expander_capacity_windings"] < 3:
+            raise ValueError(
+                "model_gap_expander_capacity_windings must be at least 3")
+        if not (0.0 < values["model_gap_expander_min_gap"]
+                < values["model_initial_dr_per_winding"]):
+            raise ValueError(
+                "model_gap_expander_min_gap must be positive and smaller "
+                "than model_initial_dr_per_winding")
         for key, value in overrides.items():
             setattr(self, key, value)
 

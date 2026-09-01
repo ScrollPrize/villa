@@ -39,11 +39,20 @@ def test_every_key_has_generated_metadata():
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
 
 
+def test_dt_target_cadence_alias_remains_positive_in_schema():
+    fields = Config.catalog()["schema"]["fields"]
+    assert fields["theta_crossing_map_update_interval"]["minimum"] == 1
+    assert fields["dt_target_update_interval"]["minimum"] == 1
+    with pytest.raises(ValueError, match="Out-of-range"):
+        Config({"dt_target_update_interval": 0})
+
+
 def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {
         "input_use_verified_patches", "input_use_unverified_patches",
-        "input_use_tracks", "input_use_fibers", "input_use_pcl_absolute",
+        "input_use_tracks", "input_use_fibers",
+        "input_use_fiber_directions", "input_use_pcl_absolute",
         "input_use_pcl_relative", "input_use_pcl_same_winding",
         "input_use_pcl_drawn_control_points", "input_use_normals",
         "input_use_surf_sdt", "input_use_gradient_magnitude",
@@ -51,7 +60,10 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     }
     assert {key for key in catalog["defaults"]
             if key.startswith("input_use_")} == expected
-    default_off = {"input_use_surf_sdt"}
+    default_off = {
+        "input_use_surf_sdt", "input_use_fiber_directions",
+        "input_use_tracks",
+    }
     for key in expected:
         assert catalog["defaults"][key] is (key not in default_off)
         assert catalog["schema"]["fields"][key]["type"] == "boolean"
@@ -182,6 +194,24 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
         Config({"dense_spacing_pair_m_short": [1]})
     with pytest.raises(ValueError):
         Config({"track_max_tortuosity": "unlimited"})
+
+
+def test_gap_capacity_and_numerical_floor_are_explicit_and_validated():
+    catalog = Config.catalog()
+    defaults = catalog["defaults"]
+    fields = catalog["schema"]["fields"]
+    assert defaults["model_gap_expander_capacity_windings"] > (
+        defaults["model_gap_expander_num_windings"])
+    assert "not a claim" in fields[
+        "model_gap_expander_capacity_windings"]["description"]
+    assert "geological preference" in fields[
+        "model_gap_expander_min_gap"]["description"]
+    with pytest.raises(ValueError, match="capacity_windings"):
+        Config({"model_gap_expander_capacity_windings": 2})
+    with pytest.raises(ValueError, match="min_gap"):
+        Config({"model_gap_expander_min_gap": 0.0})
+    with pytest.raises(ValueError, match="min_gap"):
+        Config({"model_gap_expander_min_gap": 16.0})
 
 
 def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
