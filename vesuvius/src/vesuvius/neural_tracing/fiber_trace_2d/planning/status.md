@@ -1,8 +1,11 @@
-# Status: promote the best 1024 winding tune
+# Status
 
-- [x] Capture the default-promotion task.
-- [x] Write and review the implementation plan.
-- [x] Update shared defaults, CLI help, and regression expectations.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Build and run focused validation.
-- [x] Commit the promoted defaults.
+- [x] Capture the task
+- [x] Write the implementation and validation plan
+- [x] Review the plan independently
+- [x] Add objective-neutral joint-grid MAP warm starts
+- [x] Add conditioned-to-ordinary continuation diagnostics
+- [x] Add regression tests
+- [x] Update specifications, documentation, and changelog
+- [x] Build and run focused tests
+- [x] Run and report the 1024 continuation experiment

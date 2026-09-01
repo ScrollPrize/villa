@@ -1430,7 +1430,7 @@ benchmarks the solved BP winding result. Reference runs reuse their canonical
 constraint pieces, while the represented BP lines remain exactly one input
 piece each. A filtered cross extraction measures only reference-to-BP pairs
 after that solver run has retained its main winding component; reference
-geometry never enters the solve.
+geometry does not enter the authoritative reference-free solve.
 
 Before the final BP-only winding solve, the command retains only the largest
 component of the exact effective-winding graph. Fixed-orientation runs repeat
@@ -1453,6 +1453,54 @@ distance zero and nonzero are reported separately. Constraints ending at a
 final Defect/Mixed or otherwise winding-invalid BP piece are excluded from both
 offset calibration and right/wrong totals. Unsigned perpendicular observations
 also have no candidate and are excluded.
+
+When references are present, the benchmark also prints `fixed-reference
+conflict` diagnostics. These clamp each reference to its filename-order
+half-step after applying the benchmark's single global sign and per-component
+integer-gauge offset, while retaining the ordinary reference-free BP state for
+the traced endpoint. Every admitted magnitude and sign factor is evaluated
+with the same quantized target, confidence multiplier, hard-sign rule, and
+finite coefficient used by BP. The class summary reports participating factors,
+nonzero conflicts, hard violations, and weighted finite loss. Per-reference
+rows localize bad winding bands; ranked piece and factor tables identify the
+traced source/piece, its BP latent coordinate, and the predicted versus target
+delta. Zero-weight magnitude factors are deliberately absent because they did
+not constrain the solve. This table is post-solve attribution and is distinct
+from the actual conditioned solve described next.
+
+With `--reference-conditioning-diagnostic`, a fixed joint grid additionally
+runs a second diagnostic BP
+solve containing the reference pieces as exact, non-disableable variables.
+Each reference state fixes H/V, integer winding, and component phase direction
+in the baseline raw gauge. Every ordinary factor is retained once, each
+selected reference/BP cross factor is added once, and only the reference hard
+continuity factors required to preserve split source traces are retained from
+the reference-only report. Fixed phase and scale are required. An incompatible
+fixed/fixed hard factor is an error; a post-decode hard projection may disable
+only an ordinary endpoint.
+
+`fixed-reference conditioned solve` reports convergence for both solves and
+compares only ordinary pieces. The response table counts active-to-Defect,
+Defect-to-active, H/V, winding, and unchanged pieces. The origin table separates
+pieces directly incident to a reference cross-factor from changes propagated
+through ordinary constraints or hard split continuity. The cross-factor table
+reports evaluated, infringed, and Defect-neutralized items by the same H/V,
+winding-magnitude, and sign classes before and after conditioning. A ranked
+piece table includes direct reference support and the extra degree-scaled
+Defect unary introduced by those factors. This second solve is diagnostic: it
+does not replace the reference-free OBJ/CSV artifacts.
+
+The opt-in diagnostic then removes every reference node and cross-factor and
+reruns the exact original ordinary graph from the conditioned ordinary MAP.
+The MAP is used only to expand integer support and initialize factor messages;
+it is not a clamp or an added cost. A neutral-message control uses the identical
+expanded support, separating finite-domain effects from initialization effects.
+The comparison reports ordinary decoded energies and changes relative to the
+cold, neutral-expanded, and conditioned states. Because production
+`--winding-fixed-orientation` fixes H/V, this continuation probes only Defect,
+winding, and component-sign attraction. A run that reaches its message limit is
+reported as `unresolved`, regardless of how close its decoded state remains to
+the conditioned seed.
 
 Immediately before each reference benchmark, `BP final states by source-piece
 cohort` reports H, V, active H/V, Defect, and Defect percentage for the original

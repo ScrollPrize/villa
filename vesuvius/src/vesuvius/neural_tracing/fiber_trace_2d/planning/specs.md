@@ -5981,3 +5981,36 @@
   reference-to-BP benchmarking must use each selected JSON fiber's complete
   dense line exactly once in deterministic filename order; they must not clip
   or split that line at the stored trace artifact bounds.
+- Joint-grid winding inference may receive an optional exact state for any
+  represented piece. An exact state fixes H/V, integer winding, and the
+  component phase-direction sign; it exposes one discrete state, cannot become
+  Defect, and requires fixed phase and measurement scale. Mixed exact states,
+  inconsistent exact states, and incompatible fixed/fixed hard continuity or
+  hard sign are errors. Post-decode hard projections may disable an unfixed
+  endpoint but must never disable or alter a fixed endpoint.
+- Exact states anchor the H/V gauge in their all-factor component and the
+  integer gauge in their effective-winding component. Unanchored H/V and
+  integer components retain the production gauges independently. Continuous
+  initialization uses the exact latent coordinates as Dirichlet anchors.
+- With tagged references, a fixed joint grid, and an explicit conditioning
+  diagnostic request, diagnostics run an additional
+  conditioned solve. It preserves every ordinary factor once, adds each
+  selected reference/BP cross factor once, preserves reference split
+  continuity, and fixes every reference piece to its filename-order annotated
+  H/V and winding in the baseline raw gauge. Output must distinguish direct
+  responses on cross-connected ordinary pieces from responses propagated
+  through the ordinary graph, and must report cross-factor agreement before
+  and after conditioning. The original reference-free solve and benchmark
+  remain the authoritative output artifacts.
+- A conditioned-to-ordinary continuation may initialize the reference-free
+  fixed-orientation joint grid from the conditioned MAP. The initialization
+  must normalize each ordinary integer component independently, validate hard
+  continuation and hard sign compatibility, and may only expand integer
+  support and initialize factor messages. It must not retain reference nodes,
+  cross factors, fixed states, or seed unaries in the ordinary objective.
+- The continuation diagnostic must also run neutral messages over the identical
+  expanded support. It reports support-only drift separately from initialized
+  drift and labels the basin outcome `unresolved` unless the cold, conditioned,
+  neutral-expanded, and initialized solves all satisfy their residual criteria.
+  This fixed-prepass diagnostic tests Defect, winding, and component-sign state;
+  H/V remains fixed by the production orientation prepass.

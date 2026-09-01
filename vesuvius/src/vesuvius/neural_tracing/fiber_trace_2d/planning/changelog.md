@@ -1,3 +1,18 @@
+# 2026-09-01: fixed-reference winding conflict diagnostics
+
+- Added solver-consistent reference conditioning diagnostics that clamp known
+  reference H/V and winding labels, then report admitted cross-factor conflict
+  rates, hard violations, weighted losses, and ranked offending BP pieces and
+  factors without changing the production reference-free solution.
+- Added a conditioned-to-ordinary warm-start diagnostic and an identical-support
+  neutral control. The 1024 experiment reproduced the cold solution exactly in
+  the neutral control; the conditioned initialization failed to converge after
+  2000 messages and remained a substantially higher-energy state, so it is not
+  classified as a retained ordinary minimum.
+- Kept this expensive experiment opt-in through
+  `--reference-conditioning-diagnostic`; ordinary reference benchmarks continue
+  to run only the production reference-free solution by default.
+
 # 2026-09-01: promote complete-stack 1024 winding tune
 
 - Promoted winding class weights `0,0,0.5,4,1` and sign weights `1,0.5` to the
@@ -1825,3 +1840,15 @@
   visualization, reference constraint extraction, and BP benchmarking.
 - Reference diagnostics now retain one complete dense line per selected JSON
   fiber in deterministic filename order.
+
+## 2026-09-01 - Fixed-reference conditioned winding solve
+
+- Added exact, non-disableable joint-grid states with fixed H/V, integer
+  winding, and phase-direction sign, including independent gauge anchoring and
+  protected hard-factor projection.
+- Added a second diagnostic solve containing the annotated reference pieces and
+  production reference/BP cross factors while preserving the ordinary graph.
+- Added direct-versus-propagated ordinary state changes and before/after
+  cross-factor agreement tables. On the 1024 crop, winding-magnitude conflicts
+  dominated the response; H/V and signed-order conflicts were comparatively
+  small.

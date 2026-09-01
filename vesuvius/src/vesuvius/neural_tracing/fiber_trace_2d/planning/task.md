@@ -1,5 +1,7 @@
-# Task: promote the best 1024 winding tune
+# Task
 
-Promote the completed 1024 zero-aware local-search result to the shared and CLI
-defaults so it can be checked without explicit weight flags. Commit the default,
-documentation, and focused regression updates.
+After the diagnostic BP solve with annotated reference fibers included as exact,
+non-disableable states, remove the references and their cross-factors and rerun
+the original ordinary BP objective initialized from the conditioned ordinary
+state. Measure whether that reference-corrected state is retained or whether BP
+returns to the cold-start baseline.

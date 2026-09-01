@@ -767,9 +767,14 @@ double measurementSquaredTarget(const Measurement& measurement)
 
 std::vector<double> solveContinuous(
     const PreparedWinding& problem,
-    double& rootMeanSquareResidual)
+    double& rootMeanSquareResidual,
+    std::span<const std::optional<double>> fixedValues = {})
 {
     const std::size_t nodeCount = problem.piecesByNode.size();
+    if (!fixedValues.empty() && fixedValues.size() != nodeCount) {
+        throw std::invalid_argument(
+            "Fixed continuous winding values do not match nodes");
+    }
     std::vector<unsigned char> gauge(nodeCount, 0);
     std::vector<unsigned char> preferredGauge(nodeCount, 0);
     for (const std::size_t node : problem.integerGaugeNodes)
@@ -806,11 +811,29 @@ std::vector<double> solveContinuous(
                 }
             }
         }
-        const auto preferred = std::find_if(
-            nodes.begin(), nodes.end(), [&](std::size_t node) {
-                return preferredGauge[node] != 0;
-            });
-        gauge[preferred == nodes.end() ? nodes.front() : *preferred] = 1;
+        bool anchored = false;
+        if (!fixedValues.empty()) {
+            for (const std::size_t node : nodes) {
+                if (fixedValues[node]) {
+                    gauge[node] = 1;
+                    anchored = true;
+                }
+            }
+        }
+        if (!anchored) {
+            const auto preferred = std::find_if(
+                nodes.begin(), nodes.end(), [&](std::size_t node) {
+                    return preferredGauge[node] != 0;
+                });
+            gauge[preferred == nodes.end() ? nodes.front() : *preferred] = 1;
+        }
+    }
+    std::vector<double> values(nodeCount, 0.0);
+    if (!fixedValues.empty()) {
+        for (std::size_t node = 0; node < nodeCount; ++node) {
+            if (fixedValues[node])
+                values[node] = *fixedValues[node];
+        }
     }
     std::vector<std::size_t> variable(nodeCount, std::numeric_limits<std::size_t>::max());
     std::size_t variables = 0;
@@ -839,18 +862,19 @@ std::vector<double> solveContinuous(
         const bool variableB = gauge[edge.b] == 0;
         if (variableA) {
             triplets.emplace_back(variable[edge.a], variable[edge.a], weight);
-            rhs[static_cast<Eigen::Index>(variable[edge.a])] -= weight * target;
+            rhs[static_cast<Eigen::Index>(variable[edge.a])] +=
+                weight * (values[edge.b] - target);
         }
         if (variableB) {
             triplets.emplace_back(variable[edge.b], variable[edge.b], weight);
-            rhs[static_cast<Eigen::Index>(variable[edge.b])] += weight * target;
+            rhs[static_cast<Eigen::Index>(variable[edge.b])] +=
+                weight * (values[edge.a] + target);
         }
         if (variableA && variableB) {
             triplets.emplace_back(variable[edge.a], variable[edge.b], -weight);
             triplets.emplace_back(variable[edge.b], variable[edge.a], -weight);
         }
     }
-    std::vector<double> values(nodeCount, 0.0);
     if (variables > 0) {
         matrix.setFromTriplets(triplets.begin(), triplets.end());
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
@@ -1198,6 +1222,19 @@ struct JointState {
     int winding = 0;
 };
 
+struct FixedJointStates {
+    std::vector<std::optional<JointState>> byNode;
+    std::vector<std::optional<int>> phaseSignByComponent;
+    std::vector<unsigned char> anchoredClassComponents;
+    std::vector<unsigned char> anchoredIntegerComponents;
+};
+
+struct InitialJointStates {
+    std::vector<JointState> byNode;
+    std::vector<int> phaseSignByComponent;
+    std::size_t defectGaugeComponents = 0;
+};
+
 JointClass jointClass(FiberTraceFixedOrientation orientation)
 {
     switch (orientation) {
@@ -1209,6 +1246,198 @@ JointClass jointClass(FiberTraceFixedOrientation orientation)
         return JointClass::B;
     }
     throw std::invalid_argument("Fixed winding orientation is invalid");
+}
+
+double classOffset(JointClass orientation, int sign, double phase);
+
+bool hardWindingSignCompatible(
+    const Edge& edge,
+    double predictedDelta,
+    const FiberTraceWindingBeliefPropagationConfig& config,
+    double measurementScale);
+
+bool hasFixedCalibration(const FiberTraceJointGridWindingConfig& config);
+
+FixedJointStates fixedJointStates(
+    const PreparedWinding& problem,
+    std::span<const FiberTraceFixedWindingState> fixedStates,
+    std::span<const JointClass> fixedOrientations)
+{
+    FixedJointStates result;
+    result.phaseSignByComponent.resize(problem.gaugeNodeByComponent.size());
+    result.anchoredClassComponents.assign(
+        problem.gaugeNodeByComponent.size(), 0);
+    result.anchoredIntegerComponents.assign(
+        problem.integerGaugeNodes.size(), 0);
+    if (fixedStates.empty())
+        return result;
+    result.byNode.resize(problem.piecesByNode.size());
+    if (fixedStates.size() != problem.pieceToNode.size()) {
+        throw std::invalid_argument(
+            "Fixed winding states do not match constraint pieces");
+    }
+    for (std::size_t piece = 0; piece < fixedStates.size(); ++piece) {
+        const auto& fixed = fixedStates[piece];
+        if (!fixed.fixed)
+            continue;
+        if (fixed.orientation == FiberTraceFixedOrientation::Mixed ||
+            (fixed.componentPhaseSign != -1 &&
+             fixed.componentPhaseSign != 1)) {
+            throw std::invalid_argument("Fixed winding state is invalid");
+        }
+        const JointState state{jointClass(fixed.orientation), fixed.winding};
+        const std::size_t node = problem.pieceToNode[piece];
+        if (!fixedOrientations.empty() &&
+            fixedOrientations[node] != state.orientation) {
+            throw std::invalid_argument(
+                "Fixed winding state disagrees with fixed orientation");
+        }
+        if (result.byNode[node] &&
+            (result.byNode[node]->orientation != state.orientation ||
+             result.byNode[node]->winding != state.winding)) {
+            throw std::invalid_argument(
+                "Constraint node has contradictory fixed winding states");
+        }
+        result.byNode[node] = state;
+        const std::size_t component = problem.componentByNode[node];
+        auto& sign = result.phaseSignByComponent[component];
+        if (sign && *sign != fixed.componentPhaseSign) {
+            throw std::invalid_argument(
+                "Constraint component has contradictory fixed phase signs");
+        }
+        sign = fixed.componentPhaseSign;
+        result.anchoredClassComponents[component] = 1;
+        result.anchoredIntegerComponents[
+            problem.integerGaugeByNode[node]] = 1;
+    }
+    return result;
+}
+
+InitialJointStates initialJointStates(
+    const PreparedWinding& problem,
+    std::span<const FiberTraceJointGridInitialState> initialStates,
+    std::span<const JointClass> fixedOrientations,
+    const FiberTraceJointGridWindingConfig& config)
+{
+    InitialJointStates result;
+    if (initialStates.empty())
+        return result;
+    if (initialStates.size() != problem.pieceToNode.size()) {
+        throw std::invalid_argument(
+            "Initial winding states do not match constraint pieces");
+    }
+    if (fixedOrientations.empty()) {
+        throw std::invalid_argument(
+            "Joint-grid MAP initialization currently requires fixed orientations");
+    }
+    if (!hasFixedCalibration(config) ||
+        std::abs(*config.fixedPhaseMagnitude - 0.5) > 1.0e-12) {
+        throw std::invalid_argument(
+            "Joint-grid MAP initialization requires fixed half-step phase");
+    }
+    result.byNode.assign(
+        problem.piecesByNode.size(), {JointClass::Mixed, 0});
+    std::vector<unsigned char> assigned(problem.piecesByNode.size(), 0);
+    result.phaseSignByComponent.assign(
+        problem.gaugeNodeByComponent.size(), 0);
+    for (std::size_t piece = 0; piece < initialStates.size(); ++piece) {
+        const auto& initial = initialStates[piece];
+        if ((initial.componentPhaseSign != -1 &&
+             initial.componentPhaseSign != 1) ||
+            (initial.active &&
+             initial.orientation == FiberTraceFixedOrientation::Mixed)) {
+            throw std::invalid_argument("Initial winding state is invalid");
+        }
+        const std::size_t node = problem.pieceToNode[piece];
+        const JointState state = initial.active
+            ? JointState{jointClass(initial.orientation), initial.winding}
+            : JointState{JointClass::Mixed, 0};
+        if (initial.active && fixedOrientations[node] != state.orientation) {
+            throw std::invalid_argument(
+                "Initial winding state disagrees with fixed orientation");
+        }
+        if (assigned[node] != 0 &&
+            (result.byNode[node].orientation != state.orientation ||
+             result.byNode[node].winding != state.winding)) {
+            throw std::invalid_argument(
+                "Constraint node has contradictory initial winding states");
+        }
+        result.byNode[node] = state;
+        assigned[node] = 1;
+        const std::size_t component = problem.componentByNode[node];
+        int& sign = result.phaseSignByComponent[component];
+        if (sign != 0 && sign != initial.componentPhaseSign) {
+            throw std::invalid_argument(
+                "Constraint component has contradictory initial phase signs");
+        }
+        sign = initial.componentPhaseSign;
+    }
+    if (std::find(assigned.begin(), assigned.end(), 0) != assigned.end() ||
+        std::find(
+            result.phaseSignByComponent.begin(),
+            result.phaseSignByComponent.end(), 0) !=
+            result.phaseSignByComponent.end()) {
+        throw std::invalid_argument("Initial winding state is incomplete");
+    }
+
+    for (std::size_t integerComponent = 0;
+         integerComponent < problem.integerGaugeNodes.size();
+         ++integerComponent) {
+        const std::size_t gaugeNode =
+            problem.integerGaugeNodes[integerComponent];
+        std::optional<int> offset;
+        if (result.byNode[gaugeNode].orientation != JointClass::Mixed)
+            offset = result.byNode[gaugeNode].winding;
+        if (!offset) {
+            ++result.defectGaugeComponents;
+            for (std::size_t node = 0; node < result.byNode.size(); ++node) {
+                if (problem.integerGaugeByNode[node] == integerComponent &&
+                    result.byNode[node].orientation != JointClass::Mixed) {
+                    offset = result.byNode[node].winding;
+                    break;
+                }
+            }
+        }
+        if (!offset)
+            offset = 0;
+        for (std::size_t node = 0; node < result.byNode.size(); ++node) {
+            if (problem.integerGaugeByNode[node] == integerComponent &&
+                result.byNode[node].orientation != JointClass::Mixed) {
+                result.byNode[node].winding -= *offset;
+            }
+        }
+    }
+    for (const auto& edge : problem.edges) {
+        const auto& a = result.byNode[edge.a];
+        const auto& b = result.byNode[edge.b];
+        const bool active = a.orientation != JointClass::Mixed &&
+            b.orientation != JointClass::Mixed;
+        if (config.enforceHardSplitContinuity &&
+            edge.containsHardContinuity && active &&
+            (a.orientation != b.orientation || a.winding != b.winding)) {
+            throw std::invalid_argument(
+                "Initial winding states violate hard continuity");
+        }
+        if (active) {
+            const std::size_t component = problem.componentByNode[edge.a];
+            const int sign = result.phaseSignByComponent[component];
+            const double predicted = static_cast<double>(
+                    b.winding - a.winding) +
+                classOffset(
+                    b.orientation, sign, *config.fixedPhaseMagnitude) -
+                classOffset(
+                    a.orientation, sign, *config.fixedPhaseMagnitude);
+            if (!hardWindingSignCompatible(
+                    edge,
+                    predicted,
+                    config,
+                    *config.fixedMeasurementScale)) {
+                throw std::invalid_argument(
+                    "Initial winding states violate a hard sign constraint");
+            }
+        }
+    }
+    return result;
 }
 
 std::vector<JointClass> fixedJointClasses(
@@ -1431,10 +1660,12 @@ std::size_t projectDecodedHardSigns(
     std::vector<JointState>& decoded,
     std::span<const double> activeConfidence,
     double measurementScale,
-    const PredictedDelta& predictedDelta)
+    const PredictedDelta& predictedDelta,
+    std::span<const std::optional<JointState>> fixedStates = {})
 {
     if (decoded.size() != problem.piecesByNode.size() ||
-        activeConfidence.size() != decoded.size()) {
+        activeConfidence.size() != decoded.size() ||
+        (!fixedStates.empty() && fixedStates.size() != decoded.size())) {
         throw std::logic_error("Winding hard-sign projection size mismatch");
     }
     std::vector<unsigned char> gauge(decoded.size(), 0);
@@ -1455,7 +1686,16 @@ std::size_t projectDecodedHardSigns(
             continue;
         }
         std::size_t disable = edge.b;
-        if (gauge[edge.a] != 0 && gauge[edge.b] == 0) {
+        const bool fixedA = !fixedStates.empty() && fixedStates[edge.a];
+        const bool fixedB = !fixedStates.empty() && fixedStates[edge.b];
+        if (fixedA && fixedB) {
+            throw std::runtime_error(
+                "Fixed winding states violate a hard sign constraint");
+        } else if (fixedA) {
+            disable = edge.b;
+        } else if (fixedB) {
+            disable = edge.a;
+        } else if (gauge[edge.a] != 0 && gauge[edge.b] == 0) {
             disable = edge.b;
         } else if (gauge[edge.b] != 0 && gauge[edge.a] == 0) {
             disable = edge.a;
@@ -1475,10 +1715,12 @@ std::size_t projectDecodedHardSigns(
 std::size_t projectDecodedHardContinuity(
     const PreparedWinding& problem,
     std::vector<JointState>& decoded,
-    std::span<const double> activeConfidence)
+    std::span<const double> activeConfidence,
+    std::span<const std::optional<JointState>> fixedStates = {})
 {
     if (decoded.size() != problem.piecesByNode.size() ||
-        activeConfidence.size() != decoded.size()) {
+        activeConfidence.size() != decoded.size() ||
+        (!fixedStates.empty() && fixedStates.size() != decoded.size())) {
         throw std::logic_error(
             "Winding hard-continuity projection size mismatch");
     }
@@ -1497,7 +1739,16 @@ std::size_t projectDecodedHardContinuity(
             continue;
         }
         std::size_t disable = edge.b;
-        if (gauge[edge.a] != 0 && gauge[edge.b] == 0) {
+        const bool fixedA = !fixedStates.empty() && fixedStates[edge.a];
+        const bool fixedB = !fixedStates.empty() && fixedStates[edge.b];
+        if (fixedA && fixedB) {
+            throw std::runtime_error(
+                "Fixed winding states violate hard continuity");
+        } else if (fixedA) {
+            disable = edge.b;
+        } else if (fixedB) {
+            disable = edge.a;
+        } else if (gauge[edge.a] != 0 && gauge[edge.b] == 0) {
             disable = edge.b;
         } else if (gauge[edge.b] != 0 && gauge[edge.a] == 0) {
             disable = edge.a;
@@ -2168,6 +2419,12 @@ struct GridRound {
     std::vector<int> upper;
     std::vector<unsigned char> gauge;
     std::vector<JointClass> fixedOrientations;
+    std::vector<std::optional<JointState>> fixedStates;
+    std::vector<std::optional<int>> fixedPhaseSigns;
+    std::vector<JointState> initialStates;
+    std::vector<int> initialPhaseSigns;
+    FiberTraceJointGridInitializationMode initializationMode =
+        FiberTraceJointGridInitializationMode::ConditionedMessages;
     std::vector<GridCalibrationCell> calibrationCells;
     GridCalibrationCell fixedCalibrationParameters;
     std::size_t iterations = 0;
@@ -2175,6 +2432,7 @@ struct GridRound {
     std::size_t supportChanges = 0;
     std::size_t totalStates = 0;
     std::size_t effectiveWorkers = 1;
+    std::size_t initialDefectGaugeComponents = 0;
     double residual = 0.0;
     double calibrationResidual = 0.0;
     double lowerBoundaryProbability = 0.0;
@@ -2264,8 +2522,11 @@ std::size_t gridPieceStateCount(
     const std::vector<int>& lower,
     const std::vector<int>& upper,
     const std::vector<unsigned char>& gauge,
-    std::span<const JointClass> fixedOrientations)
+    std::span<const JointClass> fixedOrientations,
+    std::span<const std::optional<JointState>> fixedStates)
 {
+    if (!fixedStates.empty() && fixedStates[node])
+        return 1;
     if (gauge[node] == 2 && fixedOrientations.empty())
         return 1;
     if (gauge[node] != 0)
@@ -2281,8 +2542,14 @@ JointState gridPieceState(
     std::size_t state,
     const std::vector<int>& lower,
     const std::vector<unsigned char>& gauge,
-    std::span<const JointClass> fixedOrientations)
+    std::span<const JointClass> fixedOrientations,
+    std::span<const std::optional<JointState>> fixedStates)
 {
+    if (!fixedStates.empty() && fixedStates[node]) {
+        if (state != 0)
+            throw std::out_of_range("Fixed joint-grid state is invalid");
+        return *fixedStates[node];
+    }
     if (gauge[node] != 0) {
         const std::size_t stateCount =
             gauge[node] == 2 && fixedOrientations.empty()
@@ -2339,6 +2606,54 @@ double gridOrientationEnergy(
     double result = 0.0;
     for (const auto& measurement : edge.measurements) {
         result += same ? measurement.perpendicular : measurement.parallel;
+    }
+    return result;
+}
+
+double gridDecodedEnergy(
+    const PreparedWinding& problem,
+    std::span<const JointState> decoded,
+    std::span<const int> phaseSigns,
+    std::span<const JointClass> fixedOrientations,
+    const GridCalibrationCell& calibration,
+    const FiberTraceJointGridWindingConfig& config)
+{
+    double result = 0.0;
+    const auto& incident = fixedOrientations.empty()
+        ? problem.incidentMeasurements
+        : problem.incidentWindingMeasurements;
+    for (std::size_t node = 0; node < decoded.size(); ++node) {
+        if (decoded[node].orientation == JointClass::Mixed &&
+            (fixedOrientations.empty() ||
+             fixedOrientations[node] != JointClass::Mixed)) {
+            result += config.mixedUnaryCost *
+                static_cast<double>(incident[node]);
+        }
+    }
+    for (const auto& edge : problem.edges) {
+        const auto& a = decoded[edge.a];
+        const auto& b = decoded[edge.b];
+        if (a.orientation == JointClass::Mixed ||
+            b.orientation == JointClass::Mixed) {
+            const bool exactlyOneDefect =
+                (a.orientation == JointClass::Mixed) !=
+                (b.orientation == JointClass::Mixed);
+            if (edge.containsHardContinuity && exactlyOneDefect)
+                result += config.pieceBreakCost;
+            continue;
+        }
+        if (fixedOrientations.empty()) {
+            result += gridOrientationEnergy(
+                edge, a.orientation, b.orientation);
+        }
+        result += gridWindingEnergy(
+            edge,
+            a,
+            b,
+            phaseSigns[problem.componentByNode[edge.a]],
+            calibration.gain,
+            calibration.phase,
+            config);
     }
     return result;
 }
@@ -2465,28 +2780,33 @@ std::size_t jointGridStateCount(
     const PreparedWinding& problem,
     const GridRound& round)
 {
-    std::size_t result = (round.fixedCalibration ? 0 : round.calibrationCells.size()) +
-        2 * problem.gaugeNodeByComponent.size();
+    std::size_t result =
+        round.fixedCalibration ? 0 : round.calibrationCells.size();
+    for (const auto& sign : round.fixedPhaseSigns)
+        result += sign ? 1 : 2;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node)
         result += gridPieceStateCount(
             node,
             round.lower,
             round.upper,
             round.gauge,
-            round.fixedOrientations);
+            round.fixedOrientations,
+            round.fixedStates);
     for (const auto& edge : problem.edges) {
         result += gridPieceStateCount(
             edge.a,
             round.lower,
             round.upper,
             round.gauge,
-            round.fixedOrientations);
+            round.fixedOrientations,
+            round.fixedStates);
         result += gridPieceStateCount(
             edge.b,
             round.lower,
             round.upper,
             round.gauge,
-            round.fixedOrientations);
+            round.fixedOrientations,
+            round.fixedStates);
         result += (round.fixedCalibration ? 0 : round.calibrationCells.size()) + 2;
     }
     return result;
@@ -2508,7 +2828,8 @@ void initializeGridMessages(
                 round.lower,
                 round.upper,
                 round.gauge,
-                round.fixedOrientations),
+                round.fixedOrientations,
+                round.fixedStates),
             0.0);
         message.toB.assign(
             gridPieceStateCount(
@@ -2516,10 +2837,85 @@ void initializeGridMessages(
                 round.lower,
                 round.upper,
                 round.gauge,
-                round.fixedOrientations),
+                round.fixedOrientations,
+                round.fixedStates),
             0.0);
         if (!round.fixedCalibration)
             message.toCalibration.assign(round.calibrationCells.size(), 0.0);
+    }
+}
+
+void initializeGridMessagesFromState(
+    const PreparedWinding& problem,
+    GridRound& round,
+    const FiberTraceJointGridWindingConfig& config)
+{
+    initializeGridMessages(problem, round);
+    if (round.initialStates.empty() ||
+        round.initializationMode ==
+            FiberTraceJointGridInitializationMode::SupportOnly)
+        return;
+    if (!round.fixedCalibration ||
+        round.initialStates.size() != problem.piecesByNode.size() ||
+        round.initialPhaseSigns.size() !=
+            problem.gaugeNodeByComponent.size()) {
+        throw std::logic_error("Joint-grid initialization is inconsistent");
+    }
+    const auto normalizeSign = [](std::array<double, 2>& values) {
+        const double normalization = logAddExp(values[0], values[1]);
+        if (!std::isfinite(normalization)) {
+            throw std::runtime_error(
+                "Joint-grid initial sign message has no finite state");
+        }
+        values[0] -= normalization;
+        values[1] -= normalization;
+    };
+    for (std::size_t edgeIndex = 0;
+         edgeIndex < problem.edges.size(); ++edgeIndex) {
+        const auto& edge = problem.edges[edgeIndex];
+        auto& message = round.messages[edgeIndex];
+        const JointState initialA = round.initialStates[edge.a];
+        const JointState initialB = round.initialStates[edge.b];
+        const int initialSign = round.initialPhaseSigns[
+            problem.componentByNode[edge.a]];
+        const auto& calibration = round.fixedCalibrationParameters;
+        for (std::size_t state = 0; state < message.toA.size(); ++state) {
+            message.toA[state] = gridLogPotential(
+                edge,
+                gridPieceState(
+                    edge.a, state, round.lower, round.gauge,
+                    round.fixedOrientations, round.fixedStates),
+                initialB,
+                initialSign,
+                calibration,
+                config,
+                round.fixedOrientations.empty());
+        }
+        for (std::size_t state = 0; state < message.toB.size(); ++state) {
+            message.toB[state] = gridLogPotential(
+                edge,
+                initialA,
+                gridPieceState(
+                    edge.b, state, round.lower, round.gauge,
+                    round.fixedOrientations, round.fixedStates),
+                initialSign,
+                calibration,
+                config,
+                round.fixedOrientations.empty());
+        }
+        for (std::size_t signState = 0; signState < 2; ++signState) {
+            message.toSign[signState] = gridLogPotential(
+                edge,
+                initialA,
+                initialB,
+                signState == 0 ? 1 : -1,
+                calibration,
+                config,
+                round.fixedOrientations.empty());
+        }
+        normalizeLogVector(message.toA);
+        normalizeLogVector(message.toB);
+        normalizeSign(message.toSign);
     }
 }
 
@@ -2540,7 +2936,8 @@ GridLogTotals buildGridTotals(
             round.lower,
             round.upper,
             round.gauge,
-            round.fixedOrientations);
+            round.fixedOrientations,
+            round.fixedStates);
         totals.pieceAccumulators[node].resize(stateCount);
         totals.pieceValues[node].resize(stateCount);
         for (std::size_t state = 0; state < stateCount; ++state) {
@@ -2549,7 +2946,8 @@ GridLogTotals buildGridTotals(
                 state,
                 round.lower,
                 round.gauge,
-                round.fixedOrientations);
+                round.fixedOrientations,
+                round.fixedStates);
             const bool chargeDefect =
                 decoded.orientation == JointClass::Mixed &&
                 (round.fixedOrientations.empty() ||
@@ -2590,6 +2988,18 @@ GridLogTotals buildGridTotals(
         const std::size_t component = problem.componentByNode[edge.a];
         addLogFactor(totals.signAccumulators[component][0], message.toSign[0]);
         addLogFactor(totals.signAccumulators[component][1], message.toSign[1]);
+    }
+    for (std::size_t component = 0;
+         component < round.fixedPhaseSigns.size();
+         ++component) {
+        if (!round.fixedPhaseSigns[component])
+            continue;
+        const std::size_t rejected = *round.fixedPhaseSigns[component] == 1
+            ? 1
+            : 0;
+        addLogFactor(
+            totals.signAccumulators[component][rejected],
+            -std::numeric_limits<double>::infinity());
     }
     for (std::size_t node = 0; node < totals.pieceValues.size(); ++node) {
         for (std::size_t state = 0;
@@ -2663,14 +3073,16 @@ double updateGridFactor(
             stateA,
             round.lower,
             round.gauge,
-            round.fixedOrientations);
+            round.fixedOrientations,
+            round.fixedStates);
         for (std::size_t stateB = 0; stateB < cavityB.size(); ++stateB) {
             const auto b = gridPieceState(
                 edge.b,
                 stateB,
                 round.lower,
                 round.gauge,
-                round.fixedOrientations);
+                round.fixedOrientations,
+                round.fixedStates);
             const std::size_t calibrationCount = round.fixedCalibration
                 ? 1
                 : cavityCalibration.size();
@@ -2766,6 +3178,8 @@ void remapPieceMessages(
     int oldLower,
     int oldUpper)
 {
+    if (!round.fixedStates.empty() && round.fixedStates[node])
+        return;
     const int newLower = round.lower[node];
     const int newUpper = round.upper[node];
     if (oldLower == newLower && oldUpper == newUpper)
@@ -2822,7 +3236,8 @@ bool ensureIntegerSupport(
     }
     bool changed = false;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
-        if (round.gauge[node] != 0)
+        if (round.gauge[node] != 0 ||
+            (!round.fixedStates.empty() && round.fixedStates[node]))
             continue;
         if (jointActiveOrientationCount(node, round.fixedOrientations) == 0)
             continue;
@@ -2853,7 +3268,8 @@ bool adjustIntegerSupport(
 {
     bool changed = false;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
-        if (round.gauge[node] != 0)
+        if (round.gauge[node] != 0 ||
+            (!round.fixedStates.empty() && round.fixedStates[node]))
             continue;
         const auto& probabilities = round.pieceProbabilities[node];
         const std::size_t orientationCount = jointActiveOrientationCount(
@@ -2882,7 +3298,8 @@ bool adjustIntegerSupport(
                     state,
                     round.lower,
                     round.gauge,
-                    round.fixedOrientations).winding);
+                    round.fixedOrientations,
+                    round.fixedStates).winding);
         }
         if (!(activeProbability > 0.0))
             continue;
@@ -3079,6 +3496,9 @@ GridRound solveJointGridRound(
     const PreparedWinding& problem,
     std::span<const double> continuousNodes,
     std::span<const JointClass> fixedOrientations,
+    const FixedJointStates& fixedStates,
+    const InitialJointStates& initialStates,
+    FiberTraceJointGridInitializationMode initializationMode,
     const FiberTraceJointGridWindingConfig& config,
     const FiberTraceJointGridProgressCallback& progress,
     const std::chrono::steady_clock::time_point& started)
@@ -3086,16 +3506,31 @@ GridRound solveJointGridRound(
     GridRound round;
     round.fixedOrientations.assign(
         fixedOrientations.begin(), fixedOrientations.end());
+    round.fixedStates = fixedStates.byNode;
+    round.fixedPhaseSigns = fixedStates.phaseSignByComponent;
+    round.initialStates = initialStates.byNode;
+    round.initialPhaseSigns = initialStates.phaseSignByComponent;
+    round.initializationMode = initializationMode;
+    round.initialDefectGaugeComponents =
+        initialStates.defectGaugeComponents;
     round.fixedCalibration = hasFixedCalibration(config);
     if (round.fixedCalibration)
         round.fixedMeasurementScale = *config.fixedMeasurementScale;
     round.gauge.assign(problem.piecesByNode.size(), 0);
     round.lower.assign(problem.piecesByNode.size(), 0);
     round.upper.assign(problem.piecesByNode.size(), 0);
-    for (const std::size_t node : problem.integerGaugeNodes)
-        round.gauge[node] = 1;
-    for (const std::size_t node : problem.gaugeNodeByComponent)
-        round.gauge[node] = 2;
+    for (const std::size_t node : problem.integerGaugeNodes) {
+        if (fixedStates.anchoredIntegerComponents[
+                problem.integerGaugeByNode[node]] == 0) {
+            round.gauge[node] = 1;
+        }
+    }
+    for (const std::size_t node : problem.gaugeNodeByComponent) {
+        if (fixedStates.anchoredClassComponents[
+                problem.componentByNode[node]] == 0) {
+            round.gauge[node] = 2;
+        }
+    }
     if (round.fixedCalibration) {
         round.fixedCalibrationParameters = fixedCalibrationCell(config);
     } else {
@@ -3103,6 +3538,11 @@ GridRound solveJointGridRound(
         round.calibrationCells = makeCalibrationCells(-halfGain, halfGain, config);
     }
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
+        if (!round.fixedStates.empty() && round.fixedStates[node]) {
+            round.lower[node] = round.fixedStates[node]->winding;
+            round.upper[node] = round.fixedStates[node]->winding;
+            continue;
+        }
         if (round.gauge[node] != 0)
             continue;
         double low = std::numeric_limits<double>::infinity();
@@ -3116,8 +3556,15 @@ GridRound solveJointGridRound(
         }
         round.lower[node] = static_cast<int>(std::floor(low)) - 1;
         round.upper[node] = static_cast<int>(std::ceil(high)) + 1;
+        if (!round.initialStates.empty() &&
+            round.initialStates[node].orientation != JointClass::Mixed) {
+            round.lower[node] = std::min(
+                round.lower[node], round.initialStates[node].winding);
+            round.upper[node] = std::max(
+                round.upper[node], round.initialStates[node].winding);
+        }
     }
-    initializeGridMessages(problem, round);
+    initializeGridMessagesFromState(problem, round, config);
     round.totalStates = jointGridStateCount(problem, round);
     if (round.totalStates > config.maximumTotalCandidateStates) {
         throw std::runtime_error(
@@ -3288,6 +3735,13 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
     report.messageConverged = round.converged;
     report.effectiveWorkers = round.effectiveWorkers;
     report.totalCandidateStates = round.totalStates;
+    report.initializedFromState = !round.initialStates.empty();
+    report.conditionedMessageInitialization =
+        report.initializedFromState &&
+        round.initializationMode ==
+            FiberTraceJointGridInitializationMode::ConditionedMessages;
+    report.initialDefectGaugeComponents =
+        round.initialDefectGaugeComponents;
     report.calibrationGridCells = round.fixedCalibration
         ? 1
         : round.calibrationCells.size();
@@ -3395,7 +3849,12 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
             probabilities.begin(),
             std::max_element(probabilities.begin(), probabilities.end())));
         auto mapState = gridPieceState(
-            node, map, round.lower, round.gauge, round.fixedOrientations);
+            node,
+            map,
+            round.lower,
+            round.gauge,
+            round.fixedOrientations,
+            round.fixedStates);
         double meanWinding = 0.0;
         double activeProbability = 0.0;
         double entropy = 0.0;
@@ -3408,7 +3867,8 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 state,
                 round.lower,
                 round.gauge,
-                round.fixedOrientations);
+                round.fixedOrientations,
+                round.fixedStates);
             const double probability = probabilities[state];
             if (current.orientation != JointClass::Mixed) {
                 activeProbability += probability;
@@ -3445,7 +3905,8 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 state,
                 round.lower,
                 round.gauge,
-                round.fixedOrientations);
+                round.fixedOrientations,
+                round.fixedStates);
             if (current.orientation == finalClass &&
                 probabilities[state] > finalStateProbability) {
                 finalStateProbability = probabilities[state];
@@ -3493,16 +3954,20 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         decoded,
         activeConfidence,
         1.0 / selectedCalibration.gain,
-        predictedDelta);
+        predictedDelta,
+        round.fixedStates);
     if (config.enforceHardSplitContinuity) {
-        projectDecodedHardContinuity(prepared, decoded, activeConfidence);
+        projectDecodedHardContinuity(
+            prepared, decoded, activeConfidence, round.fixedStates);
         report.hardSignProjectedDefects += projectDecodedHardSigns(
             prepared,
             decoded,
             activeConfidence,
             1.0 / selectedCalibration.gain,
-            predictedDelta);
-        projectDecodedHardContinuity(prepared, decoded, activeConfidence);
+            predictedDelta,
+            round.fixedStates);
+        projectDecodedHardContinuity(
+            prepared, decoded, activeConfidence, round.fixedStates);
     }
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
@@ -5158,6 +5623,147 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     return result;
 }
 
+std::vector<FiberTraceReferenceClampedFactorConflict>
+diagnoseFiberTraceReferenceClampedConflicts(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    const FiberTraceReferenceWindingBenchmark& calibration)
+{
+    if (calibration.globalSign != -1 && calibration.globalSign != 1) {
+        throw std::invalid_argument(
+            "Reference conflict calibration sign is invalid");
+    }
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : calibration.gauges) {
+        if (!std::isfinite(gauge.offset) ||
+            !offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
+            throw std::invalid_argument(
+                "Reference conflict gauge calibration is invalid");
+        }
+    }
+
+    std::vector<FiberTraceReferenceClampedFactorConflict> result;
+    result.reserve(2 * observations.size());
+    const auto append = [&](
+                            const FiberTraceReferenceWindingObservation& observation,
+                            FiberTraceReferenceBenchmarkClass factorClass,
+                            bool hardViolation,
+                            double predictedDelta,
+                            double targetDelta,
+                            double residual,
+                            double effectiveWeight,
+                            double weightedLoss) {
+        if (!std::isfinite(predictedDelta) ||
+            !std::isfinite(targetDelta) ||
+            !std::isfinite(residual) || residual < 0.0 ||
+            !std::isfinite(effectiveWeight) || effectiveWeight < 0.0 ||
+            !std::isfinite(weightedLoss) || weightedLoss < 0.0) {
+            throw std::logic_error(
+                "Reference conflict factor diagnostic is invalid");
+        }
+        result.push_back({
+            observation.referenceSource,
+            observation.bpPiece,
+            observation.constraintIndex,
+            factorClass,
+            hardViolation,
+            predictedDelta,
+            targetDelta,
+            residual,
+            effectiveWeight,
+            weightedLoss,
+        });
+    };
+
+    for (const auto& observation : observations) {
+        validateReferenceObservation(observation);
+        if (!observation.bpEndpointActive)
+            continue;
+        const auto offset = offsetByGauge.find(observation.integerGauge);
+        if (offset == offsetByGauge.end())
+            continue;
+        const double fixedReferenceLatent =
+            static_cast<double>(calibration.globalSign) *
+                observation.virtualReferenceWinding +
+            offset->second;
+        const double delta = observation.referenceDeltaSign *
+            (fixedReferenceLatent - observation.bpLatentCoordinate);
+        const double perpendicularDelta =
+            delta / observation.coordinateResidualScale;
+
+        if (observation.perpendicularMagnitudePresent &&
+            observation.perpendicularCoefficient > 0.0) {
+            const double residual = std::abs(
+                perpendicularDelta -
+                *observation.signedPerpendicularTarget);
+            append(
+                observation,
+                FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude,
+                false,
+                perpendicularDelta,
+                *observation.signedPerpendicularTarget,
+                residual,
+                observation.perpendicularCoefficient,
+                observation.perpendicularCoefficient * residual);
+        }
+        if (observation.perpendicularSignPresent &&
+            (observation.hardPerpendicularSign ||
+             observation.perpendicularSignPenalty > 0.0)) {
+            const bool violation =
+                *observation.signedPerpendicularTarget *
+                    perpendicularDelta <= 0.0;
+            append(
+                observation,
+                FiberTraceReferenceBenchmarkClass::PerpendicularSign,
+                observation.hardPerpendicularSign && violation,
+                perpendicularDelta,
+                *observation.signedPerpendicularTarget,
+                violation ? 1.0 : 0.0,
+                observation.perpendicularSignPenalty,
+                violation ? observation.perpendicularSignPenalty : 0.0);
+        }
+        if (observation.parallelMagnitudePresent &&
+            observation.admittedParallelCoefficient > 0.0) {
+            const double residual = std::abs(
+                observation.signedParallelTarget
+                    ? delta - *observation.signedParallelTarget
+                    : std::abs(delta) - observation.parallelDistance);
+            const double predicted = observation.signedParallelTarget
+                ? delta
+                : std::abs(delta);
+            const double target = observation.signedParallelTarget
+                ? *observation.signedParallelTarget
+                : observation.parallelDistance;
+            append(
+                observation,
+                observation.parallelDistance == 0.0
+                    ? FiberTraceReferenceBenchmarkClass::ParallelSameMagnitude
+                    : FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude,
+                false,
+                predicted,
+                target,
+                residual,
+                observation.admittedParallelCoefficient,
+                observation.admittedParallelCoefficient * residual);
+        }
+        if (observation.parallelSignPresent &&
+            (observation.hardParallelSign ||
+             observation.parallelSignPenalty > 0.0)) {
+            const bool violation =
+                *observation.signedParallelTarget * delta <= 0.0;
+            append(
+                observation,
+                FiberTraceReferenceBenchmarkClass::ParallelSign,
+                observation.hardParallelSign && violation,
+                delta,
+                *observation.signedParallelTarget,
+                violation ? 1.0 : 0.0,
+                observation.parallelSignPenalty,
+                violation ? observation.parallelSignPenalty : 0.0);
+        }
+    }
+    return result;
+}
+
 FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
     const FiberTraceConstraint& constraint, bool referenceIsEndpointA, double virtualReferenceWinding, std::size_t bpPiece, const FiberTraceInterleavedWindingReport& winding,
     const FiberTraceWindingBeliefPropagationConfig& config)
@@ -5176,6 +5782,7 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
     validateConfig(config);
 
     FiberTraceReferenceWindingObservation observation;
+    observation.bpPiece = bpPiece;
     observation.integerGauge = winding.integerGaugeByPiece[bpPiece];
     observation.bpEndpointOrientation =
         winding.mapOrientationByPiece[bpPiece];
@@ -5831,7 +6438,10 @@ solveFiberTraceJointGridWindingBeliefPropagation(
     const FiberTraceBeliefTopology& topology,
     const FiberTraceJointGridWindingConfig& config,
     const FiberTraceJointGridProgressCallback& progress,
-    std::span<const FiberTraceFixedOrientation> fixedOrientations)
+    std::span<const FiberTraceFixedOrientation> fixedOrientations,
+    std::span<const FiberTraceFixedWindingState> fixedStates,
+    std::span<const FiberTraceJointGridInitialState> initialStates,
+    FiberTraceJointGridInitializationMode initializationMode)
 {
     const auto started = std::chrono::steady_clock::now();
     validateJointGridConfig(config);
@@ -5845,9 +6455,77 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         fixedClasses,
         true,
         preparationScale);
+    if (!fixedStates.empty() && !hasFixedCalibration(config)) {
+        throw std::invalid_argument(
+            "Fixed winding states require fixed phase and scale");
+    }
+    const auto exactStates = fixedJointStates(
+        prepared, fixedStates, fixedClasses);
+    if (!initialStates.empty() && !exactStates.byNode.empty()) {
+        throw std::invalid_argument(
+            "Fixed and initial winding states cannot be combined");
+    }
+    if (!initialStates.empty() && !hasFixedCalibration(config)) {
+        throw std::invalid_argument(
+            "Initial winding states require fixed phase and scale");
+    }
+    const auto initial = initialJointStates(
+        prepared, initialStates, fixedClasses, config);
+    if (!exactStates.byNode.empty()) {
+        for (const auto& edge : prepared.edges) {
+            if (!exactStates.byNode[edge.a] ||
+                !exactStates.byNode[edge.b]) {
+                continue;
+            }
+            const auto& a = *exactStates.byNode[edge.a];
+            const auto& b = *exactStates.byNode[edge.b];
+            if (!hardContinuityCompatible(
+                    edge, a, b, config.enforceHardSplitContinuity)) {
+                throw std::runtime_error(
+                    "Fixed winding states violate hard continuity");
+            }
+            const std::size_t component = prepared.componentByNode[edge.a];
+            const int sign = *exactStates.phaseSignByComponent[component];
+            const double predicted = static_cast<double>(
+                    b.winding - a.winding) +
+                classOffset(
+                    b.orientation,
+                    sign,
+                    *config.fixedPhaseMagnitude) -
+                classOffset(
+                    a.orientation,
+                    sign,
+                    *config.fixedPhaseMagnitude);
+            if (!hardWindingSignCompatible(
+                    edge,
+                    predicted,
+                    config,
+                    *config.fixedMeasurementScale)) {
+                throw std::runtime_error(
+                    "Fixed winding states violate a hard sign constraint");
+            }
+        }
+    }
+    std::vector<std::optional<double>> fixedContinuous;
+    if (!exactStates.byNode.empty()) {
+        fixedContinuous.resize(prepared.piecesByNode.size());
+        for (std::size_t node = 0; node < exactStates.byNode.size(); ++node) {
+            if (!exactStates.byNode[node])
+                continue;
+            const auto& state = *exactStates.byNode[node];
+            const int sign = *exactStates.phaseSignByComponent.at(
+                prepared.componentByNode[node]);
+            fixedContinuous[node] = static_cast<double>(state.winding) +
+                classOffset(
+                    state.orientation,
+                    sign,
+                    *config.fixedPhaseMagnitude);
+        }
+    }
     const auto continuousStarted = std::chrono::steady_clock::now();
     double continuousResidual = 0.0;
-    const auto continuousNodes = solveContinuous(prepared, continuousResidual);
+    const auto continuousNodes = solveContinuous(
+        prepared, continuousResidual, fixedContinuous);
     const double continuousSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - continuousStarted).count();
     const auto discreteStarted = std::chrono::steady_clock::now();
@@ -5855,12 +6533,15 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         prepared,
         continuousNodes,
         fixedClasses,
+        exactStates,
+        initial,
+        initializationMode,
         config,
         progress,
         started);
     const double discreteSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - discreteStarted).count();
-    return makeJointGridReport(
+    auto report = makeJointGridReport(
         prepared,
         constraints,
         continuousNodes,
@@ -5869,6 +6550,16 @@ solveFiberTraceJointGridWindingBeliefPropagation(
         discreteSeconds,
         round,
         config);
+    if (!initial.byNode.empty()) {
+        report.initialStateDecodedEnergy = gridDecodedEnergy(
+            prepared,
+            initial.byNode,
+            initial.phaseSignByComponent,
+            fixedClasses,
+            fixedCalibrationCell(config),
+            config);
+    }
+    return report;
 }
 
 FiberTraceWindingBeliefPropagationReport solveFiberTraceWindingBeliefPropagation(

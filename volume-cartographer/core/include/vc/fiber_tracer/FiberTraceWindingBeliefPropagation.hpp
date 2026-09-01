@@ -64,6 +64,27 @@ enum class FiberTraceFixedOrientation : unsigned char {
     Vertical,
 };
 
+struct FiberTraceFixedWindingState {
+    bool fixed = false;
+    FiberTraceFixedOrientation orientation =
+        FiberTraceFixedOrientation::Horizontal;
+    int winding = 0;
+    int componentPhaseSign = 1;
+};
+
+struct FiberTraceJointGridInitialState {
+    bool active = false;
+    FiberTraceFixedOrientation orientation =
+        FiberTraceFixedOrientation::Horizontal;
+    int winding = 0;
+    int componentPhaseSign = 1;
+};
+
+enum class FiberTraceJointGridInitializationMode : unsigned char {
+    SupportOnly,
+    ConditionedMessages,
+};
+
 struct FiberTraceFinalStateCounts {
     std::size_t pieces = 0;
     std::size_t horizontal = 0;
@@ -454,12 +475,17 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     double minimumCalibrationGain = 1.0;
     double maximumCalibrationGain = 1.0;
     double decodedEnergy = 0.0;
+    double initialStateDecodedEnergy =
+        std::numeric_limits<double>::quiet_NaN();
     std::size_t calibrationGridCells = 0;
     std::size_t calibrationGridShifts = 0;
     std::size_t calibrationIterations = 0;
     std::size_t hardSignProjectedDefects = 0;
+    std::size_t initialDefectGaugeComponents = 0;
     std::size_t selectedInitialization = 0;
     std::size_t rankDeficientUpdates = 0;
+    bool initializedFromState = false;
+    bool conditionedMessageInitialization = false;
     bool calibrationConverged = false;
 };
 
@@ -522,6 +548,8 @@ struct FiberTraceReferenceWindingObservation {
         FiberTraceFixedOrientation::Mixed;
     std::size_t bpOrientationComponent = 0;
     bool bpEndpointActive = false;
+    std::size_t bpPiece = 0;
+    std::size_t constraintIndex = 0;
 };
 
 struct FiberTraceReferenceBenchmarkCounts {
@@ -537,6 +565,20 @@ enum class FiberTraceReferenceBenchmarkClass : unsigned char {
     ParallelOtherMagnitude,
     ParallelSign,
     Count,
+};
+
+struct FiberTraceReferenceClampedFactorConflict {
+    std::size_t referenceSource = 0;
+    std::size_t bpPiece = 0;
+    std::size_t constraintIndex = 0;
+    FiberTraceReferenceBenchmarkClass factorClass =
+        FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude;
+    bool hardViolation = false;
+    double predictedDelta = 0.0;
+    double targetDelta = 0.0;
+    double residual = 0.0;
+    double effectiveWeight = 0.0;
+    double weightedLoss = 0.0;
 };
 
 [[nodiscard]] const char* fiberTraceReferenceBenchmarkClassName(
@@ -751,6 +793,11 @@ struct FiberTraceReferenceSourceConstraintGroups {
 [[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
     std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);
 
+[[nodiscard]] std::vector<FiberTraceReferenceClampedFactorConflict>
+diagnoseFiberTraceReferenceClampedConflicts(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    const FiberTraceReferenceWindingBenchmark& calibration);
+
 [[nodiscard]] std::vector<FiberTraceReferenceRawWindingEstimate>
 inferFiberTraceReferenceRawWindings(
     std::span<const FiberTraceReferenceWindingObservation> observations);
@@ -781,6 +828,10 @@ solveFiberTraceJointGridWindingBeliefPropagation(
     const FiberTraceBeliefTopology& topology,
     const FiberTraceJointGridWindingConfig& config = {},
     const FiberTraceJointGridProgressCallback& progress = {},
-    std::span<const FiberTraceFixedOrientation> fixedOrientations = {});
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
+    std::span<const FiberTraceFixedWindingState> fixedStates = {},
+    std::span<const FiberTraceJointGridInitialState> initialStates = {},
+    FiberTraceJointGridInitializationMode initializationMode =
+        FiberTraceJointGridInitializationMode::ConditionedMessages);
 
 }  // namespace vc::fiber_tracer
