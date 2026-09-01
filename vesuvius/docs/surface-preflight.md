@@ -18,7 +18,9 @@ For an OME-Zarr with a nonstandard hierarchy, `--array-key` may explicitly
 select its base-resolution array. Non-base arrays are rejected because TIFXYZ
 coordinates are expressed in base-resolution voxel space. By default the
 command selects the first dataset declared by OME-Zarr `multiscales`, then
-falls back to array `0` or the only array in the group.
+falls back to array `0` or the only array in the group. A volume path that
+selects a concrete array inside a `.zarr` group is resolved through that group
+and must select its base dataset. Standalone single-array stores remain valid.
 
 The command checks:
 

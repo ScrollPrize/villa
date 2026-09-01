@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import tifffile
@@ -207,6 +208,73 @@ def test_resolve_volume_array_prefers_multiscale_level_zero() -> None:
 
     assert array is expected
     assert key == "level0"
+
+
+def test_open_volume_accepts_direct_base_array_path(monkeypatch) -> None:
+    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+
+    class FakeGroup(dict):
+        attrs = {"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}]}]}
+
+        def array_keys(self):
+            return self.keys()
+
+    class FakeZarr:
+        @staticmethod
+        def open(store, mode):
+            assert store == "/volume.zarr"
+            assert mode == "r"
+            return FakeGroup({"0": expected, "1": expected})
+
+    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
+
+    array, key = surface_preflight._open_volume("/volume.zarr/0", None)
+
+    assert array is expected
+    assert key == "0"
+
+
+def test_open_volume_rejects_direct_non_base_array_path(monkeypatch) -> None:
+    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+
+    class FakeGroup(dict):
+        attrs = {"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}]}]}
+
+        def array_keys(self):
+            return self.keys()
+
+    class FakeZarr:
+        @staticmethod
+        def open(store, mode):
+            assert store == "/volume.zarr"
+            assert mode == "r"
+            return FakeGroup({"0": expected, "1": expected})
+
+    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "must select the base-resolution array.*expected '0', got '1'",
+    ):
+        surface_preflight._open_volume("/volume.zarr/1", None)
+
+
+def test_open_volume_preserves_standalone_array_store(monkeypatch) -> None:
+    expected = FakeVolume(np.ones((2, 2, 2), dtype=np.uint8))
+
+    class FakeZarr:
+        @staticmethod
+        def open(store, mode):
+            assert store == "/standalone.zarr"
+            assert mode == "r"
+            return expected
+
+    monkeypatch.setitem(sys.modules, "zarr", FakeZarr)
+
+    array, key = surface_preflight._open_volume("/standalone.zarr", None)
+
+    assert array is expected
+    assert key == ""
 
 
 def test_resolve_volume_array_accepts_explicit_base_key() -> None:

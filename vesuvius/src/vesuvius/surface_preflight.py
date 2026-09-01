@@ -168,15 +168,26 @@ def _open_volume(volume: str, array_key: str | None) -> tuple[Any, str]:
     except ImportError as exc:  # pragma: no cover - package dependency invariant
         raise RuntimeError("surface preflight requires zarr") from exc
 
-    store: Any = volume
-    if "://" in volume and not volume.startswith("file://"):
+    store_volume = volume.rstrip("/")
+    direct_key = None
+    if ".zarr/" in store_volume:
+        store_root, direct_key = store_volume.rsplit(".zarr/", 1)
+        store_volume = f"{store_root}.zarr"
+    if direct_key and array_key:
+        raise ValueError(
+            "--array-key cannot be combined with a --volume path that already "
+            "selects a Zarr array"
+        )
+
+    store: Any = store_volume
+    if "://" in store_volume and not store_volume.startswith("file://"):
         import fsspec
 
-        store = fsspec.get_mapper(volume)
-    elif volume.startswith("file://"):
-        store = volume.removeprefix("file://")
+        store = fsspec.get_mapper(store_volume)
+    elif store_volume.startswith("file://"):
+        store = store_volume.removeprefix("file://")
     opened = zarr.open(store, mode="r")
-    return _resolve_volume_array(opened, array_key)
+    return _resolve_volume_array(opened, direct_key or array_key)
 
 
 def _iter_blocks(height: int, block_rows: int) -> Iterable[tuple[int, int]]:
