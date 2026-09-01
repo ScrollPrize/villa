@@ -376,28 +376,3 @@ the same source against an older sysroot solves it completely:
   container.
 
 This is packaging guidance, not part of the patches.
-
----
-
-## What is deliberately *not* here
-
-Several other avenues were measured and did not earn a place. Recording them so
-nobody spends the time again:
-
-* **GPU render prototype.** The sampling kernel is genuinely 16.5–24.6 G
-  samples/s against 19.4 M/s for a whole 32-core box, and end-to-end 8.3–14.2x
-  in-process. But rendering turned out to be an I/O job wearing a compute job's
-  clothes: on an idle dual-GPU box with the volume over 1 GbE, a render took
-  470.98 s of which **458.52 s (97.4%) was disk read**, while the sampling
-  kernel itself took 0.09 s. The right move is to integrate the kernel inside
-  the existing band loop, not to ship a separate renderer — and the scheduling
-  lesson ("run the render where the volume is on local disk", not "on whichever
-  box is idle") matters more than the kernel.
-* **A morphological dilate in the growth inner loop.** Amdahl ceiling of
-  1.00002x, confirmed by three independent instruments.
-* **Enabling the `SURFACE_SDT` residual.** Changing its weight by 1000x moved
-  the resulting area by 0.06%.
-* **Passing the surface prediction as the growth volume instead of raw CT.**
-  −1.9% area, no other benefit.
-* **Coarse-to-fine growth.** −26% throughput, −38% area, and wrong-winding
-  failures.
