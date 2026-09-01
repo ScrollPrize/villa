@@ -5636,6 +5636,26 @@
   `correct + false = total = displayed row count`. This output is diagnostic
   only and must not change main constraints, BP, or published labels.
 - Each calibrated reference/reference table set must be preceded by a separate
+  unweighted `reference raw signed step distributions` table. Every signed row
+  is grouped by its dominant perpendicular/parallel hypothesis, source and
+  target H/V class under the selected reference phase gauge, and virtual
+  separation. Opposite-parity bands are `0.5`, `1.5`, and `2.5+`; same-parity
+  bands are `1`, `2`, and `3+`. Each nonempty group reports count, raw signed
+  minimum, mean, median, and maximum. This table must not use solver admission
+  or effective weights and must not canonicalize the measurements.
+- The raw distribution must be followed by `reference constraint phase
+  calibration`. It uses every signed, dominant perpendicular, opposite-parity
+  reference row with unit weight and enumerates winding direction plus the
+  even-reference H/V assignment. For source index `i`, parity `p=i mod 2`,
+  direction `d`, and phase `phi`, the two gauges are
+  `d*(floor(i/2)+p*phi)` and `d*(ceil(i/2)-p*phi)`. At the run's fixed positive
+  measurement scale it minimizes
+  `sum(abs(predicted_delta/scale-raw_signed_delta))` exactly over `[0,0.5]` by
+  testing all L1 breakpoints and both bounds. Sign penalties and all production
+  factor weights are excluded. Same-parity perpendicular and both parallel
+  parity classes are counted but do not identify phase. This diagnostic must
+  not change solver calibration, state, or artifacts.
+- Each calibrated reference/reference table set must be preceded by a separate
   `reference constraint measurement-scale calibration` table. It must use the
   matching BP benchmark global sign and the exact effective magnitude weights
   produced by the shared winding-factor preparation path: dominant hypothesis,

@@ -26,6 +26,9 @@
   available through `--winding-adaptive-calibration`.
 - Added per-reference inferred half-step parity checks and component-gauged H/V
   endpoint consistency diagnostics for active reference-to-BP constraints.
+- Added unweighted directional raw-step distributions and a four-gauge
+  reference-only phase fit, exposing H-to-V versus V-to-H asymmetry without
+  reusing production solver weights.
 
 # 2026-08-31: weighted reference winding diagnostics
 

@@ -1,21 +1,19 @@
-# Task: retune hard continuation and alignment falloff
+# Task: reference calibration of winding phase
 
-Keep edge-local hard split continuity and retune the winding solver around it.
+Test whether the perpendicular-constraint problem comes from the fixed winding
+phase. In the proposed physical model, H and V on the same sheet have zero
+latent separation, while the transition from V on one sheet to H on the next
+has separation one. This corresponds to phase zero rather than the current
+fixed phase `0.5`.
 
-Compare the three normal-alignment confidence families (`none`, `linear`, and
-`cosine`) only after independently refining each family's decision-confidence
-mode, class weights, finite sign cost, Defect cost, and BP
-temperature to a local optimum. Do not compare an untuned falloff variant with
-parameters selected for another variant.
+Fit phase from the ordered tagged reference fibers and report how relevant it
+is. The reference H/V mapping and winding direction are ambiguous, so enumerate
+both choices for each. This is a reference-only diagnostic; do not change the
+production phase default from this experiment alone.
 
-Hard continuation and both hard sign classes at a fixed 30-degree alignment
-threshold are mandatory in every scenario. Disabled hard signs and alternative
-thresholds are outside the valid search space.
-
-Use only the 1024 crop for this tuning pass. Defer the overlapping 2048
-larger-context validation until explicitly requested. Report
-convergence, exact reference windings, reference-constraint accuracy,
-active/Defect counts, continuation and aggregate infringement, solve time, and
-total wall time. Do not promote a new default until the tuned comparison is
-available. Do not reward a setting merely for disabling difficult reference
-constraints.
+Do not collapse the two alternating perpendicular transitions into one opaque
+fit. Report direct, unweighted raw-step statistics separately for H-to-V and
+V-to-H transitions, split by nominal reference separation 0.5, 1.5, and 2.5+
+windings. Report the corresponding H-to-H and V-to-V parallel statistics at
+integer separations 1, 2, and 3+. These measurements, not solver-weight sweeps,
+are the primary result.

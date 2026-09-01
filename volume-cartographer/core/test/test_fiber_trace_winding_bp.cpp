@@ -1044,6 +1044,125 @@ TEST_CASE("Reference constraint scale calibration minimizes weighted solver L1")
         std::invalid_argument);
 }
 
+TEST_CASE("Reference phase calibration fits the alternating physical ladder")
+{
+    FiberTraceReferenceConstraintDiagnosticReport reference;
+    reference.rows = {
+        {0, 0, 1, true, true, 0.2, -9.0, 0.5, 0.5},
+        {1, 1, 2, true, true, 0.8, -9.0, 0.5, 0.5},
+        {2, 0, 3, true, true, 1.2, -9.0, 1.5, 1.5},
+        {3, 0, 2, true, true, 1.0, -9.0, 1.0, 1.0},
+        {4, 0, 2, false, true, 1.0, -9.0, 1.0, 1.0},
+        {5, 0, 1, false, true, 0.2, -9.0, 0.0, 0.5},
+    };
+    const auto calibrated = calibrateFiberTraceReferenceConstraintPhase(
+        reference, 1.0);
+    REQUIRE(calibrated.selectedGauge.has_value());
+    const auto& selected = calibrated.gauges[*calibrated.selectedGauge];
+    CHECK(selected.windingDirection == 1);
+    CHECK(selected.evenReferenceIsHorizontal);
+    REQUIRE(selected.fittedPhase.has_value());
+    CHECK(*selected.fittedPhase == doctest::Approx(0.2));
+    CHECK(selected.fittedLoss == doctest::Approx(0.0));
+    CHECK(selected.lossAtZero == doctest::Approx(0.6));
+    CHECK(selected.lossAtHalf == doctest::Approx(0.9));
+    CHECK(selected.totalRows == 6);
+    CHECK(selected.identifyingRows == 3);
+    CHECK(selected.usedRows == 3);
+    CHECK(selected.perpendicularSameParityRows == 1);
+    CHECK(selected.parallelSameParityRows == 1);
+    CHECK(selected.parallelOppositeParityRows == 1);
+    CHECK(selected.effectiveWeight == doctest::Approx(3.0));
+    CHECK(selected.fittedSignDisagreements == 0);
+
+    const auto& reversed = calibrated.gauges[2];
+    REQUIRE(reversed.fittedPhase.has_value());
+    CHECK(reversed.windingDirection == -1);
+    CHECK(reversed.fittedLoss > selected.fittedLoss);
+}
+
+TEST_CASE("Reference phase calibration keeps phase zero and scale explicit")
+{
+    FiberTraceReferenceConstraintDiagnosticReport reference;
+    reference.rows = {
+        {0, 0, 1, true, true, 0.0, 7.0, 0.5, 0.5},
+        {1, 1, 2, true, true, 1.0, 7.0, 0.5, 0.5},
+    };
+    const auto zero = calibrateFiberTraceReferenceConstraintPhase(
+        reference, 1.0);
+    REQUIRE(zero.selectedGauge.has_value());
+    const auto& selected = zero.gauges[*zero.selectedGauge];
+    REQUIRE(selected.fittedPhase.has_value());
+    CHECK(*selected.fittedPhase == 0.0);
+    CHECK(selected.fittedLoss == 0.0);
+    CHECK(selected.fittedSignDisagreements == 1);
+
+    reference.rows = {
+        {0, 0, 1, true, true, 0.1, -3.0, 0.5, 0.5},
+    };
+    const auto scaleOne = calibrateFiberTraceReferenceConstraintPhase(
+        reference, 1.0);
+    const auto scaleTwo = calibrateFiberTraceReferenceConstraintPhase(
+        reference, 2.0);
+    REQUIRE(scaleOne.selectedGauge.has_value());
+    REQUIRE(scaleTwo.selectedGauge.has_value());
+    CHECK(*scaleOne.gauges[*scaleOne.selectedGauge].fittedPhase ==
+          doctest::Approx(0.1));
+    CHECK(*scaleTwo.gauges[*scaleTwo.selectedGauge].fittedPhase ==
+          doctest::Approx(0.2));
+    CHECK_THROWS_AS(
+        calibrateFiberTraceReferenceConstraintPhase(reference, 0.0),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference phase calibration reports unidentifiable evidence")
+{
+    FiberTraceReferenceConstraintDiagnosticReport reference;
+    reference.rows = {
+        {0, 0, 1, false, true, 0.5, 0.5, 0.0, 0.5},
+        {1, 0, 2, true, true, 1.0, 1.0, 1.0, 1.0},
+        {2, 0, 3, true, false, 1.5, 1.5, 1.5, 1.5},
+    };
+    const auto unidentifiable = calibrateFiberTraceReferenceConstraintPhase(
+        reference, 1.0);
+    CHECK_FALSE(unidentifiable.selectedGauge.has_value());
+    for (const auto& gauge : unidentifiable.gauges) {
+        CHECK(gauge.identifyingRows == 1);
+        CHECK(gauge.usedRows == 0);
+        CHECK_FALSE(gauge.fittedPhase.has_value());
+    }
+}
+
+TEST_CASE("Reference step statistics retain direction and distance bands")
+{
+    FiberTraceReferenceConstraintDiagnosticReport reference;
+    reference.rows = {
+        {0, 0, 1, true, true, 0.1, 0.1, 0.5, 0.5},
+        {1, 0, 1, true, true, 0.3, 0.3, 0.5, 0.5},
+        {2, 1, 2, true, true, 0.9, 0.9, 0.5, 0.5},
+        {3, 0, 3, true, true, 1.2, 1.2, 1.5, 1.5},
+        {4, 1, 6, true, true, 2.8, 2.8, 2.5, 2.5},
+        {5, 0, 2, false, true, 0.8, 0.8, 1.0, 1.0},
+        {6, 1, 5, false, true, 2.2, 2.2, 2.0, 2.0},
+        {7, 0, 6, false, true, 3.1, 3.1, 3.0, 3.0},
+        {8, 0, 1, false, false, 99.0, 99.0, 0.5, 0.5},
+    };
+    const auto stats = summarizeFiberTraceReferenceConstraintSteps(reference);
+    const auto& hToVHalf = stats.groups[0][0][1][0];
+    CHECK(hToVHalf.observations == 2);
+    CHECK(hToVHalf.minimum == doctest::Approx(0.1));
+    CHECK(hToVHalf.mean == doctest::Approx(0.2));
+    CHECK(hToVHalf.median == doctest::Approx(0.2));
+    CHECK(hToVHalf.maximum == doctest::Approx(0.3));
+    CHECK(stats.groups[0][1][0][0].observations == 1);
+    CHECK(stats.groups[0][0][1][1].observations == 1);
+    CHECK(stats.groups[0][1][0][2].observations == 1);
+    CHECK(stats.groups[1][0][0][0].observations == 1);
+    CHECK(stats.groups[1][1][1][1].observations == 1);
+    CHECK(stats.groups[1][0][0][2].observations == 1);
+    CHECK(stats.groups[1][0][1][0].observations == 0);
+}
+
 TEST_CASE("Public winding factor diagnostics match solver preparation")
 {
     const auto source = lines(2);

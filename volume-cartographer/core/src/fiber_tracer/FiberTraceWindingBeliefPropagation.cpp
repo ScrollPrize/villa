@@ -3791,6 +3791,20 @@ makeFiberTraceReferenceConstraintDiagnosticReport(
     return result;
 }
 
+static std::map<std::size_t, const FiberTraceWindingFactorDiagnostic*>
+indexReferenceWindingFactors(
+    std::span<const FiberTraceWindingFactorDiagnostic> factors)
+{
+    std::map<std::size_t, const FiberTraceWindingFactorDiagnostic*> result;
+    for (const auto& factor : factors) {
+        if (!result.emplace(factor.constraintIndex, &factor).second) {
+            throw std::invalid_argument(
+                "Reference winding factor diagnostics contain a duplicate constraint");
+        }
+    }
+    return result;
+}
+
 FiberTraceReferenceScaleCalibrationReport
 calibrateFiberTraceReferenceConstraintScales(
     const FiberTraceReferenceConstraintDiagnosticReport& reference,
@@ -3806,14 +3820,7 @@ calibrateFiberTraceReferenceConstraintScales(
             "Reference winding scale bounds must be finite and positive");
     }
 
-    std::map<std::size_t, const FiberTraceWindingFactorDiagnostic*>
-        factorByConstraint;
-    for (const auto& factor : factors) {
-        if (!factorByConstraint.emplace(factor.constraintIndex, &factor).second) {
-            throw std::invalid_argument(
-                "Reference winding factor diagnostics contain a duplicate constraint");
-        }
-    }
+    const auto factorByConstraint = indexReferenceWindingFactors(factors);
 
     struct ScaleObservation {
         double weight = 0.0;
@@ -3973,6 +3980,271 @@ calibrateFiberTraceReferenceConstraintScales(
     for (std::size_t group = 0; group < groupCount; ++group) {
         result.rawGroups[group] = fit(grouped[group], true);
         result.canonicalGroups[group] = fit(grouped[group], false);
+    }
+    return result;
+}
+
+FiberTraceReferencePhaseCalibrationReport
+calibrateFiberTraceReferenceConstraintPhase(
+    const FiberTraceReferenceConstraintDiagnosticReport& reference,
+    double measurementScale)
+{
+    if (!std::isfinite(measurementScale) || !(measurementScale > 0.0)) {
+        throw std::invalid_argument(
+            "Reference winding phase scale must be finite and positive");
+    }
+
+    struct Observation {
+        std::size_t ownerSource = 0;
+        std::size_t targetSource = 0;
+        double target = 0.0;
+    };
+    std::vector<Observation> observations;
+    observations.reserve(reference.rows.size());
+    std::size_t identifyingRows = 0;
+    std::size_t perpendicularSameParityRows = 0;
+    std::size_t parallelSameParityRows = 0;
+    std::size_t parallelOppositeParityRows = 0;
+    for (const auto& row : reference.rows) {
+        if (row.ownerSource >= row.targetSource ||
+            !std::isfinite(row.rawStep)) {
+            throw std::invalid_argument(
+                "Reference winding phase observation is invalid");
+        }
+        const bool oppositeParity =
+            (row.ownerSource & 1U) != (row.targetSource & 1U);
+        if (!row.perpendicularDominant) {
+            if (oppositeParity)
+                ++parallelOppositeParityRows;
+            else
+                ++parallelSameParityRows;
+            continue;
+        }
+        if (!oppositeParity) {
+            ++perpendicularSameParityRows;
+            continue;
+        }
+        ++identifyingRows;
+        if (!row.signedMeasurement)
+            continue;
+        observations.push_back({
+            row.ownerSource,
+            row.targetSource,
+            row.rawStep,
+        });
+    }
+
+    const auto coordinate = [](
+                                std::size_t source,
+                                bool evenReferenceIsHorizontal,
+                                int direction,
+                                double phase) {
+        const double half = 0.5 * static_cast<double>(source);
+        const bool odd = (source & 1U) != 0;
+        const double value = evenReferenceIsHorizontal
+            ? std::floor(half) + (odd ? phase : 0.0)
+            : std::ceil(half) - (odd ? phase : 0.0);
+        return static_cast<double>(direction) * value;
+    };
+    const auto predicted = [&](const Observation& observation,
+                               bool evenReferenceIsHorizontal,
+                               int direction,
+                               double phase) {
+        return (
+                   coordinate(
+                       observation.targetSource,
+                       evenReferenceIsHorizontal,
+                       direction,
+                       phase) -
+                   coordinate(
+                       observation.ownerSource,
+                       evenReferenceIsHorizontal,
+                       direction,
+                       phase)) /
+            measurementScale;
+    };
+
+    FiberTraceReferencePhaseCalibrationReport result;
+    result.measurementScale = measurementScale;
+    std::size_t gaugeIndex = 0;
+    for (const int direction : {1, -1}) {
+        for (const bool evenReferenceIsHorizontal : {true, false}) {
+            auto& fit = result.gauges[gaugeIndex++];
+            fit.windingDirection = direction;
+            fit.evenReferenceIsHorizontal = evenReferenceIsHorizontal;
+            fit.totalRows = reference.rows.size();
+            fit.identifyingRows = identifyingRows;
+            fit.usedRows = observations.size();
+            fit.perpendicularSameParityRows =
+                perpendicularSameParityRows;
+            fit.parallelSameParityRows = parallelSameParityRows;
+            fit.parallelOppositeParityRows = parallelOppositeParityRows;
+            fit.effectiveWeight = static_cast<double>(observations.size());
+            const auto loss = [&](double phase) {
+                double total = 0.0;
+                for (const auto& observation : observations) {
+                    total += std::abs(
+                        predicted(
+                            observation,
+                            evenReferenceIsHorizontal,
+                            direction,
+                            phase) -
+                        observation.target);
+                }
+                return total;
+            };
+            fit.lossAtZero = loss(0.0);
+            fit.lossAtHalf = loss(0.5);
+            fit.fittedLoss = fit.lossAtZero;
+            if (observations.empty() || !(fit.effectiveWeight > 0.0))
+                continue;
+
+            std::vector<double> candidates{0.0, 0.5};
+            candidates.reserve(observations.size() + 2);
+            for (const auto& observation : observations) {
+                const double atZero = predicted(
+                    observation,
+                    evenReferenceIsHorizontal,
+                    direction,
+                    0.0);
+                const double slope = 2.0 * (
+                    predicted(
+                        observation,
+                        evenReferenceIsHorizontal,
+                        direction,
+                        0.5) -
+                    atZero);
+                if (slope == 0.0)
+                    continue;
+                const double breakpoint =
+                    (observation.target - atZero) / slope;
+                if (breakpoint >= 0.0 && breakpoint <= 0.5)
+                    candidates.push_back(breakpoint);
+            }
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(
+                std::unique(candidates.begin(), candidates.end()),
+                candidates.end());
+            double bestPhase = candidates.front();
+            double bestLoss = loss(bestPhase);
+            for (const double phase : candidates) {
+                const double currentLoss = loss(phase);
+                const double tolerance = 32.0 *
+                    std::numeric_limits<double>::epsilon() *
+                    std::max({1.0, std::abs(bestLoss), std::abs(currentLoss)});
+                if (currentLoss < bestLoss - tolerance ||
+                    (std::abs(currentLoss - bestLoss) <= tolerance &&
+                     phase < bestPhase)) {
+                    bestPhase = phase;
+                    bestLoss = currentLoss;
+                }
+            }
+            fit.fittedPhase = bestPhase;
+            fit.fittedLoss = bestLoss;
+            for (const auto& observation : observations) {
+                const double delta = predicted(
+                    observation,
+                    evenReferenceIsHorizontal,
+                    direction,
+                    bestPhase);
+                fit.fittedSignDisagreements +=
+                    observation.target * delta <= 0.0 ? 1 : 0;
+            }
+        }
+    }
+
+    const auto better = [](const FiberTraceReferencePhaseFit& candidate,
+                           const FiberTraceReferencePhaseFit& current) {
+        const double tolerance = 32.0 *
+            std::numeric_limits<double>::epsilon() *
+            std::max({
+                1.0,
+                std::abs(candidate.fittedLoss),
+                std::abs(current.fittedLoss),
+            });
+        if (candidate.fittedLoss < current.fittedLoss - tolerance)
+            return true;
+        if (current.fittedLoss < candidate.fittedLoss - tolerance)
+            return false;
+        if (*candidate.fittedPhase != *current.fittedPhase)
+            return *candidate.fittedPhase < *current.fittedPhase;
+        if (candidate.windingDirection != current.windingDirection)
+            return candidate.windingDirection > current.windingDirection;
+        return candidate.evenReferenceIsHorizontal &&
+            !current.evenReferenceIsHorizontal;
+    };
+    for (std::size_t index = 0; index < result.gauges.size(); ++index) {
+        if (!result.gauges[index].fittedPhase)
+            continue;
+        if (!result.selectedGauge ||
+            better(result.gauges[index], result.gauges[*result.selectedGauge])) {
+            result.selectedGauge = index;
+        }
+    }
+    return result;
+}
+
+FiberTraceReferenceStepStatisticsReport
+summarizeFiberTraceReferenceConstraintSteps(
+    const FiberTraceReferenceConstraintDiagnosticReport& reference)
+{
+    using Values = std::array<std::array<std::array<std::array<
+        std::vector<double>, 3>, 2>, 2>, 2>;
+    Values values;
+    for (const auto& row : reference.rows) {
+        if (row.ownerSource >= row.targetSource ||
+            !std::isfinite(row.rawStep) ||
+            !std::isfinite(row.groundTruthStep) ||
+            !(row.groundTruthStep > 0.0)) {
+            throw std::invalid_argument(
+                "Reference winding step statistic row is invalid");
+        }
+        if (!row.signedMeasurement)
+            continue;
+        const std::size_t relation = row.perpendicularDominant ? 0 : 1;
+        const std::size_t ownerParity = row.ownerSource & 1U;
+        const std::size_t targetParity = row.targetSource & 1U;
+        const bool oppositeParity = ownerParity != targetParity;
+        std::size_t band = 2;
+        if (oppositeParity) {
+            if (row.groundTruthStep < 1.0)
+                band = 0;
+            else if (row.groundTruthStep < 2.0)
+                band = 1;
+        } else {
+            if (row.groundTruthStep < 1.5)
+                band = 0;
+            else if (row.groundTruthStep < 2.5)
+                band = 1;
+        }
+        values[relation][ownerParity][targetParity][band].push_back(
+            row.rawStep);
+    }
+
+    FiberTraceReferenceStepStatisticsReport result;
+    for (std::size_t relation = 0; relation < 2; ++relation) {
+        for (std::size_t owner = 0; owner < 2; ++owner) {
+            for (std::size_t target = 0; target < 2; ++target) {
+                for (std::size_t band = 0; band < 3; ++band) {
+                    auto& source = values[relation][owner][target][band];
+                    auto& destination =
+                        result.groups[relation][owner][target][band];
+                    if (source.empty())
+                        continue;
+                    std::sort(source.begin(), source.end());
+                    destination.observations = source.size();
+                    destination.minimum = source.front();
+                    destination.maximum = source.back();
+                    destination.mean = std::accumulate(
+                        source.begin(), source.end(), 0.0) /
+                        static_cast<double>(source.size());
+                    const std::size_t middle = source.size() / 2;
+                    destination.median = source.size() % 2 != 0
+                        ? source[middle]
+                        : 0.5 * (source[middle - 1] + source[middle]);
+                }
+            }
+        }
     }
     return result;
 }

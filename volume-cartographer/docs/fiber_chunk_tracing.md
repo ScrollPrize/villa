@@ -1363,6 +1363,25 @@ parallel residual. With the displayed
 objective, fitted scale below one means the selected raw or canonical targets
 are larger than the known latent reference separation; scale above one means they are smaller.
 The scale table is diagnostic only and does not alter inference or artifacts.
+
+The preceding `reference raw signed step distributions` table is deliberately
+independent of solver weights. It uses every signed source-oriented reference
+measurement and groups it by dominant perpendicular/parallel classification,
+the H/V transition implied by the selected phase gauge, and virtual reference
+separation. Opposite-parity transitions use `0.5`, `1.5`, and `2.5+` bands;
+same-parity transitions use `1`, `2`, and `3+`. Each nonempty row reports count,
+minimum, arithmetic mean, median, and maximum of the raw signed winding step.
+This exposes asymmetric H-to-V and V-to-H measurements instead of hiding them
+inside one fitted phase.
+
+`reference constraint phase calibration` then fits all signed dominant
+perpendicular opposite-parity rows with unit weight. It enumerates increasing
+and decreasing winding direction and both even-reference H/V assignments, and
+minimizes `sum(abs(predicted/scale-raw_signed))` over phase `[0,0.5]` at the
+run's fixed positive measurement scale. Production class, confidence, and sign
+weights do not enter this physical reference diagnostic. The fit is diagnostic
+only and does not alter solver phase or output artifacts.
+
 After the last source table, `reference constraint canonical summary` reports
 `correct`, `false`, and `total`. Every displayed measured row contributes once,
 including repeated piece-pair measurements between the same source fibers. A

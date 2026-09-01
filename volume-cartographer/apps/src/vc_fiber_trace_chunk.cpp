@@ -3016,7 +3016,8 @@ std::string formatReferenceFiberConstraints(
     const ReferenceFiberDiagnostics& reference,
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
     const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
-    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config)
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
+    double measurementScale)
 {
     if (reference.sourceNames.size() != reference.sourceFibers) {
         throw std::invalid_argument(
@@ -3036,6 +3037,11 @@ std::string formatReferenceFiberConstraints(
     const auto scaleCalibration = vc::fiber_tracer::
         calibrateFiberTraceReferenceConstraintScales(
             diagnostics, factorDiagnostics);
+    const auto phaseCalibration = vc::fiber_tracer::
+        calibrateFiberTraceReferenceConstraintPhase(
+            diagnostics, measurementScale);
+    const auto stepStatistics = vc::fiber_tracer::
+        summarizeFiberTraceReferenceConstraintSteps(diagnostics);
     using Row = vc::fiber_tracer::FiberTraceReferenceConstraintDiagnosticRow;
     std::vector<std::vector<const Row*>> perpendicular(
         reference.sourceFibers);
@@ -3053,6 +3059,132 @@ std::string formatReferenceFiberConstraints(
     output.imbue(std::locale::classic());
     output << "reference constraint calibration global_sign="
            << calibration.globalSign << '\n';
+    const bool evenReferenceIsHorizontal =
+        !phaseCalibration.selectedGauge ||
+        phaseCalibration.gauges[*phaseCalibration.selectedGauge]
+            .evenReferenceIsHorizontal;
+    const auto orientationName = [&](std::size_t parity) {
+        const bool horizontal = parity == 0
+            ? evenReferenceIsHorizontal
+            : !evenReferenceIsHorizontal;
+        return horizontal ? "H" : "V";
+    };
+    output << "reference raw signed step distributions"
+           << " mapping=even:" << orientationName(0)
+           << ",odd:" << orientationName(1)
+           << " values=source-oriented-unweighted\n"
+           << std::left
+           << std::setw(10) << "class"
+           << std::setw(8) << "from_to"
+           << std::setw(9) << "gt_band"
+           << std::right
+           << std::setw(7) << "n"
+           << std::setw(11) << "raw_min"
+           << std::setw(11) << "raw_mean"
+           << std::setw(11) << "raw_med"
+           << std::setw(11) << "raw_max" << '\n';
+    for (std::size_t relation = 0; relation < 2; ++relation) {
+        for (std::size_t owner = 0; owner < 2; ++owner) {
+            for (std::size_t target = 0; target < 2; ++target) {
+                const bool oppositeParity = owner != target;
+                const std::array<const char*, 3> bands = oppositeParity
+                    ? std::array<const char*, 3>{"0.5", "1.5", "2.5+"}
+                    : std::array<const char*, 3>{"1", "2", "3+"};
+                for (std::size_t band = 0; band < 3; ++band) {
+                    const auto& stats =
+                        stepStatistics.groups[relation][owner][target][band];
+                    if (stats.observations == 0)
+                        continue;
+                    const std::string transition =
+                        std::string(orientationName(owner)) + "->" +
+                        orientationName(target);
+                    output << std::left
+                           << std::setw(10)
+                           << (relation == 0 ? "perp" : "parallel")
+                           << std::setw(8) << transition
+                           << std::setw(9) << bands[band]
+                           << std::right
+                           << std::setw(7) << stats.observations
+                           << std::fixed << std::setprecision(3)
+                           << std::setw(11) << stats.minimum
+                           << std::setw(11) << stats.mean
+                           << std::setw(11) << stats.median
+                           << std::setw(11) << stats.maximum << '\n';
+                }
+            }
+        }
+    }
+    output << '\n';
+    output << "reference constraint phase calibration"
+           << " objective=sum(abs(predicted/scale-raw_signed))"
+           << " scale=" << std::fixed << std::setprecision(3)
+           << phaseCalibration.measurementScale
+           << " sign_penalties=excluded\n"
+           << std::left
+           << std::setw(5) << "dir"
+           << std::setw(8) << "even"
+           << std::right
+           << std::setw(7) << "total"
+           << std::setw(7) << "ident"
+           << std::setw(7) << "used"
+           << std::setw(8) << "p_same"
+           << std::setw(8) << "q_same"
+           << std::setw(8) << "q_opp"
+           << std::setw(11) << "used_w"
+           << std::setw(12) << "loss_p0"
+           << std::setw(12) << "loss_p05"
+           << std::setw(10) << "fit_p"
+           << std::setw(12) << "fit_loss"
+           << std::setw(10) << "reduce_%"
+           << std::setw(10) << "sign_bad"
+           << "  status\n";
+    for (std::size_t index = 0;
+         index < phaseCalibration.gauges.size();
+         ++index) {
+        const auto& fit = phaseCalibration.gauges[index];
+        output << std::left
+               << std::setw(5) << fit.windingDirection
+               << std::setw(8)
+               << (fit.evenReferenceIsHorizontal ? "H" : "V")
+               << std::right
+               << std::setw(7) << fit.totalRows
+               << std::setw(7) << fit.identifyingRows
+               << std::setw(7) << fit.usedRows
+               << std::setw(8) << fit.perpendicularSameParityRows
+               << std::setw(8) << fit.parallelSameParityRows
+               << std::setw(8) << fit.parallelOppositeParityRows
+               << std::fixed << std::setprecision(3)
+               << std::setw(11) << fit.effectiveWeight
+               << std::setw(12) << fit.lossAtZero
+               << std::setw(12) << fit.lossAtHalf;
+        if (fit.fittedPhase) {
+            output << std::setw(10) << *fit.fittedPhase
+                   << std::setw(12) << fit.fittedLoss;
+            if (fit.lossAtHalf > 0.0) {
+                output << std::setw(10)
+                       << 100.0 *
+                              (fit.lossAtHalf - fit.fittedLoss) /
+                              fit.lossAtHalf;
+            } else {
+                output << std::setw(10) << "NA";
+            }
+            output << std::setw(10) << fit.fittedSignDisagreements;
+        } else {
+            output << std::setw(10) << "NA"
+                   << std::setw(12) << "NA"
+                   << std::setw(10) << "NA"
+                   << std::setw(10) << "NA";
+        }
+        output << "  "
+               << (phaseCalibration.selectedGauge &&
+                           *phaseCalibration.selectedGauge == index
+                       ? "selected"
+                       : fit.fittedPhase ? "candidate" : "unidentifiable")
+               << '\n';
+    }
+    output << "p_same=perpendicular same-parity (phase-independent);"
+              " q_same=parallel same-parity; q_opp=parallel opposite-parity"
+              " model contradictions\n\n";
     output << "reference constraint measurement-scale calibration"
            << " objective=sum(w*abs(gt/scale-target))"
            << " range=" << std::fixed << std::setprecision(2)
@@ -3499,7 +3631,8 @@ std::string formatReferenceBpWindingBenchmark(
                   reference,
                   *reference.constraintReport,
                   benchmark,
-                  config)
+                  config,
+                  winding.measurementScale)
            << '\n'
            << "reference-to-BP winding benchmark"
            << " balance=" << vc::fiber_tracer::fiberTraceBalanceModeName(balanceMode)

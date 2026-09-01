@@ -628,12 +628,58 @@ struct FiberTraceReferenceScaleCalibrationReport {
         canonicalGroups;
 };
 
+struct FiberTraceReferencePhaseFit {
+    int windingDirection = 1;
+    bool evenReferenceIsHorizontal = true;
+    std::size_t totalRows = 0;
+    std::size_t identifyingRows = 0;
+    std::size_t usedRows = 0;
+    std::size_t perpendicularSameParityRows = 0;
+    std::size_t parallelSameParityRows = 0;
+    std::size_t parallelOppositeParityRows = 0;
+    double effectiveWeight = 0.0;
+    double lossAtZero = 0.0;
+    double lossAtHalf = 0.0;
+    std::optional<double> fittedPhase;
+    double fittedLoss = 0.0;
+    std::size_t fittedSignDisagreements = 0;
+};
+
+struct FiberTraceReferencePhaseCalibrationReport {
+    double measurementScale = 1.0;
+    std::array<FiberTraceReferencePhaseFit, 4> gauges;
+    std::optional<std::size_t> selectedGauge;
+};
+
+struct FiberTraceReferenceStepStatistics {
+    std::size_t observations = 0;
+    double minimum = 0.0;
+    double mean = 0.0;
+    double median = 0.0;
+    double maximum = 0.0;
+};
+
+struct FiberTraceReferenceStepStatisticsReport {
+    // [perpendicular=0/parallel=1][owner parity][target parity][distance band]
+    std::array<std::array<std::array<std::array<
+        FiberTraceReferenceStepStatistics, 3>, 2>, 2>, 2> groups;
+};
+
 [[nodiscard]] FiberTraceReferenceScaleCalibrationReport
 calibrateFiberTraceReferenceConstraintScales(
     const FiberTraceReferenceConstraintDiagnosticReport& reference,
     std::span<const FiberTraceWindingFactorDiagnostic> factors,
     double minimumScale = 0.5,
     double maximumScale = 2.0);
+
+[[nodiscard]] FiberTraceReferencePhaseCalibrationReport
+calibrateFiberTraceReferenceConstraintPhase(
+    const FiberTraceReferenceConstraintDiagnosticReport& reference,
+    double measurementScale);
+
+[[nodiscard]] FiberTraceReferenceStepStatisticsReport
+summarizeFiberTraceReferenceConstraintSteps(
+    const FiberTraceReferenceConstraintDiagnosticReport& reference);
 
 struct FiberTraceReferenceConstraintGroupDiagnostic {
     std::size_t observations = 0;
