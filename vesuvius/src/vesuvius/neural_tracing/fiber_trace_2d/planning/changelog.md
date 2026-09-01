@@ -1,3 +1,15 @@
+# 2026-09-01: separate winding value and sign hardness
+
+- Preserved signed winding-value residuals while adding independently weighted
+  perpendicular and parallel sign-hardness terms across BP, decoded scoring,
+  projection, diagnostics, and reference inference.
+- Split agreement, evidence, CSV, and reference benchmark output into structural
+  winding-value and sign-hardness items whose benchmark denominators do not
+  disappear at zero solver weight.
+- Extended winding-weight searches to seven coordinates and promoted the 1024
+  local optimum: winding `0.5,2,1,2,1`, sign hardness `0,1`, with `8/8` exact
+  reference windings and `3562/4061` correct reference items.
+
 # 2026-09-01: reversible zero-weight refinement
 
 - Extended local winding-class weight refinement so every coordinate tests
@@ -1788,3 +1800,13 @@
   more active pieces and had lower aggregate infringement.
 - Promoted the reference-objective winner to the shared and CLI defaults.
   Deferred 2048 larger-context validation.
+
+## 2026-09-01 - Independent winding-value and sign-hardness weights
+
+- Kept the ordinary winding residual signed while separating the additional
+  perpendicular and parallel finite/hard sign penalties into two independently
+  tunable weights.
+- Split agreement, evidence, and reference benchmark reporting into winding
+  value and sign-hardness items with weight-independent structural denominators.
+- Extended exhaustive and local reference tuning from five winding coordinates
+  to five winding plus two sign coordinates.

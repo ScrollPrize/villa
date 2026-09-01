@@ -5551,14 +5551,15 @@
   half-integer canonical target, its winding-weight multiplier, and its
   effective parallel/perpendicular winding weights, and derive any calibrated
   latent target from that effective value.
-- Every completed winding solve must report final factor agreement for
-  continuity, perpendicular `0.5`/`1.5+`, parallel `0`/`1`/`2+`, and their sum.
-  The prepared population is the final admitted dominant factor diagnostics.
-  Factors with a Defect endpoint are reported as neutralized. Factors with two
-  active endpoints are evaluated and count once as infringed if their required
-  H/V relation, enabled sign, or canonical magnitude bin is wrong. The reported
-  percentage is `infringed/evaluated`; a zero denominator is `NA`. A hard
-  continuity edge with a Defect endpoint is ordinary neutralization.
+- Every completed winding solve must report final agreement as separate items:
+  continuity; perpendicular H/V, signed winding value `0.5`/`1.5+`, and extra
+  sign hardness; parallel H/V, signed winding value `0`/`1`/`2+`, and extra
+  sign hardness; plus their sum. Structural extraction determines which items
+  are listed even when a tested solver weight is zero. Factors with a Defect
+  endpoint neutralize every applicable item independently. Active winding-value
+  items compare the signed canonical target, while sign items independently
+  check ordering. The reported percentage is `infringed/evaluated`; a zero
+  denominator is `NA`.
 - The reusable interleaved solver exposes an optional synchronous progress
   callback. Events identify preparation, the one-based multi-start
   initialization, calibration iteration, adaptive-support round, BP message
@@ -5717,7 +5718,8 @@
   reference at endpoint A of `A -> B` is inferred as `z-q`; at endpoint B it
   is `z+q`. A parallel constraint similarly scales before integer
   canonicalization; a canonical nonnegative integer distance `n` infers
-  both `z-n` and `z+n`; `n=0` is `parallel_same`, otherwise it is
+  the endpoint-ordered signed candidate; an unsigned fallback retains both
+  `z-n` and `z+n`. `n=0` is `parallel_same`, otherwise it is
   `parallel_other`. A Defect/invalid BP endpoint or unsigned perpendicular
   observation has no inferred candidate. Constraints whose BP endpoint is
   final Defect/Mixed or otherwise winding-invalid are excluded from both
@@ -5775,11 +5777,12 @@
   the minimum-violation lexicographic fallback before finite factor energy.
   Then print one compact row per original selected reference source in source order, identified
   only by its virtual winding `0.5*i`. Each source row
-  contains `right`, `wrong`, and `right_fraction` for `perpendicular`,
-  `parallel_same`, `parallel_other`, and `sum`; zero-total fractions are `NA`.
+  contains `right`, `wrong`, and `right_fraction` for perpendicular winding,
+  perpendicular sign hardness, parallel-same winding, parallel-other winding,
+  parallel sign hardness, and sum; zero-total fractions are `NA`.
   Follow this with aggregate `right`, `wrong`, `total`, and
   `right_percent` rows for
-  `perpendicular`, `parallel_same`, `parallel_other`, and `sum`. Empty classes
+  those same five classes and `sum`. Empty classes
   print `NA` percent, and right plus wrong always equals total. Per-source rows
   reuse the single global gauge calibration, aggregate all runs and pieces of
   one source, include explicit zero-observation sources, and sum exactly to the
@@ -5820,10 +5823,10 @@
   authoritative factor diagnostics after fixed-orientation exclusion,
   quantization, distance-cutoff suppression, and coefficient downweighting.
   Report a unique admitted-measurement row followed by continuity,
-  perpendicular-value, perpendicular-sign, parallel-same, and parallel-other
-  term rows. The perpendicular-value row reports the finite absolute-distance
-  coefficient. The perpendicular-sign row reports the separate hard ordering
-  restriction and has no finite coefficient.
+  perpendicular-winding, perpendicular-sign, parallel-same-winding,
+  parallel-other-winding, and parallel-sign term rows. Winding rows report the
+  ordinary signed-value coefficient. Sign rows report the additional finite or
+  hard ordering rule separately.
   A measured constraint contributes to exactly one perpendicular or parallel
   row according to its dominant hypothesis, matching the solver. Each endpoint is one incidence: an internal
   constraint contributes twice to one cohort and a cross-cohort constraint
@@ -5880,16 +5883,16 @@
   dominant factor class in tuple order `perp_0.5`, `perp_1.5+`, `parallel_0`,
   `parallel_1`, `parallel_2+`. The multiplier composes with the existing
   canonical-distance decay. Signed parallel targets are authoritative for
-  integer class selection. These multipliers affect finite winding loss and
+  integer class selection. These multipliers affect ordinary signed
+  winding-value loss and
   its diagnostics only; they never scale orientation loss, hard perpendicular
   order, hard continuity, Defect unary cost, or piece-break cost.
 - `--winding-hard-signs none|perpendicular|parallel|both` independently enables
   signed ordering for the dominant perpendicular and parallel hypotheses. The
-  default enables both. A zero magnitude weight
-  removes the corresponding finite loss. If that dominant observation has an
-  enabled nonzero sign, it remains in winding connectivity, Defect incidence,
-  BP, projection, and reference inference; without an enabled sign it remains
-  orientation-only and is absent from all winding calculations. Zero/same-
+  default enables both. A zero winding-value weight removes that ordinary
+  signed-value term. If that dominant observation has an enabled nonzero sign,
+  its separately weighted extra sign rule may remain in winding connectivity,
+  Defect incidence, BP, projection, and reference inference. Zero/same-
   winding and unsigned observations never impose hard signs, and parallel
   signs obey the parallel winding cutoff. Canonical class weights do not alter
   same-trace hard continuity.
@@ -5905,10 +5908,15 @@
   connector sample, averaging the central pair for an even count. Missing,
   invalid, or component-incompatible alignment is neutral under `none` and
   zero under weighted modes. The default is `linear`.
+- `--winding-sign-weights PERP,PARALLEL` supplies finite nonnegative multipliers
+  for the additional perpendicular and parallel sign-hardness rules, default
+  `0,1`. Zero disables that relation's extra finite penalty and aligned hard
+  promotion but does not remove the ordinary signed winding-value residual.
 - `--winding-sign-cost` defaults to finite cost `44`. A wrong-sign or exactly
   zero predicted delta adds
-  `sign_cost * decision_confidence * normal_confidence` per measurement.
-  Magnitude class weights and distance decay do not scale this term. Zero cost
+  `sign_cost * relation_sign_weight * decision_confidence *
+  normal_confidence` per measurement. Winding class weights and distance decay
+  do not scale this term. Zero cost
   or zero confidence removes the sign factor from energy, connectivity, and
   Defect incidence. The literal value `hard` restores strict rejection
   regardless of confidence. Independently, `--winding-hard-sign-angle` defaults
@@ -5920,16 +5928,17 @@
   unary.
 - Standard fixed-orientation crop evaluation defaults to orientation BP
   temperature `1.25` and winding-stage Defect cost `100`. The underlying
-  winding factor temperature remains `0.25`. These defaults, both sign classes,
-  finite sign cost `44`, decision `cosine`, and normal confidence `linear` are
-  the selected fixed-1024-crop benchmark row.
-- Shared and CLI H/V-aware winding defaults are `0,4,2,2,1`. An explicit
+  winding factor temperature remains `0.25`. The default sign multipliers are
+  perpendicular zero and parallel one; finite sign cost remains `44`, decision
+  confidence `cosine`, and normal confidence `linear`.
+- Shared and CLI H/V-aware winding defaults are `0.5,2,1,2,1`. An explicit
   `1,1,1,1,1` tuple restores neutral class weighting. The standalone
   raw-integer solver retains unscaled measurements because it does not
   quantize the H/V ladder targets used for canonical class selection.
-- `--winding-weights` runs one explicit five-value tuple.
+- `--winding-weights` runs one explicit five-value winding tuple and
+  `--winding-sign-weights` runs one explicit two-value sign tuple.
   `--winding-weight-search` takes one deduplicated positive value list and runs
-  its complete five-dimensional Cartesian product, capped at 100,000
+  its complete seven-dimensional Cartesian product, capped at 100,000
   scenarios. Search requires reference fibers and mixed BP, conflicts with a
   fixed tuple, reuses all pre-winding geometry/orientation work, isolates failed
   scenarios, and uses the selected tuple for every final artifact and
@@ -5938,12 +5947,13 @@
   denominator, fewer missing and incorrect estimates, more right and evaluated
   constraints, fewer wrong constraints, residual, and lexicographic tuple.
 - `--winding-weight-search-local` requires an explicit `--winding-weights`
-  start and is mutually exclusive with exhaustive search. Each coordinate has
+  start and is mutually exclusive with exhaustive search. It searches all five
+  winding plus two sign coordinates. Each coordinate has
   a canonical tagged state: zero or an integer power-of-two exponent relative
   to its immutable positive starting base; an initially zero coordinate uses
-  base one. In dimension order `0..4`, a positive coordinate proposes zero,
+  base one. In dimension order `0..6`, a positive coordinate proposes zero,
   `/2`, and `*2`, while zero proposes `base/2`, `base`, and `base*2`. The search
-  deduplicates these at most 15 tuples, caches successes and failures by exact
+  deduplicates these at most 21 tuples, caches successes and failures by exact
   tagged tuple, moves only on a strict benchmark-quality improvement, and
   repeats to a local optimum. Residual and lexicographic tuple ordering may
   select deterministically among improving neighbors but cannot turn a quality
@@ -5951,3 +5961,12 @@
   candidates are omitted, zero remains available at either bound, and the
   printed progress denominator is the deduplicated in-range candidate count.
   An iteration-limit exit is an error rather than a local optimum.
+- The fixed 1024 reference-crop seven-coordinate refinement evaluated 111
+  scenarios from winding `0,4,2,2,1`, sign `1,1` and selected winding
+  `0.5,2,1,2,1`, sign `0,1`. Exact reference windings improved from `6/8` to
+  `8/8`; correct fixed-denominator reference items improved from `3141/3953`
+  (79.459%) to `3562/4061` (87.712%). A zero perpendicular sign-hardness weight
+  removes only the extra finite/hard reversal term: positive perpendicular
+  winding-value weights continue to apply the signed residual. The configured
+  `0.5` parallel cutoff admitted no parallel-sign reference items, so this run
+  did not identify the retained parallel sign default of one.

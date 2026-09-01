@@ -1042,10 +1042,10 @@ The five canonical winding terms can be scaled independently with
 `--winding-weights P05,PFAR,P0,P1,P2`. The tuple order is perpendicular next
 half-step (`0.5`), perpendicular farther half-steps (`1.5+`), parallel same
 winding (`0`), parallel one winding (`1`), and parallel farther windings
-(`2+`). Standard runs default to `0,4,2,2,1`; pass `1,1,1,1,1` explicitly for
+(`2+`). Standard runs default to `0.5,2,1,2,1`; pass `1,1,1,1,1` explicitly for
 neutral class weighting. Each value must be finite and nonnegative. A zero
-value removes that class's finite winding magnitude loss. If its dominant
-signed observation also has an enabled hard-sign rule, the sign remains an
+value removes that class's ordinary signed winding-value loss. If its dominant
+signed observation also has an enabled sign-hardness rule, that extra rule remains an
 active winding constraint; otherwise the observation remains orientation-only
 and does not join winding components or contribute winding Defect incidence.
 Measurement scale is applied before canonical target quantization. The
@@ -1072,6 +1072,13 @@ and zero-target observations never impose a sign. Parallel signs also respect
 the same weights with `none` removes all measured cross-trace winding terms.
 Same-trace hard continuity is unchanged in both cases.
 
+Use `--winding-sign-weights PERP,PARALLEL` to scale the additional sign-hardness
+rule independently for dominant perpendicular and parallel observations. The
+default is `0,1`. A zero entry disables both the finite sign penalty and the
+aligned hard-sign promotion for that relation. It does not make reversal
+acceptable to the ordinary winding-value term, which continues to compare the
+signed predicted and canonical winding deltas.
+
 Finite winding evidence can additionally be confidence-weighted with
 `--winding-decision-confidence legacy|linear|cosine` and
 `--winding-normal-confidence none|linear|cosine`. Let `s` be the selected
@@ -1085,8 +1092,9 @@ neutral for `none` and contributes zero confidence for weighted modes.
 
 Pass `--winding-sign-cost F` to assign each enabled sign a finite
 penalty. A nonzero signed target whose predicted delta has the wrong sign or is
-exactly zero adds `F * decision_confidence * normal_confidence`. This term is
-independent of magnitude class weights and distance decay; the ordinary BP
+exactly zero adds `F * relation_sign_weight * decision_confidence *
+normal_confidence`. This term is independent of winding class weights and
+distance decay; the ordinary BP
 temperature still scales its log potential. The default is `44`; pass
 `--winding-sign-cost hard` for strict rejection, or `F=0` to remove the enabled
 sign at weak normal alignment.
@@ -1110,30 +1118,31 @@ The winding-factor CSV records both raw alignments, the transformed decision
 and normal multipliers, effective finite sign penalties, and whether each sign
 was promoted by alignment.
 
-After every winding solve, `fiber winding constraint agreement` reports
-continuity, perpendicular `0.5`/`1.5+`, and parallel `0`/`1`/`2+` rows plus a
-sum. `prepared` is the final solver factor population after dominant selection,
+After every winding solve, `fiber winding constraint agreement` separately
+reports continuity; perpendicular H/V, winding `0.5`/`1.5+`, and sign; and
+parallel H/V, winding `0`/`1`/`2+`, and sign, plus a sum. `prepared` is the
+structurally extracted item population after dominant selection,
 cutoffs, fixed-orientation removal, and component filtering. `active` means both
 endpoints have an active winding and is the denominator for `infringed_%`.
 `neutralized` counts factors disabled by at least one Defect endpoint, including
 hard continuation edges split by a Defect.
-An active factor is infringed once when any required H/V relation, enabled sign,
-or canonical winding bin is wrong. Neutralized factors are shown explicitly and
-are not silently counted as correct or included in the percentage denominator.
+Each active item is evaluated independently. The winding item uses signed
+canonical value, and the sign item reports the extra finite/hard ordering rule.
+Neutralized items are shown explicitly and are not silently counted as correct
+or included in the percentage denominator.
 
 The initial hard-continuation 1024-crop sweep selected linear normal confidence,
 cosine decision confidence, and class weights `0,2,2,2,1` under the former
 post-quantization measurement-scale semantics. After correcting scale to act
-before canonical quantization, zero-aware local refinement selected
-`0,4,2,2,1`: with both hard-sign classes at the 30-degree gate, finite sign
-cost 44, Defect cost 100, and temperature 1.25, it retained 6/8 exact reference
-windings and matched 1,491/2,128 evaluated reference constraints (70.066%).
-These corrected measured settings are the standard defaults. Explicit
-confidence, weight, sign, Defect, and temperature options reproduce prior
-modes.
+before canonical quantization, the original five-coordinate refinement selected
+`0,4,2,2,1`. That result predates separate winding-value and sign-hardness
+benchmark items and is retained only as tuning history. The seven-coordinate
+corrected result below defines the current defaults. Explicit confidence,
+weight, sign, Defect, and temperature options reproduce prior modes.
 
 With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
-tests the Cartesian product of the listed values in all five tuple positions.
+tests the Cartesian product of the listed values in all seven winding/sign
+positions.
 It conflicts with `--winding-weights`. Constraint extraction, topology,
 effective-winding component selection, fixed orientation, and reference cross
 constraints are reused; only winding inference is repeated. Each scenario
@@ -1144,14 +1153,15 @@ turning difficult endpoints into Defect cannot improve the primary score by
 abstaining. Failed scenarios are reported and skipped. The selected report and
 tuple drive the ordinary CSV, OBJ, and reference diagnostics.
 
-For iterative tuning, pass one starting tuple with `--winding-weights` and add
-`--winding-weight-search-local`. Each iteration visits dimensions `0..4` and
+For iterative tuning, pass one starting winding tuple with `--winding-weights`,
+optionally a sign tuple with `--winding-sign-weights`, and add
+`--winding-weight-search-local`. Each iteration visits dimensions `0..6` and
 evaluates zero, `0.5x`, and `2x` for exactly one coordinate, then moves to the
 best strict benchmark improvement. A zero coordinate is reversible: its next
 neighborhood contains `base/2`, `base`, and `base*2`, where base is the
 immutable positive starting value (or one for an initially zero coordinate).
 Canonical tagged zero/exponent tuples cache both successful and failed
-scenarios, so a previously visited neighbor is not solved again. Tied benchmark
+scenarios, at most 21 per iteration, so a previously visited neighbor is not solved again. Tied benchmark
 metrics do not cause a move; tuple ordering and message residual only make
 reporting deterministic. The search stops when no single-coordinate neighbor
 improves the benchmark. Positive exponents are bounded to `[-16,16]`; reaching
@@ -1159,11 +1169,18 @@ the iteration guard before an optimum is an error rather than a successful
 termination. The selected tuple is solved once more to produce the ordinary
 output artifacts.
 
-On the fixed 1024 reference crop with scale-first targets, the zero-aware
-search moved `1,2,2,2,1 -> 0,2,2,2,1 -> 0,4,2,2,1`. The final tuple retained
-6/8 exact reference windings and improved reference constraint agreement from
-1239/2117 (58.526%) at the start to 1491/2128 (70.066%). A complete subsequent
-zero/half/double neighborhood produced no strict improvement.
+On the fixed 1024 reference crop with scale-first targets and separate
+winding/sign items, the corrected baseline was winding `0,4,2,2,1`, sign
+`1,1`: 6/8 exact reference windings and 3141/3953 correct items (79.459%). The
+seven-coordinate zero-aware search evaluated 111 scenarios and selected winding
+`0.5,2,1,2,1`, sign `0,1`: 8/8 exact and 3562/4061 correct (87.712%). Its five
+accepted moves disabled only the extra perpendicular sign-hardness term, raised
+then refined perpendicular-next winding weight, halved perpendicular-far, and
+halved parallel-same. The positive perpendicular winding weights retain signed
+value loss, so a reversal remains a winding-value error even though its second
+high/hard penalty defaults to zero. The `0.5` parallel cutoff admitted no
+parallel-other or parallel-sign reference items, so this run did not identify
+the retained parallel sign default of one.
 
 The adaptive grid stores `gain=1/measurement_scale`, but gain selects the
 scale-specific canonical target before factor evaluation; it no longer scales

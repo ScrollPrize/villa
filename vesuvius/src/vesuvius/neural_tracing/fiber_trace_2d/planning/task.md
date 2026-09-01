@@ -1,10 +1,15 @@
-# Task: zero-aware winding weight refinement
+# Task: separate winding value and sign-hardness constraints
 
-Extend the iterative five-class winding-weight search so every coordinate
-tests zero in addition to its `/2` and `*2` neighbors. Zero is a reversible
-candidate, not a permanently disabled coordinate: later search iterations
-must be able to re-enable it after other weights change.
+Separate signed winding observations into independently weighted winding-value
+and sign-hardness constraints throughout extraction-to-BP materialization,
+scoring, diagnostics, and reference benchmarking for both dominant
+perpendicular and parallel relations.
 
-Run the corrected search under scale-first semantics from `1,2,2,2,1` on the
-established 1024 reference benchmark. Report every accepted move and the final
-local optimum.
+The ordinary winding-value residual remains signed. Sign hardness adds the
+separately tunable high or hard reversal penalty. All
+constraint listings, agreement checks, and reference benchmark counts must
+report winding value and sign hardness separately, without allowing a zero solver weight to
+remove the corresponding item from the benchmark denominator.
+
+After validation, tune the seven weights on the established 1024 reference
+benchmark and promote the selected defaults.

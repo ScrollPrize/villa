@@ -54,6 +54,10 @@ struct Measurement {
     bool quantizeTargets = true;
     bool parallelDominant = false;
     bool perpendicularDominant = false;
+    bool parallelMagnitudePresent = false;
+    bool perpendicularMagnitudePresent = false;
+    bool parallelSignPresent = false;
+    bool perpendicularSignPresent = false;
 };
 
 struct Edge {
@@ -138,12 +142,14 @@ void validateConfig(const FiberTraceWindingBeliefPropagationConfig& config)
         config.parallelSameWeight,
         config.parallelOneWeight,
         config.parallelFarWeight,
+        config.perpendicularSignWeight,
+        config.parallelSignWeight,
     };
     if (std::any_of(classWeights.begin(), classWeights.end(), [](double weight) {
             return !std::isfinite(weight) || weight < 0.0;
         })) {
         throw std::invalid_argument(
-            "Winding BP class weights must be finite and nonnegative");
+            "Winding BP value and sign-hardness weights must be finite and nonnegative");
     }
 }
 
@@ -260,10 +266,11 @@ Measurement materializeMeasurement(
         parallelDistance = std::abs(*signedParallel);
     }
 
-    const bool parallelRetained =
-        (parallelDistance == 0.0 || signedParallel.has_value()) &&
+    const bool parallelRetained = source.parallelDominant &&
         (!config.parallelWindingDistanceCutoff || source.continuity ||
          parallelDistance < *config.parallelWindingDistanceCutoff);
+    const bool perpendicularMagnitudePresent = source.perpendicularDominant &&
+        signedPerpendicular.has_value();
     const double parallelMultiplier = source.quantizeTargets &&
             !source.continuity
         ? windingWeightMultiplier(parallelDistance) *
@@ -274,14 +281,18 @@ Measurement materializeMeasurement(
         ? windingWeightMultiplier(*signedPerpendicular) *
             windingClassWeight(config, true, *signedPerpendicular)
         : 1.0;
-    const bool parallelSignEnabled = !source.continuity &&
+    const bool parallelSignPresent = !source.continuity &&
         source.parallelDominant && parallelRetained &&
         config.enforceParallelWindingSign && signedParallel &&
         *signedParallel != 0.0;
-    const bool perpendicularSignEnabled = !source.continuity &&
+    const bool perpendicularSignPresent = !source.continuity &&
         source.perpendicularDominant &&
         config.enforcePerpendicularWindingSign && signedPerpendicular &&
         *signedPerpendicular != 0.0;
+    const bool parallelSignEnabled = parallelSignPresent &&
+        config.parallelSignWeight > 0.0;
+    const bool perpendicularSignEnabled = perpendicularSignPresent &&
+        config.perpendicularSignWeight > 0.0;
     const bool finiteSigns = config.finiteSignInfringementCost.has_value();
     const bool alignmentPromotesHardSign = hardSignPromotedByAlignment(
         config, source.selectedNormalAlignment);
@@ -307,12 +318,18 @@ Measurement materializeMeasurement(
     result.hardPerpendicularSign = perpendicularSignEnabled && strictSign;
     result.parallelSignPenalty = parallelSignEnabled && finiteSigns &&
             !alignmentPromotesHardSign
-        ? *config.finiteSignInfringementCost * source.selectedConfidence
+        ? *config.finiteSignInfringementCost * config.parallelSignWeight *
+            source.selectedConfidence
         : 0.0;
     result.perpendicularSignPenalty = perpendicularSignEnabled && finiteSigns &&
             !alignmentPromotesHardSign
-        ? *config.finiteSignInfringementCost * source.selectedConfidence
+        ? *config.finiteSignInfringementCost * config.perpendicularSignWeight *
+            source.selectedConfidence
         : 0.0;
+    result.parallelMagnitudePresent = parallelRetained;
+    result.perpendicularMagnitudePresent = perpendicularMagnitudePresent;
+    result.parallelSignPresent = parallelSignPresent;
+    result.perpendicularSignPresent = perpendicularSignPresent;
     return result;
 }
 
@@ -336,10 +353,8 @@ FiberTraceReferenceConstraintGroup referenceConstraintGroup(
 
 double parallelWindingWeight(const Measurement& measurement)
 {
-    if (measurement.parallelDistance != 0.0 &&
-        !measurement.parallelSignedDelta) {
+    if (!measurement.parallelMagnitudePresent)
         return 0.0;
-    }
     return measurement.parallelMultiplier * measurement.parallelConfidence;
 }
 
@@ -354,10 +369,18 @@ double parallelWindingResidual(
 
 double perpendicularWindingWeight(const Measurement& measurement)
 {
-    return measurement.perpendicularSignedDelta
+    return measurement.perpendicularMagnitudePresent &&
+            measurement.perpendicularSignedDelta
         ? measurement.perpendicularMultiplier *
             measurement.perpendicularConfidence
         : 0.0;
+}
+
+double perpendicularWindingResidual(
+    const Measurement& measurement,
+    double predictedDelta)
+{
+    return predictedDelta - *measurement.perpendicularSignedDelta;
 }
 
 double finiteSignPenalty(
@@ -501,6 +524,9 @@ PreparedWinding prepareWinding(
             measurement.parallelSignPenalty;
         diagnostic.effectivePerpendicularSignPenalty =
             measurement.perpendicularSignPenalty;
+        diagnostic.parallelSignWeightMultiplier = config.parallelSignWeight;
+        diagnostic.perpendicularSignWeightMultiplier =
+            config.perpendicularSignWeight;
         diagnostic.perpendicularNormalAlignment =
             constraint.perpendicularNormalAlignment;
         diagnostic.parallelNormalAlignment = constraint.parallelNormalAlignment;
@@ -515,10 +541,14 @@ PreparedWinding prepareWinding(
             ? std::nullopt
             : constraint.windingNormalComponent;
         diagnostic.parallelWindingRetained =
-            parallelDominant &&
-            (measurement.parallelConfidence > 0.0 ||
-             measurement.hardParallelSign ||
-             measurement.parallelSignPenalty > 0.0);
+            measurement.parallelMagnitudePresent;
+        diagnostic.parallelMagnitudePresent =
+            measurement.parallelMagnitudePresent;
+        diagnostic.perpendicularMagnitudePresent =
+            measurement.perpendicularMagnitudePresent;
+        diagnostic.parallelSignPresent = measurement.parallelSignPresent;
+        diagnostic.perpendicularSignPresent =
+            measurement.perpendicularSignPresent;
         diagnostic.selfEdge = false;
         diagnostic.originalSignedParallelDelta =
             constraint.signedParallelWindingDelta;
@@ -728,7 +758,7 @@ double measurementSquaredTarget(const Measurement& measurement)
     if (!(weight > 0.0))
         return 0.0;
     const double parallelTarget =
-        measurement.parallelSignedDelta.value_or(0.0);
+        measurement.parallelSignedDelta.value_or(measurement.parallelDistance);
     return (parallelWindingWeight(measurement) * parallelTarget +
             perpendicularWindingWeight(measurement) *
                 measurement.perpendicularSignedDelta.value_or(0.0)) /
@@ -851,7 +881,7 @@ std::vector<double> solveContinuous(
             perpendicularWindingWeight(measurement);
         if (measurement.perpendicularSignedDelta && perpendicularWeight > 0.0) {
             const double residual =
-                delta - *measurement.perpendicularSignedDelta;
+                perpendicularWindingResidual(measurement, delta);
             squared += perpendicularWeight * residual * residual;
             ++terms;
         }
@@ -873,7 +903,7 @@ double robustCost(const Edge& edge, int labelA, int labelB)
             std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             cost += perpendicularWindingWeight(measurement) *
-                std::abs(delta - *measurement.perpendicularSignedDelta);
+                std::abs(perpendicularWindingResidual(measurement, delta));
         }
         cost += finiteSignPenalty(measurement, delta);
     }
@@ -1326,8 +1356,8 @@ double windingEnergy(
             std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             energy += perpendicularWindingWeight(measurement) *
-                std::abs(
-                    predictedDelta - *measurement.perpendicularSignedDelta);
+                std::abs(perpendicularWindingResidual(
+                    measurement, predictedDelta));
         }
         energy += finiteSignPenalty(measurement, predictedDelta);
     }
@@ -1781,8 +1811,8 @@ double calibrationL1(
             if (measurement.perpendicularSignedDelta) {
                 result += term.probability *
                     perpendicularWindingWeight(measurement) *
-                    std::abs(
-                        latent - *measurement.perpendicularSignedDelta);
+                    std::abs(perpendicularWindingResidual(
+                        measurement, latent));
             }
         } else {
             result += term.probability * parallelWindingWeight(measurement) *
@@ -2292,8 +2322,8 @@ double gridWindingEnergy(
             std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
             result += perpendicularWindingWeight(measurement) *
-                std::abs(
-                    predictedDelta - *measurement.perpendicularSignedDelta);
+                std::abs(perpendicularWindingResidual(
+                    measurement, predictedDelta));
         }
         result += finiteSignPenalty(measurement, predictedDelta);
     }
@@ -3660,16 +3690,24 @@ const char* fiberTraceConstraintAgreementClassName(
     switch (agreementClass) {
     case FiberTraceConstraintAgreementClass::Continuity:
         return "continuity";
-    case FiberTraceConstraintAgreementClass::PerpendicularNext:
-        return "perp_0.5";
-    case FiberTraceConstraintAgreementClass::PerpendicularFar:
-        return "perp_1.5+";
-    case FiberTraceConstraintAgreementClass::ParallelSame:
-        return "parallel_0";
-    case FiberTraceConstraintAgreementClass::ParallelOne:
-        return "parallel_1";
-    case FiberTraceConstraintAgreementClass::ParallelFar:
-        return "parallel_2+";
+    case FiberTraceConstraintAgreementClass::PerpendicularOrientation:
+        return "perp_hv";
+    case FiberTraceConstraintAgreementClass::PerpendicularMagnitudeNext:
+        return "perp_winding_0.5";
+    case FiberTraceConstraintAgreementClass::PerpendicularMagnitudeFar:
+        return "perp_winding_1.5+";
+    case FiberTraceConstraintAgreementClass::PerpendicularSign:
+        return "perp_sign";
+    case FiberTraceConstraintAgreementClass::ParallelOrientation:
+        return "parallel_hv";
+    case FiberTraceConstraintAgreementClass::ParallelMagnitudeSame:
+        return "parallel_winding_0";
+    case FiberTraceConstraintAgreementClass::ParallelMagnitudeOne:
+        return "parallel_winding_1";
+    case FiberTraceConstraintAgreementClass::ParallelMagnitudeFar:
+        return "parallel_winding_2+";
+    case FiberTraceConstraintAgreementClass::ParallelSign:
+        return "parallel_sign";
     case FiberTraceConstraintAgreementClass::Count:
         break;
     }
@@ -3713,27 +3751,6 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
             constraints.constraints[diagnostic.constraintIndex];
         const bool perpendicular = !constraint.hardContinuity &&
             diagnostic.perpendicularScore >= diagnostic.parallelScore;
-        FiberTraceConstraintAgreementClass agreementClass;
-        if (constraint.hardContinuity) {
-            agreementClass = FiberTraceConstraintAgreementClass::Continuity;
-        } else if (perpendicular) {
-            const double target = std::abs(
-                diagnostic.effectivePerpendicularSignedDelta.value_or(0.0));
-            agreementClass = target <= 0.5 + kEpsilon
-                ? FiberTraceConstraintAgreementClass::PerpendicularNext
-                : FiberTraceConstraintAgreementClass::PerpendicularFar;
-        } else {
-            const double target = std::abs(
-                diagnostic.effectiveSignedParallelDelta.value_or(
-                    diagnostic.effectiveParallelWindingDistance));
-            agreementClass = target <= kEpsilon
-                ? FiberTraceConstraintAgreementClass::ParallelSame
-                : target <= 1.0 + kEpsilon
-                    ? FiberTraceConstraintAgreementClass::ParallelOne
-                    : FiberTraceConstraintAgreementClass::ParallelFar;
-        }
-        FiberTraceConstraintAgreementCounts counts;
-        counts.prepared = 1;
         const std::size_t a = std::min(
             diagnostic.pieceA, diagnostic.pieceB);
         const std::size_t b = std::max(
@@ -3742,66 +3759,78 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
             activeOrientation(winding.mapOrientationByPiece[a]);
         const bool activeB = winding.windingValid[b] != 0 &&
             activeOrientation(winding.mapOrientationByPiece[b]);
-        if (!activeA || !activeB) {
-            counts.defectNeutralized = 1;
-        } else {
-            counts.evaluated = 1;
-            const bool sameOrientation =
-                winding.mapOrientationByPiece[a] ==
+        const bool active = activeA && activeB;
+        const bool sameOrientation = active &&
+            winding.mapOrientationByPiece[a] ==
                 winding.mapOrientationByPiece[b];
-            const double latentDelta =
-                winding.mapLatentCoordinate[b] -
-                winding.mapLatentCoordinate[a];
-            bool infringed = false;
-            if (constraint.hardContinuity) {
-                infringed = !sameOrientation ||
-                    winding.mapWinding[a] != winding.mapWinding[b];
-            } else if (perpendicular) {
-                infringed = sameOrientation;
-                const auto target =
-                    diagnostic.effectivePerpendicularSignedDelta;
-                const bool magnitudeEnabled =
-                    diagnostic.effectivePerpendicularWindingWeight > 0.0;
-                const bool signEnabled = diagnostic.hardPerpendicularSign ||
-                    diagnostic.effectivePerpendicularSignPenalty > 0.0;
-                const double predicted = latentDelta;
-                if (magnitudeEnabled && target &&
-                    quantizedHalfWindingTarget(predicted) != *target) {
-                    infringed = true;
-                }
-                if (signEnabled && target &&
-                    *target * predicted <= 0.0) {
-                    infringed = true;
-                }
+        const double latentDelta = active
+            ? winding.mapLatentCoordinate[b] -
+                winding.mapLatentCoordinate[a]
+            : 0.0;
+        const auto emit = [&](FiberTraceConstraintAgreementClass itemClass,
+                              bool infringed) {
+            FiberTraceConstraintAgreementCounts counts;
+            counts.prepared = 1;
+            if (active) {
+                counts.evaluated = 1;
+                counts.infringed = infringed ? 1 : 0;
             } else {
-                infringed = !sameOrientation;
-                const auto signedTarget =
-                    diagnostic.effectiveSignedParallelDelta;
-                const bool magnitudeEnabled =
-                    diagnostic.parallelWindingRetained &&
-                    diagnostic.effectiveParallelWindingWeight > 0.0;
-                const bool signEnabled = diagnostic.hardParallelSign ||
-                    diagnostic.effectiveParallelSignPenalty > 0.0;
-                if (magnitudeEnabled) {
-                    const double predicted = signedTarget
-                        ? quantizedIntegerWindingTarget(latentDelta)
-                        : std::abs(quantizedIntegerWindingTarget(latentDelta));
-                    const double target = signedTarget.value_or(
-                        diagnostic.effectiveParallelWindingDistance);
-                    if (predicted != target)
-                        infringed = true;
-                }
-                if (signEnabled && signedTarget &&
-                    *signedTarget * latentDelta <= 0.0) {
-                    infringed = true;
-                }
+                counts.defectNeutralized = 1;
             }
-            counts.infringed = infringed ? 1 : 0;
+            add(result.classes[static_cast<std::size_t>(itemClass)], counts);
+            add(result.total, counts);
+        };
+        if (constraint.hardContinuity) {
+            emit(
+                FiberTraceConstraintAgreementClass::Continuity,
+                active && (!sameOrientation ||
+                    winding.mapWinding[a] != winding.mapWinding[b]));
+            continue;
         }
-        auto& classCounts = result.classes[static_cast<std::size_t>(
-            agreementClass)];
-        add(classCounts, counts);
-        add(result.total, counts);
+        emit(
+            perpendicular
+                ? FiberTraceConstraintAgreementClass::PerpendicularOrientation
+                : FiberTraceConstraintAgreementClass::ParallelOrientation,
+            active && (perpendicular ? sameOrientation : !sameOrientation));
+        if (perpendicular && diagnostic.perpendicularMagnitudePresent) {
+            const double target =
+                *diagnostic.effectivePerpendicularSignedDelta;
+            emit(
+                std::abs(target) <= 0.5 + kEpsilon
+                    ? FiberTraceConstraintAgreementClass::
+                          PerpendicularMagnitudeNext
+                    : FiberTraceConstraintAgreementClass::
+                          PerpendicularMagnitudeFar,
+                active && quantizedHalfWindingTarget(latentDelta) != target);
+        }
+        if (perpendicular && diagnostic.perpendicularSignPresent) {
+            emit(
+                FiberTraceConstraintAgreementClass::PerpendicularSign,
+                active && *diagnostic.effectivePerpendicularSignedDelta *
+                        latentDelta <= 0.0);
+        }
+        if (!perpendicular && diagnostic.parallelMagnitudePresent) {
+            const double target =
+                diagnostic.effectiveSignedParallelDelta.value_or(
+                    diagnostic.effectiveParallelWindingDistance);
+            const auto magnitudeClass = std::abs(target) <= kEpsilon
+                ? FiberTraceConstraintAgreementClass::ParallelMagnitudeSame
+                : std::abs(target) <= 1.0 + kEpsilon
+                    ? FiberTraceConstraintAgreementClass::ParallelMagnitudeOne
+                    : FiberTraceConstraintAgreementClass::ParallelMagnitudeFar;
+            emit(
+                magnitudeClass,
+                active && (diagnostic.effectiveSignedParallelDelta
+                    ? quantizedIntegerWindingTarget(latentDelta) != target
+                    : std::abs(quantizedIntegerWindingTarget(latentDelta)) !=
+                        target));
+        }
+        if (!perpendicular && diagnostic.parallelSignPresent) {
+            emit(
+                FiberTraceConstraintAgreementClass::ParallelSign,
+                active && *diagnostic.effectiveSignedParallelDelta *
+                        latentDelta <= 0.0);
+        }
     }
     return result;
 }
@@ -4855,26 +4884,39 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     FiberTraceReferenceWindingBenchmark result;
     result.tolerance = tolerance;
     result.references.resize(referenceSources);
-    const auto isRight = [&](const FiberTraceReferenceWindingObservation& o,
-                             int sign,
-                             double offset) {
-        const double expected =
-            static_cast<double>(sign) * o.virtualReferenceWinding + offset;
-        if (!(o.admittedCoefficient > 0.0) &&
-            (o.hardParallelSign || o.hardPerpendicularSign)) {
-            return scoreReferenceObservation(
-                       makeReferenceScoredObservation(o, 1, 0.0),
-                       expected)
-                       .hardViolations == 0;
+    std::vector<FiberTraceReferenceWindingObservation> benchmarkObservations(
+        observations.begin(), observations.end());
+    for (auto& observation : benchmarkObservations) {
+        const bool legacyCandidateOnly =
+            !observation.parallelMagnitudePresent &&
+            !observation.perpendicularMagnitudePresent &&
+            !observation.parallelSignPresent &&
+            !observation.perpendicularSignPresent &&
+            observation.inferredReferenceWindingCount > 0 &&
+            hasAdmittedReferenceEvidence(observation);
+        observation.admittedParallelCoefficient =
+            observation.parallelMagnitudePresent ? 1.0 : 0.0;
+        observation.perpendicularCoefficient =
+            observation.perpendicularMagnitudePresent ? 1.0 : 0.0;
+        observation.parallelSignPenalty =
+            observation.parallelSignPresent ? 1.0 : 0.0;
+        observation.perpendicularSignPenalty =
+            observation.perpendicularSignPresent ? 1.0 : 0.0;
+        observation.hardParallelSign = false;
+        observation.hardPerpendicularSign = false;
+        observation.rawCoefficient =
+            observation.admittedParallelCoefficient +
+            observation.perpendicularCoefficient +
+            observation.parallelSignPenalty +
+            observation.perpendicularSignPenalty;
+        observation.admittedCoefficient = observation.rawCoefficient;
+        if (legacyCandidateOnly) {
+            observation.rawCoefficient = 1.0;
+            observation.admittedCoefficient = 1.0;
         }
-        for (std::size_t candidate = 0; candidate < o.inferredReferenceWindingCount; ++candidate) {
-            if (std::abs(o.inferredReferenceWindings[candidate] - expected) <= tolerance + kEpsilon) {
-                return true;
-            }
-        }
-        return false;
-    };
-    const auto rawEstimates = inferFiberTraceReferenceRawWindings(observations);
+    }
+    const auto rawEstimates = inferFiberTraceReferenceRawWindings(
+        benchmarkObservations);
     std::map<
         std::size_t,
         std::vector<const FiberTraceReferenceRawWindingEstimate*>>
@@ -4949,25 +4991,17 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     std::map<std::size_t, double> offsetByGauge;
     for (const auto& gauge : result.gauges)
         offsetByGauge.emplace(gauge.integerGauge, gauge.offset);
-    for (const auto& observation : observations) {
-        if (observation.inferredReferenceWindingCount == 0 ||
-            !hasAdmittedReferenceEvidence(observation))
-            continue;
-        const auto offset = offsetByGauge.find(observation.integerGauge);
-        if (offset == offsetByGauge.end())
-            continue;
-        auto& counts = result.classes[static_cast<std::size_t>(observation.constraintClass)];
-        auto& reference = result.references[observation.referenceSource];
+    const auto addResult = [&](std::size_t source,
+                               FiberTraceReferenceBenchmarkClass itemClass,
+                               bool right) {
+        auto& counts = result.classes[static_cast<std::size_t>(itemClass)];
+        auto& reference = result.references[source];
         auto& referenceCounts =
-            reference.classes[static_cast<std::size_t>(observation.constraintClass)];
+            reference.classes[static_cast<std::size_t>(itemClass)];
         ++counts.total;
         ++referenceCounts.total;
         ++reference.sum.total;
         ++result.sum.total;
-        const bool right = isRight(
-            observation,
-            result.globalSign,
-            offset->second);
         if (right) {
             ++counts.right;
             ++referenceCounts.right;
@@ -4979,9 +5013,96 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
             ++reference.sum.wrong;
             ++result.sum.wrong;
         }
+    };
+    for (const auto& observation : observations) {
+        const bool legacyCandidateOnly =
+            !observation.parallelMagnitudePresent &&
+            !observation.perpendicularMagnitudePresent &&
+            !observation.parallelSignPresent &&
+            !observation.perpendicularSignPresent &&
+            observation.inferredReferenceWindingCount > 0 &&
+            hasAdmittedReferenceEvidence(observation);
+        if (!observation.bpEndpointActive && !legacyCandidateOnly)
+            continue;
+        const auto offset = offsetByGauge.find(observation.integerGauge);
+        const bool calibrated = offset != offsetByGauge.end();
+        const double expected = calibrated
+            ? static_cast<double>(result.globalSign) *
+                    observation.virtualReferenceWinding + offset->second
+            : 0.0;
+        const double delta = calibrated
+            ? observation.referenceDeltaSign *
+                (expected - observation.bpLatentCoordinate)
+            : 0.0;
+        if (legacyCandidateOnly) {
+            const double expectedWinding = calibrated
+                ? static_cast<double>(result.globalSign) *
+                        observation.virtualReferenceWinding + offset->second
+                : 0.0;
+            bool right = false;
+            if (calibrated) {
+                for (std::size_t candidate = 0;
+                     candidate < observation.inferredReferenceWindingCount;
+                     ++candidate) {
+                    right = right || std::abs(
+                        observation.inferredReferenceWindings[candidate] -
+                        expectedWinding) <= tolerance + kEpsilon;
+                }
+            }
+            const auto itemClass = observation.constraintClass ==
+                    FiberTraceReferenceConstraintClass::Perpendicular
+                ? FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude
+                : observation.constraintClass ==
+                        FiberTraceReferenceConstraintClass::ParallelSameWinding
+                    ? FiberTraceReferenceBenchmarkClass::ParallelSameMagnitude
+                    : FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude;
+            addResult(observation.referenceSource, itemClass, right);
+            continue;
+        }
+        if (observation.perpendicularMagnitudePresent) {
+            const bool right = calibrated &&
+                quantizedHalfWindingTarget(delta) ==
+                    *observation.signedPerpendicularTarget;
+            addResult(
+                observation.referenceSource,
+                FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude,
+                right);
+        }
+        if (observation.perpendicularSignPresent) {
+            const bool right = calibrated &&
+                *observation.signedPerpendicularTarget * delta > 0.0;
+            addResult(
+                observation.referenceSource,
+                FiberTraceReferenceBenchmarkClass::PerpendicularSign,
+                right);
+        }
+        if (observation.parallelMagnitudePresent) {
+            const bool right = calibrated &&
+                (observation.signedParallelTarget
+                    ? quantizedIntegerWindingTarget(delta) ==
+                        *observation.signedParallelTarget
+                    : std::abs(quantizedIntegerWindingTarget(delta)) ==
+                        observation.parallelDistance);
+            addResult(
+                observation.referenceSource,
+                observation.parallelDistance == 0.0
+                    ? FiberTraceReferenceBenchmarkClass::
+                          ParallelSameMagnitude
+                    : FiberTraceReferenceBenchmarkClass::
+                          ParallelOtherMagnitude,
+                right);
+        }
+        if (observation.parallelSignPresent) {
+            const bool right = calibrated &&
+                *observation.signedParallelTarget * delta > 0.0;
+            addResult(
+                observation.referenceSource,
+                FiberTraceReferenceBenchmarkClass::ParallelSign,
+                right);
+        }
     }
     const auto weighted = summarizeFiberTraceReferenceConstraintGroups(
-        observations, result);
+        benchmarkObservations, result);
     for (std::size_t source = 0;
          source < result.references.size() && source < weighted.size();
          ++source) {
@@ -4995,7 +5116,7 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
                 source, reference.estimatedWinding);
         if (!reference.estimatedWinding)
             continue;
-        for (const auto& observation : observations) {
+        for (const auto& observation : benchmarkObservations) {
             if (observation.referenceSource != source ||
                 observation.inferredReferenceWindingCount == 0 ||
                 !hasAdmittedReferenceEvidence(observation)) {
@@ -5110,16 +5231,25 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
         const double target = quantizedHalfWindingTarget(
             *constraint.signedWindingDelta * winding.measurementScale);
         observation.signedPerpendicularTarget = target;
+        observation.perpendicularMagnitudePresent = true;
+        observation.perpendicularSignPresent =
+            config.enforcePerpendicularWindingSign && target != 0.0;
+        const bool perpendicularSignEnabled =
+            observation.perpendicularSignPresent &&
+            config.perpendicularSignWeight > 0.0;
         observation.hardPerpendicularSign =
-            config.enforcePerpendicularWindingSign && target != 0.0 &&
+            perpendicularSignEnabled &&
             (!finiteSigns || hardSignPromotedByAlignment(
                  config, constraint.perpendicularNormalAlignment));
         observation.perpendicularSignPenalty =
-            config.enforcePerpendicularWindingSign && target != 0.0 &&
-                finiteSigns && !hardSignPromotedByAlignment(
+            perpendicularSignEnabled && finiteSigns &&
+                !hardSignPromotedByAlignment(
                     config, constraint.perpendicularNormalAlignment)
-            ? *config.finiteSignInfringementCost * selectedConfidence
+            ? *config.finiteSignInfringementCost *
+                config.perpendicularSignWeight * selectedConfidence
             : 0.0;
+        observation.perpendicularSignWeightMultiplier =
+            config.perpendicularSignWeight;
         observation.perpendicularCoefficient =
             selectedConfidence * windingWeightMultiplier(target) *
             windingClassWeight(config, true, target);
@@ -5143,9 +5273,9 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
         : selectedConfidence * windingWeightMultiplier(parallelTarget) *
             windingClassWeight(config, false, parallelTarget);
     const bool parallelAdmitted = !perpendicular &&
-        (parallelTarget == 0.0 || constraint.signedParallelWindingDelta) &&
         (!config.parallelWindingDistanceCutoff ||
          parallelTarget < *config.parallelWindingDistanceCutoff);
+    observation.parallelMagnitudePresent = parallelAdmitted;
     observation.admittedParallelCoefficient = parallelAdmitted
         ? observation.rawParallelCoefficient
         : 0.0;
@@ -5155,18 +5285,23 @@ FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
         observation.signedParallelTarget = quantizedIntegerWindingTarget(
             *constraint.signedParallelWindingDelta *
             winding.measurementScale);
-        observation.hardParallelSign = parallelAdmitted &&
+        observation.parallelSignPresent = parallelAdmitted &&
             config.enforceParallelWindingSign &&
-            *observation.signedParallelTarget != 0.0 &&
+            *observation.signedParallelTarget != 0.0;
+        const bool parallelSignEnabled = observation.parallelSignPresent &&
+            config.parallelSignWeight > 0.0;
+        observation.hardParallelSign = parallelAdmitted &&
+            parallelSignEnabled &&
             (!finiteSigns || hardSignPromotedByAlignment(
                  config, constraint.parallelNormalAlignment));
         observation.parallelSignPenalty = parallelAdmitted &&
-            config.enforceParallelWindingSign &&
-            *observation.signedParallelTarget != 0.0 && finiteSigns &&
+            parallelSignEnabled && finiteSigns &&
                 !hardSignPromotedByAlignment(
                     config, constraint.parallelNormalAlignment)
-            ? *config.finiteSignInfringementCost * selectedConfidence
+            ? *config.finiteSignInfringementCost * config.parallelSignWeight *
+                selectedConfidence
             : 0.0;
+        observation.parallelSignWeightMultiplier = config.parallelSignWeight;
         addCandidate(
             observation.bpLatentCoordinate +
             observation.referenceDeltaSign *
@@ -5218,6 +5353,26 @@ const char* fiberTraceReferenceConstraintGroupName(
     case FiberTraceReferenceConstraintGroup::ParallelTwoPlus:
         return "parallel_2+";
     case FiberTraceReferenceConstraintGroup::Count:
+        break;
+    }
+    return "invalid";
+}
+
+const char* fiberTraceReferenceBenchmarkClassName(
+    FiberTraceReferenceBenchmarkClass benchmarkClass) noexcept
+{
+    switch (benchmarkClass) {
+    case FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude:
+        return "perp_winding";
+    case FiberTraceReferenceBenchmarkClass::PerpendicularSign:
+        return "perp_sign";
+    case FiberTraceReferenceBenchmarkClass::ParallelSameMagnitude:
+        return "parallel_same_winding";
+    case FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude:
+        return "parallel_other_winding";
+    case FiberTraceReferenceBenchmarkClass::ParallelSign:
+        return "parallel_sign";
+    case FiberTraceReferenceBenchmarkClass::Count:
         break;
     }
     return "invalid";
@@ -5365,12 +5520,16 @@ const char* fiberTraceConstraintEvidenceClassName(
     switch (evidenceClass) {
     case FiberTraceConstraintEvidenceClass::Continuity:
         return "continuity";
-    case FiberTraceConstraintEvidenceClass::Perpendicular:
-        return "perpendicular";
-    case FiberTraceConstraintEvidenceClass::ParallelSameWinding:
-        return "parallel_same";
-    case FiberTraceConstraintEvidenceClass::ParallelOtherWinding:
-        return "parallel_other";
+    case FiberTraceConstraintEvidenceClass::PerpendicularMagnitude:
+        return "perp_winding";
+    case FiberTraceConstraintEvidenceClass::PerpendicularSign:
+        return "perp_sign";
+    case FiberTraceConstraintEvidenceClass::ParallelSameMagnitude:
+        return "parallel_same_winding";
+    case FiberTraceConstraintEvidenceClass::ParallelOtherMagnitude:
+        return "parallel_other_winding";
+    case FiberTraceConstraintEvidenceClass::ParallelSign:
+        return "parallel_sign";
     case FiberTraceConstraintEvidenceClass::Count:
         break;
     }
@@ -5507,16 +5666,22 @@ FiberTraceConstraintEvidenceSummary summarizeFiberTraceConstraintEvidence(
             diagnostic.hardPerpendicularSign;
         const bool parallelHardSign = diagnostic.hardParallelSign;
         const bool hardSign = perpendicularHardSign || parallelHardSign;
-        const double parallelWeight = diagnostic.parallelWindingRetained
-            ? diagnostic.effectiveParallelWindingWeight +
-                diagnostic.effectiveParallelSignPenalty
+        const double parallelMagnitudeWeight =
+            diagnostic.parallelMagnitudePresent
+            ? diagnostic.effectiveParallelWindingWeight
             : 0.0;
-        const double perpendicularWeight =
-            diagnostic.effectivePerpendicularWindingWeight +
+        const double perpendicularMagnitudeWeight =
+            diagnostic.perpendicularMagnitudePresent
+            ? diagnostic.effectivePerpendicularWindingWeight
+            : 0.0;
+        const double parallelSignWeight =
+            diagnostic.effectiveParallelSignPenalty;
+        const double perpendicularSignWeight =
             diagnostic.effectivePerpendicularSignPenalty;
         const double measurementWeight = constraint.hardContinuity
-            ? parallelWeight
-            : parallelWeight + perpendicularWeight;
+            ? parallelMagnitudeWeight
+            : parallelMagnitudeWeight + perpendicularMagnitudeWeight +
+                parallelSignWeight + perpendicularSignWeight;
         addMeasurementEndpoint(
             diagnostic.pieceA, measurementWeight, hardSign);
         addMeasurementEndpoint(
@@ -5526,24 +5691,32 @@ FiberTraceConstraintEvidenceSummary summarizeFiberTraceConstraintEvidence(
             addTerm(
                 diagnostic,
                 FiberTraceConstraintEvidenceClass::Continuity,
-                parallelWeight);
+                parallelMagnitudeWeight);
             continue;
         }
         addTerm(
             diagnostic,
-            FiberTraceConstraintEvidenceClass::Perpendicular,
-            perpendicularWeight,
+            FiberTraceConstraintEvidenceClass::PerpendicularMagnitude,
+            perpendicularMagnitudeWeight);
+        addTerm(
+            diagnostic,
+            FiberTraceConstraintEvidenceClass::PerpendicularSign,
+            perpendicularSignWeight,
             perpendicularHardSign);
-        if (!diagnostic.parallelWindingRetained)
+        if (!diagnostic.parallelMagnitudePresent)
             continue;
         const auto parallelClass =
             std::abs(diagnostic.effectiveParallelWindingDistance) <= kEpsilon
-            ? FiberTraceConstraintEvidenceClass::ParallelSameWinding
-            : FiberTraceConstraintEvidenceClass::ParallelOtherWinding;
+            ? FiberTraceConstraintEvidenceClass::ParallelSameMagnitude
+            : FiberTraceConstraintEvidenceClass::ParallelOtherMagnitude;
         addTerm(
             diagnostic,
             parallelClass,
-            parallelWeight,
+            parallelMagnitudeWeight);
+        addTerm(
+            diagnostic,
+            FiberTraceConstraintEvidenceClass::ParallelSign,
+            parallelSignWeight,
             parallelHardSign);
     }
     return result;

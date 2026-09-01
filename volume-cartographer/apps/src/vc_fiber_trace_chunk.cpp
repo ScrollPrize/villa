@@ -112,6 +112,8 @@ struct Options {
     std::optional<double> windingSignCost = 44.0;
     std::array<double, 5> windingWeights =
         vc::fiber_tracer::kDefaultFiberTraceWindingClassWeights;
+    std::array<double, 2> windingSignWeights =
+        vc::fiber_tracer::kDefaultFiberTraceWindingSignWeights;
     std::optional<std::vector<double>> windingWeightSearch;
     bool windingWeightSearchLocal = false;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
@@ -137,6 +139,7 @@ struct Options {
     bool hasPieceBreakCostOption = false;
     bool hasParallelWindingCutoffOption = false;
     bool hasWindingWeightOption = false;
+    bool hasWindingSignWeightOption = false;
     bool hasWindingSignOption = false;
     bool hasWindingDecisionConfidenceOption = false;
     bool hasWindingNormalConfidenceOption = false;
@@ -270,9 +273,11 @@ void usage(const char* executable)
               << "  --winding-hard-sign-angle DEG|off\n"
               << "                              promote signs within DEG of normal to hard [30]\n"
               << "  --winding-weights P05,PFAR,P0,P1,P2\n"
-              << "                              five nonnegative factor multipliers [0,4,2,2,1]\n"
+              << "                              five nonnegative factor multipliers [0.5,2,1,2,1]\n"
+              << "  --winding-sign-weights PERP,PARALLEL\n"
+              << "                              two nonnegative sign multipliers [0,1]\n"
               << "  --winding-weight-search V0,V1,...\n"
-              << "                              exhaustive five-class reference grid\n"
+              << "                              exhaustive seven-weight reference grid\n"
               << "  --winding-weight-search-local\n"
               << "                              repeat one-coordinate /2,*2 search to a local optimum\n"
               << "  --winding-fixed-phase F   fixed phase in [0,0.5] [0.5]\n"
@@ -705,6 +710,18 @@ Options parse(int argc, char** argv)
             options.hasWindingWeightOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-sign-weights") {
+            const auto values = numberList(
+                index, argc, argv, "--winding-sign-weights", true);
+            if (values.size() != options.windingSignWeights.size()) {
+                fail("--winding-sign-weights requires exactly two values");
+            }
+            std::copy(
+                values.begin(), values.end(),
+                options.windingSignWeights.begin());
+            options.hasWindingSignWeightOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-hard-signs") {
             const std::string mode = value(
                 index, argc, argv, "--winding-hard-signs");
@@ -1129,6 +1146,7 @@ Options parse(int argc, char** argv)
              options.hasPieceBreakCostOption ||
              options.hasParallelWindingCutoffOption ||
              options.hasWindingWeightOption ||
+             options.hasWindingSignWeightOption ||
              options.hasWindingSignOption ||
              options.hasWindingDecisionConfidenceOption ||
              options.hasWindingNormalConfidenceOption ||
@@ -1142,8 +1160,9 @@ Options parse(int argc, char** argv)
         }
         if (options.hasWindingWeightSearchOption &&
             (options.hasWindingWeightOption ||
+             options.hasWindingSignWeightOption ||
              options.hasWindingWeightSearchLocalOption)) {
-            fail("--winding-weights conflicts with --winding-weight-search");
+            fail("explicit winding value/sign-hardness weights conflict with --winding-weight-search");
         }
         if (options.hasWindingWeightSearchLocalOption &&
             !options.hasWindingWeightOption) {
@@ -1924,6 +1943,10 @@ void writeAndPrintBpReport(
            "decision_confidence,normal_confidence,"
            "effective_parallel_sign_penalty,"
            "effective_perpendicular_sign_penalty,"
+           "parallel_sign_weight_multiplier,"
+           "perpendicular_sign_weight_multiplier,"
+           "parallel_winding_present,perpendicular_winding_present,"
+           "parallel_sign_present,perpendicular_sign_present,"
            "perpendicular_normal_alignment,parallel_normal_alignment,"
            "original_signed_delta,canonical_raw_signed_delta,"
            "original_signed_parallel_delta,"
@@ -1965,7 +1988,13 @@ void writeAndPrintBpReport(
                      << factor.decisionConfidenceMultiplier << ','
                      << factor.normalConfidenceMultiplier << ','
                      << factor.effectiveParallelSignPenalty << ','
-                     << factor.effectivePerpendicularSignPenalty << ',';
+                     << factor.effectivePerpendicularSignPenalty << ','
+                     << factor.parallelSignWeightMultiplier << ','
+                     << factor.perpendicularSignWeightMultiplier << ','
+                     << (factor.parallelMagnitudePresent ? 1 : 0) << ','
+                     << (factor.perpendicularMagnitudePresent ? 1 : 0) << ','
+                     << (factor.parallelSignPresent ? 1 : 0) << ','
+                     << (factor.perpendicularSignPresent ? 1 : 0) << ',';
         writeOptionalDouble(
             factorOutput, factor.perpendicularNormalAlignment);
         factorOutput << ',';
@@ -3389,6 +3418,8 @@ struct ReferenceBpCrossConstraints {
     std::size_t referencePieces = 0;
 };
 
+using WindingWeightTuple = std::array<double, 7>;
+
 void setWindingClassWeights(
     vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
     const std::array<double, 5>& weights)
@@ -3398,6 +3429,30 @@ void setWindingClassWeights(
     config.parallelSameWeight = weights[2];
     config.parallelOneWeight = weights[3];
     config.parallelFarWeight = weights[4];
+}
+
+void setWindingWeights(
+    vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
+    const WindingWeightTuple& weights)
+{
+    setWindingClassWeights(
+        config,
+        {weights[0], weights[1], weights[2], weights[3], weights[4]});
+    config.perpendicularSignWeight = weights[5];
+    config.parallelSignWeight = weights[6];
+}
+
+WindingWeightTuple windingWeights(const Options& options)
+{
+    return {
+        options.windingWeights[0],
+        options.windingWeights[1],
+        options.windingWeights[2],
+        options.windingWeights[3],
+        options.windingWeights[4],
+        options.windingSignWeights[0],
+        options.windingSignWeights[1],
+    };
 }
 
 ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
@@ -3548,9 +3603,9 @@ WindingWeightSearchScore scoreWindingWeightSearch(
 
 bool betterWindingWeightSearchResult(
     const WindingWeightSearchScore& candidate,
-    const std::array<double, 5>& candidateWeights,
+    const WindingWeightTuple& candidateWeights,
     const WindingWeightSearchScore& current,
-    const std::array<double, 5>& currentWeights)
+    const WindingWeightTuple& currentWeights)
 {
     if (candidate.converged != current.converged)
         return candidate.converged;
@@ -3600,16 +3655,18 @@ bool strictlyBetterWindingWeightSearchQuality(
     return false;
 }
 
-std::string formatWindingWeights(const std::array<double, 5>& weights)
+std::string formatWindingWeights(const WindingWeightTuple& weights)
 {
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(6);
-    for (std::size_t index = 0; index < weights.size(); ++index) {
+    output << "winding=";
+    for (std::size_t index = 0; index < 5; ++index) {
         if (index != 0)
             output << ',';
         output << weights[index];
     }
+    output << " sign=" << weights[5] << ',' << weights[6];
     return output.str();
 }
 
@@ -3650,7 +3707,10 @@ std::string formatReferenceBpWindingBenchmark(
            << config.perpendicularFarWeight << ','
            << config.parallelSameWeight << ','
            << config.parallelOneWeight << ','
-           << config.parallelFarWeight << '\n'
+           << config.parallelFarWeight
+           << " sign_weights="
+           << config.perpendicularSignWeight << ','
+           << config.parallelSignWeight << '\n'
            << "global sign=" << benchmark.globalSign << '\n'
            << "gauge calibration\n"
            << std::left << std::setw(12) << "gauge"
@@ -3805,15 +3865,22 @@ std::string formatReferenceBpWindingBenchmark(
     printOrientationCounts(orientationBenchmark.sum);
     output << "\n\n";
 
-    constexpr std::array<const char*, 4> names{
-        "perpendicular", "parallel_same", "parallel_other", "sum"};
+    constexpr std::array<const char*, 6> names{
+        "perp_winding",
+        "perp_sign",
+        "parallel_same_winding",
+        "parallel_other_winding",
+        "parallel_sign",
+        "sum"};
     output << "reference fiber errors fraction=right/(right+wrong)\n"
            << std::setw(8) << "winding"
            << std::setw(8) << "est_w"
            << std::setw(10) << "parity_ok"
-           << std::setw(8) << "perp_r" << std::setw(8) << "perp_w" << std::setw(8) << "perp_f"
-           << std::setw(8) << "same_r" << std::setw(8) << "same_w" << std::setw(8) << "same_f"
-           << std::setw(8) << "other_r" << std::setw(8) << "other_w" << std::setw(8) << "other_f"
+           << std::setw(8) << "pm_r" << std::setw(8) << "pm_w" << std::setw(8) << "pm_f"
+           << std::setw(8) << "ps_r" << std::setw(8) << "ps_w" << std::setw(8) << "ps_f"
+           << std::setw(8) << "sm_r" << std::setw(8) << "sm_w" << std::setw(8) << "sm_f"
+           << std::setw(8) << "om_r" << std::setw(8) << "om_w" << std::setw(8) << "om_f"
+           << std::setw(8) << "qs_r" << std::setw(8) << "qs_w" << std::setw(8) << "qs_f"
            << std::setw(8) << "sum_r" << std::setw(8) << "sum_w" << "sum_f\n";
     for (std::size_t source = 0; source < reference.sourceNames.size(); ++source) {
         const vc::fiber_tracer::FiberTraceReferenceSourceBenchmark empty;
@@ -3992,9 +4059,11 @@ std::string formatBpConstraintEvidenceCohorts(
     };
     constexpr std::array evidenceClasses{
         vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Continuity,
-        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Perpendicular,
-        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelSameWinding,
-        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelOtherWinding,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::PerpendicularMagnitude,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::PerpendicularSign,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelSameMagnitude,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelOtherMagnitude,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelSign,
     };
     const auto cohort = [&] (
         std::string_view name,
@@ -4003,18 +4072,19 @@ std::string formatBpConstraintEvidenceCohorts(
         for (const auto evidenceClass : evidenceClasses) {
             const auto& evidence =
                 counts.classes[static_cast<std::size_t>(evidenceClass)];
-            if (evidenceClass ==
-                vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Perpendicular) {
-                row(name, "perp_value", evidence, counts.states);
-                row(name, "perp_sign", evidence, counts.states, true);
-                continue;
-            }
             row(
                 name,
                 vc::fiber_tracer::fiberTraceConstraintEvidenceClassName(
                     evidenceClass),
                 evidence,
                 counts.states);
+            if (evidenceClass == vc::fiber_tracer::
+                    FiberTraceConstraintEvidenceClass::PerpendicularSign) {
+                row(name, "perp_sign_hard", evidence, counts.states, true);
+            } else if (evidenceClass == vc::fiber_tracer::
+                    FiberTraceConstraintEvidenceClass::ParallelSign) {
+                row(name, "parallel_sign_hard", evidence, counts.states, true);
+            }
         }
     };
     cohort("central", summary.selected);
@@ -4580,6 +4650,10 @@ int main(int argc, char** argv)
                                 options.windingNormalConfidence;
                             windingConfig.finiteSignInfringementCost =
                                 options.windingSignCost;
+                            windingConfig.perpendicularSignWeight =
+                                options.windingSignWeights[0];
+                            windingConfig.parallelSignWeight =
+                                options.windingSignWeights[1];
                             setWindingClassWeights(
                                 windingConfig, options.windingWeights);
                             auto bpConstraints = selectedBpConstraints;
@@ -4749,10 +4823,10 @@ int main(int argc, char** argv)
                                     extractReferenceBpCrossConstraints(*referenceDiagnostics, bpPieceLines, options, normals, *alignedNormalField);
                             }
                             const auto solveInterleaved = [&] (
-                                const std::array<double, 5>& weights,
+                                const WindingWeightTuple& weights,
                                 bool showProgress) {
                                 auto weightedConfig = windingConfig;
-                                setWindingClassWeights(weightedConfig, weights);
+                                setWindingWeights(weightedConfig, weights);
                                 if (jointGrid) {
                                     auto joint = options.jointGrid;
                                     static_cast<vc::fiber_tracer::
@@ -4804,20 +4878,20 @@ int main(int argc, char** argv)
                                         "Winding weight search has no reference benchmark");
                                 }
                                 struct SearchRow {
-                                    std::array<double, 5> weights;
+                                    WindingWeightTuple weights;
                                     WindingWeightSearchScore score;
                                     double seconds = 0.0;
                                     std::string status;
                                 };
                                 std::vector<SearchRow> rows;
                                 std::optional<WindingWeightSearchScore> bestScore;
-                                std::array<double, 5> bestWeights{};
+                                WindingWeightTuple bestWeights{};
                                 const auto searchStarted =
                                     std::chrono::steady_clock::now();
                                 std::size_t evaluatedScenarios = 0;
 
                                 const auto evaluate = [&] (
-                                    const std::array<double, 5>& weights,
+                                    const WindingWeightTuple& weights,
                                     const std::string& phase,
                                     const std::size_t completed,
                                     const std::size_t workTotal)
@@ -4828,7 +4902,7 @@ int main(int argc, char** argv)
                                         auto candidate =
                                             solveInterleaved(weights, false);
                                         auto candidateConfig = windingConfig;
-                                        setWindingClassWeights(
+                                        setWindingWeights(
                                             candidateConfig, weights);
                                         const auto observations =
                                             makeReferenceBpWindingObservations(
@@ -4923,7 +4997,7 @@ int main(int argc, char** argv)
                                         100'000;
                                     std::size_t scenarioCount = 1;
                                     for (std::size_t dimension = 0;
-                                         dimension < 5;
+                                         dimension < 7;
                                          ++dimension) {
                                         if (scenarioCount > maximumScenarios /
                                             options.windingWeightSearch->size()) {
@@ -4939,10 +5013,13 @@ int main(int argc, char** argv)
                                     for (const double pFar : *options.windingWeightSearch)
                                     for (const double p0 : *options.windingWeightSearch)
                                     for (const double p1 : *options.windingWeightSearch)
-                                    for (const double pFarParallel : *options.windingWeightSearch) {
+                                    for (const double pFarParallel : *options.windingWeightSearch)
+                                    for (const double perpendicularSign : *options.windingWeightSearch)
+                                    for (const double parallelSign : *options.windingWeightSearch) {
                                         ++scenario;
                                         (void)evaluate(
-                                            {p05, pFar, p0, p1, pFarParallel},
+                                            {p05, pFar, p0, p1, pFarParallel,
+                                             perpendicularSign, parallelSign},
                                             "grid", scenario, scenarioCount);
                                     }
                                 } else {
@@ -4951,17 +5028,19 @@ int main(int argc, char** argv)
                                         exponentLimit + 1;
                                     constexpr std::size_t maximumIterations =
                                         160;
-                                    using WeightTuple = std::array<double, 5>;
-                                    using SearchState = std::array<int, 5>;
+                                    using WeightTuple = WindingWeightTuple;
+                                    using SearchState = std::array<int, 7>;
                                     std::map<SearchState,
                                              std::optional<std::size_t>> cache;
                                     WeightTuple positiveAnchor{};
+                                    const WeightTuple initialWeights =
+                                        windingWeights(options);
                                     for (std::size_t dimension = 0;
                                          dimension < positiveAnchor.size();
                                          ++dimension) {
                                         positiveAnchor[dimension] =
-                                            options.windingWeights[dimension] > 0.0
-                                            ? options.windingWeights[dimension]
+                                            initialWeights[dimension] > 0.0
+                                            ? initialWeights[dimension]
                                             : 1.0;
                                     }
                                     const auto weightsFor = [&] (
@@ -5015,7 +5094,7 @@ int main(int argc, char** argv)
                                     for (std::size_t dimension = 0;
                                          dimension < currentState.size();
                                          ++dimension) {
-                                        if (options.windingWeights[dimension] ==
+                                        if (initialWeights[dimension] ==
                                             0.0) {
                                             currentState[dimension] =
                                                 zeroCoordinate;
@@ -5033,7 +5112,7 @@ int main(int argc, char** argv)
                                          iteration <= maximumIterations;
                                          ++iteration) {
                                         std::vector<SearchState> neighbors;
-                                        neighbors.reserve(15);
+                                        neighbors.reserve(21);
                                         const auto appendNeighbor = [&] (
                                             const SearchState& candidate) {
                                             if (candidate == currentState ||
@@ -5046,7 +5125,7 @@ int main(int argc, char** argv)
                                             neighbors.push_back(candidate);
                                         };
                                         for (std::size_t dimension = 0;
-                                             dimension < 5;
+                                             dimension < currentState.size();
                                              ++dimension) {
                                             if (currentState[dimension] !=
                                                 zeroCoordinate) {
@@ -5190,7 +5269,7 @@ int main(int argc, char** argv)
                                         << std::noboolalpha
                                         << "  " << row.seconds << '\n';
                                 }
-                                setWindingClassWeights(
+                                setWindingWeights(
                                     windingConfig, bestWeights);
                                 interleavedWinding = solveInterleaved(
                                     bestWeights, false);
@@ -5200,7 +5279,7 @@ int main(int argc, char** argv)
                                     << '\n';
                             } else {
                                 interleavedWinding = solveInterleaved(
-                                    options.windingWeights, true);
+                                    windingWeights(options), true);
                             }
 
                             if (interleavedWinding &&
@@ -5541,6 +5620,10 @@ int main(int argc, char** argv)
                                 options.windingNormalConfidence;
                             windingConfig.finiteSignInfringementCost =
                                 options.windingSignCost;
+                            windingConfig.perpendicularSignWeight =
+                                options.windingSignWeights[0];
+                            windingConfig.parallelSignWeight =
+                                options.windingSignWeights[1];
                             const auto winding = vc::fiber_tracer::
                                 solveFiberTraceWindingBeliefPropagation(
                                     comparisonReport,

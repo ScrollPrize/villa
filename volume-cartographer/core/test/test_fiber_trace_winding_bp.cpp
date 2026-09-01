@@ -96,6 +96,8 @@ FiberTraceWindingBeliefPropagationConfig config()
     useUnitClassWeights(result);
     result.enforcePerpendicularWindingSign = true;
     result.enforceParallelWindingSign = false;
+    result.perpendicularSignWeight = 1.0;
+    result.parallelSignWeight = 1.0;
     result.decisionConfidence =
         FiberTraceWindingDecisionConfidence::Legacy;
     result.normalConfidence = FiberTraceWindingNormalConfidence::None;
@@ -110,11 +112,13 @@ FiberTraceWindingBeliefPropagationConfig config()
 TEST_CASE("Winding class production defaults use the selected reference tuple")
 {
     const FiberTraceWindingBeliefPropagationConfig defaults;
-    CHECK(defaults.perpendicularNextWeight == 0.0);
-    CHECK(defaults.perpendicularFarWeight == 4.0);
-    CHECK(defaults.parallelSameWeight == 2.0);
+    CHECK(defaults.perpendicularNextWeight == 0.5);
+    CHECK(defaults.perpendicularFarWeight == 2.0);
+    CHECK(defaults.parallelSameWeight == 1.0);
     CHECK(defaults.parallelOneWeight == 2.0);
     CHECK(defaults.parallelFarWeight == 1.0);
+    CHECK(defaults.perpendicularSignWeight == 0.0);
+    CHECK(defaults.parallelSignWeight == 1.0);
     CHECK(defaults.enforcePerpendicularWindingSign);
     CHECK(defaults.enforceParallelWindingSign);
     CHECK(defaults.decisionConfidence ==
@@ -279,6 +283,107 @@ TEST_CASE("Finite winding sign costs replace hard rejection and preserve zero-co
     CHECK(tiedHard.factorDiagnostics[0].hardPerpendicularSign);
 }
 
+TEST_CASE("Signed winding value and extra sign hardness are independently weighted")
+{
+    const auto source = lines(2);
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 1.0, 1.0);
+
+    const auto solve = [&](double valueWeight, double signWeight) {
+        FiberTraceJointGridWindingConfig joint;
+        static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) =
+            config();
+        useZeroClassWeights(joint);
+        joint.parallelOneWeight = valueWeight;
+        joint.enforcePerpendicularWindingSign = false;
+        joint.enforceParallelWindingSign = true;
+        joint.parallelSignWeight = signWeight;
+        joint.finiteSignInfringementCost = 8.0;
+        joint.hardSignMinimumNormalAlignment.reset();
+        joint.fixedPhaseMagnitude = 0.5;
+        joint.fixedMeasurementScale = 1.0;
+        joint.mixedUnaryCost = 100.0;
+        joint.stableIterations = 1;
+        return solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint, {}, fixed);
+    };
+
+    const auto valueOnly = solve(1.0, 0.0);
+    REQUIRE(valueOnly.factorDiagnostics.size() == 1);
+    CHECK(valueOnly.factorDiagnostics[0].parallelMagnitudePresent);
+    CHECK(valueOnly.factorDiagnostics[0].parallelSignPresent);
+    CHECK(valueOnly.factorDiagnostics[0].effectiveParallelWindingWeight > 0.0);
+    CHECK(valueOnly.factorDiagnostics[0].effectiveParallelSignPenalty == 0.0);
+    CHECK_FALSE(valueOnly.factorDiagnostics[0].hardParallelSign);
+    CHECK(valueOnly.mapLatentCoordinate[1] >
+          valueOnly.mapLatentCoordinate[0]);
+
+    const auto weightedSign = solve(1.0, 3.0);
+    CHECK(weightedSign.factorDiagnostics[0]
+              .effectiveParallelSignPenalty == doctest::Approx(24.0));
+    CHECK(weightedSign.factorDiagnostics[0]
+              .parallelSignWeightMultiplier == doctest::Approx(3.0));
+
+    report.constraints.front().signedParallelWindingDelta = -1.0;
+    const auto reversedValueOnly = solve(1.0, 0.0);
+    CHECK(reversedValueOnly.mapLatentCoordinate[1] <
+          reversedValueOnly.mapLatentCoordinate[0]);
+
+    auto invalid = config();
+    invalid.perpendicularSignWeight = -1.0;
+    CHECK_THROWS_AS(
+        solveFiberTraceWindingBeliefPropagation(
+            report, topology(source, report), invalid),
+        std::invalid_argument);
+    invalid = config();
+    invalid.parallelSignWeight =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        solveFiberTraceWindingBeliefPropagation(
+            report, topology(source, report), invalid),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference benchmark lists signed winding value and sign hardness separately")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1};
+    winding.mapLatentCoordinate = {0.0};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal};
+    winding.integerGaugeByPiece = {0};
+    winding.componentByPiece = {0};
+    winding.measurementScale = 1.0;
+
+    FiberTraceConstraint constraint;
+    constraint.pieceA = 0;
+    constraint.pieceB = 1;
+    constraint.parallelScore = 1.0;
+    constraint.signedParallelWindingDelta = 1.0;
+    constraint.parallelWindingDistance = 1.0;
+    auto settings = config();
+    settings.enforceParallelWindingSign = true;
+    settings.parallelSignWeight = 0.0;
+    const auto observation = makeFiberTraceReferenceWindingObservation(
+        constraint, false, 1.0, 0, winding, settings);
+    CHECK(observation.parallelMagnitudePresent);
+    CHECK(observation.parallelSignPresent);
+    CHECK(observation.parallelSignPenalty == 0.0);
+    CHECK_FALSE(observation.hardParallelSign);
+
+    const std::array observations{observation};
+    const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    const auto& windingCounts = benchmark.classes[static_cast<std::size_t>(
+        FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude)];
+    const auto& signCounts = benchmark.classes[static_cast<std::size_t>(
+        FiberTraceReferenceBenchmarkClass::ParallelSign)];
+    CHECK(windingCounts.total == 1);
+    CHECK(signCounts.total == 1);
+    CHECK(benchmark.sum.total == 2);
+}
+
 TEST_CASE("Raw normal alignment promotes enabled dominant signs to hard")
 {
     const auto source = lines(2);
@@ -289,6 +394,8 @@ TEST_CASE("Raw normal alignment promotes enabled dominant signs to hard")
     auto& constraint = report.constraints.front();
     FiberTraceJointGridWindingConfig config;
     useZeroClassWeights(config);
+    config.perpendicularSignWeight = 1.0;
+    config.parallelSignWeight = 1.0;
     config.enforcePerpendicularWindingSign = false;
     config.enforceParallelWindingSign = true;
     config.finiteSignInfringementCost = 0.0;
@@ -457,6 +564,7 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     auto hard = diagnostic(0, 0, 1);
     hard.parallelScore = 1.0;
     hard.parallelWindingRetained = true;
+    hard.parallelMagnitudePresent = true;
     hard.effectiveParallelWindingWeight = 1.0;
     diagnostics.push_back(hard);
 
@@ -464,6 +572,9 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     both.parallelScore = 0.25;
     both.perpendicularScore = 0.75;
     both.parallelWindingRetained = true;
+    both.parallelMagnitudePresent = true;
+    both.perpendicularMagnitudePresent = true;
+    both.perpendicularSignPresent = true;
     both.effectiveParallelWindingWeight = 0.25;
     both.effectivePerpendicularWindingWeight = 0.75;
     both.effectivePerpendicularSignedDelta = 0.5;
@@ -474,6 +585,9 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     other.parallelScore = 0.4;
     other.perpendicularScore = 0.6;
     other.parallelWindingRetained = true;
+    other.parallelMagnitudePresent = true;
+    other.perpendicularMagnitudePresent = true;
+    other.perpendicularSignPresent = true;
     other.effectiveParallelWindingWeight = 0.4;
     other.effectivePerpendicularWindingWeight = 0.2;
     other.effectiveParallelWindingDistance = 2.0;
@@ -506,36 +620,44 @@ TEST_CASE("Constraint evidence summary separates cohorts classes and final state
     CHECK(otherContinuity.incidences == 1);
     CHECK(otherContinuity.activeIncidences == 1);
 
-    const auto& selectedPerpendicular =
-        summary.selected.classes[static_cast<std::size_t>(Class::Perpendicular)];
-    CHECK(selectedPerpendicular.incidences == 3);
-    CHECK(selectedPerpendicular.activeIncidences == 1);
-    CHECK(selectedPerpendicular.defectIncidences == 2);
-    CHECK(selectedPerpendicular.effectiveWeight == doctest::Approx(1.7));
-    CHECK(selectedPerpendicular.activeEffectiveWeight == doctest::Approx(0.75));
-    CHECK(selectedPerpendicular.defectEffectiveWeight == doctest::Approx(0.95));
-    CHECK(selectedPerpendicular.hardSignIncidences == 3);
-    CHECK(selectedPerpendicular.activeHardSignIncidences == 1);
-    CHECK(selectedPerpendicular.defectHardSignIncidences == 2);
-    const auto& otherPerpendicular =
-        summary.other.classes[static_cast<std::size_t>(Class::Perpendicular)];
-    CHECK(otherPerpendicular.incidences == 1);
-    CHECK(otherPerpendicular.effectiveWeight == doctest::Approx(0.2));
-    CHECK(otherPerpendicular.hardSignIncidences == 1);
+    const auto& selectedPerpendicularMagnitude = summary.selected.classes[
+        static_cast<std::size_t>(Class::PerpendicularMagnitude)];
+    CHECK(selectedPerpendicularMagnitude.incidences == 3);
+    CHECK(selectedPerpendicularMagnitude.activeIncidences == 1);
+    CHECK(selectedPerpendicularMagnitude.defectIncidences == 2);
+    CHECK(selectedPerpendicularMagnitude.effectiveWeight ==
+          doctest::Approx(1.7));
+    CHECK(selectedPerpendicularMagnitude.activeEffectiveWeight ==
+          doctest::Approx(0.75));
+    CHECK(selectedPerpendicularMagnitude.defectEffectiveWeight ==
+          doctest::Approx(0.95));
+    const auto& selectedPerpendicularSign = summary.selected.classes[
+        static_cast<std::size_t>(Class::PerpendicularSign)];
+    CHECK(selectedPerpendicularSign.incidences == 0);
+    CHECK(selectedPerpendicularSign.hardSignIncidences == 3);
+    CHECK(selectedPerpendicularSign.activeHardSignIncidences == 1);
+    CHECK(selectedPerpendicularSign.defectHardSignIncidences == 2);
+    const auto& otherPerpendicularMagnitude = summary.other.classes[
+        static_cast<std::size_t>(Class::PerpendicularMagnitude)];
+    CHECK(otherPerpendicularMagnitude.incidences == 1);
+    CHECK(otherPerpendicularMagnitude.effectiveWeight == doctest::Approx(0.2));
+    const auto& otherPerpendicularSign = summary.other.classes[
+        static_cast<std::size_t>(Class::PerpendicularSign)];
+    CHECK(otherPerpendicularSign.hardSignIncidences == 1);
 
     const auto& selectedSame = summary.selected.classes[
-        static_cast<std::size_t>(Class::ParallelSameWinding)];
+        static_cast<std::size_t>(Class::ParallelSameMagnitude)];
     CHECK(selectedSame.incidences == 2);
     CHECK(selectedSame.effectiveWeight == doctest::Approx(0.5));
     CHECK(selectedSame.activeEffectiveWeight == doctest::Approx(0.25));
     CHECK(selectedSame.defectEffectiveWeight == doctest::Approx(0.25));
     const auto& selectedOther = summary.selected.classes[
-        static_cast<std::size_t>(Class::ParallelOtherWinding)];
+        static_cast<std::size_t>(Class::ParallelOtherMagnitude)];
     CHECK(selectedOther.incidences == 1);
     CHECK(selectedOther.defectIncidences == 1);
     CHECK(selectedOther.effectiveWeight == doctest::Approx(0.4));
     const auto& otherOther = summary.other.classes[
-        static_cast<std::size_t>(Class::ParallelOtherWinding)];
+        static_cast<std::size_t>(Class::ParallelOtherMagnitude)];
     CHECK(otherOther.incidences == 1);
     CHECK(otherOther.activeIncidences == 1);
     CHECK(otherOther.effectiveWeight == doctest::Approx(0.4));
@@ -607,11 +729,14 @@ TEST_CASE("Constraint agreement separates infringed and Defect-neutralized facto
     auto perpendicular = diagnostic(1, 0, 2);
     perpendicular.parallelScore = 0.0;
     perpendicular.perpendicularScore = 1.0;
+    perpendicular.perpendicularMagnitudePresent = true;
+    perpendicular.perpendicularSignPresent = true;
     perpendicular.effectivePerpendicularSignedDelta = 0.5;
     perpendicular.effectivePerpendicularWindingWeight = 1.0;
     winding.factorDiagnostics.push_back(perpendicular);
     auto parallel = diagnostic(2, 0, 3);
     parallel.parallelWindingRetained = true;
+    parallel.parallelMagnitudePresent = true;
     parallel.effectiveParallelWindingDistance = 0.0;
     parallel.effectiveParallelWindingWeight = 1.0;
     winding.factorDiagnostics.push_back(parallel);
@@ -625,17 +750,31 @@ TEST_CASE("Constraint agreement separates infringed and Defect-neutralized facto
     CHECK(continuityCounts.evaluated == 1);
     CHECK(continuityCounts.defectNeutralized == 1);
     CHECK(continuityCounts.infringed == 0);
-    const auto& perpendicularCounts = summary.classes[
+    const auto& perpendicularOrientation = summary.classes[
         static_cast<std::size_t>(
-            FiberTraceConstraintAgreementClass::PerpendicularNext)];
-    CHECK(perpendicularCounts.evaluated == 1);
-    CHECK(perpendicularCounts.infringed == 1);
+            FiberTraceConstraintAgreementClass::PerpendicularOrientation)];
+    CHECK(perpendicularOrientation.evaluated == 1);
+    CHECK(perpendicularOrientation.infringed == 1);
+    const auto& perpendicularMagnitude = summary.classes[
+        static_cast<std::size_t>(FiberTraceConstraintAgreementClass::
+                                     PerpendicularMagnitudeNext)];
+    CHECK(perpendicularMagnitude.evaluated == 1);
+    CHECK(perpendicularMagnitude.infringed == 0);
+    const auto& perpendicularSign = summary.classes[
+        static_cast<std::size_t>(
+            FiberTraceConstraintAgreementClass::PerpendicularSign)];
+    CHECK(perpendicularSign.evaluated == 1);
+    CHECK(perpendicularSign.infringed == 0);
+    const auto& parallelOrientation = summary.classes[
+        static_cast<std::size_t>(
+            FiberTraceConstraintAgreementClass::ParallelOrientation)];
+    CHECK(parallelOrientation.defectNeutralized == 1);
     const auto& parallelCounts = summary.classes[static_cast<std::size_t>(
-        FiberTraceConstraintAgreementClass::ParallelSame)];
+        FiberTraceConstraintAgreementClass::ParallelMagnitudeSame)];
     CHECK(parallelCounts.defectNeutralized == 1);
-    CHECK(summary.total.prepared == 4);
-    CHECK(summary.total.evaluated == 2);
-    CHECK(summary.total.defectNeutralized == 2);
+    CHECK(summary.total.prepared == 7);
+    CHECK(summary.total.evaluated == 4);
+    CHECK(summary.total.defectNeutralized == 3);
     CHECK(summary.total.infringed == 1);
 }
 
@@ -1258,11 +1397,11 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.sum.total == 6);
     REQUIRE(benchmark.references.size() == 4);
     CHECK(benchmark.references[0].classes[0].right == 2);
-    CHECK(benchmark.references[0].classes[1].right == 1);
+    CHECK(benchmark.references[0].classes[2].right == 1);
     CHECK(benchmark.references[0].sum.right == 3);
     CHECK(benchmark.references[0].sum.wrong == 0);
     CHECK(benchmark.references[0].sum.total == 3);
-    CHECK(benchmark.references[1].classes[2].right == 2);
+    CHECK(benchmark.references[1].classes[3].right == 2);
     CHECK(benchmark.references[1].sum.right == 2);
     CHECK(benchmark.references[1].sum.wrong == 0);
     CHECK(benchmark.references[1].sum.total == 2);
@@ -2177,9 +2316,10 @@ TEST_CASE("Signed parallel winding distinguishes opposite ladder directions")
             {},
             fixed);
     REQUIRE(unsignedSolved.factorDiagnostics.size() == 1);
-    CHECK_FALSE(unsignedSolved.factorDiagnostics[0].parallelWindingRetained);
+    CHECK(unsignedSolved.factorDiagnostics[0].parallelWindingRetained);
     CHECK(unsignedSolved.factorDiagnostics[0]
-              .effectiveParallelWindingWeight == 0.0);
+              .effectiveParallelWindingWeight > 0.0);
+    CHECK_FALSE(unsignedSolved.factorDiagnostics[0].parallelSignPresent);
 }
 
 TEST_CASE("Zero magnitude weights retain only enabled dominant hard signs")
