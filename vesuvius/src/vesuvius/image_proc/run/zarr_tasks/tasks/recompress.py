@@ -56,7 +56,7 @@ def _create_recompressed_array(
             kwargs["zarr_format"] = 2
         return zarr.open(path, mode="w", shape=shape, chunks=chunks, dtype=dtype, **kwargs)
 
-    from zarr.codecs import BloscCodec, BloscShuffle
+    from zarr.codecs import BloscCodec, BloscShuffle, BytesCodec
 
     return zarr.open(
         path,
@@ -65,7 +65,8 @@ def _create_recompressed_array(
         chunks=chunks,
         dtype=dtype,
         codecs=[
-            BloscCodec(cname="zstd", clevel=compression_level, shuffle=BloscShuffle.bitshuffle)
+            BytesCodec(),
+            BloscCodec(cname="zstd", clevel=compression_level, shuffle=BloscShuffle.bitshuffle),
         ],
         zarr_format=3,
     )
