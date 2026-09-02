@@ -1,83 +1,71 @@
-# Task Plan
+# Plan: iterative ordered-winding offender removal
 
-## Shared conflict classes
+## Semantics
 
-1. Add a diagnostic-only reference factor classification with seven classes:
-   perpendicular magnitude 0.5, perpendicular magnitude 1.5+, perpendicular
-   sign, parallel magnitude 0, parallel magnitude 1, parallel magnitude 2+,
-   and parallel sign.
-2. Evaluate both paths through one shared factor helper consuming already
-   materialized solver targets, weights, penalties, and hardness. Do not
-   reconstruct confidence or apply measurement scale a second time.
-3. Classify from the effective canonical target. Keep one sign row and one
-   magnitude row for a constraint when both factors are active. Count
-   magnitude only for positive effective magnitude weight and sign only when
-   hard or assigned a finite penalty.
-4. Preserve exact BP predicates and losses: signed magnitude uses
-   `abs(delta-target)`, unsigned parallel magnitude uses
-   `abs(abs(delta)-distance)`, and sign conflicts use `target*delta <= 0`.
-   Hard violations remain a separate count and contribute only an actual
-   finite sign penalty, which is normally zero for a promoted hard factor.
-5. Reuse the same class names and aggregate formatter for both requested
-   tables.
+1. Operate on the admitted dominant sign factors used by the ordered Ceres fit.
+2. Evaluate a sign factor against the fitted interleaved coordinate
+   `offset + H/V phase`; zero signed separation is infringed.
+3. Aggregate incident and infringed factors by source trace. An edge within one
+   trace contributes once; a cross-trace edge contributes once to each endpoint.
+4. Select the trace with maximum exact rational infringement percentage. Break
+   ties by larger infringed count, then lower source trace index.
+5. Exclude every piece of the selected trace through an explicit active-piece
+   mask. Preserve its original H/V orientation for downstream diagnostics.
+   Rebuild and re-solve the ordering so all subsequent scores are current.
+6. Stop when the fitted graph has zero infringed sign factors. Isolated fibers
+   with no incident sign factor are not offenders. The process terminates after
+   at most the number of represented source traces.
+7. Run the ordinary ordered-cut scan once on the final retained cohort. Removed
+   fibers remain inactive/Defect in downstream diagnostics and artifacts.
 
-## Reference-to-reference evaluation
+## Implementation
 
-1. Evaluate the already extracted local reference-piece constraints; do not
-   create a second extraction path or collapse the piece-pair observations.
-2. Exclude generated hard-continuity and other same-source links from this
-   cross-reference table.
-3. Use the solver-prepared factor diagnostics so admission, confidence,
-   class weights, finite sign penalties, and hard-sign promotion match the BP
-   model.
-4. Fix both endpoints to their filename-ordered half-step winding values. The
-   fixed predicted delta is `globalSign * (W_b - W_a)` in the factor's
-   canonical endpoint order; a common gauge cancels. Measurement scale has
-   already been applied to the measured target and must not affect these known
-   endpoint labels.
-5. For each admitted magnitude or sign factor, report conflict, hard
-   violation, and the same weighted L1/sign loss used by the corresponding BP
-   factor.
-6. Add `--reference-constraint-details` to enable the existing long
-   per-reference constraint listings. Suppress only those listings by default;
-   retain calibration and aggregate summaries.
+- Add core report structures and a reusable function that evaluates continuous
+  sign infringements by source trace and deterministically selects the worst.
+- Add an iterative core driver around the existing ordered fit/cut solver; do
+  not duplicate residual construction.
+- Expose `--ordered-prune-offenders` for `--winding-solver ordered-cuts` only.
+- Print one aligned row per removal containing iteration, source trace,
+  original trace, pieces, local infringed/incident percentage, old full-graph
+  infringements, surviving-edge infringements before re-solving, those same
+  surviving-edge infringements after re-solving, remaining fibers, and solve
+  time. This separates the effect of edge deletion from re-optimization.
+- Require every nonempty Ceres result to be usable with finite active offsets.
+  Treat a fully exhausted graph as a valid empty result without invoking Ceres.
+- Keep reference-oracle split selection after offender pruning.
 
-## Output-layer mapping
+## Tests
 
-1. Retain the exact inverse mapping of the final calibrated `est_w` candidate.
-2. When an otherwise valid calibrated half-step candidate lands exactly on
-   the opposite H/V ladder after class-offset removal, treat it as incompatible
-   orientation evidence and return no output-layer estimate, producing `NA`
-   in `raw_w`.
-3. Continue throwing for arbitrary off-half-step values, malformed phase
-   signs, non-finite inputs, and integer overflow.
+- Synthetic contradictory ordering where the expected high-percentage trace is
+  removed and the re-solved graph reaches zero infringements.
+- Verify all pieces of a source trace are excluded together.
+- Verify exact overflow-safe percentage comparison (`1/1 > 9/10` and
+  `1/2 == 2/4`), deterministic tie breaking, internal factors counted once,
+  cross factors counted at both endpoints, and zero-degree exclusion.
+- Prove the second selection uses a genuinely re-solved ordering, cover an
+  irreducible within-trace violation, safe full exhaustion, and the removal
+  count bound.
+- Verify the absent option preserves the existing result and reject the option
+  for non-ordered solvers.
+- GCC and Clang focused winding tests.
+- Release run on the 1024 crop with `piece-length=384`; inspect removal progress,
+  final infringement count, runtime, and reference agreement.
 
-## Validation
+## Spec update
 
-- Extend focused C++ tests for all seven conflict classes, separated sign and
-  magnitude factors, hard-sign accounting, disabled factors, and weighted
-  losses for reference-to-BP and reference-to-reference diagnostics.
-- Add an opposite-ladder half-step test that requires an absent output result;
-  preserve the arbitrary off-lattice exception test and exact mapping tests
-  for both H/V classes and phase signs.
-- Build Release and Clang targets and run the focused winding BP test.
-- Run the approved 1024 diagnostic command and verify that both conflict
-  tables print and an incompatible `raw_w` no longer aborts the run.
-- Verify that the default output omits individual constraint rows and the new
-  flag restores them.
+Document whole-trace removal, exact percentage ranking, deterministic ties,
+re-solving, termination, and opt-in behavior in `planning/specs.md`.
 
-## Spec Update
+## Documentation updates
 
-- Specify the seven-class conflict summaries and reference-to-reference fixed
-  endpoint semantics in `volume-cartographer/planning/spec.md`.
-- Clarify that orientation-incompatible output-layer inverses print `NA`.
+Document the CLI option, table columns, computational cost, and diagnostic-only
+status in `volume-cartographer/docs/fiber_chunk_tracing.md`.
 
-## Docs Updates
+## Changelog
 
-- Document both conflict tables and their class/factor meanings in
-  `volume-cartographer/docs/fiber_chunk_tracing.md`.
+Add a concise entry to both relevant changelogs after validation.
 
-## Changelog Update
+## Status and task log
 
-- Record class-resolved reference conflict diagnostics and non-fatal
-  incompatible output-layer reporting.
+Keep `planning/status.md` current and record deviations plus exact validation
+commands/results in the task-local `planning/task_log.md`.

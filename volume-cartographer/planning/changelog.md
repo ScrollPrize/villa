@@ -1,5 +1,13 @@
 # Changelog
 
+- Ordered-cut winding diagnostics can use supplied reference fibers as an
+  oracle to select the best split checkpoint for downstream analysis and
+  artifacts.
+
+- Added an experimental fixed-orientation `ordered-cuts` winding solver. It
+  fits sign-only continuous ordering with Ceres, greedily inserts exact
+  infringement-reducing winding cuts, and reports reference agreement at every
+  split plus an independent continuous reference-order diagnostic.
 - Split fixed-reference winding conflicts into five magnitude and two sign
   classes, added a matching reference/reference summary, made detailed
   piece-pair rows opt-in, and report orientation-incompatible output layers as
@@ -208,3 +216,10 @@
   re-entry from an immutable positive base.
 - Promoted the resulting scale-first 1024 local optimum `0,4,2,2,1` to the
   shared library and CLI winding-class default.
+
+## 2026-09-02
+
+- Added an opt-in ordered-winding diagnostic that ranks complete source fibers
+  by exact sign-violation percentage, removes every split piece of the worst
+  fiber, refits, and reports deletion-only versus post-refit violations at
+  every iteration.

@@ -7,6 +7,7 @@
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
+#include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -126,6 +127,10 @@ struct Options {
     std::optional<std::vector<double>> windingWeightSearch;
     bool windingWeightSearchLocal = false;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
+    double orderedSignWeight = 16.0;
+    double orderedContinuationWeight = 16.0;
+    std::size_t orderedMaximumSplits = 0;
+    bool orderedPruneOffenders = false;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -166,6 +171,7 @@ struct Options {
     bool hasFixedPhaseOption = false;
     bool hasFixedScaleOption = false;
     bool hasWindingCutoffOption = false;
+    bool hasOrderedCutsOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -277,7 +283,7 @@ void usage(const char* executable)
               << "  --bp-damping F            message damping in (0,1] [0.5]\n"
               << "  --bp-residual F           message residual tolerance [1e-8]\n"
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
-              << "  --winding-solver MODE     joint-grid, alternating, or ceres [joint-grid]\n"
+              << "  --winding-solver MODE     joint-grid, alternating, ceres, or ordered-cuts [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
               << "  --split-continuity MODE   hard or finite [hard]\n"
@@ -315,6 +321,11 @@ void usage(const char* executable)
               << "                              repeat one-coordinate /2,*2 search to a local optimum\n"
               << "  --winding-fixed-phase F   fixed phase in [0,0.5] [0.5]\n"
               << "  --winding-fixed-scale F   fixed positive measurement scale [0.822]\n"
+              << "  --ordered-sign-weight F   ordered-cut sign-margin coefficient [16]\n"
+              << "  --ordered-continuation-weight F\n"
+              << "                              ordered-cut split-continuation coefficient [16]\n"
+              << "  --ordered-max-splits N    ordered-cut accepted split limit; zero is unlimited [0]\n"
+              << "  --ordered-prune-offenders remove worst sign-violation-percentage fiber and re-solve\n"
               << "  --winding-adaptive-calibration\n"
               << "                              infer phase and scale instead of fixed defaults\n"
               << "  --winding-gain-cells N    initial joint gain cells [5]\n"
@@ -717,8 +728,11 @@ Options parse(int argc, char** argv)
             } else if (solver == "ceres") {
                 options.windingSolver = vc::fiber_tracer::
                     FiberTraceWindingSolver::Ceres;
+            } else if (solver == "ordered-cuts") {
+                options.windingSolver = vc::fiber_tracer::
+                    FiberTraceWindingSolver::OrderedCuts;
             } else {
-                fail("--winding-solver must be joint-grid, alternating, or ceres");
+                fail("--winding-solver must be joint-grid, alternating, ceres, or ordered-cuts");
             }
             options.hasWindingSolverOption = true;
             options.hasAblationOnlyOption = true;
@@ -726,6 +740,33 @@ Options parse(int argc, char** argv)
         } else if (argument == "--winding-fixed-orientation") {
             options.windingFixedOrientation = true;
             options.hasWindingOrientationOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--ordered-sign-weight") {
+            options.orderedSignWeight = number(
+                index, argc, argv, "--ordered-sign-weight");
+            if (options.orderedSignWeight < 0.0)
+                fail("--ordered-sign-weight must be nonnegative");
+            options.hasOrderedCutsOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--ordered-continuation-weight") {
+            options.orderedContinuationWeight = number(
+                index, argc, argv, "--ordered-continuation-weight");
+            if (options.orderedContinuationWeight < 0.0)
+                fail("--ordered-continuation-weight must be nonnegative");
+            options.hasOrderedCutsOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--ordered-max-splits") {
+            options.orderedMaximumSplits = count(
+                index, argc, argv, "--ordered-max-splits");
+            options.hasOrderedCutsOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--ordered-prune-offenders") {
+            options.orderedPruneOffenders = true;
+            options.hasOrderedCutsOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-defect-cost") {
@@ -1315,7 +1356,8 @@ Options parse(int argc, char** argv)
              options.hasWindingNormalConfidenceOption ||
              options.hasWindingSignCostOption ||
              options.hasWindingWeightSearchOption ||
-             options.hasWindingWeightSearchLocalOption) &&
+             options.hasWindingWeightSearchLocalOption ||
+             options.hasOrderedCutsOption) &&
             (!options.bpOnly ||
              options.bpInference != vc::fiber_tracer::
                  FiberTraceBeliefInference::SumProductMixed)) {
@@ -1352,6 +1394,22 @@ Options parse(int argc, char** argv)
             options.windingSolver != vc::fiber_tracer::
                 FiberTraceWindingSolver::JointGrid) {
             fail("joint-grid controls require --winding-solver joint-grid");
+        }
+        if (options.hasOrderedCutsOption &&
+            options.windingSolver != vc::fiber_tracer::
+                FiberTraceWindingSolver::OrderedCuts) {
+            fail("ordered-cut controls require --winding-solver ordered-cuts");
+        }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::OrderedCuts &&
+            !options.windingFixedOrientation) {
+            fail("--winding-solver ordered-cuts requires --winding-fixed-orientation");
+        }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::OrderedCuts &&
+            (options.hasWindingWeightSearchOption ||
+             options.hasWindingWeightSearchLocalOption)) {
+            fail("ordered-cut winding weight search is not implemented");
         }
         if (options.windingSolver == vc::fiber_tracer::
                 FiberTraceWindingSolver::Ceres &&
@@ -3176,6 +3234,47 @@ makeLeastSquaresWindingProgressPrinter()
     };
 }
 
+vc::fiber_tracer::FiberTraceWindingOrderedCutsProgressCallback
+makeOrderedCutsProgressPrinter()
+{
+    using Phase = vc::fiber_tracer::FiberTraceWindingOrderedCutsProgressPhase;
+    return [lastPrinted = std::chrono::steady_clock::time_point{},
+            lastPhase = Phase::Complete](
+               const vc::fiber_tracer::FiberTraceWindingOrderedCutsProgress& p)
+               mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const bool transition = p.phase != lastPhase;
+        const bool intervalElapsed =
+            lastPrinted.time_since_epoch().count() == 0 ||
+            now - lastPrinted >= std::chrono::seconds(1);
+        if (!transition && !intervalElapsed && p.phase == Phase::Iterating)
+            return;
+        std::cout << "fiber winding ordered-cuts";
+        switch (p.phase) {
+        case Phase::Preparing:
+            std::cout << " status=preparing";
+            break;
+        case Phase::Iterating:
+            std::cout << " iteration=" << p.iteration << '/'
+                      << p.maximumIterations
+                      << std::scientific << std::setprecision(3)
+                      << " cost=" << p.cost
+                      << " gradient_max=" << p.gradientMaximumNorm;
+            break;
+        case Phase::Complete:
+            std::cout << " status=complete iterations=" << p.iteration
+                      << std::scientific << std::setprecision(3)
+                      << " cost=" << p.cost;
+            break;
+        }
+        std::cout << std::fixed << std::setprecision(1)
+                  << " elapsed=" << p.elapsedSeconds << "s\n"
+                  << std::flush;
+        lastPrinted = now;
+        lastPhase = p.phase;
+    };
+}
+
 std::vector<std::size_t> applyQualityFilter(
     std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const std::optional<double>& fraction)
@@ -4573,6 +4672,357 @@ makeReferenceBpWindingObservations(
         observations.push_back(std::move(observation));
     }
     return observations;
+}
+
+std::string formatOrderedCutsDiagnostics(
+    const vc::fiber_tracer::FiberTraceWindingOrderedCutsReport& ordered,
+    const vc::fiber_tracer::FiberTraceWindingOrderedCutsConfig& orderedConfig,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& benchmarkConfig,
+    const ReferenceFiberDiagnostics* reference,
+    const ReferenceBpCrossConstraints* cross,
+    std::span<const vc::fiber_tracer::FiberletCropTraceLine> bpPieceLines)
+{
+    if (ordered.steps.empty())
+        throw std::invalid_argument("Ordered-cut report has no checkpoints");
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "ordered winding split progression\n"
+           << std::left << std::setw(8) << "splits"
+           << std::setw(10) << "windings"
+           << std::setw(14) << "infringed"
+           << std::setw(13) << "infringe_%"
+           << std::setw(12) << "cont_cuts"
+           << std::setw(14) << "threshold"
+           << std::setw(12) << "ref_exact"
+           << std::setw(12) << "ref_wrong"
+           << std::setw(12) << "ref_missing"
+           << std::setw(14) << "constraint_r"
+           << std::setw(14) << "constraint_w"
+           << "constraint_%\n";
+    for (std::size_t index = 0; index < ordered.steps.size(); ++index) {
+        const auto& step = ordered.steps[index];
+        std::size_t exact = 0;
+        std::size_t wrong = 0;
+        std::size_t missing = 0;
+        std::size_t rightConstraints = 0;
+        std::size_t wrongConstraints = 0;
+        if (reference && cross) {
+            const auto winding = vc::fiber_tracer::
+                makeFiberTraceOrderedCutsWindingReport(
+                    ordered, orderedConfig, index);
+            const auto observations = makeReferenceBpWindingObservations(
+                *reference, *cross, winding, benchmarkConfig);
+            const auto benchmark = vc::fiber_tracer::
+                calibrateFiberTraceReferenceWindings(observations);
+            for (std::size_t source = 0;
+                 source < reference->sourceNames.size(); ++source) {
+                if (source >= benchmark.references.size() ||
+                    !benchmark.references[source].estimatedWinding) {
+                    ++missing;
+                } else if (std::abs(
+                               *benchmark.references[source].estimatedWinding -
+                               0.5 * static_cast<double>(source)) <= 1.0e-12) {
+                    ++exact;
+                } else {
+                    ++wrong;
+                }
+            }
+            rightConstraints = benchmark.sum.right;
+            wrongConstraints = benchmark.sum.wrong;
+        }
+        const std::size_t constraintTotal =
+            rightConstraints + wrongConstraints;
+        const std::string infringement =
+            std::to_string(step.signInfringements) + '/' +
+            std::to_string(step.signFactors);
+        output << std::setw(8) << step.splits
+               << std::setw(10) << step.windings
+               << std::setw(14) << infringement
+               << std::setw(13) << std::fixed << std::setprecision(2)
+               << (step.signFactors == 0
+                       ? 0.0
+                       : 100.0 * static_cast<double>(step.signInfringements) /
+                             static_cast<double>(step.signFactors));
+        output << std::setw(12) << step.continuationCuts;
+        if (step.threshold) {
+            output << std::setw(14) << std::setprecision(4)
+                   << *step.threshold;
+        } else {
+            output << std::setw(14) << "-";
+        }
+        if (reference && cross) {
+            output << std::setw(12) << exact
+                   << std::setw(12) << wrong
+                   << std::setw(12) << missing
+                   << std::setw(14) << rightConstraints
+                   << std::setw(14) << wrongConstraints
+                   << std::setprecision(2)
+                   << (constraintTotal == 0
+                           ? 0.0
+                           : 100.0 * static_cast<double>(rightConstraints) /
+                                 static_cast<double>(constraintTotal));
+        } else {
+            output << std::setw(12) << "NA"
+                   << std::setw(12) << "NA"
+                   << std::setw(12) << "NA"
+                   << std::setw(14) << "NA"
+                   << std::setw(14) << "NA"
+                   << "NA";
+        }
+        output << '\n';
+    }
+
+    if (!reference || !cross)
+        return output.str();
+
+    if (cross->referencePieces != reference->pieceLines.size() ||
+        cross->report.pieces.size() !=
+            cross->referencePieces + bpPieceLines.size() ||
+        ordered.ordering.offsetByPiece.size() != bpPieceLines.size()) {
+        throw std::invalid_argument(
+            "Ordered-cut reference ordering inputs do not match");
+    }
+    std::vector<vc::fiber_tracer::FiberletCropTraceLine> combinedLines;
+    combinedLines.reserve(
+        reference->pieceLines.size() + bpPieceLines.size());
+    combinedLines.insert(
+        combinedLines.end(),
+        reference->pieceLines.begin(),
+        reference->pieceLines.end());
+    combinedLines.insert(
+        combinedLines.end(), bpPieceLines.begin(), bpPieceLines.end());
+    vc::fiber_tracer::FiberTraceBeliefTopology topology;
+    topology.piecesByTrace.resize(cross->report.inputTraces);
+    topology.pieceLines = combinedLines;
+    topology.pieceCenterDistanceBaseVoxels.assign(
+        cross->report.pieces.size(), 0.0);
+    topology.normalizedArcWeights.assign(
+        cross->report.pieces.size(), 1.0);
+    for (std::size_t piece = 0;
+         piece < cross->report.pieces.size(); ++piece) {
+        const std::size_t trace = cross->report.pieces[piece].traceIndex;
+        if (trace >= topology.piecesByTrace.size() || trace != piece) {
+            throw std::invalid_argument(
+                "Ordered-cut reference ordering requires preserved piece traces");
+        }
+        topology.piecesByTrace[trace].push_back(piece);
+    }
+    for (std::size_t index = 0;
+         index < cross->report.constraints.size(); ++index) {
+        if (cross->report.constraints[index].hardContinuity) {
+            throw std::invalid_argument(
+                "Ordered-cut reference cross report contains continuity");
+        }
+        topology.softConstraintIndices.push_back(index);
+    }
+
+    struct OrderingTrial {
+        vc::fiber_tracer::FiberTraceWindingOrderedOffsetReport fit;
+        bool evenHorizontal = true;
+    };
+    std::optional<OrderingTrial> selected;
+    for (const bool evenHorizontal : {true, false}) {
+        std::vector<vc::fiber_tracer::FiberTraceFixedOrientation>
+            orientations(cross->report.pieces.size());
+        std::vector<vc::fiber_tracer::FiberTraceWindingOrderedCutsFixedOffset>
+            fixed(cross->report.pieces.size());
+        for (std::size_t piece = 0;
+             piece < cross->referencePieces; ++piece) {
+            const bool even =
+                reference->sourceIdsByPiece.at(piece) % 2 == 0;
+            orientations[piece] = even == evenHorizontal
+                ? vc::fiber_tracer::FiberTraceFixedOrientation::Horizontal
+                : vc::fiber_tracer::FiberTraceFixedOrientation::Vertical;
+        }
+        for (std::size_t piece = 0;
+             piece < bpPieceLines.size(); ++piece) {
+            const std::size_t combined = cross->referencePieces + piece;
+            orientations[combined] =
+                ordered.ordering.orientationByPiece.at(piece);
+            fixed[combined] = {
+                true, ordered.ordering.offsetByPiece.at(piece)};
+        }
+        auto fit = vc::fiber_tracer::fitFiberTraceWindingOrderedOffsets(
+            cross->report,
+            topology,
+            orientations,
+            orderedConfig,
+            fixed);
+        if (!selected || fit.finalCost < selected->fit.finalCost) {
+            selected = OrderingTrial{std::move(fit), evenHorizontal};
+        }
+    }
+    if (!selected)
+        throw std::logic_error("Ordered-cut reference ordering fit is absent");
+
+    std::vector<double> sums(reference->sourceNames.size(), 0.0);
+    std::vector<std::size_t> counts(reference->sourceNames.size(), 0);
+    std::vector<unsigned char> supported(reference->sourceNames.size(), 0);
+    for (const auto& factor : selected->fit.signFactors) {
+        if (factor.pieceA < cross->referencePieces) {
+            supported.at(reference->sourceIdsByPiece.at(factor.pieceA)) = 1;
+        }
+        if (factor.pieceB < cross->referencePieces) {
+            supported.at(reference->sourceIdsByPiece.at(factor.pieceB)) = 1;
+        }
+    }
+    const auto fittedPhase = [](vc::fiber_tracer::FiberTraceFixedOrientation o) {
+        return o == vc::fiber_tracer::FiberTraceFixedOrientation::Vertical
+            ? 0.5
+            : 0.0;
+    };
+    for (std::size_t piece = 0;
+         piece < cross->referencePieces; ++piece) {
+        const std::size_t source = reference->sourceIdsByPiece.at(piece);
+        sums.at(source) += selected->fit.offsetByPiece.at(piece) +
+            fittedPhase(selected->fit.orientationByPiece.at(piece));
+        ++counts.at(source);
+    }
+    std::vector<std::optional<double>> orderValues(sums.size());
+    for (std::size_t source = 0; source < sums.size(); ++source) {
+        if (supported[source] != 0 && counts[source] != 0) {
+            orderValues[source] = sums[source] /
+                static_cast<double>(counts[source]);
+        }
+    }
+    const auto pairAgreement = [&](int sign) {
+        std::pair<std::size_t, std::size_t> counts{0, 0};
+        for (std::size_t a = 0; a < orderValues.size(); ++a) {
+            if (!orderValues[a])
+                continue;
+            for (std::size_t b = a + 1; b < orderValues.size(); ++b) {
+                if (!orderValues[b]) {
+                    continue;
+                }
+                ++counts.second;
+                if (static_cast<double>(sign) * *orderValues[a] <
+                    static_cast<double>(sign) * *orderValues[b]) {
+                    ++counts.first;
+                }
+            }
+        }
+        return counts;
+    };
+    const auto positive = pairAgreement(1);
+    const auto negative = pairAgreement(-1);
+    const int orderSign = negative.first > positive.first ? -1 : 1;
+    const auto agreement = orderSign < 0 ? negative : positive;
+    output << "continuous winding ordering against reference fibers\n"
+           << std::left << std::setw(10) << "reference"
+           << std::setw(14) << "order_value"
+           << std::setw(12) << "pieces"
+           << "supported\n";
+    for (std::size_t source = 0; source < orderValues.size(); ++source) {
+        output << std::setw(10)
+               << 0.5 * static_cast<double>(source);
+        if (!orderValues[source]) {
+            output << std::setw(14) << "NA"
+                   << std::setw(12) << counts[source]
+                   << "no\n";
+            continue;
+        }
+        output << std::setw(14) << std::fixed << std::setprecision(4)
+               << static_cast<double>(orderSign) * *orderValues[source]
+               << std::setw(12) << counts[source]
+               << "yes\n";
+    }
+    output << "continuous ordering fit"
+           << " even_reference_orientation="
+           << (selected->evenHorizontal ? 'H' : 'V')
+           << " cost=" << selected->fit.finalCost
+           << " pair_sign=" << orderSign
+           << " right=" << agreement.first
+           << " total=" << agreement.second
+           << " right_percent=" << std::fixed << std::setprecision(2)
+           << (agreement.second == 0
+                   ? 0.0
+                   : 100.0 * static_cast<double>(agreement.first) /
+                         static_cast<double>(agreement.second))
+           << "%\n";
+    return output.str();
+}
+
+std::optional<std::size_t> selectOrderedCutsReferenceOracleStep(
+    const vc::fiber_tracer::FiberTraceWindingOrderedCutsReport& ordered,
+    const vc::fiber_tracer::FiberTraceWindingOrderedCutsConfig& orderedConfig,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& benchmarkConfig,
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross)
+{
+    struct Score {
+        std::size_t exact = 0;
+        std::size_t wrong = 0;
+        std::size_t missing = 0;
+        std::size_t constraintRight = 0;
+        std::size_t constraintWrong = 0;
+    };
+
+    const auto score = [&](const std::size_t stepIndex) {
+        const auto winding = vc::fiber_tracer::
+            makeFiberTraceOrderedCutsWindingReport(
+                ordered, orderedConfig, stepIndex);
+        const auto observations = makeReferenceBpWindingObservations(
+            reference, cross, winding, benchmarkConfig);
+        const auto benchmark = vc::fiber_tracer::
+            calibrateFiberTraceReferenceWindings(observations);
+        Score result;
+        for (std::size_t source = 0;
+             source < reference.sourceNames.size(); ++source) {
+            if (source >= benchmark.references.size() ||
+                !benchmark.references[source].estimatedWinding) {
+                ++result.missing;
+            } else if (std::abs(
+                           *benchmark.references[source].estimatedWinding -
+                           0.5 * static_cast<double>(source)) <= 1.0e-12) {
+                ++result.exact;
+            } else {
+                ++result.wrong;
+            }
+        }
+        result.constraintRight = benchmark.sum.right;
+        result.constraintWrong = benchmark.sum.wrong;
+        return result;
+    };
+
+    const auto better = [](const Score& candidate, const Score& incumbent) {
+        if (candidate.exact != incumbent.exact)
+            return candidate.exact > incumbent.exact;
+        if (candidate.wrong != incumbent.wrong)
+            return candidate.wrong < incumbent.wrong;
+        if (candidate.missing != incumbent.missing)
+            return candidate.missing < incumbent.missing;
+        const std::size_t candidateTotal =
+            candidate.constraintRight + candidate.constraintWrong;
+        const std::size_t incumbentTotal =
+            incumbent.constraintRight + incumbent.constraintWrong;
+        if (candidateTotal != 0 && incumbentTotal != 0) {
+            const auto left = static_cast<unsigned long long>(
+                                  candidate.constraintRight) *
+                              static_cast<unsigned long long>(incumbentTotal);
+            const auto right = static_cast<unsigned long long>(
+                                   incumbent.constraintRight) *
+                               static_cast<unsigned long long>(candidateTotal);
+            if (left != right)
+                return left > right;
+        } else if (candidateTotal != incumbentTotal) {
+            return candidateTotal != 0;
+        }
+        return candidate.constraintRight > incumbent.constraintRight;
+    };
+
+    if (ordered.steps.empty())
+        return std::nullopt;
+    std::size_t bestIndex = 0;
+    Score best = score(0);
+    for (std::size_t index = 1; index < ordered.steps.size(); ++index) {
+        const Score candidate = score(index);
+        if (better(candidate, best)) {
+            bestIndex = index;
+            best = candidate;
+        }
+    }
+    return bestIndex;
 }
 
 std::string formatFixedReferenceConditionedComparison(
@@ -6631,6 +7081,12 @@ int main(int argc, char** argv)
                             std::optional<vc::fiber_tracer::
                                 FiberTraceWindingLeastSquaresConfig>
                                     leastSquaresWindingConfig;
+                            std::optional<vc::fiber_tracer::
+                                FiberTraceWindingOrderedCutsReport>
+                                    orderedCutsWinding;
+                            std::optional<vc::fiber_tracer::
+                                FiberTraceWindingOrderedCutsConfig>
+                                    orderedCutsWindingConfig;
                             const bool jointGrid =
                                 options.bpInference == vc::fiber_tracer::
                                     FiberTraceBeliefInference::SumProductMixed &&
@@ -6641,6 +7097,11 @@ int main(int argc, char** argv)
                                     FiberTraceBeliefInference::SumProductMixed &&
                                 options.windingSolver == vc::fiber_tracer::
                                     FiberTraceWindingSolver::Ceres;
+                            const bool orderedCutsWindingSelected =
+                                options.bpInference == vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed &&
+                                options.windingSolver == vc::fiber_tracer::
+                                    FiberTraceWindingSolver::OrderedCuts;
                             auto bpTopology = vc::fiber_tracer::
                                 prepareFiberTraceBeliefTopology(bpSourceLines, bpConstraints, artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
                             std::vector<vc::fiber_tracer::
@@ -6708,7 +7169,8 @@ int main(int argc, char** argv)
                                         options.bpInference == vc::fiber_tracer::
                                             FiberTraceBeliefInference::SumProductMixed,
                                         bpTopology.centralSeedPiece,
-                                        jointGrid || ceresWinding
+                                        jointGrid || ceresWinding ||
+                                                orderedCutsWindingSelected
                                             ? options.jointGrid
                                                   .fixedMeasurementScale
                                                   .value_or(
@@ -6797,6 +7259,166 @@ int main(int argc, char** argv)
                                     std::nullopt) {
                                 auto weightedConfig = windingConfig;
                                 setWindingWeights(weightedConfig, weights);
+                                if (orderedCutsWindingSelected) {
+                                    if (!initialStates.empty() || activeRange) {
+                                        throw std::logic_error(
+                                            "Discrete winding initialization/range is incompatible with ordered cuts");
+                                    }
+                                    vc::fiber_tracer::
+                                        FiberTraceWindingOrderedCutsConfig ordered;
+                                    static_cast<vc::fiber_tracer::
+                                        FiberTraceWindingBeliefPropagationConfig&>(
+                                            ordered) = weightedConfig;
+                                    ordered.signMarginWeight =
+                                        options.orderedSignWeight;
+                                    ordered.continuationWeight =
+                                        options.orderedContinuationWeight;
+                                    ordered.measurementScale =
+                                        options.jointGrid.fixedMeasurementScale
+                                            .value_or(
+                                                kDefaultWindingMeasurementScale);
+                                    ordered.maximumIterations = 100;
+                                    ordered.maximumSplits =
+                                        options.orderedMaximumSplits;
+                                    ordered.removeOffendingFibers =
+                                        options.orderedPruneOffenders;
+                                    ordered.parallelWorkers =
+                                        static_cast<std::size_t>(options.threads);
+                                    orderedCutsWindingConfig = ordered;
+                                    orderedCutsWinding = vc::fiber_tracer::
+                                        solveFiberTraceWindingOrderedCuts(
+                                            bpConstraints,
+                                            bpTopology,
+                                            fixedOrientations,
+                                            ordered,
+                                            showProgress
+                                                ? makeOrderedCutsProgressPrinter()
+                                                : vc::fiber_tracer::
+                                                      FiberTraceWindingOrderedCutsProgressCallback{},
+                                            ordered.removeOffendingFibers
+                                                ? vc::fiber_tracer::
+                                                      FiberTraceWindingOrderedRemovalCallback{
+                                                          [&, headerPrinted = false](const vc::fiber_tracer::
+                                                                  FiberTraceWindingOrderedRemovalStep& step) mutable {
+                                                              if (!headerPrinted) {
+                                                                  std::cout
+                                                                      << "ordered winding offender removal\n"
+                                                                      << std::left
+                                                                      << std::setw(6) << "iter"
+                                                                      << std::setw(10) << "trace"
+                                                                      << std::setw(12) << "original"
+                                                                      << std::setw(8) << "pieces"
+                                                                      << std::setw(14) << "local"
+                                                                      << std::setw(11) << "local_%"
+                                                                      << std::setw(16) << "old_global"
+                                                                      << std::setw(18) << "survive_before"
+                                                                      << std::setw(17) << "survive_after"
+                                                                      << std::setw(11) << "remaining"
+                                                                      << "solve_s\n";
+                                                                  headerPrinted = true;
+                                                              }
+                                                              if (step.removedTrace >=
+                                                                  bpSourceOriginalTraceIndices.size()) {
+                                                                  throw std::logic_error(
+                                                                      "Ordered offender trace has no original-trace mapping");
+                                                              }
+                                                              const auto ratio = [](
+                                                                  std::size_t numerator,
+                                                                  std::size_t denominator) {
+                                                                  return std::to_string(numerator) + '/' +
+                                                                      std::to_string(denominator);
+                                                              };
+                                                              std::cout
+                                                                  << std::left
+                                                                  << std::setw(6) << step.iteration
+                                                                  << std::setw(10) << step.removedTrace
+                                                                  << std::setw(12)
+                                                                  << bpSourceOriginalTraceIndices[
+                                                                         step.removedTrace]
+                                                                  << std::setw(8) << step.removedPieces
+                                                                  << std::setw(14)
+                                                                  << ratio(
+                                                                         step.violatedFactors,
+                                                                         step.incidentFactors)
+                                                                  << std::setw(11) << std::fixed
+                                                                  << std::setprecision(2)
+                                                                  << (step.incidentFactors == 0
+                                                                          ? 0.0
+                                                                          : 100.0 * static_cast<double>(
+                                                                                step.violatedFactors) /
+                                                                                static_cast<double>(
+                                                                                    step.incidentFactors))
+                                                                  << std::setw(16)
+                                                                  << ratio(
+                                                                         step.oldInfringements,
+                                                                         step.oldFactors)
+                                                                  << std::setw(18)
+                                                                  << ratio(
+                                                                         step.survivingBeforeInfringements,
+                                                                         step.survivingFactors)
+                                                                  << std::setw(17)
+                                                                  << ratio(
+                                                                         step.survivingAfterInfringements,
+                                                                         step.survivingFactors)
+                                                                  << std::setw(11) << step.remainingTraces
+                                                                  << std::setprecision(3)
+                                                                  << step.solveSeconds << '\n'
+                                                                  << std::flush;
+                                                          }}
+                                                : vc::fiber_tracer::
+                                                      FiberTraceWindingOrderedRemovalCallback{});
+                                    const auto& solved = *orderedCutsWinding;
+                                    const auto& final = solved.steps.back();
+                                    const auto [offsetMinimum, offsetMaximum] =
+                                        std::minmax_element(
+                                            solved.ordering.offsetByPiece.begin(),
+                                            solved.ordering.offsetByPiece.end());
+                                    std::cout
+                                        << "fiber winding ordered-cuts summary"
+                                        << " status=" << solved.ordering.status
+                                        << " usable=" << std::boolalpha
+                                        << solved.ordering.solutionUsable
+                                        << std::noboolalpha
+                                        << " iterations="
+                                        << solved.ordering.iterations
+                                        << " sign_factors="
+                                        << solved.ordering.signFactors.size()
+                                        << " removed_fibers="
+                                        << solved.removals.size()
+                                        << " splits=" << final.splits
+                                        << " windings=" << final.windings
+                                        << " infringements="
+                                        << final.signInfringements << '/'
+                                        << final.signFactors
+                                        << " initial_cost="
+                                        << solved.ordering.initialCost
+                                        << " final_cost="
+                                        << solved.ordering.finalCost
+                                        << " sign_margin_cost="
+                                        << solved.ordering.finalCosts.signMargin
+                                        << " target_distance_cost="
+                                        << solved.ordering.finalCosts.targetDistance
+                                        << " continuation_cost="
+                                        << solved.ordering.finalCosts.continuation
+                                        << " offset_min="
+                                        << (offsetMinimum ==
+                                                    solved.ordering.offsetByPiece.end()
+                                                ? 0.0
+                                                : *offsetMinimum)
+                                        << " offset_max="
+                                        << (offsetMaximum ==
+                                                    solved.ordering.offsetByPiece.end()
+                                                ? 0.0
+                                                : *offsetMaximum)
+                                        << " elapsed="
+                                        << solved.ordering.solveSeconds
+                                        << "s\n";
+                                    return vc::fiber_tracer::
+                                        makeFiberTraceOrderedCutsWindingReport(
+                                            solved,
+                                            ordered,
+                                            solved.steps.size() - 1);
+                                }
                                 if (ceresWinding) {
                                     if (!initialStates.empty() || activeRange) {
                                         throw std::logic_error(
@@ -7590,6 +8212,51 @@ int main(int argc, char** argv)
                                 } else {
                                     interleavedWinding = solveInterleaved(
                                         fullWeights, true);
+                                }
+                            }
+
+                            if (orderedCutsWinding &&
+                                orderedCutsWindingConfig) {
+                                std::cout << formatOrderedCutsDiagnostics(
+                                    *orderedCutsWinding,
+                                    *orderedCutsWindingConfig,
+                                    windingConfig,
+                                    referenceDiagnostics
+                                        ? &*referenceDiagnostics
+                                        : nullptr,
+                                    referenceBpConstraints
+                                        ? &*referenceBpConstraints
+                                        : nullptr,
+                                    bpPieceLines);
+                                if (referenceDiagnostics &&
+                                    referenceBpConstraints) {
+                                    const auto oracleStep =
+                                        selectOrderedCutsReferenceOracleStep(
+                                            *orderedCutsWinding,
+                                            *orderedCutsWindingConfig,
+                                            windingConfig,
+                                            *referenceDiagnostics,
+                                            *referenceBpConstraints);
+                                    if (!oracleStep) {
+                                        throw std::logic_error(
+                                            "Ordered-cut reference oracle did not select a checkpoint");
+                                    }
+                                    interleavedWinding = vc::fiber_tracer::
+                                        makeFiberTraceOrderedCutsWindingReport(
+                                            *orderedCutsWinding,
+                                            *orderedCutsWindingConfig,
+                                            *oracleStep);
+                                    const auto& selected =
+                                        orderedCutsWinding->steps.at(*oracleStep);
+                                    std::cout
+                                        << "fiber winding ordered-cuts selection"
+                                        << " mode=reference_oracle"
+                                        << " checkpoint=" << *oracleStep
+                                        << " splits=" << selected.splits
+                                        << " windings=" << selected.windings
+                                        << " infringements="
+                                        << selected.signInfringements << '/'
+                                        << selected.signFactors << '\n';
                                 }
                             }
 

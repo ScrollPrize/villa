@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
+#include "vc/fiber_tracer/FiberTraceWindingOrderedCuts.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -142,6 +143,356 @@ TEST_CASE("Winding class production defaults use the selected reference tuple")
     CHECK(interleavedDefaults.mixedUnaryCost == 100.0);
     const FiberTraceBeliefPropagationConfig orientationDefaults;
     CHECK(orientationDefaults.horizontalnessTemperature == 1.25);
+}
+
+TEST_CASE("Ordered winding offsets use phase-aware sign margins")
+{
+    const auto source = lines(4);
+    auto report = pieces(4);
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    addMeasured(report, 1, 2, 0.0, 0.5);
+    addMeasured(report, 2, 3, 0.0, 0.5);
+    addMeasured(report, 0, 2, 1.0, 1.0);
+    addMeasured(report, 1, 3, 1.0, 1.0);
+    const std::vector orientations{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    FiberTraceWindingOrderedCutsConfig settings;
+    settings.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    settings.normalConfidence = FiberTraceWindingNormalConfidence::None;
+    settings.parallelWorkers = 1;
+    settings.measurementScale = 1.0;
+    settings.maximumIterations = 100;
+    const auto solved = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), orientations, settings);
+
+    REQUIRE(solved.ordering.solutionUsable);
+    CHECK(solved.ordering.signFactors.size() == 5);
+    CHECK(solved.ordering.signFactors[0].margin == 0.5);
+    CHECK(solved.ordering.signFactors[3].margin == 1.0);
+    REQUIRE(solved.steps.size() >= 2);
+    CHECK(solved.steps.front().signInfringements == 3);
+    CHECK(solved.steps[1].signInfringements == 0);
+    CHECK(solved.steps[1].windings == 2);
+    CHECK(solved.steps[1].windingByPiece == std::vector<int>{0, 0, 1, 1});
+    for (std::size_t index = 1; index < solved.steps.size(); ++index) {
+        CHECK(solved.steps[index].signInfringements <
+              solved.steps[index - 1].signInfringements);
+    }
+    const auto published = makeFiberTraceOrderedCutsWindingReport(
+        solved, settings, 1);
+    CHECK(published.mapLatentCoordinate ==
+          std::vector<double>{0.0, 0.5, 1.0, 1.5});
+    CHECK(published.mapOrientationByPiece == orientations);
+}
+
+TEST_CASE("Ordered cuts exclude Mixed pieces and preserve active continuations")
+{
+    auto source = lines(3);
+    source[0].pointsBaseXYZ = {
+        {-5.0, 0.0, 0.0},
+        {5.0, 0.0, 0.0},
+    };
+    auto report = pieces(3);
+    report.inputTraces = 2;
+    report.pieces[0].traceIndex = 0;
+    report.pieces[0].pieceIndex = 0;
+    report.pieces[1].traceIndex = 0;
+    report.pieces[1].pieceIndex = 1;
+    report.pieces[1].beginArcBaseVoxels = 4.0;
+    report.pieces[1].endArcBaseVoxels = 10.0;
+    report.pieces[2].traceIndex = 1;
+    FiberTraceConstraint continuation;
+    continuation.pieceA = 0;
+    continuation.pieceB = 1;
+    continuation.arcABaseVoxels = 5.0;
+    continuation.arcBBaseVoxels = 5.0;
+    continuation.pointABaseXYZ = {0.0, 0.0, 0.0};
+    continuation.pointBBaseXYZ = continuation.pointABaseXYZ;
+    continuation.perpendicularScore = 0.0;
+    continuation.parallelScore = 1.0;
+    continuation.hardContinuity = true;
+    report.constraints.push_back(continuation);
+    addMeasured(report, 0, 2, 1.0, 1.0);
+    addMeasured(report, 1, 2, 1.0, 1.0);
+    source.resize(2);
+    const std::vector orientations{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    FiberTraceWindingOrderedCutsConfig settings;
+    settings.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    settings.normalConfidence = FiberTraceWindingNormalConfidence::None;
+    settings.parallelWorkers = 1;
+    settings.measurementScale = 1.0;
+    const auto solved = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), orientations, settings);
+    REQUIRE_FALSE(solved.steps.empty());
+    for (const auto& step : solved.steps) {
+        CHECK(step.continuationCuts == 0);
+        CHECK(step.windingByPiece[0] == step.windingByPiece[1]);
+    }
+
+    auto mixed = orientations;
+    mixed[2] = FiberTraceFixedOrientation::Mixed;
+    const auto excluded = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), mixed, settings);
+    CHECK(excluded.ordering.activeByPiece ==
+          std::vector<unsigned char>{1, 1, 0});
+    CHECK(excluded.ordering.signFactors.empty());
+    CHECK(excluded.steps.size() == 1);
+}
+
+TEST_CASE("Ordered winding config and fixed-offset inputs are validated")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 1.0, 1.0);
+    const std::vector orientations(
+        2, FiberTraceFixedOrientation::Horizontal);
+    auto settings = FiberTraceWindingOrderedCutsConfig{};
+    settings.signMarginWeight = -1.0;
+    CHECK_THROWS_AS(
+        solveFiberTraceWindingOrderedCuts(
+            report, topology(source, report), orientations, settings),
+        std::invalid_argument);
+    settings = {};
+    std::vector<FiberTraceWindingOrderedCutsFixedOffset> fixed(2);
+    fixed[0] = {true, 2.25};
+    const auto fitted = fitFiberTraceWindingOrderedOffsets(
+        report,
+        topology(source, report),
+        orientations,
+        settings,
+        fixed);
+    CHECK(fitted.offsetByPiece[0] == 2.25);
+    const std::vector<unsigned char> noActive(2, 0);
+    const auto empty = fitFiberTraceWindingOrderedOffsets(
+        report,
+        topology(source, report),
+        orientations,
+        settings,
+        {},
+        {},
+        noActive);
+    CHECK(empty.solutionUsable);
+    CHECK(empty.status == "EMPTY");
+    CHECK(empty.activeByPiece == noActive);
+    CHECK(empty.orientationByPiece == orientations);
+    const std::vector<unsigned char> wrongActive(1, 0);
+    CHECK_THROWS_AS(
+        fitFiberTraceWindingOrderedOffsets(
+            report,
+            topology(source, report),
+            orientations,
+            settings,
+            {},
+            {},
+            wrongActive),
+        std::invalid_argument);
+    const std::vector<FiberTraceWindingOrderedCutsFixedOffset> wrong(1);
+    CHECK_THROWS_AS(
+        fitFiberTraceWindingOrderedOffsets(
+            report,
+            topology(source, report),
+            orientations,
+            settings,
+            wrong),
+        std::invalid_argument);
+    settings.continuationWeight =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        solveFiberTraceWindingOrderedCuts(
+            report, topology(source, report), orientations, settings),
+        std::invalid_argument);
+}
+
+TEST_CASE("Ordered violation ranking uses exact percentages and trace incidence")
+{
+    auto report = pieces(5);
+    report.inputTraces = 3;
+    report.pieces[0].traceIndex = 0;
+    report.pieces[1].traceIndex = 0;
+    report.pieces[0].pieceIndex = 0;
+    report.pieces[0].beginArcBaseVoxels = 0.0;
+    report.pieces[0].endArcBaseVoxels = 6.0;
+    report.pieces[1].pieceIndex = 1;
+    report.pieces[1].beginArcBaseVoxels = 6.0;
+    report.pieces[1].endArcBaseVoxels = 12.0;
+    report.pieces[2].traceIndex = 1;
+    report.pieces[3].traceIndex = 1;
+    report.pieces[4].traceIndex = 2;
+    FiberTraceWindingOrderedOffsetReport ordering;
+    ordering.offsetByPiece = {0.0, 1.0, 0.0, 1.0, 0.0};
+    ordering.orientationByPiece.assign(
+        5, FiberTraceFixedOrientation::Horizontal);
+    ordering.activeByPiece.assign(5, 1);
+    const auto factor = [](std::size_t a, std::size_t b, double sign) {
+        FiberTraceWindingOrderedSignFactor result;
+        result.pieceA = a;
+        result.pieceB = b;
+        result.sign = sign;
+        return result;
+    };
+    ordering.signFactors = {factor(0, 1, -1.0)};
+    for (std::size_t index = 0; index < 9; ++index)
+        ordering.signFactors.push_back(factor(2, 3, -1.0));
+    ordering.signFactors.push_back(factor(2, 3, 1.0));
+    const auto unequal = summarizeFiberTraceWindingOrderedViolations(
+        ordering, report);
+    CHECK(unequal.traces[0].violatedFactors == 1);
+    CHECK(unequal.traces[0].incidentFactors == 1);
+    CHECK(unequal.traces[1].violatedFactors == 9);
+    CHECK(unequal.traces[1].incidentFactors == 10);
+    REQUIRE(unequal.worstTrace);
+    CHECK(*unequal.worstTrace == 0);
+
+    ordering.signFactors = {
+        factor(0, 1, 1.0),
+        factor(0, 1, -1.0),
+        factor(2, 3, 1.0),
+        factor(2, 3, 1.0),
+        factor(2, 3, -1.0),
+        factor(2, 3, -1.0),
+    };
+    const auto tied = summarizeFiberTraceWindingOrderedViolations(
+        ordering, report);
+    CHECK(tied.factors == 6);
+    CHECK(tied.infringements == 3);
+    CHECK(tied.traces[0].incidentFactors == 2);
+    CHECK(tied.traces[0].violatedFactors == 1);
+    CHECK(tied.traces[1].incidentFactors == 4);
+    CHECK(tied.traces[1].violatedFactors == 2);
+    CHECK(tied.traces[2].incidentFactors == 0);
+    REQUIRE(tied.worstTrace);
+    CHECK(*tied.worstTrace == 1);
+
+    ordering.signFactors = {factor(1, 4, 1.0)};
+    const auto cross = summarizeFiberTraceWindingOrderedViolations(
+        ordering, report);
+    CHECK(cross.factors == 1);
+    CHECK(cross.infringements == 1);
+    CHECK(cross.traces[0].incidentFactors == 1);
+    CHECK(cross.traces[2].incidentFactors == 1);
+    REQUIRE(cross.worstTrace);
+    CHECK(*cross.worstTrace == 0);
+
+    const std::vector<unsigned char> onlyTraceTwo{0, 0, 1};
+    const auto filtered = summarizeFiberTraceWindingOrderedViolations(
+        ordering, report, onlyTraceTwo);
+    CHECK(filtered.factors == 0);
+    CHECK(filtered.infringements == 0);
+    CHECK_FALSE(filtered.worstTrace);
+}
+
+TEST_CASE("Ordered offender removal excludes a whole trace and re-solves survivors")
+{
+    auto source = lines(3);
+    source[0].pointsBaseXYZ = {
+        {-6.0, 0.0, 0.0},
+        {6.0, 0.0, 0.0},
+    };
+    auto report = pieces(4);
+    report.inputTraces = 3;
+    report.pieces[0].traceIndex = 0;
+    report.pieces[1].traceIndex = 0;
+    report.pieces[0].pieceIndex = 0;
+    report.pieces[0].beginArcBaseVoxels = 0.0;
+    report.pieces[0].endArcBaseVoxels = 6.0;
+    report.pieces[1].pieceIndex = 1;
+    report.pieces[1].beginArcBaseVoxels = 6.0;
+    report.pieces[1].endArcBaseVoxels = 12.0;
+    report.pieces[2].traceIndex = 1;
+    report.pieces[3].traceIndex = 2;
+    FiberTraceConstraint continuation;
+    continuation.pieceA = 0;
+    continuation.pieceB = 1;
+    continuation.arcABaseVoxels = 6.0;
+    continuation.arcBBaseVoxels = 6.0;
+    continuation.pointABaseXYZ = {0.0, 0.0, 0.0};
+    continuation.pointBBaseXYZ = continuation.pointABaseXYZ;
+    continuation.parallelScore = 1.0;
+    continuation.hardContinuity = true;
+    report.constraints.push_back(continuation);
+    addMeasured(report, 0, 2, 0.0, 0.5);
+    addMeasured(report, 2, 1, 0.0, 0.5);
+    addMeasured(report, 1, 3, 0.0, 0.5);
+    addMeasured(report, 3, 0, 0.0, 0.5);
+    const std::vector orientations(
+        4, FiberTraceFixedOrientation::Horizontal);
+    FiberTraceWindingOrderedCutsConfig settings;
+    settings.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    settings.normalConfidence = FiberTraceWindingNormalConfidence::None;
+    settings.parallelWorkers = 1;
+    settings.measurementScale = 1.0;
+    settings.maximumIterations = 100;
+    settings.signMarginWeight = 0.0;
+
+    const auto baseline = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), orientations, settings);
+    CHECK(baseline.removals.empty());
+    CHECK(std::count(
+              baseline.ordering.activeByPiece.begin(),
+              baseline.ordering.activeByPiece.end(),
+              static_cast<unsigned char>(1)) == 4);
+
+    settings.removeOffendingFibers = true;
+    const auto pruned = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), orientations, settings);
+    REQUIRE(pruned.removals.size() == 1);
+    const auto& removal = pruned.removals.front();
+    CHECK(removal.removedTrace == 0);
+    CHECK(removal.removedPieces == 2);
+    CHECK(removal.incidentFactors == 4);
+    CHECK(removal.violatedFactors == 4);
+    CHECK(removal.oldInfringements == 4);
+    CHECK(removal.oldFactors == 4);
+    CHECK(removal.survivingBeforeInfringements == 0);
+    CHECK(removal.survivingFactors == 0);
+    CHECK(removal.survivingAfterInfringements == 0);
+    CHECK(removal.remainingTraces == 2);
+    CHECK(pruned.ordering.activeByPiece ==
+          std::vector<unsigned char>{0, 0, 1, 1});
+    CHECK(pruned.ordering.orientationByPiece == orientations);
+    const auto final = summarizeFiberTraceWindingOrderedViolations(
+        pruned.ordering, report);
+    CHECK(final.infringements == 0);
+}
+
+TEST_CASE("Ordered offender removal re-solves surviving sign factors")
+{
+    const auto source = lines(3);
+    auto report = pieces(3);
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    addMeasured(report, 1, 2, 0.0, 0.5);
+    addMeasured(report, 2, 0, 0.0, 0.5);
+    const std::vector orientations(
+        3, FiberTraceFixedOrientation::Horizontal);
+    FiberTraceWindingOrderedCutsConfig settings;
+    settings.decisionConfidence =
+        FiberTraceWindingDecisionConfidence::Legacy;
+    settings.normalConfidence = FiberTraceWindingNormalConfidence::None;
+    settings.parallelWorkers = 1;
+    settings.measurementScale = 1.0;
+    settings.maximumIterations = 100;
+    settings.signMarginWeight = 0.0;
+    settings.removeOffendingFibers = true;
+    const auto pruned = solveFiberTraceWindingOrderedCuts(
+        report, topology(source, report), orientations, settings);
+    REQUIRE(pruned.removals.size() == 1);
+    const auto& removal = pruned.removals.front();
+    CHECK(removal.removedTrace == 0);
+    CHECK(removal.oldInfringements == 3);
+    CHECK(removal.survivingFactors == 1);
+    CHECK(removal.survivingBeforeInfringements == 1);
+    CHECK(removal.survivingAfterInfringements == 0);
 }
 
 TEST_CASE("Winding confidence transforms affect only dominant winding weight")

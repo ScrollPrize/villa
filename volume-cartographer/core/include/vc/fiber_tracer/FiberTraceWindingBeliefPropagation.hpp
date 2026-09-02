@@ -46,6 +46,7 @@ enum class FiberTraceWindingSolver : unsigned char {
     JointGrid,
     Alternating,
     Ceres,
+    OrderedCuts,
 };
 
 [[nodiscard]] const char* fiberTraceWindingSolverName(

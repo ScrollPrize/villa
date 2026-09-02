@@ -6062,3 +6062,48 @@
   neutral-expanded, and initialized solves all satisfy their residual criteria.
   This fixed-prepass diagnostic tests Defect, winding, and component-sign state;
   H/V remains fixed by the production orientation prepass.
+
+## Experimental sign-only ordered winding cuts
+
+- `vc_fiber_trace_chunk direction-ablation --winding-solver ordered-cuts`
+  requires fixed-prepass orientation. Prepass-Mixed pieces are excluded;
+  active H/V pieces retain their exact orientation and use phase `0`/`0.5`.
+- The backend consumes `prepareFiberTraceWindingModel`. An admitted dominant
+  sign requires a structurally present prepared sign, finite nonzero signed
+  target, and positive shared decision/normal confidence. It intentionally
+  does not consume the five magnitude-class weights or the old finite/hard
+  sign-energy multipliers.
+- For prepared endpoints `A,B`, let
+  `d=(u_B+phase_B)-(u_A+phase_A)` and `s` be the prepared target sign. The
+  perpendicular margin is `0.5`; the parallel margin is `1.0`. The two Ceres
+  residuals are `sqrt(sign_weight*confidence)*max(0,margin-s*d)` and
+  `sqrt(confidence)*(s*d-margin)`. Hard continuation contributes
+  `sqrt(continuation_weight)*(u_B-u_A)`. Defaults are `16` for both exposed
+  weights, fixed measurement scale `0.822`, and 100 Ceres iterations.
+- Hard-continuation components are indivisible during cuts. Their arithmetic
+  mean fitted offset defines a deterministic order, with minimum piece index
+  as the tie-break. Candidate thresholds exist only between unequal means.
+  Starting from one winding, a candidate increments the complete suffix by
+  one. An edge is infringed exactly when `target_sign*predicted_delta <= 0`.
+  Each iteration accepts the unused threshold with the lowest infringement
+  count only when it strictly improves the current count; ties choose the
+  lowest threshold. `--ordered-max-splits 0` means no explicit cut limit.
+- Every zero/accepted-cut checkpoint independently reruns reference
+  calibration. A separate diagnostic fixes ordinary fitted offsets and fits
+  reference offsets with the identical sign-only model, then reports pairwise
+  filename-order agreement after resolving the global order sign. Neither
+  reference diagnostic changes the ordinary solve.
+- `--ordered-prune-offenders` is an opt-in diagnostic. On each fitted active
+  cohort, a sign factor is infringed when its signed continuous interleaved
+  separation is nonpositive. A cross-source factor contributes once to each
+  endpoint trace and a within-source factor once. Source traces are ordered by
+  the exact rational fraction `infringed / incident`, then by larger infringed
+  count and lower trace index. Zero-degree and zero-infringement traces are not
+  candidates.
+- One pruning iteration removes every split piece of the selected source trace
+  through a separate active mask, preserves fixed H/V orientation metadata,
+  and reruns the same continuous fit. It reports full old-cohort violations,
+  surviving-factor violations before the refit, and the same population after
+  the refit. Iteration ends only when no active sign factor is infringed; a
+  fully exhausted cohort is a valid empty solve. The final retained cohort is
+  passed to the ordinary ordered-cut scan, and removed pieces remain inactive.

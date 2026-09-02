@@ -6481,6 +6481,8 @@ const char* fiberTraceWindingSolverName(FiberTraceWindingSolver solver) noexcept
         return "alternating";
     case FiberTraceWindingSolver::Ceres:
         return "ceres";
+    case FiberTraceWindingSolver::OrderedCuts:
+        return "ordered-cuts";
     }
     return "invalid";
 }

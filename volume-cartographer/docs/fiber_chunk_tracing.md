@@ -1734,3 +1734,102 @@ coefficient. `perp_sign` is the independent hard ordering incidence and has
 `NA` coefficient columns. This distinction matters because a piece can have a
 small finite value residual while no integer winding satisfies all incident
 hard signs.
+
+## Experimental ordered-cut winding solver
+
+`direction-ablation` accepts `--winding-solver ordered-cuts` together with
+`--winding-fixed-orientation`. The ordinary H/V/Mixed prepass runs first.
+Mixed pieces do not enter winding inference; H/V pieces retain their fixed
+orientation.
+
+The solver assigns a continuous whole-winding offset `u` to every active
+piece. Its interleaved coordinate is `u` for H and `u+0.5` for V. It reuses the
+shared prepared winding model and keeps only the dominant relation's admitted
+signed evidence. Perpendicular signs use a `0.5` separation target and
+parallel signs use `1.0`. For signed distance `s*d` and target `m`, Ceres uses
+the residuals
+
+```text
+sqrt(sign_weight * confidence) * max(0, m - s*d)
+sqrt(confidence) * (s*d - m)
+```
+
+Hard-continuation edges additionally use
+`sqrt(continuation_weight) * (u_b-u_a)`. The defaults are `16` for both
+weights. `--ordered-sign-weight` and `--ordered-continuation-weight` override
+them. `--ordered-max-splits N` limits accepted cuts; zero is unlimited.
+
+`--ordered-prune-offenders` enables an additional diagnostic before the cut
+scan. After each continuous fit, it counts each admitted sign factor whose
+signed fitted separation is nonpositive. Each source trace is ranked by
+`violated / incident` sign factors; a cross-trace factor is incident to both
+traces, while a factor within one trace is counted once. Percentages are
+compared exactly. Ties prefer more violated factors and then the lower source
+trace index. The complete worst source trace, including all of its split
+pieces, is removed and the continuous ordering is fitted again. This repeats
+until no retained sign factor is violated.
+
+The removal table reports `local` and `local_%` for the selected trace,
+`old_global` before deletion, `survive_before` after deleting its incident
+factors but before refitting, and `survive_after` on the same surviving factor
+population after refitting. It also reports the remaining trace count and
+refit time. Thus each row distinguishes improvement caused directly by
+deleting constraints from improvement or regression caused by re-optimizing
+the remaining ordering. Removed pieces stay inactive in the subsequent cut
+scan and output diagnostics. This mode performs one Ceres solve per removed
+trace and is intended for diagnosis, not routine production.
+
+After the continuous solve, hard-continuation runs are indivisible. Their mean
+offsets define one fixed order. Starting from one winding, each iteration
+tests every unused boundary, increments the complete suffix by one winding,
+and accepts the boundary that strictly minimizes the exact count of signed
+ordering infringements. Ties choose the lowest boundary. One scan is
+`O(V+E)`; `S` accepted splits cost `O(S*(V+E))` after sorting.
+
+The command prints `ordered winding split progression` for zero cuts and every
+accepted cut. With reference fibers, each row independently calibrates the
+existing reference benchmark and includes exact/wrong/missing winding counts
+and right/wrong constraint counts. It also reports continuation cuts, which
+must remain zero because continuation runs are indivisible. A separate
+continuous reference fit holds
+the crop offsets fixed, solves reference offsets with the same residuals, and
+reports pairwise ordering agreement after resolving only the global order
+sign. These diagnostics do not change the crop solution.
+
+When reference fibers are supplied, this diagnostic backend uses them as an
+explicit oracle to select the checkpoint consumed by subsequent reports and
+artifacts. Selection maximizes exact reference windings, then minimizes wrong
+and missing references, then maximizes reference-constraint accuracy. Exact
+ties retain the earlier checkpoint. Without references, the last accepted cut
+remains selected.
+
+Example:
+
+```bash
+vc_fiber_trace_chunk direction-ablation crop_traces.zarr \
+  --normal-manifest normals.lasagna.json \
+  --output fibers \
+  --piece-length 512 \
+  --bp-only \
+  --bp-inference sum-product-mixed \
+  --winding-fixed-orientation \
+  --winding-solver ordered-cuts
+```
+
+On the 1024 crop's 25% quality cohort (500 input fibers, 1360 retained
+pieces), the Release run used 59,603 signed factors. The continuous fit took
+0.3 seconds and the complete command took 6.3 seconds wall time. Continuous
+reference ordering was correct for 240/276 comparable pairs (86.96%). The
+unregularized cut scan continued to 46 windings, but reference agreement
+peaked at 16/26 exact, 9 wrong, and 1 unsupported around 24--28 windings.
+Consequently this backend remains diagnostic: raw infringement reduction alone
+does not yet provide an adequate stopping rule.
+
+With `piece-length=384` and offender pruning on the same 1024 crop, the
+Release run removed 122 of 499 represented source traces. Continuous sign
+violations decreased from `954/94699` (1.01%) to `0/54154`; the complete
+command took 59.0 seconds wall time (`1018.19` seconds user and `4.66` seconds
+system). The reference-oracle cut checkpoint retained only 16/26 exact
+reference windings, with 8 wrong and 2 unsupported, versus 19 exact, 6 wrong,
+and 1 unsupported without pruning. Eliminating every continuous sign conflict
+therefore removes too much valid support on this sample.

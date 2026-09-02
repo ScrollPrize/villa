@@ -1879,3 +1879,25 @@
 - Hid verbose per-reference piece-pair rows behind
   `--reference-constraint-details` and made valid opposite-ladder output-layer
   estimates report `NA` instead of aborting the benchmark.
+
+## 2026-09-02 - Sign-only ordered winding cuts
+
+- Added an opt-in `ordered-cuts` backend after fixed H/V/Mixed inference. It
+  uses the shared dominant signed evidence to fit continuous whole-winding
+  offsets, preserves hard-continuation runs while inserting discrete cuts, and
+  accepts only cuts that strictly reduce exact sign infringements.
+- Added zero-cut and per-split independently calibrated reference results plus
+  a fixed-crop continuous reference ordering fit. The first 1024 experiment
+  reached 86.96% pairwise continuous-order agreement and peaked at 16/26 exact
+  discrete reference windings, showing that a cut-count stopping prior remains
+  necessary.
+
+## 2026-09-02 - Iterative ordered-winding offender removal
+
+- Added an opt-in whole-source-fiber pruning diagnostic based on exact
+  continuous sign-violation percentages, with a complete refit and comparable
+  before/after violation counts after every removal.
+- On the 1024 crop at piece length 384, it removed 122/499 traces and reached
+  zero continuous violations, but reduced reference-oracle agreement from
+  19/26 to 16/26 exact windings, so it remains diagnostic rather than a
+  production filter.
