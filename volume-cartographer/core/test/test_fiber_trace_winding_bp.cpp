@@ -1577,6 +1577,11 @@ TEST_CASE("Reference raw winding maps to the published integer layer")
     CHECK(fiberTraceReferenceOutputWinding(
               1, reference, orientation, std::array{1}, 0.5, 5) == 3);
 
+    orientation.components[0].evenReferenceIsHorizontal = true;
+    reference.rawEstimatedWinding = -1.5;
+    CHECK_FALSE(fiberTraceReferenceOutputWinding(
+        0, reference, orientation, std::array{1}, 0.5, 5));
+
     reference.rawEstimatedWinding = -1.75;
     CHECK_THROWS_AS(
         fiberTraceReferenceOutputWinding(
@@ -1794,7 +1799,7 @@ TEST_CASE("Fixed reference conflicts use authoritative factor losses")
     CHECK(conflicts[0].bpPiece == 7);
     CHECK(conflicts[0].constraintIndex == 11);
     CHECK(conflicts[0].factorClass ==
-          FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude);
+          FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext);
     CHECK_FALSE(conflicts[0].hardViolation);
     CHECK(conflicts[0].predictedDelta == doctest::Approx(-1.0));
     CHECK(conflicts[0].targetDelta == doctest::Approx(0.5));
@@ -1803,7 +1808,7 @@ TEST_CASE("Fixed reference conflicts use authoritative factor losses")
     CHECK(conflicts[0].weightedLoss == doctest::Approx(3.0));
 
     CHECK(conflicts[1].factorClass ==
-          FiberTraceReferenceBenchmarkClass::PerpendicularSign);
+          FiberTraceReferenceFactorClass::PerpendicularSign);
     CHECK_FALSE(conflicts[1].hardViolation);
     CHECK(conflicts[1].residual == doctest::Approx(1.0));
     CHECK(conflicts[1].weightedLoss == doctest::Approx(3.0));
@@ -1811,7 +1816,7 @@ TEST_CASE("Fixed reference conflicts use authoritative factor losses")
     CHECK(conflicts[2].bpPiece == 9);
     CHECK(conflicts[2].constraintIndex == 12);
     CHECK(conflicts[2].factorClass ==
-          FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude);
+          FiberTraceReferenceFactorClass::ParallelMagnitudeOne);
     CHECK_FALSE(conflicts[2].hardViolation);
     CHECK(conflicts[2].predictedDelta == doctest::Approx(2.0));
     CHECK(conflicts[2].targetDelta == doctest::Approx(-1.0));
@@ -1819,10 +1824,122 @@ TEST_CASE("Fixed reference conflicts use authoritative factor losses")
     CHECK(conflicts[2].weightedLoss == doctest::Approx(12.0));
 
     CHECK(conflicts[3].factorClass ==
-          FiberTraceReferenceBenchmarkClass::ParallelSign);
+          FiberTraceReferenceFactorClass::ParallelSign);
     CHECK(conflicts[3].hardViolation);
     CHECK(conflicts[3].residual == doctest::Approx(1.0));
     CHECK(conflicts[3].weightedLoss == doctest::Approx(0.0));
+}
+
+TEST_CASE("Reference-only conflicts use materialized seven-class factors")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.inputTraces = 6;
+    constraints.pieces.resize(6);
+    constraints.constraints.resize(8);
+    for (std::size_t index = 0; index < constraints.pieces.size(); ++index)
+        constraints.pieces[index].traceIndex = index;
+    for (std::size_t index = 0; index < constraints.constraints.size(); ++index) {
+        constraints.constraints[index].pieceA = 0;
+        constraints.constraints[index].pieceB = std::min<std::size_t>(index, 4);
+    }
+    const std::array<std::size_t, 6> sourceIds{0, 1, 2, 3, 4, 0};
+
+    std::vector<FiberTraceWindingFactorDiagnostic> factors(8);
+    for (std::size_t index = 0; index < factors.size(); ++index) {
+        factors[index].constraintIndex = index;
+        factors[index].canonicalNodeA = 0;
+        factors[index].canonicalNodeB = std::min<std::size_t>(index, 4);
+    }
+
+    factors[0].canonicalNodeB = 1;
+    factors[0].perpendicularMagnitudePresent = true;
+    factors[0].perpendicularSignPresent = true;
+    factors[0].effectivePerpendicularSignedDelta = 0.5;
+    factors[0].effectivePerpendicularWindingWeight = 2.0;
+    factors[0].effectivePerpendicularSignPenalty = 3.0;
+
+    factors[1].constraintIndex = 1;
+    factors[1].canonicalNodeB = 3;
+    factors[1].perpendicularMagnitudePresent = true;
+    factors[1].perpendicularSignPresent = true;
+    factors[1].effectivePerpendicularSignedDelta = -1.5;
+    factors[1].effectivePerpendicularWindingWeight = 2.0;
+    factors[1].hardPerpendicularSign = true;
+
+    factors[2].constraintIndex = 2;
+    factors[2].canonicalNodeB = 2;
+    factors[2].parallelMagnitudePresent = true;
+    factors[2].effectiveParallelWindingDistance = 0.0;
+    factors[2].effectiveParallelWindingWeight = 0.5;
+
+    factors[3].constraintIndex = 3;
+    factors[3].canonicalNodeB = 2;
+    factors[3].parallelMagnitudePresent = true;
+    factors[3].parallelSignPresent = true;
+    factors[3].effectiveSignedParallelDelta = -1.0;
+    factors[3].effectiveParallelWindingDistance = 1.0;
+    factors[3].effectiveParallelWindingWeight = 4.0;
+    factors[3].effectiveParallelSignPenalty = 5.0;
+
+    factors[4].constraintIndex = 4;
+    factors[4].canonicalNodeB = 4;
+    factors[4].parallelMagnitudePresent = true;
+    factors[4].effectiveSignedParallelDelta = 2.0;
+    factors[4].effectiveParallelWindingDistance = 2.0;
+    factors[4].effectiveParallelWindingWeight = 0.0;
+
+    factors[5].constraintIndex = 5;
+    factors[5].canonicalNodeB = 4;
+    factors[5].parallelMagnitudePresent = true;
+    factors[5].effectiveSignedParallelDelta = 2.0;
+    factors[5].effectiveParallelWindingDistance = 2.0;
+    factors[5].effectiveParallelWindingWeight = 1.0;
+
+    factors[6].constraintIndex = 6;
+    factors[6].canonicalNodeB = 5;
+    factors[6].parallelMagnitudePresent = true;
+    factors[6].effectiveParallelWindingDistance = 0.0;
+    factors[6].effectiveParallelWindingWeight = 10.0;
+
+    constraints.constraints[7].hardContinuity = true;
+    factors[7].constraintIndex = 7;
+    factors[7].canonicalNodeB = 4;
+    factors[7].parallelMagnitudePresent = true;
+    factors[7].effectiveParallelWindingDistance = 2.0;
+    factors[7].effectiveParallelWindingWeight = 10.0;
+
+    const auto conflicts = diagnoseFiberTraceReferenceConstraintConflicts(
+        constraints, sourceIds, factors, 1);
+    REQUIRE(conflicts.size() == 8);
+    CHECK(conflicts[0].factorClass ==
+          FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext);
+    CHECK(conflicts[0].residual == doctest::Approx(0.0));
+    CHECK(conflicts[1].factorClass ==
+          FiberTraceReferenceFactorClass::PerpendicularSign);
+    CHECK(conflicts[1].residual == doctest::Approx(0.0));
+    CHECK(conflicts[2].factorClass ==
+          FiberTraceReferenceFactorClass::PerpendicularMagnitudeFar);
+    CHECK(conflicts[2].residual == doctest::Approx(3.0));
+    CHECK(conflicts[2].weightedLoss == doctest::Approx(6.0));
+    CHECK(conflicts[3].factorClass ==
+          FiberTraceReferenceFactorClass::PerpendicularSign);
+    CHECK(conflicts[3].hardViolation);
+    CHECK(conflicts[3].weightedLoss == doctest::Approx(0.0));
+    CHECK(conflicts[4].factorClass ==
+          FiberTraceReferenceFactorClass::ParallelMagnitudeSame);
+    CHECK(conflicts[4].residual == doctest::Approx(1.0));
+    CHECK(conflicts[4].weightedLoss == doctest::Approx(0.5));
+    CHECK(conflicts[5].factorClass ==
+          FiberTraceReferenceFactorClass::ParallelMagnitudeOne);
+    CHECK(conflicts[5].residual == doctest::Approx(2.0));
+    CHECK(conflicts[5].weightedLoss == doctest::Approx(8.0));
+    CHECK(conflicts[6].factorClass ==
+          FiberTraceReferenceFactorClass::ParallelSign);
+    CHECK(conflicts[6].residual == doctest::Approx(1.0));
+    CHECK(conflicts[6].weightedLoss == doctest::Approx(5.0));
+    CHECK(conflicts[7].factorClass ==
+          FiberTraceReferenceFactorClass::ParallelMagnitudeFar);
+    CHECK(conflicts[7].residual == doctest::Approx(0.0));
 }
 
 TEST_CASE("Reference orientation benchmark calibrates component H V gauges")

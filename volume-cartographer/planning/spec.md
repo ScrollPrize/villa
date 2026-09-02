@@ -325,5 +325,23 @@ During active remote downloads, the existing cache status bar appends:
   global sign `S`, the table follows
   `raw_w = S * est_w + G - C + P`. No final estimate, evidence in more than one
   candidate-bearing gauge, or incompatible contributing orientation components
-  reports `NA`; a nonintegral result is an invariant error. Ceres keeps its
+  reports `NA`. A valid half-step candidate on the opposite H/V output ladder
+  also reports `NA`; a candidate outside the half-step lattice is an invariant
+  error. Ceres keeps its
   existing independently defined raw/calibrated reporting convention.
+
+## Reference factor conflict diagnostics
+
+- Reference-enabled direction ablation prints separate compact conflict
+  summaries for clamped reference/reference factors and clamped
+  reference/BP factors.
+- Both summaries consume materialized solver factor targets and effective
+  coefficients and use seven classes: perpendicular winding `0.5`,
+  perpendicular winding `1.5+`, perpendicular sign, parallel winding `0`,
+  parallel winding `1`, parallel winding `2+`, and parallel sign.
+- Magnitude and sign are independent. Zero-weight magnitude factors and
+  disabled finite sign factors are absent. Reference/reference diagnostics
+  exclude hard continuity and same-source links.
+- The long raw reference/reference piece-pair tables are opt-in through
+  `--reference-constraint-details`. Compact summaries remain enabled by
+  default.

@@ -645,12 +645,40 @@ enum class FiberTraceReferenceBenchmarkClass : unsigned char {
     Count,
 };
 
+enum class FiberTraceReferenceFactorClass : unsigned char {
+    PerpendicularMagnitudeNext,
+    PerpendicularMagnitudeFar,
+    PerpendicularSign,
+    ParallelMagnitudeSame,
+    ParallelMagnitudeOne,
+    ParallelMagnitudeFar,
+    ParallelSign,
+    Count,
+};
+
+[[nodiscard]] const char* fiberTraceReferenceFactorClassName(
+    FiberTraceReferenceFactorClass factorClass) noexcept;
+
 struct FiberTraceReferenceClampedFactorConflict {
     std::size_t referenceSource = 0;
     std::size_t bpPiece = 0;
     std::size_t constraintIndex = 0;
-    FiberTraceReferenceBenchmarkClass factorClass =
-        FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude;
+    FiberTraceReferenceFactorClass factorClass =
+        FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext;
+    bool hardViolation = false;
+    double predictedDelta = 0.0;
+    double targetDelta = 0.0;
+    double residual = 0.0;
+    double effectiveWeight = 0.0;
+    double weightedLoss = 0.0;
+};
+
+struct FiberTraceReferenceConstraintFactorConflict {
+    std::size_t constraintIndex = 0;
+    std::size_t sourceA = 0;
+    std::size_t sourceB = 0;
+    FiberTraceReferenceFactorClass factorClass =
+        FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext;
     bool hardViolation = false;
     double predictedDelta = 0.0;
     double targetDelta = 0.0;
@@ -886,6 +914,13 @@ struct FiberTraceReferenceSourceConstraintGroups {
 diagnoseFiberTraceReferenceClampedConflicts(
     std::span<const FiberTraceReferenceWindingObservation> observations,
     const FiberTraceReferenceWindingBenchmark& calibration);
+
+[[nodiscard]] std::vector<FiberTraceReferenceConstraintFactorConflict>
+diagnoseFiberTraceReferenceConstraintConflicts(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const std::size_t> sourceIdsByTrace,
+    std::span<const FiberTraceWindingFactorDiagnostic> factors,
+    int globalSign);
 
 [[nodiscard]] std::vector<FiberTraceReferenceRawWindingEstimate>
 inferFiberTraceReferenceRawWindings(

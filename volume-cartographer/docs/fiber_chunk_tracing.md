@@ -1388,6 +1388,12 @@ options to the `direction-ablation` command:
 --reference-fiber-dir /path/to/vc3d-fibers --reference-fiber-tag hendrik_crop1
 ```
 
+Add `--reference-constraint-details` to print the long per-reference
+piece-pair tables containing every raw, calibrated, and canonical constraint.
+Those tables are hidden by default. The compact canonical summary,
+reference-only factor-conflict summary, reference-to-BP diagnostics, and final
+benchmark tables remain enabled whenever references are supplied.
+
 The tag match is exact and case-sensitive. The command scans only regular JSON
 files directly in that directory, validates selected files with the normal
 VC3D fiber parser, and writes every complete dense base-XYZ line to
@@ -1417,8 +1423,8 @@ The navigation range is the contiguous union of solver and reference slots.
 This association is for navigation only; it does not assert a physical gauge
 match between independently gauged solver components.
 
-For each source and matching BP benchmark, the command prints a perpendicular
-table followed by a parallel table. Dominant score determines the table, with
+With `--reference-constraint-details`, each source and matching BP benchmark
+prints a perpendicular table followed by a parallel table. Dominant score determines the table, with
 exact ties assigned to perpendicular. The raw signed step is first oriented
 from the lower virtual winding to the higher one. The benchmark's fitted global
 sign then produces `calibrated_step`; the per-gauge additive offset cancels from
@@ -1483,7 +1489,8 @@ After the last source table, `reference constraint canonical summary` reports
 including repeated piece-pair measurements between the same source fibers. A
 row is correct when its parallel integer or perpendicular half-integer
 canonical step equals the virtual GT step; otherwise it is false. Consequently
-`correct + false` always equals both `total` and the number of displayed rows.
+`correct + false` always equals both `total` and the number of measured rows,
+including when the detailed rows are hidden.
 The Napari command above automatically loads this sibling as the independent
 `Reference fibers` layer when present. A later successful
 `direction-ablation` run without the reference options removes an older
@@ -1531,6 +1538,19 @@ traced source/piece, its BP latent coordinate, and the predicted versus target
 delta. Zero-weight magnitude factors are deliberately absent because they did
 not constrain the solve. This table is post-solve attribution and is distinct
 from the actual conditioned solve described next.
+
+Both `fixed-reference-to-reference conflict summary` and
+`fixed-reference-to-BP conflict summary` use the same prepared solver factors
+and seven rows: perpendicular winding `0.5`, perpendicular winding `1.5+`,
+perpendicular sign, parallel winding `0`, parallel winding `1`, parallel
+winding `2+`, and parallel sign. Magnitude and sign are independent factors, so
+one measured relation can contribute one row of each kind. The reference-only
+table clamps both endpoints to their filename-order half-step after applying
+the benchmark global sign; it excludes same-source and hard-continuity links.
+`factors`, `conflicts`, `conflict_%`, `hard`, and `weighted_loss` use the exact
+admitted target, effective coefficient, and hard-sign semantics seen by
+inference. A zero-weight magnitude factor is omitted, and a sign factor is
+omitted when it is neither hard nor assigned a finite penalty.
 
 With `--reference-conditioning-diagnostic`, a fixed joint grid additionally
 runs a second diagnostic BP
@@ -1630,8 +1650,9 @@ and adds the same output offset used by the published solver winding OBJ
 filenames. Thus `raw_w` is the integer winding-layer coordinate to select in
 the viewer. With class offset `C`, output offset `P`, gauge offset `G`, and
 global sign `S`, `raw_w = S * est_w + G - C + P`. Missing estimates,
-multi-gauge ambiguity, or incompatible orientation components print `NA`; an
-off-grid conversion is an invariant error. The lower-level per-gauge scorer
+multi-gauge ambiguity, incompatible orientation components, or a valid
+half-step estimate that belongs to the opposite H/V output ladder print `NA`.
+An estimate outside the half-step lattice remains an invariant error. The lower-level per-gauge scorer
 remains an input to calibration, not a second reported candidate. The Ceres
 reference table keeps its independently defined raw and calibrated estimates.
 

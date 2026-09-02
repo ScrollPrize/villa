@@ -5619,7 +5619,8 @@
   matching reference-to-BP benchmark has fitted its global sign. Each BP
   execution formats its own copy of these tables with that sign; no
   uncalibrated duplicate is emitted.
-- Reference constraint output has one source section in source order, with the
+- With `--reference-constraint-details`, reference constraint output has one
+  source section in source order, with the
   source name and virtual winding only in its header. Each section prints a
   perpendicular table followed by a parallel table; an exact orientation-score
   tie belongs to perpendicular. Both tables have exactly `target_winding`,
@@ -5641,7 +5642,10 @@
   pair. A row is correct exactly when its calibrated, table-specific canonical step equals
   its virtual GT step. Empty diagnostics print `0 0 0`, and always satisfy
   `correct + false = total = displayed row count`. This output is diagnostic
-  only and must not change main constraints, BP, or published labels.
+  only and must not change main constraints, BP, or published labels. Without
+  that flag the per-source tables are omitted, but the canonical summary and
+  compact conflict summaries remain present. The flag requires the paired
+  reference-fiber options.
 - Each calibrated reference/reference table set must be preceded by a separate
   unweighted `reference raw signed step distributions` table. Every signed row
   is grouped by its dominant perpendicular/parallel hypothesis, source and
@@ -5782,10 +5786,12 @@
   subtract the reference class offset determined by source H/V parity, the
   unique contributing orientation component's phase sign, and the selected
   phase, then add the same output offset used by published integer winding OBJ
-  layers. The result must be integral and name that output winding slot. No
-  estimate, multiple contributing gauges, or incompatible orientation
-  components prints `NA`; an off-grid result is an invariant error. This
-  display mapping must never run another candidate selection.
+  layers. An integral result names that output winding slot. No estimate,
+  multiple contributing gauges, incompatible orientation components, or a
+  valid half-step candidate that maps to the opposite H/V integer output
+  ladder prints `NA`. A selected candidate outside the half-step lattice is an
+  invariant error. This display mapping must never run another candidate
+  selection.
   Then print one compact row per original selected reference source in source order, identified
   only by its virtual winding `0.5*i`. Each source row
   contains `right`, `wrong`, and `right_fraction` for perpendicular winding,
@@ -5798,6 +5804,21 @@
   reuse the single global gauge calibration, aggregate all runs and pieces of
   one source, include explicit zero-observation sources, and sum exactly to the
   aggregate `sum` row.
+- Before the compact reference benchmark, print two factor-conflict summaries
+  with identical columns and semantics. The reference/reference summary fixes
+  both endpoints to `global_sign * (W_b-W_a)` in the prepared factor's
+  canonical endpoint order and excludes hard-continuity and same-source links.
+  The reference/BP summary fixes only the reference endpoint and retains the
+  ordinary BP state. Both consume the exact materialized targets and effective
+  coefficients and split rows into `perp_winding_0.5`,
+  `perp_winding_1.5+`, `perp_sign`, `parallel_winding_0`,
+  `parallel_winding_1`, `parallel_winding_2+`, and `parallel_sign`, plus a
+  `sum`. Magnitude and sign factors are counted independently. Omit
+  zero-effective-weight magnitude factors and sign factors that are neither
+  hard nor assigned a positive finite penalty. Signed magnitude residual is
+  `abs(predicted_delta-target)`; unsigned parallel magnitude residual is
+  `abs(abs(predicted_delta)-target)`; sign violation is
+  `target*predicted_delta <= 0`.
 - The compact reference winding table must include `parity_ok` beside `est_w`.
   For source `i`, normalize the modulo-two parity of integer half-step index
   `round(2*est_w)` and compare it with `i mod 2`. Missing estimates print `NA`;

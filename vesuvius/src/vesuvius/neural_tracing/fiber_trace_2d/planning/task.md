@@ -1,24 +1,20 @@
 # Task
 
-Extend winding diagnostics and visualization for tagged reference fibers.
+Make reference winding conflict diagnostics class-complete and prevent an
+unmappable reference output-layer estimate from aborting a regular run.
 
-- Keep the aggregate `<base>_reference.obj` layer.
-- Export one additional OBJ layer for every filename-ordered reference fiber
-  as `<base>_reference_hs_<source_index>.obj`, whose virtual winding is
-  `source_index / 2`.
-- Load those layers in `view_fiber_windings` and rotate their complete
-  visibility mask with the existing Next, Previous, and animation actions.
-  References at half-steps `n` and `n+0.5` belong to solver winding slot `n`.
-- Provide mutually exclusive Aggregate, Selected, and Hidden reference display
-  modes so aggregate and indexed geometry cannot be double-rendered.
-- Correct the BP `raw_w` column so it is not independently inferred. It must
-  be the exact final `est_w` candidate inverse-mapped through the selected
-  global sign and gauge offset, converted from the latent half-step coordinate
-  to integer `mapWinding` with the reference H/V class, component phase sign,
-  and selected phase, then shifted into the indices used by the generated
-  `<base>_w_<index>_*.obj` layers. It therefore tells the user which inferred
-  winding layer to inspect without permitting a separate half-step choice.
-- Report `NA` when the final estimate cannot be inverse-mapped to one
-  unambiguous solver gauge and compatible orientation component. The Ceres
-  table remains unchanged.
-- Do not change Ceres result-layer generation or thresholding.
+- Split the existing fixed-reference-to-BP conflict summary into the usual
+  five magnitude classes plus separate perpendicular and parallel sign rows:
+  perpendicular 0.5, perpendicular 1.5+, parallel 0, parallel 1, and
+  parallel 2+.
+- Add an equivalent conflict table for constraints extracted only between
+  tagged reference fibers, with both endpoint windings fixed to their known
+  filename-ordered winding labels.
+- Keep sign and magnitude factors separate and report factor count, conflict
+  count/fraction, hard violations, and weighted loss for each class.
+- Hide the long per-reference, per-piece constraint listings by default and
+  expose them through an explicit diagnostic flag. Keep the new aggregate
+  reference-to-reference table enabled whenever reference fibers are loaded.
+- If the final calibrated reference estimate is incompatible with its unique
+  orientation component and therefore cannot identify an integer published
+  winding layer, print `NA` for `raw_w` rather than terminating the run.

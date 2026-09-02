@@ -86,6 +86,7 @@ struct Options {
     std::filesystem::path referenceFiberDirectory;
     std::string referenceFiberTag;
     bool referenceConditioningDiagnostic = false;
+    bool referenceConstraintDetails = false;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
     std::size_t postIterations = 0;
@@ -242,6 +243,8 @@ void usage(const char* executable)
               << "  --reference-fiber-tag TAG exact tag selected from that directory\n"
               << "  --reference-conditioning-diagnostic\n"
               << "                              run fixed-reference and warm-start BP diagnostics\n\n"
+              << "  --reference-constraint-details\n"
+              << "                              print every reference piece-pair constraint\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -495,6 +498,10 @@ Options parse(int argc, char** argv)
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-conditioning-diagnostic") {
             options.referenceConditioningDiagnostic = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-constraint-details") {
+            options.referenceConstraintDetails = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--obj") {
@@ -1224,6 +1231,10 @@ Options parse(int argc, char** argv)
         if (options.referenceConditioningDiagnostic &&
             !options.hasReferenceFiberDirectoryOption) {
             fail("--reference-conditioning-diagnostic requires reference fibers");
+        }
+        if (options.referenceConstraintDetails &&
+            !options.hasReferenceFiberDirectoryOption) {
+            fail("--reference-constraint-details requires reference fibers");
         }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
@@ -3409,12 +3420,79 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
     return diagnostics;
 }
 
+struct ReferenceFactorConflictCounts {
+    std::size_t factors = 0;
+    std::size_t conflicts = 0;
+    std::size_t hardViolations = 0;
+    double weightedLoss = 0.0;
+};
+
+template <typename Conflicts>
+void appendReferenceFactorConflictSummary(
+    std::ostream& output,
+    std::string_view title,
+    const Conflicts& conflicts)
+{
+    constexpr std::size_t classCount = static_cast<std::size_t>(
+        vc::fiber_tracer::FiberTraceReferenceFactorClass::Count);
+    std::array<ReferenceFactorConflictCounts, classCount + 1> counts;
+    constexpr double conflictEpsilon = 1.0e-12;
+    for (const auto& conflict : conflicts) {
+        const std::size_t factorClass =
+            static_cast<std::size_t>(conflict.factorClass);
+        if (factorClass >= classCount) {
+            throw std::logic_error(
+                "Reference conflict has an invalid factor class");
+        }
+        const bool disagrees = conflict.hardViolation ||
+            conflict.weightedLoss > conflictEpsilon;
+        for (const std::size_t index : {factorClass, classCount}) {
+            auto& current = counts[index];
+            ++current.factors;
+            current.conflicts += disagrees ? 1 : 0;
+            current.hardViolations += conflict.hardViolation ? 1 : 0;
+            current.weightedLoss += conflict.weightedLoss;
+        }
+    }
+
+    output << title << '\n'
+           << std::left << std::setw(24) << "class"
+           << std::right << std::setw(10) << "factors"
+           << std::setw(11) << "conflicts"
+           << std::setw(11) << "conflict_%"
+           << std::setw(9) << "hard"
+           << std::setw(14) << "weighted_loss" << '\n';
+    for (std::size_t index = 0; index <= classCount; ++index) {
+        const auto& current = counts[index];
+        output << std::left << std::setw(24)
+               << (index == classCount
+                       ? "sum"
+                       : vc::fiber_tracer::fiberTraceReferenceFactorClassName(
+                             static_cast<vc::fiber_tracer::
+                                 FiberTraceReferenceFactorClass>(index)))
+               << std::right << std::setw(10) << current.factors
+               << std::setw(11) << current.conflicts;
+        if (current.factors == 0) {
+            output << std::setw(11) << "NA";
+        } else {
+            output << std::setw(10) << std::fixed << std::setprecision(2)
+                   << 100.0 * static_cast<double>(current.conflicts) /
+                          static_cast<double>(current.factors)
+                   << '%';
+        }
+        output << std::setw(9) << current.hardViolations
+               << std::setw(14) << std::fixed << std::setprecision(3)
+               << current.weightedLoss << '\n';
+    }
+}
+
 std::string formatReferenceFiberConstraints(
     const ReferenceFiberDiagnostics& reference,
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
     const vc::fiber_tracer::FiberTraceReferenceWindingBenchmark& calibration,
     const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
-    double measurementScale)
+    double measurementScale,
+    bool includeConstraintDetails)
 {
     if (reference.sourceNames.size() != reference.sourceFibers) {
         throw std::invalid_argument(
@@ -3436,6 +3514,12 @@ std::string formatReferenceFiberConstraints(
             {},
             true,
             measurementScale);
+    const auto referenceFactorConflicts = vc::fiber_tracer::
+        diagnoseFiberTraceReferenceConstraintConflicts(
+            report,
+            reference.sourceIds,
+            factorDiagnostics,
+            calibration.globalSign);
     const auto scaleCalibration = vc::fiber_tracer::
         calibrateFiberTraceReferenceConstraintScales(
             diagnostics, factorDiagnostics);
@@ -3740,14 +3824,18 @@ std::string formatReferenceFiberConstraints(
         }
     };
 
-    for (std::size_t source = 0; source < reference.sourceFibers; ++source) {
-        output << '\n'
-               << "reference fiber " << std::quoted(
-                      reference.sourceNames[source])
-               << " winding=" << std::fixed << std::setprecision(1)
-               << 0.5 * static_cast<double>(source) << '\n';
-        printTable("perpendicular constraints", perpendicular[source]);
-        printTable("parallel constraints", parallel[source]);
+    if (includeConstraintDetails) {
+        for (std::size_t source = 0;
+             source < reference.sourceFibers;
+             ++source) {
+            output << '\n'
+                   << "reference fiber " << std::quoted(
+                          reference.sourceNames[source])
+                   << " winding=" << std::fixed << std::setprecision(1)
+                   << 0.5 * static_cast<double>(source) << '\n';
+            printTable("perpendicular constraints", perpendicular[source]);
+            printTable("parallel constraints", parallel[source]);
+        }
     }
     output << '\n'
            << "reference constraint canonical summary\n"
@@ -3757,7 +3845,12 @@ std::string formatReferenceFiberConstraints(
            << "total\n"
            << std::setw(12) << diagnostics.counts.correct
            << std::setw(12) << diagnostics.counts.falseCount
-           << diagnostics.counts.total << '\n';
+           << diagnostics.counts.total << "\n\n";
+    appendReferenceFactorConflictSummary(
+        output,
+        "fixed-reference-to-reference conflict summary"
+        " (both reference windings clamped)",
+        referenceFactorConflicts);
     return output.str();
 }
 
@@ -5080,7 +5173,8 @@ std::string formatReferenceBpWindingBenchmark(
     vc::fiber_tracer::FiberTraceBalanceMode balanceMode,
     const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
-    std::span<const std::size_t> bpOriginalTraceIndices)
+    std::span<const std::size_t> bpOriginalTraceIndices,
+    bool includeConstraintDetails)
 {
     const auto observations = makeReferenceBpWindingObservations(
         reference, cross, winding, config);
@@ -5103,7 +5197,8 @@ std::string formatReferenceBpWindingBenchmark(
                   *reference.constraintReport,
                   benchmark,
                   config,
-                  winding.measurementScale)
+                  winding.measurementScale,
+                  includeConstraintDetails)
            << '\n'
            << "reference-to-BP winding benchmark"
            << " balance=" << vc::fiber_tracer::fiberTraceBalanceModeName(balanceMode)
@@ -5132,16 +5227,7 @@ std::string formatReferenceBpWindingBenchmark(
                << std::setw(16) << gauge.exactMatches
                << gauge.estimateVotes << '\n';
     }
-    constexpr std::size_t benchmarkClassCount = static_cast<std::size_t>(
-        vc::fiber_tracer::FiberTraceReferenceBenchmarkClass::Count);
-    struct ConflictCounts {
-        std::size_t factors = 0;
-        std::size_t conflicts = 0;
-        std::size_t hardViolations = 0;
-        double weightedLoss = 0.0;
-    };
-    std::array<ConflictCounts, benchmarkClassCount + 1> conflictCounts;
-    std::vector<ConflictCounts> conflictsByReference(
+    std::vector<ReferenceFactorConflictCounts> conflictsByReference(
         reference.sourceNames.size());
     struct PieceConflict {
         std::size_t factors = 0;
@@ -5159,15 +5245,6 @@ std::string formatReferenceBpWindingBenchmark(
         }
         const bool disagrees = conflict.hardViolation ||
             conflict.weightedLoss > conflictEpsilon;
-        for (const std::size_t index : {
-                 static_cast<std::size_t>(conflict.factorClass),
-                 benchmarkClassCount}) {
-            auto& counts = conflictCounts[index];
-            ++counts.factors;
-            counts.conflicts += disagrees ? 1 : 0;
-            counts.hardViolations += conflict.hardViolation ? 1 : 0;
-            counts.weightedLoss += conflict.weightedLoss;
-        }
         auto& piece = pieceConflicts[conflict.bpPiece];
         ++piece.factors;
         piece.conflicts += disagrees ? 1 : 0;
@@ -5185,38 +5262,11 @@ std::string formatReferenceBpWindingBenchmark(
         referenceCounts.hardViolations += conflict.hardViolation ? 1 : 0;
         referenceCounts.weightedLoss += conflict.weightedLoss;
     }
-    output << "fixed-reference conflict summary"
-           << " (reference winding clamped; ordinary BP state retained)\n"
-           << std::left << std::setw(24) << "class"
-           << std::right << std::setw(10) << "factors"
-           << std::setw(11) << "conflicts"
-           << std::setw(11) << "conflict_%"
-           << std::setw(9) << "hard"
-           << std::setw(14) << "weighted_loss" << '\n';
-    for (std::size_t index = 0; index <= benchmarkClassCount; ++index) {
-        const auto& counts = conflictCounts[index];
-        output << std::left << std::setw(24)
-               << (index == benchmarkClassCount
-                       ? "sum"
-                       : vc::fiber_tracer::
-                             fiberTraceReferenceBenchmarkClassName(
-                                 static_cast<vc::fiber_tracer::
-                                     FiberTraceReferenceBenchmarkClass>(
-                                         index)))
-               << std::right << std::setw(10) << counts.factors
-               << std::setw(11) << counts.conflicts;
-        if (counts.factors == 0) {
-            output << std::setw(11) << "NA";
-        } else {
-            output << std::setw(10) << std::fixed << std::setprecision(2)
-                   << 100.0 * static_cast<double>(counts.conflicts) /
-                          static_cast<double>(counts.factors)
-                   << '%';
-        }
-        output << std::setw(9) << counts.hardViolations
-               << std::setw(14) << std::fixed << std::setprecision(3)
-               << counts.weightedLoss << '\n';
-    }
+    appendReferenceFactorConflictSummary(
+        output,
+        "fixed-reference-to-BP conflict summary"
+        " (reference winding clamped; ordinary BP state retained)",
+        clampedConflicts);
     output << "fixed-reference conflicts by reference\n"
            << std::left << std::setw(10) << "winding"
            << std::right << std::setw(10) << "factors"
@@ -5369,7 +5419,7 @@ std::string formatReferenceBpWindingBenchmark(
                << std::setw(8) << std::fixed << std::setprecision(1)
                << 0.5 * static_cast<double>(conflict.referenceSource)
                << std::setw(24)
-               << vc::fiber_tracer::fiberTraceReferenceBenchmarkClassName(
+               << vc::fiber_tracer::fiberTraceReferenceFactorClassName(
                       conflict.factorClass)
                << std::setw(7) << (conflict.hardViolation ? "yes" : "no")
                << std::setw(10) << std::setprecision(2)
@@ -7826,7 +7876,8 @@ int main(int argc, char** argv)
                                             mode,
                                             windingConfig,
                                             bpConstraints,
-                                            bpOriginalTraceIndices);
+                                            bpOriginalTraceIndices,
+                                            options.referenceConstraintDetails);
                                 }
                                 deferredReferenceDiagnostics.push_back(
                                     formatBpWindingComponentDiagnostics(

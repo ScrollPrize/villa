@@ -1,5 +1,9 @@
 # Changelog
 
+- Split fixed-reference winding conflicts into five magnitude and two sign
+  classes, added a matching reference/reference summary, made detailed
+  piece-pair rows opt-in, and report orientation-incompatible output layers as
+  `NA`.
 - Made winding-viewer visibility rotation preserve a complete contiguous
   logical state grid across missing/empty OBJ artifacts, and added active-only
   per-reference error rows to the winding benchmark.

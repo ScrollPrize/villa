@@ -1869,3 +1869,13 @@
 - Added BP `raw_w` as the exact selected `est_w` inverse-mapped into published
   solver winding-layer coordinates, while retaining the existing calibrated
   `est_w` and Ceres output.
+
+## 2026-09-02 - Reference factor conflict diagnostics
+
+- Split fixed-reference conflict reporting into five winding-magnitude and two
+  sign-factor classes, using the exact materialized solver targets and weights.
+- Added the same seven-class summary for constraints between fixed reference
+  fibers, excluding continuity and same-source links.
+- Hid verbose per-reference piece-pair rows behind
+  `--reference-constraint-details` and made valid opposite-ladder output-layer
+  estimates report `NA` instead of aborting the benchmark.

@@ -298,6 +298,27 @@ FiberTraceReferenceConstraintGroup referenceConstraintGroup(
         : FiberTraceReferenceConstraintGroup::ParallelTwoPlus;
 }
 
+FiberTraceReferenceFactorClass referenceMagnitudeFactorClass(
+    bool perpendicular,
+    double canonicalTarget)
+{
+    switch (referenceConstraintGroup(perpendicular, canonicalTarget)) {
+    case FiberTraceReferenceConstraintGroup::PerpendicularNext:
+        return FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext;
+    case FiberTraceReferenceConstraintGroup::PerpendicularFar:
+        return FiberTraceReferenceFactorClass::PerpendicularMagnitudeFar;
+    case FiberTraceReferenceConstraintGroup::ParallelSame:
+        return FiberTraceReferenceFactorClass::ParallelMagnitudeSame;
+    case FiberTraceReferenceConstraintGroup::ParallelOne:
+        return FiberTraceReferenceFactorClass::ParallelMagnitudeOne;
+    case FiberTraceReferenceConstraintGroup::ParallelTwoPlus:
+        return FiberTraceReferenceFactorClass::ParallelMagnitudeFar;
+    case FiberTraceReferenceConstraintGroup::Count:
+        break;
+    }
+    throw std::logic_error("Invalid reference constraint group");
+}
+
 double parallelWindingWeight(const Measurement& measurement)
 {
     if (!measurement.parallelMagnitudePresent)
@@ -5360,14 +5381,14 @@ std::optional<int> fiberTraceReferenceOutputWinding(
     const double classOffset = horizontal
         ? 0.0
         : static_cast<double>(phaseSign) * phaseMagnitude;
+    (void)referenceHalfStepIndex(*reference.rawEstimatedWinding);
     const double relativeWinding =
         *reference.rawEstimatedWinding - classOffset;
     const double rounded = std::round(relativeWinding);
     const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
         std::max(1.0, std::abs(relativeWinding));
     if (std::abs(relativeWinding - rounded) > tolerance) {
-        throw std::logic_error(
-            "Reference winding estimate does not map to an integer output layer");
+        return std::nullopt;
     }
     if (rounded < static_cast<double>(std::numeric_limits<int>::min()) ||
         rounded > static_cast<double>(std::numeric_limits<int>::max())) {
@@ -5842,6 +5863,78 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
     return result;
 }
 
+namespace
+{
+
+template <typename Append>
+void appendMaterializedReferenceFactorConflicts(
+    bool perpendicular,
+    double predictedDelta,
+    bool magnitudePresent,
+    double magnitudeWeight,
+    std::optional<double> signedMagnitudeTarget,
+    double unsignedMagnitudeDistance,
+    bool signPresent,
+    bool hardSign,
+    double signPenalty,
+    Append&& append)
+{
+    if (!std::isfinite(predictedDelta) ||
+        !std::isfinite(magnitudeWeight) || magnitudeWeight < 0.0 ||
+        !std::isfinite(unsignedMagnitudeDistance) ||
+        unsignedMagnitudeDistance < 0.0 ||
+        !std::isfinite(signPenalty) || signPenalty < 0.0 ||
+        (signedMagnitudeTarget && !std::isfinite(*signedMagnitudeTarget))) {
+        throw std::invalid_argument(
+            "Reference factor conflict input is invalid");
+    }
+    if (perpendicular && magnitudePresent && !signedMagnitudeTarget) {
+        throw std::invalid_argument(
+            "Perpendicular reference magnitude factor has no signed target");
+    }
+
+    if (magnitudePresent && magnitudeWeight > 0.0) {
+        const double target = signedMagnitudeTarget
+            ? *signedMagnitudeTarget
+            : unsignedMagnitudeDistance;
+        const double residual = signedMagnitudeTarget
+            ? std::abs(predictedDelta - target)
+            : std::abs(std::abs(predictedDelta) - unsignedMagnitudeDistance);
+        const double displayedPrediction = signedMagnitudeTarget
+            ? predictedDelta
+            : std::abs(predictedDelta);
+        append(
+            referenceMagnitudeFactorClass(perpendicular, target),
+            false,
+            displayedPrediction,
+            target,
+            residual,
+            magnitudeWeight,
+            magnitudeWeight * residual);
+    }
+
+    if (signPresent && (hardSign || signPenalty > 0.0)) {
+        if (!signedMagnitudeTarget || *signedMagnitudeTarget == 0.0) {
+            throw std::invalid_argument(
+                "Reference sign factor has no nonzero signed target");
+        }
+        const bool violation =
+            *signedMagnitudeTarget * predictedDelta <= 0.0;
+        append(
+            perpendicular
+                ? FiberTraceReferenceFactorClass::PerpendicularSign
+                : FiberTraceReferenceFactorClass::ParallelSign,
+            hardSign && violation,
+            predictedDelta,
+            *signedMagnitudeTarget,
+            violation ? 1.0 : 0.0,
+            signPenalty,
+            violation ? signPenalty : 0.0);
+    }
+}
+
+} // namespace
+
 std::vector<FiberTraceReferenceClampedFactorConflict>
 diagnoseFiberTraceReferenceClampedConflicts(
     std::span<const FiberTraceReferenceWindingObservation> observations,
@@ -5862,9 +5955,9 @@ diagnoseFiberTraceReferenceClampedConflicts(
 
     std::vector<FiberTraceReferenceClampedFactorConflict> result;
     result.reserve(2 * observations.size());
-    const auto append = [&](
+    const auto append = [&result](
                             const FiberTraceReferenceWindingObservation& observation,
-                            FiberTraceReferenceBenchmarkClass factorClass,
+                            FiberTraceReferenceFactorClass factorClass,
                             bool hardViolation,
                             double predictedDelta,
                             double targetDelta,
@@ -5908,77 +6001,148 @@ diagnoseFiberTraceReferenceClampedConflicts(
             (fixedReferenceLatent - observation.bpLatentCoordinate);
         const double perpendicularDelta =
             delta / observation.coordinateResidualScale;
+        const bool perpendicular =
+            observation.constraintClass ==
+            FiberTraceReferenceConstraintClass::Perpendicular;
+        appendMaterializedReferenceFactorConflicts(
+            perpendicular,
+            perpendicular ? perpendicularDelta : delta,
+            perpendicular
+                ? observation.perpendicularMagnitudePresent
+                : observation.parallelMagnitudePresent,
+            perpendicular
+                ? observation.perpendicularCoefficient
+                : observation.admittedParallelCoefficient,
+            perpendicular
+                ? observation.signedPerpendicularTarget
+                : observation.signedParallelTarget,
+            observation.parallelDistance,
+            perpendicular
+                ? observation.perpendicularSignPresent
+                : observation.parallelSignPresent,
+            perpendicular
+                ? observation.hardPerpendicularSign
+                : observation.hardParallelSign,
+            perpendicular
+                ? observation.perpendicularSignPenalty
+                : observation.parallelSignPenalty,
+            [&](FiberTraceReferenceFactorClass factorClass,
+                bool hardViolation,
+                double predictedDelta,
+                double targetDelta,
+                double residual,
+                double effectiveWeight,
+                double weightedLoss) {
+                append(
+                    observation,
+                    factorClass,
+                    hardViolation,
+                    predictedDelta,
+                    targetDelta,
+                    residual,
+                    effectiveWeight,
+                    weightedLoss);
+            });
+    }
+    return result;
+}
 
-        if (observation.perpendicularMagnitudePresent &&
-            observation.perpendicularCoefficient > 0.0) {
-            const double residual = std::abs(
-                perpendicularDelta -
-                *observation.signedPerpendicularTarget);
-            append(
-                observation,
-                FiberTraceReferenceBenchmarkClass::PerpendicularMagnitude,
-                false,
-                perpendicularDelta,
-                *observation.signedPerpendicularTarget,
-                residual,
-                observation.perpendicularCoefficient,
-                observation.perpendicularCoefficient * residual);
+std::vector<FiberTraceReferenceConstraintFactorConflict>
+diagnoseFiberTraceReferenceConstraintConflicts(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const std::size_t> sourceIdsByTrace,
+    std::span<const FiberTraceWindingFactorDiagnostic> factors,
+    int globalSign)
+{
+    if (sourceIdsByTrace.size() != constraints.inputTraces ||
+        (globalSign != -1 && globalSign != 1)) {
+        throw std::invalid_argument(
+            "Reference constraint conflict inputs are invalid");
+    }
+
+    std::vector<FiberTraceReferenceConstraintFactorConflict> result;
+    result.reserve(2 * factors.size());
+    for (const auto& factor : factors) {
+        if (factor.constraintIndex >= constraints.constraints.size() ||
+            factor.canonicalNodeA >= constraints.pieces.size() ||
+            factor.canonicalNodeB >= constraints.pieces.size()) {
+            throw std::invalid_argument(
+                "Reference factor diagnostic identifies invalid geometry");
         }
-        if (observation.perpendicularSignPresent &&
-            (observation.hardPerpendicularSign ||
-             observation.perpendicularSignPenalty > 0.0)) {
-            const bool violation =
-                *observation.signedPerpendicularTarget *
-                    perpendicularDelta <= 0.0;
-            append(
-                observation,
-                FiberTraceReferenceBenchmarkClass::PerpendicularSign,
-                observation.hardPerpendicularSign && violation,
-                perpendicularDelta,
-                *observation.signedPerpendicularTarget,
-                violation ? 1.0 : 0.0,
-                observation.perpendicularSignPenalty,
-                violation ? observation.perpendicularSignPenalty : 0.0);
+        const auto& constraint =
+            constraints.constraints[factor.constraintIndex];
+        if (constraint.hardContinuity)
+            continue;
+
+        const std::size_t traceA =
+            constraints.pieces[factor.canonicalNodeA].traceIndex;
+        const std::size_t traceB =
+            constraints.pieces[factor.canonicalNodeB].traceIndex;
+        if (traceA >= sourceIdsByTrace.size() ||
+            traceB >= sourceIdsByTrace.size()) {
+            throw std::invalid_argument(
+                "Reference factor diagnostic identifies an invalid trace");
         }
-        if (observation.parallelMagnitudePresent &&
-            observation.admittedParallelCoefficient > 0.0) {
-            const double residual = std::abs(
-                observation.signedParallelTarget
-                    ? delta - *observation.signedParallelTarget
-                    : std::abs(delta) - observation.parallelDistance);
-            const double predicted = observation.signedParallelTarget
-                ? delta
-                : std::abs(delta);
-            const double target = observation.signedParallelTarget
-                ? *observation.signedParallelTarget
-                : observation.parallelDistance;
-            append(
-                observation,
-                observation.parallelDistance == 0.0
-                    ? FiberTraceReferenceBenchmarkClass::ParallelSameMagnitude
-                    : FiberTraceReferenceBenchmarkClass::ParallelOtherMagnitude,
-                false,
-                predicted,
-                target,
-                residual,
-                observation.admittedParallelCoefficient,
-                observation.admittedParallelCoefficient * residual);
+        const std::size_t sourceA = sourceIdsByTrace[traceA];
+        const std::size_t sourceB = sourceIdsByTrace[traceB];
+        if (sourceA == sourceB)
+            continue;
+        const double predictedDelta = static_cast<double>(globalSign) * 0.5 *
+            (static_cast<double>(sourceB) - static_cast<double>(sourceA));
+        const bool perpendicular =
+            factor.perpendicularMagnitudePresent ||
+            factor.perpendicularSignPresent;
+        const bool parallel =
+            factor.parallelMagnitudePresent || factor.parallelSignPresent;
+        if (!perpendicular && !parallel)
+            continue;
+        if (perpendicular && parallel) {
+            throw std::invalid_argument(
+                "Reference factor diagnostic has ambiguous dominant relation");
         }
-        if (observation.parallelSignPresent &&
-            (observation.hardParallelSign ||
-             observation.parallelSignPenalty > 0.0)) {
-            const bool violation =
-                *observation.signedParallelTarget * delta <= 0.0;
-            append(
-                observation,
-                FiberTraceReferenceBenchmarkClass::ParallelSign,
-                observation.hardParallelSign && violation,
-                delta,
-                *observation.signedParallelTarget,
-                violation ? 1.0 : 0.0,
-                observation.parallelSignPenalty,
-                violation ? observation.parallelSignPenalty : 0.0);
-        }
+
+        appendMaterializedReferenceFactorConflicts(
+            perpendicular,
+            predictedDelta,
+            perpendicular
+                ? factor.perpendicularMagnitudePresent
+                : factor.parallelMagnitudePresent,
+            perpendicular
+                ? factor.effectivePerpendicularWindingWeight
+                : factor.effectiveParallelWindingWeight,
+            perpendicular
+                ? factor.effectivePerpendicularSignedDelta
+                : factor.effectiveSignedParallelDelta,
+            factor.effectiveParallelWindingDistance,
+            perpendicular
+                ? factor.perpendicularSignPresent
+                : factor.parallelSignPresent,
+            perpendicular
+                ? factor.hardPerpendicularSign
+                : factor.hardParallelSign,
+            perpendicular
+                ? factor.effectivePerpendicularSignPenalty
+                : factor.effectiveParallelSignPenalty,
+            [&](FiberTraceReferenceFactorClass factorClass,
+                bool hardViolation,
+                double fixedDelta,
+                double targetDelta,
+                double residual,
+                double effectiveWeight,
+                double weightedLoss) {
+                result.push_back({
+                    factor.constraintIndex,
+                    sourceA,
+                    sourceB,
+                    factorClass,
+                    hardViolation,
+                    fixedDelta,
+                    targetDelta,
+                    residual,
+                    effectiveWeight,
+                    weightedLoss,
+                });
+            });
     }
     return result;
 }
@@ -6199,6 +6363,30 @@ const char* fiberTraceReferenceBenchmarkClassName(
     case FiberTraceReferenceBenchmarkClass::ParallelSign:
         return "parallel_sign";
     case FiberTraceReferenceBenchmarkClass::Count:
+        break;
+    }
+    return "invalid";
+}
+
+const char* fiberTraceReferenceFactorClassName(
+    FiberTraceReferenceFactorClass factorClass) noexcept
+{
+    switch (factorClass) {
+    case FiberTraceReferenceFactorClass::PerpendicularMagnitudeNext:
+        return "perp_winding_0.5";
+    case FiberTraceReferenceFactorClass::PerpendicularMagnitudeFar:
+        return "perp_winding_1.5+";
+    case FiberTraceReferenceFactorClass::PerpendicularSign:
+        return "perp_sign";
+    case FiberTraceReferenceFactorClass::ParallelMagnitudeSame:
+        return "parallel_winding_0";
+    case FiberTraceReferenceFactorClass::ParallelMagnitudeOne:
+        return "parallel_winding_1";
+    case FiberTraceReferenceFactorClass::ParallelMagnitudeFar:
+        return "parallel_winding_2+";
+    case FiberTraceReferenceFactorClass::ParallelSign:
+        return "parallel_sign";
+    case FiberTraceReferenceFactorClass::Count:
         break;
     }
     return "invalid";
