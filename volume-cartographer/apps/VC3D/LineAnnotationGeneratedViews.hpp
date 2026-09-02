@@ -117,6 +117,11 @@ struct GeneratedOverlay {
 
     std::vector<cv::Vec3f> linePoints;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
+    // Line-position range outside which linePoints segments are tails (not
+    // drawn). Defaults to the span of controlPoints; a caller that shows only
+    // a subset of the controls sets the full fiber's range here so interior
+    // spans are not mistaken for tails.
+    std::optional<std::pair<double, double>> lineTailControlRange;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -187,6 +192,10 @@ struct GeneratedViews {
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
     std::vector<cv::Vec3f> lineNormals;
+    // Unwrapped winding angle (radians) of each line point about the scroll
+    // center, or empty when no center reference exists. See
+    // unwrappedGeneratedWindingAngles.
+    std::vector<double> lineWindingAngles;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -458,6 +467,101 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
     const float t = static_cast<float>(linePosition - static_cast<double>(lower));
     return linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
            linePoints[static_cast<size_t>(upper)] * t;
+}
+
+// The side cut shows the stretch of the fiber within this winding distance of
+// the current position, on either side: half a wrap.
+inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
+
+// Unwrapped winding angle (radians) of each line point about the scroll
+// center, accumulated along the line so adjacent wraps differ by ~2*pi instead
+// of aliasing onto the same value. towardCenter(point) returns the vector from
+// the point to the center at that point's z (non-finite when unknown). A point
+// without a usable direction gets NaN and does not break the chain: the next
+// finite angle continues from the last finite one. No towardCenter: all NaN.
+inline std::vector<double> unwrappedGeneratedWindingAngles(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
+{
+    constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
+    std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
+    if (!towardCenter) {
+        return angles;
+    }
+    std::optional<double> previous;
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        const cv::Vec3f& point = linePoints[i];
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+            continue;
+        }
+        const cv::Vec3f toCenter = towardCenter(point);
+        if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
+            continue;
+        }
+        // Radial direction, center -> point, in the slice plane (z is the axis).
+        const double dx = -static_cast<double>(toCenter[0]);
+        const double dy = -static_cast<double>(toCenter[1]);
+        if (dx * dx + dy * dy <= 1.0e-12) {
+            continue;
+        }
+        double angle = std::atan2(dy, dx);
+        if (previous) {
+            // Nearest equivalent to the previous angle: remainder lands in [-pi, pi].
+            angle = *previous + std::remainder(angle - *previous, kTwoPi);
+        }
+        angles[i] = angle;
+        previous = angle;
+    }
+    return angles;
+}
+
+// Inclusive index range [first, last] of the contiguous stretch of the line
+// around linePosition whose winding angle stays within maxAngleDelta of the
+// angle at linePosition. Without usable angles (empty, size mismatch, or no
+// finite angle at the position) the whole line qualifies. NaN angles inside
+// the stretch are kept so isolated unknown points do not split the run.
+inline std::pair<size_t, size_t> generatedLineIndexRangeWithinWinding(
+    const std::vector<double>& angles,
+    size_t pointCount,
+    double linePosition,
+    double maxAngleDelta)
+{
+    if (pointCount == 0) {
+        return {0, 0};
+    }
+    const std::pair<size_t, size_t> full{0, pointCount - 1};
+    if (angles.size() != pointCount || !std::isfinite(linePosition) ||
+        !(maxAngleDelta >= 0.0)) {
+        return full;
+    }
+    const double clamped = std::clamp(linePosition, 0.0, static_cast<double>(pointCount - 1));
+    const size_t lower = static_cast<size_t>(std::floor(clamped));
+    const size_t upper = std::min(lower + 1, pointCount - 1);
+    double reference = std::numeric_limits<double>::quiet_NaN();
+    if (std::isfinite(angles[lower]) && std::isfinite(angles[upper])) {
+        const double t = clamped - static_cast<double>(lower);
+        reference = angles[lower] * (1.0 - t) + angles[upper] * t;
+    } else if (std::isfinite(angles[lower])) {
+        reference = angles[lower];
+    } else if (std::isfinite(angles[upper])) {
+        reference = angles[upper];
+    }
+    if (!std::isfinite(reference)) {
+        return full;
+    }
+    const auto within = [&](size_t index) {
+        return !std::isfinite(angles[index]) ||
+               std::abs(angles[index] - reference) <= maxAngleDelta;
+    };
+    size_t first = lower;
+    while (first > 0 && within(first - 1)) {
+        --first;
+    }
+    size_t last = upper;
+    while (last + 1 < pointCount && within(last + 1)) {
+        ++last;
+    }
+    return {first, last};
 }
 
 // Content-anchored remap of a fractional line position across a line-geometry

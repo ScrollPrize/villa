@@ -3952,6 +3952,42 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                                      _sideCutViewer,
                                                      sideViews.sideCutSurface.get());
         sideOverlay.linePoints = sideViews.linePoints;
+        // Only the stretch within half a wrap of the current position. The
+        // side cut's plane contains the sheet normal, so for a fiber annotated
+        // across several wraps EVERY wrap of this stretch lies (nearly) in the
+        // plane, and projecting the whole line drew them all on top of each
+        // other. Out-of-window points are blanked rather than erased so the
+        // point indices the tail detection keys on stay meaningful, and the
+        // tail range is taken from the plane-near controls BEFORE the window
+        // trims them, so interior spans do not turn into tails.
+        {
+            const auto window = vc3d::line_annotation::generatedLineIndexRangeWithinWinding(
+                sideViews.lineWindingAngles,
+                sideViews.linePoints.size(),
+                sidePosition,
+                vc3d::line_annotation::kGeneratedSideCutHalfWrapAngle);
+            const size_t pointCount = sideOverlay.linePoints.size();
+            if (pointCount > 0 && (window.first > 0 || window.second + 1 < pointCount)) {
+                constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+                const cv::Vec3f blank{kNanF, kNanF, kNanF};
+                for (size_t i = 0; i < window.first; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                for (size_t i = window.second + 1; i < pointCount; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                sideOverlay.lineTailControlRange =
+                    vc3d::line_annotation::generatedControlLinePositionRange(
+                        sideOverlay.controlPoints);
+                const double lowPosition = static_cast<double>(window.first) - 0.5;
+                const double highPosition = static_cast<double>(window.second) + 0.5;
+                std::erase_if(sideOverlay.controlPoints, [&](const auto& control) {
+                    return std::isfinite(control.linePosition) &&
+                           (control.linePosition < lowPosition ||
+                            control.linePosition > highPosition);
+                });
+            }
+        }
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
         // position so the highlight tracks the cursor as it moves along the line. Use the

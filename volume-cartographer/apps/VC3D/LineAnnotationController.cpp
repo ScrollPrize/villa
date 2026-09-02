@@ -11879,6 +11879,39 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.stripPositionMap = views.stripPositionMap;
     generatedViews.lineNormals = std::move(orientedNormals);
+    {
+        // Winding angles for the side cut's half-wrap window (see the side
+        // overlay in LineAnnotationDialog). Same center reference chain as
+        // orientedLineNormalsForSession, which already loaded the umbilicus:
+        // umbilicus, else the volume center; with neither the angles stay NaN
+        // and the side cut shows the whole line as before.
+        constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+        cv::Vec2f volumeCenterXY{kNanF, kNanF};
+        try {
+            if (const auto volume = _state->currentVolume()) {
+                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f,
+                                  static_cast<float>(volume->sliceHeight()) * 0.5f};
+            }
+        } catch (...) {
+        }
+        generatedViews.lineWindingAngles =
+            vc3d::line_annotation::unwrappedGeneratedWindingAngles(
+                generatedViews.linePoints,
+                [this, volumeCenterXY](const cv::Vec3f& point) -> cv::Vec3f {
+                    if (_scrollUmbilicus) {
+                        try {
+                            return _scrollUmbilicus->vector_to_umbilicus(point);
+                        } catch (...) {
+                        }
+                    }
+                    if (std::isfinite(volumeCenterXY[0])) {
+                        return {volumeCenterXY[0] - point[0],
+                                volumeCenterXY[1] - point[1],
+                                0.0f};
+                    }
+                    return {kNanF, kNanF, kNanF};
+                });
+    }
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
     generatedViews.seedPoint = seedPoint;

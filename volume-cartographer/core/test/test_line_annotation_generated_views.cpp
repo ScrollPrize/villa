@@ -1048,6 +1048,86 @@ TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber p
     }
 }
 
+TEST_CASE("line annotation winding angles unwrap along the line and window half a wrap")
+{
+    using vc3d::line_annotation::generatedLineIndexRangeWithinWinding;
+    using vc3d::line_annotation::kGeneratedSideCutHalfWrapAngle;
+    using vc3d::line_annotation::unwrappedGeneratedWindingAngles;
+    constexpr double kPi = kGeneratedSideCutHalfWrapAngle;
+
+    // A spiral of 1.5 wraps about the origin, one point every quarter turn
+    // (13 points, angles 0 .. 3*pi), radius growing slowly.
+    std::vector<cv::Vec3f> spiral;
+    for (int i = 0; i <= 12; ++i) {
+        const double angle = static_cast<double>(i) * kPi / 4.0;
+        const double radius = 100.0 + static_cast<double>(i);
+        spiral.push_back({static_cast<float>(radius * std::cos(angle)),
+                          static_cast<float>(radius * std::sin(angle)),
+                          static_cast<float>(i)});
+    }
+    const auto towardOrigin = [](const cv::Vec3f& point) {
+        return cv::Vec3f{-point[0], -point[1], 0.0f};
+    };
+
+    SUBCASE("angles accumulate past pi instead of wrapping")
+    {
+        const auto angles = unwrappedGeneratedWindingAngles(spiral, towardOrigin);
+        REQUIRE(angles.size() == spiral.size());
+        for (int i = 0; i <= 12; ++i) {
+            CHECK(angles[static_cast<size_t>(i)] ==
+                  doctest::Approx(static_cast<double>(i) * kPi / 4.0).epsilon(1e-6));
+        }
+    }
+
+    SUBCASE("a point without a center direction is NaN and does not break the chain")
+    {
+        std::vector<cv::Vec3f> withHole = spiral;
+        withHole[6] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        const auto angles = unwrappedGeneratedWindingAngles(withHole, towardOrigin);
+        CHECK(std::isnan(angles[6]));
+        CHECK(angles[7] == doctest::Approx(7.0 * kPi / 4.0).epsilon(1e-6));
+        CHECK(angles[12] == doctest::Approx(3.0 * kPi).epsilon(1e-6));
+    }
+
+    SUBCASE("the half-wrap window keeps only the stretch within pi of the position")
+    {
+        const auto angles = unwrappedGeneratedWindingAngles(spiral, towardOrigin);
+        // At index 4 (angle pi) the window is [0, 2*pi] -> indices 0..8.
+        auto range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 4.0,
+                                                          kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 8);
+        // At index 6 (1.5*pi) the window is [0.5*pi, 2.5*pi] -> indices 2..10.
+        range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 6.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 2);
+        CHECK(range.second == 10);
+        // A fractional position interpolates its reference angle.
+        range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 6.5,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 3);
+        CHECK(range.second == 10);
+    }
+
+    SUBCASE("without usable angles the whole line qualifies")
+    {
+        const std::vector<double> empty;
+        auto range = generatedLineIndexRangeWithinWinding(empty, spiral.size(), 4.0,
+                                                          kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 12);
+        const auto allNan = unwrappedGeneratedWindingAngles(spiral, nullptr);
+        range = generatedLineIndexRangeWithinWinding(allNan, spiral.size(), 4.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 12);
+        range = generatedLineIndexRangeWithinWinding(allNan, 0, 4.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 0);
+    }
+}
+
 TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
 {
     const std::vector<double> controlPositions{12.0, 20.0, 40.0};

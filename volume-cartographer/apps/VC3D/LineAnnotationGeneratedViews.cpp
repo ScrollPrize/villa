@@ -647,7 +647,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
-        const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
+        const auto controlRange = overlay.lineTailControlRange.has_value()
+            ? overlay.lineTailControlRange
+            : generatedControlLinePositionRange(overlay.controlPoints);
         // Consecutive non-tail segments accumulate into one polyline
         // primitive per run (same pattern as the branch lines above): a
         // primitive per segment meant one QGraphicsPathItem per segment,
