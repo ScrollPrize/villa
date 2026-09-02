@@ -312,6 +312,26 @@ void TiffWriter::close() {
 }
 
 // ============================================================================
+// isReadableTiff
+// ============================================================================
+
+bool isReadableTiff(const std::filesystem::path& path)
+{
+    // TIFFOpen("r") reads the first directory and fails without one; a
+    // torn file makes libtiff complain through its global handlers, so
+    // mute them for the probe and hand back a plain yes/no.
+    TIFFErrorHandler prevError = TIFFSetErrorHandler(nullptr);
+    TIFFErrorHandler prevWarning = TIFFSetWarningHandler(nullptr);
+    TIFF* tf = TIFFOpen(path.string().c_str(), "r");
+    TIFFSetErrorHandler(prevError);
+    TIFFSetWarningHandler(prevWarning);
+    if (!tf)
+        return false;
+    TIFFClose(tf);
+    return true;
+}
+
+// ============================================================================
 // mergeTiffParts implementation
 // ============================================================================
 
