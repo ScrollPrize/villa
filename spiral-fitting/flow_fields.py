@@ -673,7 +673,6 @@ class CylindricalFlowField(nn.Module):
                 acc_low = acc_high = None
                 if training_field:
                     assert self._pending_field_graphs is None
-                    low, high = low.detach(), high.detach()
                     if self._lr_grad_acc is None or self._lr_grad_acc.shape != low.shape:
                         self._lr_grad_acc = torch.zeros_like(low)
                     else:

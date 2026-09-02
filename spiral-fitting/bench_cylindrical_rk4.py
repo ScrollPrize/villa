@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 
-VARIANTS = ('cartesian-direct', 'cylindrical-eager', 'cylindrical-fused')
+VARIANTS = ('cylindrical-eager', 'cartesian-direct', 'cylindrical-fused')
 
 
 def _arguments():
@@ -52,6 +52,8 @@ def _worker(args):
     os.environ['FIT_SPIRAL_CYL_BLOCK'] = str(args.block)
     os.environ['FIT_SPIRAL_TRITON'] = (
         '0' if args.variant == 'cylindrical-eager' else '1')
+    if args.variant == 'cartesian-direct':
+        os.environ['FIT_SPIRAL_DIRECT_LR'] = '1'
 
     import torch
     import flow_triton

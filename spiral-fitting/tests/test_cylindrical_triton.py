@@ -167,6 +167,25 @@ def test_two_fused_backwards_share_accumulators(monkeypatch):
 
 
 @cuda
+def test_fused_field_gradients_do_not_require_point_gradients(monkeypatch):
+    monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
+    fused = _make_flow('cuda', seed=31)
+    eager = _make_flow('cuda', seed=31)
+    eager.load_state_dict(fused.state_dict())
+    points = torch.rand(53, 3, device='cuda')
+    output = fused.get_time_invariant_integrator()(points, 0.1, 1)
+    reference = _manual_rk4(eager.get_sampler(0.0), points, 0.1, 1)
+    output.square().mean().backward()
+    reference.square().mean().backward()
+    fused.apply_accumulated_field_grad()
+    eager.apply_accumulated_field_grad()
+    torch.testing.assert_close(fused.flows[0].grad, eager.flows[0].grad,
+                               rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(fused.flows[1].grad, eager.flows[1].grad,
+                               rtol=2e-4, atol=2e-5)
+
+
+@cuda
 def test_empty_batch_and_no_grad_avoid_stage_storage(monkeypatch):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
     flow = _make_flow('cuda')

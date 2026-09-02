@@ -1459,7 +1459,8 @@ def rk4_cylindrical_integrate(y0, low, low_num_phi, low_offsets,
                               high, high_num_phi, high_offsets,
                               acc_low, acc_high, h, n_steps):
     """Integrate a stationary pair of packed cylindrical flow lattices."""
-    if torch.is_grad_enabled() and y0.requires_grad:
+    if torch.is_grad_enabled() and (
+            y0.requires_grad or low.requires_grad or high.requires_grad):
         return TritonRK4CylindricalIntegrate.apply(
             y0, low, low_num_phi, low_offsets,
             high, high_num_phi, high_offsets,
