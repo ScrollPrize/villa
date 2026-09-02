@@ -988,6 +988,66 @@ TEST_CASE("line annotation remapped line position follows the same fiber spot")
     }
 }
 
+TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber pass")
+{
+    using vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor;
+
+    // Two passes of the same fiber through one cut plane: an outbound pass
+    // along y=0 (indices 0..10) and a return pass along y=6 (indices 11..21).
+    // The pane reports position 5 on the outbound pass; the click that
+    // requests the control point lands 5.5 units off that pass, i.e. within
+    // half a unit of the return pass.
+    std::vector<cv::Vec3d> line;
+    for (int i = 0; i <= 10; ++i) {
+        line.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+    for (int i = 0; i <= 10; ++i) {
+        line.push_back({static_cast<double>(10 - i), 6.0, 0.0});
+    }
+    const cv::Vec3d click(5.0, 5.5, 0.0);
+    const cv::Vec3d anchor(5.0, 0.0, 0.0);
+
+    SUBCASE("the clicked point is nearer to the other pass")
+    {
+        // The regression this guards: resolving the position through the
+        // click picked the return pass, thousands of vertices away on a real
+        // fiber, so the edit collapsed into that pass's control point.
+        CHECK(vc3d::fiber_slice::nearestLinePointIndex(line, click) == 16);
+    }
+
+    SUBCASE("the anchor keeps the position on the outbound pass")
+    {
+        CHECK(remappedGeneratedLinePositionFromAnchor(line, anchor, 5.0) ==
+              doctest::Approx(5.0));
+    }
+
+    SUBCASE("a renumbered line still resolves through the anchor")
+    {
+        // The session line resampled the outbound pass at half spacing while
+        // the pane still measured position 4.25 on the old line: the anchor
+        // (4.25, 0, 0) lives at index 8.5 now.
+        std::vector<cv::Vec3d> renumbered;
+        for (int i = 0; i <= 20; ++i) {
+            renumbered.push_back({static_cast<double>(i) * 0.5, 0.0, 0.0});
+        }
+        for (int i = 0; i <= 10; ++i) {
+            renumbered.push_back({static_cast<double>(10 - i), 6.0, 0.0});
+        }
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  renumbered, cv::Vec3d(4.25, 0.0, 0.0), 4.25) ==
+              doctest::Approx(8.5));
+    }
+
+    SUBCASE("a non-finite anchor falls back to the clamped position")
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  line, cv::Vec3d(nan, 0.0, 0.0), 5.0) == doctest::Approx(5.0));
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  line, cv::Vec3d(nan, 0.0, 0.0), 99.0) == doctest::Approx(21.0));
+    }
+}
+
 TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
 {
     const std::vector<double> controlPositions{12.0, 20.0, 40.0};

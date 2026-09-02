@@ -199,9 +199,13 @@ public:
 signals:
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
+    // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
+    // controller can resolve the position on its own (possibly renumbered)
+    // line without consulting the clicked point.
     void generatedControlPointRequested(const std::string& surfaceName,
                                         cv::Vec3f volumePoint,
-                                        double linePosition);
+                                        double linePosition,
+                                        cv::Vec3f lineAnchor);
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);

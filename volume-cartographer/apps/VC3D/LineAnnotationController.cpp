@@ -2495,8 +2495,11 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
             this,
-            [this](const std::string& name, cv::Vec3f volumePoint, double linePosition) {
-                handleGeneratedControlPoint(name, volumePoint, linePosition);
+            [this](const std::string& name,
+                   cv::Vec3f volumePoint,
+                   double linePosition,
+                   cv::Vec3f lineAnchor) {
+                handleGeneratedControlPoint(name, volumePoint, linePosition, lineAnchor);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointDeleteRequested,
@@ -7247,7 +7250,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
 
 void LineAnnotationController::handleGeneratedControlPoint(const std::string& surfaceName,
                                                           cv::Vec3f volumePoint,
-                                                          double linePosition)
+                                                          double linePosition,
+                                                          std::optional<cv::Vec3f> lineAnchor)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -7285,17 +7289,23 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     for (const auto& point : session.optimizedLine.points) {
         currentLinePoints.push_back(point.position);
     }
-    {
+    if (lineAnchor && std::isfinite((*lineAnchor)[0]) && std::isfinite((*lineAnchor)[1]) &&
+        std::isfinite((*lineAnchor)[2])) {
         // A rapid second click arrives while the previous edit's geometric
         // splice is still waiting for its landing: its line position was
         // measured on the previously DISPLAYED line, and the splice may have
-        // renumbered since. The 3D click point is frame-independent, so when
-        // the two disagree materially, trust the point.
-        const size_t nearestIndex = vc3d::fiber_slice::nearestLinePointIndex(
-            currentLinePoints, toVec3d(volumePoint));
-        if (std::abs(static_cast<double>(nearestIndex) - linePosition) > 2.0) {
-            linePosition = static_cast<double>(nearestIndex);
-        }
+        // renumbered since. Resolve it on the session line through the
+        // position's own 3D line point (index-continuous nearest match, the
+        // same remap the landing applies to the pane position). Where the
+        // frames agree the anchor sits exactly on the line and the position
+        // is unchanged. The CLICKED point must not drive this: a click is
+        // deliberately off the line, and where another pass of the same fiber
+        // runs through the cut plane the click can be nearer to that pass,
+        // which sent the control point thousands of vertices away -- or
+        // collapsed it into that pass's control point -- with nothing
+        // visible happening at the cut the user was looking at.
+        linePosition = vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor(
+            currentLinePoints, toVec3d(*lineAnchor), linePosition);
     }
     const auto cumulativeArclengths =
         vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);

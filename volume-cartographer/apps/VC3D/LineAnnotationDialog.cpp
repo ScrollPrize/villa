@@ -2085,7 +2085,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(currentViewer);
@@ -2144,7 +2145,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(sideViewer);
@@ -2259,7 +2261,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
-                            emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                            emit generatedControlPointRequested(surfaceName,
+                                                                volumePoint,
+                                                                position,
+                                                                interpolatedLinePoint(position));
                         }
                     }
                 });
@@ -4659,7 +4664,8 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     cancelArrowPan();
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
-                                        _currentLinePosition);
+                                        _currentLinePosition,
+                                        volumePoint);
     return true;
 }
 

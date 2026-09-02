@@ -471,10 +471,23 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
 // geometry by a comparable amount, plain nearest-point could jump the anchor
 // onto the other wrap. Falls back to the clamped input position when either
 // polyline is unusable.
-inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
-                                            const std::vector<cv::Vec3f>& newLinePoints,
-                                            double oldPosition)
+//
+// remappedGeneratedLinePositionFromAnchor is the anchor-based core, shared with
+// the controller: a pane reports control-point edits at a line position it
+// measured on the DISPLAYED line, and the controller resolves that position on
+// the session line through the position's own 3D line point. Deliberately not
+// through the clicked point: a click is meant to be off the line, and where
+// another pass of the same fiber runs through the cut plane the clicked point
+// can be nearer to that pass than to the local one.
+template <typename Point>
+inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& newLinePoints,
+                                                      const Point& anchor,
+                                                      double oldPosition)
 {
+    using Scalar = typename Point::value_type;
+    const auto finite = [](const Point& p) {
+        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+    };
     if (newLinePoints.empty()) {
         return 0.0;
     }
@@ -483,18 +496,17 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         return 0.0;
     }
     const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
-    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
-    if (!std::isfinite(anchor[0]) || !std::isfinite(anchor[1]) || !std::isfinite(anchor[2])) {
+    if (!finite(anchor)) {
         return fallback;
     }
     std::optional<size_t> nearestIndex;
     double nearestDistanceSq = std::numeric_limits<double>::max();
     for (size_t i = 0; i < newLinePoints.size(); ++i) {
-        const cv::Vec3f& point = newLinePoints[i];
-        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+        const Point& point = newLinePoints[i];
+        if (!finite(point)) {
             continue;
         }
-        const cv::Vec3f delta = point - anchor;
+        const Point delta = point - anchor;
         const double distanceSq = static_cast<double>(delta.dot(delta));
         if (distanceSq < nearestDistanceSq) {
             nearestDistanceSq = distanceSq;
@@ -515,12 +527,11 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         double chosenIndexDelta = std::abs(
             static_cast<double>(*nearestIndex) - oldPosition);
         for (size_t i = 0; i < newLinePoints.size(); ++i) {
-            const cv::Vec3f& point = newLinePoints[i];
-            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
-                !std::isfinite(point[2])) {
+            const Point& point = newLinePoints[i];
+            if (!finite(point)) {
                 continue;
             }
-            const cv::Vec3f delta = point - anchor;
+            const Point delta = point - anchor;
             const double distanceSq = static_cast<double>(delta.dot(delta));
             if (distanceSq > tieThresholdSq) {
                 continue;
@@ -544,21 +555,20 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         if (segmentStart + 1 >= newLinePoints.size()) {
             continue;
         }
-        const cv::Vec3f& a = newLinePoints[segmentStart];
-        const cv::Vec3f& b = newLinePoints[segmentStart + 1];
-        if (!std::isfinite(a[0]) || !std::isfinite(a[1]) || !std::isfinite(a[2]) ||
-            !std::isfinite(b[0]) || !std::isfinite(b[1]) || !std::isfinite(b[2])) {
+        const Point& a = newLinePoints[segmentStart];
+        const Point& b = newLinePoints[segmentStart + 1];
+        if (!finite(a) || !finite(b)) {
             continue;
         }
-        const cv::Vec3f segment = b - a;
+        const Point segment = b - a;
         const double lengthSq = static_cast<double>(segment.dot(segment));
         if (!(lengthSq > 0.0)) {
             continue;
         }
         const double t = std::clamp(
             static_cast<double>((anchor - a).dot(segment)) / lengthSq, 0.0, 1.0);
-        const cv::Vec3f projected = a + segment * static_cast<float>(t);
-        const cv::Vec3f delta = projected - anchor;
+        const Point projected = a + segment * static_cast<Scalar>(t);
+        const Point delta = projected - anchor;
         const double distanceSq = static_cast<double>(delta.dot(delta));
         if (distanceSq < bestDistanceSq) {
             bestDistanceSq = distanceSq;
@@ -566,6 +576,17 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         }
     }
     return std::clamp(bestPosition, 0.0, maxNewPosition);
+}
+
+inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
+                                            const std::vector<cv::Vec3f>& newLinePoints,
+                                            double oldPosition)
+{
+    if (newLinePoints.empty() || !std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
+    return remappedGeneratedLinePositionFromAnchor(newLinePoints, anchor, oldPosition);
 }
 
 // One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
