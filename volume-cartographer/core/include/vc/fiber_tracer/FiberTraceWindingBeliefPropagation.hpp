@@ -45,6 +45,7 @@ struct FiberTraceReferenceConstraintDiagnosticReport {
 enum class FiberTraceWindingSolver : unsigned char {
     JointGrid,
     Alternating,
+    Ceres,
 };
 
 [[nodiscard]] const char* fiberTraceWindingSolverName(
@@ -211,6 +212,11 @@ struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationCo
 struct FiberTraceJointGridWindingConfig : FiberTraceWindingBeliefPropagationConfig {
     double mixedUnaryCost = 100.0;
     double pieceBreakCost = 0.0;
+    double continuousCoordinateCost = 0.0;
+    double localSpanCost = 0.0;
+    double hardSignSlackCost = 0.0;
+    std::optional<int> minimumActiveWinding;
+    std::optional<int> maximumActiveWinding;
     double orientationTemperature = 0.25;
     std::optional<double> fixedPhaseMagnitude;
     std::optional<double> fixedMeasurementScale;
@@ -327,6 +333,74 @@ struct FiberTraceWindingFactorDiagnostic {
     bool perpendicularSignPromotedByAlignment = false;
     bool parallelSignPromotedByAlignment = false;
 };
+
+// Shared, fully materialized winding model. Solvers must consume this model
+// rather than reconstructing scale, confidence, incidence, or gauge semantics
+// from diagnostic output.
+struct FiberTracePreparedWindingMeasurement {
+    std::size_t constraintIndex = 0;
+    std::size_t a = 0;
+    std::size_t b = 0;
+    double parallel = 0.0;
+    double perpendicular = 0.0;
+    double parallelConfidence = 0.0;
+    double perpendicularConfidence = 0.0;
+    double parallelMultiplier = 1.0;
+    double perpendicularMultiplier = 1.0;
+    double parallelDistance = 0.0;
+    std::optional<double> parallelSignedDelta;
+    std::optional<double> perpendicularSignedDelta;
+    std::optional<std::size_t> normalComponent;
+    bool hardParallelSign = false;
+    bool hardPerpendicularSign = false;
+    double parallelSignPenalty = 0.0;
+    double perpendicularSignPenalty = 0.0;
+    double rawParallelDistance = 0.0;
+    std::optional<double> rawParallelSignedDelta;
+    std::optional<double> rawPerpendicularSignedDelta;
+    std::optional<double> selectedNormalAlignment;
+    double selectedConfidence = 1.0;
+    bool continuity = false;
+    bool quantizeTargets = true;
+    bool parallelDominant = false;
+    bool perpendicularDominant = false;
+    bool parallelMagnitudePresent = false;
+    bool perpendicularMagnitudePresent = false;
+    bool parallelSignPresent = false;
+    bool perpendicularSignPresent = false;
+};
+
+struct FiberTracePreparedWindingEdge {
+    std::size_t a = 0;
+    std::size_t b = 0;
+    std::vector<FiberTracePreparedWindingMeasurement> measurements;
+    bool containsHardContinuity = false;
+};
+
+struct FiberTracePreparedWindingModel {
+    std::vector<std::size_t> pieceToNode;
+    std::vector<std::vector<std::size_t>> piecesByNode;
+    std::vector<FiberTracePreparedWindingEdge> edges;
+    std::vector<std::vector<std::size_t>> adjacency;
+    std::vector<std::size_t> incidentMeasurements;
+    std::vector<std::size_t> incidentWindingMeasurements;
+    std::vector<std::size_t> componentByNode;
+    std::vector<std::size_t> integerGaugeByNode;
+    std::vector<std::size_t> gaugeNodeByComponent;
+    std::vector<std::size_t> gaugePieceByComponent;
+    std::vector<std::size_t> integerGaugeNodes;
+    std::vector<FiberTraceWindingFactorDiagnostic> diagnostics;
+    FiberTraceWindingBeliefPropagationConfig config;
+    double preparedMeasurementScale = 1.0;
+};
+
+[[nodiscard]] FiberTracePreparedWindingModel prepareFiberTraceWindingModel(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceWindingBeliefPropagationConfig& config = {},
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
+    bool quantizeComponentTargets = true,
+    double measurementScale = 1.0);
 
 [[nodiscard]] std::vector<FiberTraceWindingFactorDiagnostic>
 diagnoseFiberTraceWindingFactors(
@@ -475,6 +549,10 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     double minimumCalibrationGain = 1.0;
     double maximumCalibrationGain = 1.0;
     double decodedEnergy = 0.0;
+    double decodedDataEnergy = 0.0;
+    double continuousCoordinateEnergy = 0.0;
+    double localSpanEnergy = 0.0;
+    double hardSignSlackEnergy = 0.0;
     double initialStateDecodedEnergy =
         std::numeric_limits<double>::quiet_NaN();
     std::size_t calibrationGridCells = 0;

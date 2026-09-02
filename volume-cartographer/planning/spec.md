@@ -285,3 +285,27 @@ During active remote downloads, the existing cache status bar appends:
 - Worker callbacks only publish activity state. Framebuffer composition and Qt
   repaint requests happen on the UI thread, and diagnostics never queue chunks
   or alter request priority.
+
+## Experimental continuous fiber winding solve
+
+- `vc_fiber_trace_chunk direction-ablation --winding-solver ceres` must leave
+  the default joint-grid and alternating solvers unchanged.
+- Ceres must consume the same public prepared winding model as BP. It must not
+  reconstruct canonical targets, confidence attenuation, class weights,
+  distance decay, sign promotion, incidence, or gauge connectivity from CSV
+  diagnostics.
+- Each piece has bounded horizontalness and activity in `[0,1]` plus an
+  unbounded real winding coordinate. Pair residuals are gated by both endpoint
+  activities; inactive-piece and orientation-extremeness residuals use the
+  prepared incident measurement count.
+- The fixed-scale experiment uses canonical scale-first targets and the
+  existing five magnitude weights, two sign weights, defect cost,
+  piece-break cost, and host-derived thread default. It does not add an integer
+  winding-ladder prior.
+- BP hard continuation and hard signs are explicitly finite approximations in
+  Ceres. Reports must expose remaining violations and must not describe them as
+  exact constraints.
+- A reference benchmark must solve each reference source independently from
+  its selected cross constraints while fixing all connected crop endpoints to
+  the main continuous solution. Ground-truth filename order may only enter a
+  final global sign/half-step offset calibration, not the per-reference solve.

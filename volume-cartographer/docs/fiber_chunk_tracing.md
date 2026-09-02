@@ -1006,6 +1006,55 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp_alternating --bp-only --bp-inference sum-product-mixed --winding-solver alternating
 ```
 
+An experimental continuous least-squares backend is available as
+`--winding-solver ceres`:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_ceres --bp-only --bp-inference sum-product-mixed --winding-solver ceres
+```
+
+It optimizes horizontalness `h` and activity `a` in `[0,1]` and a real winding
+coordinate `z`. The ordinary orientation prepass and PCA direction groups only
+initialize `h` and `a`; they are not fixed. Ceres consumes the same prepared
+dominant constraint hypothesis as BP, after measurement scale, canonical
+integer/half-integer target quantization, class weighting, distance decay,
+decision confidence, normal confidence, parallel cutoff, and sign promotion.
+The five `--winding-weights`, two `--winding-sign-weights`,
+`--winding-defect-cost`, `--piece-break-cost`, thread count, and fixed
+measurement scale therefore retain their existing meanings. The existing
+`--bp-mixed-cost` is the per-incident-constraint regularizer that encourages
+active horizontalness away from the ambiguous midpoint. The Ceres iteration
+limit reuses `--bp-message-iterations`.
+
+For a measured edge, every residual is multiplied by `a_i*a_j`; its squared
+energy therefore fades quartically as endpoint activity decreases. A piece's
+inactivity residual is degree-scaled by its prepared incident measurement
+count. One H/V gauge and one winding gauge are fixed deterministically per
+otherwise-unfixed component, but gauge fixing does not force activity.
+Same-trace hard continuation and promoted hard signs are represented by a
+large finite residual (`10000` before confidence/sign-weight scaling), because
+Ceres does not impose exact discrete constraints. This is an approximation,
+and the standard infringement tables remain relevant.
+
+Ceres uses plain squared residuals without a robust loss. It does not impose an
+integer ladder prior: fractional winding is the authoritative result. Legacy
+OBJ layers and state tables threshold the fractional result only for display;
+the winding CSV retains continuous fields. The printed `initial_ceres_cost`
+and `final_ceres_cost` use Ceres's `0.5 * sum(residual^2)` convention, while
+`residual_sum_squares` and the class breakdown print the unhalved sums.
+`--winding-fixed-orientation`, adaptive calibration, active integer ranges,
+sign-first initialization, and winding-weight search are not supported by the
+Ceres backend.
+
+When reference fibers are supplied, Ceres does not use the BP voting
+benchmark. Each reference source is solved independently using its own split
+pieces and continuation links plus selected cross constraints. Connected crop
+piece states are fixed to the main Ceres solution. The final table reports the
+reference source's active-arc-weighted horizontalness, activity, and raw
+winding, then applies one global sign and half-step offset chosen to maximize
+filename-order ladder matches. A source without usable active winding evidence
+reports `NA`.
+
 In joint-grid mode, a non-Mixed pair factor charges orientation and winding
 evidence once. Orientation and the Mixed unary retain `--bp-temperature`;
 winding retains its established temperature `0.25`. A Mixed endpoint disables

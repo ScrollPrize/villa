@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -99,6 +100,11 @@ struct Options {
     bool windingFixedOrientation = false;
     double windingDefectCost = 100.0;
     double pieceBreakCost = 0.0;
+    double windingContinuousCost = 0.0;
+    double windingTemperature = 0.25;
+    bool windingSignFirst = false;
+    std::size_t windingSignFirstSteps = 1;
+    std::optional<std::size_t> windingLevelGrowthMaximum;
     bool hardSplitContinuity = true;
     std::optional<double> hardSignMinimumNormalAlignment =
         0.8660254037844386;
@@ -139,6 +145,11 @@ struct Options {
     bool hasWindingOrientationOption = false;
     bool hasWindingDefectCostOption = false;
     bool hasPieceBreakCostOption = false;
+    bool hasWindingContinuousCostOption = false;
+    bool hasWindingLocalSpanCostOption = false;
+    bool hasWindingHardSignSlackCostOption = false;
+    bool hasWindingTemperatureOption = false;
+    bool hasWindingComponentRangeOption = false;
     bool hasParallelWindingCutoffOption = false;
     bool hasWindingWeightOption = false;
     bool hasWindingSignWeightOption = false;
@@ -151,6 +162,8 @@ struct Options {
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
     bool hasFixedCalibrationOption = false;
+    bool hasFixedPhaseOption = false;
+    bool hasFixedScaleOption = false;
     bool hasWindingCutoffOption = false;
 };
 
@@ -261,11 +274,24 @@ void usage(const char* executable)
               << "  --bp-damping F            message damping in (0,1] [0.5]\n"
               << "  --bp-residual F           message residual tolerance [1e-8]\n"
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
-              << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
+              << "  --winding-solver MODE     joint-grid, alternating, or ceres [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [100]\n"
               << "  --split-continuity MODE   hard or finite [hard]\n"
               << "  --piece-break-cost F      finite-mode same-trace boundary cost [0]\n"
+              << "  --winding-continuous-cost F\n"
+              << "                              integer-coordinate prior to continuous solve [0]\n"
+              << "  --winding-component-range MIN,MAX\n"
+              << "                              experimental active integer interval [unbounded]\n"
+              << "  --winding-local-span-cost F\n"
+              << "                              local signed-distance compactness cost [0]\n"
+              << "  --winding-hard-sign-slack-cost F\n"
+              << "                              excess separation cost on hard-sign edges [0]\n"
+              << "  --winding-temperature F   winding sum-product temperature [0.25]\n"
+              << "  --winding-sign-first      initialize the full solve from a sign-only solve\n"
+              << "  --winding-sign-first-steps N\n"
+              << "                              magnitude continuation stages after sign-only [1]\n"
+              << "  --winding-level-growth N  grow sign-only integer support to N levels\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-hard-signs MODE  none, perpendicular, parallel, or both [both]\n"
@@ -354,6 +380,32 @@ std::size_t count(int& index, int argc, char** argv, const char* option)
     if (parsed != text.size())
         fail(std::string(option) + " requires a non-negative integer");
     return static_cast<std::size_t>(result);
+}
+
+std::array<int, 2> integerPair(
+    int& index, int argc, char** argv, const char* option)
+{
+    const std::string input = value(index, argc, argv, option);
+    const std::size_t separator = input.find(',');
+    if (separator == std::string::npos ||
+        input.find(',', separator + 1) != std::string::npos) {
+        fail(std::string(option) + " requires two comma-separated integers");
+    }
+    std::array<int, 2> result{};
+    for (std::size_t item = 0; item < result.size(); ++item) {
+        const std::string text = item == 0
+            ? input.substr(0, separator)
+            : input.substr(separator + 1);
+        std::size_t parsed = 0;
+        try {
+            result[item] = std::stoi(text, &parsed);
+        } catch (const std::exception&) {
+            fail(std::string(option) + " requires two comma-separated integers");
+        }
+        if (parsed != text.size())
+            fail(std::string(option) + " requires two comma-separated integers");
+    }
+    return result;
 }
 
 std::vector<double> numberList(
@@ -655,8 +707,11 @@ Options parse(int argc, char** argv)
             } else if (solver == "alternating") {
                 options.windingSolver = vc::fiber_tracer::
                     FiberTraceWindingSolver::Alternating;
+            } else if (solver == "ceres") {
+                options.windingSolver = vc::fiber_tracer::
+                    FiberTraceWindingSolver::Ceres;
             } else {
-                fail("--winding-solver must be joint-grid or alternating");
+                fail("--winding-solver must be joint-grid, alternating, or ceres");
             }
             options.hasWindingSolverOption = true;
             options.hasAblationOnlyOption = true;
@@ -684,6 +739,89 @@ Options parse(int argc, char** argv)
                 fail("--piece-break-cost must be finite and nonnegative");
             }
             options.hasPieceBreakCostOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-continuous-cost") {
+            options.windingContinuousCost = number(
+                index, argc, argv, "--winding-continuous-cost");
+            if (!std::isfinite(options.windingContinuousCost) ||
+                options.windingContinuousCost < 0.0) {
+                fail("--winding-continuous-cost must be finite and nonnegative");
+            }
+            options.jointGrid.continuousCoordinateCost =
+                options.windingContinuousCost;
+            options.hasWindingContinuousCostOption = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-component-range") {
+            const auto range = integerPair(
+                index, argc, argv, "--winding-component-range");
+            if (range[0] > 0 || range[1] < 0 || range[0] > range[1]) {
+                fail("--winding-component-range must be MIN<=0<=MAX");
+            }
+            options.jointGrid.minimumActiveWinding = range[0];
+            options.jointGrid.maximumActiveWinding = range[1];
+            options.hasWindingComponentRangeOption = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-local-span-cost") {
+            options.jointGrid.localSpanCost = number(
+                index, argc, argv, "--winding-local-span-cost");
+            if (!std::isfinite(options.jointGrid.localSpanCost) ||
+                options.jointGrid.localSpanCost < 0.0) {
+                fail("--winding-local-span-cost must be finite and nonnegative");
+            }
+            options.hasWindingLocalSpanCostOption = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-hard-sign-slack-cost") {
+            options.jointGrid.hardSignSlackCost = number(
+                index, argc, argv, "--winding-hard-sign-slack-cost");
+            if (!std::isfinite(options.jointGrid.hardSignSlackCost) ||
+                options.jointGrid.hardSignSlackCost < 0.0) {
+                fail("--winding-hard-sign-slack-cost must be finite and nonnegative");
+            }
+            options.hasWindingHardSignSlackCostOption = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-temperature") {
+            options.windingTemperature = number(
+                index, argc, argv, "--winding-temperature");
+            if (!std::isfinite(options.windingTemperature) ||
+                !(options.windingTemperature > 0.0)) {
+                fail("--winding-temperature must be finite and positive");
+            }
+            options.hasWindingTemperatureOption = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-sign-first") {
+            options.windingSignFirst = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-sign-first-steps") {
+            options.windingSignFirstSteps = count(
+                index, argc, argv, "--winding-sign-first-steps");
+            if (options.windingSignFirstSteps == 0) {
+                fail("--winding-sign-first-steps must be positive");
+            }
+            options.windingSignFirst = true;
+            options.hasJointGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-level-growth") {
+            const auto levels = count(
+                index, argc, argv, "--winding-level-growth");
+            if (levels == 0)
+                fail("--winding-level-growth must be positive");
+            options.windingLevelGrowthMaximum = levels;
+            options.windingSignFirst = true;
+            options.hasJointGridOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--split-continuity") {
@@ -896,13 +1034,14 @@ Options parse(int argc, char** argv)
                 index, argc, argv, "--winding-fixed-phase");
             options.hasJointGridOption = true;
             options.hasFixedCalibrationOption = true;
+            options.hasFixedPhaseOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-fixed-scale") {
             options.jointGrid.fixedMeasurementScale = number(
                 index, argc, argv, "--winding-fixed-scale");
-            options.hasJointGridOption = true;
             options.hasFixedCalibrationOption = true;
+            options.hasFixedScaleOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-adaptive-calibration") {
@@ -1156,6 +1295,7 @@ Options parse(int argc, char** argv)
              options.hasWindingOrientationOption ||
              options.hasWindingDefectCostOption ||
              options.hasPieceBreakCostOption ||
+             options.hasWindingContinuousCostOption ||
              options.hasParallelWindingCutoffOption ||
              options.hasWindingWeightOption ||
              options.hasWindingSignWeightOption ||
@@ -1180,6 +1320,18 @@ Options parse(int argc, char** argv)
             !options.hasWindingWeightOption) {
             fail("--winding-weight-search-local requires --winding-weights");
         }
+        if (options.windingSignFirst &&
+            (options.hasWindingWeightSearchOption ||
+             options.hasWindingWeightSearchLocalOption)) {
+            fail("--winding-sign-first cannot be combined with winding weight search");
+        }
+        if (options.windingSignFirst && !options.windingFixedOrientation) {
+            fail("--winding-sign-first requires --winding-fixed-orientation");
+        }
+        if (options.windingLevelGrowthMaximum &&
+            options.hasWindingComponentRangeOption) {
+            fail("--winding-level-growth cannot be combined with --winding-component-range");
+        }
         if ((options.hasWindingWeightSearchOption ||
              options.hasWindingWeightSearchLocalOption) &&
             !options.hasReferenceFiberDirectoryOption) {
@@ -1190,11 +1342,34 @@ Options parse(int argc, char** argv)
                 FiberTraceWindingSolver::JointGrid) {
             fail("joint-grid controls require --winding-solver joint-grid");
         }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::Ceres &&
+            options.windingFixedOrientation) {
+            fail("--winding-fixed-orientation is incompatible with fractional Ceres orientation");
+        }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::Ceres &&
+            (options.hasWindingWeightSearchOption ||
+             options.hasWindingWeightSearchLocalOption)) {
+            fail("Ceres winding weight search is not implemented; run one fixed weight set");
+        }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::Ceres &&
+            options.hasFixedPhaseOption) {
+            fail("--winding-fixed-phase is not used by the fractional Ceres solver");
+        }
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::Alternating &&
+            options.hasFixedCalibrationOption) {
+            fail("fixed winding calibration requires joint-grid or Ceres");
+        }
         const bool hasExplicitFixedPhase =
             options.jointGrid.fixedPhaseMagnitude.has_value();
         const bool hasExplicitFixedScale =
             options.jointGrid.fixedMeasurementScale.has_value();
-        if (hasExplicitFixedPhase != hasExplicitFixedScale) {
+        if (options.windingSolver == vc::fiber_tracer::
+                FiberTraceWindingSolver::JointGrid &&
+            hasExplicitFixedPhase != hasExplicitFixedScale) {
             fail("--winding-fixed-phase and --winding-fixed-scale must be supplied together");
         }
         if (options.hasFixedCalibrationOption && options.hasAdaptiveGridOption) {
@@ -1761,6 +1936,9 @@ void writeAndPrintBpReport(
         vc::fiber_tracer::FiberTraceBeliefInference::MinSum;
     const bool mixedState = report.inference ==
         vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed;
+    const bool ceresWinding = interleaved &&
+        interleaved->solver ==
+            vc::fiber_tracer::FiberTraceWindingSolver::Ceres;
     if (report.horizontalness.size() != lines.size() ||
         constraints.pieces.size() != lines.size() ||
         directions.size() != lines.size() ||
@@ -2257,7 +2435,9 @@ void writeAndPrintBpReport(
     if (validWindingCount != 0)
         meanWindingConfidence /= static_cast<double>(validWindingCount);
     std::cout << std::fixed << std::setprecision(6)
-              << "fiber winding BP\n"
+              << (ceresWinding
+                      ? "fiber winding Ceres adapter diagnostics\n"
+                      : "fiber winding BP\n")
               << "status  pieces  variables  factors  components"
                  "  continuous_rms  continuous_s  temperature  expansion_rounds"
                  "  message_iterations  message_residual  workers  candidate_states"
@@ -2281,14 +2461,17 @@ void writeAndPrintBpReport(
               << "winding_factor_csv=" << factorCsv
               << " winding_obj_layers=" << windingPaths.size() << '\n';
     if (interleaved) {
-        std::cout << "fiber winding calibration\n";
+        std::cout << (ceresWinding
+                ? "fiber winding Ceres configuration\n"
+                : "fiber winding calibration\n");
         if (interleaved->solver == vc::fiber_tracer::
                 FiberTraceWindingSolver::JointGrid) {
             std::cout
                 << "solver  orientation_mode  calibration_mode  defect_cost_per_constraint  piece_break_cost  phase_map  phase_mean  scale_map  scale_mean"
                    "  grid_cells  grid_shifts  entropy  lower_boundary"
                    "  upper_boundary  min_gain  max_gain  converged"
-                   "  decoded_energy  hard_sign_projected_defects\n"
+                   "  decoded_energy  data_energy  continuous_coordinate_energy  local_span_energy  hard_sign_slack_energy"
+                   "  hard_sign_projected_defects\n"
                 << vc::fiber_tracer::fiberTraceWindingSolverName(
                        interleaved->solver)
                 << "  " << vc::fiber_tracer::
@@ -2313,6 +2496,10 @@ void writeAndPrintBpReport(
                 << "  "
                 << (interleaved->calibrationConverged ? "true" : "false")
                 << "  " << interleaved->decodedEnergy
+                << "  " << interleaved->decodedDataEnergy
+                << "  " << interleaved->continuousCoordinateEnergy
+                << "  " << interleaved->localSpanEnergy
+                << "  " << interleaved->hardSignSlackEnergy
                 << "  " << interleaved->hardSignProjectedDefects << '\n';
         } else {
             std::cout
@@ -2916,6 +3103,48 @@ makeJointGridWindingProgressPrinter()
     };
 }
 
+vc::fiber_tracer::FiberTraceWindingLeastSquaresProgressCallback
+makeLeastSquaresWindingProgressPrinter()
+{
+    using Phase = vc::fiber_tracer::
+        FiberTraceWindingLeastSquaresProgressPhase;
+    return [lastPrinted = std::chrono::steady_clock::time_point{},
+            lastPhase = Phase::Complete](
+               const vc::fiber_tracer::
+                   FiberTraceWindingLeastSquaresProgress& p) mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const bool transition = p.phase != lastPhase;
+        const bool intervalElapsed =
+            lastPrinted.time_since_epoch().count() == 0 ||
+            now - lastPrinted >= std::chrono::seconds(1);
+        if (!transition && !intervalElapsed && p.phase == Phase::Iterating)
+            return;
+        std::cout << "fiber winding ceres";
+        switch (p.phase) {
+        case Phase::Preparing:
+            std::cout << " status=preparing";
+            break;
+        case Phase::Iterating:
+            std::cout << " iteration=" << p.iteration << '/'
+                      << p.maximumIterations
+                      << std::scientific << std::setprecision(3)
+                      << " cost=" << p.cost
+                      << " gradient_max=" << p.gradientMaximumNorm;
+            break;
+        case Phase::Complete:
+            std::cout << " status=complete iterations=" << p.iteration
+                      << std::scientific << std::setprecision(3)
+                      << " cost=" << p.cost;
+            break;
+        }
+        std::cout << std::fixed << std::setprecision(1)
+                  << " elapsed=" << p.elapsedSeconds << "s\n"
+                  << std::flush;
+        lastPrinted = now;
+        lastPhase = p.phase;
+    };
+}
+
 std::vector<std::size_t> applyQualityFilter(
     std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const std::optional<double>& fraction)
@@ -3421,6 +3650,27 @@ struct ReferenceBpCrossConstraints {
     std::size_t referencePieces = 0;
 };
 
+struct ReferenceCeresLeastSquaresRow {
+    std::size_t source = 0;
+    std::size_t pieces = 0;
+    std::size_t constraints = 0;
+    std::size_t activeConstraints = 0;
+    double rawWinding = 0.0;
+    double calibratedWinding = 0.0;
+    double horizontalness = 0.5;
+    double activity = 0.0;
+    double finalCost = 0.0;
+    bool valid = false;
+    bool usable = false;
+};
+
+struct ReferenceCeresLeastSquaresBenchmark {
+    std::vector<ReferenceCeresLeastSquaresRow> rows;
+    int globalSign = 1;
+    double globalOffset = 0.0;
+    std::size_t exactMatches = 0;
+};
+
 struct FixedReferenceConditionedProblem {
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> lines;
     vc::fiber_tracer::FiberTraceConstraintReport constraints;
@@ -3505,6 +3755,345 @@ ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
         throw std::logic_error("Reference/BP cross extraction did not preserve input pieces");
     }
     return {std::move(report), referencePieces};
+}
+
+ReferenceCeresLeastSquaresBenchmark solveReferenceCeresLeastSquares(
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpPieceLines,
+    const vc::fiber_tracer::FiberTraceWindingLeastSquaresReport& crop,
+    const vc::fiber_tracer::FiberTraceWindingLeastSquaresConfig& config,
+    const vc::fiber_tracer::FiberTraceLabelingConfig& labeling,
+    const cv::Vec3d& cropMinimumBaseXYZ,
+    const cv::Vec3d& cropMaximumBaseXYZ)
+{
+    if (!reference.constraintReport ||
+        cross.referencePieces != reference.pieceLines.size() ||
+        cross.report.pieces.size() !=
+            cross.referencePieces + bpPieceLines.size() ||
+        crop.states.size() != bpPieceLines.size()) {
+        throw std::invalid_argument(
+            "Ceres reference benchmark inputs do not match pieces");
+    }
+    const auto selection = vc::fiber_tracer::
+        selectFiberTraceLabelConstraints(cross.report, labeling);
+    std::vector<unsigned char> selected(
+        cross.report.constraints.size(), 0);
+    for (const std::size_t index : selection.retainedIndices)
+        selected.at(index) = 1;
+
+    ReferenceCeresLeastSquaresBenchmark benchmark;
+    benchmark.rows.resize(reference.sourceFibers);
+    constexpr std::size_t missing = std::numeric_limits<std::size_t>::max();
+    constexpr double epsilon = 1.0e-10;
+    for (std::size_t source = 0; source < reference.sourceFibers; ++source) {
+        auto& row = benchmark.rows[source];
+        row.source = source;
+        std::vector<std::size_t> referencePieces;
+        for (std::size_t piece = 0;
+             piece < cross.referencePieces; ++piece) {
+            if (reference.sourceIdsByPiece.at(piece) == source)
+                referencePieces.push_back(piece);
+        }
+        row.pieces = referencePieces.size();
+        if (referencePieces.empty())
+            continue;
+
+        std::vector<unsigned char> belongs(
+            cross.referencePieces, 0);
+        for (const std::size_t piece : referencePieces)
+            belongs[piece] = 1;
+        std::vector<std::size_t> crossIndices;
+        std::set<std::size_t> bpPieces;
+        for (std::size_t index = 0;
+             index < cross.report.constraints.size(); ++index) {
+            if (selected[index] == 0)
+                continue;
+            const auto& constraint = cross.report.constraints[index];
+            const bool aReference = constraint.pieceA < cross.referencePieces;
+            const bool bReference = constraint.pieceB < cross.referencePieces;
+            if (aReference == bReference)
+                continue;
+            const std::size_t referencePiece = aReference
+                ? constraint.pieceA
+                : constraint.pieceB;
+            if (belongs[referencePiece] == 0)
+                continue;
+            const std::size_t combinedBp = aReference
+                ? constraint.pieceB
+                : constraint.pieceA;
+            crossIndices.push_back(index);
+            bpPieces.insert(combinedBp - cross.referencePieces);
+        }
+        row.constraints = crossIndices.size();
+        if (crossIndices.empty())
+            continue;
+
+        std::vector<vc::fiber_tracer::FiberletCropTraceLine> lines;
+        vc::fiber_tracer::FiberTraceConstraintReport problem;
+        std::vector<std::size_t> oldToNew(
+            cross.report.pieces.size(), missing);
+        std::map<std::size_t, std::size_t> referenceTraceToLocal;
+        for (const std::size_t oldPiece : referencePieces) {
+            const auto& sourcePiece =
+                reference.constraintReport->pieces.at(oldPiece);
+            const auto [found, inserted] = referenceTraceToLocal.try_emplace(
+                sourcePiece.traceIndex, lines.size());
+            if (inserted)
+                lines.push_back(reference.lines.at(sourcePiece.traceIndex));
+            oldToNew[oldPiece] = problem.pieces.size();
+            auto piece = sourcePiece;
+            piece.traceIndex = found->second;
+            problem.pieces.push_back(std::move(piece));
+        }
+        for (const std::size_t bpPiece : bpPieces) {
+            const std::size_t oldPiece = cross.referencePieces + bpPiece;
+            const std::size_t trace = lines.size();
+            lines.push_back(bpPieceLines.at(bpPiece));
+            oldToNew[oldPiece] = problem.pieces.size();
+            auto piece = cross.report.pieces.at(oldPiece);
+            piece.traceIndex = trace;
+            piece.pieceIndex = 0;
+            problem.pieces.push_back(std::move(piece));
+        }
+        problem.inputTraces = lines.size();
+        for (const std::size_t index : crossIndices) {
+            auto constraint = cross.report.constraints.at(index);
+            constraint.pieceA = oldToNew.at(constraint.pieceA);
+            constraint.pieceB = oldToNew.at(constraint.pieceB);
+            problem.constraints.push_back(std::move(constraint));
+        }
+        for (const auto& sourceConstraint :
+             reference.constraintReport->constraints) {
+            if (!sourceConstraint.hardContinuity ||
+                sourceConstraint.pieceA >= cross.referencePieces ||
+                sourceConstraint.pieceB >= cross.referencePieces ||
+                belongs[sourceConstraint.pieceA] == 0 ||
+                belongs[sourceConstraint.pieceB] == 0) {
+                continue;
+            }
+            auto constraint = sourceConstraint;
+            constraint.pieceA = oldToNew.at(constraint.pieceA);
+            constraint.pieceB = oldToNew.at(constraint.pieceB);
+            problem.constraints.push_back(std::move(constraint));
+        }
+        const auto topology = vc::fiber_tracer::
+            prepareFiberTraceBeliefTopology(
+                lines, problem, cropMinimumBaseXYZ, cropMaximumBaseXYZ);
+        const auto prepared = vc::fiber_tracer::prepareFiberTraceWindingModel(
+            problem, topology, config, {}, true, config.measurementScale);
+        std::vector<vc::fiber_tracer::FiberTraceWindingLeastSquaresState>
+            initial(problem.pieces.size());
+        std::vector<vc::fiber_tracer::FiberTraceWindingLeastSquaresFixedState>
+            fixed(problem.pieces.size());
+        const std::size_t referencePieceCount = referencePieces.size();
+        for (const std::size_t bpPiece : bpPieces) {
+            const std::size_t combined = cross.referencePieces + bpPiece;
+            const std::size_t local = oldToNew.at(combined);
+            fixed[local] = {true, crop.states.at(bpPiece)};
+            initial[local] = crop.states.at(bpPiece);
+        }
+
+        std::vector<double> orientationWeight(referencePieceCount, 0.0);
+        std::vector<double> horizontalSum(referencePieceCount, 0.0);
+        std::vector<double> windingWeight(referencePieceCount, 0.0);
+        std::vector<double> windingSum(referencePieceCount, 0.0);
+        for (const auto& edge : prepared.edges) {
+            const bool aReference = edge.a < referencePieceCount;
+            const bool bReference = edge.b < referencePieceCount;
+            if (aReference == bReference)
+                continue;
+            const std::size_t ref = aReference ? edge.a : edge.b;
+            const std::size_t other = aReference ? edge.b : edge.a;
+            const auto& fixedSource = initial[other];
+            if (fixedSource.activity <= epsilon)
+                continue;
+            for (const auto& measurement : edge.measurements) {
+                if (measurement.continuity)
+                    continue;
+                const double orientation = std::max(
+                    measurement.parallel, measurement.perpendicular);
+                const double desiredHorizontal =
+                    measurement.parallelDominant
+                    ? fixedSource.horizontalness
+                    : 1.0 - fixedSource.horizontalness;
+                orientationWeight[ref] += orientation;
+                horizontalSum[ref] += orientation * desiredHorizontal;
+                const double parallelWeight =
+                    measurement.parallelMagnitudePresent
+                    ? measurement.parallelMultiplier *
+                          measurement.parallelConfidence
+                    : 0.0;
+                const double perpendicularWeight =
+                    measurement.perpendicularMagnitudePresent &&
+                            measurement.perpendicularSignedDelta
+                        ? measurement.perpendicularMultiplier *
+                              measurement.perpendicularConfidence
+                        : 0.0;
+                const double weight = parallelWeight + perpendicularWeight;
+                const bool signedEvidence =
+                    measurement.hardParallelSign ||
+                    measurement.hardPerpendicularSign ||
+                    measurement.parallelSignPenalty > 0.0 ||
+                    measurement.perpendicularSignPenalty > 0.0;
+                if (weight > 0.0 || signedEvidence)
+                    ++row.activeConstraints;
+                if (!(weight > 0.0))
+                    continue;
+                const double target = parallelWeight > 0.0
+                    ? measurement.parallelSignedDelta.value_or(
+                          measurement.parallelDistance)
+                    : *measurement.perpendicularSignedDelta;
+                const double candidate = aReference
+                    ? fixedSource.winding - target
+                    : fixedSource.winding + target;
+                windingWeight[ref] += weight;
+                windingSum[ref] += weight * candidate;
+            }
+        }
+        for (std::size_t piece = 0;
+             piece < referencePieceCount; ++piece) {
+            initial[piece].horizontalness = orientationWeight[piece] > 0.0
+                ? std::clamp(
+                      horizontalSum[piece] / orientationWeight[piece],
+                      0.0, 1.0)
+                : 0.5;
+            initial[piece].activity = 1.0;
+            initial[piece].winding = windingWeight[piece] > 0.0
+                ? windingSum[piece] / windingWeight[piece]
+                : 0.0;
+        }
+        if (row.activeConstraints == 0)
+            continue;
+        const auto solved = vc::fiber_tracer::
+            solveFiberTraceWindingLeastSquares(
+                problem, topology, config, initial, fixed);
+        row.usable = solved.solutionUsable;
+        row.finalCost = solved.finalCost;
+        if (!row.usable)
+            continue;
+        double arcSum = 0.0;
+        double activeArcSum = 0.0;
+        double horizontalSumFinal = 0.0;
+        double windingSumFinal = 0.0;
+        for (std::size_t piece = 0;
+             piece < referencePieceCount; ++piece) {
+            const auto& metadata = problem.pieces[piece];
+            const double arc = std::max(
+                epsilon,
+                metadata.endArcBaseVoxels - metadata.beginArcBaseVoxels);
+            const auto& state = solved.states[piece];
+            arcSum += arc;
+            const double activeArc = arc * state.activity;
+            activeArcSum += activeArc;
+            horizontalSumFinal += activeArc * state.horizontalness;
+            windingSumFinal += activeArc * state.winding;
+        }
+        if (!(activeArcSum > epsilon) || !(arcSum > epsilon))
+            continue;
+        row.activity = activeArcSum / arcSum;
+        row.horizontalness = horizontalSumFinal / activeArcSum;
+        row.rawWinding = windingSumFinal / activeArcSum;
+        row.valid = true;
+    }
+
+    std::vector<double> candidateOffsets;
+    for (const auto& row : benchmark.rows) {
+        if (!row.valid)
+            continue;
+        const double truth = 0.5 * static_cast<double>(row.source);
+        for (const int sign : {-1, 1}) {
+            candidateOffsets.push_back(
+                0.5 * std::round(2.0 * (truth - sign * row.rawWinding)));
+        }
+    }
+    std::sort(candidateOffsets.begin(), candidateOffsets.end());
+    candidateOffsets.erase(
+        std::unique(candidateOffsets.begin(), candidateOffsets.end()),
+        candidateOffsets.end());
+    double bestSquaredError = std::numeric_limits<double>::infinity();
+    for (const int sign : {-1, 1}) {
+        for (const double offset : candidateOffsets) {
+            std::size_t matches = 0;
+            double squaredError = 0.0;
+            for (const auto& row : benchmark.rows) {
+                if (!row.valid)
+                    continue;
+                const double truth = 0.5 * static_cast<double>(row.source);
+                const double estimate = sign * row.rawWinding + offset;
+                matches += std::abs(estimate - truth) <= 0.25 ? 1 : 0;
+                squaredError += (estimate - truth) * (estimate - truth);
+            }
+            if (matches > benchmark.exactMatches ||
+                (matches == benchmark.exactMatches &&
+                 squaredError < bestSquaredError)) {
+                benchmark.exactMatches = matches;
+                bestSquaredError = squaredError;
+                benchmark.globalSign = sign;
+                benchmark.globalOffset = offset;
+            }
+        }
+    }
+    for (auto& row : benchmark.rows) {
+        if (row.valid) {
+            row.calibratedWinding =
+                benchmark.globalSign * row.rawWinding +
+                benchmark.globalOffset;
+        }
+    }
+    return benchmark;
+}
+
+std::string formatReferenceCeresLeastSquaresBenchmark(
+    const ReferenceCeresLeastSquaresBenchmark& benchmark)
+{
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "reference Ceres fixed-source least-squares benchmark\n"
+           << "global_sign=" << benchmark.globalSign
+           << " global_offset=" << std::fixed << std::setprecision(3)
+           << benchmark.globalOffset
+           << " matched=" << benchmark.exactMatches << '/'
+           << std::count_if(
+                  benchmark.rows.begin(), benchmark.rows.end(),
+                  [](const auto& row) { return row.valid; }) << '\n'
+           << std::left
+           << std::setw(9) << "truth"
+           << std::setw(11) << "raw_w"
+           << std::setw(11) << "est_w"
+           << std::setw(10) << "h"
+           << std::setw(10) << "active"
+           << std::setw(9) << "pieces"
+           << std::setw(13) << "constraints"
+           << std::setw(15) << "wind_evidence"
+           << std::setw(13) << "final_cost"
+           << "status\n";
+    for (const auto& row : benchmark.rows) {
+        output << std::fixed << std::setprecision(1)
+               << std::setw(9) << 0.5 * static_cast<double>(row.source);
+        if (!row.valid) {
+            output << std::setw(11) << "NA"
+                   << std::setw(11) << "NA"
+                   << std::setw(10) << "NA"
+                   << std::setw(10) << "NA";
+        } else {
+            output << std::setprecision(3)
+                   << std::setw(11) << row.rawWinding
+                   << std::setw(11) << row.calibratedWinding
+                   << std::setw(10) << row.horizontalness
+                   << std::setw(10) << row.activity;
+        }
+        output << std::setw(9) << row.pieces
+               << std::setw(13) << row.constraints
+               << std::setw(15) << row.activeConstraints;
+        if (row.usable)
+            output << std::setprecision(3) << std::setw(13) << row.finalCost;
+        else
+            output << std::setw(13) << "NA";
+        output << (row.valid ? "ok" : row.usable ? "inactive" : "NA")
+               << '\n';
+    }
+    return output.str();
 }
 
 FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
@@ -4870,6 +5459,234 @@ std::string formatReferenceBpWindingBenchmark(
     return output.str();
 }
 
+std::string formatBpWindingComponentDiagnostics(
+    const vc::fiber_tracer::FiberTraceConstraintReport& constraints,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding)
+{
+    if (winding.componentByPiece.size() != winding.windingValid.size() ||
+        winding.mapWinding.size() != winding.windingValid.size() ||
+        winding.mapLatentCoordinate.size() != winding.windingValid.size()) {
+        throw std::invalid_argument(
+            "BP winding component diagnostics require aligned piece arrays");
+    }
+    struct Component {
+        std::size_t pieces = 0;
+        std::size_t active = 0;
+        std::size_t defect = 0;
+        int minimum = std::numeric_limits<int>::max();
+        int maximum = std::numeric_limits<int>::min();
+        double latentMinimum = std::numeric_limits<double>::infinity();
+        double latentMaximum = -std::numeric_limits<double>::infinity();
+        std::set<int> occupied;
+    };
+    std::map<std::size_t, Component> components;
+    for (std::size_t piece = 0; piece < winding.windingValid.size(); ++piece) {
+        auto& component = components[winding.componentByPiece[piece]];
+        ++component.pieces;
+        if (winding.windingValid[piece] == 0 ||
+            !std::isfinite(winding.mapLatentCoordinate[piece])) {
+            ++component.defect;
+            continue;
+        }
+        ++component.active;
+        component.minimum = std::min(component.minimum, winding.mapWinding[piece]);
+        component.maximum = std::max(component.maximum, winding.mapWinding[piece]);
+        component.latentMinimum = std::min(
+            component.latentMinimum, winding.mapLatentCoordinate[piece]);
+        component.latentMaximum = std::max(
+            component.latentMaximum, winding.mapLatentCoordinate[piece]);
+        component.occupied.insert(winding.mapWinding[piece]);
+    }
+
+    struct HardSigns {
+        std::size_t prepared = 0;
+        std::size_t evaluated = 0;
+        std::size_t satisfied = 0;
+        std::size_t violated = 0;
+        std::size_t neutralized = 0;
+    };
+    HardSigns perpendicular;
+    HardSigns parallel;
+    const auto addHardSign = [&](HardSigns& counts,
+                                 const vc::fiber_tracer::FiberTraceWindingFactorDiagnostic& diagnostic,
+                                 std::optional<double> target) {
+        ++counts.prepared;
+        const bool active = winding.windingValid.at(diagnostic.pieceA) != 0 &&
+            winding.windingValid.at(diagnostic.pieceB) != 0;
+        if (!active) {
+            ++counts.neutralized;
+            return;
+        }
+        ++counts.evaluated;
+        const double delta = winding.mapLatentCoordinate.at(
+                                 diagnostic.canonicalNodeB) -
+            winding.mapLatentCoordinate.at(diagnostic.canonicalNodeA);
+        const bool violated = !target || *target * delta <= 0.0;
+        counts.violated += violated ? 1 : 0;
+        counts.satisfied += violated ? 0 : 1;
+    };
+    for (const auto& diagnostic : winding.factorDiagnostics) {
+        if (diagnostic.hardPerpendicularSign) {
+            addHardSign(
+                perpendicular,
+                diagnostic,
+                diagnostic.effectivePerpendicularSignedDelta);
+        }
+        if (diagnostic.hardParallelSign) {
+            addHardSign(
+                parallel,
+                diagnostic,
+                diagnostic.effectiveSignedParallelDelta);
+        }
+    }
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "BP decoded winding components\n"
+           << std::left << std::setw(10) << "component"
+           << std::right << std::setw(9) << "pieces"
+           << std::setw(9) << "active"
+           << std::setw(9) << "defect"
+           << std::setw(8) << "min"
+           << std::setw(8) << "max"
+           << std::setw(8) << "span"
+           << std::setw(10) << "levels"
+           << std::setw(8) << "gaps"
+           << std::setw(12) << "latent_min"
+           << std::setw(12) << "latent_max" << '\n';
+    for (const auto& [index, component] : components) {
+        output << std::left << std::setw(10) << index
+               << std::right << std::setw(9) << component.pieces
+               << std::setw(9) << component.active
+               << std::setw(9) << component.defect;
+        if (component.active == 0) {
+            output << std::setw(8) << "NA" << std::setw(8) << "NA"
+                   << std::setw(8) << "NA" << std::setw(10) << 0
+                   << std::setw(8) << "NA" << std::setw(12) << "NA"
+                   << "NA\n";
+            continue;
+        }
+        const int span = component.maximum - component.minimum;
+        const std::size_t gaps = static_cast<std::size_t>(span + 1) -
+            component.occupied.size();
+        output << std::setw(8) << component.minimum
+               << std::setw(8) << component.maximum
+               << std::setw(8) << span
+               << std::setw(10) << component.occupied.size()
+               << std::setw(8) << gaps
+               << std::setw(12) << std::fixed << std::setprecision(1)
+               << component.latentMinimum
+               << std::setw(12) << component.latentMaximum << '\n';
+    }
+    const auto emitHardSigns = [&output](std::string_view name,
+                                          const HardSigns& counts) {
+        output << std::left << std::setw(16) << name
+               << std::right << std::setw(11) << counts.prepared
+               << std::setw(11) << counts.evaluated
+               << std::setw(11) << counts.satisfied
+               << std::setw(11) << counts.violated
+               << std::setw(11) << counts.neutralized << '\n';
+    };
+    output << "BP decoded hard-sign factors\n"
+           << std::left << std::setw(16) << "class"
+           << std::right << std::setw(11) << "prepared"
+           << std::setw(11) << "evaluated"
+           << std::setw(11) << "satisfied"
+           << std::setw(11) << "violated"
+           << std::setw(11) << "neutralized" << '\n';
+    emitHardSigns("perpendicular", perpendicular);
+    emitHardSigns("parallel", parallel);
+
+    struct Connectivity {
+        std::size_t pieces = 0;
+        std::size_t edges = 0;
+        std::size_t components = 0;
+        std::size_t largest = 0;
+        std::size_t isolated = 0;
+    };
+    const auto connectivity = [&](const bool activeOnly) {
+        const std::size_t size = winding.windingValid.size();
+        std::vector<std::size_t> parent(size);
+        std::iota(parent.begin(), parent.end(), 0);
+        std::vector<std::size_t> componentSize(size, 1);
+        std::vector<std::size_t> degree(size, 0);
+        const auto included = [&](const std::size_t piece) {
+            return !activeOnly || winding.windingValid.at(piece) != 0;
+        };
+        const auto root = [&](std::size_t node) {
+            while (parent[node] != node) {
+                parent[node] = parent[parent[node]];
+                node = parent[node];
+            }
+            return node;
+        };
+        std::set<std::pair<std::size_t, std::size_t>> edges;
+        const auto add = [&](std::size_t a, std::size_t b) {
+            if (a == b || !included(a) || !included(b))
+                return;
+            if (a > b)
+                std::swap(a, b);
+            if (!edges.emplace(a, b).second)
+                return;
+            ++degree[a];
+            ++degree[b];
+            std::size_t rootA = root(a);
+            std::size_t rootB = root(b);
+            if (rootA == rootB)
+                return;
+            if (componentSize[rootA] < componentSize[rootB])
+                std::swap(rootA, rootB);
+            parent[rootB] = rootA;
+            componentSize[rootA] += componentSize[rootB];
+        };
+        for (const auto& constraint : constraints.constraints) {
+            if (constraint.hardContinuity)
+                add(constraint.pieceA, constraint.pieceB);
+        }
+        for (const auto& diagnostic : winding.factorDiagnostics) {
+            if (diagnostic.hardPerpendicularSign ||
+                diagnostic.hardParallelSign) {
+                add(diagnostic.pieceA, diagnostic.pieceB);
+            }
+        }
+        Connectivity result;
+        result.edges = edges.size();
+        for (std::size_t piece = 0; piece < size; ++piece) {
+            if (!included(piece))
+                continue;
+            ++result.pieces;
+            result.isolated += degree[piece] == 0 ? 1 : 0;
+            if (root(piece) != piece)
+                continue;
+            ++result.components;
+            result.largest = std::max(result.largest, componentSize[piece]);
+        }
+        return result;
+    };
+    const auto allConnectivity = connectivity(false);
+    const auto activeConnectivity = connectivity(true);
+    const auto emitConnectivity = [&output](
+                                      std::string_view scope,
+                                      const Connectivity& counts) {
+        output << std::left << std::setw(10) << scope
+               << std::right << std::setw(10) << counts.pieces
+               << std::setw(10) << counts.edges
+               << std::setw(12) << counts.components
+               << std::setw(10) << counts.largest
+               << std::setw(10) << counts.isolated << '\n';
+    };
+    output << "BP hard-order connectivity\n"
+           << std::left << std::setw(10) << "scope"
+           << std::right << std::setw(10) << "pieces"
+           << std::setw(10) << "edges"
+           << std::setw(12) << "components"
+           << std::setw(10) << "largest"
+           << std::setw(10) << "isolated" << '\n';
+    emitConnectivity("all", allConnectivity);
+    emitConnectivity("active", activeConnectivity);
+    return output.str();
+}
+
 std::string formatBpFinalStateCohorts(
     std::span<const unsigned char> sourcePieceOne,
     const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding)
@@ -5560,7 +6377,7 @@ int main(int argc, char** argv)
                             windingConfig.temperature =
                                 options.bpInference == vc::fiber_tracer::
                                     FiberTraceBeliefInference::SumProductMixed
-                                ? 0.25
+                                ? options.windingTemperature
                                 : options.bp.horizontalnessTemperature;
                             windingConfig.messageDamping = options.bp.messageDamping;
                             windingConfig.messageResidualTolerance =
@@ -5607,11 +6424,22 @@ int main(int argc, char** argv)
                             std::optional<vc::fiber_tracer::
                                 FiberTraceInterleavedWindingReport>
                                     interleavedWinding;
+                            std::optional<vc::fiber_tracer::
+                                FiberTraceWindingLeastSquaresReport>
+                                    leastSquaresWinding;
+                            std::optional<vc::fiber_tracer::
+                                FiberTraceWindingLeastSquaresConfig>
+                                    leastSquaresWindingConfig;
                             const bool jointGrid =
                                 options.bpInference == vc::fiber_tracer::
                                     FiberTraceBeliefInference::SumProductMixed &&
                                 options.windingSolver == vc::fiber_tracer::
                                     FiberTraceWindingSolver::JointGrid;
+                            const bool ceresWinding =
+                                options.bpInference == vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed &&
+                                options.windingSolver == vc::fiber_tracer::
+                                    FiberTraceWindingSolver::Ceres;
                             auto bpTopology = vc::fiber_tracer::
                                 prepareFiberTraceBeliefTopology(bpSourceLines, bpConstraints, artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
                             std::vector<vc::fiber_tracer::
@@ -5679,10 +6507,11 @@ int main(int argc, char** argv)
                                         options.bpInference == vc::fiber_tracer::
                                             FiberTraceBeliefInference::SumProductMixed,
                                         bpTopology.centralSeedPiece,
-                                        jointGrid
+                                        jointGrid || ceresWinding
                                             ? options.jointGrid
                                                   .fixedMeasurementScale
-                                                  .value_or(1.0)
+                                                  .value_or(
+                                                      kDefaultWindingMeasurementScale)
                                             : 1.0);
                                 if (component.components <= 1)
                                     break;
@@ -5759,11 +6588,122 @@ int main(int argc, char** argv)
                             }
                             const auto solveInterleaved = [&] (
                                 const WindingWeightTuple& weights,
-                                bool showProgress) {
+                                bool showProgress,
+                                std::span<const vc::fiber_tracer::
+                                    FiberTraceJointGridInitialState>
+                                    initialStates = {},
+                                std::optional<std::array<int, 2>> activeRange =
+                                    std::nullopt) {
                                 auto weightedConfig = windingConfig;
                                 setWindingWeights(weightedConfig, weights);
+                                if (ceresWinding) {
+                                    if (!initialStates.empty() || activeRange) {
+                                        throw std::logic_error(
+                                            "Discrete winding initialization/range is incompatible with Ceres");
+                                    }
+                                    vc::fiber_tracer::
+                                        FiberTraceWindingLeastSquaresConfig leastSquares;
+                                    static_cast<vc::fiber_tracer::
+                                        FiberTraceWindingBeliefPropagationConfig&>(
+                                            leastSquares) = weightedConfig;
+                                    leastSquares.defectCost =
+                                        options.windingDefectCost;
+                                    leastSquares.pieceBreakCost =
+                                        options.pieceBreakCost;
+                                    leastSquares.orientationExtremenessCost =
+                                        options.bp.mixedUnaryCost;
+                                    leastSquares.measurementScale =
+                                        options.jointGrid.fixedMeasurementScale
+                                            .value_or(
+                                                kDefaultWindingMeasurementScale);
+                                    leastSquares.maximumIterations =
+                                        options.bp.maximumMessageIterations;
+                                    std::vector<vc::fiber_tracer::
+                                        FiberTraceWindingLeastSquaresState>
+                                        leastSquaresInitial(
+                                            bpConstraints.pieces.size());
+                                    for (std::size_t piece = 0;
+                                         piece < leastSquaresInitial.size();
+                                         ++piece) {
+                                        const double horizontal =
+                                            report.horizontalProbability.at(piece);
+                                        const double vertical =
+                                            report.verticalProbability.at(piece);
+                                        const double active = horizontal + vertical;
+                                        double initialHorizontalness =
+                                            active > 1.0e-12
+                                            ? horizontal / active
+                                            : 0.5;
+                                        if (bpDirections.at(piece) ==
+                                            vc::fiber_tracer::
+                                                FiberDirectionGroup::Direction1) {
+                                            initialHorizontalness = 1.0;
+                                        } else if (bpDirections.at(piece) ==
+                                            vc::fiber_tracer::
+                                                FiberDirectionGroup::Direction2) {
+                                            initialHorizontalness = 0.0;
+                                        }
+                                        leastSquaresInitial[piece] = {
+                                            initialHorizontalness,
+                                            std::clamp(active, 0.0, 1.0),
+                                            0.0,
+                                        };
+                                    }
+                                    leastSquaresWindingConfig = leastSquares;
+                                    leastSquaresWinding =
+                                        vc::fiber_tracer::
+                                            solveFiberTraceWindingLeastSquares(
+                                                bpConstraints,
+                                                bpTopology,
+                                                leastSquares,
+                                                leastSquaresInitial,
+                                                {},
+                                                showProgress
+                                                    ? makeLeastSquaresWindingProgressPrinter()
+                                                    : vc::fiber_tracer::
+                                                          FiberTraceWindingLeastSquaresProgressCallback{});
+                                    std::cout
+                                        << "fiber winding ceres summary"
+                                        << " status=" << leastSquaresWinding->status
+                                        << " usable=" << std::boolalpha
+                                        << leastSquaresWinding->solutionUsable
+                                        << std::noboolalpha
+                                        << " iterations="
+                                        << leastSquaresWinding->iterations
+                                        << " initial_ceres_cost="
+                                        << leastSquaresWinding->initialCost
+                                        << " final_ceres_cost="
+                                        << leastSquaresWinding->finalCost
+                                        << " residual_sum_squares="
+                                        << leastSquaresWinding->finalCosts.total()
+                                        << " orientation="
+                                        << leastSquaresWinding->finalCosts.orientation
+                                        << " magnitude="
+                                        << leastSquaresWinding->finalCosts.windingMagnitude
+                                        << " sign="
+                                        << leastSquaresWinding->finalCosts.windingSign
+                                        << " defect="
+                                        << leastSquaresWinding->finalCosts.defect
+                                        << " extremeness="
+                                        << leastSquaresWinding->finalCosts.orientationExtremeness
+                                        << " continuity="
+                                        << leastSquaresWinding->finalCosts.continuation
+                                        << " piece_break="
+                                        << leastSquaresWinding->finalCosts.pieceBreak
+                                        << " elapsed="
+                                        << leastSquaresWinding->solveSeconds << "s\n";
+                                    return vc::fiber_tracer::
+                                        makeFiberTraceInterleavedWindingReport(
+                                            *leastSquaresWinding, leastSquares);
+                                }
                                 if (jointGrid) {
                                     auto joint = options.jointGrid;
+                                    if (activeRange) {
+                                        joint.minimumActiveWinding =
+                                            (*activeRange)[0];
+                                        joint.maximumActiveWinding =
+                                            (*activeRange)[1];
+                                    }
                                     static_cast<vc::fiber_tracer::
                                         FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                             weightedConfig;
@@ -5780,7 +6720,16 @@ int main(int argc, char** argv)
                                                 ? makeJointGridWindingProgressPrinter()
                                                 : vc::fiber_tracer::
                                                       FiberTraceJointGridProgressCallback{},
-                                            fixedOrientations);
+                                            fixedOrientations,
+                                            {},
+                                            initialStates,
+                                            vc::fiber_tracer::
+                                                FiberTraceJointGridInitializationMode::
+                                                    ConditionedMessages);
+                                }
+                                if (!initialStates.empty()) {
+                                    throw std::logic_error(
+                                        "Winding state initialization requires joint-grid BP");
                                 }
                                 vc::fiber_tracer::
                                     FiberTraceInterleavedWindingConfig joint;
@@ -6213,8 +7162,234 @@ int main(int argc, char** argv)
                                     << formatWindingWeights(bestWeights)
                                     << '\n';
                             } else {
-                                interleavedWinding = solveInterleaved(
-                                    windingWeights(options), true);
+                                const auto fullWeights = windingWeights(options);
+                                if (options.windingSignFirst) {
+                                    auto signOnlyWeights = fullWeights;
+                                    std::fill_n(
+                                        signOnlyWeights.begin(), 5, 0.0);
+                                    std::cout
+                                        << "fiber winding sign-first stage=sign_only status=started\n"
+                                        << std::flush;
+                                    const auto signOnly = solveInterleaved(
+                                        signOnlyWeights, true);
+                                    std::cout
+                                        << "fiber winding sign-first stage=sign_only status="
+                                        << signOnly.status
+                                        << " active="
+                                        << std::count_if(
+                                               signOnly.windingValid.begin(),
+                                               signOnly.windingValid.end(),
+                                               [](const unsigned char valid) {
+                                                   return valid != 0;
+                                               })
+                                        << " defect="
+                                        << std::count(
+                                               signOnly.windingValid.begin(),
+                                               signOnly.windingValid.end(),
+                                               static_cast<unsigned char>(0))
+                                        << " energy=" << signOnly.decodedEnergy
+                                        << '\n';
+                                    auto initialStates =
+                                        makeConditionedOrdinaryWarmStart(
+                                            signOnly,
+                                            0,
+                                            bpConstraints.pieces.size());
+                                    if (options.windingLevelGrowthMaximum) {
+                                        int minimum =
+                                            std::numeric_limits<int>::max();
+                                        int maximum =
+                                            std::numeric_limits<int>::lowest();
+                                        for (std::size_t piece = 0;
+                                             piece < signOnly.windingValid.size();
+                                             ++piece) {
+                                            if (signOnly.windingValid[piece] == 0)
+                                                continue;
+                                            minimum = std::min(
+                                                minimum,
+                                                signOnly.mapWinding[piece]);
+                                            maximum = std::max(
+                                                maximum,
+                                                signOnly.mapWinding[piece]);
+                                        }
+                                        if (minimum > maximum) {
+                                            throw std::runtime_error(
+                                                "Sign-only level growth has no active state");
+                                        }
+                                        minimum = std::min(minimum, 0);
+                                        maximum = std::max(maximum, 0);
+                                        const auto levels = [&] {
+                                            return static_cast<std::size_t>(
+                                                maximum - minimum + 1);
+                                        };
+                                        if (*options.windingLevelGrowthMaximum <
+                                            levels()) {
+                                            throw std::runtime_error(
+                                                "Requested winding level growth is smaller than the sign-only ladder");
+                                        }
+                                        auto benchmarkConfig = windingConfig;
+                                        setWindingWeights(
+                                            benchmarkConfig, fullWeights);
+                                        const auto printGrowthStage = [&] (
+                                            std::size_t stage,
+                                            const auto& result) {
+                                            const std::size_t active =
+                                                std::count_if(
+                                                    result.windingValid.begin(),
+                                                    result.windingValid.end(),
+                                                    [](const unsigned char valid) {
+                                                        return valid != 0;
+                                                    });
+                                            std::cout
+                                                << "fiber winding level growth"
+                                                << " stage=" << stage
+                                                << " range=" << minimum << ','
+                                                << maximum
+                                                << " levels=" << levels()
+                                                << " status=" << result.status
+                                                << " active=" << active
+                                                << " defect="
+                                                << result.windingValid.size() - active
+                                                << " data_energy="
+                                                << result.decodedDataEnergy;
+                                            if (referenceDiagnostics &&
+                                                referenceBpConstraints) {
+                                                const auto observations =
+                                                    makeReferenceBpWindingObservations(
+                                                        *referenceDiagnostics,
+                                                        *referenceBpConstraints,
+                                                        result,
+                                                        benchmarkConfig);
+                                                const auto benchmark =
+                                                    vc::fiber_tracer::
+                                                        calibrateFiberTraceReferenceWindings(
+                                                            observations);
+                                                std::size_t exact = 0;
+                                                std::cout << " ref_ladder=";
+                                                for (std::size_t source = 0;
+                                                     source < benchmark.references.size();
+                                                     ++source) {
+                                                    if (source != 0)
+                                                        std::cout << ',';
+                                                    const auto estimate =
+                                                        benchmark.references[source].
+                                                            estimatedWinding;
+                                                    if (!estimate) {
+                                                        std::cout << "NA";
+                                                        continue;
+                                                    }
+                                                    std::cout << *estimate;
+                                                    if (std::abs(
+                                                            *estimate -
+                                                            0.5 * static_cast<double>(source)) <=
+                                                        1.0e-12) {
+                                                        ++exact;
+                                                    }
+                                                }
+                                                std::cout
+                                                    << " ref_exact=" << exact
+                                                    << '/'
+                                                    << benchmark.references.size()
+                                                    << " ref_constraints="
+                                                    << benchmark.sum.right << '/'
+                                                    << benchmark.sum.right +
+                                                           benchmark.sum.wrong;
+                                            }
+                                            std::cout << '\n';
+                                        };
+                                        std::size_t stage = 0;
+                                        while (true) {
+                                            ++stage;
+                                            std::cout
+                                                << "fiber winding level growth"
+                                                << " stage=" << stage
+                                                << " range=" << minimum << ','
+                                                << maximum
+                                                << " levels=" << levels()
+                                                << " status=started\n"
+                                                << std::flush;
+                                            auto stageResult = solveInterleaved(
+                                                fullWeights,
+                                                levels() ==
+                                                    *options.windingLevelGrowthMaximum,
+                                                initialStates,
+                                                std::array{minimum, maximum});
+                                            printGrowthStage(stage, stageResult);
+                                            interleavedWinding =
+                                                std::move(stageResult);
+                                            if (levels() ==
+                                                *options.windingLevelGrowthMaximum) {
+                                                break;
+                                            }
+                                            initialStates =
+                                                makeConditionedOrdinaryWarmStart(
+                                                    *interleavedWinding,
+                                                    0,
+                                                    bpConstraints.pieces.size());
+                                            if (-minimum <= maximum)
+                                                --minimum;
+                                            else
+                                                ++maximum;
+                                        }
+                                    } else {
+                                        for (std::size_t stage = 1;
+                                             stage <= options.windingSignFirstSteps;
+                                             ++stage) {
+                                            const double fraction =
+                                                static_cast<double>(stage) /
+                                                static_cast<double>(
+                                                    options.windingSignFirstSteps);
+                                            auto stageWeights = fullWeights;
+                                            for (std::size_t dimension = 0;
+                                                 dimension < 5;
+                                                 ++dimension) {
+                                                stageWeights[dimension] *= fraction;
+                                            }
+                                            std::cout
+                                                << "fiber winding sign-first stage="
+                                                << stage << '/'
+                                                << options.windingSignFirstSteps
+                                                << " magnitude_fraction=" << fraction
+                                                << " status=started\n"
+                                                << std::flush;
+                                            auto stageResult = solveInterleaved(
+                                                stageWeights,
+                                                stage == options.windingSignFirstSteps,
+                                                initialStates);
+                                            std::cout
+                                                << "fiber winding sign-first stage="
+                                                << stage << '/'
+                                                << options.windingSignFirstSteps
+                                                << " magnitude_fraction=" << fraction
+                                                << " status=" << stageResult.status
+                                                << " active="
+                                                << std::count_if(
+                                                       stageResult.windingValid.begin(),
+                                                       stageResult.windingValid.end(),
+                                                       [](const unsigned char valid) {
+                                                           return valid != 0;
+                                                       })
+                                                << " defect="
+                                                << std::count(
+                                                       stageResult.windingValid.begin(),
+                                                       stageResult.windingValid.end(),
+                                                       static_cast<unsigned char>(0))
+                                                << " energy="
+                                                << stageResult.decodedEnergy << '\n';
+                                            if (stage < options.windingSignFirstSteps) {
+                                                initialStates =
+                                                    makeConditionedOrdinaryWarmStart(
+                                                        stageResult,
+                                                        0,
+                                                        bpConstraints.pieces.size());
+                                            }
+                                            interleavedWinding =
+                                                std::move(stageResult);
+                                        }
+                                    }
+                                } else {
+                                    interleavedWinding = solveInterleaved(
+                                        fullWeights, true);
+                                }
                             }
 
                             std::optional<std::string>
@@ -6473,7 +7648,39 @@ int main(int argc, char** argv)
                                       *interleavedWinding)
                                 : *independentWinding;
                             if (referenceBpConstraints && interleavedWinding) {
+                                std::string referenceBenchmark;
+                                if (ceresWinding) {
+                                    if (!leastSquaresWinding ||
+                                        !leastSquaresWindingConfig) {
+                                        throw std::logic_error(
+                                            "Ceres winding report is missing for reference benchmark");
+                                    }
+                                    referenceBenchmark =
+                                        formatReferenceCeresLeastSquaresBenchmark(
+                                            solveReferenceCeresLeastSquares(
+                                                *referenceDiagnostics,
+                                                *referenceBpConstraints,
+                                                bpPieceLines,
+                                                *leastSquaresWinding,
+                                                *leastSquaresWindingConfig,
+                                                options.labeling,
+                                                artifact.minimumBaseXYZ,
+                                                artifact.maximumBaseXYZ));
+                                } else {
+                                    referenceBenchmark =
+                                        formatReferenceBpWindingBenchmark(
+                                            *referenceDiagnostics,
+                                            *referenceBpConstraints,
+                                            *interleavedWinding,
+                                            mode,
+                                            windingConfig,
+                                            bpConstraints,
+                                            bpOriginalTraceIndices);
+                                }
                                 deferredReferenceDiagnostics.push_back(
+                                    formatBpWindingComponentDiagnostics(
+                                        bpConstraints,
+                                        *interleavedWinding) +
                                     formatBpFinalStateCohorts(
                                         bpSourcePieceOne,
                                         *interleavedWinding) +
@@ -6481,20 +7688,16 @@ int main(int argc, char** argv)
                                         bpSourcePieceOne,
                                         bpConstraints,
                                         *interleavedWinding) +
-                                    formatReferenceBpWindingBenchmark(
-                                        *referenceDiagnostics,
-                                        *referenceBpConstraints,
-                                        *interleavedWinding,
-                                        mode,
-                                        windingConfig,
-                                        bpConstraints,
-                                        bpOriginalTraceIndices) +
+                                    referenceBenchmark +
                                     (fixedReferenceConditionedDiagnostics
                                          ? "\n" +
                                                *fixedReferenceConditionedDiagnostics
                                          : std::string{}));
                             } else if (interleavedWinding) {
                                 deferredBpStateDiagnostics.push_back(
+                                    formatBpWindingComponentDiagnostics(
+                                        bpConstraints,
+                                        *interleavedWinding) +
                                     formatBpFinalStateCohorts(
                                         bpSourcePieceOne,
                                         *interleavedWinding) +

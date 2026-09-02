@@ -1852,3 +1852,11 @@
   cross-factor agreement tables. On the 1024 crop, winding-magnitude conflicts
   dominated the response; H/V and signed-order conflicts were comparatively
   small.
+
+## 2026-09-02 - Fractional Ceres winding experiment
+
+- Added an opt-in continuous Ceres backend for joint horizontalness, activity,
+  and real winding using the exact prepared BP targets and coefficients.
+- Added per-reference fixed-source least-squares diagnostics, fractional
+  artifact publication, progress/cost reporting, and synthetic regression
+  coverage while retaining joint-grid as the default.

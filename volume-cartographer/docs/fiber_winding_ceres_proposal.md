@@ -1,13 +1,15 @@
 # Continuous Fiber Orientation and Winding Proposal
 
-This is a deferred experimental design. It does not describe the current
-belief-propagation implementation.
+The fixed-scale subset of this design is implemented experimentally by
+`vc_fiber_trace_chunk direction-ablation --winding-solver ceres`. The
+phase/scale optimization and periodic integer-ladder residual below remain
+deferred.
 
 ## Variables
 
-For every fiber piece `i`, optimize:
+The implemented parameterization for every fiber piece `i` is:
 
-- `x_i` in `[-1,1]`: orientation, with `+1` for H and `-1` for V.
+- `h_i` in `[0,1]`: horizontalness, with `1` for H and `0` for V.
 - `a_i` in `[0,1]`: active confidence. `a_i=0` denotes Defect.
 - `z_i` in `R`: continuous winding coordinate.
 
@@ -20,8 +22,8 @@ and positive measurement scale `scale`. The first experiment should fix
 For parallel and perpendicular evidence weights `w_p` and `w_q`, use:
 
 ```text
-r_parallel = sqrt(w_p) * a_i * a_j * (x_i - x_j)
-r_perpendicular = sqrt(w_q) * a_i * a_j * (x_i + x_j)
+r_parallel = sqrt(w_p) * a_i * a_j * (h_i - h_j)
+r_perpendicular = sqrt(w_q) * a_i * a_j * (h_i + h_j - 1)
 r_same_winding = sqrt(w_p) * a_i * a_j * (z_j - z_i)
 r_measured_winding = sqrt(w_q) * a_i * a_j
     * ((z_j - z_i) / scale - signed_distance)
@@ -32,8 +34,8 @@ then contributes `weight * error^2`, rather than unintentionally squaring the
 confidence weight.
 
 The product `a_i*a_j` makes a Defect endpoint neutral for both orientation and
-winding evidence. Bad measured constraints should use a robust loss such as
-Huber. Same-trace continuity should use a strong, non-robust factor.
+winding evidence. The current first experiment uses no robust loss.
+Same-trace continuity uses a strong finite, non-robust factor.
 
 ## Unary and ladder residuals
 
@@ -41,10 +43,11 @@ Penalize inactive pieces and encourage active orientations to approach H/V:
 
 ```text
 r_defect = sqrt(lambda_defect) * (1 - a_i)
-r_binary = sqrt(lambda_binary) * a_i * (1 - x_i*x_i)
+r_binary = sqrt(lambda_binary * degree_i) * a_i * h_i * (1 - h_i)
 ```
 
-Encourage active winding coordinates onto two interleaved integer ladders:
+The following integer-ladder residual remains deferred; current Ceres winding
+coordinates are deliberately fractional:
 
 ```text
 r_ladder = sqrt(lambda_ladder) * a_i

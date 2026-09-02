@@ -1,69 +1,85 @@
 # Task Plan
 
-## Warm-start model
+## Shared model
 
-1. Add an optional per-piece joint-grid initialization carrying active/Defect,
-   fixed-prepass H/V, integer winding, and component phase sign. It is
-   initialization only: it does not add a unary, fix a variable, or change the
-   ordinary objective. This experiment therefore probes Defect/winding/sign
-   basins; fixed-prepass H/V cannot move.
-2. Map the piece initialization into the prepared ordinary nodes, validate
-   fixed-orientation and component-sign consistency, and normalize each
-   ordinary integer component into its existing gauge without changing any
-   relative latent differences.
-3. Expand initial integer support to include the normalized seed state. Require
-   fixed half-step phase for an unambiguous latent-coordinate gauge, validate
-   hard continuation and hard sign compatibility, and explicitly use the first
-   active node as the integer origin when an ordinary gauge node is Defect.
-4. Initialize each ordinary factor-to-variable message from the factor
-   potential conditioned on the seeded state of its opposite endpoint, and
-   initialize component-sign messages from the seeded endpoints. Then run the
-   unchanged production message updates, support expansion, projection, and
-   decoding with no seed prior remaining.
+1. Add a public Ceres solver API beside the BP API. Extract and reuse the exact
+   public prepared winding model as the single source of materialized
+   dominant hypothesis, scale-first canonical target, effective magnitude
+   coefficient, sign coefficient/hardness, and endpoint ordering.
+2. Optimize `horizontalness h in [0,1]`, `activity a in [0,1]`, and real
+   winding `z` per piece. Use the existing orientation scores as paired
+   parallel/perpendicular residuals, so binary endpoints reproduce the
+   existing same/different orientation costs.
+3. Gate cross-piece residuals by endpoint activity. Use degree-scaled
+   `--winding-defect-cost` for the activity unary and
+   `--piece-break-cost` for activity discontinuity across split-continuation
+   links. Preserve exact split-continuation H/V and winding behavior through a
+   strong least-squares residual when hard continuation is enabled.
+4. Use the five existing magnitude weights and two sign weights after current
+   confidence attenuation. Map every effective coefficient `c` to residual
+   scale `sqrt(c)`, so Ceres contributes `c*r^2`. Represent finite and promoted
+   hard signs by one-sided residuals. Reuse the existing mixed/defect,
+   continuation, sign, magnitude, confidence, and scale controls without adding
+   a separate Ceres-only tuning surface.
+5. Fix one deterministic central H/V gauge and one winding gauge per
+   otherwise-unfixed corresponding component without fixing activity.
+   Initialize H/V from PCA direction groups, activity from the orientation
+   prepass, and winding at zero without running discrete BP.
 
-## Experiment
+## CLI and artifacts
 
-1. Run the existing cold ordinary solve and exact fixed-reference conditioned
-   solve. The seed is the conditioned solver's published, hard-projected MAP,
-   not its private converged message buffers.
-2. Slice the conditioned ordinary MAP states into a warm-start vector and
-   discard every reference node and cross-factor. Run a neutral-message control
-   with the expanded warm support, then a conditioned-message solve with the
-   identical support. Both use the exact original ordinary graph, configuration,
-   and weights.
-3. Report convergence for all three solves and compare the warm result against
-   both the conditioned seed and cold baseline: active/Defect, H/V, and latent
-   winding changes. Use the same ordinary gauge normalization so representation
-   changes are not counted as physical changes.
-4. Report the cold-to-neutral support effect separately from the
-   neutral-to-warm initialization effect. Report whether the warm solve returns
-   to the neutral expanded-support solution, retains the conditioned solution,
-   or converges to a third fixed point. Mark the conclusion unresolved unless
-   every solve reaches the residual criterion.
+1. Extend `--winding-solver` with `ceres`; retain `joint-grid` as the default.
+2. In Ceres mode, run the usual orientation prepass only as initialization,
+   then publish fractional H/V/activity/winding through the existing OBJ/CSV
+   artifact path. Threshold only where legacy discrete files require a label;
+   preserve the fractional values in the report/CSV.
+3. Print Ceres termination, iterations, initial/final cost, solve time, and
+   residual-class summaries. Existing BP-only component selection and
+   constraint extraction remain shared.
 
-## Tests
+## Reference solve
 
-1. Verify an empty initialization reproduces the cold solve exactly.
-2. Verify support-only and conditioned-message runs use identical expanded
-   domains, while a valid warm initialization remains free to leave its seed.
-3. Verify invalid size, orientation, phase sign, hard-continuity, and hard-sign
-   seed states are rejected, including a Defect endpoint that neutralizes a
-   hard sign.
-4. Build Release `vc_fiber_trace_chunk` and the winding BP tests, run the
-   focused test executable, run `git diff --check`, and execute the 1024
-   reference experiment once.
+1. Reuse the existing reference-to-crop cross-constraint extraction. For each
+   annotated reference source, build the subproblem containing its pieces,
+   their hard continuation links, and only cross constraints to solved crop
+   pieces.
+2. Fix every crop endpoint to its main Ceres horizontalness, activity, and
+   winding. Optimize only the selected reference source with the identical
+   residual construction and settings; do not use the BP reference voting
+   scorer to infer its state.
+3. Aggregate each reference source's piece results by arc-length weight. Report
+   raw horizontalness, activity, winding, residual cost, and usable connected
+   constraints. Fit one global sign and half-step offset maximizing exact
+   filename-order ladder matches, with squared error as deterministic tie
+   break, then report calibrated winding and error.
+
+## Validation
+
+- Unit-test a synthetic parallel/perpendicular system, fractional activity,
+  weight reuse, hard-continuation behavior, deterministic gauge fixing, fixed
+  endpoint solving, and per-reference recovery.
+- Build Release `vc_fiber_trace_chunk` and the focused solver test.
+- Run the focused test and a short 1024-crop Ceres command using the approved
+  runner. Record exact command, input, build type, runtime, convergence, and
+  reference table.
+- Confirm the established joint-grid command still takes the old path and its
+  defaults are unchanged.
 
 ## Spec Update
 
-Document that joint-grid warm starts affect only initial support and messages,
-preserve the ordinary objective, and normalize integer gauges before seeding.
+- Specify the continuous variables, residual definitions, activity gating,
+  gauge, hard-continuation approximation, sign handling, output thresholds,
+  and per-reference fixed-source benchmark.
+- State explicitly that least squares changes the residual norm relative to
+  discrete BP while reusing its materialized targets and coefficients.
 
-## Documentation Update
+## Docs Updates
 
-Document the fixed-reference release experiment and its three-way comparison
-in `volume-cartographer/docs/fiber_chunk_tracing.md`.
+- Document `--winding-solver ceres`, its reused controls, output
+  fields, and the reference benchmark in
+  `volume-cartographer/docs/fiber_chunk_tracing.md`.
 
-## Changelog
+## Changelog Update
 
-Record the reference-conditioned warm-start experiment and observed basin
-behavior.
+- Add one entry for the experimental continuous Ceres solver and fixed-source
+  reference evaluation.

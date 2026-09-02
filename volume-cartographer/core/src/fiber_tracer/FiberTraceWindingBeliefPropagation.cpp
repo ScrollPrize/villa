@@ -27,62 +27,9 @@ constexpr double kEpsilon = 1.0e-12;
 
 enum class JointClass : unsigned char { A = 0, Mixed = 1, B = 2 };
 
-struct Measurement {
-    std::size_t constraintIndex = 0;
-    std::size_t a = 0;
-    std::size_t b = 0;
-    double parallel = 0.0;
-    double perpendicular = 0.0;
-    double parallelConfidence = 0.0;
-    double perpendicularConfidence = 0.0;
-    double parallelMultiplier = 1.0;
-    double perpendicularMultiplier = 1.0;
-    double parallelDistance = 0.0;
-    std::optional<double> parallelSignedDelta;
-    std::optional<double> perpendicularSignedDelta;
-    std::optional<std::size_t> normalComponent;
-    bool hardParallelSign = false;
-    bool hardPerpendicularSign = false;
-    double parallelSignPenalty = 0.0;
-    double perpendicularSignPenalty = 0.0;
-    double rawParallelDistance = 0.0;
-    std::optional<double> rawParallelSignedDelta;
-    std::optional<double> rawPerpendicularSignedDelta;
-    std::optional<double> selectedNormalAlignment;
-    double selectedConfidence = 1.0;
-    bool continuity = false;
-    bool quantizeTargets = true;
-    bool parallelDominant = false;
-    bool perpendicularDominant = false;
-    bool parallelMagnitudePresent = false;
-    bool perpendicularMagnitudePresent = false;
-    bool parallelSignPresent = false;
-    bool perpendicularSignPresent = false;
-};
-
-struct Edge {
-    std::size_t a = 0;
-    std::size_t b = 0;
-    std::vector<Measurement> measurements;
-    bool containsHardContinuity = false;
-};
-
-struct PreparedWinding {
-    std::vector<std::size_t> pieceToNode;
-    std::vector<std::vector<std::size_t>> piecesByNode;
-    std::vector<Edge> edges;
-    std::vector<std::vector<std::size_t>> adjacency;
-    std::vector<std::size_t> incidentMeasurements;
-    std::vector<std::size_t> incidentWindingMeasurements;
-    std::vector<std::size_t> componentByNode;
-    std::vector<std::size_t> integerGaugeByNode;
-    std::vector<std::size_t> gaugeNodeByComponent;
-    std::vector<std::size_t> gaugePieceByComponent;
-    std::vector<std::size_t> integerGaugeNodes;
-    std::vector<FiberTraceWindingFactorDiagnostic> diagnostics;
-    FiberTraceWindingBeliefPropagationConfig config;
-    double preparedMeasurementScale = 1.0;
-};
+using Measurement = FiberTracePreparedWindingMeasurement;
+using Edge = FiberTracePreparedWindingEdge;
+using PreparedWinding = FiberTracePreparedWindingModel;
 
 void validateConfig(const FiberTraceWindingBeliefPropagationConfig& config)
 {
@@ -1400,6 +1347,29 @@ InitialJointStates initialJointStates(
         }
         if (!offset)
             offset = 0;
+        if (config.minimumActiveWinding) {
+            int minimum = std::numeric_limits<int>::max();
+            int maximum = std::numeric_limits<int>::lowest();
+            for (std::size_t node = 0; node < result.byNode.size(); ++node) {
+                if (problem.integerGaugeByNode[node] != integerComponent ||
+                    result.byNode[node].orientation == JointClass::Mixed) {
+                    continue;
+                }
+                minimum = std::min(minimum, result.byNode[node].winding);
+                maximum = std::max(maximum, result.byNode[node].winding);
+            }
+            if (minimum <= maximum) {
+                const int minimumOffset =
+                    maximum - *config.maximumActiveWinding;
+                const int maximumOffset =
+                    minimum - *config.minimumActiveWinding;
+                if (minimumOffset > maximumOffset) {
+                    throw std::invalid_argument(
+                        "Initial winding component does not fit the active range");
+                }
+                offset = std::clamp(*offset, minimumOffset, maximumOffset);
+            }
+        }
         for (std::size_t node = 0; node < result.byNode.size(); ++node) {
             if (problem.integerGaugeByNode[node] == integerComponent &&
                 result.byNode[node].orientation != JointClass::Mixed) {
@@ -2423,6 +2393,7 @@ struct GridRound {
     std::vector<std::optional<int>> fixedPhaseSigns;
     std::vector<JointState> initialStates;
     std::vector<int> initialPhaseSigns;
+    std::vector<double> continuousNodes;
     FiberTraceJointGridInitializationMode initializationMode =
         FiberTraceJointGridInitializationMode::ConditionedMessages;
     std::vector<GridCalibrationCell> calibrationCells;
@@ -2571,7 +2542,7 @@ double gridWindingEnergy(
     int sign,
     double gain,
     double phase,
-    const FiberTraceWindingBeliefPropagationConfig& config)
+    const FiberTraceJointGridWindingConfig& config)
 {
     const double delta = static_cast<double>(b.winding - a.winding) +
         classOffset(b.orientation, sign, phase) -
@@ -2581,10 +2552,32 @@ double gridWindingEnergy(
     if (!hardWindingSignCompatible(
             edge, predictedDelta, config, measurementScale))
         return std::numeric_limits<double>::infinity();
+    const auto minimumPositiveDelta = [&] (const double targetSign) {
+        const double offset = targetSign * (
+            classOffset(b.orientation, sign, phase) -
+            classOffset(a.orientation, sign, phase));
+        double fractional = offset - std::floor(offset);
+        if (fractional <= 1.0e-12)
+            fractional = 1.0;
+        return fractional;
+    };
     double result = 0.0;
     for (const auto& raw : edge.measurements) {
         const auto measurement = materializeMeasurement(
             raw, config, measurementScale);
+        if (!raw.continuity) {
+            result += config.localSpanCost *
+                measurement.selectedConfidence * std::abs(predictedDelta);
+        }
+        if (requiresHardWindingSign(measurement)) {
+            const double target = measurement.hardPerpendicularSign
+                ? *measurement.perpendicularSignedDelta
+                : *measurement.parallelSignedDelta;
+            const double targetSign = std::copysign(1.0, target);
+            const double signedDelta = targetSign * predictedDelta;
+            result += config.hardSignSlackCost * std::max(
+                0.0, signedDelta - minimumPositiveDelta(targetSign));
+        }
         result += parallelWindingWeight(measurement) *
             std::abs(parallelWindingResidual(measurement, delta));
         if (measurement.perpendicularSignedDelta) {
@@ -2616,8 +2609,13 @@ double gridDecodedEnergy(
     std::span<const int> phaseSigns,
     std::span<const JointClass> fixedOrientations,
     const GridCalibrationCell& calibration,
-    const FiberTraceJointGridWindingConfig& config)
+    const FiberTraceJointGridWindingConfig& config,
+    std::span<const double> continuousNodes = {})
 {
+    if (!continuousNodes.empty() && continuousNodes.size() != decoded.size()) {
+        throw std::logic_error(
+            "Joint-grid continuous coordinate size mismatch");
+    }
     double result = 0.0;
     const auto& incident = fixedOrientations.empty()
         ? problem.incidentMeasurements
@@ -2628,6 +2626,12 @@ double gridDecodedEnergy(
              fixedOrientations[node] != JointClass::Mixed)) {
             result += config.mixedUnaryCost *
                 static_cast<double>(incident[node]);
+        } else if (decoded[node].orientation != JointClass::Mixed &&
+                   !continuousNodes.empty()) {
+            result += config.continuousCoordinateCost *
+                std::abs(
+                    static_cast<double>(decoded[node].winding) -
+                    std::round(continuousNodes[node]));
         }
     }
     for (const auto& edge : problem.edges) {
@@ -2766,11 +2770,23 @@ void validateJointGridConfig(const FiberTraceJointGridWindingConfig& config)
          config.initialGainCells == 0 || config.initialGainCells % 2 == 0 ||
          config.phaseCells < 2 ||
          config.maximumGainCells < config.initialGainCells);
+    const bool hasMinimumWinding = config.minimumActiveWinding.has_value();
+    const bool hasMaximumWinding = config.maximumActiveWinding.has_value();
+    const bool activeRangeInvalid = hasMinimumWinding != hasMaximumWinding ||
+        (hasMinimumWinding &&
+         (*config.minimumActiveWinding > *config.maximumActiveWinding ||
+          *config.minimumActiveWinding > 0 ||
+          *config.maximumActiveWinding < 0));
     if (!std::isfinite(config.mixedUnaryCost) || config.mixedUnaryCost < 0.0 ||
         !std::isfinite(config.pieceBreakCost) || config.pieceBreakCost < 0.0 ||
+        !std::isfinite(config.continuousCoordinateCost) ||
+        config.continuousCoordinateCost < 0.0 ||
+        !std::isfinite(config.localSpanCost) || config.localSpanCost < 0.0 ||
+        !std::isfinite(config.hardSignSlackCost) ||
+        config.hardSignSlackCost < 0.0 ||
         !std::isfinite(config.orientationTemperature) ||
         !(config.orientationTemperature > 0.0) ||
-        fixedInvalid || adaptiveInvalid ||
+        fixedInvalid || adaptiveInvalid || activeRangeInvalid ||
         config.stableIterations == 0) {
         throw std::invalid_argument("Joint-grid winding BP config is invalid");
     }
@@ -2952,11 +2968,21 @@ GridLogTotals buildGridTotals(
                 decoded.orientation == JointClass::Mixed &&
                 (round.fixedOrientations.empty() ||
                  round.fixedOrientations[node] != JointClass::Mixed);
-            addLogFactor(totals.pieceAccumulators[node][state], chargeDefect
+            double logUnary = chargeDefect
                 ? -config.mixedUnaryCost *
-                    static_cast<double>(incident[node]) /
-                    config.orientationTemperature
-                : 0.0);
+                      static_cast<double>(incident[node]) /
+                      config.orientationTemperature
+                : 0.0;
+            if (!chargeDefect &&
+                decoded.orientation != JointClass::Mixed &&
+                config.continuousCoordinateCost > 0.0) {
+                logUnary -= config.continuousCoordinateCost *
+                    std::abs(
+                        static_cast<double>(decoded.winding) -
+                        std::round(round.continuousNodes.at(node))) /
+                    config.temperature;
+            }
+            addLogFactor(totals.pieceAccumulators[node][state], logUnary);
         }
     }
     if (!round.fixedCalibration) {
@@ -3221,7 +3247,8 @@ void remapPieceMessages(
 bool ensureIntegerSupport(
     const PreparedWinding& problem,
     GridRound& round,
-    std::span<const double> continuousNodes)
+    std::span<const double> continuousNodes,
+    const FiberTraceJointGridWindingConfig& config)
 {
     double minimumGain = std::numeric_limits<double>::infinity();
     double maximumGain = 0.0;
@@ -3253,6 +3280,12 @@ bool ensureIntegerSupport(
             round.lower[node], static_cast<int>(std::floor(low)) - 1);
         round.upper[node] = std::max(
             round.upper[node], static_cast<int>(std::ceil(high)) + 1);
+        if (config.minimumActiveWinding) {
+            round.lower[node] = std::max(
+                round.lower[node], *config.minimumActiveWinding);
+            round.upper[node] = std::min(
+                round.upper[node], *config.maximumActiveWinding);
+        }
         if (oldLower != round.lower[node] || oldUpper != round.upper[node]) {
             remapPieceMessages(problem, round, node, oldLower, oldUpper);
             changed = true;
@@ -3311,11 +3344,15 @@ bool adjustIntegerSupport(
         const int oldLower = round.lower[node];
         const int oldUpper = round.upper[node];
         if (normalizedLowerProbability > config.boundaryProbabilityThreshold &&
-            meanWinding - static_cast<double>(oldLower) <= 0.75) {
+            meanWinding - static_cast<double>(oldLower) <= 0.75 &&
+            (!config.minimumActiveWinding ||
+             oldLower > *config.minimumActiveWinding)) {
             --round.lower[node];
         }
         if (normalizedUpperProbability > config.boundaryProbabilityThreshold &&
-            static_cast<double>(oldUpper) - meanWinding <= 0.75) {
+            static_cast<double>(oldUpper) - meanWinding <= 0.75 &&
+            (!config.maximumActiveWinding ||
+             oldUpper < *config.maximumActiveWinding)) {
             ++round.upper[node];
         }
         if (oldLower != round.lower[node] || oldUpper != round.upper[node]) {
@@ -3510,6 +3547,7 @@ GridRound solveJointGridRound(
     round.fixedPhaseSigns = fixedStates.phaseSignByComponent;
     round.initialStates = initialStates.byNode;
     round.initialPhaseSigns = initialStates.phaseSignByComponent;
+    round.continuousNodes.assign(continuousNodes.begin(), continuousNodes.end());
     round.initializationMode = initializationMode;
     round.initialDefectGaugeComponents =
         initialStates.defectGaugeComponents;
@@ -3539,6 +3577,15 @@ GridRound solveJointGridRound(
     }
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
         if (!round.fixedStates.empty() && round.fixedStates[node]) {
+            if (config.minimumActiveWinding &&
+                round.fixedStates[node]->orientation != JointClass::Mixed &&
+                (round.fixedStates[node]->winding <
+                     *config.minimumActiveWinding ||
+                 round.fixedStates[node]->winding >
+                     *config.maximumActiveWinding)) {
+                throw std::invalid_argument(
+                    "Fixed winding state is outside the active component range");
+            }
             round.lower[node] = round.fixedStates[node]->winding;
             round.upper[node] = round.fixedStates[node]->winding;
             continue;
@@ -3556,8 +3603,30 @@ GridRound solveJointGridRound(
         }
         round.lower[node] = static_cast<int>(std::floor(low)) - 1;
         round.upper[node] = static_cast<int>(std::ceil(high)) + 1;
+        if (config.minimumActiveWinding) {
+            round.lower[node] = std::max(
+                round.lower[node], *config.minimumActiveWinding);
+            round.upper[node] = std::min(
+                round.upper[node], *config.maximumActiveWinding);
+            if (round.lower[node] > round.upper[node]) {
+                const int nearest = std::clamp(
+                    static_cast<int>(std::round(continuousNodes[node])),
+                    *config.minimumActiveWinding,
+                    *config.maximumActiveWinding);
+                round.lower[node] = nearest;
+                round.upper[node] = nearest;
+            }
+        }
         if (!round.initialStates.empty() &&
             round.initialStates[node].orientation != JointClass::Mixed) {
+            if (config.minimumActiveWinding &&
+                (round.initialStates[node].winding <
+                     *config.minimumActiveWinding ||
+                 round.initialStates[node].winding >
+                     *config.maximumActiveWinding)) {
+                throw std::invalid_argument(
+                    "Initial winding state is outside the active component range");
+            }
             round.lower[node] = std::min(
                 round.lower[node], round.initialStates[node].winding);
             round.upper[node] = std::max(
@@ -3653,7 +3722,7 @@ GridRound solveJointGridRound(
             adjustCalibrationSupport(round, config);
         const bool calibrationIntegerSupportChanged =
             calibrationSupportChanged &&
-            ensureIntegerSupport(problem, round, continuousNodes);
+            ensureIntegerSupport(problem, round, continuousNodes, config);
         if (posteriorSupportChanged || calibrationSupportChanged ||
             calibrationIntegerSupportChanged) {
             stableIterations = 0;
@@ -4043,15 +4112,63 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
                 selectedCalibration.gain,
                 selectedCalibration.phase,
                 config);
+            const double latentDelta = static_cast<double>(b.winding - a.winding) +
+                classOffset(
+                    b.orientation,
+                    report.componentPhaseSign[component],
+                    selectedCalibration.phase) -
+                classOffset(
+                    a.orientation,
+                    report.componentPhaseSign[component],
+                    selectedCalibration.phase);
+            for (const auto& raw : edge.measurements) {
+                if (raw.continuity)
+                    continue;
+                const auto measurement = materializeMeasurement(
+                    raw, config, 1.0 / selectedCalibration.gain);
+                report.localSpanEnergy += config.localSpanCost *
+                    measurement.selectedConfidence * std::abs(latentDelta);
+                if (requiresHardWindingSign(measurement)) {
+                    const double target = measurement.hardPerpendicularSign
+                        ? *measurement.perpendicularSignedDelta
+                        : *measurement.parallelSignedDelta;
+                    const double targetSign = std::copysign(1.0, target);
+                    const double offset = targetSign * (
+                        classOffset(
+                            b.orientation,
+                            report.componentPhaseSign[component],
+                            selectedCalibration.phase) -
+                        classOffset(
+                            a.orientation,
+                            report.componentPhaseSign[component],
+                            selectedCalibration.phase));
+                    double minimum = offset - std::floor(offset);
+                    if (minimum <= 1.0e-12)
+                        minimum = 1.0;
+                    report.hardSignSlackEnergy += config.hardSignSlackCost *
+                        std::max(0.0, targetSign * latentDelta - minimum);
+                }
+            }
         }
     }
+    report.decodedDataEnergy = report.decodedEnergy -
+        report.localSpanEnergy - report.hardSignSlackEnergy;
+    for (std::size_t node = 0; node < decoded.size(); ++node) {
+        if (decoded[node].orientation == JointClass::Mixed)
+            continue;
+        report.continuousCoordinateEnergy +=
+            config.continuousCoordinateCost *
+            std::abs(
+                static_cast<double>(decoded[node].winding) -
+                std::round(continuousNodes[node]));
+    }
+    report.decodedEnergy += report.continuousCoordinateEnergy;
     return report;
 }
 
 }  // namespace
 
-std::vector<FiberTraceWindingFactorDiagnostic>
-diagnoseFiberTraceWindingFactors(
+FiberTracePreparedWindingModel prepareFiberTraceWindingModel(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceBeliefTopology& topology,
     const FiberTraceWindingBeliefPropagationConfig& config,
@@ -4063,10 +4180,28 @@ diagnoseFiberTraceWindingFactors(
     const auto fixedClasses = fixedJointClasses(
         fixedOrientations, constraints.pieces.size());
     return prepareWinding(
+        constraints,
+        topology,
+        config,
+        fixedClasses,
+        quantizeComponentTargets,
+        measurementScale);
+}
+
+std::vector<FiberTraceWindingFactorDiagnostic>
+diagnoseFiberTraceWindingFactors(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceWindingBeliefPropagationConfig& config,
+    std::span<const FiberTraceFixedOrientation> fixedOrientations,
+    bool quantizeComponentTargets,
+    double measurementScale)
+{
+    return prepareFiberTraceWindingModel(
                constraints,
                topology,
                config,
-               fixedClasses,
+               fixedOrientations,
                quantizeComponentTargets,
                measurementScale)
         .diagnostics;
@@ -6072,6 +6207,8 @@ const char* fiberTraceWindingSolverName(FiberTraceWindingSolver solver) noexcept
         return "joint_grid";
     case FiberTraceWindingSolver::Alternating:
         return "alternating";
+    case FiberTraceWindingSolver::Ceres:
+        return "ceres";
     }
     return "invalid";
 }
@@ -6557,7 +6694,8 @@ solveFiberTraceJointGridWindingBeliefPropagation(
             initial.phaseSignByComponent,
             fixedClasses,
             fixedCalibrationCell(config),
-            config);
+            config,
+            continuousNodes);
     }
     return report;
 }

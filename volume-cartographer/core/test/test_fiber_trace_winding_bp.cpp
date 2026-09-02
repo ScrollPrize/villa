@@ -3,6 +3,7 @@
 
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberTraceWindingLeastSquares.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -4022,6 +4023,98 @@ TEST_CASE("Interleaved winding preserves serial and parallel marginals")
 #else
     CHECK(parallel.effectiveWorkers == 1);
 #endif
+}
+
+TEST_CASE("Ceres winding recovers fractional state from a fixed source")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    auto prepared = topology(source, report);
+    FiberTraceWindingLeastSquaresConfig leastSquares;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(leastSquares) =
+        config();
+    leastSquares.defectCost = 100.0;
+    leastSquares.orientationExtremenessCost = 10.0;
+    leastSquares.maximumIterations = 100;
+    const std::array initial{
+        FiberTraceWindingLeastSquaresState{1.0, 1.0, 0.0},
+        FiberTraceWindingLeastSquaresState{0.0, 1.0, 0.5},
+    };
+    const std::array fixed{
+        FiberTraceWindingLeastSquaresFixedState{true, initial[0]},
+        FiberTraceWindingLeastSquaresFixedState{},
+    };
+
+    const auto solved = solveFiberTraceWindingLeastSquares(
+        report, prepared, leastSquares, initial, fixed);
+
+    REQUIRE(solved.solutionUsable);
+    CHECK(solved.factorDiagnostics.size() == 1);
+    CHECK(solved.incidentEffectiveConstraints ==
+          std::vector<std::size_t>{1, 1});
+    CHECK(solved.states[1].horizontalness < 0.05);
+    CHECK(solved.states[1].activity > 0.95);
+    CHECK(solved.states[1].winding == doctest::Approx(0.5).epsilon(1.0e-4));
+}
+
+TEST_CASE("Ceres winding uses fractional activity for contradictory sources")
+{
+    const auto source = lines(3);
+    auto report = pieces(3);
+    addMeasured(report, 0, 1, 1.0, 0.0);
+    addMeasured(report, 1, 2, 1.0, 0.0);
+    auto prepared = topology(source, report);
+    FiberTraceWindingLeastSquaresConfig leastSquares;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(leastSquares) =
+        config();
+    leastSquares.defectCost = 0.01;
+    leastSquares.orientationExtremenessCost = 1.0;
+    leastSquares.maximumIterations = 100;
+    const std::array initial{
+        FiberTraceWindingLeastSquaresState{1.0, 1.0, 0.0},
+        FiberTraceWindingLeastSquaresState{0.5, 1.0, 0.0},
+        FiberTraceWindingLeastSquaresState{0.0, 1.0, 4.0},
+    };
+    const std::array fixed{
+        FiberTraceWindingLeastSquaresFixedState{true, initial[0]},
+        FiberTraceWindingLeastSquaresFixedState{},
+        FiberTraceWindingLeastSquaresFixedState{true, initial[2]},
+    };
+
+    const auto solved = solveFiberTraceWindingLeastSquares(
+        report, prepared, leastSquares, initial, fixed);
+
+    REQUIRE(solved.solutionUsable);
+    CHECK(solved.states[1].activity < 0.25);
+    CHECK(solved.finalCosts.total() < solved.initialCosts.total());
+}
+
+TEST_CASE("Ceres winding fixes only the winding gauge deterministically")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    auto prepared = topology(source, report);
+    FiberTraceWindingLeastSquaresConfig leastSquares;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(leastSquares) =
+        config();
+    leastSquares.defectCost = 100.0;
+    leastSquares.orientationExtremenessCost = 10.0;
+    leastSquares.maximumIterations = 100;
+    const std::array initial{
+        FiberTraceWindingLeastSquaresState{1.0, 1.0, 7.0},
+        FiberTraceWindingLeastSquaresState{0.0, 1.0, 7.5},
+    };
+
+    const auto solved = solveFiberTraceWindingLeastSquares(
+        report, prepared, leastSquares, initial);
+
+    REQUIRE(solved.solutionUsable);
+    REQUIRE(solved.gaugePieces == std::vector<std::size_t>{0});
+    CHECK(solved.states[0].winding == 0.0);
+    CHECK(solved.states[1].winding == doctest::Approx(0.5).epsilon(1.0e-4));
+    CHECK(solved.states[1].horizontalness < 0.05);
 }
 
 }  // namespace
