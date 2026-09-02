@@ -1,13 +1,16 @@
-# Current task: iterative ordered-winding offender removal
+# Current task: oracle construction of a correct winding working set
 
-Extend the experimental sign-only continuous winding ordering with an optional
-diagnostic that repeatedly removes the worst offending original traced fiber.
+The sign-consistent conditioned inlier selector improves the 1024 reference
+benchmark from 16/26 to 20/26 exact windings but is still insufficient. Build a
+reference-supervised oracle pruning mode that finds a retained ordinary
+fiber-piece set whose conditioned solve has no wrong identifiable reference
+winding. References that lose all correct support must be reported as missing,
+not retained under a known false label.
 
-- Score a fiber by the percentage of its incident admitted sign constraints
-  violated by the current continuous ordering.
-- Remove the complete source fiber, including every split piece.
-- Re-solve the continuous ordering after each removal.
-- Continue until the remaining ordering has no violated sign constraint.
-- Report every removal with the fiber's incident/violated counts and the global
-  ordering violations before and after the re-solve.
-- Preserve existing behavior unless the diagnostic is explicitly requested.
+Reference sign constraints are authoritative. Winding-magnitude constraints
+may be biased and may be weighted or disabled while ranking removals. Preserve
+as much retained fiber arc as possible after first maximizing exact references
+and eliminating wrong labels.
+Re-solve after pruning rounds rather than assuming one conditioned assignment
+remains valid. Report the trajectory, final retained geometry, direct
+conditioned benchmark, and fresh reference-free stability benchmark.

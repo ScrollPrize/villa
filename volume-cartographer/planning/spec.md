@@ -345,3 +345,57 @@ During active remote downloads, the existing cache status bar appends:
 - The long raw reference/reference piece-pair tables are opt-in through
   `--reference-constraint-details`. Compact summaries remain enabled by
   default.
+
+## Fixed-reference offender-pruning diagnostic
+
+- `vc_fiber_trace_chunk direction-ablation --reference-prune-offenders` is an
+  opt-in joint-grid, fixed-orientation diagnostic. It removes ordinary pieces
+  decoded as Defect by the non-disableable fixed-reference solve, removes their
+  incident factors and all reference state, and solves the retained induced
+  ordinary graph from scratch without a warm start.
+- Selection defaults to conditioned post-projection MAP Defects. The explicit
+  `union-defect` policy selects the union of baseline and conditioned MAP
+  Defects. The explicit `conditioned-posterior` policy selects only ordinary
+  pieces whose conditioned pre-hard-projection Defect marginal is strictly
+  greater than its required finite threshold in `[0,1]`; it does not silently
+  union projected Defects. Reference-prefix pieces are never selected.
+- Policy-specific runs publish distinct `_pruned`, `_pruned_union`, and
+  `_pruned_pF` artifact families and partition selected pieces into mutually
+  exclusive baseline-only, conditioned-only, both-Defect, and neither-Defect
+  cohorts.
+- The final compact report is aligned component-wise to the conditioned gauge.
+  Integer winding, latent coordinates, candidate support, and component phase
+  sign are transformed consistently. The `_pruned_w_N_h/v/disabled.obj`
+  artifacts and the separately headed pruned reference benchmark use this same
+  aligned report and output offset. `_pruned_w_N_broken.obj` remains the removed
+  conditioned cohort.
+- The pruned reference benchmark reuses an induced subset of the original
+  reference cross-constraint report. It retains the complete reference prefix
+  and retained ordinary piece IDs, never regenerates geometry, and applies the
+  same scoring and calibration path as the original benchmark.
+- `conditioned-inliers` constructs a direct reference-conditioned working set
+  instead of defining the fresh reference-free solve as authoritative. It
+  removes conditioned Defects, direct fixed-reference sign conflicts, a
+  deterministic weighted vertex cover of all remaining admitted-sign
+  conflicts, and pieces disconnected from fixed references through satisfied
+  sign or hard-continuation edges.
+- Admitted-sign semantics are shared with the prepared solver diagnostics:
+  dominant relation, nonzero signed target, and either hard enforcement or a
+  finite positive sign penalty. Sign consistency is mandatory for the direct
+  set. Winding magnitude residuals are soft endpoint-ranking support only and
+  default to zero weight.
+- The selector is piece-atomic. Hard continuation supplies equality when both
+  endpoints remain active and supplies connectivity, but does not merge a full
+  source trace into one removable unit.
+- Direct conditioned labels publish under `_inliers`; reason-specific removed
+  layers are `_input_defect`, `_ref_conflict`, `_sign_cover`, and
+  `_disconnected`. A fresh solve of the same retained induced graph publishes
+  separately under `_inliers_fresh` and is a stability diagnostic.
+- `oracle-inliers` is reference-supervised. It re-solves exact induced subsets
+  from original piece IDs, accepts only converged non-regressive reference
+  tuples, permits neutral offender peeling, and prefers an explicit missing
+  estimate to a known wrong estimate after exact-count maximization.
+- Oracle sign consistency is mandatory. Magnitude evidence ranks removals but
+  is not authoritative. References below the configured active-observation
+  threshold are not identifiable oracle targets. Oracle direct and fresh
+  artifacts use `_oracle` and `_oracle_fresh`.

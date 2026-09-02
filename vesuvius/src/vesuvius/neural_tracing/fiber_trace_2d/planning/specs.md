@@ -5876,7 +5876,7 @@
   after all ordinary `direction-ablation` summaries and immediately before the
   command returns.
 - The winding viewer consumes current published state artifacts matching
-  `<base>_w_N_{h,v,err,tie}.obj`. Aggregate `<base>_w_N.obj`, CSV reports, and
+  `<base>_w_N_{h,v,err,tie,broken,disabled}.obj`. Aggregate `<base>_w_N.obj`, CSV reports, and
   unrelated siblings are not state layers. At least one matching artifact is
   required, but state files and whole winding labels may be absent. Every file
   that is present still receives strict header and geometry validation.
@@ -5887,16 +5887,18 @@
   branching, cycles, disconnected chains, unsupported records, and singleton
   winding fibers are errors. The existing fiber-presence reader uses the same
   parser while retaining its own header, metadata, and crop validation.
-- Every H/V/error/tie slot at every integer winding from the lowest through the
+- Every H/V/error/tie/conditioned-broken/final-disabled slot at every integer winding from the lowest through the
   highest observed artifact label becomes an independent managed 3D Napari
   path layer. Present nonempty artifacts supply geometry; empty or absent
   artifacts and completely absent intermediate windings become empty layers.
   H and V at one winding `N` have exactly the same bright opaque color derived
-  from `N`; error and tie remain distinct from H/V and each other.
-  Viewer category `Broken` contains both Mixed/error argmax (`err`) and exact
-  argmax ties (`tie`). H, V, Broken, All, and None presets act across every
+  from `N`; error, tie, conditioned-broken, and final-disabled remain distinct
+  from H/V and each other. Viewer category `All broken` contains Mixed/error
+  argmax (`err`), exact argmax ties (`tie`), conditioned offenders (`broken`),
+  and final-solve Defects (`disabled`). H, V, conditioned-broken,
+  final-disabled, All broken, All, and None presets act across every
   winding. Full-size Previous/Next buttons snapshot and circularly rotate the
-  complete managed H/V/error/tie visibility mask over that contiguous winding
+  complete managed state visibility mask over that contiguous winding
   range. Next moves source slot `i` to `(i+1) mod N`; Previous moves it to
   `(i-1) mod N`, preserving state. Hidden bits move exactly like visible bits,
   so arbitrary sparse selections and missing/empty windings rotate bijectively
@@ -6062,6 +6064,70 @@
   neutral-expanded, and initialized solves all satisfy their residual criteria.
   This fixed-prepass diagnostic tests Defect, winding, and component-sign state;
   H/V remains fixed by the production orientation prepass.
+- `--reference-prune-offenders` is a separate opt-in joint-grid diagnostic. It
+  runs the exact fixed-reference conditioned solve, defines every ordinary
+  post-projection Defect as an offender, removes those pieces and every incident
+  factor, removes all reference pieces and cross-factors, and solves the induced
+  ordinary graph from scratch. The second solve receives the retained fixed H/V
+  prepass labels but no reference state, fixed winding, conditioned warm start,
+  or newly synthesized continuity across a removed piece gap.
+- Offender selection is explicit and reproducible. `conditioned-defect` is the
+  compatibility default, `union-defect` uses the union of baseline and
+  conditioned post-projection MAP Defects, and `conditioned-posterior` uses the
+  strict conditioned pre-hard-projection marginal test `p > threshold`. The
+  posterior policy requires a finite threshold in `[0,1]` and never implicitly
+  adds MAP Defects. The fixed-reference prefix is excluded from every policy.
+- Nondefault policies publish policy/threshold-qualified diagnostic bases and
+  selected-piece reporting partitions MAP membership without overlapping
+  counts.
+- The diagnostic preserves `mapWinding` as invalid for a Defect. For artifact
+  placement only, joint-grid reports retain the rounded continuous winding that
+  seeded discrete support before hard projection. Final connected components
+  are independently aligned to the conditioned gauge by maximum exact agreement
+  on common active pieces, followed by minimum squared error and deterministic
+  ties. One shared nonnegative suffix offset is applied after alignment.
+- Component alignment transforms the complete compact second-inference report,
+  not only displayed integers. For `x' = s*x+b`, integer and latent winding
+  coordinates use the same transform and component phase sign becomes
+  `s*phaseSign`. The `_pruned` OBJ publisher and the second reference benchmark
+  consume that same aligned report and shared output offset, so a non-NA
+  benchmark `raw_w` names its corresponding `_pruned_w_N_*` layer.
+- The original and second-inference reference tables are explicitly headed
+  `reference original result benchmark` and
+  `reference offender-pruned result benchmark`. The second table uses the exact
+  induced subset of the original reference cross report: all reference-prefix
+  pieces and only retained ordinary pieces are kept, and no geometry is
+  re-extracted.
+- The experiment publishes a separate `<base>_pruned` family. Active retained
+  pieces use `_w_N_h.obj` and `_w_N_v.obj`; conditioned offenders use
+  `_w_N_broken.obj`; pieces disabled only by the final reference-free solve use
+  `_w_N_disabled.obj`; unsupported diagnostics use `_unresolved.obj`. It reports
+  pre-existing versus newly conditioned Defects separately and never replaces
+  the ordinary production artifact family. Absent option means unchanged solve
+  and artifact behavior.
+- `--reference-prune-policy conditioned-inliers` is the explicit
+  reference-conditioned working-set diagnostic. Fixed reference pieces are
+  protected. Conditioned ordinary Defects and direct reference sign conflicts
+  are removed first; a deterministic weighted vertex cover then removes an
+  endpoint of every remaining admitted sign conflict; finally, pieces without
+  satisfied-sign or hard-continuation connectivity to a reference are removed.
+- Sign admission and direction use the prepared factor diagnostics exactly:
+  the dominant relation supplies the signed target, and the sign exists only
+  when hard or assigned a finite positive penalty. Sign consistency is an
+  inlier invariant. Magnitude agreement may rank competing removals but is not
+  an admission gate and has zero default weight.
+- Selection is per piece. Hard continuation relates retained active neighbors
+  and contributes connectivity, but an active/Defect boundary remains legal.
+  Direct conditioned labels publish as `_inliers`; removal reasons publish as
+  `_input_defect`, `_ref_conflict`, `_sign_cover`, and `_disconnected` layers.
+  The reference-free second solve publishes separately as `_inliers_fresh` and
+  is not the authoritative diagnostic result.
+- `--reference-prune-policy oracle-inliers` is a supervised extension. It
+  rebuilds and re-solves original-ID induced subsets, accepts only converged
+  non-regressive reference tuples, and permits neutral peeling to expose
+  collective offenders. After exact-count maximization, an explicit missing
+  reference is preferable to preserving a known wrong winding. Direct and
+  fresh artifacts use `_oracle` and `_oracle_fresh`.
 
 ## Experimental sign-only ordered winding cuts
 

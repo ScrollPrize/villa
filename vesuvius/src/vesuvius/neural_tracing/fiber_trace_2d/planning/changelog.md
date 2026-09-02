@@ -1,3 +1,11 @@
+# 2026-09-02: conditioned-reference pruning variants
+
+- Added and evaluated union-MAP and conditioned-posterior offender selection on
+  the 1024 reference crop. Neither variant exceeded the untouched production
+  winding result.
+- Added a sign-consistent reference-conditioned fiber-piece working-set
+  diagnostic and separate direct/fresh winding artifacts for evaluation.
+
 # 2026-09-01: fixed-reference winding conflict diagnostics
 
 - Added solver-consistent reference conditioning diagnostics that clamp known
@@ -1901,3 +1909,19 @@
   zero continuous violations, but reduced reference-oracle agreement from
   19/26 to 16/26 exact windings, so it remains diagnostic rather than a
   production filter.
+
+## 2026-09-02 - Fixed-reference offender pruning diagnostic
+
+- Added an opt-in fixed-reference experiment that removes ordinary pieces
+  decoded as Defect, re-solves the exact retained ordinary subgraph from scratch,
+  and publishes final active, conditioned-broken, and final-disabled pieces as
+  separate per-winding OBJ layers.
+- Added diagnostic winding hypotheses for projected Defects, independent gauge
+  alignment after graph splitting, and Napari controls for the two Defect
+  cohorts.
+- Added a second, explicitly labeled reference benchmark for the fresh pruned
+  inference. It reuses retained cross constraints and shares its phase-aware
+  aligned winding frame with the `_pruned` OBJ layers.
+- Added supervised oracle inlier diagnostics. The 1024 reference crop retained
+  997/1360 pieces and reached 24 exact, 0 wrong, and 2 missing references over
+  the full 26-reference set in the direct conditioned result.

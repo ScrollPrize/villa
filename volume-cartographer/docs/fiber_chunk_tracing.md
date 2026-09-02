@@ -1586,6 +1586,150 @@ winding, and component-sign attraction. A run that reaches its message limit is
 reported as `unresolved`, regardless of how close its decoded state remains to
 the conditioned seed.
 
+`--reference-prune-offenders` runs a different deletion experiment. It first
+runs the same exact, non-disableable fixed-reference solve, removes every
+ordinary piece that ends as post-projection Defect plus all of its incident
+constraints, and then solves the retained ordinary induced graph from scratch.
+The final solve has no reference variables, reference cross-factors, fixed
+winding states, or conditioned initialization. It retains only the ordinary
+fixed H/V prepass classification. Removed gaps in one source trace remain gaps;
+they do not create replacement hard-continuity links.
+
+The default selection policy is `conditioned-defect`. Three explicit diagnostic
+variants are available through `--reference-prune-policy`: `union-defect`
+removes the union of baseline and conditioned post-projection MAP Defects, while
+`conditioned-posterior` removes pieces whose conditioned pre-hard-projection
+Defect marginal is strictly greater than the required
+`--reference-prune-defect-probability F`. `conditioned-inliers` instead builds
+an authoritative diagnostic working set directly from the conditioned labels.
+It first removes conditioned Defects and ordinary pieces that conflict directly
+with a fixed reference sign. It then covers every remaining admitted sign
+conflict by deterministically removing the endpoint with the least retained
+support, and finally removes pieces disconnected from every reference through
+satisfied sign or hard-continuation links. A sign is admitted exactly when the
+prepared dominant relation has a nonzero target and is either hard or has a
+finite positive penalty. Winding magnitude residuals are optional soft support;
+they never decide whether a piece is an inlier. Hard continuation remains
+piece-atomic: it links two retained active pieces but does not prevent a piece
+on one side from becoming Defect. The fixed-reference prefix is never eligible.
+
+The inlier ranking parameters are `--reference-inlier-sign-weight`,
+`--reference-inlier-magnitude-weight`, and `--reference-inlier-retention`.
+Their defaults are `1`, `0`, and `1`: the validated default therefore uses only
+the reliable sign graph plus a deterministic retention floor. New variants use
+deterministic `<base>_pruned_union`, `<base>_pruned_pF`, and `<base>_inliers`
+artifact families; the compatibility default retains `<base>_pruned`.
+
+`oracle-inliers` is a supervised diagnostic extension of
+`conditioned-inliers`. It repeatedly removes reference-adjacent candidates,
+rebuilds exact induced ordinary and reference-cross graphs from original piece
+IDs, reruns the fixed-reference solve, and reapplies sign-consistent closure.
+Single and bounded pair counterfactuals are tried first. Collective errors use
+calibrated raw-candidate residuals and bounded graph-neighbor alternatives. A
+converged round may peel a reference-inconsistent piece while leaving the
+exact/wrong/missing tuple unchanged; regressions are rolled back. The objective
+maximizes exact estimates, then eliminates wrong estimates, then minimizes
+missing estimates. Thus unsupported false support is removed and reported as
+missing rather than retained under a known wrong winding.
+
+`--reference-oracle-magnitude-weight`, `--reference-oracle-rounds`,
+`--reference-oracle-pair-candidates`, and
+`--reference-oracle-min-observations` control ranking and guards. Defaults are
+`1`, `20`, `32`, and `3`. Oracle direct artifacts use `_oracle`; the fresh
+reference-free stability solve uses `_oracle_fresh`. This mode consumes ground
+truth references and is not a production pruning algorithm.
+
+Oracle rounds normally require BP convergence. For larger diagnostic graphs,
+`--reference-oracle-accept-message-limit` permits scoring a conditioned state
+that reached the configured message limit. Round output records `converged` or
+`message_limit` in the `conditioned` column; capped results must not be reported
+as converged.
+
+The experiment writes a separate `<output-stem>_pruned` artifact family:
+
+```text
+<base>_pruned_w_N_h.obj         final active horizontal pieces
+<base>_pruned_w_N_v.obj         final active vertical pieces
+<base>_pruned_w_N_broken.obj    pieces selected for removal by the policy
+<base>_pruned_w_N_disabled.obj  retained pieces rejected by the final solve
+<base>_pruned_unresolved.obj    diagnostics without a representable winding
+```
+
+For `conditioned-inliers`, `<base>_inliers_w_N_h/v.obj` is the direct
+conditioned assignment and is the authoritative diagnostic working set. Removed
+pieces are split into `_input_defect`, `_ref_conflict`, `_sign_cover`, and
+`_disconnected` layers. A second `<base>_inliers_fresh` family contains a fresh
+reference-free solve of the retained graph. It measures whether the retained
+topology alone reproduces the conditioned ladder; it does not replace the
+direct inlier result.
+
+Defect windings are visualization hypotheses, not active MAP labels. They use
+the rounded continuous winding that seeded the joint-grid support before hard
+projection. Each disconnected final component is aligned independently to the
+conditioned gauge using retained common active pieces. The complete compact
+second-inference report is transformed into that gauge, including phase signs
+and latent coordinates, before both benchmark formatting and OBJ publication.
+Consequently the second benchmark's `raw_w` labels refer directly to the
+`_pruned_w_N_*` suffixes. The summary separates
+baseline Defects from pieces newly disabled by reference conditioning. The
+Napari winding viewer accepts the `_pruned` base and provides separate
+`Cond broken`, `Final disabled`, and `All broken` controls.
+
+When this experiment is enabled, console output labels the existing table as
+`reference original result benchmark`. After the removal summary it prints
+`reference offender-pruned result benchmark`, generated by the identical
+reference scoring and calibration path from the fresh second inference. Its
+reference cross report is the exact induced subset of the original extracted
+cross constraints: constraints incident to conditioned offenders disappear,
+while final-solve Defects remain structurally represented and are handled by
+the benchmark's normal inactive-endpoint semantics.
+
+For example, append the following to the normal reference-enabled BP command:
+
+```text
+--winding-fixed-orientation --reference-prune-offenders
+```
+
+On the 1024 diagnostic crop with 500 retained fibers and 512-base-voxel pieces,
+the conditioned solve removed 90/1360 pieces and the fresh solve disabled 6 of
+the remaining 1270. The original benchmark recovered 16/26 exact reference
+windings; the pruned solve recovered 13/26. Aggregate evidence agreement moved
+from 74.829% to 75.175%. Conditioned-Defect-only pruning therefore does not
+recover the correct ladder on this workload and remains diagnostic.
+
+On the same workload, union pruning removed 113 pieces and recovered 14/26
+exact reference windings, while posterior thresholds 0.03, 0.10, 0.25, and
+0.50 all selected the same 90 pieces as conditioned-MAP pruning and recovered
+13/26. Neither variant exceeds the untouched result's 16/26 exact references.
+
+On that workload, `conditioned-inliers` with the sign-only default retained
+1054/1360 pieces and eliminated all 1530 admitted sign conflicts. The direct
+conditioned result recovered 20/26 exact reference windings (5 wrong, 1
+missing) and agreed with 7538/8908 (84.621%) retained reference constraints.
+The fresh solve remained unstable at 13/26, which is why it is reported and
+published separately rather than treated as the working set.
+
+On the same workload, `oracle-inliers` retained 997/1360 pieces. Its direct
+conditioned result reached 24 exact, 0 wrong, and 1 missing reference in the
+frozen 25-reference objective after six removal rounds (57.74 seconds wall,
+1245.97 seconds user, Release build). Across all 26 reference files the result
+is 24 exact, 0 wrong, and 2 missing: one was initially unsupported and the
+other had no retained support at its true winding, so its false winding-0
+support was removed. The fresh solve reached 12 exact, 11 wrong, and 3 missing;
+it remains a separate stability diagnostic without the fixed-reference
+guarantee.
+
+On the 2048 crop, the same 0.25 quality fraction retained 500/1999 fibers and
+produced 2524 main-component pieces. Strict 500- and 2000-message runs did not
+converge. With capped-state scoring enabled, sign-consistent closure retained
+1842 pieces at 25 exact, 1 wrong, and 0 missing reference windings. Oracle
+rounds removed four more pieces and reached 26 exact, 0 wrong, and 0 missing at
+1838/2524 retained pieces. All rounds had `message_limit` status. The direct
+conditioned constraint agreement was 9437/11254 (83.855%); the fresh
+reference-free solve only reached 11 exact and 15 wrong with 6090/10078
+(60.429%) agreement. The perfect result is therefore supervised and does not
+show that the retained graph independently recovers the ladder.
+
 Immediately before each reference benchmark, `BP final states by source-piece
 cohort` reports H, V, active H/V, Defect, and Defect percentage for the original
 `source_piece == 1` cohort, all other pieces, and their total. The cohort bit is

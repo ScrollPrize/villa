@@ -1083,6 +1083,7 @@ TEST_CASE("Constraint agreement separates infringed and Defect-neutralized facto
     perpendicular.perpendicularScore = 1.0;
     perpendicular.perpendicularMagnitudePresent = true;
     perpendicular.perpendicularSignPresent = true;
+    perpendicular.hardPerpendicularSign = true;
     perpendicular.effectivePerpendicularSignedDelta = 0.5;
     perpendicular.effectivePerpendicularWindingWeight = 1.0;
     winding.factorDiagnostics.push_back(perpendicular);
@@ -2035,6 +2036,45 @@ TEST_CASE("Reference winding benchmark corrects a global sign reversal")
         CHECK(*benchmark.references[source].estimatedWinding ==
               doctest::Approx(0.5 * static_cast<double>(source)));
     }
+}
+
+TEST_CASE("Reference oracle prefers missing evidence to a wrong winding")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 0, 0.0, {0.0, 0.0}, 1, 0},
+        {Class::Perpendicular, 0, 0.5, {2.0, 0.0}, 1, 1},
+    };
+    observations[0].bpEndpointActive = true;
+    observations[0].bpEndpointOrientation =
+        FiberTraceFixedOrientation::Horizontal;
+    observations[0].bpPiece = 0;
+    observations[1].bpEndpointActive = true;
+    observations[1].bpEndpointOrientation =
+        FiberTraceFixedOrientation::Horizontal;
+    observations[1].bpPiece = 1;
+    const std::array<unsigned char, 2> required{1, 1};
+    const std::array<double, 2> arcLengths{10.0, 20.0};
+
+    const auto before = scoreFiberTraceReferenceOracle(
+        observations, required.size(), required);
+    CHECK(before.exact == 1);
+    CHECK(before.wrong == 1);
+    CHECK(before.missing == 0);
+
+    const auto proposal = selectFiberTraceReferenceOracleRemovalBatch(
+        observations,
+        required.size(),
+        required,
+        arcLengths,
+        1.0,
+        8);
+    CHECK(proposal.removedPieceIndices == std::vector<std::size_t>{1});
+    CHECK(proposal.after.exact == 1);
+    CHECK(proposal.after.wrong == 0);
+    CHECK(proposal.after.missing == 1);
+    CHECK(fiberTraceReferenceOracleScoreImproves(
+        proposal.after, proposal.before));
 }
 
 TEST_CASE("Reference observations use authoritative latent endpoint algebra")
@@ -3068,6 +3108,14 @@ TEST_CASE("Contradictory parallel hard signs escape through Defect")
         solved.windingValid.begin(),
         solved.windingValid.end(),
         static_cast<unsigned char>(0)) >= 1);
+    REQUIRE(solved.mapWindingHypothesis.size() == solved.windingValid.size());
+    for (std::size_t piece = 0; piece < solved.windingValid.size(); ++piece) {
+        CHECK(solved.mapWindingHypothesis[piece] >= solved.candidateMinimum[piece]);
+        CHECK(solved.mapWindingHypothesis[piece] <= solved.candidateMaximum[piece]);
+        if (solved.windingValid[piece] != 0) {
+            CHECK(solved.mapWindingHypothesis[piece] == solved.mapWinding[piece]);
+        }
+    }
     CHECK(solved.hardSignProjectedDefects >= 1);
 }
 
@@ -4678,6 +4726,347 @@ TEST_CASE("Ceres winding fixes only the winding gauge deterministically")
     CHECK(solved.states[0].winding == 0.0);
     CHECK(solved.states[1].winding == doctest::Approx(0.5).epsilon(1.0e-4));
     CHECK(solved.states[1].horizontalness < 0.05);
+}
+
+TEST_CASE("Conditioned offender selection distinguishes old and new Defects")
+{
+    FiberTraceInterleavedWindingReport baseline;
+    baseline.windingValid = {0, 1, 1};
+    baseline.mapWinding = {0, 1, 2};
+    baseline.posteriorMeanWinding = {0.2, 1.0, 2.0};
+    baseline.mapWindingHypothesis = {0, 1, 2};
+    baseline.classAProbability = {0.0, 1.0, 1.0};
+    baseline.classBProbability = {0.0, 0.0, 0.0};
+    baseline.componentByPiece = {0, 0, 0};
+
+    FiberTraceInterleavedWindingReport conditioned;
+    conditioned.windingValid = {1, 1, 0, 0, 1};
+    conditioned.mapWinding = {0, 0, 0, 0, 2};
+    conditioned.posteriorMeanWinding = {0.0, 0.0, 0.0, 1.6, 2.0};
+    conditioned.mapWindingHypothesis = {0, 0, 0, 2, 2};
+    conditioned.classAProbability = {1.0, 1.0, 0.0, 0.2, 1.0};
+    conditioned.mixedProbability = {0.0, 0.0, 0.7, 0.6, 0.1};
+    conditioned.classBProbability = {0.0, 0.0, 0.0, 0.1, 0.0};
+    conditioned.componentByPiece = {0, 0, 0, 0, 0};
+
+    const auto selected = selectFiberTraceConditionedOffenders(baseline, conditioned, 2);
+    CHECK(selected.retainedOrdinaryPieceIndices == std::vector<std::size_t>{2});
+    CHECK(selected.brokenOrdinaryPieceIndices == std::vector<std::size_t>{0, 1});
+    CHECK(selected.preexistingBrokenPieces == 1);
+    CHECK(selected.newlyBrokenPieces == 1);
+    CHECK(selected.baselineDefectPieces == 1);
+    CHECK(selected.conditionedDefectPieces == 2);
+    CHECK(selected.posteriorSelectedPieces == 0);
+    CHECK(selected.selectedBaselineOnlyPieces == 0);
+    CHECK(selected.selectedConditionedOnlyPieces == 1);
+    CHECK(selected.selectedBothDefectPieces == 1);
+    CHECK(selected.selectedNeitherDefectPieces == 0);
+    CHECK(selected.unresolvedBrokenPieces == 0);
+    REQUIRE(selected.inferredWindingByOrdinaryPiece[0].has_value());
+    CHECK(*selected.inferredWindingByOrdinaryPiece[0] == 0);
+    REQUIRE(selected.inferredWindingByOrdinaryPiece[1].has_value());
+    CHECK(*selected.inferredWindingByOrdinaryPiece[1] == 2);
+
+    FiberTraceConditionedOffenderConfig unionConfig;
+    unionConfig.policy = FiberTraceConditionedOffenderPolicy::UnionDefect;
+    auto unionConditioned = conditioned;
+    unionConditioned.windingValid[2] = 1;
+    const auto unionSelected = selectFiberTraceConditionedOffenders(
+        baseline, unionConditioned, 2, unionConfig);
+    CHECK(unionSelected.retainedOrdinaryPieceIndices ==
+          std::vector<std::size_t>{2});
+    CHECK(unionSelected.brokenOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0, 1});
+    CHECK(unionSelected.selectedBaselineOnlyPieces == 1);
+    CHECK(unionSelected.selectedConditionedOnlyPieces == 1);
+    CHECK(unionSelected.selectedBothDefectPieces == 0);
+    CHECK(unionSelected.selectedNeitherDefectPieces == 0);
+
+    FiberTraceConditionedOffenderConfig posteriorConfig;
+    posteriorConfig.policy =
+        FiberTraceConditionedOffenderPolicy::ConditionedPosterior;
+    posteriorConfig.conditionedDefectProbabilityThreshold = 0.6;
+    const auto posteriorSelected = selectFiberTraceConditionedOffenders(
+        baseline, conditioned, 2, posteriorConfig);
+    CHECK(posteriorSelected.retainedOrdinaryPieceIndices ==
+          std::vector<std::size_t>{1, 2});
+    CHECK(posteriorSelected.brokenOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0});
+    CHECK(posteriorSelected.posteriorSelectedPieces == 1);
+
+    posteriorConfig.conditionedDefectProbabilityThreshold = 0.65;
+    const auto highPosteriorSelected = selectFiberTraceConditionedOffenders(
+        baseline, conditioned, 2, posteriorConfig);
+    CHECK(highPosteriorSelected.retainedOrdinaryPieceIndices ==
+          std::vector<std::size_t>{1, 2});
+    CHECK(highPosteriorSelected.brokenOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0});
+
+    posteriorConfig.conditionedDefectProbabilityThreshold = 0.05;
+    const auto lowPosteriorSelected = selectFiberTraceConditionedOffenders(
+        baseline, conditioned, 2, posteriorConfig);
+    CHECK(lowPosteriorSelected.retainedOrdinaryPieceIndices.empty());
+    CHECK(lowPosteriorSelected.brokenOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0, 1, 2});
+
+    posteriorConfig.conditionedDefectProbabilityThreshold = 1.0;
+    const auto noneSelected = selectFiberTraceConditionedOffenders(
+        baseline, conditioned, 2, posteriorConfig);
+    CHECK(noneSelected.retainedOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0, 1, 2});
+    CHECK(noneSelected.brokenOrdinaryPieceIndices.empty());
+
+    auto malformed = conditioned;
+    malformed.mixedProbability.pop_back();
+    CHECK_THROWS_AS(
+        selectFiberTraceConditionedOffenders(
+            baseline, malformed, 2, posteriorConfig),
+        std::invalid_argument);
+    malformed = conditioned;
+    malformed.mixedProbability[2] =
+        std::numeric_limits<double>::quiet_NaN();
+    posteriorConfig.conditionedDefectProbabilityThreshold = 0.5;
+    CHECK_THROWS_AS(
+        selectFiberTraceConditionedOffenders(
+            baseline, malformed, 2, posteriorConfig),
+        std::invalid_argument);
+}
+
+TEST_CASE("Conditioned inliers cover sign conflicts without deleting continuation neighbors")
+{
+    constexpr std::size_t referencePieces = 1;
+    constexpr std::size_t ordinaryPieces = 5;
+    constexpr std::size_t totalPieces = referencePieces + ordinaryPieces;
+    FiberTraceInterleavedWindingReport baseline;
+    baseline.windingValid.assign(ordinaryPieces, 1);
+    baseline.mapWinding = {0, 1, 1, -1, 2};
+    baseline.posteriorMeanWinding = {0.0, 1.0, 1.0, -1.0, 2.0};
+    baseline.mapWindingHypothesis = baseline.mapWinding;
+    baseline.classAProbability.assign(ordinaryPieces, 1.0);
+    baseline.classBProbability.assign(ordinaryPieces, 0.0);
+    baseline.componentByPiece.assign(ordinaryPieces, 0);
+
+    FiberTraceInterleavedWindingReport conditioned;
+    conditioned.windingValid = {1, 1, 1, 1, 1, 0};
+    conditioned.mapWinding = {0, 0, 1, 1, -1, 2};
+    conditioned.posteriorMeanWinding = {0.0, 0.0, 1.0, 1.0, -1.0, 2.0};
+    conditioned.mapWindingHypothesis = conditioned.mapWinding;
+    conditioned.classAProbability.assign(totalPieces, 1.0);
+    conditioned.mixedProbability.assign(totalPieces, 0.0);
+    conditioned.classBProbability.assign(totalPieces, 0.0);
+    conditioned.componentByPiece.assign(totalPieces, 0);
+    conditioned.integerGaugeByPiece.assign(totalPieces, 0);
+    conditioned.mapLatentCoordinate = {0.0, 0.5, 1.0, 1.5, -0.5, 2.0};
+    conditioned.continuousWinding = conditioned.mapLatentCoordinate;
+    conditioned.posteriorMeanLatentCoordinate =
+        conditioned.mapLatentCoordinate;
+    conditioned.mapProbability.assign(totalPieces, 1.0);
+    conditioned.entropy.assign(totalPieces, 0.0);
+    conditioned.candidateMinimum.assign(totalPieces, -2);
+    conditioned.candidateMaximum.assign(totalPieces, 3);
+    conditioned.incidentSignedConstraints.assign(totalPieces, 0);
+    conditioned.incidentSkippedConstraints.assign(totalPieces, 0);
+    conditioned.mapOrientationByPiece.assign(
+        totalPieces, FiberTraceFixedOrientation::Horizontal);
+    conditioned.fixedOrientationByPiece =
+        conditioned.mapOrientationByPiece;
+
+    FiberTraceConstraintReport constraints = pieces(totalPieces);
+    const auto addSign = [&](std::size_t a, std::size_t b, double target) {
+        FiberTraceConstraint constraint;
+        constraint.pieceA = a;
+        constraint.pieceB = b;
+        constraint.parallelScore = 0.0;
+        constraint.perpendicularScore = 1.0;
+        constraint.signedWindingDelta = target;
+        constraints.constraints.push_back(constraint);
+        FiberTraceWindingFactorDiagnostic diagnostic;
+        diagnostic.constraintIndex = constraints.constraints.size() - 1;
+        diagnostic.pieceA = a;
+        diagnostic.pieceB = b;
+        diagnostic.canonicalNodeA = std::min(a, b);
+        diagnostic.canonicalNodeB = std::max(a, b);
+        diagnostic.perpendicularScore = 1.0;
+        diagnostic.effectivePerpendicularSignedDelta =
+            a < b ? target : -target;
+        diagnostic.perpendicularSignPresent = true;
+        diagnostic.hardPerpendicularSign = true;
+        conditioned.factorDiagnostics.push_back(diagnostic);
+    };
+    addSign(0, 1, 0.5);
+    addSign(0, 1, 0.5);  // Extra retained support for ordinary piece 0.
+    addSign(1, 2, -0.5); // Conflict: the less-supported piece 1 is removed.
+    addSign(0, 3, 0.5);  // Keeps the continuation neighbor independently.
+    addSign(0, 4, 0.5);  // Direct reference conflict removes ordinary piece 3.
+    addSign(0, 0, 0.5);  // Protected reference conflict is reported, not removed.
+    FiberTraceConstraint continuation;
+    continuation.pieceA = 2;
+    continuation.pieceB = 3;
+    continuation.hardContinuity = true;
+    constraints.constraints.push_back(continuation);
+    FiberTraceWindingFactorDiagnostic continuationDiagnostic;
+    continuationDiagnostic.constraintIndex = constraints.constraints.size() - 1;
+    continuationDiagnostic.pieceA = 2;
+    continuationDiagnostic.pieceB = 3;
+    continuationDiagnostic.canonicalNodeA = 2;
+    continuationDiagnostic.canonicalNodeB = 3;
+    conditioned.factorDiagnostics.push_back(continuationDiagnostic);
+
+    FiberTraceConditionedOffenderConfig inliers;
+    inliers.policy = FiberTraceConditionedOffenderPolicy::ConditionedInliers;
+    const auto selected = selectFiberTraceConditionedInliers(
+        constraints, baseline, conditioned, referencePieces, inliers);
+
+    CHECK(selected.retainedOrdinaryPieceIndices ==
+          std::vector<std::size_t>{0, 2});
+    CHECK(selected.brokenOrdinaryPieceIndices ==
+          std::vector<std::size_t>{1, 3, 4});
+    CHECK(selected.conditionedDefectRemovedPieces == 1);
+    CHECK(selected.directReferenceConflictRemovedPieces == 1);
+    CHECK(selected.conflictCoverRemovedPieces == 1);
+    CHECK(selected.disconnectedRemovedPieces == 0);
+    CHECK(selected.initialSignConflicts == 2);
+    CHECK(selected.retainedSignConflicts == 0);
+    CHECK(selected.protectedReferenceSignFactors == 1);
+    CHECK(selected.protectedReferenceSignConflicts == 1);
+    CHECK(selected.removalReasonByOrdinaryPiece[0] ==
+          FiberTraceConditionedRemovalReason::None);
+    CHECK(selected.removalReasonByOrdinaryPiece[1] ==
+          FiberTraceConditionedRemovalReason::SignConflictCover);
+    CHECK(selected.removalReasonByOrdinaryPiece[2] ==
+          FiberTraceConditionedRemovalReason::None);
+    CHECK(selected.removalReasonByOrdinaryPiece[3] ==
+          FiberTraceConditionedRemovalReason::DirectReferenceConflict);
+    CHECK(selected.removalReasonByOrdinaryPiece[4] ==
+          FiberTraceConditionedRemovalReason::ConditionedDefect);
+
+    const auto extracted = extractFiberTraceConditionedOrdinaryReport(
+        conditioned, referencePieces, selected.retainedOrdinaryPieceIndices);
+    CHECK(extracted.windingValid == std::vector<unsigned char>{1, 1});
+    CHECK(extracted.mapLatentCoordinate == std::vector<double>{0.5, 1.5});
+    CHECK(extracted.mapWinding == std::vector<int>{0, 1});
+    CHECK(extracted.factorDiagnostics.empty());
+
+    inliers.inlierSignConflictWeight = 0.0;
+    CHECK_THROWS_AS(
+        selectFiberTraceConditionedInliers(
+            constraints, baseline, conditioned, referencePieces, inliers),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        extractFiberTraceConditionedOrdinaryReport(
+            conditioned, referencePieces,
+            std::vector<std::size_t>{2, 1}),
+        std::invalid_argument);
+}
+
+TEST_CASE("Final winding components align independently to conditioned gauge")
+{
+    FiberTraceInterleavedWindingReport conditioned;
+    conditioned.windingValid = {1, 1, 1, 1, 1, 1};
+    conditioned.mapWinding = {0, 2, 3, 4, 8, 9};
+    conditioned.posteriorMeanWinding = {0.0, 2.0, 3.0, 4.0, 8.0, 9.0};
+    conditioned.mapWindingHypothesis = {0, 2, 3, 4, 8, 9};
+    conditioned.classAProbability.assign(6, 1.0);
+    conditioned.classBProbability.assign(6, 0.0);
+    conditioned.componentByPiece.assign(6, 0);
+
+    FiberTraceInterleavedWindingReport finalReport;
+    finalReport.windingValid = {1, 1, 0, 1, 1};
+    finalReport.mapWinding = {0, 1, 0, 5, 4};
+    finalReport.posteriorMeanWinding = {0.0, 1.0, 2.0, 5.0, 4.0};
+    finalReport.mapWindingHypothesis = {0, 1, 2, 5, 4};
+    finalReport.classAProbability.assign(5, 1.0);
+    finalReport.classBProbability.assign(5, 0.0);
+    finalReport.componentByPiece = {0, 0, 0, 1, 1};
+    const std::array<std::size_t, 5> mapping{0, 1, 2, 3, 4};
+
+    const auto aligned = alignFiberTraceWindingToConditionedGauge(conditioned, 1, finalReport, mapping);
+    REQUIRE(aligned.components.size() == 2);
+    CHECK(aligned.components[0].resolved);
+    CHECK(aligned.components[0].sign == 1);
+    CHECK(aligned.components[0].offset == 2);
+    CHECK(aligned.components[0].exactMatches == 2);
+    CHECK(aligned.components[1].resolved);
+    CHECK(aligned.components[1].sign == -1);
+    CHECK(aligned.components[1].offset == 13);
+    CHECK(aligned.components[1].exactMatches == 2);
+    CHECK(aligned.alignedWindingByPiece == std::vector<std::optional<int>>{2, 3, 4, 8, 9});
+}
+
+TEST_CASE("Defect-only final component retains its decoded winding hypothesis")
+{
+    FiberTraceInterleavedWindingReport conditioned;
+    conditioned.windingValid = {1, 1};
+    conditioned.mapWinding = {0, 4};
+    conditioned.posteriorMeanWinding = {0.0, 4.0};
+    conditioned.mapWindingHypothesis = {0, 4};
+    conditioned.classAProbability = {1.0, 1.0};
+    conditioned.classBProbability = {0.0, 0.0};
+    conditioned.componentByPiece = {0, 0};
+
+    FiberTraceInterleavedWindingReport finalReport;
+    finalReport.windingValid = {0};
+    finalReport.mapWinding = {0};
+    finalReport.posteriorMeanWinding = {0.0};
+    finalReport.mapWindingHypothesis = {3};
+    finalReport.classAProbability = {0.0};
+    finalReport.classBProbability = {0.0};
+    finalReport.componentByPiece = {0};
+    const std::array<std::size_t, 1> mapping{0};
+
+    const auto aligned = alignFiberTraceWindingToConditionedGauge(conditioned, 1, finalReport, mapping);
+    REQUIRE(aligned.components.size() == 1);
+    CHECK(aligned.components[0].resolved);
+    CHECK(aligned.components[0].offset == 1);
+    REQUIRE(aligned.alignedWindingByPiece[0].has_value());
+    CHECK(*aligned.alignedWindingByPiece[0] == 4);
+}
+
+TEST_CASE("Gauge alignment transforms integer and interleaved latent coordinates")
+{
+    FiberTraceInterleavedWindingReport report;
+    report.windingValid = {1, 1};
+    report.continuousWinding = {2.0, 3.0};
+    report.mapWinding = {2, 3};
+    report.posteriorMeanWinding = {2.25, 3.25};
+    report.mapWindingHypothesis = {2, 3};
+    report.posteriorMeanLatentCoordinate = {2.25, 3.75};
+    report.mapLatentCoordinate = {2.0, 3.5};
+    report.candidateMinimum = {1, 2};
+    report.candidateMaximum = {4, 5};
+    report.componentByPiece = {0, 0};
+    report.integerGaugeByPiece = {0, 0};
+    report.classAProbability = {1.0, 0.0};
+    report.mixedProbability = {0.0, 0.0};
+    report.classBProbability = {0.0, 1.0};
+    report.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    report.componentPhaseSign = {1};
+    report.componentPositivePhaseSignProbability = {0.8};
+    report.phaseMagnitude = 0.5;
+
+    FiberTraceWindingGaugeAlignment alignment;
+    alignment.alignedWindingByPiece = {8, 7};
+    alignment.components = {{-1, 10, 2, 2, true}};
+
+    const auto transformed =
+        applyFiberTraceWindingGaugeAlignment(report, alignment);
+    CHECK(transformed.mapWinding == std::vector<int>{8, 7});
+    CHECK(transformed.mapWindingHypothesis == std::vector<int>{8, 7});
+    CHECK(transformed.continuousWinding == std::vector<double>{8.0, 7.0});
+    CHECK(transformed.posteriorMeanWinding ==
+          std::vector<double>{7.75, 6.75});
+    CHECK(transformed.mapLatentCoordinate ==
+          std::vector<double>{8.0, 6.5});
+    CHECK(transformed.posteriorMeanLatentCoordinate ==
+          std::vector<double>{7.75, 6.25});
+    CHECK(transformed.candidateMinimum == std::vector<int>{6, 5});
+    CHECK(transformed.candidateMaximum == std::vector<int>{9, 8});
+    CHECK(transformed.componentPhaseSign == std::vector<int>{-1});
+    CHECK(transformed.componentPositivePhaseSignProbability[0] ==
+          doctest::Approx(0.2));
 }
 
 }  // namespace

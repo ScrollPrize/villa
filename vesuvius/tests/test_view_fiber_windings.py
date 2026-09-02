@@ -46,6 +46,8 @@ HEADERS = {
     "v": "VC3D Fiberlet crop traces: BP vertical argmax",
     "err": "VC3D Fiberlet crop traces: BP error/Mixed argmax",
     "tie": "VC3D Fiberlet crop traces: BP exact argmax tie",
+    "broken": "VC3D Fiberlet crop traces: conditioned reference Defect",
+    "disabled": "VC3D Fiberlet crop traces: final pruned-solve Defect",
 }
 
 
@@ -154,7 +156,7 @@ def test_winding_discovery_uses_numeric_order_complete_quartets_and_ignores_sibl
 
     artifacts = discover_winding_artifacts(tmp_path / "fibers.obj")
     assert [(item.key.winding, item.key.state) for item in artifacts] == [
-        (winding, state) for winding in (2, 10) for state in ("h", "v", "err", "tie")
+        (winding, state) for winding in (2, 10) for state in HEADERS
     ]
 
 
@@ -423,7 +425,7 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     viewer = FakeViewer()
     layers, fiber_count = add_winding_layers(viewer, geometry, 3.0)
     assert tuple(layers) == tuple(
-        WindingLayerKey(2, state) for state in ("h", "v", "err", "tie")
+        WindingLayerKey(2, state) for state in HEADERS
     )
     assert fiber_count == 3
     assert len(viewer.calls) == 2
@@ -439,6 +441,8 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     )
     assert not layers[WindingLayerKey(2, "err")].visible
     assert not layers[WindingLayerKey(2, "tie")].visible
+    assert not layers[WindingLayerKey(2, "broken")].visible
+    assert not layers[WindingLayerKey(2, "disabled")].visible
 
 
 def test_add_winding_layers_materializes_missing_states_and_windings(tmp_path):
@@ -466,7 +470,7 @@ def test_add_winding_layers_materializes_missing_states_and_windings(tmp_path):
     assert tuple(layers) == tuple(
         WindingLayerKey(winding, state)
         for winding in range(1, 4)
-        for state in ("h", "v", "err", "tie")
+        for state in HEADERS
     )
     assert fiber_count == 1
     assert len(viewer.calls) == 1
@@ -588,7 +592,7 @@ def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
     keys = tuple(
         WindingLayerKey(winding, state)
         for winding in (2, 10)
-        for state in ("h", "v", "err", "tie")
+        for state in HEADERS
     )
     assert visible_winding_layers(keys, "h") == {
         WindingLayerKey(winding, "h") for winding in range(2, 11)
@@ -599,7 +603,13 @@ def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
     assert visible_winding_layers(keys, "broken") == {
         WindingLayerKey(winding, state)
         for winding in range(2, 11)
-        for state in ("err", "tie")
+        for state in ("err", "tie", "broken", "disabled")
+    }
+    assert visible_winding_layers(keys, "conditioned") == {
+        WindingLayerKey(winding, "broken") for winding in range(2, 11)
+    }
+    assert visible_winding_layers(keys, "disabled") == {
+        WindingLayerKey(winding, "disabled") for winding in range(2, 11)
     }
     assert visible_winding_layers(keys, "winding", winding=10) == {
         WindingLayerKey(10, "h"),

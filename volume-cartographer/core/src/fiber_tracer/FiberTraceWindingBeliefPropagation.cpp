@@ -3905,6 +3905,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
     report.classBProbability.resize(pieceCount);
     report.posteriorMeanLatentCoordinate.resize(pieceCount);
     report.mapLatentCoordinate.resize(pieceCount);
+    report.mapWindingHypothesis.resize(pieceCount);
     report.mapOrientationByPiece.resize(pieceCount);
     report.incidentSignedConstraints.assign(pieceCount, 0);
     report.incidentSkippedConstraints.assign(pieceCount, 0);
@@ -4067,6 +4068,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         report.continuousWinding[piece] =
             active ? continuousNodes[node] : 0.0;
         report.mapWinding[piece] = active ? state.winding : 0;
+        report.mapWindingHypothesis[piece] = active ? state.winding : static_cast<int>(std::llround(continuousNodes[node]));
         report.mapOrientationByPiece[piece] = publicOrientation(state.orientation);
         report.mapLatentCoordinate[piece] =
             active ? static_cast<double>(state.winding) +
@@ -4287,6 +4289,815 @@ FiberTraceWindingComponentSelection selectLargestFiberTraceWindingComponent(
     return result;
 }
 
+namespace
+{
+
+std::optional<double> diagnosticWindingHypothesis(const FiberTraceInterleavedWindingReport& report, std::size_t piece)
+{
+    if (piece >= report.mapWindingHypothesis.size()) {
+        throw std::invalid_argument("Winding report is missing diagnostic winding hypotheses");
+    }
+    return static_cast<double>(report.mapWindingHypothesis[piece]);
+}
+
+std::optional<int> roundedDiagnosticWinding(const FiberTraceInterleavedWindingReport& report, std::size_t piece)
+{
+    const auto winding = diagnosticWindingHypothesis(report, piece);
+    if (!winding || *winding < static_cast<double>(std::numeric_limits<int>::min()) ||
+        *winding > static_cast<double>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<int>(std::llround(*winding));
+}
+
+void validateConditionedDiagnosticReport(const FiberTraceInterleavedWindingReport& report, std::size_t pieces, const char* name)
+{
+    if (report.windingValid.size() != pieces || report.mapWinding.size() != pieces || report.posteriorMeanWinding.size() != pieces ||
+        report.classAProbability.size() != pieces || report.classBProbability.size() != pieces ||
+        report.mapWindingHypothesis.size() != pieces || report.componentByPiece.size() != pieces) {
+        throw std::invalid_argument(std::string(name) + " winding report has inconsistent piece data");
+    }
+}
+
+struct DiagnosticSignTerm {
+    bool perpendicular = false;
+    bool admitted = false;
+    bool hard = false;
+    double target = 0.0;
+    double finitePenalty = 0.0;
+};
+
+DiagnosticSignTerm diagnosticSignTerm(
+    const FiberTraceWindingFactorDiagnostic& diagnostic)
+{
+    DiagnosticSignTerm result;
+    result.perpendicular =
+        diagnostic.perpendicularScore >= diagnostic.parallelScore;
+    const auto target = result.perpendicular
+        ? diagnostic.effectivePerpendicularSignedDelta
+        : diagnostic.effectiveSignedParallelDelta;
+    result.hard = result.perpendicular
+        ? diagnostic.hardPerpendicularSign
+        : diagnostic.hardParallelSign;
+    result.finitePenalty = result.perpendicular
+        ? diagnostic.effectivePerpendicularSignPenalty
+        : diagnostic.effectiveParallelSignPenalty;
+    if (!std::isfinite(result.finitePenalty) ||
+        result.finitePenalty < 0.0 ||
+        (target && !std::isfinite(*target))) {
+        throw std::invalid_argument(
+            "Winding factor diagnostic contains invalid sign evidence");
+    }
+    result.admitted = target && (result.hard || result.finitePenalty > 0.0);
+    if (target)
+        result.target = *target;
+    return result;
+}
+
+}  // namespace
+
+FiberTraceConditionedOffenderSelection selectFiberTraceConditionedOffenders(
+    const FiberTraceInterleavedWindingReport& baseline,
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceConditionedOffenderConfig& config)
+{
+    const std::size_t ordinaryPieces = baseline.windingValid.size();
+    validateConditionedDiagnosticReport(baseline, ordinaryPieces, "Baseline");
+    if (referencePieces > conditioned.windingValid.size() || conditioned.windingValid.size() - referencePieces != ordinaryPieces) {
+        throw std::invalid_argument("Conditioned winding report does not contain the ordinary suffix");
+    }
+    validateConditionedDiagnosticReport(conditioned, conditioned.windingValid.size(), "Conditioned");
+    if (!std::isfinite(config.conditionedDefectProbabilityThreshold) ||
+        config.conditionedDefectProbabilityThreshold < 0.0 ||
+        config.conditionedDefectProbabilityThreshold > 1.0) {
+        throw std::invalid_argument("Conditioned Defect probability threshold must be finite and in [0, 1]");
+    }
+    if (config.policy == FiberTraceConditionedOffenderPolicy::ConditionedPosterior &&
+        conditioned.mixedProbability.size() != conditioned.windingValid.size()) {
+        throw std::invalid_argument("Conditioned winding report is missing Defect marginals");
+    }
+
+    FiberTraceConditionedOffenderSelection result;
+    result.inferredWindingByOrdinaryPiece.resize(ordinaryPieces);
+    result.removalReasonByOrdinaryPiece.assign(
+        ordinaryPieces, FiberTraceConditionedRemovalReason::None);
+    result.retainedOrdinaryPieceIndices.reserve(ordinaryPieces);
+    result.brokenOrdinaryPieceIndices.reserve(ordinaryPieces);
+    for (std::size_t ordinaryPiece = 0; ordinaryPiece < ordinaryPieces; ++ordinaryPiece) {
+        const std::size_t conditionedPiece = referencePieces + ordinaryPiece;
+        const bool baselineDefect = baseline.windingValid[ordinaryPiece] == 0;
+        const bool conditionedDefect = conditioned.windingValid[conditionedPiece] == 0;
+        result.baselineDefectPieces += baselineDefect ? 1 : 0;
+        result.conditionedDefectPieces += conditionedDefect ? 1 : 0;
+        bool selected = conditionedDefect;
+        if (config.policy == FiberTraceConditionedOffenderPolicy::UnionDefect) {
+            selected = baselineDefect || conditionedDefect;
+        } else if (config.policy == FiberTraceConditionedOffenderPolicy::ConditionedPosterior) {
+            const double probability = conditioned.mixedProbability[conditionedPiece];
+            if (!std::isfinite(probability) || probability < 0.0 || probability > 1.0) {
+                throw std::invalid_argument("Conditioned winding report contains an invalid Defect marginal");
+            }
+            selected = probability > config.conditionedDefectProbabilityThreshold;
+            result.posteriorSelectedPieces += selected ? 1 : 0;
+        }
+        if (!selected) {
+            result.retainedOrdinaryPieceIndices.push_back(ordinaryPiece);
+            continue;
+        }
+        result.brokenOrdinaryPieceIndices.push_back(ordinaryPiece);
+        result.removalReasonByOrdinaryPiece[ordinaryPiece] =
+            FiberTraceConditionedRemovalReason::Policy;
+        if (baselineDefect && conditionedDefect)
+            ++result.selectedBothDefectPieces;
+        else if (baselineDefect)
+            ++result.selectedBaselineOnlyPieces;
+        else if (conditionedDefect)
+            ++result.selectedConditionedOnlyPieces;
+        else
+            ++result.selectedNeitherDefectPieces;
+        if (baselineDefect)
+            ++result.preexistingBrokenPieces;
+        if (conditionedDefect && !baselineDefect)
+            ++result.newlyBrokenPieces;
+        result.inferredWindingByOrdinaryPiece[ordinaryPiece] = roundedDiagnosticWinding(conditioned, conditionedPiece);
+        if (!result.inferredWindingByOrdinaryPiece[ordinaryPiece])
+            ++result.unresolvedBrokenPieces;
+    }
+    return result;
+}
+
+FiberTraceConditionedOffenderSelection selectFiberTraceConditionedInliers(
+    const FiberTraceConstraintReport& conditionedConstraints,
+    const FiberTraceInterleavedWindingReport& baseline,
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceConditionedOffenderConfig& config)
+{
+    if (config.policy != FiberTraceConditionedOffenderPolicy::ConditionedInliers) {
+        throw std::invalid_argument(
+            "Conditioned inlier selection requires the conditioned-inliers policy");
+    }
+    const std::array weights{
+        config.inlierSignConflictWeight,
+        config.inlierMagnitudeSupportWeight,
+        config.inlierRetentionSupport,
+    };
+    if (std::any_of(weights.begin(), weights.end(), [](double value) {
+            return !std::isfinite(value) || value < 0.0;
+        }) || !(config.inlierSignConflictWeight > 0.0) ||
+        !(config.inlierRetentionSupport > 0.0)) {
+        throw std::invalid_argument(
+            "Conditioned inlier weights must be finite and nonnegative, with positive sign and retention weights");
+    }
+
+    const std::size_t ordinaryPieces = baseline.windingValid.size();
+    const std::size_t totalPieces = referencePieces + ordinaryPieces;
+    validateConditionedDiagnosticReport(baseline, ordinaryPieces, "Baseline");
+    validateConditionedDiagnosticReport(conditioned, totalPieces, "Conditioned");
+    if (conditionedConstraints.pieces.size() != totalPieces ||
+        conditioned.mapLatentCoordinate.size() != totalPieces ||
+        conditioned.mapOrientationByPiece.size() != totalPieces) {
+        throw std::invalid_argument(
+            "Conditioned inlier inputs do not represent the same pieces");
+    }
+
+    for (const auto& constraint : conditionedConstraints.constraints) {
+        if (constraint.pieceA >= totalPieces ||
+            constraint.pieceB >= totalPieces) {
+            throw std::invalid_argument(
+                "Conditioned inlier constraint references an invalid piece");
+        }
+    }
+
+    const std::size_t nodeCount = totalPieces;
+    std::vector<std::size_t> nodeByPiece(totalPieces);
+    std::iota(nodeByPiece.begin(), nodeByPiece.end(), 0);
+    struct Node {
+        std::vector<std::size_t> ordinaryPieces;
+        std::size_t minimumPiece = std::numeric_limits<std::size_t>::max();
+        bool reference = false;
+        bool active = true;
+        bool conditionedDefect = false;
+        bool directReferenceConflict = false;
+        bool conflictCover = false;
+        bool disconnected = false;
+    };
+    std::vector<Node> nodes(nodeCount);
+    for (std::size_t piece = 0; piece < totalPieces; ++piece) {
+        auto& node = nodes[nodeByPiece[piece]];
+        node.minimumPiece = std::min(node.minimumPiece, piece);
+        if (piece < referencePieces) {
+            node.reference = true;
+        } else {
+            node.ordinaryPieces.push_back(piece - referencePieces);
+            if (conditioned.windingValid[piece] == 0)
+                node.conditionedDefect = true;
+        }
+    }
+    for (auto& node : nodes) {
+        if (node.reference && !node.ordinaryPieces.empty()) {
+            throw std::invalid_argument(
+                "Hard continuation unexpectedly joins reference and ordinary pieces");
+        }
+        if (!node.reference && node.conditionedDefect)
+            node.active = false;
+    }
+
+    struct EvidenceEdge {
+        std::size_t a = 0;
+        std::size_t b = 0;
+        double signWeight = 0.0;
+        double supportWeight = 0.0;
+        bool sign = false;
+        bool signConflict = false;
+        bool continuity = false;
+    };
+    std::vector<EvidenceEdge> edges;
+    edges.reserve(conditioned.factorDiagnostics.size());
+    for (const auto& diagnostic : conditioned.factorDiagnostics) {
+        if (diagnostic.constraintIndex >= conditionedConstraints.constraints.size() ||
+            diagnostic.pieceA >= totalPieces ||
+            diagnostic.pieceB >= totalPieces) {
+            throw std::invalid_argument(
+                "Conditioned inlier factor diagnostic is invalid");
+        }
+        const auto& constraint =
+            conditionedConstraints.constraints[diagnostic.constraintIndex];
+        if (constraint.hardContinuity) {
+            edges.push_back({
+                nodeByPiece[diagnostic.canonicalNodeA],
+                nodeByPiece[diagnostic.canonicalNodeB],
+                0.0,
+                config.inlierRetentionSupport,
+                false,
+                false,
+                true,
+            });
+            continue;
+        }
+        const std::size_t nodeA = nodeByPiece[diagnostic.canonicalNodeA];
+        const std::size_t nodeB = nodeByPiece[diagnostic.canonicalNodeB];
+        if ((!nodes[nodeA].reference && !nodes[nodeA].active) ||
+            (!nodes[nodeB].reference && !nodes[nodeB].active)) {
+            continue;
+        }
+        const auto signTerm = diagnosticSignTerm(diagnostic);
+        const bool perpendicular = signTerm.perpendicular;
+        const std::size_t lowPiece = diagnostic.canonicalNodeA;
+        const std::size_t highPiece = diagnostic.canonicalNodeB;
+        const double delta = conditioned.mapLatentCoordinate[highPiece] -
+            conditioned.mapLatentCoordinate[lowPiece];
+        if (!std::isfinite(delta)) {
+            throw std::invalid_argument(
+                "Conditioned inlier report contains a nonfinite latent coordinate");
+        }
+
+        const bool hardSign = signTerm.hard;
+        const double finiteSignWeight = signTerm.finitePenalty;
+        const bool signPresent = signTerm.admitted;
+        const bool magnitudePresent = perpendicular
+            ? diagnostic.perpendicularMagnitudePresent
+            : diagnostic.parallelMagnitudePresent;
+        const double magnitudeWeight = perpendicular
+            ? diagnostic.effectivePerpendicularWindingWeight
+            : diagnostic.effectiveParallelWindingWeight;
+        const double magnitudeTarget = perpendicular
+            ? diagnostic.effectivePerpendicularSignedDelta.value_or(0.0)
+            : diagnostic.effectiveSignedParallelDelta.value_or(
+                  diagnostic.effectiveParallelWindingDistance);
+        if (!std::isfinite(magnitudeWeight) || magnitudeWeight < 0.0 ||
+            !std::isfinite(magnitudeTarget)) {
+            throw std::invalid_argument(
+                "Conditioned inlier factor has invalid effective evidence");
+        }
+
+        EvidenceEdge edge;
+        edge.a = nodeA;
+        edge.b = nodeB;
+        edge.sign = signPresent;
+        if (signPresent) {
+            const double baseWeight = finiteSignWeight > 0.0
+                ? finiteSignWeight
+                : hardSign ? 1.0 : 0.0;
+            edge.signWeight = config.inlierSignConflictWeight * baseWeight;
+            edge.signConflict = signTerm.target * delta <= 0.0;
+        }
+        if (magnitudePresent) {
+            const double quantized = perpendicular
+                ? quantizedHalfWindingTarget(delta)
+                : quantizedIntegerWindingTarget(delta);
+            const double residual = std::abs(quantized - magnitudeTarget);
+            edge.supportWeight = config.inlierMagnitudeSupportWeight *
+                magnitudeWeight / (1.0 + residual);
+        }
+        if (edge.sign || edge.supportWeight > 0.0)
+            edges.push_back(edge);
+    }
+
+    FiberTraceConditionedOffenderSelection result;
+    result.inferredWindingByOrdinaryPiece.resize(ordinaryPieces);
+    result.removalReasonByOrdinaryPiece.assign(
+        ordinaryPieces, FiberTraceConditionedRemovalReason::None);
+    for (const auto& node : nodes) {
+        if (node.reference)
+            continue;
+        result.conditionedActivePieces += node.conditionedDefect
+            ? 0 : node.ordinaryPieces.size();
+        result.conditionedDefectRemovedPieces += node.conditionedDefect
+            ? node.ordinaryPieces.size() : 0;
+    }
+
+    const auto available = [&](std::size_t node) {
+        return nodes[node].reference || nodes[node].active;
+    };
+    for (const auto& edge : edges) {
+        if (edge.sign && edge.signConflict &&
+            available(edge.a) && available(edge.b) &&
+            !(nodes[edge.a].reference && nodes[edge.b].reference)) {
+            ++result.initialSignConflicts;
+        }
+    }
+    for (const auto& edge : edges) {
+        if (!edge.sign)
+            continue;
+        ++result.signFactors;
+        if (nodes[edge.a].reference && nodes[edge.b].reference) {
+            ++result.protectedReferenceSignFactors;
+            result.protectedReferenceSignConflicts +=
+                edge.signConflict ? 1 : 0;
+            continue;
+        }
+        if (!edge.signConflict || !available(edge.a) || !available(edge.b))
+            continue;
+        if (edge.a == edge.b) {
+            if (!nodes[edge.a].reference) {
+                nodes[edge.a].active = false;
+                nodes[edge.a].directReferenceConflict = true;
+            }
+            continue;
+        }
+        if (nodes[edge.a].reference != nodes[edge.b].reference) {
+            const std::size_t ordinary = nodes[edge.a].reference
+                ? edge.b : edge.a;
+            nodes[ordinary].active = false;
+            nodes[ordinary].directReferenceConflict = true;
+        }
+    }
+
+    for (;;) {
+        std::vector<double> conflict(nodeCount, 0.0);
+        std::vector<double> support(nodeCount, 0.0);
+        bool unresolved = false;
+        for (const auto& edge : edges) {
+            if (!available(edge.a) || !available(edge.b))
+                continue;
+            if (edge.sign && edge.signConflict) {
+                if (edge.a == edge.b) {
+                    if (!nodes[edge.a].reference) {
+                        conflict[edge.a] += edge.signWeight;
+                        unresolved = true;
+                    }
+                } else if (!nodes[edge.a].reference ||
+                           !nodes[edge.b].reference) {
+                    if (!nodes[edge.a].reference)
+                        conflict[edge.a] += edge.signWeight;
+                    if (!nodes[edge.b].reference)
+                        conflict[edge.b] += edge.signWeight;
+                    unresolved = true;
+                }
+                continue;
+            }
+            const double retainedSupport =
+                (edge.sign ? edge.signWeight : 0.0) + edge.supportWeight;
+            if (!nodes[edge.a].reference)
+                support[edge.a] += retainedSupport;
+            if (!nodes[edge.b].reference)
+                support[edge.b] += retainedSupport;
+        }
+        if (!unresolved)
+            break;
+
+        std::optional<std::size_t> selected;
+        double selectedRatio = -1.0;
+        double selectedConflict = -1.0;
+        for (std::size_t node = 0; node < nodeCount; ++node) {
+            if (nodes[node].reference || !nodes[node].active ||
+                !(conflict[node] > 0.0)) {
+                continue;
+            }
+            const double retained = config.inlierRetentionSupport *
+                static_cast<double>(nodes[node].ordinaryPieces.size()) +
+                support[node];
+            const double ratio = conflict[node] / retained;
+            if (!selected || ratio > selectedRatio + kEpsilon ||
+                (std::abs(ratio - selectedRatio) <= kEpsilon &&
+                 (conflict[node] > selectedConflict + kEpsilon ||
+                  (std::abs(conflict[node] - selectedConflict) <= kEpsilon &&
+                   nodes[node].minimumPiece <
+                       nodes[*selected].minimumPiece)))) {
+                selected = node;
+                selectedRatio = ratio;
+                selectedConflict = conflict[node];
+            }
+        }
+        if (!selected)
+            break;
+        nodes[*selected].active = false;
+        nodes[*selected].conflictCover = true;
+    }
+
+    std::vector<std::vector<std::size_t>> satisfiedSignAdjacency(nodeCount);
+    for (const auto& edge : edges) {
+        if ((!edge.sign && !edge.continuity) || edge.signConflict ||
+            !available(edge.a) || !available(edge.b) || edge.a == edge.b) {
+            continue;
+        }
+        satisfiedSignAdjacency[edge.a].push_back(edge.b);
+        satisfiedSignAdjacency[edge.b].push_back(edge.a);
+    }
+    std::vector<unsigned char> referenceConnected(nodeCount, 0);
+    std::vector<std::size_t> queue;
+    for (std::size_t node = 0; node < nodeCount; ++node) {
+        if (nodes[node].reference) {
+            referenceConnected[node] = 1;
+            queue.push_back(node);
+        }
+    }
+    for (std::size_t index = 0; index < queue.size(); ++index) {
+        for (const std::size_t neighbor :
+             satisfiedSignAdjacency[queue[index]]) {
+            if (referenceConnected[neighbor] == 0) {
+                referenceConnected[neighbor] = 1;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    for (std::size_t node = 0; node < nodeCount; ++node) {
+        if (!nodes[node].reference && nodes[node].active &&
+            referenceConnected[node] == 0) {
+            nodes[node].active = false;
+            nodes[node].disconnected = true;
+        }
+    }
+
+    for (const auto& edge : edges) {
+        if (edge.sign && edge.signConflict &&
+            available(edge.a) && available(edge.b) &&
+            !(nodes[edge.a].reference && nodes[edge.b].reference)) {
+            ++result.retainedSignConflicts;
+        }
+    }
+    for (const auto& node : nodes) {
+        if (node.reference)
+            continue;
+        for (const std::size_t ordinaryPiece : node.ordinaryPieces) {
+            const std::size_t conditionedPiece =
+                referencePieces + ordinaryPiece;
+            const bool baselineDefect =
+                baseline.windingValid[ordinaryPiece] == 0;
+            const bool conditionedDefect =
+                conditioned.windingValid[conditionedPiece] == 0;
+            result.baselineDefectPieces += baselineDefect ? 1 : 0;
+            result.conditionedDefectPieces += conditionedDefect ? 1 : 0;
+            if (node.active) {
+                result.retainedOrdinaryPieceIndices.push_back(ordinaryPiece);
+                continue;
+            }
+            result.brokenOrdinaryPieceIndices.push_back(ordinaryPiece);
+            result.removalReasonByOrdinaryPiece[ordinaryPiece] =
+                node.conditionedDefect
+                ? FiberTraceConditionedRemovalReason::ConditionedDefect
+                : node.directReferenceConflict
+                    ? FiberTraceConditionedRemovalReason::DirectReferenceConflict
+                    : node.conflictCover
+                        ? FiberTraceConditionedRemovalReason::SignConflictCover
+                        : FiberTraceConditionedRemovalReason::Disconnected;
+            result.directReferenceConflictRemovedPieces +=
+                node.directReferenceConflict ? 1 : 0;
+            result.conflictCoverRemovedPieces +=
+                node.conflictCover ? 1 : 0;
+            result.disconnectedRemovedPieces +=
+                node.disconnected ? 1 : 0;
+            if (baselineDefect && conditionedDefect)
+                ++result.selectedBothDefectPieces;
+            else if (baselineDefect)
+                ++result.selectedBaselineOnlyPieces;
+            else if (conditionedDefect)
+                ++result.selectedConditionedOnlyPieces;
+            else
+                ++result.selectedNeitherDefectPieces;
+            result.preexistingBrokenPieces += baselineDefect ? 1 : 0;
+            result.newlyBrokenPieces +=
+                conditionedDefect && !baselineDefect ? 1 : 0;
+            result.inferredWindingByOrdinaryPiece[ordinaryPiece] =
+                roundedDiagnosticWinding(conditioned, conditionedPiece);
+            if (!result.inferredWindingByOrdinaryPiece[ordinaryPiece])
+                ++result.unresolvedBrokenPieces;
+        }
+    }
+    return result;
+}
+
+FiberTraceInterleavedWindingReport extractFiberTraceConditionedOrdinaryReport(
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    std::span<const std::size_t> retainedOrdinaryPieceIndices)
+{
+    validateConditionedDiagnosticReport(
+        conditioned, conditioned.windingValid.size(), "Conditioned");
+    if (referencePieces > conditioned.windingValid.size()) {
+        throw std::invalid_argument(
+            "Conditioned report reference prefix exceeds its pieces");
+    }
+    const std::size_t ordinaryPieces =
+        conditioned.windingValid.size() - referencePieces;
+    std::size_t previous = 0;
+    bool first = true;
+    for (const std::size_t piece : retainedOrdinaryPieceIndices) {
+        if (piece >= ordinaryPieces || (!first && piece <= previous)) {
+            throw std::invalid_argument(
+                "Conditioned report subset indices must be sorted and unique");
+        }
+        first = false;
+        previous = piece;
+    }
+
+    FiberTraceInterleavedWindingReport result = conditioned;
+    const auto subset = [&]<typename T>(const std::vector<T>& source) {
+        std::vector<T> values;
+        if (source.empty())
+            return values;
+        if (source.size() != conditioned.windingValid.size()) {
+            throw std::invalid_argument(
+                "Conditioned report has inconsistent per-piece arrays");
+        }
+        values.reserve(retainedOrdinaryPieceIndices.size());
+        for (const std::size_t piece : retainedOrdinaryPieceIndices)
+            values.push_back(source[referencePieces + piece]);
+        return values;
+    };
+    result.windingValid = subset(conditioned.windingValid);
+    result.continuousWinding = subset(conditioned.continuousWinding);
+    result.mapWinding = subset(conditioned.mapWinding);
+    result.posteriorMeanWinding = subset(conditioned.posteriorMeanWinding);
+    result.mapProbability = subset(conditioned.mapProbability);
+    result.entropy = subset(conditioned.entropy);
+    result.candidateMinimum = subset(conditioned.candidateMinimum);
+    result.candidateMaximum = subset(conditioned.candidateMaximum);
+    result.componentByPiece = subset(conditioned.componentByPiece);
+    result.integerGaugeByPiece = subset(conditioned.integerGaugeByPiece);
+    result.incidentSignedConstraints =
+        subset(conditioned.incidentSignedConstraints);
+    result.incidentSkippedConstraints =
+        subset(conditioned.incidentSkippedConstraints);
+    result.classAProbability = subset(conditioned.classAProbability);
+    result.mixedProbability = subset(conditioned.mixedProbability);
+    result.classBProbability = subset(conditioned.classBProbability);
+    result.posteriorMeanLatentCoordinate =
+        subset(conditioned.posteriorMeanLatentCoordinate);
+    result.mapLatentCoordinate = subset(conditioned.mapLatentCoordinate);
+    result.mapWindingHypothesis = subset(conditioned.mapWindingHypothesis);
+    result.mapOrientationByPiece =
+        subset(conditioned.mapOrientationByPiece);
+    result.fixedOrientationByPiece =
+        subset(conditioned.fixedOrientationByPiece);
+    result.gaugePieces.clear();
+    result.factorDiagnostics.clear();
+    result.variables = retainedOrdinaryPieceIndices.size();
+    result.factors = 0;
+    return result;
+}
+
+FiberTraceWindingGaugeAlignment alignFiberTraceWindingToConditionedGauge(
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceInterleavedWindingReport& finalReport,
+    std::span<const std::size_t> finalPieceToOrdinaryPiece)
+{
+    validateConditionedDiagnosticReport(conditioned, conditioned.windingValid.size(), "Conditioned");
+    const std::size_t finalPieces = finalPieceToOrdinaryPiece.size();
+    validateConditionedDiagnosticReport(finalReport, finalPieces, "Final");
+    if (referencePieces > conditioned.windingValid.size()) {
+        throw std::invalid_argument("Conditioned reference prefix exceeds its report");
+    }
+    const std::size_t ordinaryPieces = conditioned.windingValid.size() - referencePieces;
+    std::size_t components = 0;
+    for (const std::size_t component : finalReport.componentByPiece)
+        components = std::max(components, component + 1);
+
+    struct Support {
+        std::size_t piece = 0;
+        double finalWinding = 0.0;
+        int conditionedWinding = 0;
+        bool finalActive = false;
+    };
+    std::vector<std::vector<Support>> supportByComponent(components);
+    for (std::size_t piece = 0; piece < finalPieces; ++piece) {
+        const std::size_t ordinaryPiece = finalPieceToOrdinaryPiece[piece];
+        if (ordinaryPiece >= ordinaryPieces) {
+            throw std::invalid_argument("Final winding alignment maps outside ordinary pieces");
+        }
+        const std::size_t conditionedPiece = referencePieces + ordinaryPiece;
+        if (conditioned.windingValid[conditionedPiece] == 0) {
+            throw std::invalid_argument("Final winding alignment includes a conditioned offender");
+        }
+        const bool finalActive = finalReport.windingValid[piece] != 0;
+        const auto inferred = finalActive ? std::optional<double>{static_cast<double>(finalReport.mapWinding[piece])}
+                                          : diagnosticWindingHypothesis(finalReport, piece);
+        if (!inferred)
+            continue;
+        supportByComponent.at(finalReport.componentByPiece[piece])
+            .push_back({
+                piece,
+                *inferred,
+                conditioned.mapWinding[conditionedPiece],
+                finalActive,
+            });
+    }
+
+    FiberTraceWindingGaugeAlignment result;
+    result.alignedWindingByPiece.resize(finalPieces);
+    result.components.resize(components);
+    for (std::size_t component = 0; component < components; ++component) {
+        const auto& allSupport = supportByComponent[component];
+        const bool hasActive = std::any_of(allSupport.begin(), allSupport.end(), [](const Support& value) { return value.finalActive; });
+        std::vector<const Support*> support;
+        support.reserve(allSupport.size());
+        for (const auto& value : allSupport) {
+            if (!hasActive || value.finalActive)
+                support.push_back(&value);
+        }
+        if (support.empty())
+            continue;
+
+        struct Candidate {
+            int sign = 1;
+            int offset = 0;
+            std::size_t exact = 0;
+            double squared = std::numeric_limits<double>::infinity();
+            bool set = false;
+        };
+        Candidate best;
+        std::set<int> offsets;
+        for (const int sign : {1, -1}) {
+            offsets.clear();
+            for (const Support* value : support) {
+                const double rawOffset = static_cast<double>(value->conditionedWinding) - static_cast<double>(sign) * value->finalWinding;
+                if (rawOffset < static_cast<double>(std::numeric_limits<int>::min()) ||
+                    rawOffset > static_cast<double>(std::numeric_limits<int>::max())) {
+                    continue;
+                }
+                offsets.insert(static_cast<int>(std::floor(rawOffset)));
+                offsets.insert(static_cast<int>(std::ceil(rawOffset)));
+            }
+            for (const int offset : offsets) {
+                Candidate candidate{sign, offset, 0, 0.0, true};
+                for (const Support* value : support) {
+                    const double aligned = static_cast<double>(sign) * value->finalWinding + static_cast<double>(offset);
+                    candidate.exact += static_cast<int>(std::llround(aligned)) == value->conditionedWinding ? 1 : 0;
+                    const double error = aligned - static_cast<double>(value->conditionedWinding);
+                    candidate.squared += error * error;
+                }
+                const auto better = [](const Candidate& left, const Candidate& right) {
+                    if (!right.set || left.exact != right.exact)
+                        return !right.set || left.exact > right.exact;
+                    if (std::abs(left.squared - right.squared) > kEpsilon)
+                        return left.squared < right.squared;
+                    if (left.sign != right.sign)
+                        return left.sign > right.sign;
+                    if (std::abs(left.offset) != std::abs(right.offset))
+                        return std::abs(left.offset) < std::abs(right.offset);
+                    return left.offset < right.offset;
+                };
+                if (better(candidate, best))
+                    best = candidate;
+            }
+        }
+        if (!best.set)
+            continue;
+        auto& aligned = result.components[component];
+        aligned.sign = best.sign;
+        aligned.offset = best.offset;
+        aligned.supportPieces = support.size();
+        aligned.exactMatches = best.exact;
+        aligned.resolved = true;
+    }
+
+    for (std::size_t piece = 0; piece < finalPieces; ++piece) {
+        const auto& alignment = result.components.at(finalReport.componentByPiece[piece]);
+        if (!alignment.resolved)
+            continue;
+        const auto winding = finalReport.windingValid[piece] != 0 ? std::optional<double>{static_cast<double>(finalReport.mapWinding[piece])}
+                                                                  : diagnosticWindingHypothesis(finalReport, piece);
+        if (!winding)
+            continue;
+        const double value = static_cast<double>(alignment.sign) * *winding + static_cast<double>(alignment.offset);
+        if (value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max())) {
+            continue;
+        }
+        result.alignedWindingByPiece[piece] = static_cast<int>(std::llround(value));
+    }
+    return result;
+}
+
+FiberTraceInterleavedWindingReport applyFiberTraceWindingGaugeAlignment(
+    const FiberTraceInterleavedWindingReport& report,
+    const FiberTraceWindingGaugeAlignment& alignment)
+{
+    const std::size_t pieces = report.windingValid.size();
+    validateConditionedDiagnosticReport(report, pieces, "Winding alignment");
+    if (alignment.alignedWindingByPiece.size() != pieces ||
+        report.continuousWinding.size() != pieces ||
+        report.posteriorMeanLatentCoordinate.size() != pieces ||
+        report.mapLatentCoordinate.size() != pieces ||
+        report.candidateMinimum.size() != pieces ||
+        report.candidateMaximum.size() != pieces) {
+        throw std::invalid_argument(
+            "Winding alignment does not match represented pieces");
+    }
+
+    std::size_t components = 0;
+    for (const std::size_t component : report.componentByPiece)
+        components = std::max(components, component + 1);
+    if (alignment.components.size() != components ||
+        report.componentPhaseSign.size() != components ||
+        (!report.componentPositivePhaseSignProbability.empty() &&
+         report.componentPositivePhaseSignProbability.size() != components)) {
+        throw std::invalid_argument(
+            "Winding alignment does not match report components");
+    }
+
+    FiberTraceInterleavedWindingReport result = report;
+    for (std::size_t component = 0; component < components; ++component) {
+        const auto& transform = alignment.components[component];
+        if (!transform.resolved ||
+            (transform.sign != 1 && transform.sign != -1)) {
+            throw std::invalid_argument(
+                "Winding alignment contains an unresolved component");
+        }
+        result.componentPhaseSign[component] *= transform.sign;
+        if (!result.componentPositivePhaseSignProbability.empty() &&
+            transform.sign < 0) {
+            result.componentPositivePhaseSignProbability[component] =
+                1.0 - result.componentPositivePhaseSignProbability[component];
+        }
+    }
+
+    const auto transformDouble = [](double value, int sign, int offset) {
+        return std::isfinite(value)
+            ? static_cast<double>(sign) * value +
+                  static_cast<double>(offset)
+            : value;
+    };
+    for (std::size_t piece = 0; piece < pieces; ++piece) {
+        const auto& transform = alignment.components.at(
+            report.componentByPiece[piece]);
+        const auto transformInt = [&](int value) {
+            const long long transformed =
+                static_cast<long long>(transform.sign) * value +
+                transform.offset;
+            if (transformed < std::numeric_limits<int>::min() ||
+                transformed > std::numeric_limits<int>::max()) {
+                throw std::overflow_error(
+                    "Aligned winding exceeds the integer range");
+            }
+            return static_cast<int>(transformed);
+        };
+
+        if (report.windingValid[piece] != 0)
+            result.mapWinding[piece] = transformInt(report.mapWinding[piece]);
+        result.mapWindingHypothesis[piece] =
+            transformInt(report.mapWindingHypothesis[piece]);
+        result.continuousWinding[piece] = transformDouble(
+            report.continuousWinding[piece], transform.sign, transform.offset);
+        result.posteriorMeanWinding[piece] = transformDouble(
+            report.posteriorMeanWinding[piece],
+            transform.sign,
+            transform.offset);
+        result.posteriorMeanLatentCoordinate[piece] = transformDouble(
+            report.posteriorMeanLatentCoordinate[piece],
+            transform.sign,
+            transform.offset);
+        result.mapLatentCoordinate[piece] = transformDouble(
+            report.mapLatentCoordinate[piece],
+            transform.sign,
+            transform.offset);
+        if (transform.sign > 0) {
+            result.candidateMinimum[piece] =
+                transformInt(report.candidateMinimum[piece]);
+            result.candidateMaximum[piece] =
+                transformInt(report.candidateMaximum[piece]);
+        } else {
+            result.candidateMinimum[piece] =
+                transformInt(report.candidateMaximum[piece]);
+            result.candidateMaximum[piece] =
+                transformInt(report.candidateMinimum[piece]);
+        }
+    }
+    return result;
+}
+
 double quantizedHalfWindingTarget(double value)
 {
     if (value == 0.0)
@@ -4370,8 +5181,9 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
         }
         const auto& constraint =
             constraints.constraints[diagnostic.constraintIndex];
+        const auto signTerm = diagnosticSignTerm(diagnostic);
         const bool perpendicular = !constraint.hardContinuity &&
-            diagnostic.perpendicularScore >= diagnostic.parallelScore;
+            signTerm.perpendicular;
         const std::size_t a = std::min(
             diagnostic.pieceA, diagnostic.pieceB);
         const std::size_t b = std::max(
@@ -4424,11 +5236,10 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
                           PerpendicularMagnitudeFar,
                 active && quantizedHalfWindingTarget(latentDelta) != target);
         }
-        if (perpendicular && diagnostic.perpendicularSignPresent) {
+        if (perpendicular && signTerm.admitted) {
             emit(
                 FiberTraceConstraintAgreementClass::PerpendicularSign,
-                active && *diagnostic.effectivePerpendicularSignedDelta *
-                        latentDelta <= 0.0);
+                active && signTerm.target * latentDelta <= 0.0);
         }
         if (!perpendicular && diagnostic.parallelMagnitudePresent) {
             const double target =
@@ -4446,11 +5257,10 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
                     : std::abs(quantizedIntegerWindingTarget(latentDelta)) !=
                         target));
         }
-        if (!perpendicular && diagnostic.parallelSignPresent) {
+        if (!perpendicular && signTerm.admitted) {
             emit(
                 FiberTraceConstraintAgreementClass::ParallelSign,
-                active && *diagnostic.effectiveSignedParallelDelta *
-                        latentDelta <= 0.0);
+                active && signTerm.target * latentDelta <= 0.0);
         }
     }
     return result;
@@ -5859,6 +6669,321 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
                     distance <= tolerance + kEpsilon ? 1 : 0;
             }
         }
+    }
+    return result;
+}
+
+FiberTraceReferenceOracleScore scoreFiberTraceReferenceOracle(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    std::size_t referenceSources,
+    std::span<const unsigned char> requiredReferenceSources)
+{
+    if (!requiredReferenceSources.empty() &&
+        requiredReferenceSources.size() != referenceSources) {
+        throw std::invalid_argument(
+            "Oracle required-reference mask has the wrong size");
+    }
+    const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    FiberTraceReferenceOracleScore result;
+    for (std::size_t source = 0; source < referenceSources; ++source) {
+        if (!requiredReferenceSources.empty() &&
+            requiredReferenceSources[source] == 0) {
+            continue;
+        }
+        if (source >= benchmark.references.size() ||
+            !benchmark.references[source].estimatedWinding) {
+            ++result.missing;
+            continue;
+        }
+        const double truth = 0.5 * static_cast<double>(source);
+        if (std::abs(*benchmark.references[source].estimatedWinding - truth) <=
+            kEpsilon) {
+            ++result.exact;
+        } else {
+            ++result.wrong;
+        }
+    }
+    result.constraintRight = benchmark.sum.right;
+    result.constraintWrong = benchmark.sum.wrong;
+    return result;
+}
+
+bool fiberTraceReferenceOracleScoreImproves(
+    const FiberTraceReferenceOracleScore& candidate,
+    const FiberTraceReferenceOracleScore& incumbent) noexcept
+{
+    if (candidate.exact != incumbent.exact)
+        return candidate.exact > incumbent.exact;
+    if (candidate.wrong != incumbent.wrong)
+        return candidate.wrong < incumbent.wrong;
+    if (candidate.missing != incumbent.missing)
+        return candidate.missing < incumbent.missing;
+    return false;
+}
+
+FiberTraceReferenceOracleRemovalBatch
+selectFiberTraceReferenceOracleRemovalBatch(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    std::size_t referenceSources,
+    std::span<const unsigned char> requiredReferenceSources,
+    std::span<const double> pieceArcLengths,
+    double magnitudeEvidenceWeight,
+    std::size_t maximumPairCandidates,
+    std::span<const unsigned char> excludedPieces,
+    bool allowExploratoryProposal)
+{
+    if (!std::isfinite(magnitudeEvidenceWeight) ||
+        magnitudeEvidenceWeight < 0.0) {
+        throw std::invalid_argument(
+            "Oracle magnitude-evidence weight must be finite and nonnegative");
+    }
+    if (requiredReferenceSources.size() != referenceSources) {
+        throw std::invalid_argument(
+            "Oracle removal selection requires a fixed reference mask");
+    }
+    if (!excludedPieces.empty() &&
+        excludedPieces.size() != pieceArcLengths.size()) {
+        throw std::invalid_argument(
+            "Oracle excluded-piece mask has the wrong size");
+    }
+    for (const auto& observation : observations) {
+        validateReferenceObservation(observation);
+        if (observation.referenceSource >= referenceSources ||
+            observation.bpPiece >= pieceArcLengths.size()) {
+            throw std::invalid_argument(
+                "Oracle reference observation is out of range");
+        }
+    }
+    for (const double length : pieceArcLengths) {
+        if (!std::isfinite(length) || length < 0.0) {
+            throw std::invalid_argument(
+                "Oracle piece arc lengths must be finite and nonnegative");
+        }
+    }
+
+    FiberTraceReferenceOracleRemovalBatch result;
+    result.before = scoreFiberTraceReferenceOracle(
+        observations, referenceSources, requiredReferenceSources);
+    result.after = result.before;
+    if (result.before.wrong == 0)
+        return result;
+
+    const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    std::vector<unsigned char> wrongReference(referenceSources, 0);
+    for (std::size_t source = 0; source < referenceSources; ++source) {
+        if (source >= benchmark.references.size() ||
+            !benchmark.references[source].estimatedWinding) {
+            continue;
+        }
+        wrongReference[source] = std::abs(
+            *benchmark.references[source].estimatedWinding -
+            0.5 * static_cast<double>(source)) > kEpsilon;
+    }
+
+    std::vector<double> evidence(pieceArcLengths.size(), 0.0);
+    std::vector<unsigned char> candidate(pieceArcLengths.size(), 0);
+    for (const auto& observation : observations) {
+        if (wrongReference[observation.referenceSource] == 0 ||
+            !observation.bpEndpointActive ||
+            (!excludedPieces.empty() &&
+             excludedPieces[observation.bpPiece] != 0)) {
+            continue;
+        }
+        candidate[observation.bpPiece] = 1;
+        const bool sign = observation.parallelSignPresent ||
+            observation.perpendicularSignPresent ||
+            observation.hardParallelSign ||
+            observation.hardPerpendicularSign;
+        const double magnitude =
+            std::max(0.0, observation.admittedParallelCoefficient) +
+            std::max(0.0, observation.perpendicularCoefficient);
+        evidence[observation.bpPiece] += (sign ? 1.0 : 0.0) +
+            magnitudeEvidenceWeight * magnitude;
+    }
+
+    std::vector<std::size_t> candidates;
+    for (std::size_t piece = 0; piece < candidate.size(); ++piece) {
+        if (candidate[piece] != 0)
+            candidates.push_back(piece);
+    }
+    const auto filteredScore = [&](std::span<const std::size_t> removed) {
+        std::vector<FiberTraceReferenceWindingObservation> filtered;
+        filtered.reserve(observations.size());
+        for (const auto& observation : observations) {
+            if (std::find(removed.begin(), removed.end(),
+                          observation.bpPiece) == removed.end()) {
+                filtered.push_back(observation);
+            }
+        }
+        return scoreFiberTraceReferenceOracle(
+            filtered, referenceSources, requiredReferenceSources);
+    };
+    const auto sameReferenceScore = [](
+        const FiberTraceReferenceOracleScore& a,
+        const FiberTraceReferenceOracleScore& b) {
+        return a.exact == b.exact && a.wrong == b.wrong &&
+            a.missing == b.missing;
+    };
+    const auto agreementBetter = [](
+        const FiberTraceReferenceOracleScore& a,
+        const FiberTraceReferenceOracleScore& b) {
+        const std::size_t aTotal = a.constraintRight + a.constraintWrong;
+        const std::size_t bTotal = b.constraintRight + b.constraintWrong;
+        if (aTotal == 0 || bTotal == 0)
+            return aTotal > bTotal;
+        return static_cast<long double>(a.constraintRight) *
+                static_cast<long double>(bTotal) >
+            static_cast<long double>(b.constraintRight) *
+                static_cast<long double>(aTotal);
+    };
+    const auto consider = [&](std::vector<std::size_t> removed,
+                              FiberTraceReferenceOracleRemovalBatch& best) {
+        std::sort(removed.begin(), removed.end());
+        const auto after = filteredScore(removed);
+        if (!fiberTraceReferenceOracleScoreImproves(after, result.before))
+            return;
+        double removedArc = 0.0;
+        for (const std::size_t piece : removed)
+            removedArc += pieceArcLengths[piece];
+        const bool haveBest = !best.removedPieceIndices.empty();
+        const bool betterScore = !haveBest ||
+            fiberTraceReferenceOracleScoreImproves(after, best.after);
+        const bool equalScore = haveBest &&
+            sameReferenceScore(after, best.after);
+        const bool betterTie = equalScore &&
+            (removedArc < best.removedArcLength - kEpsilon ||
+             (std::abs(removedArc - best.removedArcLength) <= kEpsilon &&
+              (agreementBetter(after, best.after) ||
+               (!agreementBetter(best.after, after) &&
+                removed < best.removedPieceIndices))));
+        if (betterScore || betterTie) {
+            best.after = after;
+            best.removedPieceIndices = std::move(removed);
+            best.removedArcLength = removedArc;
+            best.counterfactualImprovement = true;
+        }
+    };
+
+    for (const std::size_t piece : candidates) {
+        ++result.evaluatedSingles;
+        consider({piece}, result);
+    }
+    if (!result.removedPieceIndices.empty())
+        return result;
+
+    std::sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) {
+        if (evidence[a] != evidence[b])
+            return evidence[a] > evidence[b];
+        if (pieceArcLengths[a] != pieceArcLengths[b])
+            return pieceArcLengths[a] < pieceArcLengths[b];
+        return a < b;
+    });
+    auto pairCandidates = candidates;
+    if (pairCandidates.size() > maximumPairCandidates)
+        pairCandidates.resize(maximumPairCandidates);
+    for (std::size_t first = 0; first < pairCandidates.size(); ++first) {
+        for (std::size_t second = first + 1;
+             second < pairCandidates.size(); ++second) {
+            ++result.evaluatedPairs;
+            consider({pairCandidates[first], pairCandidates[second]}, result);
+        }
+    }
+    if (!result.removedPieceIndices.empty())
+        return result;
+
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : benchmark.gauges)
+        offsetByGauge.emplace(gauge.integerGauge, gauge.offset);
+    std::vector<double> wrongAdvantage(pieceArcLengths.size(), 0.0);
+    std::vector<double> truthInconsistency(pieceArcLengths.size(), 0.0);
+    for (const auto& observation : observations) {
+        if (wrongReference[observation.referenceSource] == 0 ||
+            !observation.bpEndpointActive ||
+            observation.referenceSource >= benchmark.references.size() ||
+            !benchmark.references[observation.referenceSource].estimatedWinding) {
+            continue;
+        }
+        const auto offset = offsetByGauge.find(observation.integerGauge);
+        if (offset == offsetByGauge.end())
+            continue;
+        const double truth = static_cast<double>(benchmark.globalSign) *
+                (0.5 * static_cast<double>(observation.referenceSource)) +
+            offset->second;
+        const double wrong = static_cast<double>(benchmark.globalSign) *
+                *benchmark.references[observation.referenceSource].estimatedWinding +
+            offset->second;
+        const auto scored = makeReferenceScoredObservation(observation, 1, 0.0);
+        const auto truthScore = scoreReferenceObservation(scored, truth);
+        const auto wrongScore = scoreReferenceObservation(scored, wrong);
+        double inferredResidual = 0.0;
+        if (observation.inferredReferenceWindingCount != 0) {
+            inferredResidual = std::numeric_limits<double>::infinity();
+            for (std::size_t index = 0;
+                 index < observation.inferredReferenceWindingCount; ++index) {
+                inferredResidual = std::min(
+                    inferredResidual,
+                    std::abs(
+                        observation.inferredReferenceWindings[index] - truth));
+            }
+        }
+        truthInconsistency[observation.bpPiece] +=
+            1.0e6 * static_cast<double>(truthScore.hardViolations) +
+            magnitudeEvidenceWeight * (truthScore.loss + inferredResidual);
+        const double hardAdvantage = truthScore.hardViolations > wrongScore.hardViolations
+            ? static_cast<double>(truthScore.hardViolations - wrongScore.hardViolations)
+            : 0.0;
+        const double softAdvantage = std::max(0.0, truthScore.loss - wrongScore.loss);
+        wrongAdvantage[observation.bpPiece] +=
+            1.0e6 * hardAdvantage + magnitudeEvidenceWeight * softAdvantage;
+    }
+    std::vector<std::size_t> ranked;
+    for (const std::size_t piece : candidates) {
+        if (wrongAdvantage[piece] > 0.0)
+            ranked.push_back(piece);
+    }
+    if (ranked.empty()) {
+        for (const std::size_t piece : candidates) {
+            if (truthInconsistency[piece] > 0.0)
+                ranked.push_back(piece);
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](std::size_t a, std::size_t b) {
+            if (truthInconsistency[a] != truthInconsistency[b])
+                return truthInconsistency[a] > truthInconsistency[b];
+            if (pieceArcLengths[a] != pieceArcLengths[b])
+                return pieceArcLengths[a] < pieceArcLengths[b];
+            return a < b;
+        });
+        if (ranked.empty())
+            ranked = candidates;
+    } else {
+    std::sort(ranked.begin(), ranked.end(), [&](std::size_t a, std::size_t b) {
+        if (wrongAdvantage[a] != wrongAdvantage[b])
+            return wrongAdvantage[a] > wrongAdvantage[b];
+        if (pieceArcLengths[a] != pieceArcLengths[b])
+            return pieceArcLengths[a] < pieceArcLengths[b];
+        return a < b;
+    });
+    }
+    std::vector<std::size_t> batch;
+    batch.reserve(ranked.size());
+    for (const std::size_t piece : ranked) {
+        batch.push_back(piece);
+        consider(batch, result);
+        if (!result.removedPieceIndices.empty())
+            break;
+    }
+    if (result.removedPieceIndices.empty() && allowExploratoryProposal &&
+        !ranked.empty()) {
+        const std::size_t count = std::min(
+            ranked.size(), std::max<std::size_t>(1, maximumPairCandidates));
+        result.removedPieceIndices.assign(
+            ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(count));
+        std::sort(
+            result.removedPieceIndices.begin(),
+            result.removedPieceIndices.end());
+        result.after = filteredScore(result.removedPieceIndices);
+        for (const std::size_t piece : result.removedPieceIndices)
+            result.removedArcLength += pieceArcLengths[piece];
     }
     return result;
 }
@@ -7417,6 +8542,7 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
     report.classBProbability.resize(pieceCount);
     report.posteriorMeanLatentCoordinate.resize(pieceCount);
     report.mapLatentCoordinate.resize(pieceCount);
+    report.mapWindingHypothesis.resize(pieceCount);
     report.mapOrientationByPiece.resize(pieceCount);
     report.incidentSignedConstraints.assign(pieceCount, 0);
     report.incidentSkippedConstraints.assign(pieceCount, 0);
@@ -7555,6 +8681,7 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
         report.continuousWinding[piece] =
             active ? continuousNodes[node] : 0.0;
         report.mapWinding[piece] = active ? state.winding : 0;
+        report.mapWindingHypothesis[piece] = active ? state.winding : static_cast<int>(std::llround(continuousNodes[node]));
         report.mapOrientationByPiece[piece] = publicOrientation(state.orientation);
         report.mapLatentCoordinate[piece] =
             active ? static_cast<double>(state.winding) +

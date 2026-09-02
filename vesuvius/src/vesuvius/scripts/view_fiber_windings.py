@@ -13,23 +13,29 @@ from pathlib import Path
 import numpy as np
 from vesuvius.scripts.ordered_polyline_obj import read_ordered_polyline_obj
 
-_STATE_ORDER = ("h", "v", "err", "tie")
-_BROKEN_STATES = frozenset(("err", "tie"))
+_STATE_ORDER = ("h", "v", "err", "tie", "broken", "disabled")
+_BROKEN_STATES = frozenset(("err", "tie", "broken", "disabled"))
 _STATE_HEADERS = {
     "h": "VC3D Fiberlet crop traces: BP horizontal argmax",
     "v": "VC3D Fiberlet crop traces: BP vertical argmax",
     "err": "VC3D Fiberlet crop traces: BP error/Mixed argmax",
     "tie": "VC3D Fiberlet crop traces: BP exact argmax tie",
+    "broken": "VC3D Fiberlet crop traces: conditioned reference Defect",
+    "disabled": "VC3D Fiberlet crop traces: final pruned-solve Defect",
 }
 _STATE_NAMES = {
     "h": "H",
     "v": "V",
     "err": "Broken",
     "tie": "Tie",
+    "broken": "Conditioned broken",
+    "disabled": "Final disabled",
 }
 _STATE_HUE_OFFSETS = {
     "err": 0.38,
     "tie": 0.57,
+    "broken": 0.30,
+    "disabled": 0.48,
 }
 _REFERENCE_HEADER = "VC3D tagged reference fibers"
 _REFERENCE_COLOR = (1.0, 0.88, 0.12, 1.0)
@@ -417,6 +423,10 @@ def visible_winding_layers(
         states = frozenset(("v",))
     elif preset == "broken":
         states = _BROKEN_STATES
+    elif preset == "conditioned":
+        states = frozenset(("broken",))
+    elif preset == "disabled":
+        states = frozenset(("disabled",))
     elif preset == "winding":
         if winding is None or winding < 0:
             raise ValueError("winding preset requires a nonnegative winding")
@@ -688,7 +698,9 @@ def add_winding_controls(
     for label, preset in (
         ("H", "h"),
         ("V", "v"),
-        ("Broken", "broken"),
+        ("Cond broken", "conditioned"),
+        ("Final disabled", "disabled"),
+        ("All broken", "broken"),
         ("All", "all"),
         ("None", "none"),
     ):

@@ -1,5 +1,9 @@
 # Changelog
 
+- Added explicit union-MAP and conditioned-posterior variants to the
+  fixed-reference offender-pruning diagnostic, with policy-qualified artifacts
+  and directly comparable geometry/result reporting.
+
 - Ordered-cut winding diagnostics can use supplied reference fibers as an
   oracle to select the best split checkpoint for downstream analysis and
   artifacts.
@@ -223,3 +227,16 @@
   by exact sign-violation percentage, removes every split piece of the worst
   fiber, refits, and reports deletion-only versus post-refit violations at
   every iteration.
+- Added an opt-in fixed-reference offender-pruning experiment with exact
+  induced-subgraph re-solving and separate per-winding conditioned-broken and
+  final-disabled visualization layers.
+- Added a separately labeled reference benchmark for the fresh pruned solve;
+  benchmark labels and `_pruned` OBJ suffixes now share one phase-aware aligned
+  report.
+- Added reference-conditioned inlier construction for winding diagnostics,
+  with exact sign-conflict removal, reason-specific visualization layers, and a
+  separate fresh-solve stability result.
+- Added supervised iterative oracle-inlier construction with canonical
+  reference scoring, exact induced-subgraph re-solving, neutral collective
+  offender peeling, bounded graph-neighbor trials, and explicit unsupported
+  reference handling.

@@ -529,6 +529,11 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::vector<double> classBProbability;
     std::vector<double> posteriorMeanLatentCoordinate;
     std::vector<double> mapLatentCoordinate;
+    // Retains the decoded winding for active pieces and the rounded continuous
+    // winding hypothesis when projection marks a piece Defect. This is
+    // diagnostic only; mapWinding remains authoritative only when windingValid
+    // is nonzero.
+    std::vector<int> mapWindingHypothesis;
     std::vector<FiberTraceFixedOrientation> mapOrientationByPiece;
     std::vector<int> componentPhaseSign;
     std::vector<double> componentPositivePhaseSignProbability;
@@ -567,6 +572,108 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     bool conditionedMessageInitialization = false;
     bool calibrationConverged = false;
 };
+
+enum class FiberTraceConditionedOffenderPolicy : unsigned char {
+    ConditionedDefect,
+    UnionDefect,
+    ConditionedPosterior,
+    ConditionedInliers,
+    OracleInliers,
+};
+
+struct FiberTraceConditionedOffenderConfig {
+    FiberTraceConditionedOffenderPolicy policy =
+        FiberTraceConditionedOffenderPolicy::ConditionedDefect;
+    double conditionedDefectProbabilityThreshold = 0.5;
+    double inlierSignConflictWeight = 1.0;
+    double inlierMagnitudeSupportWeight = 0.0;
+    double inlierRetentionSupport = 1.0;
+    double oracleMagnitudeEvidenceWeight = 1.0;
+    std::size_t oracleMaximumRounds = 20;
+    std::size_t oracleMaximumPairCandidates = 32;
+    std::size_t oracleMinimumReferenceObservations = 3;
+};
+
+enum class FiberTraceConditionedRemovalReason : unsigned char {
+    None,
+    Policy,
+    ConditionedDefect,
+    DirectReferenceConflict,
+    SignConflictCover,
+    Disconnected,
+    Oracle,
+};
+
+struct FiberTraceConditionedOffenderSelection {
+    std::vector<std::size_t> retainedOrdinaryPieceIndices;
+    std::vector<std::size_t> brokenOrdinaryPieceIndices;
+    std::vector<std::optional<int>> inferredWindingByOrdinaryPiece;
+    std::vector<FiberTraceConditionedRemovalReason>
+        removalReasonByOrdinaryPiece;
+    std::size_t preexistingBrokenPieces = 0;
+    std::size_t newlyBrokenPieces = 0;
+    std::size_t baselineDefectPieces = 0;
+    std::size_t conditionedDefectPieces = 0;
+    std::size_t posteriorSelectedPieces = 0;
+    std::size_t selectedBaselineOnlyPieces = 0;
+    std::size_t selectedConditionedOnlyPieces = 0;
+    std::size_t selectedBothDefectPieces = 0;
+    std::size_t selectedNeitherDefectPieces = 0;
+    std::size_t unresolvedBrokenPieces = 0;
+    std::size_t conditionedActivePieces = 0;
+    std::size_t conditionedDefectRemovedPieces = 0;
+    std::size_t directReferenceConflictRemovedPieces = 0;
+    std::size_t conflictCoverRemovedPieces = 0;
+    std::size_t disconnectedRemovedPieces = 0;
+    std::size_t signFactors = 0;
+    std::size_t initialSignConflicts = 0;
+    std::size_t retainedSignConflicts = 0;
+    std::size_t protectedReferenceSignFactors = 0;
+    std::size_t protectedReferenceSignConflicts = 0;
+};
+
+[[nodiscard]] FiberTraceConditionedOffenderSelection selectFiberTraceConditionedOffenders(
+    const FiberTraceInterleavedWindingReport& baseline,
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceConditionedOffenderConfig& config = {});
+
+[[nodiscard]] FiberTraceConditionedOffenderSelection
+selectFiberTraceConditionedInliers(
+    const FiberTraceConstraintReport& conditionedConstraints,
+    const FiberTraceInterleavedWindingReport& baseline,
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceConditionedOffenderConfig& config = {});
+
+[[nodiscard]] FiberTraceInterleavedWindingReport
+extractFiberTraceConditionedOrdinaryReport(
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    std::span<const std::size_t> retainedOrdinaryPieceIndices);
+
+struct FiberTraceWindingGaugeAlignmentComponent {
+    int sign = 1;
+    int offset = 0;
+    std::size_t supportPieces = 0;
+    std::size_t exactMatches = 0;
+    bool resolved = false;
+};
+
+struct FiberTraceWindingGaugeAlignment {
+    std::vector<std::optional<int>> alignedWindingByPiece;
+    std::vector<FiberTraceWindingGaugeAlignmentComponent> components;
+};
+
+[[nodiscard]] FiberTraceWindingGaugeAlignment alignFiberTraceWindingToConditionedGauge(
+    const FiberTraceInterleavedWindingReport& conditioned,
+    std::size_t referencePieces,
+    const FiberTraceInterleavedWindingReport& finalReport,
+    std::span<const std::size_t> finalPieceToOrdinaryPiece);
+
+[[nodiscard]] FiberTraceInterleavedWindingReport applyFiberTraceWindingGaugeAlignment(
+    const FiberTraceInterleavedWindingReport& report,
+    const FiberTraceWindingGaugeAlignment& alignment);
 
 [[nodiscard]] FiberTraceConstraintAgreementSummary
 summarizeFiberTraceConstraintAgreement(
@@ -732,6 +839,44 @@ struct FiberTraceReferenceWindingBenchmark {
     std::vector<FiberTraceReferenceSourceBenchmark> references;
     FiberTraceReferenceBenchmarkCounts sum;
 };
+
+struct FiberTraceReferenceOracleScore {
+    std::size_t exact = 0;
+    std::size_t wrong = 0;
+    std::size_t missing = 0;
+    std::size_t constraintRight = 0;
+    std::size_t constraintWrong = 0;
+};
+
+struct FiberTraceReferenceOracleRemovalBatch {
+    FiberTraceReferenceOracleScore before;
+    FiberTraceReferenceOracleScore after;
+    std::vector<std::size_t> removedPieceIndices;
+    double removedArcLength = 0.0;
+    std::size_t evaluatedSingles = 0;
+    std::size_t evaluatedPairs = 0;
+    bool counterfactualImprovement = false;
+};
+
+[[nodiscard]] FiberTraceReferenceOracleScore scoreFiberTraceReferenceOracle(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    std::size_t referenceSources,
+    std::span<const unsigned char> requiredReferenceSources = {});
+
+[[nodiscard]] bool fiberTraceReferenceOracleScoreImproves(
+    const FiberTraceReferenceOracleScore& candidate,
+    const FiberTraceReferenceOracleScore& incumbent) noexcept;
+
+[[nodiscard]] FiberTraceReferenceOracleRemovalBatch
+selectFiberTraceReferenceOracleRemovalBatch(
+    std::span<const FiberTraceReferenceWindingObservation> observations,
+    std::size_t referenceSources,
+    std::span<const unsigned char> requiredReferenceSources,
+    std::span<const double> pieceArcLengths,
+    double magnitudeEvidenceWeight,
+    std::size_t maximumPairCandidates,
+    std::span<const unsigned char> excludedPieces = {},
+    bool allowExploratoryProposal = false);
 
 enum class FiberTraceReferenceOrientationRelation : unsigned char {
     Perpendicular,

@@ -87,6 +87,16 @@ struct Options {
     std::filesystem::path referenceFiberDirectory;
     std::string referenceFiberTag;
     bool referenceConditioningDiagnostic = false;
+    bool referencePruneOffenders = false;
+    vc::fiber_tracer::FiberTraceConditionedOffenderConfig
+        referencePruneConfig;
+    bool hasReferencePrunePolicyOption = false;
+    bool hasReferencePruneProbabilityOption = false;
+    bool hasReferenceInlierSignWeightOption = false;
+    bool hasReferenceInlierMagnitudeWeightOption = false;
+    bool hasReferenceInlierRetentionOption = false;
+    bool hasReferenceOracleOption = false;
+    bool referenceOracleAcceptMessageLimit = false;
     bool referenceConstraintDetails = false;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
@@ -249,6 +259,28 @@ void usage(const char* executable)
               << "  --reference-fiber-tag TAG exact tag selected from that directory\n"
               << "  --reference-conditioning-diagnostic\n"
               << "                              run fixed-reference and warm-start BP diagnostics\n\n"
+              << "  --reference-prune-offenders\n"
+              << "                              remove conditioned Defects and re-solve ordinary graph\n\n"
+              << "  --reference-prune-policy MODE\n"
+              << "                              conditioned-defect, union-defect, conditioned-posterior, conditioned-inliers, or oracle-inliers\n"
+              << "  --reference-prune-defect-probability F\n"
+              << "                              conditioned-posterior threshold in [0,1]\n\n"
+              << "  --reference-inlier-sign-weight F\n"
+              << "                              positive sign-conflict ranking weight [1]\n"
+              << "  --reference-inlier-magnitude-weight F\n"
+              << "                              nonnegative soft magnitude-support weight [0]\n"
+              << "  --reference-inlier-retention F\n"
+              << "                              positive retained-piece support floor [1]\n\n"
+              << "  --reference-oracle-magnitude-weight F\n"
+              << "                              nonnegative oracle candidate-ranking weight [1]\n"
+              << "  --reference-oracle-rounds N\n"
+              << "                              maximum conditioned oracle re-solves [20]\n"
+              << "  --reference-oracle-pair-candidates N\n"
+              << "                              top candidates used for bounded pair search [32]\n"
+              << "  --reference-oracle-min-observations N\n"
+              << "                              active cross-constraints required per oracle reference [3]\n\n"
+              << "  --reference-oracle-accept-message-limit\n"
+              << "                              score capped conditioned states (diagnostic only)\n\n"
               << "  --reference-constraint-details\n"
               << "                              print every reference piece-pair constraint\n\n"
               << "Trace options:\n"
@@ -509,6 +541,87 @@ Options parse(int argc, char** argv)
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-conditioning-diagnostic") {
             options.referenceConditioningDiagnostic = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-prune-offenders") {
+            options.referencePruneOffenders = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-prune-policy") {
+            const std::string policy = value(
+                index, argc, argv, "--reference-prune-policy");
+            if (policy == "conditioned-defect") {
+                options.referencePruneConfig.policy = vc::fiber_tracer::
+                    FiberTraceConditionedOffenderPolicy::ConditionedDefect;
+            } else if (policy == "union-defect") {
+                options.referencePruneConfig.policy = vc::fiber_tracer::
+                    FiberTraceConditionedOffenderPolicy::UnionDefect;
+            } else if (policy == "conditioned-posterior") {
+                options.referencePruneConfig.policy = vc::fiber_tracer::
+                    FiberTraceConditionedOffenderPolicy::ConditionedPosterior;
+            } else if (policy == "conditioned-inliers") {
+                options.referencePruneConfig.policy = vc::fiber_tracer::
+                    FiberTraceConditionedOffenderPolicy::ConditionedInliers;
+            } else if (policy == "oracle-inliers") {
+                options.referencePruneConfig.policy = vc::fiber_tracer::
+                    FiberTraceConditionedOffenderPolicy::OracleInliers;
+            } else {
+                fail("--reference-prune-policy must be conditioned-defect, union-defect, conditioned-posterior, conditioned-inliers, or oracle-inliers");
+            }
+            options.hasReferencePrunePolicyOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-prune-defect-probability") {
+            options.referencePruneConfig.conditionedDefectProbabilityThreshold =
+                number(index, argc, argv, "--reference-prune-defect-probability");
+            options.hasReferencePruneProbabilityOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-inlier-sign-weight") {
+            options.referencePruneConfig.inlierSignConflictWeight =
+                number(index, argc, argv, "--reference-inlier-sign-weight");
+            options.hasReferenceInlierSignWeightOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-inlier-magnitude-weight") {
+            options.referencePruneConfig.inlierMagnitudeSupportWeight =
+                number(index, argc, argv, "--reference-inlier-magnitude-weight");
+            options.hasReferenceInlierMagnitudeWeightOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-inlier-retention") {
+            options.referencePruneConfig.inlierRetentionSupport =
+                number(index, argc, argv, "--reference-inlier-retention");
+            options.hasReferenceInlierRetentionOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-oracle-magnitude-weight") {
+            options.referencePruneConfig.oracleMagnitudeEvidenceWeight =
+                number(index, argc, argv, "--reference-oracle-magnitude-weight");
+            options.hasReferenceOracleOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-oracle-rounds") {
+            options.referencePruneConfig.oracleMaximumRounds =
+                count(index, argc, argv, "--reference-oracle-rounds");
+            options.hasReferenceOracleOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-oracle-pair-candidates") {
+            options.referencePruneConfig.oracleMaximumPairCandidates =
+                count(index, argc, argv, "--reference-oracle-pair-candidates");
+            options.hasReferenceOracleOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-oracle-min-observations") {
+            options.referencePruneConfig.oracleMinimumReferenceObservations =
+                count(index, argc, argv, "--reference-oracle-min-observations");
+            options.hasReferenceOracleOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-oracle-accept-message-limit") {
+            options.referenceOracleAcceptMessageLimit = true;
+            options.hasReferenceOracleOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--reference-constraint-details") {
@@ -1273,6 +1386,64 @@ Options parse(int argc, char** argv)
             !options.hasReferenceFiberDirectoryOption) {
             fail("--reference-conditioning-diagnostic requires reference fibers");
         }
+        if (options.referencePruneOffenders && !options.hasReferenceFiberDirectoryOption) {
+            fail("--reference-prune-offenders requires reference fibers");
+        }
+        if (options.referencePruneOffenders && (!options.bpOnly || options.bpInference != vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed)) {
+            fail("--reference-prune-offenders requires --bp-only --bp-inference sum-product-mixed");
+        }
+        if ((options.hasReferencePrunePolicyOption ||
+             options.hasReferencePruneProbabilityOption ||
+             options.hasReferenceInlierSignWeightOption ||
+             options.hasReferenceInlierMagnitudeWeightOption ||
+             options.hasReferenceInlierRetentionOption ||
+             options.hasReferenceOracleOption) &&
+            !options.referencePruneOffenders) {
+            fail("reference-prune selection options require --reference-prune-offenders");
+        }
+        if (options.hasReferencePruneProbabilityOption &&
+            (options.referencePruneConfig.conditionedDefectProbabilityThreshold < 0.0 ||
+             options.referencePruneConfig.conditionedDefectProbabilityThreshold > 1.0)) {
+            fail("--reference-prune-defect-probability must be in [0, 1]");
+        }
+        const bool posteriorPruning = options.referencePruneConfig.policy ==
+            vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedPosterior;
+        const bool inlierPruning = options.referencePruneConfig.policy ==
+                vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedInliers ||
+            options.referencePruneConfig.policy ==
+                vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::OracleInliers;
+        const bool oraclePruning = options.referencePruneConfig.policy ==
+            vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::OracleInliers;
+        if (posteriorPruning &&
+            !options.hasReferencePruneProbabilityOption) {
+            fail("conditioned-posterior pruning requires --reference-prune-defect-probability");
+        }
+        if (!posteriorPruning &&
+            options.hasReferencePruneProbabilityOption) {
+            fail("--reference-prune-defect-probability is only valid with conditioned-posterior pruning");
+        }
+        const bool hasInlierTuning =
+            options.hasReferenceInlierSignWeightOption ||
+            options.hasReferenceInlierMagnitudeWeightOption ||
+            options.hasReferenceInlierRetentionOption;
+        if (hasInlierTuning && !inlierPruning) {
+            fail("reference-inlier weights are only valid with conditioned-inliers pruning");
+        }
+        if (inlierPruning &&
+            (!(options.referencePruneConfig.inlierSignConflictWeight > 0.0) ||
+             options.referencePruneConfig.inlierMagnitudeSupportWeight < 0.0 ||
+             !(options.referencePruneConfig.inlierRetentionSupport > 0.0))) {
+            fail("conditioned-inliers requires positive sign/retention weights and a nonnegative magnitude weight");
+        }
+        if (options.hasReferenceOracleOption && !oraclePruning) {
+            fail("reference-oracle options are only valid with oracle-inliers pruning");
+        }
+        if (oraclePruning &&
+            (!(options.referencePruneConfig.oracleMagnitudeEvidenceWeight >= 0.0) ||
+             options.referencePruneConfig.oracleMaximumRounds == 0 ||
+             options.referencePruneConfig.oracleMinimumReferenceObservations == 0)) {
+            fail("oracle-inliers requires a nonnegative magnitude weight, at least one round, and at least one reference observation");
+        }
         if (options.referenceConstraintDetails &&
             !options.hasReferenceFiberDirectoryOption) {
             fail("--reference-constraint-details requires reference fibers");
@@ -1431,6 +1602,12 @@ Options parse(int argc, char** argv)
                 FiberTraceWindingSolver::Alternating &&
             options.hasFixedCalibrationOption) {
             fail("fixed winding calibration requires joint-grid or Ceres");
+        }
+        if (options.referencePruneOffenders && options.windingSolver != vc::fiber_tracer::FiberTraceWindingSolver::JointGrid) {
+            fail("--reference-prune-offenders requires --winding-solver joint-grid");
+        }
+        if (options.referencePruneOffenders && !options.windingFixedOrientation) {
+            fail("--reference-prune-offenders requires --winding-fixed-orientation");
         }
         const bool hasExplicitFixedPhase =
             options.jointGrid.fixedPhaseMagnitude.has_value();
@@ -3978,6 +4155,38 @@ struct ReferenceBpCrossConstraints {
     std::size_t referencePieces = 0;
 };
 
+ReferenceBpCrossConstraints subsetReferenceBpCrossConstraints(
+    const ReferenceBpCrossConstraints& cross,
+    std::span<const std::size_t> retainedOrdinaryPieceIndices)
+{
+    if (cross.referencePieces > cross.report.pieces.size()) {
+        throw std::invalid_argument(
+            "Reference cross-constraint prefix exceeds represented pieces");
+    }
+    const std::size_t ordinaryPieces =
+        cross.report.pieces.size() - cross.referencePieces;
+    std::vector<std::size_t> retained;
+    retained.reserve(
+        cross.referencePieces + retainedOrdinaryPieceIndices.size());
+    for (std::size_t piece = 0; piece < cross.referencePieces; ++piece)
+        retained.push_back(piece);
+    for (const std::size_t ordinaryPiece : retainedOrdinaryPieceIndices) {
+        if (ordinaryPiece >= ordinaryPieces) {
+            throw std::invalid_argument(
+                "Retained ordinary piece exceeds reference cross report");
+        }
+        retained.push_back(cross.referencePieces + ordinaryPiece);
+    }
+    auto subset = vc::fiber_tracer::subsetFiberTraceConstraintReport(
+        cross.report, retained);
+    if (subset.report.inputTraces != retained.size() ||
+        subset.report.pieces.size() != retained.size()) {
+        throw std::logic_error(
+            "Reference cross-constraint subset did not preserve canonical pieces");
+    }
+    return {std::move(subset.report), cross.referencePieces};
+}
+
 struct ReferenceCeresLeastSquaresRow {
     std::size_t source = 0;
     std::size_t pieces = 0;
@@ -5025,6 +5234,22 @@ std::optional<std::size_t> selectOrderedCutsReferenceOracleStep(
     return bestIndex;
 }
 
+void validateFixedReferenceConditionedResult(const FixedReferenceConditionedProblem& problem, const vc::fiber_tracer::FiberTraceInterleavedWindingReport& conditioned)
+{
+    if (conditioned.windingValid.size() != problem.constraints.pieces.size() ||
+        conditioned.mapOrientationByPiece.size() != problem.constraints.pieces.size() ||
+        conditioned.mapWinding.size() != problem.constraints.pieces.size()) {
+        throw std::invalid_argument("Fixed-reference conditioned result has the wrong size");
+    }
+    for (std::size_t piece = 0; piece < problem.referencePieces; ++piece) {
+        const auto& fixed = problem.fixedStates.at(piece);
+        if (!fixed.fixed || conditioned.windingValid[piece] == 0 || conditioned.mapOrientationByPiece[piece] != fixed.orientation ||
+            conditioned.mapWinding[piece] != fixed.winding) {
+            throw std::logic_error("Conditioned solve altered a fixed reference state");
+        }
+    }
+}
+
 std::string formatFixedReferenceConditionedComparison(
     const ReferenceFiberDiagnostics& reference,
     const FixedReferenceConditionedProblem& problem,
@@ -5041,15 +5266,7 @@ std::string formatFixedReferenceConditionedComparison(
         throw std::invalid_argument(
             "Fixed-reference comparison inputs do not match");
     }
-    for (std::size_t piece = 0; piece < problem.referencePieces; ++piece) {
-        const auto& fixed = problem.fixedStates.at(piece);
-        if (!fixed.fixed || conditioned.windingValid[piece] == 0 ||
-            conditioned.mapOrientationByPiece[piece] != fixed.orientation ||
-            conditioned.mapWinding[piece] != fixed.winding) {
-            throw std::logic_error(
-                "Conditioned solve altered a fixed reference state");
-        }
-    }
+    validateFixedReferenceConditionedResult(problem, conditioned);
     struct PieceChange {
         std::size_t crossFactors = 0;
         std::size_t hardFactors = 0;
@@ -5360,6 +5577,267 @@ makeConditionedOrdinaryWarmStart(
     return result;
 }
 
+struct ReferencePruneArtifactReport {
+    std::filesystem::path outputBase;
+    std::size_t finalHorizontalPieces = 0;
+    std::size_t finalVerticalPieces = 0;
+    std::size_t conditionedBrokenPieces = 0;
+    std::size_t finalDisabledPieces = 0;
+    std::size_t unresolvedPieces = 0;
+    std::size_t windingLayers = 0;
+    int outputOffset = 0;
+};
+
+std::string referencePruneArtifactSuffix(
+    const vc::fiber_tracer::FiberTraceConditionedOffenderConfig& config)
+{
+    using Policy =
+        vc::fiber_tracer::FiberTraceConditionedOffenderPolicy;
+    if (config.policy == Policy::ConditionedDefect)
+        return "_pruned";
+    if (config.policy == Policy::UnionDefect)
+        return "_pruned_union";
+    if (config.policy == Policy::ConditionedInliers)
+        return "_inliers";
+    if (config.policy == Policy::OracleInliers)
+        return "_oracle";
+    std::ostringstream threshold;
+    threshold << std::fixed << std::setprecision(6)
+              << config.conditionedDefectProbabilityThreshold;
+    std::string label = threshold.str();
+    while (label.size() > 1 && label.back() == '0')
+        label.pop_back();
+    if (!label.empty() && label.back() == '.')
+        label.pop_back();
+    std::replace(label.begin(), label.end(), '.', 'p');
+    return "_pruned_p" + label;
+}
+
+double polylineLengthBase(
+    std::span<const cv::Vec3d> points)
+{
+    double length = 0.0;
+    for (std::size_t point = 1; point < points.size(); ++point)
+        length += cv::norm(points[point] - points[point - 1]);
+    return length;
+}
+
+bool isReferencePruneWindingArtifact(const std::filesystem::path& outputBase, const std::filesystem::path& candidate)
+{
+    const std::string name = candidate.filename().string();
+    const std::string prefix = outputBase.stem().string() + "_w_";
+    constexpr std::string_view extension = ".obj";
+    if (!name.starts_with(prefix) || !name.ends_with(extension))
+        return false;
+    const std::string_view middle{name.data() + prefix.size(), name.size() - prefix.size() - extension.size()};
+    const std::size_t separator = middle.find('_');
+    if (separator == std::string_view::npos || separator == 0)
+        return false;
+    if (!std::all_of(middle.begin(), middle.begin() + static_cast<std::ptrdiff_t>(separator), [](char value) {
+            return value >= '0' && value <= '9';
+        })) {
+        return false;
+    }
+    const std::string_view state = middle.substr(separator + 1);
+    return state == "h" || state == "v" || state == "err" || state == "tie" || state == "broken" || state == "disabled" ||
+        state == "input_defect" || state == "ref_conflict" || state == "sign_cover" || state == "disconnected" || state == "oracle";
+}
+
+ReferencePruneArtifactReport publishReferencePruneArtifacts(
+    const std::filesystem::path& output,
+    std::string_view outputSuffix,
+    const ReferenceFiberDiagnostics& reference,
+    std::span<const vc::fiber_tracer::FiberletCropTraceLine> ordinaryPieceLines,
+    const vc::fiber_tracer::FiberTraceConditionedOffenderSelection& selection,
+    std::span<const vc::fiber_tracer::FiberletCropTraceLine> finalPieceLines,
+    const vc::fiber_tracer::FiberTraceConstraintSubsetResult& subset,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& finalReport)
+{
+    using Orientation = vc::fiber_tracer::FiberTraceFixedOrientation;
+    if (selection.inferredWindingByOrdinaryPiece.size() != ordinaryPieceLines.size() ||
+        selection.removalReasonByOrdinaryPiece.size() != ordinaryPieceLines.size() ||
+        finalPieceLines.size() != subset.retainedPieceIndices.size() || finalReport.windingValid.size() != finalPieceLines.size() ||
+        finalReport.mapOrientationByPiece.size() != finalPieceLines.size() || finalReport.mapWindingHypothesis.size() != finalPieceLines.size()) {
+        throw std::invalid_argument("Reference-prune artifacts do not match represented pieces");
+    }
+
+    struct PendingLine {
+        int winding = 0;
+        std::string state;
+        vc::core::io::NamedPolyline line;
+    };
+    std::vector<PendingLine> pending;
+    std::vector<vc::core::io::NamedPolyline> unresolved;
+    ReferencePruneArtifactReport result;
+    result.outputBase = output.parent_path() /
+        (output.stem().string() + std::string(outputSuffix));
+
+    for (const std::size_t ordinaryPiece : selection.brokenOrdinaryPieceIndices) {
+        if (ordinaryPiece >= ordinaryPieceLines.size()) {
+            throw std::logic_error("Conditioned offender index is out of range");
+        }
+        vc::core::io::NamedPolyline line{
+            "conditioned_broken_piece_" + std::to_string(ordinaryPiece),
+            ordinaryPieceLines[ordinaryPiece].pointsBaseXYZ,
+        };
+        const auto winding = selection.inferredWindingByOrdinaryPiece[ordinaryPiece];
+        if (winding) {
+            using Reason = vc::fiber_tracer::FiberTraceConditionedRemovalReason;
+            const std::string state = [&] {
+                switch (selection.removalReasonByOrdinaryPiece[ordinaryPiece]) {
+                case Reason::ConditionedDefect:
+                    return std::string{"input_defect"};
+                case Reason::DirectReferenceConflict:
+                    return std::string{"ref_conflict"};
+                case Reason::SignConflictCover:
+                    return std::string{"sign_cover"};
+                case Reason::Disconnected:
+                    return std::string{"disconnected"};
+                case Reason::Oracle:
+                    return std::string{"oracle"};
+                case Reason::Policy:
+                case Reason::None:
+                    return std::string{"broken"};
+                }
+                return std::string{"broken"};
+            }();
+            pending.push_back({*winding, state, std::move(line)});
+            ++result.conditionedBrokenPieces;
+        } else {
+            unresolved.push_back(std::move(line));
+            ++result.unresolvedPieces;
+        }
+    }
+    for (std::size_t piece = 0; piece < finalPieceLines.size(); ++piece) {
+        const std::size_t ordinaryPiece = subset.retainedPieceIndices[piece];
+        vc::core::io::NamedPolyline line{
+            "final_piece_" + std::to_string(ordinaryPiece),
+            finalPieceLines[piece].pointsBaseXYZ,
+        };
+        const int winding = finalReport.windingValid[piece] != 0
+            ? finalReport.mapWinding[piece]
+            : finalReport.mapWindingHypothesis[piece];
+        if (finalReport.windingValid[piece] == 0) {
+            pending.push_back({winding, "disabled", std::move(line)});
+            ++result.finalDisabledPieces;
+            continue;
+        }
+        const auto orientation = finalReport.mapOrientationByPiece[piece];
+        if (orientation == Orientation::Horizontal) {
+            pending.push_back({winding, "h", std::move(line)});
+            ++result.finalHorizontalPieces;
+        } else if (orientation == Orientation::Vertical) {
+            pending.push_back({winding, "v", std::move(line)});
+            ++result.finalVerticalPieces;
+        } else {
+            throw std::logic_error("Active final reference-prune piece has Mixed orientation");
+        }
+    }
+
+    if (!pending.empty()) {
+        const auto minimum =
+            std::min_element(pending.begin(), pending.end(), [](const PendingLine& a, const PendingLine& b) { return a.winding < b.winding; });
+        result.outputOffset = -minimum->winding;
+    }
+    using ArtifactKey = std::pair<int, std::string>;
+    std::map<ArtifactKey, std::vector<vc::core::io::NamedPolyline>> grouped;
+    for (auto& line : pending) {
+        grouped[{line.winding + result.outputOffset, line.state}].push_back(std::move(line.line));
+    }
+    std::set<int> windingLabels;
+    for (const auto& [key, lines] : grouped) {
+        (void)lines;
+        windingLabels.insert(key.first);
+    }
+    result.windingLayers = windingLabels.size();
+
+    struct Artifact {
+        std::filesystem::path finalPath;
+        std::filesystem::path stagedPath;
+        std::vector<vc::core::io::NamedPolyline> lines;
+        std::string comment;
+    };
+    const std::map<std::string, std::string> comments{
+        {"h", "VC3D Fiberlet crop traces: BP horizontal argmax"},
+        {"v", "VC3D Fiberlet crop traces: BP vertical argmax"},
+        {"broken", "VC3D Fiberlet crop traces: selected pruning offender"},
+        {"input_defect", "VC3D Fiberlet crop traces: conditioned Defect removed from inlier set"},
+        {"ref_conflict", "VC3D Fiberlet crop traces: direct reference sign conflict"},
+        {"sign_cover", "VC3D Fiberlet crop traces: ordinary sign-conflict cover"},
+        {"disconnected", "VC3D Fiberlet crop traces: disconnected from reference-supported inliers"},
+        {"oracle", "VC3D Fiberlet crop traces: removed by reference oracle search"},
+        {"disabled", "VC3D Fiberlet crop traces: final pruned-solve Defect"},
+    };
+    std::vector<Artifact> artifacts;
+    artifacts.reserve(grouped.size() + 1);
+    for (auto& [key, lines] : grouped) {
+        const auto path = result.outputBase.parent_path() /
+                          (result.outputBase.stem().string() + "_w_" + std::to_string(key.first) + "_" + key.second + ".obj");
+        artifacts.push_back({
+            path,
+            path.string() + ".tmp",
+            std::move(lines),
+            comments.at(key.second),
+        });
+    }
+    const auto unresolvedPath = result.outputBase.parent_path() / (result.outputBase.stem().string() + "_unresolved.obj");
+    artifacts.push_back({
+        unresolvedPath,
+        unresolvedPath.string() + ".tmp",
+        std::move(unresolved),
+        "VC3D Fiberlet crop traces: unresolved diagnostic winding",
+    });
+
+    const auto cleanStaged = [&] {
+        for (const auto& artifact : artifacts) {
+            std::error_code ignored;
+            std::filesystem::remove(artifact.stagedPath, ignored);
+        }
+    };
+    try {
+        cleanStaged();
+        for (const auto& artifact : artifacts) {
+            vc::core::io::writePolylinesObj(artifact.lines, artifact.stagedPath, artifact.comment);
+        }
+        std::error_code error;
+        if (std::filesystem::exists(result.outputBase.parent_path(), error)) {
+            for (const auto& entry : std::filesystem::directory_iterator(result.outputBase.parent_path())) {
+                if (isReferencePruneWindingArtifact(result.outputBase, entry.path())) {
+                    removeReferenceFiberArtifact(entry.path());
+                }
+            }
+        }
+        removeReferenceFiberArtifact(unresolvedPath);
+        std::vector<std::filesystem::path> published;
+        try {
+            for (const auto& artifact : artifacts) {
+                std::filesystem::rename(artifact.stagedPath, artifact.finalPath);
+                published.push_back(artifact.finalPath);
+            }
+        } catch (...) {
+            for (const auto& path : published) {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
+            throw;
+        }
+    } catch (...) {
+        cleanStaged();
+        throw;
+    }
+
+    std::vector<vc::core::io::NamedPolyline> referenceLines;
+    referenceLines.reserve(reference.lines.size());
+    for (std::size_t index = 0; index < reference.lines.size(); ++index) {
+        referenceLines.push_back({
+            "reference_" + std::to_string(index) + "_" + reference.sourceNames.at(index),
+            reference.lines[index].pointsBaseXYZ,
+        });
+    }
+    publishReferenceFiberArtifacts(result.outputBase, referenceLines);
+    return result;
+}
+
 std::string formatConditionedWarmStartComparison(
     const vc::fiber_tracer::FiberTraceInterleavedWindingReport& cold,
     const vc::fiber_tracer::FiberTraceInterleavedWindingReport& conditioned,
@@ -5624,13 +6102,15 @@ std::string formatReferenceBpWindingBenchmark(
     const vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig& config,
     const vc::fiber_tracer::FiberTraceConstraintReport& bpConstraints,
     std::span<const std::size_t> bpOriginalTraceIndices,
-    bool includeConstraintDetails)
+    bool includeConstraintDetails,
+    std::optional<int> windingOutputOffsetOverride = std::nullopt)
 {
     const auto observations = makeReferenceBpWindingObservations(
         reference, cross, winding, config);
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
-    const int windingOutputOffset = publishedWindingRange(winding).outputOffset();
+    const int windingOutputOffset = windingOutputOffsetOverride.value_or(
+        publishedWindingRange(winding).outputOffset());
     const auto orientationBenchmark = vc::fiber_tracer::
         benchmarkFiberTraceReferenceOrientations(observations);
     const auto clampedConflicts = vc::fiber_tracer::
@@ -7951,7 +8431,8 @@ int main(int argc, char** argv)
                                     });
                                 std::cout
                                     << "winding weight search ranking\n"
-                                    << "rank  weights  ref_exact  ref_wrong  ref_missing  right  wrong  fraction  converged  seconds\n";
+                                    << "rank  weights  ref_exact  ref_wrong  ref_missing  right  wrong  fraction  converged  "
+                                             "seconds\n";
                                 for (std::size_t rank = 0;
                                      rank < rows.size();
                                      ++rank) {
@@ -8262,7 +8743,8 @@ int main(int argc, char** argv)
 
                             std::optional<std::string>
                                 fixedReferenceConditionedDiagnostics;
-                            if (options.referenceConditioningDiagnostic &&
+                            std::optional<std::string> referencePruneDiagnostics;
+                            if ((options.referenceConditioningDiagnostic || options.referencePruneOffenders) &&
                                 jointGrid && referenceDiagnostics &&
                                 referenceBpConstraints &&
                                 interleavedWinding) {
@@ -8337,7 +8819,7 @@ int main(int argc, char** argv)
                                     << " ordinary_factors="
                                     << bpConstraints.constraints.size()
                                     << '\n' << std::flush;
-                                const auto conditioned = vc::fiber_tracer::
+                                auto conditioned = vc::fiber_tracer::
                                     solveFiberTraceJointGridWindingBeliefPropagation(
                                         conditionedProblem.constraints,
                                         conditionedTopology,
@@ -8345,7 +8827,638 @@ int main(int argc, char** argv)
                                         {},
                                         conditionedOrientations,
                                         conditionedProblem.fixedStates);
-                                fixedReferenceConditionedDiagnostics =
+                                validateFixedReferenceConditionedResult(conditionedProblem, conditioned);
+                                if (options.referencePruneOffenders) {
+                                    const bool oracleInliers =
+                                        options.referencePruneConfig.policy ==
+                                        vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::OracleInliers;
+                                    const bool conditionedInliers = oracleInliers ||
+                                        options.referencePruneConfig.policy ==
+                                        vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedInliers;
+                                    auto inlierConfig = options.referencePruneConfig;
+                                    if (oracleInliers) {
+                                        inlierConfig.policy = vc::fiber_tracer::
+                                            FiberTraceConditionedOffenderPolicy::ConditionedInliers;
+                                    }
+                                    auto selection = conditionedInliers
+                                        ? vc::fiber_tracer::selectFiberTraceConditionedInliers(
+                                              conditionedProblem.constraints,
+                                              *interleavedWinding,
+                                              conditioned,
+                                              conditionedProblem.referencePieces,
+                                              inlierConfig)
+                                        : vc::fiber_tracer::selectFiberTraceConditionedOffenders(
+                                              *interleavedWinding,
+                                              conditioned,
+                                              conditionedProblem.referencePieces,
+                                              options.referencePruneConfig);
+                                    std::string oracleDiagnostics;
+                                    std::vector<std::size_t> oracleLocalGaugeMapping;
+                                    if (oracleInliers) {
+                                        struct OracleState {
+                                            vc::fiber_tracer::FiberTraceConstraintSubsetResult subset;
+                                            ReferenceBpCrossConstraints cross;
+                                            FixedReferenceConditionedProblem problem;
+                                            vc::fiber_tracer::FiberTraceInterleavedWindingReport baseline;
+                                            vc::fiber_tracer::FiberTraceInterleavedWindingReport conditioned;
+                                            std::vector<vc::fiber_tracer::FiberletCropTraceLine> sourceLines;
+                                            vc::fiber_tracer::FiberTraceReferenceOracleScore score;
+                                        };
+                                        const auto buildOracleState = [&](const std::vector<std::size_t>& retained,
+                                                                          std::span<const unsigned char> required) {
+                                            OracleState state;
+                                            state.subset = vc::fiber_tracer::subsetFiberTraceConstraintReport(
+                                                bpConstraints, retained);
+                                            state.sourceLines.reserve(state.subset.retainedTraceIndices.size());
+                                            for (const std::size_t oldTrace : state.subset.retainedTraceIndices)
+                                                state.sourceLines.push_back(bpSourceLines.at(oldTrace));
+                                            state.cross = subsetReferenceBpCrossConstraints(
+                                                *referenceBpConstraints, retained);
+                                            state.baseline = vc::fiber_tracer::extractFiberTraceConditionedOrdinaryReport(
+                                                *interleavedWinding, 0, retained);
+                                            state.problem = makeFixedReferenceConditionedProblem(
+                                                *referenceDiagnostics,
+                                                state.cross,
+                                                state.sourceLines,
+                                                state.subset.report,
+                                                state.baseline,
+                                                referenceCalibration,
+                                                options.labeling,
+                                                *options.jointGrid.fixedPhaseMagnitude);
+                                            const auto topology = vc::fiber_tracer::prepareFiberTraceBeliefTopology(
+                                                state.problem.lines,
+                                                state.problem.constraints,
+                                                artifact.minimumBaseXYZ,
+                                                artifact.maximumBaseXYZ);
+                                            std::vector<vc::fiber_tracer::FiberTraceFixedOrientation> orientations(
+                                                state.problem.constraints.pieces.size());
+                                            for (std::size_t piece = 0; piece < state.problem.referencePieces; ++piece)
+                                                orientations[piece] = state.problem.fixedStates[piece].orientation;
+                                            for (std::size_t piece = 0; piece < retained.size(); ++piece) {
+                                                orientations[state.problem.referencePieces + piece] =
+                                                    fixedOrientations.at(retained[piece]);
+                                            }
+                                            state.conditioned = vc::fiber_tracer::
+                                                solveFiberTraceJointGridWindingBeliefPropagation(
+                                                    state.problem.constraints,
+                                                    topology,
+                                                    conditionedConfig,
+                                                    {},
+                                                    orientations,
+                                                    state.problem.fixedStates);
+                                            validateFixedReferenceConditionedResult(
+                                                state.problem, state.conditioned);
+                                            std::vector<std::size_t> local(retained.size());
+                                            std::iota(local.begin(), local.end(), 0);
+                                            const auto ordinary = vc::fiber_tracer::
+                                                extractFiberTraceConditionedOrdinaryReport(
+                                                    state.conditioned,
+                                                    state.problem.referencePieces,
+                                                    local);
+                                            const auto observations = makeReferenceBpWindingObservations(
+                                                *referenceDiagnostics,
+                                                state.cross,
+                                                ordinary,
+                                                windingConfig);
+                                            state.score = vc::fiber_tracer::scoreFiberTraceReferenceOracle(
+                                                observations,
+                                                referenceDiagnostics->sourceNames.size(),
+                                                required);
+                                            return state;
+                                        };
+
+                                        std::vector<std::size_t> retained =
+                                            selection.retainedOrdinaryPieceIndices;
+                                        std::vector<unsigned char> requiredReferences;
+                                        std::optional<OracleState> accepted;
+                                        vc::fiber_tracer::FiberTraceReferenceOracleScore acceptedScore;
+                                        bool haveAccepted = false;
+                                        bool pendingTrial = false;
+                                        std::vector<std::size_t> pendingRemovedOriginals;
+                                        std::deque<std::vector<std::size_t>> alternativeProposals;
+                                        bool baseProposalRejected = false;
+                                        std::string terminal = "round_limit";
+                                        const auto oracleStart = std::chrono::steady_clock::now();
+                                        std::ostringstream rounds;
+                                        rounds << "reference oracle rounds\n"
+                                               << std::left << std::setw(7) << "round"
+                                               << std::setw(10) << "pieces"
+                                               << std::setw(9) << "removed"
+                                               << std::setw(8) << "exact"
+                                               << std::setw(8) << "wrong"
+                                               << std::setw(9) << "missing"
+                                               << std::setw(13) << "right"
+                                               << std::setw(13) << "constraints"
+                                               << std::setw(15) << "conditioned"
+                                               << std::setw(12) << "elapsed_s"
+                                               << "status\n";
+                                        for (std::size_t round = 0;
+                                             round < options.referencePruneConfig.oracleMaximumRounds;
+                                             ++round) {
+                                            auto state = buildOracleState(retained, requiredReferences);
+                                            const bool usableConditionedState =
+                                                state.conditioned.status == "converged" ||
+                                                (options.referenceOracleAcceptMessageLimit &&
+                                                 state.conditioned.status == "message_limit");
+                                            if (!usableConditionedState) {
+                                                terminal = "message_limit";
+                                                break;
+                                            }
+                                            std::vector<std::size_t> local(retained.size());
+                                            std::iota(local.begin(), local.end(), 0);
+                                            const auto closure = vc::fiber_tracer::selectFiberTraceConditionedInliers(
+                                                state.problem.constraints,
+                                                state.baseline,
+                                                state.conditioned,
+                                                state.problem.referencePieces,
+                                                inlierConfig);
+                                            if (closure.retainedOrdinaryPieceIndices.size() != retained.size()) {
+                                                std::vector<std::size_t> closed;
+                                                closed.reserve(closure.retainedOrdinaryPieceIndices.size());
+                                                std::vector<unsigned char> keep(retained.size(), 0);
+                                                for (const std::size_t localPiece : closure.retainedOrdinaryPieceIndices) {
+                                                    keep.at(localPiece) = 1;
+                                                    closed.push_back(retained.at(localPiece));
+                                                }
+                                                for (std::size_t localPiece = 0; localPiece < retained.size(); ++localPiece) {
+                                                    if (keep[localPiece] != 0)
+                                                        continue;
+                                                    const std::size_t originalPiece = retained[localPiece];
+                                                    selection.removalReasonByOrdinaryPiece[originalPiece] =
+                                                        closure.removalReasonByOrdinaryPiece[localPiece];
+                                                    selection.inferredWindingByOrdinaryPiece[originalPiece] =
+                                                        closure.inferredWindingByOrdinaryPiece[localPiece];
+                                                }
+                                                retained = std::move(closed);
+                                                --round;
+                                                continue;
+                                            }
+                                            const auto observations = makeReferenceBpWindingObservations(
+                                                *referenceDiagnostics,
+                                                state.cross,
+                                                vc::fiber_tracer::extractFiberTraceConditionedOrdinaryReport(
+                                                    state.conditioned,
+                                                    state.problem.referencePieces,
+                                                    local),
+                                                windingConfig);
+                                            if (requiredReferences.empty()) {
+                                                const auto benchmark = vc::fiber_tracer::
+                                                    calibrateFiberTraceReferenceWindings(observations);
+                                                std::vector<std::size_t> observationCounts(
+                                                    referenceDiagnostics->sourceNames.size(), 0);
+                                                for (const auto& observation : observations) {
+                                                    if (observation.bpEndpointActive)
+                                                        ++observationCounts.at(observation.referenceSource);
+                                                }
+                                                requiredReferences.assign(
+                                                    referenceDiagnostics->sourceNames.size(), 0);
+                                                for (std::size_t source = 0;
+                                                     source < requiredReferences.size(); ++source) {
+                                                    requiredReferences[source] = source < benchmark.references.size() &&
+                                                        benchmark.references[source].estimatedWinding &&
+                                                        observationCounts[source] >= options.referencePruneConfig.
+                                                            oracleMinimumReferenceObservations ? 1 : 0;
+                                                }
+                                                state.score = vc::fiber_tracer::scoreFiberTraceReferenceOracle(
+                                                    observations,
+                                                    requiredReferences.size(),
+                                                    requiredReferences);
+                                            }
+                                            const bool equalReferenceScore = haveAccepted &&
+                                                state.score.exact == acceptedScore.exact &&
+                                                state.score.wrong == acceptedScore.wrong &&
+                                                state.score.missing == acceptedScore.missing;
+                                            const bool realizedImprovement = !haveAccepted || !pendingTrial ||
+                                                equalReferenceScore ||
+                                                vc::fiber_tracer::fiberTraceReferenceOracleScoreImproves(
+                                                    state.score, acceptedScore);
+                                            const auto elapsed = std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() - oracleStart).count();
+                                            rounds << std::setw(7) << round
+                                                   << std::setw(10) << retained.size()
+                                                   << std::setw(9) << (haveAccepted ? accepted->subset.retainedPieceIndices.size() - retained.size() : 0)
+                                                   << std::setw(8) << state.score.exact
+                                                   << std::setw(8) << state.score.wrong
+                                                   << std::setw(9) << state.score.missing
+                                                   << std::setw(13) << state.score.constraintRight
+                                                   << std::setw(13) << state.score.constraintRight + state.score.constraintWrong
+                                                   << std::setw(15) << state.conditioned.status
+                                                   << std::setw(12) << std::fixed << std::setprecision(2) << elapsed
+                                                   << (realizedImprovement
+                                                           ? (equalReferenceScore && pendingTrial
+                                                                  ? "accepted_neutral"
+                                                                  : "accepted")
+                                                           : "rejected") << '\n';
+                                            if (!realizedImprovement) {
+                                                if (!baseProposalRejected &&
+                                                    !pendingRemovedOriginals.empty()) {
+                                                    if (pendingRemovedOriginals.size() > 1) {
+                                                        for (const std::size_t piece : pendingRemovedOriginals)
+                                                            alternativeProposals.push_back({piece});
+                                                        baseProposalRejected = true;
+                                                    } else {
+                                                    std::vector<unsigned char> inBase(
+                                                        bpConstraints.pieces.size(), 0);
+                                                    for (const std::size_t piece : pendingRemovedOriginals)
+                                                        inBase.at(piece) = 1;
+                                                    std::vector<double> neighborWeight(
+                                                        bpConstraints.pieces.size(), 0.0);
+                                                    std::vector<unsigned char> acceptedMask(
+                                                        bpConstraints.pieces.size(), 0);
+                                                    for (const std::size_t piece : accepted->subset.retainedPieceIndices)
+                                                        acceptedMask.at(piece) = 1;
+                                                    for (const auto& constraint : bpConstraints.constraints) {
+                                                        const bool a = inBase.at(constraint.pieceA) != 0;
+                                                        const bool b = inBase.at(constraint.pieceB) != 0;
+                                                        if (a == b)
+                                                            continue;
+                                                        const std::size_t neighbor = a
+                                                            ? constraint.pieceB
+                                                            : constraint.pieceA;
+                                                        if (acceptedMask.at(neighbor) == 0) {
+                                                            continue;
+                                                        }
+                                                        neighborWeight[neighbor] += std::max(
+                                                            constraint.parallelScore,
+                                                            constraint.perpendicularScore);
+                                                    }
+                                                    std::vector<std::size_t> neighbors;
+                                                    for (std::size_t piece = 0;
+                                                         piece < neighborWeight.size(); ++piece) {
+                                                        if (neighborWeight[piece] > 0.0)
+                                                            neighbors.push_back(piece);
+                                                    }
+                                                    std::sort(
+                                                        neighbors.begin(), neighbors.end(),
+                                                        [&](std::size_t a, std::size_t b) {
+                                                            if (neighborWeight[a] != neighborWeight[b])
+                                                                return neighborWeight[a] > neighborWeight[b];
+                                                            return a < b;
+                                                        });
+                                                    if (neighbors.size() > options.referencePruneConfig.oracleMaximumPairCandidates) {
+                                                        neighbors.resize(options.referencePruneConfig.oracleMaximumPairCandidates);
+                                                    }
+                                                    for (const std::size_t neighbor : neighbors) {
+                                                        auto proposal = pendingRemovedOriginals;
+                                                        proposal.push_back(neighbor);
+                                                        std::sort(proposal.begin(), proposal.end());
+                                                        proposal.erase(
+                                                            std::unique(proposal.begin(), proposal.end()),
+                                                            proposal.end());
+                                                        alternativeProposals.push_back(std::move(proposal));
+                                                    }
+                                                    baseProposalRejected = true;
+                                                    }
+                                                }
+                                                retained = accepted->subset.retainedPieceIndices;
+                                                pendingRemovedOriginals.clear();
+                                                pendingTrial = false;
+                                                terminal = "trying_alternative";
+                                                continue;
+                                            }
+                                            const bool acceptedTrial = pendingTrial;
+                                            acceptedScore = state.score;
+                                            accepted = std::move(state);
+                                            haveAccepted = true;
+                                            pendingTrial = false;
+                                            if (acceptedTrial) {
+                                                baseProposalRejected = false;
+                                                alternativeProposals.clear();
+                                            }
+                                            const std::size_t requiredCount = static_cast<std::size_t>(
+                                                std::count(requiredReferences.begin(), requiredReferences.end(), 1));
+                                            if (acceptedScore.exact == requiredCount &&
+                                                acceptedScore.wrong == 0 &&
+                                                acceptedScore.missing == 0) {
+                                                terminal = "zero_errors";
+                                                break;
+                                            }
+                                            if (acceptedScore.wrong == 0) {
+                                                terminal = "zero_wrong_with_missing";
+                                                break;
+                                            }
+                                            std::vector<double> arc(retained.size(), 0.0);
+                                            for (std::size_t piece = 0; piece < retained.size(); ++piece)
+                                            {
+                                                arc[piece] = polylineLengthBase(bpPieceLines.at(retained[piece]).pointsBaseXYZ);
+                                            }
+                                            vc::fiber_tracer::FiberTraceReferenceOracleRemovalBatch proposal;
+                                            if (!alternativeProposals.empty()) {
+                                                const auto originalProposal = std::move(
+                                                    alternativeProposals.front());
+                                                alternativeProposals.pop_front();
+                                                for (const std::size_t originalPiece : originalProposal) {
+                                                    const auto found = std::find(
+                                                        retained.begin(), retained.end(), originalPiece);
+                                                    if (found != retained.end()) {
+                                                        proposal.removedPieceIndices.push_back(
+                                                            static_cast<std::size_t>(found - retained.begin()));
+                                                    }
+                                                }
+                                            } else if (!baseProposalRejected) {
+                                                proposal = vc::fiber_tracer::
+                                                    selectFiberTraceReferenceOracleRemovalBatch(
+                                                        observations,
+                                                        requiredReferences.size(),
+                                                        requiredReferences,
+                                                        arc,
+                                                        options.referencePruneConfig.oracleMagnitudeEvidenceWeight,
+                                                        options.referencePruneConfig.oracleMaximumPairCandidates,
+                                                        {},
+                                                        true);
+                                            }
+                                            if (proposal.removedPieceIndices.empty()) {
+                                                terminal = "no_improving_removal";
+                                                break;
+                                            }
+                                            std::vector<unsigned char> remove(retained.size(), 0);
+                                            pendingRemovedOriginals.clear();
+                                            pendingRemovedOriginals.reserve(
+                                                proposal.removedPieceIndices.size());
+                                            for (const std::size_t localPiece : proposal.removedPieceIndices) {
+                                                remove.at(localPiece) = 1;
+                                                const std::size_t originalPiece = retained.at(localPiece);
+                                                pendingRemovedOriginals.push_back(originalPiece);
+                                                selection.removalReasonByOrdinaryPiece[originalPiece] =
+                                                    vc::fiber_tracer::FiberTraceConditionedRemovalReason::Oracle;
+                                                selection.inferredWindingByOrdinaryPiece[originalPiece] =
+                                                    accepted->conditioned.mapWindingHypothesis.at(
+                                                        accepted->problem.referencePieces + localPiece);
+                                            }
+                                            std::vector<std::size_t> trial;
+                                            trial.reserve(retained.size() - proposal.removedPieceIndices.size());
+                                            for (std::size_t piece = 0; piece < retained.size(); ++piece) {
+                                                if (remove[piece] == 0)
+                                                    trial.push_back(retained[piece]);
+                                            }
+                                            retained = std::move(trial);
+                                            pendingTrial = true;
+                                        }
+                                        if (!haveAccepted)
+                                            throw std::runtime_error("Reference oracle produced no converged state");
+                                        if (pendingTrial)
+                                            retained = accepted->subset.retainedPieceIndices;
+                                        selection.retainedOrdinaryPieceIndices = retained;
+                                        std::vector<unsigned char> retainedMask(bpConstraints.pieces.size(), 0);
+                                        for (const std::size_t piece : retained)
+                                            retainedMask.at(piece) = 1;
+                                        selection.brokenOrdinaryPieceIndices.clear();
+                                        for (std::size_t piece = 0; piece < retainedMask.size(); ++piece) {
+                                            if (retainedMask[piece] == 0)
+                                                selection.brokenOrdinaryPieceIndices.push_back(piece);
+                                        }
+                                        conditioned = std::move(accepted->conditioned);
+                                        oracleLocalGaugeMapping.resize(retained.size());
+                                        std::iota(oracleLocalGaugeMapping.begin(), oracleLocalGaugeMapping.end(), 0);
+                                        rounds << "terminal=" << terminal
+                                               << " required_references="
+                                               << std::count(requiredReferences.begin(), requiredReferences.end(), 1)
+                                               << " min_observations="
+                                               << options.referencePruneConfig.oracleMinimumReferenceObservations
+                                               << '\n';
+                                        oracleDiagnostics = rounds.str();
+                                    }
+                                    const auto subset =
+                                        vc::fiber_tracer::subsetFiberTraceConstraintReport(bpConstraints, selection.retainedOrdinaryPieceIndices);
+                                    std::vector<vc::fiber_tracer::FiberletCropTraceLine> prunedSourceLines;
+                                    prunedSourceLines.reserve(subset.retainedTraceIndices.size());
+                                    for (const std::size_t oldTrace : subset.retainedTraceIndices) {
+                                        prunedSourceLines.push_back(bpSourceLines.at(oldTrace));
+                                    }
+                                    std::vector<vc::fiber_tracer::FiberTraceFixedOrientation> prunedOrientations;
+                                    prunedOrientations.reserve(subset.retainedPieceIndices.size());
+                                    for (const std::size_t oldPiece : subset.retainedPieceIndices) {
+                                        prunedOrientations.push_back(fixedOrientations.at(oldPiece));
+                                    }
+                                    vc::fiber_tracer::FiberTraceInterleavedWindingReport finalPruned;
+                                    vc::fiber_tracer::FiberTraceInterleavedWindingReport alignedFinalPruned;
+                                    std::vector<vc::fiber_tracer::FiberletCropTraceLine> finalPieceLines;
+                                    vc::fiber_tracer::FiberTraceWindingGaugeAlignment alignment;
+                                    if (!subset.report.pieces.empty()) {
+                                        const auto prunedTopology = vc::fiber_tracer::prepareFiberTraceBeliefTopology(
+                                            prunedSourceLines, subset.report, artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
+                                        std::cout << "reference offender-pruned solve status=started"
+                                                  << " pieces=" << subset.report.pieces.size()
+                                                  << " factors=" << subset.report.constraints.size() << " references=0 cross_factors=0"
+                                                  << " fixed_states=0 warm_start=0\n"
+                                                  << std::flush;
+                                        finalPruned =
+                                            vc::fiber_tracer::solveFiberTraceJointGridWindingBeliefPropagation(subset.report, prunedTopology, conditionedConfig, makeJointGridWindingProgressPrinter(), prunedOrientations);
+                                        finalPieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(prunedSourceLines, subset.report);
+                                        alignment = vc::fiber_tracer::alignFiberTraceWindingToConditionedGauge(
+                                            conditioned,
+                                            conditionedProblem.referencePieces,
+                                            finalPruned,
+                                            oracleInliers
+                                                ? std::span<const std::size_t>(oracleLocalGaugeMapping)
+                                                : std::span<const std::size_t>(subset.retainedPieceIndices));
+                                        alignedFinalPruned = vc::fiber_tracer::applyFiberTraceWindingGaugeAlignment(
+                                            finalPruned, alignment);
+                                    }
+                                    const auto prunedCross = subsetReferenceBpCrossConstraints(
+                                        *referenceBpConstraints,
+                                        subset.retainedPieceIndices);
+                                    std::vector<std::size_t> prunedOriginalTraceIndices;
+                                    prunedOriginalTraceIndices.reserve(
+                                        subset.retainedPieceIndices.size());
+                                    for (const std::size_t oldPiece :
+                                         subset.retainedPieceIndices) {
+                                        prunedOriginalTraceIndices.push_back(
+                                            bpOriginalTraceIndices.at(oldPiece));
+                                    }
+                                    std::optional<vc::fiber_tracer::FiberTraceInterleavedWindingReport>
+                                        directInlierReport;
+                                    std::optional<ReferencePruneArtifactReport>
+                                        directArtifactReport;
+                                    if (conditionedInliers) {
+                                        std::vector<std::size_t> directIndices;
+                                        const std::span<const std::size_t> conditionedIndices = [&]() -> std::span<const std::size_t> {
+                                            if (!oracleInliers)
+                                                return subset.retainedPieceIndices;
+                                            directIndices.resize(subset.retainedPieceIndices.size());
+                                            std::iota(directIndices.begin(), directIndices.end(), 0);
+                                            return directIndices;
+                                        }();
+                                        directInlierReport = vc::fiber_tracer::
+                                            extractFiberTraceConditionedOrdinaryReport(
+                                                conditioned,
+                                                conditionedProblem.referencePieces,
+                                                conditionedIndices);
+                                        directArtifactReport = publishReferencePruneArtifacts(
+                                            options.output,
+                                            referencePruneArtifactSuffix(
+                                                options.referencePruneConfig),
+                                            *referenceDiagnostics,
+                                            bpPieceLines,
+                                            selection,
+                                            finalPieceLines,
+                                            subset,
+                                            *directInlierReport);
+                                    }
+                                    const std::string freshSuffix =
+                                        referencePruneArtifactSuffix(
+                                            options.referencePruneConfig) +
+                                        (conditionedInliers ? "_fresh" : "");
+                                    const auto artifactReport =
+                                        publishReferencePruneArtifacts(
+                                            options.output,
+                                            freshSuffix,
+                                            *referenceDiagnostics,
+                                            bpPieceLines,
+                                            selection,
+                                            finalPieceLines,
+                                            subset,
+                                            alignedFinalPruned);
+                                    const std::string directReferenceBenchmark =
+                                        conditionedInliers
+                                        ? formatReferenceBpWindingBenchmark(
+                                              *referenceDiagnostics,
+                                              prunedCross,
+                                              *directInlierReport,
+                                              mode,
+                                              windingConfig,
+                                              subset.report,
+                                              prunedOriginalTraceIndices,
+                                              options.referenceConstraintDetails,
+                                              directArtifactReport->outputOffset)
+                                        : std::string{};
+                                    const std::string alignedFreshReferenceBenchmark =
+                                        formatReferenceBpWindingBenchmark(
+                                            *referenceDiagnostics,
+                                            prunedCross,
+                                            alignedFinalPruned,
+                                            mode,
+                                            windingConfig,
+                                            subset.report,
+                                            prunedOriginalTraceIndices,
+                                            options.referenceConstraintDetails,
+                                            artifactReport.outputOffset);
+                                    const std::size_t finalActive = artifactReport.finalHorizontalPieces + artifactReport.finalVerticalPieces;
+                                    double finalActiveLength = 0.0;
+                                    double retainedPieceLength = 0.0;
+                                    for (std::size_t piece = 0;
+                                         piece < finalPieceLines.size(); ++piece) {
+                                        retainedPieceLength += polylineLengthBase(
+                                            finalPieceLines[piece]
+                                                .pointsBaseXYZ);
+                                        if (alignedFinalPruned.windingValid[piece] != 0) {
+                                            finalActiveLength += polylineLengthBase(
+                                                finalPieceLines[piece]
+                                                    .pointsBaseXYZ);
+                                        }
+                                    }
+                                    std::size_t alignedComponents = 0;
+                                    for (const auto& component : alignment.components) {
+                                        alignedComponents += component.resolved ? 1 : 0;
+                                    }
+                                    std::ostringstream diagnostic;
+                                    diagnostic << "reference offender pruning\n"
+                                               << "selection_policy=";
+                                    switch (options.referencePruneConfig.policy) {
+                                    case vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedDefect:
+                                        diagnostic << "conditioned-defect";
+                                        break;
+                                    case vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::UnionDefect:
+                                        diagnostic << "union-defect";
+                                        break;
+                                    case vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedPosterior:
+                                        diagnostic << "conditioned-posterior"
+                                                   << " threshold="
+                                                   << options.referencePruneConfig.conditionedDefectProbabilityThreshold;
+                                        break;
+                                    case vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::ConditionedInliers:
+                                        diagnostic << "conditioned-inliers"
+                                                   << " sign_weight=" << options.referencePruneConfig.inlierSignConflictWeight
+                                                   << " magnitude_weight=" << options.referencePruneConfig.inlierMagnitudeSupportWeight
+                                                   << " retention=" << options.referencePruneConfig.inlierRetentionSupport;
+                                        break;
+                                    case vc::fiber_tracer::FiberTraceConditionedOffenderPolicy::OracleInliers:
+                                        diagnostic << "oracle-inliers"
+                                                   << " sign_weight=" << options.referencePruneConfig.inlierSignConflictWeight
+                                                   << " magnitude_weight=" << options.referencePruneConfig.inlierMagnitudeSupportWeight
+                                                   << " retention=" << options.referencePruneConfig.inlierRetentionSupport
+                                                   << " oracle_magnitude=" << options.referencePruneConfig.oracleMagnitudeEvidenceWeight
+                                                   << " rounds=" << options.referencePruneConfig.oracleMaximumRounds
+                                                   << " pair_candidates=" << options.referencePruneConfig.oracleMaximumPairCandidates;
+                                        break;
+                                    }
+                                    diagnostic << '\n'
+                                               << std::left << std::setw(28) << "metric" << std::right << std::setw(12) << "value" << '\n'
+                                               << std::left << std::setw(28) << "ordinary input pieces" << std::right << std::setw(12)
+                                               << bpConstraints.pieces.size() << '\n'
+                                               << std::left << std::setw(28) << "selected offenders" << std::right << std::setw(12)
+                                               << selection.brokenOrdinaryPieceIndices.size() << '\n'
+                                               << std::left << std::setw(28) << "baseline MAP defect" << std::right << std::setw(12)
+                                               << selection.baselineDefectPieces << '\n'
+                                               << std::left << std::setw(28) << "conditioned MAP defect" << std::right << std::setw(12)
+                                               << selection.conditionedDefectPieces << '\n'
+                                               << std::left << std::setw(28) << "posterior selected" << std::right << std::setw(12)
+                                               << selection.posteriorSelectedPieces << '\n'
+                                               << std::left << std::setw(28) << "selected baseline only" << std::right << std::setw(12)
+                                               << selection.selectedBaselineOnlyPieces << '\n'
+                                               << std::left << std::setw(28) << "selected conditioned only" << std::right << std::setw(12)
+                                               << selection.selectedConditionedOnlyPieces << '\n'
+                                               << std::left << std::setw(28) << "selected both MAP defect" << std::right << std::setw(12)
+                                               << selection.selectedBothDefectPieces << '\n'
+                                               << std::left << std::setw(28) << "selected neither MAP defect" << std::right << std::setw(12)
+                                               << selection.selectedNeitherDefectPieces << '\n'
+                                               << std::left << std::setw(28) << "pre-existing broken" << std::right << std::setw(12)
+                                               << selection.preexistingBrokenPieces << '\n'
+                                               << std::left << std::setw(28) << "newly conditioned broken" << std::right << std::setw(12)
+                                               << selection.newlyBrokenPieces << '\n'
+                                               << std::left << std::setw(28) << "conditioned active" << std::right << std::setw(12)
+                                               << selection.conditionedActivePieces << '\n'
+                                               << std::left << std::setw(28) << "conditioned Defect removed" << std::right << std::setw(12)
+                                               << selection.conditionedDefectRemovedPieces << '\n'
+                                               << std::left << std::setw(28) << "direct-reference removed" << std::right << std::setw(12)
+                                               << selection.directReferenceConflictRemovedPieces << '\n'
+                                               << std::left << std::setw(28) << "conflict-cover removed" << std::right << std::setw(12)
+                                               << selection.conflictCoverRemovedPieces << '\n'
+                                               << std::left << std::setw(28) << "disconnected removed" << std::right << std::setw(12)
+                                               << selection.disconnectedRemovedPieces << '\n'
+                                               << std::left << std::setw(28) << "sign conflicts before" << std::right << std::setw(12)
+                                               << selection.initialSignConflicts << '/' << selection.signFactors << '\n'
+                                               << std::left << std::setw(28) << "sign conflicts retained" << std::right << std::setw(12)
+                                               << selection.retainedSignConflicts << '/' << selection.signFactors << '\n'
+                                               << std::left << std::setw(28) << "protected ref sign factors" << std::right << std::setw(12)
+                                               << selection.protectedReferenceSignFactors << '\n'
+                                               << std::left << std::setw(28) << "protected ref sign conflicts" << std::right << std::setw(12)
+                                               << selection.protectedReferenceSignConflicts << '\n'
+                                               << std::left << std::setw(28) << "retained pieces" << std::right << std::setw(12)
+                                               << subset.report.pieces.size() << '\n'
+                                               << std::left << std::setw(28) << "retained piece arc" << std::right << std::setw(12)
+                                               << std::fixed << std::setprecision(1) << retainedPieceLength << '\n'
+                                               << std::left << std::setw(28) << "retained factors" << std::right << std::setw(12)
+                                               << subset.report.constraints.size() << '\n'
+                                               << std::left << std::setw(28) << "retained reference factors" << std::right << std::setw(12)
+                                               << prunedCross.report.constraints.size() << '\n'
+                                               << std::left << std::setw(28) << "final active" << std::right << std::setw(12) << finalActive << '\n'
+                                               << std::left << std::setw(28) << "final active piece arc" << std::right << std::setw(12)
+                                               << std::fixed << std::setprecision(1) << finalActiveLength << '\n'
+                                               << std::left << std::setw(28) << "final disabled" << std::right << std::setw(12)
+                                               << artifactReport.finalDisabledPieces << '\n'
+                                               << std::left << std::setw(28) << "unresolved visualization" << std::right << std::setw(12)
+                                               << artifactReport.unresolvedPieces << '\n'
+                                               << std::left << std::setw(28) << "aligned final components" << std::right << std::setw(12)
+                                               << alignedComponents << '/' << alignment.components.size() << '\n'
+                                               << std::left << std::setw(28) << "published winding layers" << std::right << std::setw(12)
+                                               << artifactReport.windingLayers << '\n'
+                                               << "status=" << (subset.report.pieces.empty() ? "empty" : finalPruned.status)
+                                               << " output_base=" << std::quoted(artifactReport.outputBase.string()) << '\n';
+                                    if (conditionedInliers) {
+                                        diagnostic << "direct_output_base="
+                                                   << std::quoted(directArtifactReport->outputBase.string())
+                                                   << "\n\nreference conditioned-inlier result benchmark\n"
+                                                   << directReferenceBenchmark;
+                                    }
+                                    if (oracleInliers)
+                                        diagnostic << '\n' << oracleDiagnostics;
+                                    diagnostic << "\nreference fresh retained-graph result benchmark\n"
+                                               << alignedFreshReferenceBenchmark;
+                                    referencePruneDiagnostics = diagnostic.str();
+                                }
+                                if (options.referenceConditioningDiagnostic) {
+                                    fixedReferenceConditionedDiagnostics =
                                     formatFixedReferenceConditionedComparison(
                                         *referenceDiagnostics,
                                         conditionedProblem,
@@ -8354,18 +9467,18 @@ int main(int argc, char** argv)
                                         bpConstraints,
                                         bpOriginalTraceIndices,
                                         conditionedConfig);
-                                const auto warmStart =
+                                    if (fixedOrientations.empty()) {
+                                        *fixedReferenceConditionedDiagnostics +=
+                                            "\nconditioned-to-ordinary warm-start solve"
+                                            " status=skipped"
+                                            " reason=fixed_prepass_required";
+                                    } else {
+                                        const auto warmStart =
                                     makeConditionedOrdinaryWarmStart(
                                         conditioned,
                                         conditionedProblem.referencePieces,
                                         bpConstraints.pieces.size());
-                                if (fixedOrientations.empty()) {
-                                    *fixedReferenceConditionedDiagnostics +=
-                                        "\nconditioned-to-ordinary warm-start solve"
-                                        " status=skipped"
-                                        " reason=fixed_prepass_required";
-                                } else {
-                                    auto continuationConfig =
+                                        auto continuationConfig =
                                         conditionedConfig;
                                     continuationConfig.maximumMessageIterations =
                                         std::max<std::size_t>(
@@ -8419,6 +9532,7 @@ int main(int argc, char** argv)
                                             neutralExpanded,
                                             warm,
                                             conditionedProblem.referencePieces);
+                                    }
                                 }
                             }
 
@@ -8546,6 +9660,11 @@ int main(int argc, char** argv)
                                             bpOriginalTraceIndices,
                                             options.referenceConstraintDetails);
                                 }
+                                if (options.referencePruneOffenders) {
+                                    referenceBenchmark =
+                                        "reference original result benchmark\n" +
+                                        referenceBenchmark;
+                                }
                                 deferredReferenceDiagnostics.push_back(
                                     formatBpWindingComponentDiagnostics(
                                         bpConstraints,
@@ -8557,7 +9676,7 @@ int main(int argc, char** argv)
                                         bpSourcePieceOne,
                                         bpConstraints,
                                         *interleavedWinding) +
-                                    referenceBenchmark +
+                                    referenceBenchmark + (referencePruneDiagnostics ? "\n" + *referencePruneDiagnostics : std::string{}) +
                                     (fixedReferenceConditionedDiagnostics
                                          ? "\n" +
                                                *fixedReferenceConditionedDiagnostics
