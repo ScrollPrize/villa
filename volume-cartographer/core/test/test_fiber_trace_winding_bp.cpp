@@ -1407,13 +1407,22 @@ TEST_CASE("Reference winding benchmark calibrates each integer gauge")
     CHECK(benchmark.references[1].sum.wrong == 0);
     CHECK(benchmark.references[1].sum.total == 2);
     REQUIRE(benchmark.references[0].estimatedWinding.has_value());
+    CHECK_FALSE(benchmark.references[0].rawEstimatedWinding.has_value());
     CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(0.0));
     REQUIRE(benchmark.references[1].estimatedWinding.has_value());
+    CHECK_FALSE(benchmark.references[1].rawEstimatedWinding.has_value());
     CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(0.5));
     CHECK(benchmark.references[1].estimatedWindingSupport == 2);
     CHECK(benchmark.references[1].estimatedWindingObservations == 2);
-    CHECK(benchmark.references[2].estimatedWinding == 1.0);
+    REQUIRE(benchmark.references[2].rawEstimatedWinding.has_value());
+    REQUIRE(benchmark.references[2].estimatedWinding.has_value());
+    CHECK(*benchmark.references[2].estimatedWinding == doctest::Approx(
+        static_cast<double>(benchmark.globalSign) *
+        (*benchmark.references[2].rawEstimatedWinding -
+         benchmark.gauges[0].offset)));
+    CHECK(*benchmark.references[2].estimatedWinding == 1.0);
     CHECK_FALSE(benchmark.references[3].estimatedWinding.has_value());
+    CHECK_FALSE(benchmark.references[3].rawEstimatedWinding.has_value());
     CHECK(std::accumulate(
               benchmark.references.begin(),
               benchmark.references.end(),
@@ -1482,6 +1491,8 @@ TEST_CASE("Reference winding calibration includes boundaries and stable ties")
     CHECK(allInvalid.sum.right == 0);
     CHECK(allInvalid.sum.wrong == 0);
     CHECK(allInvalid.sum.total == 0);
+    REQUIRE(allInvalid.references.size() == 1);
+    CHECK_FALSE(allInvalid.references[0].rawEstimatedWinding.has_value());
     CHECK(calibrateFiberTraceReferenceWindings(std::span<const FiberTraceReferenceWindingObservation>{}).gauges.empty());
 }
 
@@ -1509,6 +1520,79 @@ TEST_CASE("Raw reference winding inference ignores truth and report tolerance")
     }
 }
 
+TEST_CASE("Reported raw winding inverse maps the selected calibrated estimate")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    const std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 0, 0.0, {4.0, 0.0}, 1, 0},
+        {Class::Perpendicular, 0, 0.5, {3.5, 0.0}, 1, 1},
+        {Class::Perpendicular, 0, 1.0, {2.5, 3.0}, 2, 2},
+    };
+
+    const auto independentlyRaw =
+        inferFiberTraceReferenceRawWindings(observations);
+    const auto rawSourceTwo = std::find_if(
+        independentlyRaw.begin(), independentlyRaw.end(),
+        [](const auto& estimate) { return estimate.referenceSource == 2; });
+    REQUIRE(rawSourceTwo != independentlyRaw.end());
+    CHECK(rawSourceTwo->winding == 2.5);
+
+    const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    REQUIRE(benchmark.globalSign == -1);
+    REQUIRE(benchmark.gauges.size() == 1);
+    CHECK(benchmark.gauges[0].offset == 4.0);
+    REQUIRE(benchmark.references[2].estimatedWinding.has_value());
+    REQUIRE(benchmark.references[2].rawEstimatedWinding.has_value());
+    CHECK(*benchmark.references[2].estimatedWinding == 1.0);
+    CHECK(*benchmark.references[2].rawEstimatedWinding == 3.0);
+    CHECK(*benchmark.references[2].rawEstimatedWinding !=
+          rawSourceTwo->winding);
+}
+
+TEST_CASE("Reference raw winding maps to the published integer layer")
+{
+    FiberTraceReferenceSourceBenchmark reference;
+    reference.estimatedIntegerGauge = 3;
+    reference.estimatedOrientationComponent = 0;
+    FiberTraceReferenceOrientationBenchmark orientation;
+    orientation.components.push_back({0, true, 1, 0});
+
+    reference.rawEstimatedWinding = -2.0;
+    CHECK(fiberTraceReferenceOutputWinding(
+              0, reference, orientation, std::array{1}, 0.5, 5) == 3);
+
+    reference.rawEstimatedWinding = -1.5;
+    CHECK(fiberTraceReferenceOutputWinding(
+              1, reference, orientation, std::array{1}, 0.5, 5) == 3);
+
+    reference.rawEstimatedWinding = -2.5;
+    CHECK(fiberTraceReferenceOutputWinding(
+              1, reference, orientation, std::array{-1}, 0.5, 5) == 3);
+
+    orientation.components[0].evenReferenceIsHorizontal = false;
+    reference.rawEstimatedWinding = -1.5;
+    CHECK(fiberTraceReferenceOutputWinding(
+              0, reference, orientation, std::array{1}, 0.5, 5) == 3);
+    reference.rawEstimatedWinding = -2.0;
+    CHECK(fiberTraceReferenceOutputWinding(
+              1, reference, orientation, std::array{1}, 0.5, 5) == 3);
+
+    reference.rawEstimatedWinding = -1.75;
+    CHECK_THROWS_AS(
+        fiberTraceReferenceOutputWinding(
+            0, reference, orientation, std::array{1}, 0.5, 5),
+        std::logic_error);
+
+    reference.rawEstimatedWinding.reset();
+    CHECK_FALSE(fiberTraceReferenceOutputWinding(
+        0, reference, orientation, std::array{1}, 0.5, 5));
+
+    reference.rawEstimatedWinding = -2.0;
+    reference.estimatedOrientationComponent.reset();
+    CHECK_FALSE(fiberTraceReferenceOutputWinding(
+        0, reference, orientation, std::array{1}, 0.5, 5));
+}
+
 TEST_CASE("Calibrated reference inference combines independent gauges")
 {
     using Class = FiberTraceReferenceConstraintClass;
@@ -1528,6 +1612,7 @@ TEST_CASE("Calibrated reference inference combines independent gauges")
     CHECK(benchmark.gauges[0].offset == 2.0);
     CHECK(benchmark.gauges[1].offset == 10.0);
     REQUIRE(benchmark.references[0].estimatedWinding.has_value());
+    CHECK_FALSE(benchmark.references[0].rawEstimatedWinding.has_value());
     CHECK(*benchmark.references[0].estimatedWinding == -0.5);
     CHECK(benchmark.references[0].estimatedWindingObservations == 2);
 }
@@ -1551,10 +1636,20 @@ TEST_CASE("Reference winding benchmark estimates each source independently")
     CHECK(benchmark.gauges[0].offset == doctest::Approx(2.0));
     REQUIRE(benchmark.references.size() == 2);
     REQUIRE(benchmark.references[0].estimatedWinding.has_value());
+    REQUIRE(benchmark.references[0].rawEstimatedWinding.has_value());
+    CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(
+        static_cast<double>(benchmark.globalSign) *
+        (*benchmark.references[0].rawEstimatedWinding -
+         benchmark.gauges[0].offset)));
     CHECK(*benchmark.references[0].estimatedWinding == doctest::Approx(0.0));
     CHECK(benchmark.references[0].estimatedWindingSupport == 3);
     CHECK(benchmark.references[0].estimatedWindingObservations == 3);
     REQUIRE(benchmark.references[1].estimatedWinding.has_value());
+    REQUIRE(benchmark.references[1].rawEstimatedWinding.has_value());
+    CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(
+        static_cast<double>(benchmark.globalSign) *
+        (*benchmark.references[1].rawEstimatedWinding -
+         benchmark.gauges[0].offset)));
     CHECK(*benchmark.references[1].estimatedWinding == doctest::Approx(0.5));
     CHECK(benchmark.references[1].estimatedWindingSupport == 2);
     CHECK(benchmark.references[1].estimatedWindingObservations == 2);

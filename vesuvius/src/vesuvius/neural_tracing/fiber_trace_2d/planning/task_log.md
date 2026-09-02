@@ -2,60 +2,57 @@
 
 ## Discovery
 
-- The repository already requires and links Ceres in several targets, but
-  `vc_fiber_tracer` does not currently link it.
-- The existing deferred proposal in
-  `volume-cartographer/docs/fiber_winding_ceres_proposal.md` defines continuous
-  orientation, activity, and winding variables. This task promotes a scoped,
-  fixed-calibration version of that proposal into an experimental solver.
-- Printable factor diagnostics were not sufficient solver input. The private
-  scale-first materialization path was extracted as
-  `prepareFiberTraceWindingModel`; BP diagnostics and Ceres now consume that
-  same prepared model.
-- The existing reference cross report preserves one piece per input line and
-  contains only reference-to-crop constraints. Reference-source continuity is
-  available separately from the reference-only constraint report.
+- The just-added BP `raw_w` is the result of a separate per-gauge raw scorer.
+  The final `est_w` is selected again after gauge calibration and evidence
+  aggregation, so the two columns can select different half-step candidates.
+- The requested value is not another inference. It is the exact final
+  `est_w` candidate expressed before benchmark sign/offset calibration.
+- Solver OBJ files add `-min(active mapWinding)` to relative solver windings.
+  The CLI table must add the same offset for `raw_w` to identify the actual
+  `<base>_w_<index>_*.obj` layer.
+- A source spanning multiple candidate-bearing gauges has no single inverse
+  solver coordinate and must report `NA`.
 
-## Deliberate semantic difference
+## Deviations
 
-- Ceres minimizes squared residuals. Existing joint-grid BP ranks discrete
-  states using predominantly weighted absolute residuals. The new solver
-  shares targets and coefficients, not the residual norm; this is the point of
-  the experiment and will be explicit in diagnostics and documentation.
-- Residuals use the differentiable product `a_i*a_j`; because Ceres squares
-  residuals, pair energy fades as `a_i^2*a_j^2`. No hidden epsilon or robust
-  loss is applied.
-- BP hard continuation and promoted hard signs are large finite residuals in
-  Ceres. Exact discrete feasibility is intentionally not claimed.
-- The first implementation uses the existing PCA orientation split as the H/V
-  initializer and zero winding. Exporting BP's private continuous initializer
-  was deferred because it would couple the independent experiment to another
-  solve.
+- None.
 
 ## Independent plan review
 
-- Incorporated: expose the exact prepared model; apply measurement scale once;
-  use exact prepared incidence and winding gauges; use a positive sign margin;
-  report unidentifiable references as `NA`; avoid hidden robust losses and
-  ladder priors; distinguish finite hard-constraint approximations.
-- Clarified: an H/V component also requires one orientation-label gauge. It
-  fixes horizontalness only, while the winding gauge fixes winding only;
-  neither gauge forces activity.
+- Corrected the initial inverse-calibration-only plan: that value is a latent
+  half-step, not an integer OBJ layer. The implementation also removes the
+  reference H/V class offset using the contributing component phase sign and
+  selected phase.
+- Gauge/component eligibility now follows all admitted candidate-bearing
+  evidence used by the final scorer rather than the independently selected raw
+  calibration votes.
+- The existing publication-range calculation was extracted and reused so OBJ
+  naming and diagnostic output share the same output-offset rule.
+
+## Implementation
+
+- The final calibrated `est_w` remains the only per-reference candidate
+  selection. Its stored raw latent coordinate is now computed algebraically as
+  `globalSign * est_w + gaugeOffset` for one contributing gauge.
+- The compact BP table converts that latent value to integer `mapWinding` with
+  the independently calibrated reference H/V class, contributing component
+  phase sign, and selected phase, then adds the solver artifact output offset.
+- Missing estimates and ambiguous gauges/components print `NA`; off-grid
+  latent-to-integer conversion is an invariant error. Ceres reporting is
+  unchanged.
 
 ## Validation
 
-- Release build: `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk -j 8`.
-- Focused tests: `volume-cartographer/build/bin/test_fiber_trace_winding_bp`;
-  all 80 cases passed, including three new Ceres regression cases.
-- Clang system-dependency build of `vc_fiber_trace_chunk` and the focused test
-  succeeded; the same 80 cases passed. Clang reported one pre-existing ignored
-  `[[nodiscard]]` warning in `FiberReplay.cpp`, outside this change.
-- 1024-crop Release validation input: `crop_traces.zarr`, 500/1998
-  quality-selected fibers, 1360 retained pieces, 69,232 prepared constraints,
-  32 workers, and the default 500-iteration cap. Main Ceres solve converged in
-  47 iterations and 4.9 seconds.
-- Initial result deliberately uses current production weights and scale 0.822.
-  It retained fractional activity near one; the per-reference fixed-source
-  solve produced 24 usable estimates, matched 9/24 filename-order windings,
-  and reported two sources with no usable winding evidence as `NA`. This is a
-  functioning experimental baseline, not a tuned quality result.
+- Release build:
+  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiber_trace_winding_bp -j 16`.
+- Focused C++ tests: 82 cases passed. Added a sign-reversed tie regression in
+  which the obsolete independent raw scorer chooses `2.5`, while final
+  `est_w=1.0` inverse-maps correctly to raw latent `3.0`.
+- The Clang system-dependency build succeeded and the same 82 focused cases
+  passed.
+- Viewer tests: 41 cases passed with
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src pytest -q vesuvius/tests/test_view_fiber_windings.py`.
+- The standard 1024 Release diagnostic completed in 15.58 seconds. It reported
+  relative solver winding range `-15..13`, published range `0..28`, and finite
+  BP `raw_w` values only as integer published layers (`15`, `16`, ...), while
+  retaining calibrated half-step `est_w` values (`0.0`, `0.5`, ...).

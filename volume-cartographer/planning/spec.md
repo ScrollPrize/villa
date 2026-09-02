@@ -309,3 +309,21 @@ During active remote downloads, the existing cache status bar appends:
   its selected cross constraints while fixing all connected crop endpoints to
   the main continuous solution. Ground-truth filename order may only enter a
   final global sign/half-step offset calibration, not the per-reference solve.
+
+## Reference winding estimate reporting
+
+- The BP per-reference table reports one selected candidate in two coordinate
+  systems. `est_w` is the globally calibrated reference-coordinate value.
+  `raw_w` must be that exact candidate inverse-mapped through the selected
+  global sign and unique candidate-bearing gauge offset. That latent coordinate
+  must then be converted to integer `mapWinding` using the reference H/V class,
+  component phase sign, and selected phase before adding the same output offset
+  used to name published solver winding OBJ layers. It must not run a second
+  raw candidate selection. Consequently `raw_w` directly identifies the
+  inferred winding layer to inspect.
+- With latent class offset `C`, published offset `P`, gauge offset `G`, and
+  global sign `S`, the table follows
+  `raw_w = S * est_w + G - C + P`. No final estimate, evidence in more than one
+  candidate-bearing gauge, or incompatible contributing orientation components
+  reports `NA`; a nonintegral result is an invariant error. Ceres keeps its
+  existing independently defined raw/calibrated reporting convention.

@@ -1860,3 +1860,12 @@
 - Added per-reference fixed-source least-squares diagnostics, fractional
   artifact publication, progress/cost reporting, and synthetic regression
   coverage while retaining joint-grid as the default.
+
+## 2026-09-02 - Indexed reference winding visualization
+
+- Published one strict reference OBJ per filename-ordered half-step alongside
+  the aggregate reference artifact and added aggregate/selected/hidden viewer
+  modes with parity-preserving reference-mask navigation.
+- Added BP `raw_w` as the exact selected `est_w` inverse-mapped into published
+  solver winding-layer coordinates, while retaining the existing calibrated
+  `est_w` and Ceres output.

@@ -6,27 +6,39 @@ import vesuvius.scripts.view_fiber_windings as viewer_module
 from vesuvius.scripts.ordered_polyline_obj import read_ordered_polyline_obj
 from vesuvius.scripts.view_fiber_windings import (
     ReferenceGeometry,
+    ReferenceWindingArtifact,
+    ReferenceWindingGeometry,
+    ReferenceWindingLayerKey,
     WindingArtifact,
     WindingGeometry,
     WindingLayerKey,
     add_reference_layer,
+    add_reference_winding_layers,
     add_winding_layers,
     animation_interval_milliseconds,
     build_parser,
+    complete_reference_winding_layer_keys,
     complete_winding_layer_keys,
     discover_reference_artifact,
+    discover_reference_winding_artifacts,
     discover_winding_artifacts,
     format_visible_windings,
     load_reference_geometry,
+    load_reference_winding_geometry,
     navigable_windings,
     nonempty_layer_keys,
     read_reference_artifact,
+    read_reference_winding_artifact,
     read_winding_artifact,
+    reference_visibility_for_mode,
+    reference_winding_layer_name,
+    rotate_visible_reference_winding_mask,
     rotate_visible_winding_mask,
     rotate_winding_layer_visibility,
     visible_winding_layers,
     winding_layer_color,
     winding_layer_colors,
+    winding_navigation_range,
 )
 
 HEADERS = {
@@ -55,6 +67,12 @@ def _write_quartet(base: Path, winding: int, *, h_body: str = "") -> None:
 
 def _write_reference(base: Path, body: str) -> Path:
     path = base.parent / f"{base.name}_reference.obj"
+    path.write_text(f"# VC3D tagged reference fibers\n{body}")
+    return path
+
+
+def _write_reference_half_step(base: Path, index: int, body: str) -> Path:
+    path = base.parent / f"{base.name}_reference_hs_{index}.obj"
     path.write_text(f"# VC3D tagged reference fibers\n{body}")
     return path
 
@@ -237,6 +255,116 @@ def test_reference_artifact_rejects_malformed_present_output(
         read_reference_artifact(path)
 
 
+def test_indexed_reference_discovery_and_reader_use_half_step_order(tmp_path):
+    base = tmp_path / "fibers"
+    third = _write_reference_half_step(
+        base,
+        3,
+        "o reference_3_third\nv 1 2 3\nv 4 5 6\nl 1 2\n",
+    )
+    first = _write_reference_half_step(
+        base,
+        0,
+        "o reference_0_first\nv 7 8 9\nv 10 11 12\nl 1 2\n",
+    )
+
+    artifacts = discover_reference_winding_artifacts(base)
+    assert [artifact.path for artifact in artifacts] == [first, third]
+    assert [artifact.key.half_step_index for artifact in artifacts] == [0, 3]
+    assert [artifact.key.winding for artifact in artifacts] == [0, 1]
+    loaded = load_reference_winding_geometry(base)
+    assert len(loaded) == 2
+    np.testing.assert_array_equal(
+        loaded[0].paths_zyx[0], [[9, 8, 7], [12, 11, 10]]
+    )
+    assert reference_winding_layer_name(loaded[0].artifact.key) == "Reference w0.0"
+    assert reference_winding_layer_name(loaded[1].artifact.key) == "Reference w1.5"
+
+
+def test_indexed_reference_discovery_rejects_malformed_family_member(tmp_path):
+    base = tmp_path / "fibers"
+    (tmp_path / "fibers_reference_hs_bad.obj").write_text("# bad\n")
+    with pytest.raises(ValueError, match="malformed indexed reference artifact"):
+        discover_reference_winding_artifacts(base)
+
+
+@pytest.mark.parametrize(
+    ("index", "body", "message"),
+    [
+        (
+            2,
+            (
+                "o reference_2_a\nv 0 0 0\nv 1 0 0\nl 1 2\n"
+                "o reference_2_b\nv 0 1 0\nv 1 1 0\nl 3 4\n"
+            ),
+            "exactly one fiber",
+        ),
+        (
+            2,
+            "o reference_1_wrong\nv 0 0 0\nv 1 0 0\nl 1 2\n",
+            "ordinal does not match",
+        ),
+    ],
+)
+def test_indexed_reference_reader_rejects_wrong_cardinality_or_ordinal(
+    tmp_path, index, body, message
+):
+    base = tmp_path / "fibers"
+    path = _write_reference_half_step(base, index, body)
+    artifact = ReferenceWindingArtifact(ReferenceWindingLayerKey(index), path)
+    with pytest.raises(ValueError, match=message):
+        read_reference_winding_artifact(artifact)
+
+
+def test_reference_modes_are_mutually_exclusive():
+    selected = {
+        ReferenceWindingLayerKey(0),
+        ReferenceWindingLayerKey(1),
+    }
+    assert reference_visibility_for_mode("aggregate", selected) == (True, set())
+    assert reference_visibility_for_mode("selected", selected) == (
+        False,
+        selected,
+    )
+    assert reference_visibility_for_mode("hidden", selected) == (False, set())
+    with pytest.raises(ValueError, match="unknown reference visibility mode"):
+        reference_visibility_for_mode("bad", selected)
+
+
+def test_reference_mask_rotates_whole_winding_preserving_half_step_bits():
+    observed = (
+        ReferenceWindingLayerKey(0),
+        ReferenceWindingLayerKey(3),
+        ReferenceWindingLayerKey(5),
+    )
+    windings = (0, 1, 2)
+    complete = complete_reference_winding_layer_keys(observed, windings)
+    assert [key.half_step_index for key in complete] == list(range(6))
+    selected = {
+        ReferenceWindingLayerKey(0),
+        ReferenceWindingLayerKey(3),
+    }
+    rotated = rotate_visible_reference_winding_mask(
+        observed, selected, windings, 1
+    )
+    assert rotated == {
+        ReferenceWindingLayerKey(2),
+        ReferenceWindingLayerKey(5),
+    }
+    assert rotate_visible_reference_winding_mask(
+        observed, rotated, windings, -1
+    ) == selected
+
+
+def test_navigation_range_is_contiguous_union_of_solver_and_reference_slots():
+    solver = (WindingLayerKey(2, "h"), WindingLayerKey(3, "v"))
+    references = (
+        ReferenceWindingLayerKey(0),
+        ReferenceWindingLayerKey(9),
+    )
+    assert winding_navigation_range(solver, references) == (0, 1, 2, 3, 4)
+
+
 def test_winding_colors_are_stable_shared_for_hv_bright_and_opaque():
     keys = [
         WindingLayerKey(winding, state)
@@ -414,6 +542,46 @@ def test_reference_layer_is_independent_bright_and_visible(tmp_path):
     assert visible_winding_layers(keys, "none") == set()
     assert reference_layer.visible
     assert add_reference_layer(viewer, None, 4.0) is None
+
+
+def test_add_reference_winding_layers_materializes_missing_half_steps(tmp_path):
+    class FakeLayer:
+        def __init__(self, visible: bool):
+            self.visible = visible
+            self.editable = True
+
+    class FakeViewer:
+        def __init__(self):
+            self.calls = []
+
+        def add_shapes(self, data, **kwargs):
+            layer = FakeLayer(kwargs["visible"])
+            self.calls.append((data, kwargs, layer))
+            return layer
+
+    geometry = (
+        ReferenceWindingGeometry(
+            ReferenceWindingArtifact(
+                ReferenceWindingLayerKey(3), tmp_path / "reference_hs_3.obj"
+            ),
+            (np.zeros((2, 3), dtype=np.float32),),
+        ),
+    )
+    viewer = FakeViewer()
+    layers, count = add_reference_winding_layers(
+        viewer, geometry, 3.0, (0, 1, 2)
+    )
+    assert tuple(layers) == tuple(
+        ReferenceWindingLayerKey(index) for index in range(6)
+    )
+    assert count == 1
+    assert len(viewer.calls) == 1
+    _, kwargs, layer = viewer.calls[0]
+    assert kwargs["name"] == "Reference w1.5"
+    assert kwargs["visible"] is False
+    assert kwargs["edge_width"] == 3.0
+    assert layer.editable is False
+    assert all(not current.visible for current in layers.values())
 
 
 def test_visibility_presets_and_winding_navigation_group_ties_as_broken():

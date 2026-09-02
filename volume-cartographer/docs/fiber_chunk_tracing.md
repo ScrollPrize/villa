@@ -1373,10 +1373,9 @@ visibility at once. Full-size Previous and Next buttons circularly rotate the
 entire managed H/V/Broken/Tie visibility mask by one winding in the contiguous
 observed range while preserving state. Visible and hidden bits both move, so
 any arbitrary pattern, including missing and empty slots, wraps intact.
-The reference and unrelated layers are untouched. The label lists all currently
-visible managed windings and follows manual layer-panel visibility changes. The
-first nonempty H/V winding is the initial view. `--width` changes the displayed
-path width.
+Unrelated layers are untouched. The label lists all currently visible managed
+windings and follows manual layer-panel visibility changes. The first nonempty
+H/V winding is the initial view. `--width` changes the displayed path width.
 
 The shown winding number is the nonnegative publication offset, not an absolute
 physical winding. Likewise, physical H/V identity and absolute winding are not
@@ -1392,7 +1391,12 @@ options to the `direction-ablation` command:
 The tag match is exact and case-sensitive. The command scans only regular JSON
 files directly in that directory, validates selected files with the normal
 VC3D fiber parser, and writes every complete dense base-XYZ line to
-`<base>_reference.obj`. Reference annotations are not clipped to the stored
+`<base>_reference.obj`. It also writes one
+`<base>_reference_hs_<index>.obj` for each filename-ordered source; index `i`
+has diagnostic winding `i/2` and contains exactly that source. The complete
+aggregate/indexed family is staged before publication, and rerunning with fewer
+or no reference fibers removes stale generated siblings. Reference annotations
+are not clipped to the stored
 trace artifact's crop: geometry outside that crop remains available to both
 visual comparison and constraint diagnostics. The reference fibers are
 diagnostic only and do not affect BP. The same complete lines are passed once
@@ -1401,6 +1405,17 @@ defines diagnostic virtual winding values `0.0, 0.5, 1.0, ...`, with one
 complete diagnostic trace per source. Generated within-source continuity links
 are excluded. Every remaining link is presented exactly once under its
 lower-winding source and only points to a higher winding.
+
+The viewer starts in `Aggregate` reference mode, showing only the combined
+reference layer. `Selected` hides the aggregate and shows the indexed references
+for the current persistent selection; `Hidden` shows neither. Previous, Next,
+and animation shift the complete indexed selection by one integer winding while
+preserving whether each selected reference is on the integer or half-integer
+slot. The selection keeps moving while Aggregate or Hidden is displayed.
+Missing indexed files are logical empty slots, so they do not collapse the mask.
+The navigation range is the contiguous union of solver and reference slots.
+This association is for navigation only; it does not assert a physical gauge
+match between independently gauged solver components.
 
 For each source and matching BP benchmark, the command prints a perpendicular
 table followed by a parallel table. Dominant score determines the table, with
@@ -1606,6 +1621,20 @@ against the scaled canonical targets in latent winding units. Gauge-local candid
 and their gauge offset before aggregation, including when one reference source
 reaches multiple gauges. `NA` denotes a group with no positive raw coefficient.
 
+The per-reference BP table prints `raw_w` before `est_w`, but these are not two
+independent inferences. `est_w` is selected once in the globally calibrated
+reference coordinate. For a source with one candidate-bearing gauge, `raw_w`
+inverse-maps that exact candidate to a raw latent half-step. It then removes
+the solved H/V class offset (using the component phase sign and selected phase)
+and adds the same output offset used by the published solver winding OBJ
+filenames. Thus `raw_w` is the integer winding-layer coordinate to select in
+the viewer. With class offset `C`, output offset `P`, gauge offset `G`, and
+global sign `S`, `raw_w = S * est_w + G - C + P`. Missing estimates,
+multi-gauge ambiguity, or incompatible orientation components print `NA`; an
+off-grid conversion is an invariant error. The lower-level per-gauge scorer
+remains an input to calibration, not a second reported candidate. The Ceres
+reference table keeps its independently defined raw and calibrated estimates.
+
 An additional `all` row evaluates every constraint for the reference with the
 same scorer. Its preferred winding is exactly the `est_w` printed in the next
 table. This removes the previous difference between weighted-L1 group inference
@@ -1616,7 +1645,7 @@ violations before finite energy when hard evidence is contradictory.
 
 The command then prints one compact error row for every selected reference JSON in source order,
 identified only by its filename-ordered virtual winding. Each row
-contains `est_w`, `parity_ok`, and right/wrong/right-fraction columns for perpendicular, parallel-same,
+contains `raw_w`, `est_w`, `parity_ok`, and right/wrong/right-fraction columns for perpendicular, parallel-same,
 parallel-other, and sum; a zero-total fraction is `NA`. Multiple cropped runs
 and pieces accumulate into the same row. These rows reuse the one global gauge
 calibration and each class and sum count agrees with its aggregate. The command

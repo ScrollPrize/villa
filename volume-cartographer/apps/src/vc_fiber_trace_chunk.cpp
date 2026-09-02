@@ -1921,6 +1921,37 @@ void printConsensusReport(
     std::cout << std::defaultfloat;
 }
 
+struct FiberTracePublishedWindingRange {
+    std::optional<int> relativeMinimum;
+    std::optional<int> relativeMaximum;
+
+    [[nodiscard]] int outputOffset() const noexcept
+    {
+        return relativeMinimum ? -*relativeMinimum : 0;
+    }
+};
+
+FiberTracePublishedWindingRange publishedWindingRange(
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationReport& winding)
+{
+    if (winding.mapWinding.size() != winding.windingValid.size()) {
+        throw std::logic_error(
+            "Winding values and validity do not have matching sizes");
+    }
+    FiberTracePublishedWindingRange result;
+    for (std::size_t piece = 0; piece < winding.mapWinding.size(); ++piece) {
+        if (winding.windingValid[piece] == 0)
+            continue;
+        result.relativeMinimum = result.relativeMinimum
+            ? std::min(*result.relativeMinimum, winding.mapWinding[piece])
+            : winding.mapWinding[piece];
+        result.relativeMaximum = result.relativeMaximum
+            ? std::max(*result.relativeMaximum, winding.mapWinding[piece])
+            : winding.mapWinding[piece];
+    }
+    return result;
+}
+
 void writeAndPrintBpReport(
     const vc::fiber_tracer::FiberTraceBeliefPropagationReport& report,
     const vc::fiber_tracer::FiberTraceWindingBeliefPropagationReport& winding,
@@ -2062,21 +2093,10 @@ void writeAndPrintBpReport(
         }
     }
 
-    std::optional<int> relativeWindingMinimum;
-    std::optional<int> relativeWindingMaximum;
-    for (std::size_t piece = 0; piece < lines.size(); ++piece) {
-        if (winding.windingValid[piece] == 0)
-            continue;
-        relativeWindingMinimum = relativeWindingMinimum
-            ? std::min(*relativeWindingMinimum, winding.mapWinding[piece])
-            : winding.mapWinding[piece];
-        relativeWindingMaximum = relativeWindingMaximum
-            ? std::max(*relativeWindingMaximum, winding.mapWinding[piece])
-            : winding.mapWinding[piece];
-    }
-    const int windingOutputOffset = relativeWindingMinimum
-        ? -*relativeWindingMinimum
-        : 0;
+    const auto publishedRange = publishedWindingRange(winding);
+    const auto relativeWindingMinimum = publishedRange.relativeMinimum;
+    const auto relativeWindingMaximum = publishedRange.relativeMaximum;
+    const int windingOutputOffset = publishedRange.outputOffset();
     std::map<int, std::vector<vc::core::io::NamedPolyline>> windingLines;
     std::map<int, std::vector<std::size_t>> windingPieceIndices;
     for (std::size_t piece = 0; piece < lines.size(); ++piece) {
@@ -3180,11 +3200,28 @@ std::vector<std::size_t> applyQualityFilter(
     return originalTraceIndices;
 }
 
+std::filesystem::path referenceFiberArtifactDirectory(
+    const std::filesystem::path& output)
+{
+    return output.parent_path().empty()
+        ? std::filesystem::path{"."}
+        : output.parent_path();
+}
+
 std::filesystem::path referenceFiberObjPath(
     const std::filesystem::path& output)
 {
     return output.parent_path() /
         (output.stem().string() + "_reference.obj");
+}
+
+std::filesystem::path referenceFiberHalfStepObjPath(
+    const std::filesystem::path& output,
+    std::size_t halfStepIndex)
+{
+    return output.parent_path() /
+        (output.stem().string() + "_reference_hs_" +
+         std::to_string(halfStepIndex) + ".obj");
 }
 
 void removeReferenceFiberArtifact(const std::filesystem::path& path)
@@ -3209,6 +3246,104 @@ void removeReferenceFiberArtifact(const std::filesystem::path& path)
     }
 }
 
+bool isIndexedReferenceFiberArtifact(
+    const std::filesystem::path& output,
+    const std::filesystem::path& candidate)
+{
+    const std::string name = candidate.filename().string();
+    const std::string prefix = output.stem().string() + "_reference_hs_";
+    constexpr std::string_view suffix = ".obj";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix) ||
+        name.size() <= prefix.size() + suffix.size()) {
+        return false;
+    }
+    const std::string_view index{
+        name.data() + prefix.size(),
+        name.size() - prefix.size() - suffix.size()};
+    return std::all_of(index.begin(), index.end(), [](char value) {
+        return value >= '0' && value <= '9';
+    });
+}
+
+void removeReferenceFiberArtifacts(const std::filesystem::path& output)
+{
+    removeReferenceFiberArtifact(referenceFiberObjPath(output));
+    const auto directory = referenceFiberArtifactDirectory(output);
+    std::error_code error;
+    if (!std::filesystem::exists(directory, error)) {
+        if (error) {
+            throw std::runtime_error(
+                "failed to inspect reference artifact directory: " +
+                error.message());
+        }
+        return;
+    }
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory)) {
+        if (isIndexedReferenceFiberArtifact(output, entry.path()))
+            removeReferenceFiberArtifact(entry.path());
+    }
+}
+
+void publishReferenceFiberArtifacts(
+    const std::filesystem::path& output,
+    const std::vector<vc::core::io::NamedPolyline>& lines)
+{
+    struct Artifact {
+        std::filesystem::path finalPath;
+        std::filesystem::path stagedPath;
+        std::vector<vc::core::io::NamedPolyline> lines;
+    };
+    std::vector<Artifact> artifacts;
+    artifacts.reserve(lines.size() + 1);
+    artifacts.push_back({referenceFiberObjPath(output), {}, lines});
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        artifacts.push_back({
+            referenceFiberHalfStepObjPath(output, index),
+            {},
+            {lines[index]},
+        });
+    }
+    for (auto& artifact : artifacts) {
+        artifact.stagedPath = artifact.finalPath;
+        artifact.stagedPath += ".tmp";
+    }
+
+    const auto cleanStaged = [&] {
+        for (const auto& artifact : artifacts) {
+            std::error_code ignored;
+            std::filesystem::remove(artifact.stagedPath, ignored);
+        }
+    };
+    try {
+        cleanStaged();
+        for (const auto& artifact : artifacts) {
+            vc::core::io::writePolylinesObj(
+                artifact.lines,
+                artifact.stagedPath,
+                "VC3D tagged reference fibers");
+        }
+        removeReferenceFiberArtifacts(output);
+        std::vector<std::filesystem::path> published;
+        try {
+            for (const auto& artifact : artifacts) {
+                std::filesystem::rename(
+                    artifact.stagedPath, artifact.finalPath);
+                published.push_back(artifact.finalPath);
+            }
+        } catch (...) {
+            for (const auto& path : published) {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
+            throw;
+        }
+    } catch (...) {
+        cleanStaged();
+        throw;
+    }
+}
+
 struct ReferenceFiberDiagnostics {
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> lines;
     std::vector<std::size_t> sourceIds;
@@ -3226,9 +3361,10 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
     const Options& options)
 {
     const auto outputPath = referenceFiberObjPath(options.output);
-    removeReferenceFiberArtifact(outputPath);
-    if (!options.hasReferenceFiberDirectoryOption)
+    if (!options.hasReferenceFiberDirectoryOption) {
+        removeReferenceFiberArtifacts(options.output);
         return std::nullopt;
+    }
 
     const auto selection = vc::fiber_tracer::loadTaggedVc3dFiberJsonDirectory(
         options.referenceFiberDirectory, options.referenceFiberTag);
@@ -3259,13 +3395,13 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
         diagnostics.lines.push_back(std::move(diagnostic));
         diagnostics.sourceIds.push_back(index);
     }
-    vc::core::io::writePolylinesObj(
-        objLines, outputPath, "VC3D tagged reference fibers");
+    publishReferenceFiberArtifacts(options.output, objLines);
     std::cout << "fiber reference export"
               << " scanned_json=" << selection.scannedJsonFiles
               << " selected=" << selection.fibers.size()
               << " retained_fibers=" << objLines.size()
               << " retained_points=" << retainedPoints
+              << " indexed_outputs=" << objLines.size()
               << " tag=" << std::quoted(options.referenceFiberTag)
               << " directory=" << std::quoted(
                      options.referenceFiberDirectory.string())
@@ -4950,6 +5086,7 @@ std::string formatReferenceBpWindingBenchmark(
         reference, cross, winding, config);
 
     const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
+    const int windingOutputOffset = publishedWindingRange(winding).outputOffset();
     const auto orientationBenchmark = vc::fiber_tracer::
         benchmarkFiberTraceReferenceOrientations(observations);
     const auto clampedConflicts = vc::fiber_tracer::
@@ -5401,6 +5538,7 @@ std::string formatReferenceBpWindingBenchmark(
         "sum"};
     output << "reference fiber errors fraction=right/(right+wrong)\n"
            << std::setw(8) << "winding"
+           << std::setw(8) << "raw_w"
            << std::setw(8) << "est_w"
            << std::setw(10) << "parity_ok"
            << std::setw(8) << "pm_r" << std::setw(8) << "pm_w" << std::setw(8) << "pm_f"
@@ -5414,8 +5552,21 @@ std::string formatReferenceBpWindingBenchmark(
         const auto& referenceCounts = source < benchmark.references.size()
             ? benchmark.references[source]
             : empty;
+        const auto rawPublishedWinding = vc::fiber_tracer::
+            fiberTraceReferenceOutputWinding(
+                source,
+                referenceCounts,
+                orientationBenchmark,
+                winding.componentPhaseSign,
+                winding.phaseMagnitude,
+                windingOutputOffset);
         output << std::setw(8) << std::setprecision(1)
                << 0.5 * static_cast<double>(source);
+        if (rawPublishedWinding)
+            output << std::setw(8) << std::setprecision(1)
+                   << *rawPublishedWinding;
+        else
+            output << std::setw(8) << "NA";
         if (referenceCounts.estimatedWinding)
             output << std::setw(8) << std::setprecision(1)
                    << *referenceCounts.estimatedWinding;

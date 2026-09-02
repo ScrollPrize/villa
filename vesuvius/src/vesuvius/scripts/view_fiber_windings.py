@@ -68,6 +68,34 @@ class ReferenceGeometry:
     paths_zyx: tuple[np.ndarray, ...]
 
 
+@dataclass(frozen=True, order=True)
+class ReferenceWindingLayerKey:
+    """One filename-ordered reference half-step visibility slot."""
+
+    half_step_index: int
+
+    @property
+    def winding(self) -> int:
+        """Return the integer solver-winding slot used for navigation."""
+        return self.half_step_index // 2
+
+
+@dataclass(frozen=True)
+class ReferenceWindingArtifact:
+    """One indexed tagged-reference OBJ artifact."""
+
+    key: ReferenceWindingLayerKey
+    path: Path
+
+
+@dataclass(frozen=True)
+class ReferenceWindingGeometry:
+    """One indexed tagged-reference artifact converted to Napari ZYX."""
+
+    artifact: ReferenceWindingArtifact
+    paths_zyx: tuple[np.ndarray, ...]
+
+
 @dataclass
 class _EmptyWindingLayer:
     """Logical visibility slot for winding geometry absent from Napari."""
@@ -199,6 +227,84 @@ def load_reference_geometry(path: str | Path) -> ReferenceGeometry | None:
     return None if artifact is None else read_reference_artifact(artifact)
 
 
+def discover_reference_winding_artifacts(
+    path: str | Path,
+) -> tuple[ReferenceWindingArtifact, ...]:
+    """Discover indexed reference artifacts and reject malformed siblings."""
+    base = normalize_winding_output_base(path)
+    prefix = f"{base.name}_reference_hs_"
+    pattern = re.compile(rf"^{re.escape(prefix)}(?P<index>[0-9]+)\.obj$")
+    by_index: dict[int, Path] = {}
+    for candidate in base.parent.iterdir():
+        if not candidate.is_file() or not candidate.name.startswith(prefix):
+            continue
+        match = pattern.fullmatch(candidate.name)
+        if match is None:
+            raise ValueError(f"malformed indexed reference artifact: {candidate}")
+        index = int(match.group("index"))
+        if index in by_index:
+            raise ValueError(
+                f"duplicate indexed reference artifact for half-step {index}"
+            )
+        by_index[index] = candidate
+    return tuple(
+        ReferenceWindingArtifact(ReferenceWindingLayerKey(index), by_index[index])
+        for index in sorted(by_index)
+    )
+
+
+def read_reference_winding_artifact(
+    artifact: ReferenceWindingArtifact,
+) -> ReferenceWindingGeometry:
+    """Read one indexed reference and verify its source ordinal."""
+    parsed = read_ordered_polyline_obj(
+        artifact.path,
+        container_records=("o",),
+        allow_singletons=False,
+        require_segment_lines=True,
+    )
+    comments = tuple(comment.text for comment in parsed.preamble_comments)
+    if comments != (_REFERENCE_HEADER,):
+        raise ValueError(
+            f"{artifact.path}: expected exactly the tagged reference-fiber header"
+        )
+    if len(parsed.groups) != 1:
+        raise ValueError(
+            f"{artifact.path}: indexed reference artifact must contain exactly one fiber"
+        )
+    group = parsed.groups[0]
+    expected_prefix = f"reference_{artifact.key.half_step_index}_"
+    if not group.name.startswith(expected_prefix):
+        raise ValueError(
+            f"{artifact.path}: reference object ordinal does not match half-step index"
+        )
+    if group.comments:
+        raise ValueError(
+            f"{artifact.path}:{group.comments[0].line_number}: "
+            "reference fiber objects may not contain metadata comments"
+        )
+    return ReferenceWindingGeometry(
+        artifact=artifact,
+        paths_zyx=(group.points_xyz[:, ::-1].astype(np.float32, copy=True),),
+    )
+
+
+def load_reference_winding_geometry(
+    path: str | Path,
+) -> tuple[ReferenceWindingGeometry, ...]:
+    """Load all indexed reference-fiber artifacts for one output base."""
+    return tuple(
+        read_reference_winding_artifact(artifact)
+        for artifact in discover_reference_winding_artifacts(path)
+    )
+
+
+def reference_winding_layer_name(key: ReferenceWindingLayerKey) -> str:
+    """Return a layer name containing the exact virtual half-step winding."""
+    whole, half = divmod(key.half_step_index, 2)
+    return f"Reference w{whole}.{5 if half else 0}"
+
+
 def winding_layer_color(key: WindingLayerKey) -> tuple[float, float, float, float]:
     """Return a stable bright color, sharing one color for H/V per winding."""
     if key.winding < 0 or key.state not in _STATE_ORDER:
@@ -237,20 +343,60 @@ def navigable_windings(keys: Sequence[WindingLayerKey]) -> tuple[int, ...]:
 
 def complete_winding_layer_keys(
     keys: Sequence[WindingLayerKey],
+    windings: Sequence[int] | None = None,
 ) -> tuple[WindingLayerKey, ...]:
     """Expand observed artifacts to the complete contiguous managed grid."""
     observed = tuple(keys)
-    if not observed:
+    requested = tuple(windings or ())
+    if not observed and not requested:
         return ()
     if any(key.winding < 0 or key.state not in _STATE_ORDER for key in observed):
         raise ValueError("invalid winding layer key")
-    first = min(key.winding for key in observed)
-    last = max(key.winding for key in observed)
+    if any(winding < 0 for winding in requested):
+        raise ValueError("invalid winding range")
+    values = [key.winding for key in observed]
+    values.extend(requested)
+    first = min(values)
+    last = max(values)
     return tuple(
         WindingLayerKey(winding, state)
         for winding in range(first, last + 1)
         for state in _STATE_ORDER
     )
+
+
+def complete_reference_winding_layer_keys(
+    keys: Sequence[ReferenceWindingLayerKey],
+    windings: Sequence[int],
+) -> tuple[ReferenceWindingLayerKey, ...]:
+    """Return both logical reference half-steps for every winding slot."""
+    observed = tuple(keys)
+    requested = tuple(windings)
+    if any(key.half_step_index < 0 for key in observed) or any(
+        winding < 0 for winding in requested
+    ):
+        raise ValueError("invalid reference winding key")
+    values = [key.winding for key in observed]
+    values.extend(requested)
+    if not values:
+        return ()
+    return tuple(
+        ReferenceWindingLayerKey(2 * winding + parity)
+        for winding in range(min(values), max(values) + 1)
+        for parity in (0, 1)
+    )
+
+
+def winding_navigation_range(
+    winding_keys: Sequence[WindingLayerKey],
+    reference_keys: Sequence[ReferenceWindingLayerKey] = (),
+) -> tuple[int, ...]:
+    """Return the contiguous union range used by solver and reference masks."""
+    values = [key.winding for key in winding_keys]
+    values.extend(key.winding for key in reference_keys)
+    if not values:
+        return ()
+    return tuple(range(min(values), max(values) + 1))
 
 
 def visible_winding_layers(
@@ -304,6 +450,63 @@ def rotate_visible_winding_mask(
         destination = WindingLayerKey(windings[destination_index], source.state)
         if destination in available:
             rotated.add(destination)
+    return frozenset(rotated)
+
+
+def visible_reference_winding_layers(
+    keys: Sequence[ReferenceWindingLayerKey],
+    windings: Sequence[int],
+) -> frozenset[ReferenceWindingLayerKey]:
+    """Select both reference half-step slots for the requested windings."""
+    selected_windings = frozenset(windings)
+    return frozenset(
+        key
+        for key in keys
+        if key.winding in selected_windings
+    )
+
+
+def reference_visibility_for_mode(
+    mode: str,
+    selected: Sequence[ReferenceWindingLayerKey],
+) -> tuple[bool, frozenset[ReferenceWindingLayerKey]]:
+    """Resolve aggregate and indexed visibility for one reference mode."""
+    if mode == "aggregate":
+        return True, frozenset()
+    if mode == "selected":
+        return False, frozenset(selected)
+    if mode == "hidden":
+        return False, frozenset()
+    raise ValueError(f"unknown reference visibility mode: {mode!r}")
+
+
+def rotate_visible_reference_winding_mask(
+    keys: Sequence[ReferenceWindingLayerKey],
+    visible: Sequence[ReferenceWindingLayerKey],
+    windings: Sequence[int],
+    delta: int,
+) -> frozenset[ReferenceWindingLayerKey]:
+    """Rotate indexed references by whole windings while preserving parity."""
+    if delta == 0:
+        raise ValueError("reference winding visibility rotation must be nonzero")
+    available = frozenset(complete_reference_winding_layer_keys(keys, windings))
+    selected = frozenset(visible) & available
+    winding_values = tuple(sorted({key.winding for key in available}))
+    if len(winding_values) <= 1:
+        return selected
+    winding_index = {
+        winding: index for index, winding in enumerate(winding_values)
+    }
+    rotated: set[ReferenceWindingLayerKey] = set()
+    for source in selected:
+        destination = winding_values[
+            (winding_index[source.winding] + delta) % len(winding_values)
+        ]
+        rotated.add(
+            ReferenceWindingLayerKey(
+                2 * destination + source.half_step_index % 2
+            )
+        )
     return frozenset(rotated)
 
 
@@ -394,10 +597,13 @@ def add_winding_controls(
     viewer,
     layers: Mapping[WindingLayerKey, object],
     initial_windings: Sequence[int] | None = None,
+    reference_layers: Mapping[ReferenceWindingLayerKey, object] | None = None,
+    aggregate_reference_layer: object | None = None,
 ) -> None:
     """Add grouped category and winding navigation controls to a viewer."""
     from qtpy.QtCore import QTimer
     from qtpy.QtWidgets import (
+        QButtonGroup,
         QDoubleSpinBox,
         QHBoxLayout,
         QLabel,
@@ -408,7 +614,9 @@ def add_winding_controls(
     )
 
     keys = tuple(layers)
-    windings = tuple(sorted({key.winding for key in keys}))
+    reference_layers = reference_layers or {}
+    reference_keys = tuple(reference_layers)
+    windings = winding_navigation_range(keys, reference_keys)
     if initial_windings is None:
         initial_windings = navigable_windings(keys)
     initial_windings = tuple(
@@ -418,6 +626,7 @@ def add_winding_controls(
     widget = QWidget()
     layout = QVBoxLayout(widget)
     category_row = QHBoxLayout()
+    reference_row = QHBoxLayout()
     navigation_row = QHBoxLayout()
     animation_row = QHBoxLayout()
     winding_label = QLabel()
@@ -427,6 +636,13 @@ def add_winding_controls(
     label_update_timer.setObjectName("fiber_winding_label_update")
     label_update_timer.setSingleShot(True)
     label_update_timer.setInterval(0)
+    selected_reference_keys = visible_reference_winding_layers(
+        reference_keys, initial_windings
+    )
+    reference_mode = "aggregate" if aggregate_reference_layer is not None else (
+        "selected" if reference_keys else "hidden"
+    )
+    applying_reference_visibility = False
 
     def update_label() -> None:
         visible_windings = sorted(
@@ -434,6 +650,11 @@ def add_winding_controls(
                 key.winding
                 for key, layer in layers.items()
                 if layer.visible
+            }
+            | {
+                key.winding
+                for key in selected_reference_keys
+                if reference_mode == "selected"
             }
         )
         winding_label.setText(format_visible_windings(visible_windings))
@@ -450,11 +671,18 @@ def add_winding_controls(
             label_update_timer.start()
 
     def apply(preset: str, winding: int | None = None) -> None:
+        nonlocal selected_reference_keys
         selected = visible_winding_layers(keys, preset, winding=winding)
         for key, layer in layers.items():
             target = key in selected
             if layer.visible != target:
                 layer.visible = target
+        if reference_mode == "selected":
+            selected_reference_keys = visible_reference_winding_layers(
+                reference_keys,
+                sorted({key.winding for key in selected}),
+            )
+            apply_reference_visibility()
         schedule_label_update()
 
     for label, preset in (
@@ -468,6 +696,57 @@ def add_winding_controls(
         button.clicked.connect(lambda _checked=False, value=preset: apply(value))
         category_row.addWidget(button)
 
+    def apply_reference_visibility() -> None:
+        nonlocal applying_reference_visibility
+        aggregate_visible, indexed_visible = reference_visibility_for_mode(
+            reference_mode, selected_reference_keys
+        )
+        applying_reference_visibility = True
+        try:
+            if aggregate_reference_layer is not None and (
+                aggregate_reference_layer.visible != aggregate_visible
+            ):
+                aggregate_reference_layer.visible = aggregate_visible
+            for key, layer in reference_layers.items():
+                target = key in indexed_visible
+                if layer.visible != target:
+                    layer.visible = target
+        finally:
+            applying_reference_visibility = False
+
+    def set_reference_mode(mode: str) -> None:
+        nonlocal reference_mode
+        reference_mode = mode
+        reference_mode_buttons[mode].setChecked(True)
+        apply_reference_visibility()
+        schedule_label_update()
+
+    reference_row.addWidget(QLabel("References"))
+    reference_button_group = QButtonGroup(widget)
+    reference_button_group.setExclusive(True)
+    reference_mode_buttons: dict[str, object] = {}
+    for label, mode in (
+        ("Aggregate", "aggregate"),
+        ("Selected", "selected"),
+        ("Hidden", "hidden"),
+    ):
+        button = QPushButton(label)
+        button.setCheckable(True)
+        if mode == "aggregate":
+            enabled = aggregate_reference_layer is not None
+        elif mode == "selected":
+            enabled = bool(reference_keys)
+        else:
+            enabled = aggregate_reference_layer is not None or bool(reference_keys)
+        button.setEnabled(enabled)
+        button.setChecked(mode == reference_mode)
+        reference_button_group.addButton(button)
+        reference_mode_buttons[mode] = button
+        button.clicked.connect(
+            lambda _checked=False, value=mode: set_reference_mode(value)
+        )
+        reference_row.addWidget(button)
+
     previous_button = QPushButton("Previous")
     previous_button.setToolTip("Rotate visibility to the previous winding")
     next_button = QPushButton("Next")
@@ -476,7 +755,15 @@ def add_winding_controls(
     next_button.setEnabled(bool(windings))
 
     def move(delta: int) -> None:
+        nonlocal selected_reference_keys
         rotate_winding_layer_visibility(layers, delta)
+        selected_reference_keys = rotate_visible_reference_winding_mask(
+            reference_keys,
+            selected_reference_keys,
+            windings,
+            delta,
+        )
+        apply_reference_visibility()
         schedule_label_update()
 
     previous_button.clicked.connect(lambda _checked=False: move(-1))
@@ -521,17 +808,46 @@ def add_winding_controls(
     animation_row.addWidget(animation_interval)
     animation_row.addStretch(1)
     layout.addLayout(category_row)
+    layout.addLayout(reference_row)
     layout.addLayout(navigation_row)
     layout.addLayout(animation_row)
     for layer in layers.values():
         visible_event = getattr(getattr(layer, "events", None), "visible", None)
         if visible_event is not None:
             visible_event.connect(schedule_label_update)
+    for key, layer in reference_layers.items():
+        visible_event = getattr(getattr(layer, "events", None), "visible", None)
+        if visible_event is None:
+            continue
+
+        def reference_visibility_changed(
+            _event=None,
+            *,
+            current_key=key,
+            current_layer=layer,
+        ) -> None:
+            nonlocal reference_mode, selected_reference_keys
+            if applying_reference_visibility:
+                return
+            reference_mode = "selected"
+            reference_mode_buttons["selected"].setChecked(True)
+            if current_layer.visible:
+                selected_reference_keys = selected_reference_keys | {current_key}
+            else:
+                selected_reference_keys = frozenset(
+                    key for key in selected_reference_keys
+                    if key != current_key
+                )
+            apply_reference_visibility()
+            schedule_label_update()
+
+        visible_event.connect(reference_visibility_changed)
     update_label()
     if not initial_windings:
         apply("all")
     else:
         apply("winding", initial_windings[0])
+    apply_reference_visibility()
     viewer.window.add_dock_widget(widget, area="right", name="Winding visibility")
 
 
@@ -539,6 +855,7 @@ def add_winding_layers(
     viewer,
     geometry: Sequence[WindingGeometry],
     edge_width: float,
+    windings: Sequence[int] | None = None,
 ) -> tuple[dict[WindingLayerKey, object], int]:
     """Add the complete managed grid, with geometry where it exists."""
     layers: dict[WindingLayerKey, object] = {}
@@ -549,7 +866,7 @@ def add_winding_layers(
         if key in geometry_by_key:
             raise ValueError(f"duplicate winding geometry for {key}")
         geometry_by_key[key] = item.paths_zyx
-    for key in complete_winding_layer_keys(tuple(geometry_by_key)):
+    for key in complete_winding_layer_keys(tuple(geometry_by_key), windings):
         paths = geometry_by_key.get(key, ())
         if not paths:
             layers[key] = _EmptyWindingLayer()
@@ -570,6 +887,48 @@ def add_winding_layers(
         layers[key] = layer
         fiber_count += len(paths)
     return layers, fiber_count
+
+
+def add_reference_winding_layers(
+    viewer,
+    geometry: Sequence[ReferenceWindingGeometry],
+    edge_width: float,
+    windings: Sequence[int],
+) -> tuple[dict[ReferenceWindingLayerKey, object], int]:
+    """Add indexed references and placeholders over the navigation range."""
+    layers: dict[ReferenceWindingLayerKey, object] = {}
+    geometry_by_key: dict[ReferenceWindingLayerKey, tuple[np.ndarray, ...]] = {}
+    for item in geometry:
+        key = item.artifact.key
+        if key in geometry_by_key:
+            raise ValueError(f"duplicate indexed reference geometry for {key}")
+        geometry_by_key[key] = item.paths_zyx
+
+    for key in complete_reference_winding_layer_keys(
+        tuple(geometry_by_key), windings
+    ):
+        paths = geometry_by_key.get(key, ())
+        if not paths:
+            layers[key] = _EmptyWindingLayer()
+            continue
+        colors = np.broadcast_to(
+            np.asarray(_REFERENCE_COLOR, dtype=np.float32),
+            (len(paths), 4),
+        ).copy()
+        layer = viewer.add_shapes(
+            list(paths),
+            ndim=3,
+            shape_type="path",
+            name=reference_winding_layer_name(key),
+            edge_color=colors,
+            edge_width=edge_width,
+            face_color="transparent",
+            blending="opaque",
+            visible=False,
+        )
+        layer.editable = False
+        layers[key] = layer
+    return layers, len(geometry_by_key)
 
 
 def add_reference_layer(viewer, geometry: ReferenceGeometry | None, edge_width: float):
@@ -612,17 +971,37 @@ def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
     geometry = load_winding_geometry(base)
     initial_windings = navigable_windings(tuple(nonempty_layer_keys(geometry)))
     reference = load_reference_geometry(base)
+    reference_winding_geometry = load_reference_winding_geometry(base)
+    navigation_windings = winding_navigation_range(
+        tuple(item.artifact.key for item in geometry),
+        tuple(item.artifact.key for item in reference_winding_geometry),
+    )
     viewer = napari.Viewer(ndisplay=3, title=f"Fiber windings: {base.name}")
-    layers, fiber_count = add_winding_layers(viewer, geometry, edge_width)
+    layers, fiber_count = add_winding_layers(
+        viewer, geometry, edge_width, navigation_windings
+    )
     if fiber_count == 0:
         raise ValueError(f"all winding state OBJ artifacts are empty for base {base}")
-    add_reference_layer(viewer, reference, edge_width)
-    add_winding_controls(viewer, layers, initial_windings)
+    aggregate_reference_layer = add_reference_layer(viewer, reference, edge_width)
+    reference_layers, indexed_reference_count = add_reference_winding_layers(
+        viewer,
+        reference_winding_geometry,
+        edge_width,
+        navigation_windings,
+    )
+    add_winding_controls(
+        viewer,
+        layers,
+        initial_windings,
+        reference_layers,
+        aggregate_reference_layer,
+    )
     viewer.reset_view()
     print(
         f"fiber winding viewer windings={len({key.winding for key in layers})} "
         f"layers={len(layers)} fibers={fiber_count} "
         f"reference_fibers={0 if reference is None else len(reference.paths_zyx)}"
+        f" indexed_reference_fibers={indexed_reference_count}"
     )
     napari.run()
 

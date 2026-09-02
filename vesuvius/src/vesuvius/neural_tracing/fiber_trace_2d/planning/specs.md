@@ -5775,6 +5775,17 @@
   hard-sign-violating active state impossible and may select Defect; because
   the reference diagnostic is forced active, contradictory signs instead use
   the minimum-violation lexicographic fallback before finite factor energy.
+  The internal per-`(source,gauge)` raw estimates above are calibration votes;
+  they are not the compact table's displayed `raw_w`. Displayed `raw_w` must
+  use the exact selected `est_w`, inverse-map it with the fitted global sign and
+  the one gauge shared by all candidate-bearing evidence used for that source,
+  subtract the reference class offset determined by source H/V parity, the
+  unique contributing orientation component's phase sign, and the selected
+  phase, then add the same output offset used by published integer winding OBJ
+  layers. The result must be integral and name that output winding slot. No
+  estimate, multiple contributing gauges, or incompatible orientation
+  components prints `NA`; an off-grid result is an invariant error. This
+  display mapping must never run another candidate selection.
   Then print one compact row per original selected reference source in source order, identified
   only by its virtual winding `0.5*i`. Each source row
   contains `right`, `wrong`, and `right_fraction` for perpendicular winding,
@@ -5868,14 +5879,30 @@
   range. Next moves source slot `i` to `(i+1) mod N`; Previous moves it to
   `(i-1) mod N`, preserving state. Hidden bits move exactly like visible bits,
   so arbitrary sparse selections and missing/empty windings rotate bijectively
-  without being replaced by a preset. One observed winding is a no-op. The independent reference layer
-  and unmanaged Napari layers remain unchanged. The displayed winding label
+  without being replaced by a preset. One observed winding is a no-op.
+  Unmanaged Napari layers remain unchanged. The displayed winding label
   summarizes all currently visible managed winding labels and follows presets,
   rotations, and manual layer-visibility changes.
-- When `<base>_reference.obj` is present, the viewer validates its dedicated
-  header and ordered-polylines contract, converts base XYZ to Napari ZYX, and
-  adds one visible bright `Reference fibers` layer. Winding category and
-  previous/next controls do not change this independent comparison layer.
+- A run with tagged reference fibers publishes both aggregate
+  `<base>_reference.obj` and one indexed
+  `<base>_reference_hs_<i>.obj` per filename-ordered source. Indexed file `i`
+  contains exactly the nonempty `reference_<i>_...` polyline and represents
+  virtual winding `i/2`. The complete artifact family is staged before the old
+  generation is replaced; a fewer-source or reference-free run removes stale
+  indexed members without matching unrelated files.
+- The viewer validates the aggregate and indexed reference artifacts under the
+  dedicated reference header and strict ordered-polyline contract. Indexed
+  filenames matching the family prefix must be well formed, and their single
+  object ordinal must match the file index. It materializes two logical
+  half-step reference slots per integer winding across the contiguous union of
+  solver and reference winding slots; absent files remain empty logical slots.
+  Reference modes are mutually exclusive: `Aggregate` shows only the aggregate
+  layer, `Selected` shows only the persistent indexed mask, and `Hidden` shows
+  neither. Aggregate is the initial mode. Previous, Next, and animation rotate
+  every indexed bit by one integer winding, preserving half-step parity,
+  hidden bits, missing slots, and wraparound even while Aggregate or Hidden is
+  displayed. This grouping is a navigation convention only and does not imply
+  physical gauge equivalence between independently gauged components.
 - Published `N` is the solver's nonnegative display-offset integer label.
   Absolute winding and physical H/V identity are not comparable across
   independently gauged components; visualization must not imply otherwise.

@@ -1,13 +1,11 @@
 # Status
 
-- [x] Capture the requested Ceres solver task.
-- [x] Inspect the current constraint materialization, BP configuration, CLI,
-  reference extraction, Ceres dependency, tests, and documentation.
-- [x] Write the implementation plan, including spec/docs/tests/changelog.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Implement the shared continuous solver API and Ceres residuals.
-- [x] Integrate `--winding-solver ceres`, reporting, and artifacts.
-- [x] Implement fixed-source per-reference least-squares evaluation.
-- [x] Add focused unit tests.
-- [x] Update specs, user documentation, changelog, and task log.
-- [x] Build Release and run focused validation plus the 1024 evaluation.
+- [x] Capture the corrected BP `raw_w` semantics.
+- [x] Inspect calibration, final estimate selection, output winding offset,
+  tests, and documentation.
+- [x] Update the implementation/test/spec/docs plan.
+- [x] Complete independent review of the corrected plan.
+- [x] Make `raw_w` the inverse-mapped final `est_w` candidate.
+- [x] Shift the reported value into published solver-layer coordinates.
+- [x] Correct focused C++ tests and documentation.
+- [x] Build Release and run focused plus real-data validation.

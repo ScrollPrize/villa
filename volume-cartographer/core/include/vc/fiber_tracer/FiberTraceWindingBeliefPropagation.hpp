@@ -683,7 +683,10 @@ struct FiberTraceReferenceSourceBenchmark {
         static_cast<std::size_t>(FiberTraceReferenceBenchmarkClass::Count)>
         classes;
     FiberTraceReferenceBenchmarkCounts sum;
+    std::optional<double> rawEstimatedWinding;
     std::optional<double> estimatedWinding;
+    std::optional<std::size_t> estimatedIntegerGauge;
+    std::optional<std::size_t> estimatedOrientationComponent;
     std::size_t estimatedWindingSupport = 0;
     std::size_t estimatedWindingObservations = 0;
     std::optional<bool> estimatedParityMatches;
@@ -749,6 +752,14 @@ struct FiberTraceReferenceOrientationBenchmark {
 [[nodiscard]] std::optional<bool> fiberTraceReferenceEstimateParityMatches(
     std::size_t referenceSource,
     std::optional<double> estimatedWinding);
+
+[[nodiscard]] std::optional<int> fiberTraceReferenceOutputWinding(
+    std::size_t referenceSource,
+    const FiberTraceReferenceSourceBenchmark& reference,
+    const FiberTraceReferenceOrientationBenchmark& orientation,
+    std::span<const int> componentPhaseSigns,
+    double phaseMagnitude,
+    int outputOffset);
 
 [[nodiscard]] FiberTraceReferenceOrientationBenchmark
 benchmarkFiberTraceReferenceOrientations(

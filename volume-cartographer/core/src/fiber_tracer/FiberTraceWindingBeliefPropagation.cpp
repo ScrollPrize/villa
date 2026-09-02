@@ -5323,6 +5323,60 @@ std::optional<bool> fiberTraceReferenceEstimateParityMatches(
         static_cast<int>(referenceSource % 2);
 }
 
+std::optional<int> fiberTraceReferenceOutputWinding(
+    std::size_t referenceSource,
+    const FiberTraceReferenceSourceBenchmark& reference,
+    const FiberTraceReferenceOrientationBenchmark& orientation,
+    std::span<const int> componentPhaseSigns,
+    double phaseMagnitude,
+    int outputOffset)
+{
+    if (!reference.rawEstimatedWinding ||
+        !reference.estimatedIntegerGauge ||
+        !reference.estimatedOrientationComponent) {
+        return std::nullopt;
+    }
+    const std::size_t component =
+        *reference.estimatedOrientationComponent;
+    const auto calibration = std::find_if(
+        orientation.components.begin(), orientation.components.end(),
+        [component](const auto& current) {
+            return current.component == component;
+        });
+    if (calibration == orientation.components.end() ||
+        component >= componentPhaseSigns.size() ||
+        !std::isfinite(phaseMagnitude)) {
+        return std::nullopt;
+    }
+    const int phaseSign = componentPhaseSigns[component];
+    if (phaseSign != -1 && phaseSign != 1) {
+        throw std::invalid_argument(
+            "Reference winding component phase sign is invalid");
+    }
+    const bool evenSource = referenceSource % 2 == 0;
+    const bool horizontal = evenSource
+        ? calibration->evenReferenceIsHorizontal
+        : !calibration->evenReferenceIsHorizontal;
+    const double classOffset = horizontal
+        ? 0.0
+        : static_cast<double>(phaseSign) * phaseMagnitude;
+    const double relativeWinding =
+        *reference.rawEstimatedWinding - classOffset;
+    const double rounded = std::round(relativeWinding);
+    const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(relativeWinding));
+    if (std::abs(relativeWinding - rounded) > tolerance) {
+        throw std::logic_error(
+            "Reference winding estimate does not map to an integer output layer");
+    }
+    if (rounded < static_cast<double>(std::numeric_limits<int>::min()) ||
+        rounded > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(
+            "Reference winding output layer is out of range");
+    }
+    return static_cast<int>(rounded) + outputOffset;
+}
+
 FiberTraceReferenceOrientationBenchmark
 benchmarkFiberTraceReferenceOrientations(
     std::span<const FiberTraceReferenceWindingObservation> observations)
@@ -5523,6 +5577,20 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
         estimatesByGauge;
     for (const auto& estimate : rawEstimates)
         estimatesByGauge[estimate.integerGauge].push_back(&estimate);
+    std::vector<std::set<std::size_t>> estimateGaugesBySource(
+        referenceSources);
+    std::vector<std::set<std::size_t>> estimateComponentsBySource(
+        referenceSources);
+    for (const auto& observation : benchmarkObservations) {
+        if (observation.inferredReferenceWindingCount == 0 ||
+            !hasAdmittedReferenceEvidence(observation)) {
+            continue;
+        }
+        estimateGaugesBySource.at(observation.referenceSource).insert(
+            observation.integerGauge);
+        estimateComponentsBySource.at(observation.referenceSource).insert(
+            observation.bpOrientationComponent);
+    }
 
     struct SignCalibration {
         int sign = 1;
@@ -5708,6 +5776,22 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
          ++source) {
         auto& reference = result.references[source];
         reference.estimatedWinding = weighted[source].all.preferredWinding;
+        if (reference.estimatedWinding &&
+            estimateGaugesBySource[source].size() == 1) {
+            const std::size_t gauge = *estimateGaugesBySource[source].begin();
+            const auto offset = offsetByGauge.find(gauge);
+            if (offset != offsetByGauge.end()) {
+                reference.rawEstimatedWinding =
+                    static_cast<double>(result.globalSign) *
+                        *reference.estimatedWinding +
+                    offset->second;
+                reference.estimatedIntegerGauge = gauge;
+            }
+        }
+        if (estimateComponentsBySource[source].size() == 1) {
+            reference.estimatedOrientationComponent =
+                *estimateComponentsBySource[source].begin();
+        }
         reference.estimatedWindingObservations =
             weighted[source].all.observations;
         reference.estimatedWindingSupport = 0;
