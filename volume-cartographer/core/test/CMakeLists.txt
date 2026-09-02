@@ -865,6 +865,13 @@ if(TARGET vc_tifxyz_selfcross)
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
 endif()
 
+if(TARGET vc_obj2tifxyz)
+    vc_add_test(NAME test_obj2tifxyz_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_OBJ2TIFXYZ_BIN="$<TARGET_FILE:vc_obj2tifxyz>")
+    add_dependencies(test_obj2tifxyz_cli vc_obj2tifxyz)
+endif()
+
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_remote_url)

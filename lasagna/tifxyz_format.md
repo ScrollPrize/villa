@@ -30,7 +30,7 @@ Any other `*.tif` files are interpreted as additional channels (by filename stem
 	- `Y = y.tif[row, col]`
 	- `Z = z.tif[row, col]`
 
-The grid is a *regular* 2D lattice in index space; physical spacing of the grid in “surface units” is given by `meta.json.scale`.
+The grid is a *regular* 2D lattice in index space; `meta.json.scale` gives its sampling density in grid cells per voxel (see §5.1).
 
 ## 3. Data types (TIFF)
 
@@ -108,15 +108,12 @@ Common fields produced by tools:
 
 ### 5.1 `scale` meaning
 
-`scale = [sx, sy]` describes the grid spacing in surface-parameter space.
-
-- Many tools interpret the parametric coordinate of a vertex `(row, col)` as `(u = col * sx, v = row * sy)`.
-- Some operations may also use `1/sx` and `1/sy` as a “pixels-per-unit” scaling.
+`scale = [sx, sy]` is the sampling density of the grid: grid cells per voxel along each axis. It is a density, not a spacing: adjacent grid vertices are `1/sx` (resp. `1/sy`) voxels apart, and a grid of `cols x rows` cells spans `cols/sx x rows/sy` voxels (`QuadSurface::size()`). The tracer writes `0.05` for its 20-voxel step.
 
 To stay compatible:
 
 - Preserve `scale` when copying/transforming surfaces.
-- If you resample the grid resolution, update `scale` consistently.
+- If you resample the grid resolution, update `scale` consistently: doubling the cell spacing halves `scale`.
 
 ## 6. Writing rules (recommended)
 
