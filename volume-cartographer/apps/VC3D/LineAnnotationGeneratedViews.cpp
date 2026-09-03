@@ -236,15 +236,15 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
     return overlay;
 }
 
-void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
-                           const std::string& surfaceName,
-                           const GeneratedOverlay& overlay)
+std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
+                                  const std::string& surfaceName,
+                                  const GeneratedOverlay& overlay)
 {
     if (!viewer) {
-        return;
+        return {};
     }
 
-    const auto key = "line_annotation_overlay_" + surfaceName;
+    const std::string key = generatedOverlayGroupKey(surfaceName);
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
     size_t branchPointCount = 0;
     for (const auto& branch : overlay.branchLinePoints) {
@@ -712,6 +712,7 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     ViewerOverlayControllerBase::applyPrimitives(viewer, key, std::move(primitives));
+    return key;
 }
 
 void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,

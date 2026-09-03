@@ -370,6 +370,9 @@ private:
     // arrow pan, Space snap) is measured in these units.
     const std::vector<double>& currentLineArclengths() const;
     void rebuildGeneratedStaticStripOverlays();
+    // Arrow-pan tick: shift the static strip overlays with the camera (exact
+    // while the zoom is unchanged), rebuilding only when it is not.
+    void updateStaticStripOverlaysForPan();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
                                          bool updateSpanLabels = true);
     void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
@@ -384,7 +387,8 @@ private:
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
     void restoreInitialGeneratedViewerCameras();
-    void applyOverlayForViewer(const std::string& overlayKey,
+    // Returns the viewer overlay-group key the items were registered under.
+    std::string applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
@@ -504,6 +508,18 @@ private:
     std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
+    // Per strip viewer: the viewer group the current static overlay was
+    // registered under (the key registration returned, used verbatim for the
+    // pan-time translation) and the camera it was built for.
+    struct StaticStripOverlayPlacement {
+        std::string groupKey;
+        vc3d::line_annotation::GeneratedOverlayCameraBaseline camera;
+    };
+    std::vector<StaticStripOverlayPlacement> _staticStripOverlayPlacements;
+    // A missing group during a pan means a registration/lookup mismatch, not a
+    // legitimate rebuild reason; warn once per pan so it cannot hide behind
+    // the rebuild fallback.
+    bool _staticStripOverlayPanFallbackWarned = false;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;

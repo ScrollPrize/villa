@@ -523,6 +523,53 @@ TEST_CASE("line annotation arclength snap uses a quarter strip column")
           doctest::Approx(19.7));
 }
 
+TEST_CASE("line annotation overlay group key is the registration key")
+{
+    // Registration (applyGeneratedOverlay) and the pan-time translation must
+    // address the viewer group by the same string; both go through this helper.
+    CHECK(vc3d::line_annotation::generatedOverlayGroupKey("line_surface_x") ==
+          "line_annotation_overlay_line_surface_x");
+}
+
+TEST_CASE("line annotation static overlay pan translation shifts at fixed zoom only")
+{
+    using vc3d::line_annotation::GeneratedOverlayCameraBaseline;
+    using vc3d::line_annotation::generatedOverlayPanTranslation;
+
+    GeneratedOverlayCameraBaseline baseline;
+    baseline.referenceScene = QPointF(100.0, 50.0);
+    baseline.scale = 2.0;
+
+    SUBCASE("a camera pan is a common scene delta")
+    {
+        const auto delta = generatedOverlayPanTranslation(baseline, QPointF(90.0, 50.0), 2.0);
+        REQUIRE(delta.has_value());
+        CHECK(delta->x() == doctest::Approx(-10.0));
+        CHECK(delta->y() == doctest::Approx(0.0));
+    }
+
+    SUBCASE("an unchanged camera yields a zero delta")
+    {
+        const auto delta = generatedOverlayPanTranslation(baseline, QPointF(100.0, 50.0), 2.0);
+        REQUIRE(delta.has_value());
+        CHECK(delta->isNull());
+    }
+
+    SUBCASE("a zoom change requires a rebuild")
+    {
+        CHECK_FALSE(generatedOverlayPanTranslation(baseline, QPointF(90.0, 50.0), 2.5).has_value());
+    }
+
+    SUBCASE("an unknown baseline requires a rebuild")
+    {
+        const GeneratedOverlayCameraBaseline unknown;
+        CHECK_FALSE(generatedOverlayPanTranslation(unknown, QPointF(90.0, 50.0), 2.0).has_value());
+        CHECK_FALSE(generatedOverlayPanTranslation(
+                        baseline, QPointF(std::numeric_limits<double>::quiet_NaN(), 0.0), 2.0)
+                        .has_value());
+    }
+}
+
 TEST_CASE("line annotation straight shift scroll moves cut origin along plane normal")
 {
     const cv::Vec3f origin{1.0f, 2.0f, 3.0f};

@@ -9,6 +9,7 @@
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -1528,13 +1529,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 if (_arrowPanDirection != 0) {
-                    // During a keyboard pan every tick already rebuilds the
-                    // dynamic overlays (via setCurrentLinePosition), so only
-                    // the static strip overlays need to track the scrolling
-                    // camera here. The side-strip intersection request (which
-                    // clones geometry and snapshots+hashes every fiber per
-                    // call) waits for the landing's full refresh.
-                    rebuildGeneratedStaticStripOverlays();
+                    // During a keyboard pan every tick rebuilds the dynamic
+                    // overlays and shifts the static strip overlays with the
+                    // camera right after the camera move (tickArrowPan), so a
+                    // rebuild here would only re-place the control-point dots
+                    // at an arbitrary phase relative to the ticks. The
+                    // side-strip intersection request (which clones geometry
+                    // and snapshots+hashes every fiber per call) waits for the
+                    // landing's full refresh.
                     return;
                 }
                 rebuildGeneratedOverlays();
@@ -2503,14 +2505,14 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
-void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
-                                                 CChunkedVolumeViewer* viewer,
-                                                 const GeneratedOverlay& overlay)
+std::string LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
+                                                        CChunkedVolumeViewer* viewer,
+                                                        const GeneratedOverlay& overlay)
 {
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
-        return;
+        return {};
     }
-    vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
+    return vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
 void LineAnnotationDialog::clearControlPointContextPreview(const std::string& surfaceName,
@@ -2906,6 +2908,13 @@ void LineAnnotationDialog::tickArrowPan()
     // centered right after - a ~60 Hz flicker that reads as two green lines.
     centerStripsOnLinePosition(position, false);
     setCurrentLinePosition(position, false);
+    // The static strip overlays (control-point dots) bake the camera in too.
+    // Left to the coalesced post-render refresh they trail the camera by up to
+    // one tick and then snap - a jiggle that grows with the pan speed. Their
+    // scene placement is affine in the camera pointer at a fixed zoom, so the
+    // tick shifts the existing items by the camera delta (no item churn) and
+    // rebuilds only when the zoom changed; the landing does the full rebuild.
+    updateStaticStripOverlaysForPan();
 }
 
 void LineAnnotationDialog::finishArrowPan(double position)
@@ -2938,6 +2947,7 @@ void LineAnnotationDialog::cancelArrowPan()
     _arrowPanStopTarget.reset();
     _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
     _arrowPanArclengthUnits.reset();
+    _staticStripOverlayPanFallbackWarned = false;
     _arrowPanEndedByLanding = false;
 }
 
@@ -3651,6 +3661,7 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         return;
     }
 
+    _staticStripOverlayPlacements.assign(_stripViewers.size(), StaticStripOverlayPlacement{});
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
         auto* viewer = _stripViewers[i].data();
         if (!viewer) {
@@ -3671,15 +3682,68 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (sideStrip) {
             strip.fiberIntersections = stripViews.fiberIntersections;
         }
-        applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        auto& placement = _staticStripOverlayPlacements[i];
+        placement.groupKey = applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        // The camera these items were placed against; a pan tick shifts them
+        // from here instead of rebuilding (updateStaticStripOverlaysForPan).
+        placement.camera.referenceScene = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        placement.camera.scale = static_cast<double>(viewer->cameraState().scale);
     }
 
+}
+
+void LineAnnotationDialog::updateStaticStripOverlaysForPan()
+{
+    if (!kGeneratedLineAnnotationOverlaysEnabled) {
+        return;
+    }
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    if (_staticStripOverlayPlacements.size() != _stripViewers.size()) {
+        rebuildGeneratedStaticStripOverlays();
+        return;
+    }
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        auto* viewer = _stripViewers[i].data();
+        if (!viewer) {
+            continue;
+        }
+        auto& placement = _staticStripOverlayPlacements[i];
+        const QPointF reference = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        const auto delta = vc3d::line_annotation::generatedOverlayPanTranslation(
+            placement.camera, reference, static_cast<double>(viewer->cameraState().scale));
+        if (!delta) {
+            // The zoom changed under the pan: one ordinary rebuild re-records
+            // every placement.
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        if (placement.groupKey.empty() ||
+            !viewer->translateOverlayGroup(placement.groupKey, *delta)) {
+            // No group under the key registration returned. Legitimate only
+            // when the viewer dropped its groups (surface swap); anything else
+            // is a bookkeeping bug that would otherwise hide behind this
+            // rebuild, so say so once per pan.
+            if (!_staticStripOverlayPanFallbackWarned) {
+                _staticStripOverlayPanFallbackWarned = true;
+                Logger()->warn(
+                    "Line annotation: static strip overlay group '{}' missing during arrow pan; "
+                    "rebuilding instead of translating",
+                    placement.groupKey);
+            }
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        placement.camera.referenceScene = reference;
+    }
 }
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
 {
     _fastStripOverlayItems.clear();
     _fastCurrentCutOverlayItems = {};
+    _staticStripOverlayPlacements.clear();
 }
 
 void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,

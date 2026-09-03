@@ -1125,6 +1125,39 @@ inline constexpr double kGeneratedArrowPanSpeedStep = 1.25;
 // double rounding on arclengths of ~1e4.
 inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-3;
 
+// Camera baseline an overlay group was built against: the scene position of
+// a fixed reference surface point and the camera scale. A strip viewer maps
+// surface to scene as (surface - cameraPointer) * scale + viewportCenter, so
+// while the scale is unchanged every camera move (pan, linked-camera echo,
+// viewport recenter) shifts all overlay items by one common scene delta.
+struct GeneratedOverlayCameraBaseline {
+    QPointF referenceScene{std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::quiet_NaN()};
+    double scale = std::numeric_limits<double>::quiet_NaN();
+};
+
+// The scene delta that moves an overlay built at `baseline` to the camera
+// whose reference point now sits at `referenceScene`, or nullopt when the
+// items must be rebuilt instead: the scale changed (a zoom), or either state
+// is unknown.
+inline std::optional<QPointF> generatedOverlayPanTranslation(
+    const GeneratedOverlayCameraBaseline& baseline,
+    const QPointF& referenceScene,
+    double scale)
+{
+    const auto finitePoint = [](const QPointF& point) {
+        return std::isfinite(point.x()) && std::isfinite(point.y());
+    };
+    if (!finitePoint(baseline.referenceScene) || !std::isfinite(baseline.scale) ||
+        !finitePoint(referenceScene) || !std::isfinite(scale)) {
+        return std::nullopt;
+    }
+    if (scale != baseline.scale) {
+        return std::nullopt;
+    }
+    return referenceScene - baseline.referenceScene;
+}
+
 struct GeneratedArrowPanState {
     double position = 0.0;
     // Signed, in the integrator's unit per second.
@@ -1443,9 +1476,18 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(const GeneratedVi
                                                                CChunkedVolumeViewer* viewer,
                                                                PlaneSurface* plane,
                                                                const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
-void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
-                           const std::string& surfaceName,
-                           const GeneratedOverlay& overlay);
+// The viewer overlay-group key applyGeneratedOverlay registers an overlay
+// under. Single source for registration and for anything that later addresses
+// the group (translateOverlayGroup during a pan).
+inline std::string generatedOverlayGroupKey(const std::string& surfaceName)
+{
+    return "line_annotation_overlay_" + surfaceName;
+}
+// Registers the overlay's items on the viewer and returns the group key they
+// were registered under (empty when nothing was registered).
+std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
+                                  const std::string& surfaceName,
+                                  const GeneratedOverlay& overlay);
 void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
                                               const std::string& surfaceName);
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
