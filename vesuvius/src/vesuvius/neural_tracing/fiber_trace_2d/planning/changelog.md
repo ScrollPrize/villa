@@ -1955,8 +1955,8 @@
   replay reset after every failure and evaluate the full directional reference
   run.
 - Added version-2 JSON accounting for every failure, seeded interval coverage,
-  failure density, and failure-free span lengths while preserving the prior
-  first-failure record as historical data.
+  failure density, and failure-free span lengths. Superseded interim benchmark
+  records were removed once the final reliability metric was recorded.
 
 ## 2026-09-03 - Endpoint replay reliability metric
 

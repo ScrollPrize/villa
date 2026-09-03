@@ -24,8 +24,11 @@
 | Reset | minimum advance 1 base voxel, seed window 32 base voxels |
 | Base voxel size | 2.4 um |
 
-Input artifact hashes are unchanged from the preceding [whole-run
-record](2026-09-03-d1c52f1b0-reference-whole-run-replay.md).
+| Artifact | SHA-256 |
+| --- | --- |
+| Fiberlet `.zattrs` | `d38b08d3fb06dd237adcd50da7228d963ac50a44dd6039628d5b37eb87a51e73` |
+| Normal manifest | `77834e54d9e2dfde4c10b6dba8610ba881a5ad509d1c82d6409346a931e3aa29` |
+| Reference inventory | `1a2a5c0d608f8b5b6cf9ceb361a78ff163eea640422662d669d89a33eeca3b90` |
 
 ## Command
 
