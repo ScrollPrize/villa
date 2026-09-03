@@ -13,7 +13,8 @@ dependencies = [
     "imageio>=2.37.3",
     "kimimaro[all]>=5.8.1",
     "kornia>=0.8.3",
-    "libigl>=2.6.1",
+    # 2.6.2 shipped no Windows wheel; 2.6.3 restored it.
+    "libigl>=2.6.3",
     "matplotlib>=3.11.0",
     "networkx>=3.6.1",
     "numpy>=2.5.0",
