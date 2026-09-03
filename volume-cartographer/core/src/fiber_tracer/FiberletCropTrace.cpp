@@ -409,7 +409,15 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
 }
 
 struct SideTrace {
+    struct Boundary {
+        FiberletStorageKey target;
+        std::size_t pointCount = 0;
+        double totalMetricCost = 0.0;
+        double pathLengthPredictionVoxels = 0.0;
+    };
+
     std::vector<cv::Vec3d> points;
+    std::vector<Boundary> boundaries;
     std::string termination = "graph_exhausted";
     std::size_t fiberlets = 0;
   double totalMetricCost = 0.0;
@@ -461,6 +469,14 @@ SideTrace traceSide(
             result.termination = "crop_boundary";
             return result;
         }
+        if (config.stopAtCoveredAnchors) {
+            result.boundaries.push_back({
+                edge.target,
+                result.points.size(),
+                result.totalMetricCost,
+                result.pathLengthPredictionVoxels,
+            });
+        }
         current = edge.target;
         incoming = edge;
         if (!visited.insert(current).second) {
@@ -479,10 +495,57 @@ struct InitialPair {
 
 struct TraceCandidate {
     FiberletCropTraceLine line;
+    SideTrace negative;
+    SideTrace positive;
+    double centralMetricCost = 0.0;
     LookaheadStatistics lookahead;
     bool hasUsableEdge = false;
-    bool bidirectional = false;
 };
+
+void truncateAtCoveredAnchor(
+    SideTrace& side,
+    const std::map<FiberletStorageKey, std::size_t>& anchorIndices,
+    const std::vector<bool>& covered)
+{
+    for (std::size_t index = 0; index < side.boundaries.size(); ++index) {
+        const auto found = anchorIndices.find(side.boundaries[index].target);
+        if (found == anchorIndices.end() || !covered[found->second])
+            continue;
+        const auto boundary = side.boundaries[index];
+        side.points.resize(boundary.pointCount);
+        side.boundaries.resize(index + 1);
+        side.fiberlets = index + 1;
+        side.totalMetricCost = boundary.totalMetricCost;
+        side.pathLengthPredictionVoxels =
+            boundary.pathLengthPredictionVoxels;
+        side.termination = "covered_anchor";
+        return;
+    }
+}
+
+FiberletCropTraceLine finalizeCandidate(TraceCandidate& candidate)
+{
+    auto& line = candidate.line;
+    const auto& negative = candidate.negative;
+    const auto& positive = candidate.positive;
+    line.negativeTermination = negative.termination;
+    line.positiveTermination = positive.termination;
+    line.negativeFiberlets = negative.fiberlets;
+    line.positiveFiberlets = positive.fiberlets;
+    line.totalMetricCost =
+        negative.totalMetricCost + positive.totalMetricCost;
+    line.pathLengthPredictionVoxels =
+        negative.pathLengthPredictionVoxels +
+        positive.pathLengthPredictionVoxels;
+    if (negative.fiberlets > 0 && positive.fiberlets > 0)
+        line.totalMetricCost += candidate.centralMetricCost;
+    line.pointsBaseXYZ.assign(
+        negative.points.rbegin(), negative.points.rend());
+    line.pointsBaseXYZ.insert(
+        line.pointsBaseXYZ.end(), std::next(positive.points.begin()),
+        positive.points.end());
+    return std::move(line);
+}
 
 InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const FiberletStoredAnchor& seed)
 {
@@ -569,47 +632,31 @@ TraceCandidate traceCandidate(
     result.hasUsableEdge = true;
 
     const cv::Vec3d axis = normalized(seed.fittedAxisXYZ);
-    SideTrace negative;
-    SideTrace positive;
     if (initial.negative.has_value()) {
-        negative = traceSide(
+        result.negative = traceSide(
             graph, seed, -axis, initial.negative, config, searchBox,
             result.lookahead);
     } else {
-        negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
-        negative.termination = "no_usable_edge";
+        result.negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
+        result.negative.termination = "no_usable_edge";
     }
     if (initial.positive.has_value()) {
-        positive = traceSide(
+        result.positive = traceSide(
             graph, seed, axis, initial.positive, config, searchBox,
             result.lookahead);
     } else {
-        positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
-        positive.termination = "no_usable_edge";
+        result.positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
+        result.positive.termination = "no_usable_edge";
     }
 
-    result.line.negativeTermination = negative.termination;
-    result.line.positiveTermination = positive.termination;
-    result.line.negativeFiberlets = negative.fiberlets;
-    result.line.positiveFiberlets = positive.fiberlets;
-    result.line.totalMetricCost =
-        negative.totalMetricCost + positive.totalMetricCost;
-    result.line.pathLengthPredictionVoxels =
-        negative.pathLengthPredictionVoxels +
-        positive.pathLengthPredictionVoxels;
-    if (negative.fiberlets > 0 && positive.fiberlets > 0) {
+    if (result.negative.fiberlets > 0 && result.positive.fiberlets > 0) {
         auto incomingId = *initial.negative;
         incomingId.reverse = !incomingId.reverse;
         const auto central = graph.transition(
             graph.arc(incomingId), graph.arc(*initial.positive));
         if (central.has_value())
-            result.line.totalMetricCost += central->cost.total();
+            result.centralMetricCost = central->cost.total();
     }
-    result.line.pointsBaseXYZ.assign(negative.points.rbegin(), negative.points.rend());
-    result.line.pointsBaseXYZ.insert(
-        result.line.pointsBaseXYZ.end(),
-        std::next(positive.points.begin()), positive.points.end());
-    result.bidirectional = negative.fiberlets > 0 && positive.fiberlets > 0;
     return result;
 }
 
@@ -624,6 +671,7 @@ std::size_t suppressCoveredAnchors(
     const std::vector<cv::Vec3d>& line,
     const std::vector<FiberletStoredAnchor>& anchors,
     std::vector<bool>& active,
+    std::vector<bool>& covered,
     const std::map<Bucket, std::vector<std::size_t>>& index,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
@@ -659,7 +707,7 @@ std::size_t suppressCoveredAnchors(
                     if (found == index.end())
                         continue;
                     for (const auto anchorIndex : found->second) {
-                        if (!active[anchorIndex])
+                        if (covered[anchorIndex])
                             continue;
                         const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * graph.predictionToBaseScale());
                         const double t = std::clamp((point - start).dot(delta) / segmentLengthSquared, 0.0, 1.0);
@@ -677,7 +725,7 @@ std::size_t suppressCoveredAnchors(
 
     std::size_t suppressed = 0;
     for (const auto& [anchorIndex, projection] : projections) {
-        if (!active[anchorIndex])
+        if (covered[anchorIndex])
             continue;
         const cv::Vec3d point(anchors[anchorIndex].positionPredictionXYZ * graph.predictionToBaseScale());
         const auto measurement =
@@ -689,8 +737,11 @@ std::size_t suppressCoveredAnchors(
         if (std::abs(axis.dot(projection.tangent)) + kEpsilon < minimumDirectionDot) {
             continue;
         }
-        active[anchorIndex] = false;
-        ++suppressed;
+        covered[anchorIndex] = true;
+        if (active[anchorIndex]) {
+            active[anchorIndex] = false;
+            ++suppressed;
+        }
     }
     return suppressed;
 }
@@ -739,7 +790,10 @@ FiberletCropTraceResult traceFiberletCrop(
     const auto searchBox = fiberletCropTraceSearchBox(config);
     if (config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
         config.maximumFiberletsPerSide == 0 || !(config.coverageNormalRadiusBaseVoxels > 0.0) ||
-        !(config.coverageDirectionDegrees >= 0.0) || !(config.coverageDirectionDegrees <= 90.0) || !(normalWorkingToBaseScale > 0.0)) {
+        !(config.coverageDirectionDegrees >= 0.0) || !(config.coverageDirectionDegrees <= 90.0) || !(normalWorkingToBaseScale > 0.0) ||
+        (config.maximumAcceptedCostDensity &&
+         (!std::isfinite(*config.maximumAcceptedCostDensity) ||
+          *config.maximumAcceptedCostDensity < 0.0))) {
         throw std::invalid_argument("Fiberlet crop trace configuration is invalid");
     }
     std::sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right) {
@@ -751,9 +805,14 @@ FiberletCropTraceResult traceFiberletCrop(
     FiberletCropTraceResult result;
     result.candidateAnchors = anchors.size();
     std::vector<bool> active(anchors.size(), true);
+    std::vector<bool> covered(anchors.size(), false);
+    std::size_t activeAnchors = anchors.size();
+    std::map<FiberletStorageKey, std::size_t> anchorIndices;
     const double bucketSide = fiberReplayTangentialThresholdBaseVoxels(config.coverageNormalRadiusBaseVoxels);
     std::map<Bucket, std::vector<std::size_t>> spatialIndex;
     for (std::size_t index = 0; index < anchors.size(); ++index) {
+        if (!anchorIndices.emplace(anchors[index].key, index).second)
+            throw std::invalid_argument("Fiberlet crop anchors contain a duplicate key");
         const cv::Vec3d point(anchors[index].positionPredictionXYZ * graph.predictionToBaseScale());
         spatialIndex[bucketFor(point, bucketSide)].push_back(index);
     }
@@ -886,27 +945,49 @@ FiberletCropTraceResult traceFiberletCrop(
             ++result.discardedCandidates;
         } else if (!limitsReached()) {
             active[index] = false;
+            --activeAnchors;
             ++result.attemptedAnchors;
             auto& candidate = completion.candidate;
-            if (!candidate.hasUsableEdge ||
-                candidate.line.pointsBaseXYZ.size() < 2) {
+            if (!candidate.hasUsableEdge) {
                 ++result.noEdgeAnchors;
             } else {
-                if (candidate.bidirectional)
-                    ++result.bidirectionalLines;
-                else
-                    ++result.oneSidedLines;
-                result.coveredAnchors += suppressCoveredAnchors(
-                    candidate.line.pointsBaseXYZ, anchors, active,
-                    spatialIndex, normalSampler, normalWorkingToBaseScale,
-                    graph, config);
-                result.lines.push_back(std::move(candidate.line));
-                if (progress) {
-                    const auto remaining = static_cast<std::size_t>(
-                        std::count(active.begin(), active.end(), true));
-                    progress(result, remaining);
+                if (config.stopAtCoveredAnchors) {
+                    truncateAtCoveredAnchor(
+                        candidate.negative, anchorIndices, covered);
+                    truncateAtCoveredAnchor(
+                        candidate.positive, anchorIndices, covered);
+                }
+                const bool bidirectional = candidate.negative.fiberlets > 0 &&
+                    candidate.positive.fiberlets > 0;
+                auto line = finalizeCandidate(candidate);
+                if (line.pointsBaseXYZ.size() < 2) {
+                    ++result.noEdgeAnchors;
+                } else if (config.maximumAcceptedCostDensity &&
+                           line.totalMetricCost /
+                                   line.pathLengthPredictionVoxels >
+                               *config.maximumAcceptedCostDensity) {
+                    ++result.qualityRejectedAnchors;
+                } else {
+                    result.coveredAnchorStops +=
+                        candidate.negative.termination == "covered_anchor";
+                    result.coveredAnchorStops +=
+                        candidate.positive.termination == "covered_anchor";
+                    if (bidirectional)
+                        ++result.bidirectionalLines;
+                    else
+                        ++result.oneSidedLines;
+                    covered[index] = true;
+                    const std::size_t suppressed = suppressCoveredAnchors(
+                        line.pointsBaseXYZ, anchors, active, covered,
+                        spatialIndex, normalSampler, normalWorkingToBaseScale,
+                        graph, config);
+                    result.coveredAnchors += suppressed;
+                    activeAnchors -= suppressed;
+                    result.lines.push_back(std::move(line));
                 }
             }
+            if (progress)
+                progress(result, activeAnchors);
         }
         result.integrationSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - integrationStarted).count();
@@ -1288,6 +1369,32 @@ selectFiberletCropQuality(
   std::sort(result.lineIndices.begin(), result.lineIndices.end());
   result.effectiveFraction = static_cast<double>(retained) /
       static_cast<double>(lines.size());
+  return result;
+}
+
+FiberQualitySelection selectFiberletCropQualityThreshold(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double maximumCostDensity) {
+  if (!std::isfinite(maximumCostDensity) || maximumCostDensity < 0.0) {
+    throw std::invalid_argument(
+        "Fiber quality threshold must be finite and nonnegative");
+  }
+  FiberQualitySelection result;
+  result.inputLines = lines.size();
+  result.requestedMaximumCostDensity = maximumCostDensity;
+  const auto ranked = rankFiberletCropQuality(lines);
+  result.lineIndices.reserve(lines.size());
+  for (const auto& line : ranked) {
+    if (line.density > maximumCostDensity)
+      break;
+    result.lineIndices.push_back(line.index);
+    result.maximumRetainedCostDensity = line.density;
+  }
+  std::sort(result.lineIndices.begin(), result.lineIndices.end());
+  result.effectiveFraction = lines.empty()
+      ? 0.0
+      : static_cast<double>(result.lineIndices.size()) /
+          static_cast<double>(lines.size());
   return result;
 }
 

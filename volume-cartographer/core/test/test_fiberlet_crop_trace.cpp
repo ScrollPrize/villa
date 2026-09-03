@@ -364,6 +364,37 @@ TEST_CASE("Fiberlet crop tracing accepts an immediate minimum-face exit")
     CHECK(line.pointsBaseXYZ.back() == cv::Vec3d{100, 0, 0});
 }
 
+TEST_CASE("Fiberlet crop tracing rejects a one-sided zero-length crop exit")
+{
+    TestGraph graph;
+    const auto outside = key(-10);
+    const auto seed = key(0);
+    graph.addAnchor(outside, {-10, 0, 0});
+    graph.addAnchor(seed, {0, 0, 0});
+    graph.connect(outside, seed);
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, -100, -100};
+    config.maximumBaseXYZ = {100, 100, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.maximumAttempts = 1;
+    ZNormalSampler normals;
+
+    for (const bool stopAtCovered : {false, true}) {
+        config.stopAtCoveredAnchors = stopAtCovered;
+        const auto result = traceFiberletCrop(
+            graph,
+            {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals,
+            1.0,
+            config);
+        CHECK(result.attemptedAnchors == 1);
+        CHECK(result.noEdgeAnchors == 1);
+        CHECK(result.lines.empty());
+        CHECK(result.coveredAnchorStops == 0);
+    }
+}
+
 TEST_CASE("Fiberlet crop lookahead ranks beyond output boundary but clips output")
 {
     TestGraph graph;
@@ -520,6 +551,242 @@ TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonicall
     const auto unsupportedSource = traceFiberletCrop(graph, anchors, normals, 1.0, parallelConfig);
     CHECK(unsupportedSource.attemptedAnchors == 2);
     CHECK(graph.maximumConcurrentQueries.load() == 1);
+}
+
+TEST_CASE("Fiberlet crop tracing optionally stops at prior covered anchor endpoints")
+{
+    TestGraph graph;
+    const auto firstSeed = key(0);
+    const auto firstEnd = key(100);
+    const auto secondSeed = key(200);
+    const auto coveredEndpoint = key(50);
+    const auto continuation = key(51);
+    graph.addAnchor(firstSeed, {0, 0, 0});
+    graph.addAnchor(firstEnd, {100, 0, 0});
+    graph.addAnchor(secondSeed, {50, 100, 0});
+    graph.addAnchor(coveredEndpoint, {50, 0, 0});
+    graph.addAnchor(continuation, {50, -100, 0});
+    graph.connect(firstSeed, firstEnd);
+    graph.connect(secondSeed, coveredEndpoint);
+    graph.connect(coveredEndpoint, continuation);
+
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(firstSeed, {0, 0, 0}, {1, 0, 0}, 1.0F),
+        anchor(secondSeed, {50, 100, 0}, {0, -1, 0}, 0.9F),
+        anchor(coveredEndpoint, {50, 0, 0}, {1, 0, 0}, 0.8F),
+        anchor(continuation, {50, -100, 0}, {0, 1, 0}, 0.7F),
+    };
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -100};
+    config.maximumBaseXYZ = {200, 200, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.parallelThreads = 1;
+
+    const auto baseline = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    REQUIRE(baseline.lines.size() == 2);
+    CHECK(baseline.attemptedAnchors == 2);
+    CHECK(baseline.coveredAnchorStops == 0);
+    const auto baselineSecond = std::find_if(
+        baseline.lines.begin(), baseline.lines.end(), [&](const auto& line) {
+            return line.seed == secondSeed;
+        });
+    REQUIRE(baselineSecond != baseline.lines.end());
+    CHECK(baselineSecond->positiveTermination == "graph_exhausted");
+    CHECK(baselineSecond->positiveFiberlets == 2);
+    CHECK(baselineSecond->pathLengthPredictionVoxels == doctest::Approx(200.0));
+    CHECK(baselineSecond->totalMetricCost == doctest::Approx(200.0));
+    CHECK(baselineSecond->pointsBaseXYZ.back() == cv::Vec3d{50, -100, 0});
+
+    config.stopAtCoveredAnchors = true;
+    const auto serial = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    REQUIRE(serial.lines.size() == 3);
+    CHECK(serial.attemptedAnchors == 3);
+    CHECK(serial.coveredAnchorStops == 2);
+    const auto stopped = std::find_if(
+        serial.lines.begin(), serial.lines.end(), [&](const auto& line) {
+            return line.seed == secondSeed;
+        });
+    REQUIRE(stopped != serial.lines.end());
+    CHECK(stopped->positiveTermination == "covered_anchor");
+    CHECK(stopped->positiveFiberlets == 1);
+    CHECK(stopped->pathLengthPredictionVoxels == doctest::Approx(100.0));
+    CHECK(stopped->totalMetricCost == doctest::Approx(100.0));
+    REQUIRE(stopped->pointsBaseXYZ.size() == 2);
+    CHECK(stopped->pointsBaseXYZ.back() == cv::Vec3d{50, 0, 0});
+    CHECK(std::any_of(
+        serial.lines.begin(), serial.lines.end(), [&](const auto& line) {
+            return line.seed == continuation;
+        }));
+
+    graph.concurrentQueries = true;
+    graph.queryDelay[firstSeed] = std::chrono::milliseconds(30);
+    config.parallelThreads = 4;
+    const auto parallel = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    CHECK(parallel.attemptedAnchors == serial.attemptedAnchors);
+    CHECK(parallel.coveredAnchors == serial.coveredAnchors);
+    CHECK(parallel.noEdgeAnchors == serial.noEdgeAnchors);
+    CHECK(parallel.oneSidedLines == serial.oneSidedLines);
+    CHECK(parallel.bidirectionalLines == serial.bidirectionalLines);
+    CHECK(parallel.coveredAnchorStops == serial.coveredAnchorStops);
+    REQUIRE(parallel.lines.size() == serial.lines.size());
+    for (std::size_t index = 0; index < serial.lines.size(); ++index) {
+        CHECK(parallel.lines[index].seed == serial.lines[index].seed);
+        CHECK(parallel.lines[index].negativeTermination ==
+              serial.lines[index].negativeTermination);
+        CHECK(parallel.lines[index].positiveTermination ==
+              serial.lines[index].positiveTermination);
+        CHECK(parallel.lines[index].negativeFiberlets ==
+              serial.lines[index].negativeFiberlets);
+        CHECK(parallel.lines[index].positiveFiberlets ==
+              serial.lines[index].positiveFiberlets);
+        CHECK(parallel.lines[index].totalMetricCost ==
+              serial.lines[index].totalMetricCost);
+        CHECK(parallel.lines[index].pathLengthPredictionVoxels ==
+              serial.lines[index].pathLengthPredictionVoxels);
+        CHECK(parallel.lines[index].pointsBaseXYZ ==
+              serial.lines[index].pointsBaseXYZ);
+    }
+}
+
+TEST_CASE("Attempted anchors are not covered-anchor stop barriers")
+{
+    TestGraph graph;
+    const auto attempted = key(50);
+    const auto seed = key(200);
+    const auto finish = key(51);
+    graph.addAnchor(attempted, {50, 0, 0});
+    graph.addAnchor(seed, {50, 100, 0});
+    graph.addAnchor(finish, {50, -100, 0});
+    graph.connect(seed, attempted);
+    graph.connect(attempted, finish);
+
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(attempted, {50, 0, 0}, {1, 0, 0}, 1.0F),
+        anchor(seed, {50, 100, 0}, {0, -1, 0}, 0.9F),
+    };
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -100};
+    config.maximumBaseXYZ = {200, 200, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.parallelThreads = 1;
+    config.stopAtCoveredAnchors = true;
+
+    const auto result = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    REQUIRE(result.lines.size() == 1);
+    CHECK(result.attemptedAnchors == 2);
+    CHECK(result.noEdgeAnchors == 1);
+    CHECK(result.lines.front().seed == seed);
+    CHECK(result.lines.front().positiveTermination == "graph_exhausted");
+    CHECK(result.lines.front().positiveFiberlets == 2);
+    CHECK(result.lines.front().pathLengthPredictionVoxels ==
+          doctest::Approx(200.0));
+    CHECK(result.lines.front().pointsBaseXYZ.back() == cv::Vec3d{50, -100, 0});
+}
+
+TEST_CASE("Fiberlet crop tracing applies an inclusive quality threshold before coverage")
+{
+    TestGraph graph;
+    const auto seed = key(0);
+    const auto finish = key(100);
+    graph.addAnchor(seed, {0, 0, 0});
+    graph.addAnchor(finish, {100, 0, 0});
+    graph.connect(seed, finish);
+    graph.setCostDensity(seed, finish, 2.0F);
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -100};
+    config.maximumBaseXYZ = {200, 200, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.maximumAttempts = 1;
+    config.maximumAcceptedCostDensity = 1.999;
+    ZNormalSampler normals;
+
+    const auto rejected = traceFiberletCrop(
+        graph,
+        {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals,
+        1.0,
+        config);
+    CHECK(rejected.attemptedAnchors == 1);
+    CHECK(rejected.qualityRejectedAnchors == 1);
+    CHECK(rejected.coveredAnchors == 0);
+    CHECK(rejected.lines.empty());
+
+    config.maximumAcceptedCostDensity = 2.0;
+    const auto accepted = traceFiberletCrop(
+        graph,
+        {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals,
+        1.0,
+        config);
+    CHECK(accepted.qualityRejectedAnchors == 0);
+    REQUIRE(accepted.lines.size() == 1);
+    CHECK(accepted.lines.front().totalMetricCost /
+              accepted.lines.front().pathLengthPredictionVoxels ==
+          doctest::Approx(2.0));
+
+    config.maximumAcceptedCostDensity =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        traceFiberletCrop(
+            graph,
+            {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals,
+            1.0,
+            config),
+        std::invalid_argument);
+}
+
+TEST_CASE("Quality-rejected crop traces leave nearby seeds eligible")
+{
+    TestGraph graph;
+    const auto strongSeed = key(0);
+    const auto strongFinish = key(100);
+    const auto nearbySeed = key(200);
+    const auto nearbyFinish = key(300);
+    graph.addAnchor(strongSeed, {0, 0, 0});
+    graph.addAnchor(strongFinish, {100, 0, 0});
+    graph.addAnchor(nearbySeed, {0, 10, 0});
+    graph.addAnchor(nearbyFinish, {100, 10, 0});
+    graph.connect(strongSeed, strongFinish);
+    graph.connect(nearbySeed, nearbyFinish);
+    graph.setCostDensity(strongSeed, strongFinish, 2.0F);
+    graph.setCostDensity(nearbySeed, nearbyFinish, 1.0F);
+
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(strongSeed, {0, 0, 0}, {1, 0, 0}, 1.0F),
+        anchor(nearbySeed, {0, 10, 0}, {1, 0, 0}, 0.9F),
+    };
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -100};
+    config.maximumBaseXYZ = {200, 200, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    config.maximumAcceptedCostDensity = 1.5;
+    config.stopAtCoveredAnchors = true;
+    config.parallelThreads = 1;
+    ZNormalSampler normals;
+
+    const auto rejected = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    CHECK(rejected.attemptedAnchors == 2);
+    CHECK(rejected.qualityRejectedAnchors == 1);
+    CHECK(rejected.coveredAnchorStops == 0);
+    REQUIRE(rejected.lines.size() == 1);
+    CHECK(rejected.lines.front().seed == nearbySeed);
+
+    config.maximumAcceptedCostDensity = 2.0;
+    const auto accepted = traceFiberletCrop(
+        graph, anchors, normals, 1.0, config);
+    CHECK(accepted.attemptedAnchors == 1);
+    CHECK(accepted.qualityRejectedAnchors == 0);
+    REQUIRE(accepted.lines.size() == 1);
+    CHECK(accepted.lines.front().seed == strongSeed);
 }
 
 TEST_CASE("Fiberlet crop tracing reports speculative failures in canonical order")
@@ -1008,6 +1275,54 @@ TEST_CASE("Crop quality deciles are stable and write every rank once")
             lines, std::numeric_limits<double>::quiet_NaN()),
         std::invalid_argument);
 
+    const auto threshold = selectFiberletCropQualityThreshold(lines, 2.0);
+    CHECK(threshold.inputLines == 3);
+    CHECK(threshold.lineIndices == std::vector<std::size_t>{1, 2});
+    CHECK(threshold.effectiveFraction == doctest::Approx(2.0 / 3.0));
+    REQUIRE(threshold.requestedMaximumCostDensity.has_value());
+    CHECK(*threshold.requestedMaximumCostDensity == doctest::Approx(2.0));
+    REQUIRE(threshold.maximumRetainedCostDensity.has_value());
+    CHECK(*threshold.maximumRetainedCostDensity == doctest::Approx(2.0));
+
+    const auto zeroMatches = selectFiberletCropQualityThreshold(lines, 0.5);
+    CHECK(zeroMatches.inputLines == 3);
+    CHECK(zeroMatches.lineIndices.empty());
+    CHECK(zeroMatches.effectiveFraction == 0.0);
+    CHECK_FALSE(zeroMatches.maximumRetainedCostDensity.has_value());
+
+    const auto thresholdEmpty =
+        selectFiberletCropQualityThreshold({}, 0.0);
+    CHECK(thresholdEmpty.lineIndices.empty());
+    CHECK(thresholdEmpty.effectiveFraction == 0.0);
+    CHECK_FALSE(thresholdEmpty.maximumRetainedCostDensity.has_value());
+    CHECK_THROWS_AS(
+        selectFiberletCropQualityThreshold(lines, -0.1),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        selectFiberletCropQualityThreshold(
+            lines, std::numeric_limits<double>::infinity()),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        selectFiberletCropQualityThreshold(
+            lines, std::numeric_limits<double>::quiet_NaN()),
+        std::invalid_argument);
+
+    auto tiedThreshold = lines;
+    tiedThreshold[0].totalMetricCost = 2.0;
+    tiedThreshold[0].pathLengthPredictionVoxels = 2.0;
+    tiedThreshold[1].totalMetricCost = 2.0;
+    tiedThreshold[1].pathLengthPredictionVoxels = 2.0;
+    tiedThreshold[2].totalMetricCost = 4.0;
+    tiedThreshold[2].pathLengthPredictionVoxels = 2.0;
+    CHECK(selectFiberletCropQualityThreshold(tiedThreshold, 1.0).lineIndices ==
+        std::vector<std::size_t>{0, 1});
+
+    auto malformed = lines;
+    malformed.back().pathLengthPredictionVoxels = 0.0;
+    CHECK_THROWS_AS(
+        selectFiberletCropQualityThreshold(malformed, 1.0),
+        std::invalid_argument);
+
     const auto output = directory / "crop.obj";
     writeFiberletCropQualityArtifacts(lines, histogram, output);
     const auto paths = fiberQualityObjPaths(output);
@@ -1040,6 +1355,8 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
     FiberletCropTraceConfig config;
     config.minimumBaseXYZ = {64, 128, 192};
     config.maximumBaseXYZ = {256, 320, 384};
+    config.stopAtCoveredAnchors = true;
+    config.maximumAcceptedCostDensity = 0.35;
     std::vector<FiberletCropTraceLine> lines(3);
     lines[0].seedBaseXYZ = {127.5, 191.5, 255.5};
     lines[1].seedBaseXYZ = {128.0, 192.0, 256.0};
@@ -1066,6 +1383,10 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
     CHECK(artifact.minimumBaseXYZ == config.minimumBaseXYZ);
     CHECK(artifact.metadata.processing.at("preprocessing") == preprocessing);
     CHECK(artifact.maximumBaseXYZ == config.maximumBaseXYZ);
+    const auto& traceMetadata = artifact.metadata.processing.at("trace");
+    CHECK(traceMetadata.at("stop_at_covered_anchors") == true);
+    CHECK(traceMetadata.at("maximum_accepted_cost_density").get<double>() ==
+          doctest::Approx(0.35));
     REQUIRE(artifact.lines.size() == lines.size());
     for (std::size_t index = 0; index < lines.size(); ++index) {
         CHECK(artifact.lines[index].seedBaseXYZ == lines[index].seedBaseXYZ);
@@ -1074,6 +1395,7 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
         CHECK(artifact.lines[index].pathLengthPredictionVoxels == lines[index].pathLengthPredictionVoxels);
         CHECK(artifact.lines[index].pointsBaseXYZ == lines[index].pointsBaseXYZ);
     }
+
     CHECK_THROWS_AS(writeFiberletCropTraceArtifact(output, source, nlohmann::json{{"version", 2}}, config, lines), std::invalid_argument);
 
     const auto empty = directory.path / "empty-traces.zarr";

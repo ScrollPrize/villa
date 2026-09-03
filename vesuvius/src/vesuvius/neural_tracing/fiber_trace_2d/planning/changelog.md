@@ -1993,3 +1993,20 @@
   stages cannot requantize compact source geometry.
 - Ran the 256-aligned, 256-half-offset, and 512-half-offset schedule over the
   PHercParis4 1024 crop and produced a 2,000-trace output.
+
+## 2026-09-03 - Optional crop no-overtracing
+
+- Added deterministic covered-anchor stopping for crop Fiberlet traces. The
+  opt-in mode leaves beam search unchanged, truncates geometry and cost only at
+  canonical integration, and distinguishes prior accepted coverage from failed
+  seed attempts.
+- Added an absolute inclusive cost-density selector for stored crop traces and
+  online crop acceptance, alongside the existing rank-fraction selector.
+
+## 2026-09-03 - Baseline threshold benchmark
+
+- Tuned absolute stored-trace quality filtering on the ordinary 1024 crop and
+  selected density `0.25`, improving pre-pruning reference accuracy from 80%
+  to 88% while retaining 451 traces.
+- Added a raw-count-derived pre-pruning exact-reference progress plot alongside
+  the existing replay and crop-constraint plots.

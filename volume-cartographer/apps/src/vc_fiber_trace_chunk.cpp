@@ -103,6 +103,7 @@ struct Options {
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
     std::optional<std::size_t> maximumConstraintsPerFiber;
     std::optional<double> qualityFraction;
+    std::optional<double> qualityThreshold;
     std::optional<double> baseVoxelSizeUm;
     double replayFailureThresholdBaseVoxels = 20.0;
     double replayMatchRefineSteps = 1.0;
@@ -312,6 +313,8 @@ void usage(const char* executable)
                  " --normal-manifest PATH --bbox X0 Y0 Z0 X1 Y1 Z1"
                  " --reference-fiber-dir DIR --reference-fiber-tag TAG"
                  " --base-voxel-size-um N --output result.json [options]\n\n"
+              << "Trace quality options:\n"
+              << "  --quality-threshold D     accept/retain traces with cost density <= D\n\n"
               << "Stored trace input options:\n"
               << "  --quality-fraction F      retain the best F fraction by cost density\n"
               << "  --reference-fiber-dir DIR tagged VC3D reference fiber JSON directory\n"
@@ -365,6 +368,7 @@ void usage(const char* executable)
               << "  --lookahead N              lookahead in base voxels [384]\n"
               << "  --coverage N               normal coverage radius in base voxels [20]\n"
               << "  --coverage-angle N         parallel-axis coverage angle [25]\n"
+              << "  --stop-at-covered          stop output after reaching a covered anchor\n"
               << "  --max-attempts N           anchor attempt limit; zero is unlimited [0]\n"
               << "  --max-fibers N             accepted line limit; zero is unlimited [0]\n"
               << "  --texture-max N            maximum bbox texture dimension [4096]\n\n"
@@ -625,6 +629,13 @@ Options parse(int argc, char** argv)
                 *options.qualityFraction > 1.0) {
                 fail("--quality-fraction must be in (0, 1]");
             }
+        } else if (argument == "--quality-threshold") {
+            options.qualityThreshold = number(
+                index, argc, argv, "--quality-threshold");
+            if (!std::isfinite(*options.qualityThreshold) ||
+                *options.qualityThreshold < 0.0) {
+                fail("--quality-threshold must be finite and nonnegative");
+            }
         } else if (argument == "--reference-fiber-dir") {
             options.referenceFiberDirectory = value(
                 index, argc, argv, "--reference-fiber-dir");
@@ -831,6 +842,9 @@ Options parse(int argc, char** argv)
             options.hasTraceOnlyOption = true;
         } else if (argument == "--coverage-angle") {
             options.trace.coverageDirectionDegrees = number(index, argc, argv, "--coverage-angle");
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--stop-at-covered") {
+            options.trace.stopAtCoveredAnchors = true;
             options.hasTraceOnlyOption = true;
         } else if (argument == "--max-attempts") {
             options.trace.maximumAttempts = count(index, argc, argv, "--max-attempts");
@@ -1508,6 +1522,9 @@ Options parse(int argc, char** argv)
             fail("unknown option: " + argument);
         }
     }
+    if (options.qualityFraction && options.qualityThreshold) {
+        fail("--quality-fraction and --quality-threshold are mutually exclusive");
+    }
     if (options.mode == Mode::Visualize) {
         if (options.output.empty())
             fail("--output is required");
@@ -1515,7 +1532,7 @@ Options parse(int argc, char** argv)
             options.hasBounds || options.hasConstraintOnlyOption || options.hasSharedRuntimeOption) {
             fail(
                 "visualize accepts only a trace dataset, --output OBJ, "
-                "--direction-dominance, and --quality-fraction");
+                "--direction-dominance, and one quality selector");
         }
         return options;
     }
@@ -1558,7 +1575,8 @@ Options parse(int argc, char** argv)
         options.directReplayTrace.parallelThreads = options.threads;
         vc::fiber_tracer::cli::validateTraceOptions(
             options.directReplayTrace);
-        if (options.qualityFraction || !options.obj.empty() || !options.volume.empty() || options.hasConstraintOnlyOption ||
+        if (options.qualityFraction || options.qualityThreshold ||
+            !options.obj.empty() || !options.volume.empty() || options.hasConstraintOnlyOption ||
             options.profileMemory || options.trace.maximumAttempts != 0 || options.trace.maximumFibers != 0) {
             fail("reference replay benchmark received an unsupported option");
         }
@@ -1901,6 +1919,7 @@ Options parse(int argc, char** argv)
     if (options.maximumTextureDimension < 2)
         fail("--texture-max must be at least two");
     options.trace.parallelThreads = static_cast<std::size_t>(options.threads);
+    options.trace.maximumAcceptedCostDensity = options.qualityThreshold;
     return options;
 }
 
@@ -3664,17 +3683,22 @@ makeOrderedCutsProgressPrinter()
 
 std::vector<std::size_t> applyQualityFilter(
     std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
-    const std::optional<double>& fraction)
+    const std::optional<double>& fraction,
+    const std::optional<double>& threshold)
 {
     std::vector<std::size_t> originalTraceIndices(lines.size());
     std::iota(
         originalTraceIndices.begin(), originalTraceIndices.end(),
         std::size_t{0});
-    if (!fraction)
+    if (!fraction && !threshold)
         return originalTraceIndices;
 
-    const auto selection = vc::fiber_tracer::selectFiberletCropQuality(
-        lines, *fraction);
+    const auto selection = fraction
+        ? vc::fiber_tracer::selectFiberletCropQuality(lines, *fraction)
+        : vc::fiber_tracer::selectFiberletCropQualityThreshold(
+              lines, *threshold);
+    if (!lines.empty() && selection.lineIndices.empty())
+        fail("quality threshold retained no traces");
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> retained;
     retained.reserve(selection.lineIndices.size());
     for (const std::size_t index : selection.lineIndices)
@@ -3684,8 +3708,12 @@ std::vector<std::size_t> applyQualityFilter(
 
     std::cout << std::fixed << std::setprecision(6)
               << "fiber input quality filter"
-              << " requested_fraction=" << selection.requestedFraction
-              << " input=" << selection.inputLines
+              << " selector=" << (fraction ? "fraction" : "threshold");
+    if (fraction)
+        std::cout << " requested_fraction=" << selection.requestedFraction;
+    else
+        std::cout << " requested_max_cost_density=" << *threshold;
+    std::cout << " input=" << selection.inputLines
               << " retained=" << selection.lineIndices.size()
               << " effective_fraction=" << selection.effectiveFraction
               << " cutoff_cost_density=";
@@ -7443,7 +7471,8 @@ int main(int argc, char** argv)
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
             const auto retainedOriginalTraceIndices = applyQualityFilter(
-                artifact.lines, options.qualityFraction);
+                artifact.lines, options.qualityFraction,
+                options.qualityThreshold);
             vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
             normalOptions.workingToBaseScale = 1.0;
             normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
@@ -10544,7 +10573,9 @@ int main(int argc, char** argv)
         if (options.mode == Mode::Visualize) {
             auto artifact =
                 vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
-            applyQualityFilter(artifact.lines, options.qualityFraction);
+            applyQualityFilter(
+                artifact.lines, options.qualityFraction,
+                options.qualityThreshold);
             const auto report = visualize(
                 artifact.lines, options.output, options.directionDominance);
             printDirectionReport(report.directions, options.output);
@@ -11110,6 +11141,7 @@ int main(int argc, char** argv)
         std::deque<std::pair<
             std::chrono::steady_clock::time_point, std::size_t>>
             traceProgressSamples{{traceStarted, 0}};
+        auto lastTraceProgress = traceStarted - std::chrono::seconds(1);
         graphDiagnostics.phase.store(
             vc::fiber_tracer::FiberletGraphMaterializationPhase::Tracing,
             std::memory_order_relaxed);
@@ -11131,6 +11163,11 @@ int main(int argc, char** argv)
                        traceProgressSamples[1].first <= currentWindowBegin) {
                     traceProgressSamples.pop_front();
                 }
+                if (remaining != 0 &&
+                    now - lastTraceProgress < std::chrono::seconds(1)) {
+                    return;
+                }
+                lastTraceProgress = now;
                 const double elapsed = std::chrono::duration<double>(
                     now - traceStarted).count();
                 const double averageRate = elapsed > 0.0
@@ -11156,6 +11193,8 @@ int main(int argc, char** argv)
                     : std::numeric_limits<double>::infinity();
                 std::cout << "fiberlet crop attempted=" << current.attemptedAnchors << " accepted=" << current.lines.size()
                           << " covered=" << current.coveredAnchors
+                          << " quality_rejected="
+                          << current.qualityRejectedAnchors
                           << " remaining=" << remaining
                           << " elapsed=" << formatProgressDuration(elapsed)
                           << " eta_current="
@@ -11191,7 +11230,9 @@ int main(int argc, char** argv)
                   << " candidates=" << result.candidateAnchors << " attempted=" << result.attemptedAnchors << " covered=" << result.coveredAnchors
                   << " computed=" << result.computedCandidates << " discarded=" << result.discardedCandidates
                   << " accepted=" << artifact.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
-                  << " bidirectional=" << result.bidirectionalLines << " trace_output=" << options.output << " obj_output=" << options.obj << '\n';
+                  << " bidirectional=" << result.bidirectionalLines << " covered_anchor_stops=" << result.coveredAnchorStops
+                  << " quality_rejected=" << result.qualityRejectedAnchors
+                  << " trace_output=" << options.output << " obj_output=" << options.obj << '\n';
         printDirectionReport(visualization.directions, options.obj);
         std::cout << "fiberlet crop timing"
                   << " graph_seconds=" << graphSeconds << " graph_cpu_seconds=" << graphCpuSeconds << " trace_seconds=" << traceSeconds

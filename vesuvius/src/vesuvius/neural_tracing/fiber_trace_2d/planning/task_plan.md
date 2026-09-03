@@ -1,44 +1,49 @@
-# Plan
+# Plan: baseline quality-threshold benchmark
 
-1. Generate a new immutable crop-trace artifact with the three staged filter
-   passes and no `--max-fibers` or `--max-attempts` limit. Confirm tracing ends
-   because every candidate is covered or attempted, not because of a cap.
-2. Run the canonical supervised oracle-inlier pruning benchmark against that
-   exact staged trace cohort, preserving current defaults and the established
-   reference set, quality fraction, and 512-base piece split.
-3. Run `reference-replay-benchmark` directly against the source Fiberlet Zarr
-   with the identical ordered stage list, crop, references, and physical voxel
-   size. Confirm the stage options are accepted and applied before replay graph
-   materialization.
-4. Capture Git revision, Release build, source identities, commands, stage
-   populations, output hashes, wall/user/system time, maximum RSS where
-   available, and the headline metrics in dedicated benchmark run records.
-5. Update the benchmark result index and plot data only with measured values,
-   regenerate plots, and validate their consistency with the run records.
+## Evaluation
 
-The records must freeze effective scientific defaults, distinguish the new
-uncapped cohort from the old capped cohort, identify aggregate overlapping
-stage counts as non-unique, hash durable artifacts, and disclose that the
-local source is an unverified `build_state=partial` mirror. Successful sparse
-reads do not prove parity with the unavailable authoritative remote inventory.
+1. Load the existing complete ordinary crop artifact without no-overtracing and
+   apply an absolute quality threshold at BP input. Freeze the crop, inputs,
+   build, and every non-threshold pruning setting across candidates. Keep the
+   completed online-threshold run only as a separate diagnostic because online
+   rejection changes seed coverage and is not the intended baseline comparison.
+2. Run the existing fixed oracle-pruning diagnostic on every candidate and
+   capture round-zero exact/wrong/missing references, final reference result,
+   retained geometry, problematic constraints, and Release timing.
+3. Refine the threshold upward or downward from the first result. Prefer higher
+   round-zero exact percentage, then fewer wrong references, then greater
+   evaluable-reference and geometry support. Keep the selected result explicitly
+   reference-tuned and preserve all historical points.
+4. Write a permanent run record with exact commands, source and input identity,
+   threshold candidates, and the selection rationale.
 
-## Spec Update
+## Plotting
 
-No behavioral specification change is planned. Benchmark records must treat
-the staged schedule and uncapped trace cohort as distinct provenance from the
-earlier unstaged capped cohort.
+1. Extend the checked benchmark plot schema with a pre-pruning reference metric
+   computed from raw exact and wrong counts.
+2. Plot exact / (exact + wrong) as a percentage. Missing references are reported
+   in records but excluded from this fraction because they have no estimate.
+3. Add historical fixed-quarter, no-overtrace threshold, and selected ordinary
+   threshold points; regenerate deterministic benchmark SVGs.
 
-## Docs Update
+## Tests
 
-Add the complete staged commands and link the new run records from the Fiber
-benchmark result index.
+- Run the plot-data validation path and render all benchmark plots.
+- Run `git diff --check`; source tests need not be repeated unless source code
+  changes during this benchmark-only task.
 
-## Changelog
+## Spec update
 
-Record the first complete staged crop and staged reference-replay benchmark.
+- Extend the benchmark-progress specification with the pre-pruning reference
+  accuracy metric `exact / (exact + wrong)`, its exclusion of missing
+  references, derivation from raw counts, required run-record/revision
+  provenance for measured points, and the existing marker plus cumulative-best
+  display behavior.
 
-## Validation
+## Docs updates
 
-Verify both benchmark commands exit successfully, inspect their JSON/Zarr
-metadata, cross-check headline counts against detailed reports, regenerate the
-two benchmark plots, and run the focused crop-trace and storage tests.
+- Add the run record, result-index rows, metric definition, and plot.
+
+## Changelog update
+
+- Record the baseline threshold benchmark and new reference-accuracy plot.

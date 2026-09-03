@@ -1,10 +1,10 @@
-# Status
+# Status: baseline quality-threshold benchmark
 
-- [x] Capture the complete staged benchmark task.
-- [x] Write the benchmark execution and recording plan.
-- [x] Complete independent plan review.
-- [x] Generate the uncapped staged 1024 trace cohort.
-- [x] Run the staged crop-pruning benchmark.
-- [x] Run the staged whole-reference tracing benchmark.
-- [x] Record results and regenerate benchmark plots.
-- [x] Run focused validation and commit results.
+- [x] Capture task and implementation plan
+- [x] Independently review plan against specifications
+- [x] Run ordinary stored-cohort threshold candidates
+- [x] Evaluate and select the operating point
+- [x] Add permanent run record and result index
+- [x] Add pre-pruning exact-reference benchmark plot
+- [x] Validate plot data, render plots, and check diffs
+- [x] Update task log and changelog

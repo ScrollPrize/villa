@@ -25,6 +25,8 @@ struct FiberletCropTraceConfig {
     std::size_t maximumFiberletsPerSide = 100'000;
     double coverageNormalRadiusBaseVoxels = 20.0;
     double coverageDirectionDegrees = 25.0;
+    bool stopAtCoveredAnchors = false;
+    std::optional<double> maximumAcceptedCostDensity;
     std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
     std::size_t maximumFibers = 0;
@@ -61,6 +63,8 @@ struct FiberletCropTraceResult {
     std::size_t noEdgeAnchors = 0;
     std::size_t oneSidedLines = 0;
     std::size_t bidirectionalLines = 0;
+    std::size_t coveredAnchorStops = 0;
+    std::size_t qualityRejectedAnchors = 0;
     double candidateBatchSeconds = 0.0;
     double candidateBatchCpuSeconds = 0.0;
     double candidateTaskSeconds = 0.0;
@@ -132,6 +136,7 @@ struct FiberQualitySelection {
   std::vector<std::size_t> lineIndices;
   std::size_t inputLines = 0;
   double requestedFraction = 1.0;
+  std::optional<double> requestedMaximumCostDensity;
   double effectiveFraction = 1.0;
   std::optional<double> maximumRetainedCostDensity;
 };
@@ -199,6 +204,11 @@ classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines);
 selectFiberletCropQuality(
     const std::vector<FiberletCropTraceLine>& lines,
     double fraction);
+
+[[nodiscard]] FiberQualitySelection
+selectFiberletCropQualityThreshold(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double maximumCostDensity);
 
 [[nodiscard]] FiberQualityObjPaths
 fiberQualityObjPaths(const std::filesystem::path &allOutputPath);

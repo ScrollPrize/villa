@@ -44,6 +44,21 @@ fitted axis agrees with the covering trace tangent within 25 degrees, so a
 crossing direction remains available as another seed. This first version does
 not compare, split, merge, or deduplicate already accepted output lines.
 
+Pass `--stop-at-covered` to prevent accepted crop traces from overtracing
+geometry already represented by an earlier accepted line. Worker lookahead
+still evaluates the complete immutable graph, including covered anchors and
+Fiberlets; coverage does not alter candidate selection. When the result reaches
+canonical ordered integration, each side stops immediately after the first
+selected Fiberlet whose endpoint anchor is already covered by a prior accepted
+line. The reaching edge and endpoint remain, with their edge cost, preceding
+join cost, and prediction length. Later geometry is removed, and only the
+retained line updates coverage. A Fiberlet that crosses covered space but ends
+at an uncovered anchor is not truncated. An anchor made inactive by an earlier
+failed attempt is not covered and therefore is not a stop barrier. The runtime
+line result uses termination `covered_anchor`; the current trace Zarr does not
+persist per-side termination metadata. The final CLI summary reports the number
+of stopped sides as `covered_anchor_stops`.
+
 The combined Fiberlet Zarr is authoritative. Present tuples contain graph data;
 wholly absent sparse chunks are empty. A present anchor/prefix/route tuple must
 be complete and valid. The original Fiber manifest and an expected-chunk index
@@ -141,6 +156,18 @@ by ordinal, so the printed cutoff is diagnostic rather than a complete filter
 predicate. The complete artifact is still read and validated; this reduces
 downstream computation, not Zarr input I/O. Crop bounds and provenance remain
 unchanged, and diagnostics retain the original stored trace IDs.
+
+Alternatively, pass `--quality-threshold D` to retain every trace with cost
+density at most `D`. This inclusive absolute selector retains all ties at the
+boundary and reports its data-dependent retained fraction. It is mutually
+exclusive with `--quality-fraction`; a threshold selecting no traces is an
+error. The threshold is meaningful only while the tracer and cost settings are
+fixed. For stored artifacts both selectors are post-trace filters and do not
+reduce artifact-read work. The `trace` command also accepts the absolute
+threshold as an online acceptance rule: it applies after covered-endpoint
+truncation, and rejected candidates create neither output nor coverage, so
+later anchors remain eligible. Trace metadata and the final summary record the
+threshold and rejection count. `trace` does not accept `--quality-fraction`.
 
 ## H/V constraint diagnostics
 

@@ -86,6 +86,11 @@
 - [ ] beamsearch
 - [ ] short brute-force lookahead
 - [ ] substep evaluation
+- [x] crop tracing: stop committed output at already traced anchors without
+      excluding covered anchors or Fiberlets from beam-search expansion
+- [ ] crop tracing: stop on ambiguity when the best genuinely distinct route
+      outside the acceptance ellipse is within a configurable score/cost margin
+      of the selected route
 - [ ] use staged Fiberlet filtering before crop tracing
     - materialize the transient filtered overlay through the existing staged
       cache path, without changing the authoritative combined Fiberlet dataset

@@ -18,6 +18,7 @@ from typing import Any
 
 REPLAY_METRIC = "distance_per_failure_percent"
 CROP_METRIC = "negative_problematic_per_retained_fulfilled_percent"
+REFERENCE_EXACT_METRIC = "pre_pruning_exact_reference_percent"
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -79,6 +80,13 @@ def _score_point(
             if problematic < 0 or fulfilled <= 0:
                 raise ValueError(f"{algorithm}: invalid unique-constraint counts")
             score = -100.0 * problematic / fulfilled
+        elif metric == REFERENCE_EXACT_METRIC:
+            exact = int(raw.get("exact_references", -1))
+            wrong = int(raw.get("wrong_references", -1))
+            missing = int(raw.get("missing_references", -1))
+            if exact < 0 or wrong < 0 or missing < 0 or exact + wrong <= 0:
+                raise ValueError(f"{algorithm}: invalid reference-result counts")
+            score = 100.0 * exact / (exact + wrong)
         else:
             raise ValueError(f"unsupported metric: {metric}")
         measured = True
@@ -100,8 +108,11 @@ def _score_point(
     if score is not None:
         if not math.isfinite(score):
             raise ValueError(f"{algorithm}: score must be finite")
-        if metric == REPLAY_METRIC and not 0.0 <= score <= 100.0:
-            raise ValueError(f"{algorithm}: replay score must be in [0, 100]")
+        if (
+            metric in (REPLAY_METRIC, REFERENCE_EXACT_METRIC)
+            and not 0.0 <= score <= 100.0
+        ):
+            raise ValueError(f"{algorithm}: percentage score must be in [0, 100]")
         if metric == CROP_METRIC and score > 0.0:
             raise ValueError(f"{algorithm}: crop error score must not exceed zero")
     return PlotPoint(algorithm, plot_label, algorithm_date, score, measured)
@@ -133,6 +144,7 @@ def load_plot_data(path: Path) -> tuple[dict[str, Any], dict[str, list[PlotPoint
     expected = {
         "reference_replay": REPLAY_METRIC,
         "crop_pruning": CROP_METRIC,
+        "pre_pruning_reference": REFERENCE_EXACT_METRIC,
     }
     parsed: dict[str, list[PlotPoint]] = {}
     for name, metric in expected.items():
@@ -251,8 +263,9 @@ def render_plot(
             label="Assumed floor (not measured)",
         )
     zero_label = 0
-    measured_label = 0
     for index, point in enumerate(points):
+        horizontal = 5
+        horizontal_alignment = "left"
         display_score = (
             point.score_percent
             if point.score_percent is not None
@@ -262,8 +275,21 @@ def render_plot(
             vertical = 12 + zero_label * 17
             zero_label += 1
         elif annotation_rotation_degrees:
-            vertical = 10 + measured_label * 18
-            measured_label += 1
+            same_date_index = sum(
+                previous.algorithm_date == point.algorithm_date
+                for previous in points[:index]
+            )
+            vertical = 10
+            if point.algorithm_date == max(dates):
+                vertical += (same_date_index // 2) * 36
+                if same_date_index % 2 == 0:
+                    horizontal = -7
+                    horizontal_alignment = "right"
+                else:
+                    horizontal = 7
+            elif point.algorithm_date != min(dates):
+                horizontal = -5
+                horizontal_alignment = "right"
         else:
             vertical = 10 if index % 2 == 0 else -18
         value_label = (
@@ -274,9 +300,9 @@ def render_plot(
         axis.annotate(
             f"{point.plot_label}\n{value_label}",
             (point.algorithm_date, display_score),
-            xytext=(5, vertical),
+            xytext=(horizontal, vertical),
             textcoords="offset points",
-            ha="left",
+            ha=horizontal_alignment,
             va="bottom" if vertical >= 0 else "top",
             fontsize=9,
             rotation=annotation_rotation_degrees,
@@ -346,6 +372,7 @@ def main() -> int:
     outputs = {
         "reference_replay": args.output_dir / "fiber_reference_replay_progress.svg",
         "crop_pruning": args.output_dir / "fiber_crop_pruning_progress.svg",
+        "pre_pruning_reference": args.output_dir / "fiber_crop_reference_accuracy.svg",
     }
     descriptions = {
         "reference_replay": (
@@ -357,6 +384,11 @@ def main() -> int:
             "problematic to retained fulfilled unique constraints after supervised "
             "oracle pruning. Zero is ideal and higher is better. Direct controls "
             "are unmeasured assumed floor points."
+        ),
+        "pre_pruning_reference": (
+            "Historical Fiberlet crop milestones measured before supervised "
+            "oracle pruning by exact reference estimates divided by exact plus "
+            "wrong estimates. Missing references are excluded. Higher is better."
         ),
     }
     for name, output in outputs.items():

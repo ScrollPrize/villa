@@ -4641,13 +4641,28 @@
 - `--threads` defaults to the host CPU count and controls both batched graph
   preparation and immutable seed tracing. There is no separate low trace-worker
   cap.
-- Accepted lines suppress only later anchor seeds. Coverage uses the shared
+- Accepted lines suppress later anchor seeds. Coverage uses the shared
   replay threshold measurement with a default 20-base-voxel normal radius and
   four-times-wider Lasagna tangent-plane radius. The threshold comparison is
   strict, and invalid normals use the existing Euclidean fallback.
 - Coverage additionally requires inclusive unoriented fitted-axis agreement
   with the projected line tangent within 25 degrees. Crossing directions are
   retained. This version performs no line-to-line Fiber deduplication.
+- Crop tracing may opt into covered-endpoint stopping. Workers still compute
+  complete candidates against the immutable graph, and lookahead neither
+  excludes nor penalizes covered anchors or Fiberlets. At canonical ordered
+  integration, each side uses only coverage produced by earlier accepted
+  lines and stops immediately after the first selected Fiberlet whose endpoint
+  anchor is covered. The reaching Fiberlet and endpoint remain in the output;
+  its edge cost, preceding join cost, and prediction length remain included,
+  while later geometry and costs are discarded. Crossing covered space within
+  a Fiberlet does not stop it. The retained line alone produces new coverage.
+- Covered-by-accepted-line state is distinct from seed eligibility. An anchor
+  made inactive by an unsuccessful attempt is not a stop barrier; an accepted
+  seed and every anchor satisfying accepted-line coverage are barriers for
+  later canonical candidates. Both sides consult the same state from before
+  the current line, so the current seed or first integrated side cannot stop
+  the other side. Parallel and serial output remains identical.
 - The authoritative crop output is a sparse Fiberlet Zarr dataset of kind
   `traces`, not an OBJ. It uses a trace-only `float64_traces` profile and
   crop-local base-coordinate chunks aligned to the source Fiberlet spatial
@@ -4722,6 +4737,23 @@
   fraction, and the worst retained density. The cutoff is diagnostic because
   ordinal tie-breaking may split equal-density traces. Trace generation rejects
   this artifact-input option.
+- The same consumers alternatively accept `--quality-threshold D` for finite
+  `D >= 0`. After strictly validating every input line, retain exactly those
+  traces whose `total_metric_cost / path_length_prediction_voxels <= D` and
+  preserve their original stored ordinals and order. Equal-density traces at
+  the inclusive boundary are all retained. A nonempty input for which no trace
+  qualifies is rejected rather than entering downstream processing with an
+  empty cohort. The fraction and threshold selectors are mutually exclusive.
+  `trace` accepts the threshold and applies it after candidate finalization and
+  covered-endpoint truncation but before accepted-line coverage. An
+  over-threshold candidate counts as attempted but creates no output or
+  coverage, leaving other anchors in its region eligible. Trace metadata
+  records the optional threshold and the summary reports quality rejections.
+  `trace` rejects the fraction selector and `reference-replay-benchmark` rejects
+  both. Stored-artifact consumers report the selector,
+  requested threshold, input/retained counts, effective fraction, and maximum
+  observed retained density. The density is comparable only for a fixed tracer
+  and cost configuration; it is not a universal confidence value.
 
 ## Stored crop-trace H/V constraint diagnostics
 
@@ -6258,7 +6290,10 @@
   `100/max(failures,1)` after complete evaluation. Crop plots preserve the
   existing problematic-to-retained error ratio but negate it as
   `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
-  The two percentages are not comparable metrics.
+  Pre-pruning reference-accuracy plots derive
+  `100*exact/(exact+wrong)` from the raw round-zero counts before supervised
+  oracle removal; missing references have no estimate and are excluded from
+  that fraction. These three percentages are not comparable metrics.
 - A crop point with `measurement_status=assumed_floor` is not a measurement.
   It must carry an explicit rationale, no measurement revision or run record,
   and must be visually distinguishable by marker and line style. This permits
@@ -6269,3 +6304,6 @@
   fixed cohort identity, full algorithm and measurement revisions, and an
   existing run record. Deterministic SVG output uses fixed metadata and IDs and
   includes an accessible title and description.
+- Every measured result remains visible at its actual score. The progress line
+  for each metric is the cumulative best-so-far envelope, so a later regression
+  cannot lower the historical line.

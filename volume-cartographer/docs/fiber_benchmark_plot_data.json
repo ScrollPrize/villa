@@ -103,6 +103,79 @@
           "problematic_unique_constraints": 45996,
           "retained_fulfilled_unique_constraints": 32929,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-3046918b5-staged-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + baseline quality threshold + BP oracle pruning",
+          "plot_label": "Baseline q0.25",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "cohort": "PHercParis4 1024 baseline traces quality<=0.25",
+          "problematic_unique_constraints": 35695,
+          "retained_fulfilled_unique_constraints": 22198,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-baseline-q025-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + no-overtrace + quality threshold + BP oracle pruning",
+          "plot_label": "No-overtrace q0.35",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "cohort": "PHercParis4 1024 no-overtrace quality<=0.35",
+          "problematic_unique_constraints": 6822,
+          "retained_fulfilled_unique_constraints": 6925,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
+        }
+      ]
+    },
+    "pre_pruning_reference": {
+      "title": "1024-crop reference accuracy before pruning",
+      "metric": "pre_pruning_exact_reference_percent",
+      "y_label": "Exact / (exact + wrong) references (%)",
+      "annotation_rotation_degrees": 20,
+      "points": [
+        {
+          "algorithm": "Fiberlet + BP oracle pruning",
+          "plot_label": "Fiberlet + BP",
+          "algorithm_date": "2026-09-02",
+          "algorithm_revision": "41052ac96e2841fe030708c7f4a8452baabdd9f9",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "exact_references": 20,
+          "wrong_references": 5,
+          "missing_references": 0,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + baseline quality threshold",
+          "plot_label": "Baseline q0.25",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "exact_references": 22,
+          "wrong_references": 3,
+          "missing_references": 0,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-baseline-q025-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + no-overtrace + quality threshold",
+          "plot_label": "No-overtrace q0.35",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
+          "exact_references": 21,
+          "wrong_references": 4,
+          "missing_references": 0,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
         }
       ]
     }

@@ -1,8 +1,7 @@
-# Task: Benchmark staged filtering
+# Task: baseline quality-threshold benchmark
 
-Run the complete 1024-base-voxel crop trace without fiber or attempt limits
-after applying the 256-aligned, 256-half-offset, and final 512-half-offset
-Fiberlet reduction schedule. Run the existing supervised crop-pruning
-benchmark on that exact trace artifact, then run the whole-reference tracing
-benchmark with the same filter stages. Record reproducible commands,
-revisions, effective settings, timings, and benchmark results.
+Tune the complete ordinary 1024-crop Fiberlet cohort, without no-overtracing,
+using the new absolute quality threshold when BP loads the stored traces.
+Record the selected result as an additional benchmark point. Add a benchmark
+plot for the pre-pruning reference accuracy, defined as exact divided by exact
+plus wrong reference estimates.

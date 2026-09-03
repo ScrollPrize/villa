@@ -165,6 +165,11 @@ FiberletDatasetMetadata traceMetadata(
              {"maximum_fiberlets_per_side", config.maximumFiberletsPerSide},
              {"coverage_normal_radius_base", config.coverageNormalRadiusBaseVoxels},
              {"coverage_direction_degrees", config.coverageDirectionDegrees},
+             {"stop_at_covered_anchors", config.stopAtCoveredAnchors},
+             {"maximum_accepted_cost_density",
+              config.maximumAcceptedCostDensity
+                  ? nlohmann::json(*config.maximumAcceptedCostDensity)
+                  : nlohmann::json(nullptr)},
              {"maximum_attempts", config.maximumAttempts},
              {"maximum_fibers", config.maximumFibers},
          }},
@@ -317,17 +322,59 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
         throw std::invalid_argument("Fiber trace processing contract is unsupported");
     }
     requireObjectKeys(processing.at("crop"), {"minimum_base_xyz", "maximum_base_xyz"}, "Fiber trace crop metadata");
-    requireObjectKeys(
-        processing.at("trace"),
-        {"beam_width",
-         "lookahead_distance_base",
-         "maximum_generated_states_per_step",
-         "maximum_fiberlets_per_side",
-         "coverage_normal_radius_base",
-         "coverage_direction_degrees",
-         "maximum_attempts",
-         "maximum_fibers"},
-        "Fiber trace parameters");
+    const auto& trace = processing.at("trace");
+    const bool hasCoveredStop = trace.contains("stop_at_covered_anchors");
+    const bool hasQualityThreshold =
+        trace.contains("maximum_accepted_cost_density");
+    if (hasCoveredStop && hasQualityThreshold) {
+        requireObjectKeys(
+            trace,
+            {"beam_width", "lookahead_distance_base",
+             "maximum_generated_states_per_step",
+             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
+             "coverage_direction_degrees", "stop_at_covered_anchors",
+             "maximum_accepted_cost_density", "maximum_attempts",
+             "maximum_fibers"},
+            "Fiber trace parameters");
+    } else if (hasCoveredStop) {
+        requireObjectKeys(
+            trace,
+            {"beam_width", "lookahead_distance_base",
+             "maximum_generated_states_per_step",
+             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
+             "coverage_direction_degrees", "stop_at_covered_anchors",
+             "maximum_attempts", "maximum_fibers"},
+            "Fiber trace parameters");
+    } else if (hasQualityThreshold) {
+        requireObjectKeys(
+            trace,
+            {"beam_width", "lookahead_distance_base",
+             "maximum_generated_states_per_step",
+             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
+             "coverage_direction_degrees", "maximum_accepted_cost_density",
+             "maximum_attempts", "maximum_fibers"},
+            "Fiber trace parameters");
+    } else {
+        requireObjectKeys(
+            trace,
+            {"beam_width", "lookahead_distance_base",
+             "maximum_generated_states_per_step",
+             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
+             "coverage_direction_degrees", "maximum_attempts",
+             "maximum_fibers"},
+            "Fiber trace parameters");
+    }
+    if (hasCoveredStop && !trace.at("stop_at_covered_anchors").is_boolean())
+        throw std::invalid_argument(
+            "Fiber trace covered-anchor parameter is not boolean");
+    if (hasQualityThreshold &&
+        !trace.at("maximum_accepted_cost_density").is_null() &&
+        (!trace.at("maximum_accepted_cost_density").is_number() ||
+         !std::isfinite(trace.at("maximum_accepted_cost_density").get<double>()) ||
+         trace.at("maximum_accepted_cost_density").get<double>() < 0.0)) {
+        throw std::invalid_argument(
+            "Fiber trace quality threshold parameter is invalid");
+    }
     requireObjectKeys(processing.at("artifact"), {"trace_count", "populated_chunks_zyx"}, "Fiber trace artifact metadata");
     FiberletCropTraceArtifact result;
     result.metadata = metadata;
