@@ -78,22 +78,25 @@ retain every annotation control point and both line endpoints. The optimized
 line points between adjacent controls define the polyline path but are not
 mandatory columns. Each control-point span is resampled by polyline arclength
 using the interval count whose physical spacing is closest to the
-32-base-voxel target; a short span remains one interval with both controls
-unchanged. Explicit
+8-base-voxel along-line target; a short span remains one interval with both
+controls unchanged. Explicit
 support arclengths provide a bidirectional mapping that keeps control points,
 span labels, hover positions, cut planes, and saved line positions in the
 original fractional point-index coordinate. The strip grid always declares an
-along-line scale of `1/32`, so a short physical control-point span expands to
+along-line scale of `1/8`, so a short physical control-point span expands to
 one nominal display interval instead of changing the scale of the rest of the
 strip. Both ribbons have a fixed seven-row cross grid at 32 voxels per row,
 giving a 192-base-voxel first-to-last-row extent close to the previous typical
-width without depending on optimized-line spacing.
+width without depending on optimized-line spacing. The along-line target and
+the cross-row spacing are independent constants
+(`kLineViewAlongSamplingDistanceBaseVoxels`, `kLineViewCrossRowSpacingBaseVoxels`).
 
 Clicking to place a control point uses optimized-polyline arclength in base
-voxels. Every existing control within an inclusive 32-voxel radius is collapsed
-into one control at the clicked location. This keeps adjacent control spans from
-becoming shorter than the generated strip's nominal sampling distance. Seed,
-surviving span policy, and branch links follow the collapsed control.
+voxels. Every existing control within an inclusive 8-voxel radius (the strip's
+along-line sampling distance) is collapsed into one control at the clicked
+location. This keeps adjacent control spans from becoming shorter than the
+generated strip's nominal sampling distance. Seed, surviving span policy, and
+branch links follow the collapsed control.
 
 With automatic reoptimization, VC3D prepares the edit before changing the live
 session. The same local update is used for insertion, one-control replacement,

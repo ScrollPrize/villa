@@ -330,8 +330,12 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// Arclength radius within which a placement click replaces the existing
+// control(s) instead of adding one. Tied to the strip's along-line sampling
+// so no control span can be created shorter than one strip column (#1484:
+// such a span would be drawn stretched to a full column).
 constexpr double kMinimumControlPointSpacingBaseVoxels =
-    vc::lasagna::kLineViewSamplingDistanceBaseVoxels;
+    vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
 
 std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
     const CState* state)

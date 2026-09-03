@@ -138,17 +138,19 @@
   supports. Optimized line points between adjacent controls define the path but
   are not mandatory columns. Each control-point span is independently
   resampled by optimized-polyline arclength using the interval count whose
-  physical spacing is closest to the 32-base-voxel target; a shorter span
-  remains one interval.
-  The along-strip grid density is always declared as `1/32` samples per base
+  physical spacing is closest to the 8-base-voxel along-line target; a shorter
+  span remains one interval.
+  The along-strip grid density is always declared as `1/8` samples per base
   voxel, so a short physical control-point span expands to one nominal display
   interval. Explicit support arclengths provide the bidirectional mapping
   between original fractional point positions and nonuniform ribbon columns.
   Both generated ribbons have seven cross rows at `1/32` samples per base voxel,
   giving a fixed 192-base-voxel first-to-last-row extent close to the previous
-  typical width without depending on optimized-line spacing.
-  Generated-view clicks collapse all controls within an inclusive 32-base-voxel
-  optimized-polyline arclength radius into one control at the clicked point.
+  typical width without depending on optimized-line spacing; the along and
+  cross spacings are independent constants.
+  Generated-view clicks collapse all controls within an inclusive 8-base-voxel
+  optimized-polyline arclength radius (equal to the along-line sampling
+  distance) into one control at the clicked point.
   Before automatic full optimization, every insertion, replacement, or
   multi-control collapse first reconstructs the replacement's surviving
   adjacent spans from its authoritative line position. A multi-control collapse
