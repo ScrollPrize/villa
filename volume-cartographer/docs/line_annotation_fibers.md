@@ -23,9 +23,22 @@ finished fiber. If no inference dataset is selected or uniquely attached,
 seed creation remains Lasagna and does not open a dataset picker.
 
 The fallback order is `trace -> lasagna -> cspline` or `lasagna -> cspline`.
-For global Lasagna/trace goals only, endpoint distance below 100 base voxels
-selects `cspline` immediately; exactly 100 voxels still attempts the global
-mode. Explicit goals never use this shortcut. Adjacent cubic-spline spans are
+For the Global goal only, a span shorter than the global mode's own minimum
+selects `cspline` immediately: in trace mode 12 tracer steps
+(`kMinimumTraceSteps * stepVoxels * traceToBaseScale`, 48 base voxels with the
+default 4 vx step), in Lasagna mode two Lasagna segments
+(`kMinimumLasagnaSegments * segmentLength`, about 63 base voxels with the
+default discretization). A span exactly at the minimum still attempts the
+mode (48.0 vx is traced, 47.9 vx is a spline). In trace mode a Global-goal
+span whose trace is not accepted falls back
+to Lasagna only when it is at least the Lasagna minimum long; a shorter one
+goes straight to `cspline` (message `short span, trace -> cspline`, counted as
+`cspline_fallback_segments`, the trace failure metadata kept on the span).
+Explicit goals never use these shortcuts. The tracer's endpoint acceptance is
+bounded per span to a quarter of the start-to-target distance
+(`kEndpointAcceptSpanFraction`; a 50 vx span accepts an endpoint miss of at
+most 12.5 vx, spans of 80 vx and more keep the configured 20 vx), so a short
+accepted trace must actually reach its target. Adjacent cubic-spline spans are
 interpolated jointly with exact CPs, shared internal tangents, and hard boundary
 directions from neighboring stored geometry. The spline helper uses no normal
 or prediction data.

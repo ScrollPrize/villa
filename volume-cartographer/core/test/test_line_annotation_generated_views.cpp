@@ -1128,6 +1128,77 @@ TEST_CASE("line annotation winding angles unwrap along the line and window half 
     }
 }
 
+TEST_CASE("segment interpolation mode uses regime-specific minimum spans")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    using vc3d::line_annotation::SegmentInterpolationGoal;
+    using vc3d::line_annotation::SegmentInterpolationMode;
+    using vc3d::line_annotation::resolveSegmentInterpolationMode;
+    using vc3d::line_annotation::segmentInterpolationCutoffs;
+
+    vc::fiber_tracer::FiberTraceConfig traceConfig;  // stepVoxels 4
+    vc::lasagna::LineOptimizationConfig lasagnaConfig;
+    lasagnaConfig.segmentLength = 31.5;
+    const auto cutoffs = segmentInterpolationCutoffs(traceConfig, lasagnaConfig, 1.0);
+    CHECK(cutoffs.traceMinimumSpanBaseVoxels == doctest::Approx(48.0));
+    CHECK(cutoffs.lasagnaMinimumSpanBaseVoxels == doctest::Approx(63.0));
+
+    SUBCASE("trace-to-base scale converts the tracer step into base voxels")
+    {
+        const auto scaled = segmentInterpolationCutoffs(traceConfig, lasagnaConfig, 2.0);
+        CHECK(scaled.traceMinimumSpanBaseVoxels == doctest::Approx(96.0));
+        CHECK(scaled.lasagnaMinimumSpanBaseVoxels == doctest::Approx(63.0));
+    }
+
+    SUBCASE("global goal in trace mode uses the trace minimum")
+    {
+        const auto mode = FiberOptimizationMode::NativeFiberTrace3d;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 47.9, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 48.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 100.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+    }
+
+    SUBCASE("global goal in lasagna mode uses the lasagna minimum")
+    {
+        const auto mode = FiberOptimizationMode::Lasagna;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 62.9, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 63.0, cutoffs) ==
+              SegmentInterpolationMode::Lasagna);
+    }
+
+    SUBCASE("explicit goals ignore the cutoffs")
+    {
+        const auto mode = FiberOptimizationMode::NativeFiberTrace3d;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Trace, mode, 10.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Lasagna, mode, 10.0, cutoffs) ==
+              SegmentInterpolationMode::Lasagna);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Cspline, mode, 1000.0, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+    }
+
+    SUBCASE("degenerate configs are rejected")
+    {
+        vc::fiber_tracer::FiberTraceConfig zeroStep = traceConfig;
+        zeroStep.stepVoxels = 0.0;
+        CHECK_THROWS_AS(segmentInterpolationCutoffs(zeroStep, lasagnaConfig, 1.0),
+                        std::invalid_argument);
+        vc::lasagna::LineOptimizationConfig zeroSegment = lasagnaConfig;
+        zeroSegment.segmentLength = 0.0;
+        CHECK_THROWS_AS(segmentInterpolationCutoffs(traceConfig, zeroSegment, 1.0),
+                        std::invalid_argument);
+        CHECK_THROWS_AS(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global,
+                                                        FiberOptimizationMode::NativeFiberTrace3d,
+                                                        -1.0,
+                                                        cutoffs),
+                        std::invalid_argument);
+    }
+}
+
 TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
 {
     const std::vector<double> controlPositions{12.0, 20.0, 40.0};
@@ -3068,25 +3139,73 @@ TEST_CASE("native seed tracing requires native mode and configured inference")
     CHECK_FALSE(shouldRunNativeSeedTrace(FiberOptimizationMode::Lasagna, true, 1));
 }
 
-TEST_CASE("segment interpolation resolution applies short fallback only to global goals")
+TEST_CASE("fiber mode sends a failed short global-goal trace straight to cspline")
 {
-    using namespace vc3d::line_annotation;
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Global,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              99.999) == SegmentInterpolationMode::Cspline);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Global,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              100.0) == SegmentInterpolationMode::Trace);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Trace,
-              FiberOptimizationMode::Lasagna,
-              1.0) == SegmentInterpolationMode::Trace);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Lasagna,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              1.0) == SegmentInterpolationMode::Lasagna);
+    // Trace minimum 12 * 4 = 48 vx, Lasagna minimum 2 * 40 = 80 vx. Two
+    // 64 vx Global-goal spans: both long enough to trace; the second one's
+    // trace throws (invalid prediction at x = 96) and, being shorter than the
+    // Lasagna minimum, goes to cspline instead of the Lasagna fallback.
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions(96.0);
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {18.0, {64.0, 0.0, 0.0}, false, 18},
+        {34.0, {128.0, 0.0, 0.0}, false, 34},
+    };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Global;
+    request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Global;
+    for (int x = -8; x <= 136; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.normalManifestLocation = "normal.lasagna.json";
+    request.fiberManifestLocation = "fiber.lasagna.json";
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.retraceAll = true;
+    request.globalMode = vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 40.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 3);
+    CHECK(result.nativeSegments == 1);
+    CHECK(result.lasagnaFallbackSegments == 0);
+    CHECK(result.csplineFallbackSegments == 1);
+    REQUIRE(result.controlPoints[0].segmentToNext.has_value());
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[0].segmentToNext));
+    REQUIRE(result.controlPoints[1].segmentToNext.has_value());
+    const auto& gated = *result.controlPoints[1].segmentToNext;
+    CHECK(gated.interpMode == vc3d::line_annotation::SegmentInterpolationMode::Cspline);
+    CHECK(gated.interpGoal == vc3d::line_annotation::SegmentInterpolationGoal::Global);
+    // The trace failure stays on the span; the message records the gate.
+    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[1].segmentToNext));
+    CHECK_FALSE(gated.failureCode.empty());
+    CHECK(gated.message.find("short span, trace -> cspline") != std::string::npos);
+    CHECK(result.optimization.report.message.find("cspline_fallback_segments=1") !=
+          std::string::npos);
 }
 
 TEST_CASE("fiber mode falls back only the failed native span")

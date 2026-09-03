@@ -4691,6 +4691,10 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
     request.budgetSpanVoxels = distanceVoxels;
+    // No target planes and no endpoint acceptance here: an open-tail
+    // extrapolation has a synthetic target at the requested distance, nothing
+    // to "reach", so the span-bounded endpoint threshold of traceFiberSegment
+    // deliberately does not apply.
     request.config = config;
     return traceOneWayCore(
         predictions,
@@ -4699,6 +4703,16 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         progress,
         "extrapolation",
         distanceVoxels);
+}
+
+double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,
+                                                  double spanLengthBaseVoxels)
+{
+    if (!std::isfinite(spanLengthBaseVoxels) || spanLengthBaseVoxels < 0.0) {
+        return config.endpointAcceptThresholdBaseVoxels;
+    }
+    return std::min(config.endpointAcceptThresholdBaseVoxels,
+                    kEndpointAcceptSpanFraction * spanLengthBaseVoxels);
 }
 
 FiberTraceSegmentResult traceFiberSegment(
@@ -4721,7 +4735,17 @@ FiberTraceSegmentResult traceFiberSegment(
     FiberTraceSegmentResult result;
     const cv::Vec3d start = request.referenceLine[request.startIndex];
     const cv::Vec3d target = request.referenceLine[request.targetIndex];
+    // The reference line, start, target and span are in trace voxels; the
+    // acceptance threshold is configured in base voxels.
     const double span = length(target - start);
+    // One effective config for this segment: the endpoint acceptance is
+    // bounded by the span (see effectiveEndpointAcceptThresholdBaseVoxels), and
+    // the same value drives both one-way target-plane acceptances (through
+    // targetPlaneAcceptThresholdVoxels; traceOneWayCore does not read the
+    // config threshold itself) and the meeting fusion below.
+    FiberTraceConfig config = request.config;
+    config.endpointAcceptThresholdBaseVoxels = effectiveEndpointAcceptThresholdBaseVoxels(
+        request.config, span * request.config.traceToBaseScale);
     FiberTraceOneWayRequest forwardOneWay;
     forwardOneWay.startPoint = start;
     forwardOneWay.targetPoint = target;
@@ -4734,11 +4758,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.startIndex,
         target);
     forwardOneWay.targetPlaneAcceptThresholdVoxels =
-        request.config.endpointAcceptThresholdBaseVoxels /
-        request.config.traceToBaseScale;
+        config.endpointAcceptThresholdBaseVoxels / config.traceToBaseScale;
     forwardOneWay.snapTraceToSelectedCrossing = false;
     forwardOneWay.budgetSpanVoxels = span;
-    forwardOneWay.config = request.config;
+    forwardOneWay.config = config;
     FiberTraceOneWayRequest reverseOneWay;
     reverseOneWay.startPoint = target;
     reverseOneWay.targetPoint = start;
@@ -4751,11 +4774,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.targetIndex,
         start);
     reverseOneWay.targetPlaneAcceptThresholdVoxels =
-        request.config.endpointAcceptThresholdBaseVoxels /
-        request.config.traceToBaseScale;
+        config.endpointAcceptThresholdBaseVoxels / config.traceToBaseScale;
     reverseOneWay.snapTraceToSelectedCrossing = false;
     reverseOneWay.budgetSpanVoxels = span;
-    reverseOneWay.config = request.config;
+    reverseOneWay.config = config;
 
     result.forward = traceOneWayCore(
         predictions, forwardOneWay, normalSampler, progress, "forward");
@@ -4763,7 +4785,7 @@ FiberTraceSegmentResult traceFiberSegment(
         predictions, reverseOneWay, normalSampler, progress, "reverse");
 
     const TraceMeetingFusion fusion =
-        fuseTraceMeetings(result.forward, result.reverse, request.config);
+        fuseTraceMeetings(result.forward, result.reverse, config);
     result.fusedLine = fusion.fusedLine;
     if (!result.fusedLine.empty()) {
         result.fusedLine.front() = request.referenceLine[request.startIndex];
