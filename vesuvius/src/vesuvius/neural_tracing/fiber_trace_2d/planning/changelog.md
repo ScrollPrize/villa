@@ -1974,3 +1974,12 @@
   accounting, and distance-per-failure aggregation across direct backends;
   version-3 JSON records tracer-specific initialization, spacing, settings, and
   inputs.
+
+## 2026-09-03 - Fiber benchmark progress plots
+
+- Added reproducible percentage-versus-algorithm-date step plots for reference
+  replay reliability and the negated 1024-crop problematic/retained constraint
+  ratio.
+- Kept raw counts and separate algorithm/measurement provenance in an
+  extensible data file, and marked unexecuted direct crop policies as assumed
+  floor markers without fabricated measurements.

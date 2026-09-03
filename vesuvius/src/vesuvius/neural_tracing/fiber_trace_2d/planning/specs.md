@@ -6247,3 +6247,25 @@
   measurement. They also include threshold geometry, effective search/reset
   settings, seed window, inputs, worker count, and summary metrics. External-
   data runs are manual scientific benchmarks, not CI performance gates.
+
+# Fiber benchmark progress plots
+
+- The benchmark progress data records historical `algorithm_date` and
+  `algorithm_revision` separately from `measurement_date`,
+  `measurement_revision`, and the reproducible run record. Plot dates are
+  algorithm milestones; benchmark table dates remain execution dates.
+- Reference replay plots derive `distance_per_failure_percent` as
+  `100/max(failures,1)` after complete evaluation. Crop plots preserve the
+  existing problematic-to-retained error ratio but negate it as
+  `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
+  The two percentages are not comparable metrics.
+- A crop point with `measurement_status=assumed_floor` is not a measurement.
+  It must carry an explicit rationale, no measurement revision or run record,
+  and must be visually distinguishable by marker and line style. This permits
+  direct tracers without a candidate-piece graph to appear at the requested
+  a plotting floor without being represented as executed crop benchmarks or
+  being assigned a fabricated numeric metric.
+- Plot scores are computed from raw counts. Each measured point must retain the
+  fixed cohort identity, full algorithm and measurement revisions, and an
+  existing run record. Deterministic SVG output uses fixed metadata and IDs and
+  includes an accessible title and description.

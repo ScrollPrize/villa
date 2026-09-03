@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "cohort": {
+    "name": "PHercParis4 1024",
+    "crop_base_xyz": [10240, 22016, 6144, 11264, 23040, 7168],
+    "reference_inventory_sha256": "1a2a5c0d608f8b5b6cf9ceb361a78ff163eea640422662d669d89a33eeca3b90",
+    "normal_manifest_sha256": "77834e54d9e2dfde4c10b6dba8610ba881a5ad509d1c82d6409346a931e3aa29"
+  },
+  "benchmarks": {
+    "reference_replay": {
+      "title": "Reference-fiber replay reliability",
+      "metric": "distance_per_failure_percent",
+      "y_label": "Distance per failure / tested length (%)",
+      "points": [
+        {
+          "algorithm": "Lasagna transport",
+          "algorithm_date": "2026-06-01",
+          "algorithm_revision": "e5e925774911d3c3c5591513e4592e5ddab503f1",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "6c006d9b0a1477cfcb618ab1b02e3f2855349f9c",
+          "tested_length_mm": 101.03576428789299,
+          "failures": 57,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-6c006d9b0-lasagna-reference-replay.md"
+        },
+        {
+          "algorithm": "Greedy direct",
+          "algorithm_date": "2026-07-30",
+          "algorithm_revision": "196829918631fb802e5cda68d7209a7d5448820e",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "6c006d9b0a1477cfcb618ab1b02e3f2855349f9c",
+          "tested_length_mm": 101.03576428789299,
+          "failures": 13,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-6c006d9b0-greedy-reference-replay.md"
+        },
+        {
+          "algorithm": "Fiberlet",
+          "algorithm_date": "2026-08-22",
+          "algorithm_revision": "ebb5bf071ec0584de7b2a37a43ca135e78a2028b",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "cd0fbd52a1fdc48952a8d44227f98f7e240d5bdb",
+          "tested_length_mm": 101.03576428789299,
+          "failures": 6,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-cd0fbd52a-reference-distance-per-failure.md"
+        }
+      ]
+    },
+    "crop_pruning": {
+      "title": "1024-crop constraint error",
+      "metric": "negative_problematic_per_retained_fulfilled_percent",
+      "y_label": "Negative problematic / retained fulfilled (%)",
+      "points": [
+        {
+          "algorithm": "Lasagna transport",
+          "algorithm_date": "2026-06-01",
+          "algorithm_revision": "e5e925774911d3c3c5591513e4592e5ddab503f1",
+          "measurement_status": "assumed_floor",
+          "assumption": "No candidate-piece graph or crop-pruning solve; plotted at the requested floor."
+        },
+        {
+          "algorithm": "Greedy direct",
+          "algorithm_date": "2026-07-30",
+          "algorithm_revision": "196829918631fb802e5cda68d7209a7d5448820e",
+          "measurement_status": "assumed_floor",
+          "assumption": "No candidate-piece graph or crop-pruning solve; plotted at the requested floor."
+        },
+        {
+          "algorithm": "Fiberlet + BP oracle pruning",
+          "algorithm_date": "2026-09-02",
+          "algorithm_revision": "41052ac96e2841fe030708c7f4a8452baabdd9f9",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "1a70f9e57e47754df8379bf453ab73fddf757088",
+          "problematic_unique_constraints": 44284,
+          "retained_fulfilled_unique_constraints": 24888,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-1a70f9e57-oracle-pruning.md"
+        }
+      ]
+    }
+  }
+}

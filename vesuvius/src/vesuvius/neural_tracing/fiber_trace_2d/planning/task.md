@@ -1,6 +1,8 @@
-# Task: Direct Tracer Reference Replay Benchmarks
+# Task: Fiber benchmark progress plots
 
-Extend the reference-fiber replay benchmark to evaluate the older direct greedy
-Fiber tracer and the Lasagna normal-transport tracer in addition to the
-Fiberlet tracer. These additional backends apply only to reference replay; the
-1024-crop oracle-pruning benchmark remains Fiberlet-only.
+Add reproducible step plots for the reference-fiber replay benchmark and the
+1024-crop BP/oracle-pruning benchmark. Plot percentage against the historical
+algorithm completion date, keep the plot data easy to extend, orient both
+scores so higher is better, and represent greedy direct and Lasagna transport
+as explicit unmeasured floor assumptions in the crop plot because those
+pipelines were not run there.

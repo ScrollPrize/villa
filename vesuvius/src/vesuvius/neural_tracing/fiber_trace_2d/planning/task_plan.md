@@ -1,53 +1,39 @@
 # Plan
 
-1. Generalize reference replay so Fiberlet, direct greedy, and Lasagna use the
-   same directed cases, forward-reference matcher, anisotropic threshold,
-   failure accounting, completion requirement, and distance-per-failure
-   summary. Preserve each backend's native seed and reset increment, but record
-   these differences explicitly.
-2. Add an explicit replay tracer selection to `vc_fiber_trace_chunk`. Keep the
-   current Fiberlet backend as the default; require a Fiber prediction manifest
-   only for direct greedy replay. Lasagna replay uses the normal manifest.
-3. Reuse the existing direct greedy `traceFiberReplay` implementation with a
-   synthetic two-control-point input for each clipped directed run. Extract the
-   existing Lasagna normal-transport step into a public helper, port its current
-   caller to that helper, and drive it through the same reset-capable replay
-   implementation. Lasagna starts exactly at the reference endpoint tangent,
-   keeps the previous direction across invalid normal samples, and is reported
-   as a normal-transport control.
-4. Version benchmark JSON to version 3 so it records tracer identity, common
-   evaluator settings, actual evaluation/reset spacing, backend-specific
-   effective settings, and only the inputs consumed by that backend. Keep
-   headline metrics identical across backends and retain version-2 Fiberlet
-   records as historical artifacts.
-5. Add focused synthetic tests for direct-result adapter semantics, constant
-   and invalid-normal Lasagna replay, antipodal normal transport, and JSON
-   tracer provenance. Re-run the existing greedy replay and Lasagna optimizer
-   tests, then smoke-test CLI validation and both direct backends on the frozen
-   external dataset.
-6. Build Release targets, run focused tests, then run and record the greedy and
-   Lasagna reference benchmarks on the frozen PHercParis4 1024 crop if the
-   required local prediction input is discoverable.
-
-The crop-pruning command and its benchmark schema are intentionally unchanged.
+1. Add one structured plot-data file containing algorithm completion date and
+   revision, measurement date and revision, cohort identity, raw numerator and
+   denominator, measured/assumed status, and run record for both benchmark
+   families.
+2. Define replay score exactly as `100 / max(failures, 1)` after complete
+   evaluation. Preserve the crop benchmark's existing
+   `100*problematic/retained_fulfilled` error ratio and negate it so zero is the
+   ideal target and higher is better. Record direct greedy and Lasagna as
+   assumed floor markers without fabricated crop metric values.
+3. Add a deterministic plotting script that validates raw counts and
+   provenance, orders points by algorithm completion date, renders
+   percentage-versus-date stair steps, distinguishes measured and assumed
+   points by both color and marker, and writes two accessible SVG artifacts.
+4. Link and explain both plots in the benchmark results index, including the
+   score transforms and historical-date policy.
+5. Run the plot generator, validate both SVGs and their labels, and run a
+   lightweight script test with the checked-in data.
 
 ## Spec Update
 
-Specify the three reference replay backends, common metric/evaluation policy,
-backend inputs, and the fact that crop pruning remains Fiberlet-only.
+Document plot score definitions, assumed floor-point semantics, algorithm-date
+semantics, and the requirement that future points retain provenance.
 
 ## Docs Update
 
-Document commands and effective settings for Fiberlet, greedy, and Lasagna
-reference replay. Add reproducible run records and index rows for completed
-external-data runs.
+Embed the generated replay and crop progress plots in the benchmark index and
+document how to regenerate them.
 
 ## Changelog
 
-Record direct greedy and Lasagna reference replay support.
+Record the reproducible benchmark visualization and extensible data source.
 
 ## Validation
 
-Run the focused C++ tests and the frozen 1024-crop replay command for both new
-backends. Record wall/CPU time, source revision, artifact identities, failure
-count, mean distance per failure, and percentage.
+Run the plotting script against the checked-in data, parse both generated SVGs,
+and verify the expected point count, ordering, labels, score recomputation,
+numeric range, provenance, and run-record links.

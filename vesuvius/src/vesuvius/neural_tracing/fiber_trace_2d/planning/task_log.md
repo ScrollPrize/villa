@@ -1,25 +1,60 @@
 # Task Log
 
-- Located the existing Fiberlet reference replay benchmark and its shared
-  distance-per-failure summary.
-- Located the reset-capable direct greedy `traceFiberReplay` implementation.
-- Located Lasagna's normal-transport line construction inside `LineOptimizer`;
-  it is currently private and must be extracted for replay rather than copied.
-- Independent review clarified that Lasagna normals do not identify fibers.
-  The new backend is explicitly a reference-tangent-initialized normal-
-  transport control. Native seeding, reset increments, evaluation cadence, and
-  invalid-normal behavior must be serialized because they differ by backend.
-- Extracted Lasagna tangent transport and ported existing line construction to
-  the shared helper. Direct greedy and Lasagna now use a common reset-capable
-  forward-reference evaluation driver.
-- Release build and focused tests passed. Preliminary frozen-crop runs found 13
-  greedy failures and 57 Lasagna-control failures over 101.036 directed mm;
-  final records will be rerun from the committed implementation revision.
-- Committed implementation revision `6c006d9b0` passed the focused greedy,
-  reference replay, and Lasagna optimizer tests in a CMake Release build.
-- Final greedy replay: 13 failures over 101.036 directed mm, 7.772 mm per
-  failure (7.692%), 0.49 seconds wall, 274,592 KiB maximum RSS.
-- Final Lasagna normal-transport control: 57 failures over 101.036 directed mm,
-  1.773 mm per failure (1.754%), 0.09 seconds wall, 70,776 KiB maximum RSS.
-- Both direct policies were measured only on endpoint replay. No crop tracing,
-  direction solve, or oracle-pruning benchmark was run for either policy.
+## Scope
+
+- Add two percentage-versus-time step plots without changing either benchmark.
+- Keep all new work uncommitted at the user's request.
+
+## Decisions
+
+- Use algorithm completion dates rather than the later benchmark execution
+  date: Lasagna transport `2026-06-01`, greedy direct `2026-07-30`, and the
+  current Fiberlet replay default `2026-08-22`. The crop Fiberlet-plus-BP point
+  instead uses `2026-09-02`, when reference-conditioned pruning was completed.
+- Replay uses the recorded distance-per-failure percentage directly.
+- Crop preserves and negates the recorded
+  `100 * problematic / retained_fulfilled` ratio: Fiberlet is `-177.9331%`
+  from 44,284 problematic and 24,888 retained fulfilled constraints. Direct
+  greedy and Lasagna are visibly marked as unmeasured floor points without
+  numeric metric values.
+
+## Independent Review
+
+- Separate historical algorithm provenance from later measurement provenance.
+- Derive plot scores from raw fields, preserve the exact metric names, validate
+  their domains, and retain cohort identity. The review initially proposed a
+  bounded fulfilled fraction; the user corrected this to the benchmark's
+  existing problematic/retained ratio before finalization.
+- Treat crop floor markers as assumptions in a separate visual style and do
+  not imply they were crop measurements or give them fabricated metric values.
+- Date the crop point to the complete BP/pruning method rather than the earlier
+  Fiberlet replay milestone. Keep the two percentage families on separate axes
+  and state that they are not numerically comparable.
+
+## Implementation
+
+- Added `volume-cartographer/docs/fiber_benchmark_plot_data.json` with raw
+  benchmark counts, cohort identity, separate algorithm/measurement
+  provenance, run-record links, and explicit assumed-floor rationales.
+- Added `volume-cartographer/scripts/plot_fiber_benchmarks.py`. It validates
+  source data, derives scores, orders algorithm milestones, and emits two
+  deterministic accessible SVG step plots. Measured and assumed crop points
+  differ by marker, fill, color, and line style.
+- Embedded and documented the plots in the benchmark index. No benchmark
+  implementation, recorded run, or result value was changed.
+
+## Validation
+
+- `python volume-cartographer/scripts/plot_fiber_benchmarks.py --check` derives
+  replay scores `1.754386%`, `7.692308%`, and `16.666667%`, plus two unmeasured
+  crop floors and the Fiberlet crop score `-177.933140%`.
+- Generated both SVGs twice; SHA-256 remained
+  `9463e3197aeeb38c14c68e01ae1020a718a79c4d44a8f6113c630f95adc3590f`
+  for replay and
+  `aecc709ead62b053c866687846cbf7f27e60f3dad17527754a385a3786924f7b`
+  for crop.
+- Python compilation, XML parsing of both SVGs, and `git diff --check` passed.
+- Visual inspection used temporary PNG conversions and confirmed readable
+  labels, distinct assumed markers, and non-overlapping plot content.
+- The user reviewed the corrected `-177.933140%` crop-error presentation and
+  requested that the completed visualization changes be committed.

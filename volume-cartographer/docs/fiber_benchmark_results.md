@@ -5,6 +5,37 @@ complete command, source revision, effective settings, artifact identities,
 timing, and detailed results. These are manual external-data measurements, not
 CI performance gates.
 
+## Progress Plots
+
+![Reference-fiber replay reliability over algorithm completion time](imgs/fiber_reference_replay_progress.svg)
+
+Reference replay uses `100 / max(failures, 1)`, equivalently mean tested
+distance per failure divided by total tested directed length. Higher is better;
+zero and one failure both saturate at 100 percent under the benchmark's censored
+zero-failure convention.
+
+![Crop constraint error over algorithm completion time](imgs/fiber_crop_pruning_progress.svg)
+
+The crop plot preserves the recorded problematic-to-retained error ratio and
+negates it so higher is better:
+`-100 * problematic / retained_fulfilled`. The Fiberlet result is therefore
+`-177.93%`, and zero is the ideal target. The direct greedy and Lasagna markers
+are unmeasured plotting-floor assumptions without numeric benchmark values;
+neither produces the candidate-piece graph required by this benchmark. The two
+plots use different metrics and their percentages are not numerically
+comparable.
+
+The horizontal coordinate is the historical algorithm completion date, not the
+later benchmark execution date. Each data row separately records algorithm and
+measurement revisions. Regenerate both deterministic SVGs with:
+
+```bash
+python volume-cartographer/scripts/plot_fiber_benchmarks.py
+```
+
+Add later results to `docs/fiber_benchmark_plot_data.json`; scores are derived
+from raw failure or unique-constraint counts rather than copied percentages.
+
 ## Reference endpoint replay
 
 | Date | Revision | Policy | Crop | Tested length | Failures | Distance/failure | Distance % | Wall time | Run |
