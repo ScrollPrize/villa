@@ -6,6 +6,6 @@
 - [x] Implement continuation and multi-failure accounting.
 - [x] Add focused regression tests.
 - [x] Update specs, documentation, and changelog.
-- [ ] Add the committed benchmark record.
+- [x] Add the committed benchmark record.
 - [x] Build and run focused validation.
-- [ ] Run and record the 1024-crop endpoint benchmark.
+- [x] Run and record the 1024-crop endpoint benchmark.

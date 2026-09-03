@@ -32,7 +32,14 @@
 - Release `vc_fiber_trace_chunk` and
   `test_fiber_reference_replay_benchmark` build successfully.
 - Focused benchmark tests: 4 test cases passed.
+- `ctest --test-dir volume-cartographer/build -R
+  '^test_fiber_reference_replay_benchmark$' --output-on-failure`: passed.
 - The broad `test_fiberlet_paths` executable still reports the pre-existing
   bit-exact prepared-scoring failures at line 414; its continuation replay
   regression is compiled, and the benchmark uses the unchanged ordinary reset
   path already covered by that suite.
+- Committed implementation `d1c52f1b0` evaluated all 48 directions on the
+  frozen PHercParis4 1024 crop in 21.58 seconds wall time. All directions
+  reached the reference end; 43 were failure-free and 5 contained 6 total
+  failures. Source 0 reverse contained two failures, proving whole-run
+  continuation exposes an error hidden by the first-failure benchmark.
