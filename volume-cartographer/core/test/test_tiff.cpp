@@ -1,6 +1,7 @@
 // Coverage for core/src/Tiff.cpp. atomicImwriteMulti has its own test elsewhere;
 // here we exercise voxelSizeToDpi, writeTiff (typed & untiled), TiffWriter
-// tiled writes, type-conversion paths, and mergeTiffParts no-input.
+// tiled writes, type-conversion paths, isReadableTiff, and mergeTiffParts
+// no-input.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -11,6 +12,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -199,6 +201,31 @@ TEST_CASE("TiffWriter: move construction transfers file handle")
     w2.writeTile(0, 0, tile);
     w2.close();
     CHECK(fs::exists(p));
+    fs::remove_all(d);
+}
+
+TEST_CASE("isReadableTiff: finished vs torn, empty and absent files")
+{
+    auto d = tmpDir("readable");
+    auto p = d / "out.tif";
+    auto torn = d / "torn.tif";
+    {
+        TiffWriter w(p, 32, 32, CV_8UC1, 16, 16);
+        cv::Mat tile = ramp(16, 16, CV_8UC1);
+        w.writeTile(0, 0, tile);
+        w.writeTile(16, 0, tile);
+        // What a writer killed at this point leaves on disk: header and
+        // tiles, no directory (that is written by close()).
+        fs::copy_file(p, torn);
+        w.writeTile(0, 16, tile);
+        w.writeTile(16, 16, tile);
+    }
+    CHECK(isReadableTiff(p));
+    CHECK(fs::file_size(torn) > 0);
+    CHECK_FALSE(isReadableTiff(torn));
+    { std::ofstream empty(d / "empty.tif"); }
+    CHECK_FALSE(isReadableTiff(d / "empty.tif"));
+    CHECK_FALSE(isReadableTiff(d / "absent.tif"));
     fs::remove_all(d);
 }
 
