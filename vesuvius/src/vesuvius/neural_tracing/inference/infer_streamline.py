@@ -2773,7 +2773,10 @@ def _parse_args(argv=None):
         default=None,
         help="Volume pyramid scale. Defaults to the matched checkpoint dataset scale when --volume-path=auto.",
     )
-    parser.add_argument("--volume-cache-dir", default="/tmp/vesuvius-volume-cache")
+    parser.add_argument(
+        "--volume-cache-dir",
+        default=str(Path(tempfile.gettempdir()) / "vesuvius-volume-cache"),
+    )
     parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
     parser.add_argument("--output-dir", required=True, help="Run output directory.")
     parser.add_argument("--grow-direction", default="left", choices=sorted(_DIRECTION_SPECS))
