@@ -1,5 +1,9 @@
 # Fiberlet crop tracing
 
+The complete frozen PHercParis4 1024-crop evaluation workflow, including
+prediction and Fiberlet generation, is documented in
+[`fiber_pruning_benchmark.md`](fiber_pruning_benchmark.md).
+
 `vc_fiber_trace_chunk` fills a base-coordinate crop with traces from a
 preprocessed combined Fiberlet dataset. It does not read or regenerate the
 original dense Fiber prediction. The authoritative output is a sparse Fiberlet
@@ -367,13 +371,6 @@ are populated when `--parallel-diagnostics` is passed. They do not affect
 candidate selection, winding integration, or BP; collection is off by default
 to avoid adding work to the normal distance path.
 
-On the fixed 1024-crop, eight-reference diagnostic, the distance mode retained
-the best measured result (`1784/2839`, 62.839%, with 8/8 exact reference
-windings). Tested perpendicular grids ranged from 62.359% to 62.698%. The best
-grid improved mean connector perpendicularity from 0.266 to 0.254, but changed
-261 quantized parallel-winding bins; 246 of those baseline measurements were
-within 0.10 winding of a half-integer boundary. This threshold sensitivity is
-why the distance mode remains the default.
 The mean consistently oriented tangent dot is clamped to `[0,1]` as raw
 parallel evidence. Raw perpendicular evidence is `1 - abs(initial tangent
 dot)`; the two values are divided by their sum, so the reported normalized
@@ -1180,15 +1177,6 @@ canonical value, and the sign item reports the extra finite/hard ordering rule.
 Neutralized items are shown explicitly and are not silently counted as correct
 or included in the percentage denominator.
 
-The initial hard-continuation 1024-crop sweep selected linear normal confidence,
-cosine decision confidence, and class weights `0,2,2,2,1` under the former
-post-quantization measurement-scale semantics. After correcting scale to act
-before canonical quantization, the original five-coordinate refinement selected
-`0,4,2,2,1`. That result predates separate winding-value and sign-hardness
-benchmark items and is retained only as tuning history. The seven-coordinate
-corrected result below defines the current defaults. Explicit confidence,
-weight, sign, Defect, and temperature options reproduce prior modes.
-
 With reference fibers loaded, `--winding-weight-search V0,V1,...` exhaustively
 tests the Cartesian product of the listed values in all seven winding/sign
 positions.
@@ -1218,25 +1206,10 @@ the iteration guard before an optimum is an error rather than a successful
 termination. The selected tuple is solved once more to produce the ordinary
 output artifacts.
 
-The first seven-coordinate run used a `0.5` parallel cutoff and selected winding
-`0.5,2,1,2,1`, sign `0,1`, but that result excluded parallel-other and
-parallel-sign items and is not a production default. The corrected no-cutoff
-search started there, evaluated 58 scenarios, and selected winding
-`0.5,0,1,2,1`, sign `0.5,1`: 8/8 exact reference windings and 4835/5446 correct
-items (88.781%). All five reference classes were populated: perpendicular
-winding 1420/1797, perpendicular sign 1775/1797, parallel-same winding 283/306,
-parallel-other winding 600/773, and parallel sign 757/773. No additional
-parallel cutoff is enabled by default. The zero perpendicular-far winding weight
-is a selected class weight, not an extraction cutoff; far observations and their
-separate sign items remain present in diagnostics and benchmark denominators.
-
-A subsequent zero-aware local search on the 1024 crop used the complete
-26-fiber `2026-09-01_fiber_stack2` reference set. It started from winding
-`0.5,0,1,2,1`, sign `0.5,1` at 13/26 exact inferred windings and selected
-winding `0,0,0.5,4,1`, sign `1,0.5` at 16/26 exact inferred windings after 129
-scenarios. Those selected tuples are the shared and CLI defaults. One reference
-had no usable cross constraint in this crop; the fixed reference denominator
-therefore reports 16 exact, 9 wrong, and 1 missing.
+The selected shared defaults remain visible in `--help`. Historical tuning
+measurements are intentionally excluded here; fixed-workload measurements and
+the exact benchmark invocation belong in
+[`fiber_pruning_benchmark.md`](fiber_pruning_benchmark.md).
 
 The adaptive grid stores `gain=1/measurement_scale`, but gain selects the
 scale-specific canonical target before factor evaluation; it no longer scales
@@ -1645,27 +1618,12 @@ that reached the configured message limit. Round output records `converged` or
 `message_limit` in the `conditioned` column; capped results must not be reported
 as converged.
 
-The direct `conditioned-inliers` and `oracle-inliers` report also includes a
-`reference winding-area retained pieces` table. The interval is the inclusive
-annotated reference range `0..0.5*(reference_count-1)`. The final benchmark
-calibration maps every retained active H/V piece to an assigned half-winding
-row. The following piece benchmark reports all original, retained, removed,
-in-range retained, and other retained pieces. `problematic_%` is
-`100*removed/(removed+retained_ref)`; `problematic/ref_%` is
-`100*removed/retained_ref`. Both are percentages. Because pruning is
-piece-level, no source-fiber count is reported. Active final pieces without a
-usable gauge are separate.
-
-The `constraint pruning benchmark` counts unique graph constraints rather than
-factor terms. `removed_incident` counts constraints dropped because at least one
-endpoint was removed. Among retained constraints, `retained_defect` counts
-constraints neutralized by final Defects and `retained_infringed` counts a
-constraint once when any of its evaluated terms is infringed. Remaining
-constraints are `retained_fulfilled`. The two summary values are
-`100*problematic/(problematic+retained_fulfilled)` and
-`problematic/retained_% = 100*problematic/retained_fulfilled`. Retained subsets
-carry their exact original constraint indices so non-contiguous pruning cannot
-accidentally benchmark a same-sized prefix.
+The direct `conditioned-inliers` and `oracle-inliers` reports include retained
+piece populations over the annotated winding interval and unique-constraint
+retention. The calculations, denominators, frozen inputs, and expected values
+are defined in [`fiber_pruning_benchmark.md`](fiber_pruning_benchmark.md).
+Retained subsets carry their exact original constraint indices so
+non-contiguous pruning cannot accidentally evaluate a same-sized prefix.
 
 The experiment writes a separate `<output-stem>_pruned` artifact family:
 
@@ -1712,45 +1670,8 @@ For example, append the following to the normal reference-enabled BP command:
 --winding-fixed-orientation --reference-prune-offenders
 ```
 
-On the 1024 diagnostic crop with 500 retained fibers and 512-base-voxel pieces,
-the conditioned solve removed 90/1360 pieces and the fresh solve disabled 6 of
-the remaining 1270. The original benchmark recovered 16/26 exact reference
-windings; the pruned solve recovered 13/26. Aggregate evidence agreement moved
-from 74.829% to 75.175%. Conditioned-Defect-only pruning therefore does not
-recover the correct ladder on this workload and remains diagnostic.
-
-On the same workload, union pruning removed 113 pieces and recovered 14/26
-exact reference windings, while posterior thresholds 0.03, 0.10, 0.25, and
-0.50 all selected the same 90 pieces as conditioned-MAP pruning and recovered
-13/26. Neither variant exceeds the untouched result's 16/26 exact references.
-
-On that workload, `conditioned-inliers` with the sign-only default retained
-1054/1360 pieces and eliminated all 1530 admitted sign conflicts. The direct
-conditioned result recovered 20/26 exact reference windings (5 wrong, 1
-missing) and agreed with 7538/8908 (84.621%) retained reference constraints.
-The fresh solve remained unstable at 13/26, which is why it is reported and
-published separately rather than treated as the working set.
-
-On the same workload, `oracle-inliers` retained 997/1360 pieces. Its direct
-conditioned result reached 24 exact, 0 wrong, and 1 missing reference in the
-frozen 25-reference objective after six removal rounds (57.74 seconds wall,
-1245.97 seconds user, Release build). Across all 26 reference files the result
-is 24 exact, 0 wrong, and 2 missing: one was initially unsupported and the
-other had no retained support at its true winding, so its false winding-0
-support was removed. The fresh solve reached 12 exact, 11 wrong, and 3 missing;
-it remains a separate stability diagnostic without the fixed-reference
-guarantee.
-
-On the 2048 crop, the same 0.25 quality fraction retained 500/1999 fibers and
-produced 2524 main-component pieces. Strict 500- and 2000-message runs did not
-converge. With capped-state scoring enabled, sign-consistent closure retained
-1842 pieces at 25 exact, 1 wrong, and 0 missing reference windings. Oracle
-rounds removed four more pieces and reached 26 exact, 0 wrong, and 0 missing at
-1838/2524 retained pieces. All rounds had `message_limit` status. The direct
-conditioned constraint agreement was 9437/11254 (83.855%); the fresh
-reference-free solve only reached 11 exact and 15 wrong with 6090/10078
-(60.429%) agreement. The perfect result is therefore supervised and does not
-show that the retained graph independently recovers the ladder.
+Fixed-crop result tables and timings are kept in the benchmark guide rather
+than duplicated in this command reference.
 
 Immediately before each reference benchmark, `BP final states by source-piece
 cohort` reports H, V, active H/V, Defect, and Defect percentage for the original
@@ -1982,20 +1903,5 @@ vc_fiber_trace_chunk direction-ablation crop_traces.zarr \
   --winding-solver ordered-cuts
 ```
 
-On the 1024 crop's 25% quality cohort (500 input fibers, 1360 retained
-pieces), the Release run used 59,603 signed factors. The continuous fit took
-0.3 seconds and the complete command took 6.3 seconds wall time. Continuous
-reference ordering was correct for 240/276 comparable pairs (86.96%). The
-unregularized cut scan continued to 46 windings, but reference agreement
-peaked at 16/26 exact, 9 wrong, and 1 unsupported around 24--28 windings.
-Consequently this backend remains diagnostic: raw infringement reduction alone
-does not yet provide an adequate stopping rule.
-
-With `piece-length=384` and offender pruning on the same 1024 crop, the
-Release run removed 122 of 499 represented source traces. Continuous sign
-violations decreased from `954/94699` (1.01%) to `0/54154`; the complete
-command took 59.0 seconds wall time (`1018.19` seconds user and `4.66` seconds
-system). The reference-oracle cut checkpoint retained only 16/26 exact
-reference windings, with 8 wrong and 2 unsupported, versus 19 exact, 6 wrong,
-and 1 unsupported without pruning. Eliminating every continuous sign conflict
-therefore removes too much valid support on this sample.
+This backend remains diagnostic: raw infringement reduction alone does not
+provide an adequate unsupervised stopping rule.

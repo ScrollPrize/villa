@@ -1,11 +1,8 @@
-# Task: Reference-Winding Population Retention
+# Task: 1024 Fiber Pruning Benchmark Guide
 
-Convert the supervised conditioned-oracle population diagnostics into a compact
-piece-and-constraint pruning benchmark.
-
-Report final retained active pieces per annotated reference winding. Compare all
-removed pieces against retained in-range pieces as both a problematic fraction
-and a problematic/retained percentage. Count each graph constraint once and
-classify constraints incident to removed/final-Defect pieces or infringed by the
-authoritative final solution as problematic, versus retained fulfilled
-constraints. Do not aggregate pieces into source-fiber counts.
+Write a standalone evaluation and benchmark guide that reproduces the complete
+1024-crop workflow: Fiber prediction, Lasagna normal prediction, whole-volume
+Fiberlet preprocessing, crop tracing, reference-conditioned pruning, and the
+piece/constraint benchmark. Record the exact crop, the lookahead-expanded data
+range, model identities, source levels, artifact paths, commands, outputs, and
+metric definitions.

@@ -1,53 +1,62 @@
 # Task Log
 
-## Scope
+## Recovered Baseline
 
-- Measure final retained population specifically within the calibrated
-  reference winding interval and compare it with all removed pieces.
-- Report only split pieces because pruning is piece-level; source-fiber
-  aggregation is not a valid removal statistic.
-- Count unique graph constraints, not the multiple factor terms emitted from a
-  single constraint.
+- Output crop, base XYZ half-open: `[10240,22016,6144) ->
+  [11264,23040,7168)`, side 1024.
+- Default trace lookahead: 384 base voxels on every face.
+- Required search range, base XYZ half-open: `[9856,21632,5760) ->
+  [11648,23424,7552)`, side 1792.
+- Fiber source: manager Fiber 3D run
+  `s1a_128_1_single_8x8_20260801_084232`, checkpoint `best91_5k.pt`,
+  requested source group 1.
+- Normal source: manager Lasagna run
+  `20260419_180421_conthr_1e-5_warp_2um_noss_dist`, checkpoint
+  `model_current.pt`, requested source group 2.
+- Fiberlet prediction spacing: 8 base voxels; storage chunk side: 512 base
+  voxels; encoding: compact directions and nonlinear uint16 costs.
+- Stored trace baseline: 1998 traces with 2000 maximum attempts.
+- Evaluation cohort: best 25% by trace cost density, 512-base-voxel pieces,
+  26 `hendrik_crop1` reference fibers.
 
 ## Decisions
 
-- Use the final authoritative conditioned-result reference calibration for the
-  retained winding population.
-- Define the area as the inclusive virtual reference interval from the first
-  to last loaded reference fiber (`0.0..0.5*(N-1)`).
-- Count only active H/V assignments; Defect/Mixed pieces are not used.
-- Define piece percentages as `100*removed/(removed+retained_in_range)` and
-  `100*removed/retained_in_range`.
-- A unique constraint is problematic when it touches a removed piece, is
-  neutralized by a retained final Defect, or has any infringed factor term.
-  Retained constraints with all terms fulfilled form the comparison population.
-- Retained subset construction preserves original constraint indices. Ordinary
-  conditioned graphs use those identities after their conditioned prefix;
-  oracle-rebuilt graphs use compact local identities.
-- Report final active pieces without a calibrated gauge separately.
+- Document managed full-volume prediction and Fiberlet preprocessing because
+  the manager deliberately rejects cropped prediction bundles.
+- State the smaller expanded range separately as the minimum graph support
+  needed by the crop trace, not as a substitute for the recorded full-volume
+  source artifacts.
+
+## Implementation
+
+- Added `volume-cartographer/docs/fiber_pruning_benchmark.md` with the complete
+  managed generation and evaluation pipeline.
+- Linked it from `volume-cartographer/docs/fiber_chunk_tracing.md`.
+- Removed fixed-crop tuning history, benchmark formulas, population results,
+  and timings from the general crop-tracing reference; it now links to the
+  standalone guide for those workload-specific details.
+- Recorded the requested, search-expanded, and storage-aligned regions
+  separately to avoid XYZ/ZYX or crop/support ambiguity.
 
 ## Independent Review
 
-- Incorporated exact latent-coordinate gauge semantics, stable-ID subset
-  membership, half-ladder validation, inclusive boundaries, uncalibrated
-  counts, and validation for malformed reports.
+- Distinguished the manager Lasagna prediction used for Fiberlet construction
+  from the `las008_s1_full` normals used by tracing and evaluation.
+- Added source run UUIDs, manifest and model hashes, reference inventory hash,
+  and the differing source/Fiber/normal base shapes.
+- Marked the staged Fiberlet dataset as a partial local mirror and the capped
+  1998-trace dataset as the intentional frozen benchmark cohort.
+- Separated fresh trace generation from repeated evaluation so benchmark runs
+  reuse validated preprocessing artifacts.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiber_trace_winding_bp -j 16`
+- Parsed every Bash code block after substituting documented placeholders and
+  checked it with `bash -n`.
+- Confirmed all documented `vc_fiber_trace_chunk` options against `--help` and
+  the manager snapshot-selector form against `lasagna/docs/manager.md`.
+- Recomputed the 26-file reference inventory digest as
+  `1a2a5c0d608f8b5b6cf9ceb361a78ff163eea640422662d669d89a33eeca3b90`.
+- `git diff --check` passed.
 - `volume-cartographer/build/bin/test_fiber_trace_winding_bp`: 97 test cases
   passed.
-- `/tmp/vc_direction_ablation_runner.sh reference-prune oracle 1`: 1024 crop,
-  Release build, 57.83 s wall. The final working set contains 454 active pieces
-  in reference windings `0.0..12.5`; all 363 removed pieces give 44.43%
-  problematic and a removed/in-range percentage of 80.00%. No active final piece
-  had an uncalibrated gauge.
-- The same run has 69,172 original unique constraints: 33,299 removed-incident,
-  10,985 retained but infringed, zero retained-Defect, and 24,888 retained and
-  fulfilled. That is 44,284 problematic constraints, 64.02% of the combined
-  problematic/fulfilled population, and 177.90% of fulfilled constraints.
-- `/tmp/vc_direction_ablation_runner.sh reference-prune inliers`: the ordinary
-  non-contiguous subset retained 1,054 pieces and 39,123 constraints. Of 69,172
-  original constraints, 30,049 were removed-incident, 12,708 retained and
-  infringed, zero retained-Defect, and 26,415 retained and fulfilled. Its
-  problematic fraction is 61.81% and problematic/fulfilled is 161.90%.

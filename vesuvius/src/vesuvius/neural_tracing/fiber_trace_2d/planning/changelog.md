@@ -1932,3 +1932,10 @@
   pruning benchmark for the annotated reference interval. Both report a
   problematic fraction and problematic-to-retained percentage without
   source-fiber or multi-term constraint double counting.
+
+## 2026-09-03 - Fiber pruning benchmark guide
+
+- Added a standalone reproducibility guide for the PHercParis4 1024-crop
+  pruning benchmark, covering source prediction, sparse Fiberlet generation,
+  crop/lookahead coordinates, tracing, oracle evaluation, metric definitions,
+  expected results, and validation.
