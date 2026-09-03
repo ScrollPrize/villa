@@ -1494,6 +1494,142 @@ std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     return lineIndices;
 }
 
+bool constrainLineOpenTailsToBounds(
+    vc::lasagna::LineModel& line,
+    std::vector<LineControlPoint>& controls,
+    const Rect3D& focusBounds)
+{
+    if (controls.empty() || line.points.size() < 2) {
+        throw std::invalid_argument(
+            "focus-bounds constraint requires a control and at least two line points");
+    }
+
+    std::vector<cv::Vec3d> controlPositions;
+    controlPositions.reserve(controls.size());
+    for (const auto& control : controls) {
+        controlPositions.push_back(control.volumePoint);
+    }
+    std::vector<cv::Vec3d> linePositions;
+    linePositions.reserve(line.points.size());
+    for (const auto& point : line.points) {
+        linePositions.push_back(point.position);
+    }
+    const auto indices = orderedControlPointLineIndices(
+        controlPositions, linePositions);
+    if (!indices) {
+        throw std::runtime_error(
+            "focus-bounds constraint could not resolve controls on the line");
+    }
+
+    const size_t firstControl = indices->front();
+    const size_t lastControl = indices->back();
+    size_t keepBegin = firstControl;
+    size_t keepEnd = lastControl;
+
+    const bool singleOutsideControl = firstControl == lastControl &&
+        !contains_point(focusBounds, line.points[firstControl].position);
+    if (singleOutsideControl) {
+        bool enteredBounds = false;
+        for (size_t i = firstControl; i > 0;) {
+            --i;
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepBegin = i;
+                continue;
+            }
+            keepBegin = i;
+            if (!inside) {
+                break;
+            }
+        }
+
+        enteredBounds = false;
+        for (size_t i = lastControl + 1; i < line.points.size(); ++i) {
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepEnd = i;
+                continue;
+            }
+            keepEnd = i;
+            if (!inside) {
+                break;
+            }
+        }
+    } else if (contains_point(focusBounds, line.points[firstControl].position)) {
+        while (keepBegin > 0) {
+            --keepBegin;
+            if (!contains_point(focusBounds, line.points[keepBegin].position)) {
+                break;
+            }
+        }
+    }
+    if (!singleOutsideControl &&
+        contains_point(focusBounds, line.points[lastControl].position)) {
+        while (keepEnd + 1 < line.points.size()) {
+            ++keepEnd;
+            if (!contains_point(focusBounds, line.points[keepEnd].position)) {
+                break;
+            }
+        }
+    }
+
+    // A one-control solve still needs a direction-bearing line. Prefer an
+    // adjacent in-bounds sample, then retain whichever neighbor exists.
+    if (keepBegin == keepEnd) {
+        const bool leftInside = keepBegin > 0 &&
+            contains_point(focusBounds, line.points[keepBegin - 1].position);
+        const bool rightInside = keepEnd + 1 < line.points.size() &&
+            contains_point(focusBounds, line.points[keepEnd + 1].position);
+        if (leftInside || (!rightInside && keepBegin > 0)) {
+            --keepBegin;
+        } else if (keepEnd + 1 < line.points.size()) {
+            ++keepEnd;
+        }
+    }
+
+    const bool changed = keepBegin != 0 || keepEnd + 1 != line.points.size();
+    if (!changed) {
+        for (size_t i = 0; i < controls.size(); ++i) {
+            controls[i].optimizedIndex = static_cast<int>((*indices)[i]);
+            controls[i].linePosition = static_cast<double>((*indices)[i]);
+        }
+        return false;
+    }
+
+    if (line.segmentSamples.size() + 1 == line.points.size()) {
+        line.segmentSamples = std::vector<vc::lasagna::LineSegmentSamples>(
+            line.segmentSamples.begin() + static_cast<std::ptrdiff_t>(keepBegin),
+            line.segmentSamples.begin() + static_cast<std::ptrdiff_t>(keepEnd));
+    } else {
+        line.segmentSamples.clear();
+    }
+    line.points = std::vector<vc::lasagna::LinePoint>(
+        line.points.begin() + static_cast<std::ptrdiff_t>(keepBegin),
+        line.points.begin() + static_cast<std::ptrdiff_t>(keepEnd + 1));
+
+    if (line.displayFrameAnchorIndex >= 0) {
+        const int clampedAnchor = std::clamp(
+            line.displayFrameAnchorIndex,
+            static_cast<int>(keepBegin),
+            static_cast<int>(keepEnd));
+        line.displayFrameAnchorIndex = clampedAnchor - static_cast<int>(keepBegin);
+    }
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const size_t rebased = (*indices)[i] - keepBegin;
+        controls[i].optimizedIndex = static_cast<int>(rebased);
+        controls[i].linePosition = static_cast<double>(rebased);
+    }
+    return true;
+}
+
 vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
     const vc::lasagna::LineModel& previous,
     const std::vector<cv::Vec3d>& points,

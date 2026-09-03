@@ -14,6 +14,7 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/core/util/Rect3D.hpp"
 
 namespace vc3d::line_annotation
 {
@@ -270,6 +271,15 @@ void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls
 [[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints);
+
+// Keep the complete path between the outer controls, but shorten open tails
+// near focusBounds. One outside sample per tail is retained as bounded
+// overshoot. Control indices and the display anchor are rebased in place.
+// Throws when controls are not an exact ordered subset of line.points.
+bool constrainLineOpenTailsToBounds(
+    vc::lasagna::LineModel& line,
+    std::vector<LineControlPoint>& controls,
+    const Rect3D& focusBounds);
 
 // Publish a superseded solve by span merge (render-job model: edits no
 // longer cancel the in-flight solve, and its landing must not be discarded
