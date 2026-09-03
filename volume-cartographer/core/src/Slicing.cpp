@@ -573,8 +573,12 @@ namespace {
 
 enum class AccumMode : std::uint8_t { Max, Min, Mean, LayerStorage };
 
+// "median" and "minabs" are fast-path-only reducers with no entry in
+// utils::CompositingMethod, so they are named explicitly. Everything else
+// defers to the shared table, so a method added to Compositing.cpp is routed
+// here too instead of silently degrading to a mean.
 static bool needsLayerStorage(const std::string& m) {
-    return m == "median" || m == "alpha" || m == "minabs";
+    return m == "median" || m == "minabs" || methodRequiresLayerStorage(m);
 }
 
 template<typename T, SampleMode Mode>
@@ -595,6 +599,12 @@ void readCompositeFastImpl(
     else if (params.method == "max") mode = AccumMode::Max;
     else if (params.method == "min") mode = AccumMode::Min;
 
+    // Highpass: layers below the cutoff are dropped from the stack rather than
+    // zeroed, matching the interactive compositors (SurfaceCache.cpp,
+    // CChunkedVolumeViewer.cpp). A pixel with no surviving layer keeps the
+    // value it came in with, like the non-finite-coord case below.
+    const float isoCutoff = float(params.isoCutoff);
+
     // Prefetch all layers' coverage.
     // Approximation: bbox of baseCoords ± numLayers * zStep in each normal direction.
     prefetchCoordsRegion(cache, level, baseCoords);
@@ -602,7 +612,10 @@ void readCompositeFastImpl(
     #pragma omp parallel
     {
         ChunkSampler<T> s(cache, level);
-        std::vector<float> layerVals(numLayers);
+        // One stack per thread: compositeLayerStack() reads it as a span, so
+        // the buffer is reused across pixels rather than reallocated.
+        LayerStack stack;
+        if (mode == AccumMode::LayerStorage) stack.values.resize(numLayers);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
             const cv::Vec3f* bRow = baseCoords.ptr<cv::Vec3f>(y);
@@ -621,36 +634,42 @@ void readCompositeFastImpl(
                     float vy = base[1] + n[1] * z;
                     float vz = base[2] + n[2] * z;
                     float v = float(sampleOne<T, Mode>(s, vz, vy, vx));
+                    if (v < isoCutoff) continue;
                     switch (mode) {
                         case AccumMode::Max: mx = std::max(mx, v); break;
                         case AccumMode::Min: mn = std::min(mn, v); break;
-                        case AccumMode::Mean: accum += v; count++; break;
-                        case AccumMode::LayerStorage: layerVals[li] = v; break;
+                        case AccumMode::Mean: accum += v; break;
+                        case AccumMode::LayerStorage: stack.values[count] = v; break;
                     }
+                    count++;
                 }
+                if (count == 0) continue;
 
                 float val = 0.f;
                 switch (mode) {
                     case AccumMode::Max:  val = mx; break;
                     case AccumMode::Min:  val = mn; break;
-                    case AccumMode::Mean: val = count > 0 ? accum / float(count) : 0.f; break;
+                    case AccumMode::Mean: val = accum / float(count); break;
                     case AccumMode::LayerStorage: {
                         if (params.method == "median") {
                             // partial_sort matches the other median path
                             // (Slicing.cpp composite) and beats nth_element
                             // at the small N we run with (<=~65).
-                            std::partial_sort(layerVals.begin(),
-                                              layerVals.begin() + numLayers / 2 + 1,
-                                              layerVals.end());
-                            val = layerVals[numLayers / 2];
+                            std::partial_sort(stack.values.begin(),
+                                              stack.values.begin() + count / 2 + 1,
+                                              stack.values.begin() + count);
+                            val = stack.values[count / 2];
                         } else if (params.method == "minabs") {
-                            float best = layerVals[0];
-                            for (int i = 1; i < numLayers; i++)
-                                if (std::abs(layerVals[i] - 127.5f) < std::abs(best - 127.5f))
-                                    best = layerVals[i];
+                            float best = stack.values[0];
+                            for (int i = 1; i < count; i++)
+                                if (std::abs(stack.values[i] - 127.5f) < std::abs(best - 127.5f))
+                                    best = stack.values[i];
                             val = best;
                         } else {
-                            val = count > 0 ? accum / float(count) : 0.f;
+                            // alpha / beerLambert / dvr / firstHitIso / ... :
+                            // the same compositors the VC3D viewer runs.
+                            stack.validCount = count;
+                            val = compositeLayerStack(stack, params);
                         }
                         break;
                     }

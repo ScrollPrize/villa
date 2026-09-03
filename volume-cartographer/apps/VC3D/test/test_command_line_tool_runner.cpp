@@ -1,7 +1,9 @@
 #include <csignal>
 
 #include <QApplication>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QScopeGuard>
 #include <QTemporaryFile>
 #include <QThread>
@@ -261,6 +263,47 @@ private slots:
         QVERIFY(second.open(QIODevice::ReadOnly));
         QCOMPARE(first.readAll(), QByteArray("739"));
         QCOMPARE(second.readAll(), QByteArray("17"));
+    }
+
+    void zarrRenderCanRequestSiblingTiffSlices()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        runner.setVolumePath("volume.zarr");
+        runner.setSegmentPath("surface");
+        const QString zarrPath = QDir::temp().filePath("render.zarr");
+        runner.setOutputPattern(zarrPath);
+        runner.setRenderParams(1.0f, 0, 4);
+        runner.setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::Zarr);
+        runner.setIncludeTifs(true);
+
+        const QStringList arguments =
+            runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
+        QCOMPARE(arguments.count("--zarr-output"), 1);
+        QCOMPARE(arguments.count("--tif-output"), 1);
+        QVERIFY(!arguments.contains("--include-tifs"));
+
+        const int tifOption = arguments.indexOf("--tif-output");
+        QVERIFY(tifOption >= 0 && tifOption + 1 < arguments.size());
+        const QFileInfo zarrInfo(zarrPath);
+        QCOMPARE(arguments.at(tifOption + 1),
+                 zarrInfo.dir().filePath(zarrInfo.completeBaseName() + "_layers"));
+    }
+
+    void tiffRenderDoesNotAddASecondTiffOutput()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        runner.setVolumePath("volume.zarr");
+        runner.setSegmentPath("surface");
+        runner.setOutputPattern(QDir::temp().filePath("render_layers"));
+        runner.setRenderParams(1.0f, 0, 4);
+        runner.setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
+        runner.setIncludeTifs(true);
+
+        const QStringList arguments =
+            runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
+        QCOMPARE(arguments.count("--tif-output"), 1);
+        QCOMPARE(arguments.count("--zarr-output"), 0);
+        QVERIFY(!arguments.contains("--include-tifs"));
     }
 };
 
