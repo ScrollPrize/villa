@@ -1,56 +1,44 @@
 # Plan
 
-1. Generalize the existing filter-stage planner so its final-stage selection
-   is the complete global-lattice boxes intersecting the exact half-open target
-   crop, not the lookahead box. Preserve repeat order and duplicate stages,
-   normalize offsets modulo positive side, recursively select every preceding
-   box intersecting later boxes expanded by endpoint reach, and expand source
-   support once more to cover cross-boundary endpoints.
-2. Extract transient stored-dataset stage orchestration into reusable core
-   code. Build separate anchor/path overlay views over a combined source,
-   process each stage monotonically, and expose the final read-only graph view
-   while deleting temporary layers on teardown.
-3. Add repeatable `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` plus filter join
-   angle, stored-cost profile, and per-entry state-limit controls to crop
-   tracing. Show a separate deterministic stage/box progress phase and stage
-   reduction counts. Materialize the existing lookahead-padded graph from the
-   final transient view; outside written overlays, missing upper chunks fall
-   through to the original combined dataset.
-4. Preserve sparse tuple semantics: a wholly absent source tuple is empty, a
-   missing upper tuple inherits, an explicit empty upper tuple shadows, and a
-   partial prefix/route tuple is corruption. Process overlapping boxes serially
-   in canonical Z/Y/X order while retaining existing within-box parallelism.
-5. Keep one shared bounded write-back LRU for every layer, drain it on exit,
-   retain overlays through graph materialization, and remove all temporary
-   layers on success or exception. Include ordered stages and filter policy in
-   trace artifact provenance so incompatible outputs cannot be mixed.
-6. Add planner and stored-overlay regression coverage, including the exact
-   1024 crop and `256/0`, `256/128`, `512/256` schedule (27 final boxes),
-   malformed CLI values, cross-boundary endpoints, monotone writes, tuple
-   behavior, cleanup, and unchanged unstaged behavior.
-7. Build the optimized targets, run focused tests, then run the requested crop
-   trace using the existing input and report filtering/trace results.
+1. Generate a new immutable crop-trace artifact with the three staged filter
+   passes and no `--max-fibers` or `--max-attempts` limit. Confirm tracing ends
+   because every candidate is covered or attempted, not because of a cap.
+2. Run the canonical supervised oracle-inlier pruning benchmark against that
+   exact staged trace cohort, preserving current defaults and the established
+   reference set, quality fraction, and 512-base piece split.
+3. Run `reference-replay-benchmark` directly against the source Fiberlet Zarr
+   with the identical ordered stage list, crop, references, and physical voxel
+   size. Confirm the stage options are accepted and applied before replay graph
+   materialization.
+4. Capture Git revision, Release build, source identities, commands, stage
+   populations, output hashes, wall/user/system time, maximum RSS where
+   available, and the headline metrics in dedicated benchmark run records.
+5. Update the benchmark result index and plot data only with measured values,
+   regenerate plots, and validate their consistency with the run records.
+
+The records must freeze effective scientific defaults, distinguish the new
+uncapped cohort from the old capped cohort, identify aggregate overlapping
+stage counts as non-unique, hash durable artifacts, and disclose that the
+local source is an unverified `build_state=partial` mirror. Successful sparse
+reads do not prove parity with the unavailable authoritative remote inventory.
 
 ## Spec Update
 
-Specify crop-driven final-box selection, recursive dependency/source closure,
-ordered monotone execution, exact sparse tuple behavior, combined-source
-fall-through overlays, shared bounded lifecycle, filter controls/provenance,
-and the relationship between target crop and separately padded search graph.
+No behavioral specification change is planned. Benchmark records must treat
+the staged schedule and uncapped trace cohort as distinct provenance from the
+earlier unstaged capped cohort.
 
 ## Docs Update
 
-Document the crop tracer `--stage` option and provide the concrete aligned
-1024-crop command.
+Add the complete staged commands and link the new run records from the Fiber
+benchmark result index.
 
 ## Changelog
 
-Record transient staged Fiberlet filtering for crop tracing.
+Record the first complete staged crop and staged reference-replay benchmark.
 
 ## Validation
 
-Run focused Fiberlet storage/graph tests, CLI parsing smoke coverage, an
-optimized build, and staged/unstaged versions of the same requested 1024 crop.
-Compare stage populations, trace geometry/counts, wall/user/sys/RSS, and verify
-all source payloads remain unchanged. Record that sparse absence cannot prove a
-partial mirror is complete without an external inventory/build marker.
+Verify both benchmark commands exit successfully, inspect their JSON/Zarr
+metadata, cross-check headline counts against detailed reports, regenerate the
+two benchmark plots, and run the focused crop-trace and storage tests.

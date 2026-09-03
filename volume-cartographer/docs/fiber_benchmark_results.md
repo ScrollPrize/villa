@@ -18,9 +18,9 @@ zero-failure convention.
 
 The crop plot preserves the recorded problematic-to-retained error ratio and
 negates it so higher is better:
-`-100 * problematic / retained_fulfilled`. The Fiberlet result is therefore
-`-177.93%`, and zero is the ideal target. The direct greedy and Lasagna markers
-are unmeasured plotting-floor assumptions without numeric benchmark values;
+`-100 * problematic / retained_fulfilled`. The original capped Fiberlet result
+is `-177.93%`; the staged uncapped result is `-139.68%`; zero is the ideal
+target. The direct greedy and Lasagna markers are unmeasured plotting-floor assumptions without numeric benchmark values;
 neither produces the candidate-piece graph required by this benchmark. The two
 plots use different metrics and their percentages are not numerically
 comparable.
@@ -41,6 +41,7 @@ from raw failure or unique-constraint counts rather than copied percentages.
 | Date | Revision | Policy | Crop | Tested length | Failures | Distance/failure | Distance % | Wall time | Run |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-09-03 | `cd0fbd52a` | Fiberlet whole run | PHercParis4 1024 | 101.036 mm | 6 | 16.839 mm | 16.667% | 21.41 s | [record](fiber_benchmark_runs/2026-09-03-cd0fbd52a-reference-distance-per-failure.md) |
+| 2026-09-03 | `3046918b5` | Fiberlet, staged 256/256-offset/512 | PHercParis4 1024 | 101.036 mm | 7 | 14.434 mm | 14.286% | 243.75 s | [record](fiber_benchmark_runs/2026-09-03-3046918b5-staged-reference-replay.md) |
 | 2026-09-03 | `6c006d9b0` | Greedy direct | PHercParis4 1024 | 101.036 mm | 13 | 7.772 mm | 7.692% | 0.49 s | [record](fiber_benchmark_runs/2026-09-03-6c006d9b0-greedy-reference-replay.md) |
 | 2026-09-03 | `6c006d9b0` | Lasagna transport | PHercParis4 1024 | 101.036 mm | 57 | 1.773 mm | 1.754% | 0.09 s | [record](fiber_benchmark_runs/2026-09-03-6c006d9b0-lasagna-reference-replay.md) |
 
@@ -49,3 +50,8 @@ from raw failure or unique-constraint counts rather than copied percentages.
 | Date | Revision | Crop | Pieces removed | Piece problematic | Constraint problematic | Reference result | Wall time | Run |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | 2026-09-03 | `1a70f9e57` | PHercParis4 1024 | 363 / 1360 | 44.43% | 64.02% | 24 exact, 0 wrong, 2 missing | 57.62 s | [record](fiber_benchmark_runs/2026-09-03-1a70f9e57-oracle-pruning.md) |
+| 2026-09-03 | `3046918b5` | PHercParis4 1024, staged uncapped | 308 / 1450 | 39.04% | 58.28% | 24 exact, 0 wrong, 2 missing | 81.34 s median | [record](fiber_benchmark_runs/2026-09-03-3046918b5-staged-oracle-pruning.md) |
+
+The older pruning row uses a capped 1,998-trace unstaged cohort; the staged row
+uses the complete uncapped 2,062-trace cohort. Their difference combines stage
+filtering with cohort completion and is not a controlled causal comparison.

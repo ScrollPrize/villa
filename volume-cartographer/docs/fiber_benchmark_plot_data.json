@@ -44,6 +44,18 @@
           "tested_length_mm": 101.03576428789299,
           "failures": 6,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-cd0fbd52a-reference-distance-per-failure.md"
+        },
+        {
+          "algorithm": "Fiberlet + staged filtering",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
+          "cohort": "PHercParis4 1024 staged uncapped",
+          "tested_length_mm": 101.03576428789299,
+          "failures": 7,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-3046918b5-staged-reference-replay.md"
         }
       ]
     },
@@ -76,6 +88,18 @@
           "problematic_unique_constraints": 44284,
           "retained_fulfilled_unique_constraints": 24888,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-1a70f9e57-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + staged filtering + BP oracle pruning",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
+          "cohort": "PHercParis4 1024 staged uncapped",
+          "problematic_unique_constraints": 45996,
+          "retained_fulfilled_unique_constraints": 32929,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-3046918b5-staged-oracle-pruning.md"
         }
       ]
     }
