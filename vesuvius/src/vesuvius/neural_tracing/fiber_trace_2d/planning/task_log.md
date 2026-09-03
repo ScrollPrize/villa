@@ -1,62 +1,55 @@
 # Task Log
 
-## Recovered Baseline
+## Scope
 
-- Output crop, base XYZ half-open: `[10240,22016,6144) ->
-  [11264,23040,7168)`, side 1024.
-- Default trace lookahead: 384 base voxels on every face.
-- Required search range, base XYZ half-open: `[9856,21632,5760) ->
-  [11648,23424,7552)`, side 1792.
-- Fiber source: manager Fiber 3D run
-  `s1a_128_1_single_8x8_20260801_084232`, checkpoint `best91_5k.pt`,
-  requested source group 1.
-- Normal source: manager Lasagna run
-  `20260419_180421_conthr_1e-5_warp_2um_noss_dist`, checkpoint
-  `model_current.pt`, requested source group 2.
-- Fiberlet prediction spacing: 8 base voxels; storage chunk side: 512 base
-  voxels; encoding: compact directions and nonlinear uint16 costs.
-- Stored trace baseline: 1998 traces with 2000 maximum attempts.
-- Evaluation cohort: best 25% by trace cost density, 512-base-voxel pieces,
-  26 `hendrik_crop1` reference fibers.
+- Benchmark the current Fiberlet tracer from both endpoints of every tagged
+  reference run inside the fixed crop.
+- Reuse `measureFiberReplayThreshold` and `traceFiberletGraphReplay`; do not
+  introduce a parallel evaluation implementation.
+- Store each endpoint and oracle-pruning run as Markdown and maintain a separate
+  compact result index.
 
 ## Decisions
 
-- Document managed full-volume prediction and Fiberlet preprocessing because
-  the manager deliberately rejects cropped prediction bundles.
-- State the smaller expanded range separately as the minimum graph support
-  needed by the crop trace, not as a substitute for the recorded full-volume
-  source artifacts.
-
-## Implementation
-
-- Added `volume-cartographer/docs/fiber_pruning_benchmark.md` with the complete
-  managed generation and evaluation pipeline.
-- Linked it from `volume-cartographer/docs/fiber_chunk_tracing.md`.
-- Removed fixed-crop tuning history, benchmark formulas, population results,
-  and timings from the general crop-tracing reference; it now links to the
-  standalone guide for those workload-specific details.
-- Recorded the requested, search-expanded, and storage-aligned regions
-  separately to avoid XYZ/ZYX or crop/support ambiguity.
+- Clip full reference polylines to the half-open benchmark crop and retain all
+  contiguous in-crop runs.
+- Reverse each run to create the opposite endpoint case.
+- Stop accounting at the first failure. The aggregate denominator is twice the
+  total in-crop reference length.
+- Require an explicit positive base-voxel size for millimeter output.
 
 ## Independent Review
 
-- Distinguished the manager Lasagna prediction used for Fiberlet construction
-  from the `las008_s1_full` normals used by tracing and evaluation.
-- Added source run UUIDs, manifest and model hashes, reference inventory hash,
-  and the differing source/Fiber/normal base shapes.
-- Marked the staged Fiberlet dataset as a partial local mirror and the capped
-  1998-trace dataset as the intentional frozen benchmark cohort.
-- Separated fresh trace generation from repeated evaluation so benchmark runs
-  reuse validated preprocessing artifacts.
+- Keep this benchmark's crop clipping separate from `direction-ablation`, whose
+  reference diagnostics intentionally retain complete JSON polylines.
+- Restrict the first seed to the initial replay seed window. Credit a valid,
+  threshold-checked seed offset; return zero when no endpoint seed exists.
+- Add shared opt-in stop-at-first-failure behavior while leaving ordinary replay
+  restart semantics unchanged.
+- Report both length-weighted success and binary completion, and distinguish
+  all-direction mean credited length from failed-direction mean failure length.
+- Emit versioned JSON and render Markdown from it; do not parse unstable console
+  tables.
+- Record dirty-tree identity, host/build/cache metadata, and one Markdown file
+  per invocation. These are manual external-data evaluations, not CI gates.
+
+## Implementation
+
+- Added opt-in replay controls for an initial endpoint seed window and stopping
+  at the first failure; ordinary replay defaults are unchanged.
+- Added reusable crop-run preparation, bidirectional case generation,
+  first-failure accounting, physical conversion, and versioned JSON output.
+- Added `vc_fiber_trace_chunk reference-replay-benchmark`; reference directions
+  run concurrently while each beam search uses one expansion worker.
+- Added focused tests for crop re-entry, max-face clipping, forward/reverse
+  failure accounting, non-distance failure aggregation, unit conversion,
+  endpoint seed restriction, and first-failure termination.
 
 ## Validation
 
-- Parsed every Bash code block after substituting documented placeholders and
-  checked it with `bash -n`.
-- Confirmed all documented `vc_fiber_trace_chunk` options against `--help` and
-  the manager snapshot-selector form against `lasagna/docs/manager.md`.
-- Recomputed the 26-file reference inventory digest as
-  `1a2a5c0d608f8b5b6cf9ceb361a78ff163eea640422662d669d89a33eeca3b90`.
-- `git diff --check` passed.
-- `volume-cartographer/build/bin/test_fiber_trace_winding_bp`: 97 test cases
-  passed.
+- Release build: `vc_fiber_trace_chunk`, `test_fiberlet_paths`, and
+  `test_fiber_reference_replay_benchmark` build successfully.
+- `test_fiber_reference_replay_benchmark`: 3 test cases passed.
+- The full `test_fiberlet_paths` binary retains existing bit-exact prepared
+  scoring failures at line 414 in this build. The newly added replay cases did
+  not emit failures.

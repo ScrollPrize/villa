@@ -1,4 +1,5 @@
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
@@ -11,6 +12,7 @@
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
+#include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
@@ -33,6 +35,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <numbers>
 #include <optional>
@@ -41,6 +44,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <syncstream>
 #include <thread>
 #include <vector>
 
@@ -54,6 +58,7 @@ enum class Mode {
     Consensus,
     DirectionDiagnostic,
     DirectionAblation,
+    ReferenceReplayBenchmark,
 };
 
 enum class BpBalanceSelection {
@@ -84,6 +89,9 @@ struct Options {
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
     std::optional<std::size_t> maximumConstraintsPerFiber;
     std::optional<double> qualityFraction;
+    std::optional<double> baseVoxelSizeUm;
+    double replayFailureThresholdBaseVoxels = 20.0;
+    double replayMatchRefineSteps = 1.0;
     std::filesystem::path referenceFiberDirectory;
     std::string referenceFiberTag;
     bool referenceConditioningDiagnostic = false;
@@ -253,6 +261,11 @@ void usage(const char* executable)
                  " [--perpendicular-only] [--post-iterations N]"
                  " [--post-influence F] [--bp-only]"
                  " [--bp-balance MODE] [options]\n\n"
+              << "  " << executable
+              << " reference-replay-benchmark <fiberlets.zarr>"
+                 " --normal-manifest PATH --bbox X0 Y0 Z0 X1 Y1 Z1"
+                 " --reference-fiber-dir DIR --reference-fiber-tag TAG"
+                 " --base-voxel-size-um N --output result.json [options]\n\n"
               << "Stored trace input options:\n"
               << "  --quality-fraction F      retain the best F fraction by cost density\n"
               << "  --reference-fiber-dir DIR tagged VC3D reference fiber JSON directory\n"
@@ -283,6 +296,10 @@ void usage(const char* executable)
               << "                              score capped conditioned states (diagnostic only)\n\n"
               << "  --reference-constraint-details\n"
               << "                              print every reference piece-pair constraint\n\n"
+              << "Reference replay benchmark options:\n"
+              << "  --base-voxel-size-um N     physical base-voxel size; required\n"
+              << "  --failure-threshold N      normal error radius in base voxels [20]\n"
+              << "  --match-refine-steps N     closest-segment refinement steps [1]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -512,8 +529,10 @@ Options parse(int argc, char** argv)
         options.mode = Mode::DirectionDiagnostic;
     else if (mode == "direction-ablation")
         options.mode = Mode::DirectionAblation;
+    else if (mode == "reference-replay-benchmark")
+        options.mode = Mode::ReferenceReplayBenchmark;
     else
-        fail("mode must be 'trace', 'visualize', 'constraints', 'consensus', 'direction-diagnostic', or 'direction-ablation'");
+        fail("mode must be 'trace', 'visualize', 'constraints', 'consensus', 'direction-diagnostic', 'direction-ablation', or 'reference-replay-benchmark'");
     options.input = argv[2];
 
     for (int index = 3; index < argc; ++index) {
@@ -531,14 +550,24 @@ Options parse(int argc, char** argv)
             options.referenceFiberDirectory = value(
                 index, argc, argv, "--reference-fiber-dir");
             options.hasReferenceFiberDirectoryOption = true;
-            options.hasAblationOnlyOption = true;
-            options.hasConstraintOnlyOption = true;
+            if (options.mode != Mode::ReferenceReplayBenchmark) {
+                options.hasAblationOnlyOption = true;
+                options.hasConstraintOnlyOption = true;
+            }
         } else if (argument == "--reference-fiber-tag") {
             options.referenceFiberTag = value(
                 index, argc, argv, "--reference-fiber-tag");
             options.hasReferenceFiberTagOption = true;
-            options.hasAblationOnlyOption = true;
-            options.hasConstraintOnlyOption = true;
+            if (options.mode != Mode::ReferenceReplayBenchmark) {
+                options.hasAblationOnlyOption = true;
+                options.hasConstraintOnlyOption = true;
+            }
+        } else if (argument == "--base-voxel-size-um") {
+            options.baseVoxelSizeUm = number(index, argc, argv, "--base-voxel-size-um");
+        } else if (argument == "--failure-threshold") {
+            options.replayFailureThresholdBaseVoxels = number(index, argc, argv, "--failure-threshold");
+        } else if (argument == "--match-refine-steps") {
+            options.replayMatchRefineSteps = number(index, argc, argv, "--match-refine-steps");
         } else if (argument == "--reference-conditioning-diagnostic") {
             options.referenceConditioningDiagnostic = true;
             options.hasAblationOnlyOption = true;
@@ -1358,6 +1387,30 @@ Options parse(int argc, char** argv)
         fail("--threads must be positive");
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
+    }
+    if (options.mode == Mode::ReferenceReplayBenchmark) {
+        if (options.output.empty())
+            fail("--output is required");
+        if (!options.hasBounds)
+            fail("--bbox is required");
+        if (options.hasReferenceFiberDirectoryOption != options.hasReferenceFiberTagOption)
+            fail("--reference-fiber-dir and --reference-fiber-tag must be used together");
+        if (!options.hasReferenceFiberDirectoryOption)
+            fail("reference replay benchmark requires tagged reference fibers");
+        if (options.referenceFiberTag.empty())
+            fail("--reference-fiber-tag must not be empty");
+        if (!options.baseVoxelSizeUm || !(*options.baseVoxelSizeUm > 0.0))
+            fail("--base-voxel-size-um must be positive and is required");
+        if (!(options.replayFailureThresholdBaseVoxels >= 0.0))
+            fail("--failure-threshold must be nonnegative");
+        if (!(options.replayMatchRefineSteps >= 0.0))
+            fail("--match-refine-steps must be nonnegative");
+        if (options.qualityFraction || !options.obj.empty() || !options.volume.empty() || options.hasConstraintOnlyOption ||
+            options.profileMemory || options.trace.maximumAttempts != 0 || options.trace.maximumFibers != 0) {
+            fail("reference replay benchmark received an unsupported option");
+        }
+        options.trace.parallelThreads = static_cast<std::size_t>(options.threads);
+        return options;
     }
     if (options.mode == Mode::Constraints ||
         options.mode == Mode::Consensus ||
@@ -10409,6 +10462,98 @@ int main(int argc, char** argv)
                   << " search_max_xyz=" << searchBox.maximumBaseXYZ[0] << ',' << searchBox.maximumBaseXYZ[1] << ',' << searchBox.maximumBaseXYZ[2]
                   << " search_padding_base=" << options.trace.lookaheadDistanceBaseVoxels
                   << " elapsed_seconds=" << graphSeconds << " cpu_seconds=" << graphCpuSeconds << '\n';
+
+        if (options.mode == Mode::ReferenceReplayBenchmark) {
+            const auto selection = vc::fiber_tracer::loadTaggedVc3dFiberJsonDirectory(
+                options.referenceFiberDirectory, options.referenceFiberTag);
+            if (selection.fibers.empty())
+                fail("no VC3D fibers matched the requested reference tag");
+            std::vector<std::vector<cv::Vec3d>> sourceFibers;
+            sourceFibers.reserve(selection.fibers.size());
+            nlohmann::json sources = nlohmann::json::array();
+            for (const auto& selected : selection.fibers) {
+                sourceFibers.push_back(selected.fiber.linePoints);
+                sources.push_back(selected.path.filename().string());
+            }
+            const auto cases = vc::fiber_tracer::makeFiberReferenceReplayCases(
+                sourceFibers, options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
+            if (cases.empty())
+                fail("selected reference fibers have no nonempty in-crop runs");
+
+            vc::fiber_tracer::FiberletGraphReplayConfig replayConfig;
+            replayConfig.beamWidth = options.trace.beamWidth;
+            replayConfig.expansionThreads = 1;
+            replayConfig.lookaheadDistanceBaseVoxels = options.trace.lookaheadDistanceBaseVoxels;
+            replayConfig.maximumGeneratedStatesPerIteration = options.trace.maximumGeneratedStatesPerStep;
+            replayConfig.errorThresholdBaseVoxels = options.replayFailureThresholdBaseVoxels;
+            replayConfig.matchRefineSteps = options.replayMatchRefineSteps;
+            replayConfig.requireInitialSeedInFirstWindow = true;
+            replayConfig.stopAtFirstFailure = true;
+
+            std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome> outcomes(cases.size());
+            std::atomic<std::size_t> next{0};
+            std::atomic<std::size_t> completed{0};
+            std::mutex errorMutex;
+            std::exception_ptr workerError;
+            const auto benchmarkStarted = std::chrono::steady_clock::now();
+            const std::size_t workers = std::min(cases.size(), static_cast<std::size_t>(options.threads));
+            std::vector<std::jthread> workerThreads;
+            workerThreads.reserve(workers);
+            for (std::size_t worker = 0; worker < workers; ++worker) {
+                workerThreads.emplace_back([&] {
+                    while (true) {
+                        const std::size_t index = next.fetch_add(1);
+                        if (index >= cases.size())
+                            return;
+                        try {
+                            const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+                                *materialized.graph, cases[index].pointsBaseXYZ, normals,
+                                dataset->metadata().predictionToBaseScale, replayConfig);
+                            outcomes[index] = vc::fiber_tracer::measureFiberReferenceReplayOutcome(cases[index], replay);
+                            const std::size_t done = completed.fetch_add(1) + 1;
+                            std::osyncstream(std::cout) << "fiber reference replay progress=" << done << '/' << cases.size() << '\n';
+                        } catch (...) {
+                            std::lock_guard lock(errorMutex);
+                            if (!workerError)
+                                workerError = std::current_exception();
+                            return;
+                        }
+                    }
+                });
+            }
+            workerThreads.clear();
+            if (workerError)
+                std::rethrow_exception(workerError);
+
+            const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(
+                selection.fibers.size(), outcomes, *options.baseVoxelSizeUm);
+            auto output = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
+                summary, outcomes, replayConfig, options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
+            output["inputs"] = {
+                {"fiberlet_dataset", options.input.string()},
+                {"normal_manifest", options.normalManifest},
+                {"reference_fiber_directory", options.referenceFiberDirectory.string()},
+                {"reference_fiber_tag", options.referenceFiberTag},
+                {"reference_files", std::move(sources)},
+            };
+            output["runtime"] = {
+                {"workers", workers},
+                {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - benchmarkStarted).count()},
+            };
+            vc::core::util::atomicWriteString(options.output, output.dump(2) + "\n");
+            std::cout << std::fixed << std::setprecision(3)
+                      << "fiber reference replay benchmark\n"
+                      << "cases  completed  failed  completion_%  mean_credited_mm  mean_failed_mm  success_length_%\n"
+                      << summary.directedCases << "  " << summary.completedCases << "  " << summary.failedCases << "  "
+                      << summary.completedCasesPercent << "  " << summary.meanCreditedLengthMillimeters << "  "
+                      << summary.meanFailureLengthMillimeters << "  " << summary.lengthWeightedSuccessPercent << '\n'
+                      << "output=" << options.output << '\n';
+            if (profileThread.joinable()) {
+                profileThread.request_stop();
+                profileThread.join();
+            }
+            return 0;
+        }
 
         const auto traceStarted = std::chrono::steady_clock::now();
         const auto traceCpuStarted = std::clock();

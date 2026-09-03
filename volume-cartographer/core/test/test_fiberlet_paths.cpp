@@ -2526,6 +2526,45 @@ TEST_CASE("empty fiberlet graph reports one uncovered-tail reset")
     CHECK(replay.completedReferenceArcBase == doctest::Approx(5.0));
 }
 
+TEST_CASE("fiberlet replay benchmark requires an endpoint-window seed")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 3, 4, {{3, 0, 0}, {4, 0, 0}}, 1.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 1.0;
+    const auto ordinary = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayYNormals(), 1.0, config);
+    CHECK(std::any_of(ordinary.segments.begin(), ordinary.segments.end(), [](const auto& segment) { return segment.seedKey.has_value(); }));
+
+    config.requireInitialSeedInFirstWindow = true;
+    config.stopAtFirstFailure = true;
+    const auto benchmark = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE(benchmark.failures.size() == 1);
+    CHECK(benchmark.failures.front().reason == "no_usable_seed_for_remaining_reference");
+    CHECK(benchmark.completedReferenceArcBase == doctest::Approx(0.0));
+}
+
+TEST_CASE("fiberlet replay benchmark stops at its first route failure")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0.6, 0}, {2, 0.6, 0}}, 1.0);
+    addGraphPath(report, 2, 3, {{3, 0, 0}, {4, 0.6, 0}, {5, 0.6, 0}}, 2.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 0.25;
+    config.errorThresholdBaseVoxels = 0.5;
+    config.stopAtFirstFailure = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {6, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE(replay.failures.size() == 1);
+    CHECK(replay.failures.front().reason == "distance_above_threshold");
+    CHECK(replay.completedReferenceArcBase == doctest::Approx(replay.failures.front().referenceArcBase));
+    CHECK(replay.completedReferenceArcBase < replay.referenceEndArcBase);
+}
+
 TEST_CASE("fiberlet DP preloads each scoring voxel once")
 {
     const auto anchors = twoAnchorArtifact();

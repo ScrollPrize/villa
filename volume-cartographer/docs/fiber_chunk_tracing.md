@@ -1905,3 +1905,27 @@ vc_fiber_trace_chunk direction-ablation crop_traces.zarr \
 
 This backend remains diagnostic: raw infringement reduction alone does not
 provide an adequate unsupervised stopping rule.
+
+## Reference endpoint replay
+
+Use `reference-replay-benchmark` to start the current Fiberlet search from both
+ends of every tagged reference run inside a crop. The command uses the same
+lookahead-padded graph materialization and Lasagna-normal ellipsoid as replay,
+but requires a seed near the endpoint and stops at the first failure.
+
+```bash
+vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers \
+  --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 \
+  --output reference-replay.json
+```
+
+The JSON report contains one forward and reverse case per contiguous in-crop
+reference run. `length_weighted_success_percent` is the credited directed
+length divided by full directed reference length. Successful cases contribute
+their complete length; failed cases contribute their first-failure arc. The
+report separately includes direction completion, mean credited length over all
+cases, and mean failure length over failed cases.

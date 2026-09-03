@@ -207,6 +207,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberPaths.cpp
     src/fiber_tracer/FiberReplay.cpp
     src/fiber_tracer/FiberReplayMetric.cpp
+    src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberTrace.cpp
     src/fiber_tracer/FiberletQuantization.cpp

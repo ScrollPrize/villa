@@ -6188,3 +6188,27 @@
   the refit. Iteration ends only when no active sign factor is infringed; a
   fully exhausted cohort is a valid empty solve. The final retained cohort is
   passed to the ordinary ordered-cut scan, and removed pieces remain inactive.
+
+# Reference endpoint replay benchmark
+
+- `vc_fiber_trace_chunk reference-replay-benchmark` evaluates tagged VC3D
+  reference fibers against a combined Fiberlet dataset in a half-open base-XYZ
+  crop. It clips each reference into every contiguous in-crop run and evaluates
+  both directions of every nondegenerate run.
+- The graph support is the requested crop padded on every face by the configured
+  lookahead. The first replay seed must occur in the ordinary initial seed
+  window and pass the shared Lasagna-normal ellipsoid threshold. A missing
+  endpoint seed is a zero-length failure.
+- Benchmark replay stops at the first failure of any kind. A failed direction
+  receives the first failure's reference arc; a successful direction receives
+  its full run length. Ordinary replay keeps its restart behavior unless the
+  benchmark-only flags are enabled.
+- Length-weighted success is `100 * sum(credited directed length) /
+  sum(full directed length)`. The report also gives binary direction completion,
+  mean credited length over every direction, and mean first-failure length over
+  failed directions. Millimeter conversion requires an explicit positive base
+  voxel size.
+- Results are emitted as deterministic, versioned JSON including cases,
+  threshold geometry, effective search settings, inputs, worker count, and
+  summary metrics. External-data runs are manual scientific benchmarks, not CI
+  performance gates.

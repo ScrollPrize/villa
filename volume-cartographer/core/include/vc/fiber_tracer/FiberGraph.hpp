@@ -83,6 +83,8 @@ struct FiberletGraphReplayConfig {
     double referenceBeginArcBase = 0.0;
     std::optional<double> referenceEndArcBase;
     std::optional<FiberletStorageKey> initialSeedKey;
+    bool requireInitialSeedInFirstWindow = false;
+    bool stopAtFirstFailure = false;
     bool recordDecisionDiagnostics = false;
     std::vector<std::pair<double, double>> decisionDiagnosticReferenceArcWindowsBase;
 };

@@ -1939,3 +1939,12 @@
   pruning benchmark, covering source prediction, sparse Fiberlet generation,
   crop/lookahead coordinates, tracing, oracle evaluation, metric definitions,
   expected results, and validation.
+
+## 2026-09-03 - Reference endpoint replay benchmark
+
+- Added bidirectional replay of every tagged reference-fiber run inside a
+  requested crop, stopping at the first shared anisotropic-threshold failure.
+- Added versioned JSON metrics for mean traced distance, direction completion,
+  and length-weighted success with explicit physical voxel size.
+- Added reproducible per-run Markdown records and a separate combined benchmark
+  result index for endpoint replay and 1024-crop oracle pruning.

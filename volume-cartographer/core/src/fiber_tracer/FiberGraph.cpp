@@ -3048,7 +3048,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         PolylineArcProjection projection;
         FiberReplayThresholdMeasurement thresholdMeasurement;
     };
-    const auto selectSeed = [&](double resetArc, std::optional<FiberletStorageKey> forcedKey) -> std::optional<Seed> {
+    const auto selectSeed = [&](double resetArc, std::optional<FiberletStorageKey> forcedKey, bool firstWindowOnly) -> std::optional<Seed> {
         double scanBegin = resetArc;
         while (scanBegin < referenceEndArcBase - kReplayEpsilon) {
             const double scanEnd = std::min(referenceEndArcBase, scanBegin + seedWindowBase);
@@ -3085,7 +3085,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             }
             if (selected.has_value())
                 return selected;
-            if (forcedKey.has_value())
+            if (forcedKey.has_value() || firstWindowOnly)
                 break;
             if (scanEnd >= referenceEndArcBase - kReplayEpsilon)
                 break;
@@ -3125,7 +3125,10 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     double resetArc = config.referenceBeginArcBase;
     for (size_t iteration = 0; iteration < maximumSegments && resetArc < referenceEndArcBase - kReplayEpsilon; ++iteration) {
         emitProgress(result.segments.size(), resetArc, "segment_start");
-        const auto seed = selectSeed(resetArc, iteration == 0 ? config.initialSeedKey : std::nullopt);
+        const auto seed = selectSeed(
+            resetArc,
+            iteration == 0 ? config.initialSeedKey : std::nullopt,
+            iteration == 0 && config.requireInitialSeedInFirstWindow);
         if (iteration == 0 && config.initialSeedKey.has_value() && !seed.has_value()) {
             throw std::invalid_argument("fiberlet graph replay initial seed key is not usable in the focused interval");
         }
@@ -3142,8 +3145,13 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 "no_usable_seed_for_remaining_reference",
                 resetArc,
             });
-            result.completedReferenceArcBase = referenceEndArcBase;
-            emitProgress(result.segments.size() - 1, referenceEndArcBase, "completed");
+            result.completedReferenceArcBase = config.stopAtFirstFailure
+                ? resetArc
+                : referenceEndArcBase;
+            emitProgress(
+                result.segments.size() - 1,
+                result.completedReferenceArcBase,
+                config.stopAtFirstFailure ? "failed" : "completed");
             break;
         }
         if (seed->projection.arc > resetArc + seedWindowBase + kReplayEpsilon) {
@@ -3154,7 +3162,15 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             const size_t segmentIndex = result.segments.size();
             result.segments.push_back(std::move(gap));
             appendFailure({0, segmentIndex, "missing_seed_gap", resetArc});
+            if (config.stopAtFirstFailure) {
+                result.completedReferenceArcBase = resetArc;
+                emitProgress(segmentIndex, resetArc, "failed");
+                break;
+            }
         }
+
+        if (config.stopAtFirstFailure && !result.failures.empty())
+            break;
 
         FiberletGraphReplaySegment segment;
         (void)stableIndex(nodeIndices, seed->node.id);
@@ -3576,13 +3592,18 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         }
         result.segments.push_back(std::move(segment));
         appendFailure(std::move(*distanceFailure));
+        if (config.stopAtFirstFailure) {
+            result.completedReferenceArcBase = failureArc;
+            emitProgress(result.segments.size() - 1, failureArc, "failed");
+            break;
+        }
         resetArc = std::min(referenceEndArcBase, std::max(failureArc, result.segments.back().startReferenceArcBase + config.minimumResetAdvanceBaseVoxels));
         if (!(resetArc > result.segments.back().startReferenceArcBase + kReplayEpsilon))
             throw std::logic_error("fiberlet graph replay reset did not advance");
         result.completedReferenceArcBase = resetArc;
         emitProgress(result.segments.size() - 1, resetArc, "restart");
     }
-    if (result.completedReferenceArcBase < referenceEndArcBase - kReplayEpsilon)
+    if (!config.stopAtFirstFailure && result.completedReferenceArcBase < referenceEndArcBase - kReplayEpsilon)
         throw std::logic_error("fiberlet graph replay exceeded its deterministic reset bound");
     return result;
 }
@@ -3702,6 +3723,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         {"reference_begin_arc_base", config.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
         {"initial_seed_key", config.initialSeedKey.has_value() ? storageKeyJson(*config.initialSeedKey) : nlohmann::json(nullptr)},
+        {"require_initial_seed_in_first_window", config.requireInitialSeedInFirstWindow},
+        {"stop_at_first_failure", config.stopAtFirstFailure},
         {"record_decision_diagnostics", config.recordDecisionDiagnostics},
         {"decision_diagnostic_reference_arc_windows_base", std::move(diagnosticWindows)},
     };
