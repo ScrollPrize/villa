@@ -282,6 +282,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_flatten.cpp
     agent_bridge/AgentBridgeMethods_jobs.cpp
     agent_bridge/AgentBridgeMethods_lasagna.cpp
+    agent_bridge/AgentBridgeMethods_spiral.cpp
     agent_bridge/AgentBridgeMethods_points.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
@@ -299,6 +300,7 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_fiber.cpp
     agent_bridge/AgentBridgeHandlers_seeding.cpp
     agent_bridge/AgentBridgeHandlers_lasagna.cpp
+    agent_bridge/AgentBridgeHandlers_spiral.cpp
     agent_bridge/AgentBridgeHandlers_flatten.cpp
     agent_bridge/AgentBridgeHandlers_points.cpp
     agent_bridge/AgentBridgeHandlers_review.cpp

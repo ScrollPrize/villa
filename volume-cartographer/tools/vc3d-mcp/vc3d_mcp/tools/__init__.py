@@ -20,6 +20,7 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     seeding,
     segmentation,
     session,
+    spiral,
     surface_ops,
     viewer,
     wrap,
