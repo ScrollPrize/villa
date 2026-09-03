@@ -7,14 +7,14 @@ CI performance gates.
 
 ## Progress Plots
 
-![Reference-fiber replay reliability over algorithm completion time](imgs/fiber_reference_replay_progress.svg)
+![Reference-fiber replay reliability over algorithm completion time](fiber_benchmarks/imgs/fiber_reference_replay_progress.svg)
 
 Reference replay uses `100 / max(failures, 1)`, equivalently mean tested
 distance per failure divided by total tested directed length. Higher is better;
 zero and one failure both saturate at 100 percent under the benchmark's censored
 zero-failure convention.
 
-![Crop constraint error over algorithm completion time](imgs/fiber_crop_pruning_progress.svg)
+![Crop constraint error over algorithm completion time](fiber_benchmarks/imgs/fiber_crop_pruning_progress.svg)
 
 The crop plot preserves the recorded problematic-to-retained error ratio and
 negates it so higher is better:

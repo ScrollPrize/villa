@@ -300,7 +300,9 @@ def main() -> int:
         default=project_root / "docs" / "fiber_benchmark_plot_data.json",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=project_root / "docs" / "imgs"
+        "--output-dir",
+        type=Path,
+        default=project_root / "docs" / "fiber_benchmarks" / "imgs",
     )
     parser.add_argument(
         "--check", action="store_true", help="validate data without rendering"
