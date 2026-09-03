@@ -53,3 +53,16 @@
 - The full `test_fiberlet_paths` binary retains existing bit-exact prepared
   scoring failures at line 414 in this build. The newly added replay cases did
   not emit failures.
+
+## Recorded Runs
+
+- Source revision: `1a70f9e57e47754df8379bf453ab73fddf757088`.
+- Reference endpoint replay: 48 directed cases, 43 complete, five failures,
+  1.901 mm mean credited length, 0.465 mm failed-case mean, and 90.311%
+  length-weighted success. Whole-command wall time was 21.37 seconds.
+- Oracle pruning: 363/1360 pieces removed, 44.43% problematic piece fraction,
+  64.02% problematic constraint fraction, and 24 exact / 0 wrong / 2 missing
+  reference windings. Wall time was 57.62 seconds.
+- Added `volume-cartographer/docs/fiber_benchmark_results.md` and one detailed
+  Markdown provenance record per invocation under
+  `volume-cartographer/docs/fiber_benchmark_runs/`.

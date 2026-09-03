@@ -6,7 +6,7 @@
 - [x] Implement reference-run preparation and aggregation.
 - [x] Add the crop reference-replay CLI mode.
 - [x] Add focused tests.
-- [ ] Add Markdown run recording and result index.
+- [x] Add Markdown run recording and result index.
 - [x] Update specs, documentation, changelog, and task log.
 - [x] Build and run focused validation.
-- [ ] Run and record both 1024-crop benchmarks.
+- [x] Run and record both 1024-crop benchmarks.

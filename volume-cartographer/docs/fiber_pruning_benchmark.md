@@ -1,5 +1,8 @@
 # Fiber pruning benchmark
 
+Recorded invocations are indexed in
+[fiber_benchmark_results.md](fiber_benchmark_results.md).
+
 This guide reproduces the supervised Fiber pruning benchmark on the fixed
 PHercParis4 1024-base-voxel crop. It covers the complete data path from Fiber
 and Lasagna inference through Fiberlet preprocessing, crop tracing, and the

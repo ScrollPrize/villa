@@ -22,13 +22,12 @@
    maximum-face closure, exit/re-entry, bidirectional accounting, reversed
    failure arcs, no endpoint seed, non-distance failures, physical conversion,
    empty inputs, and threshold metadata.
-6. Add a repository benchmark runner that consumes JSON rather than parsing
-   human output and records each invocation as Markdown
-   with Git revision, exact command, effective configuration, artifact
-   identities, clean/dirty state and diff checksum, host/build metadata, cache
-   state, repetition, timing, raw output, and parsed results. It must run both the new
-   endpoint benchmark and existing oracle-pruning benchmark without rerunning
-   prediction, Fiberlet generation, or crop tracing.
+6. Record each invocation as Markdown from machine-readable output where
+   available, with Git revision, exact command, effective configuration,
+   artifact identities, clean/dirty state, host/build metadata, cache state,
+   repetition, timing, and results. Run both the new endpoint benchmark and
+   existing oracle-pruning benchmark without rerunning prediction, Fiberlet
+   generation, or crop tracing.
 7. Add a separate benchmark-results Markdown table linking the individual run
    records. Run both benchmarks on the frozen PHercParis4 1024 crop and record
    their measured results.
