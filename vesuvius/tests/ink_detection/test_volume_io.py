@@ -171,6 +171,118 @@ def test_open_sweep_prunes_oldest_recursively_and_leaves_under_budget(
 
 
 @pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_reopening_reuses_one_budget_instead_of_granting_a_new_one(tmp_path):
+    chunk_bytes = 16 * 16 * 16
+    chunk_count = 40
+    shape = (16, 16, 16 * chunk_count)
+    expected = (
+        np.arange(chunk_bytes * chunk_count, dtype=np.int64)
+        .astype(np.uint8)
+        .reshape(shape)
+    )
+    source_path = tmp_path / "volume.zarr"
+    source = zarr.open_group(source_path, mode="w")
+    # Uncompressed chunks make every cached file exactly chunk_bytes long, so
+    # the budget below holds exactly half of this volume.
+    source.create_array(
+        "0",
+        shape=shape,
+        chunks=(16, 16, 16),
+        dtype="uint8",
+        compressors=None,
+    )
+    source["0"][:] = expected
+
+    budget_bytes = chunk_bytes * (chunk_count // 2)
+    cache_root = tmp_path / "cache"
+    cache_path = disk_cache_subdir(str(source_path), cache_root)
+
+    for _ in range(3):
+        # Each open builds a new CacheStore whose in-memory LRU starts empty,
+        # which is exactly what a second training or inference process sees.
+        root = open_volume_root(
+            source_path,
+            cache_dir=cache_root,
+            cache_max_gb=budget_bytes / 1e9,
+        )
+        assert np.asarray(root["0"][:]).tobytes() == expected.tobytes()
+        on_disk = sum(
+            size for _, size, _ in volume_io._cache_snapshot(cache_path)
+        )
+        assert 0 < on_disk <= budget_bytes
+        # Every cached file is a tracked full-key entry, so the store's own
+        # accounting can only exceed the directory (current_size also covers
+        # CacheStore's in-memory byte-range entries, which never reach disk).
+        # Sandwiching the directory under it is what makes max_size a real
+        # bound; before the seed, on_disk ran to twice current_size.
+        assert on_disk <= root.store.cache_info()["current_size"] <= budget_bytes
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_seeded_entries_evict_oldest_first_and_survive_reuse(tmp_path):
+    from zarr.experimental.cache_store import CacheStore
+    from zarr.storage import LocalStore, MemoryStore
+
+    cache_path = tmp_path / "cache"
+    files = [cache_path / "c" / "1", cache_path / "c" / "0"]
+    # Whole seconds, not raw nanoseconds: NTFS keeps 100 ns granularity and
+    # anchors at 1601, so sub-microsecond mtimes near the epoch collapse to 0
+    # and the intended age ordering disappears.
+    for timestamp, path in enumerate(files, start=1):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 4)
+        os.utime(path, ns=(timestamp * 10**9, timestamp * 10**9))
+
+    source = MemoryStore()
+    store = CacheStore(
+        store=source,
+        cache_store=LocalStore(cache_path),
+        max_size=10,
+    )
+    assert volume_io._seed_cache_store_lru(
+        store, cache_path, volume_io._cache_snapshot(cache_path)
+    )
+    assert store.cache_info()["current_size"] == 8
+
+    async def scenario():
+        from zarr.core.buffer.core import default_buffer_prototype
+
+        prototype = default_buffer_prototype()
+        # Reading the older seeded entry must promote it, so the newer one is
+        # what the next admission evicts. "c/1" is the older file here, so an
+        # order taken from paths instead of mtimes would evict the wrong one.
+        assert (await store.get("c/1", prototype)).to_bytes() == b"x" * 4
+        await source.set("c/2", prototype.buffer.from_bytes(b"y" * 4))
+        assert (await store.get("c/2", prototype)).to_bytes() == b"y" * 4
+
+    asyncio.run(scenario())
+
+    assert files[0].exists()
+    assert not files[1].exists()
+    assert store.cache_info()["current_size"] == 8
+    assert sum(size for _, size, _ in volume_io._cache_snapshot(cache_path)) == 8
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_unseedable_cache_store_is_reported_not_silently_overfilled(
+    tmp_path, monkeypatch
+):
+    class Stateless:
+        pass
+
+    assert not volume_io._seed_cache_store_lru(Stateless(), tmp_path, [])
+
+    monkeypatch.setattr(volume_io.zarr, "open", lambda *, store, mode: store)
+    monkeypatch.setattr(
+        volume_io, "_seed_cache_store_lru", lambda *args, **kwargs: False
+    )
+    with pytest.warns(RuntimeWarning, match="enforced only by the open-time"):
+        open_volume_root(
+            "unseedable.zarr", cache_dir=tmp_path / "cache", cache_max_gb=1e-6
+        )
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
 def test_shared_cache_multiprocess_reads_are_not_torn(tmp_path):
     source_path = tmp_path / "source.zarr"
     cache_dir = tmp_path / "cache"
