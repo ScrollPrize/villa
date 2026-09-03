@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <QtGlobal>
+
 #include "CState.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
@@ -2279,14 +2281,16 @@ TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
     writeText(first, "{\"old\":\"a\"}\n");
     writeText(second, "{\"old\":\"b\"}\n");
 
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    // qputenv/qunsetenv rather than setenv/unsetenv: those are POSIX-only and this
+    // file did not compile on Windows. The Qt spellings are portable and need no ifdef.
+    qputenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1");
     std::vector<vc3d::line_annotation::FiberSavePayload> payloads{
         {1, 2, first, nlohmann::json{{"new", "a"}}},
         {2, 3, second, nlohmann::json{{"new", "b"}}},
     };
 
     const auto result = vc3d::line_annotation::runFiberSaveJob(12, std::move(payloads));
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+    qunsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
 
     CHECK_FALSE(result.ok);
     CHECK(result.error.find("Injected failure") != std::string::npos);
@@ -2353,13 +2357,13 @@ TEST_CASE("line annotation failed save restores retired originals")
     const auto secondTarget = dir / "fiber_b.json";
     writeText(original, "{\"old\":true}\n");
 
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    qputenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1");
     const auto result = vc3d::line_annotation::runFiberSaveJob(
         15,
         {{1, 1, firstTarget, nlohmann::json{{"new", "a"}}},
          {2, 1, secondTarget, nlohmann::json{{"new", "b"}}}},
         {original});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+    qunsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
 
     CHECK_FALSE(result.ok);
     // The retired original is renamed straight back into place.
@@ -2383,12 +2387,12 @@ TEST_CASE("line annotation failed multi fiber save removes orphan new targets")
     const auto first = dir / "fiber_new_a.json";
     const auto second = dir / "fiber_new_b.json";
 
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    qputenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1");
     const auto result = vc3d::line_annotation::runFiberSaveJob(
         16,
         {{1, 1, first, nlohmann::json{{"new", "a"}}},
          {2, 1, second, nlohmann::json{{"new", "b"}}}});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+    qunsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
 
     CHECK_FALSE(result.ok);
     // Neither brand-new target survives the aborted batch; a pre-existing
