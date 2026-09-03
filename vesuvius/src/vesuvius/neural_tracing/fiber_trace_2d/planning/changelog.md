@@ -1930,5 +1930,5 @@
 
 - Added a calibrated per-winding final-piece benchmark and a unique-constraint
   pruning benchmark for the annotated reference interval. Both report a
-  problematic fraction and problematic-to-retained magnitude without
+  problematic fraction and problematic-to-retained percentage without
   source-fiber or multi-term constraint double counting.

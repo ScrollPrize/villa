@@ -4,7 +4,7 @@
    coordinates through the final reference calibration and counts the inclusive
    annotated half-winding interval.
 2. Report all removed pieces against final retained in-range pieces as both a
-   fraction of their combined population and a removed/retained magnitude.
+   percentage of their combined population and a removed/retained percentage.
 3. Extend shared constraint-agreement evaluation with unique per-constraint
    state, then classify removed-incident, final-Defect, infringed, and fulfilled
    constraints without double-counting multi-term constraints. Preserve the

@@ -6133,16 +6133,16 @@
   `0..0.5*(reference_count-1)`, using the final result's benchmark global sign
   and integer-gauge offsets. The piece benchmark compares every removed
   original piece with final active in-range pieces, reporting both
-  `removed/(removed+in_range)` and `removed/in_range`. It must not aggregate
-  piece-level removal into source-fiber counts. Active final pieces without a
-  calibrated gauge are reported separately.
+  `100*removed/(removed+in_range)` and `100*removed/in_range`. It must not
+  aggregate piece-level removal into source-fiber counts. Active final pieces
+  without a calibrated gauge are reported separately.
 - The companion constraint benchmark counts every original graph constraint
   once, independently of how many orientation, magnitude, or sign terms it
   emits. A constraint is problematic if either endpoint was removed, a retained
   endpoint is final Defect, or any evaluated term is infringed by the
   authoritative conditioned result. All other retained constraints are
-  fulfilled. Report both `problematic/(problematic+fulfilled)` and
-  `problematic/fulfilled`.
+  fulfilled. Report both `100*problematic/(problematic+fulfilled)` and
+  `100*problematic/fulfilled`.
 
 ## Experimental sign-only ordered winding cuts
 

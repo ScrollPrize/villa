@@ -16,8 +16,8 @@
 - Define the area as the inclusive virtual reference interval from the first
   to last loaded reference fiber (`0.0..0.5*(N-1)`).
 - Count only active H/V assignments; Defect/Mixed pieces are not used.
-- Define piece problematic fraction as `removed/(removed+retained_in_range)`
-  and magnitude as `removed/retained_in_range`.
+- Define piece percentages as `100*removed/(removed+retained_in_range)` and
+  `100*removed/retained_in_range`.
 - A unique constraint is problematic when it touches a removed piece, is
   neutralized by a retained final Defect, or has any infringed factor term.
   Retained constraints with all terms fulfilled form the comparison population.
@@ -40,14 +40,14 @@
 - `/tmp/vc_direction_ablation_runner.sh reference-prune oracle 1`: 1024 crop,
   Release build, 57.83 s wall. The final working set contains 454 active pieces
   in reference windings `0.0..12.5`; all 363 removed pieces give 44.43%
-  problematic and a removed/in-range magnitude of 0.800. No active final piece
+  problematic and a removed/in-range percentage of 80.00%. No active final piece
   had an uncalibrated gauge.
 - The same run has 69,172 original unique constraints: 33,299 removed-incident,
   10,985 retained but infringed, zero retained-Defect, and 24,888 retained and
   fulfilled. That is 44,284 problematic constraints, 64.02% of the combined
-  problematic/fulfilled population, and magnitude 1.779.
+  problematic/fulfilled population, and 177.90% of fulfilled constraints.
 - `/tmp/vc_direction_ablation_runner.sh reference-prune inliers`: the ordinary
   non-contiguous subset retained 1,054 pieces and 39,123 constraints. Of 69,172
   original constraints, 30,049 were removed-incident, 12,708 retained and
   infringed, zero retained-Defect, and 26,415 retained and fulfilled. Its
-  problematic fraction is 61.81% and problematic/fulfilled magnitude is 1.619.
+  problematic fraction is 61.81% and problematic/fulfilled is 161.90%.

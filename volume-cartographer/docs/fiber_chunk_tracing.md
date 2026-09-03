@@ -1651,9 +1651,10 @@ annotated reference range `0..0.5*(reference_count-1)`. The final benchmark
 calibration maps every retained active H/V piece to an assigned half-winding
 row. The following piece benchmark reports all original, retained, removed,
 in-range retained, and other retained pieces. `problematic_%` is
-`removed/(removed+retained_ref)`; `problematic/ref` is
-`removed/retained_ref`. Because pruning is piece-level, no source-fiber count is
-reported. Active final pieces without a usable gauge are separate.
+`100*removed/(removed+retained_ref)`; `problematic/ref_%` is
+`100*removed/retained_ref`. Both are percentages. Because pruning is
+piece-level, no source-fiber count is reported. Active final pieces without a
+usable gauge are separate.
 
 The `constraint pruning benchmark` counts unique graph constraints rather than
 factor terms. `removed_incident` counts constraints dropped because at least one
@@ -1661,10 +1662,10 @@ endpoint was removed. Among retained constraints, `retained_defect` counts
 constraints neutralized by final Defects and `retained_infringed` counts a
 constraint once when any of its evaluated terms is infringed. Remaining
 constraints are `retained_fulfilled`. The two summary values are
-`problematic/(problematic+retained_fulfilled)` and
-`problematic/retained_fulfilled`. Retained subsets carry their exact original
-constraint indices so non-contiguous pruning cannot accidentally benchmark a
-same-sized prefix.
+`100*problematic/(problematic+retained_fulfilled)` and
+`problematic/retained_% = 100*problematic/retained_fulfilled`. Retained subsets
+carry their exact original constraint indices so non-contiguous pruning cannot
+accidentally benchmark a same-sized prefix.
 
 The experiment writes a separate `<output-stem>_pruned` artifact family:
 

@@ -9506,17 +9506,6 @@ int main(int argc, char** argv)
                                                          static_cast<double>(denominator);
                                             return value.str();
                                         };
-                                        const auto ratioText = [](std::size_t numerator,
-                                                                  std::size_t denominator) {
-                                            if (denominator == 0)
-                                                return std::string{"NA"};
-                                            std::ostringstream value;
-                                            value.imbue(std::locale::classic());
-                                            value << std::fixed << std::setprecision(3)
-                                                  << static_cast<double>(numerator) /
-                                                         static_cast<double>(denominator);
-                                            return value.str();
-                                        };
                                         const auto windingRow = [&](std::string_view winding,
                                                                     const vc::fiber_tracer::
                                                                         FiberTraceReferenceWindingPopulation& row) {
@@ -9544,7 +9533,7 @@ int main(int argc, char** argv)
                                                    << referenceRangeBenchmark->retainedInRangePieces
                                                    << '\n'
                                                    << "fiber piece pruning benchmark\n"
-                                                   << "initial  retained_all  removed  retained_ref  retained_other  problematic_%  problematic/ref\n"
+                                                   << "initial  retained_all  removed  retained_ref  retained_other  problematic_%  problematic/ref_%\n"
                                                    << referenceRangeBenchmark->initialPieces << "  "
                                                    << referenceRangeBenchmark->retainedPieces << "  "
                                                    << referenceRangeBenchmark->removedPieces << "  "
@@ -9554,7 +9543,7 @@ int main(int argc, char** argv)
                                                           referenceRangeBenchmark->removedPieces,
                                                           referenceRangeBenchmark->removedPieces +
                                                               referenceRangeBenchmark->retainedInRangePieces)
-                                                   << "  " << ratioText(
+                                                   << "  " << percentText(
                                                           referenceRangeBenchmark->removedPieces,
                                                           referenceRangeBenchmark->retainedInRangePieces)
                                                    << '\n'
@@ -9562,7 +9551,7 @@ int main(int argc, char** argv)
                                                    << referenceRangeBenchmark->activeUncalibratedPieces
                                                    << '\n'
                                                    << "constraint pruning benchmark\n"
-                                                   << "initial  removed_incident  retained_infringed  retained_defect  problematic  retained_fulfilled  problematic_%  problematic/retained\n"
+                                                   << "initial  removed_incident  retained_infringed  retained_defect  problematic  retained_fulfilled  problematic_%  problematic/retained_%\n"
                                                    << constraintBenchmark->initialConstraints << "  "
                                                    << constraintBenchmark->removedIncidentConstraints << "  "
                                                    << constraintBenchmark->retainedInfringedConstraints << "  "
@@ -9573,7 +9562,7 @@ int main(int argc, char** argv)
                                                           constraintBenchmark->problematicConstraints,
                                                           constraintBenchmark->problematicConstraints +
                                                               constraintBenchmark->retainedFulfilledConstraints)
-                                                   << "  " << ratioText(
+                                                   << "  " << percentText(
                                                           constraintBenchmark->problematicConstraints,
                                                           constraintBenchmark->retainedFulfilledConstraints)
                                                    << '\n';

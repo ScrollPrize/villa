@@ -402,11 +402,11 @@ During active remote downloads, the existing cache status bar appends:
 - Direct inlier reporting groups final active H/V pieces by their assigned
   half-winding in the inclusive annotated reference interval using the final
   benchmark calibration. It compares all removed original pieces with final
-  in-range pieces as both a combined-population problematic fraction and a
-  removed/in-range magnitude. Source-fiber aggregation is not used.
+  in-range pieces as both a combined-population problematic percentage and a
+  removed/in-range percentage. Source-fiber aggregation is not used.
 - Its constraint benchmark counts each original graph constraint once. Removed-
   incident constraints, retained constraints neutralized by final Defects, and
   retained constraints with any infringed factor term are problematic; all
-  other retained constraints are fulfilled. Both problematic fraction and
-  problematic/fulfilled magnitude are reported. Arbitrary retained subsets
+  other retained constraints are fulfilled. Both combined-population and
+  problematic/fulfilled percentages are reported. Arbitrary retained subsets
   preserve original constraint identity through conditioned-prefix lookup.
