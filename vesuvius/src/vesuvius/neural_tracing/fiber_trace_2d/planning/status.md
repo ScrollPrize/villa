@@ -5,4 +5,5 @@
 - [x] Complete independent plan review.
 - [x] Implement and test the corrected metrics.
 - [x] Update specifications and documentation.
-- [ ] Commit the completed change.
+- [x] Commit the completed change.
+- [x] Run and record the corrected 1024-crop benchmark.

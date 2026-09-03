@@ -7,10 +7,11 @@ CI performance gates.
 
 ## Reference endpoint replay
 
-| Date | Revision | Policy | Crop | Directions | Failure-free | Failures | Mean failed span | Length success | Wall time | Run |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 2026-09-03 | `d1c52f1b0` | Whole run | PHercParis4 1024 | 48 | 43 (89.58%) | 6 | 0.441 mm | 100.000% | 21.58 s | [record](fiber_benchmark_runs/2026-09-03-d1c52f1b0-reference-whole-run-replay.md) |
-| 2026-09-03 | `1a70f9e57` | First failure (superseded) | PHercParis4 1024 | 48 | 43 (89.58%) | 5 | 0.465 mm | 90.311% | 21.37 s | [record](fiber_benchmark_runs/2026-09-03-1a70f9e57-reference-endpoint-replay.md) |
+| Date | Revision | Policy | Crop | Tested length | Failures | Distance/failure | Distance % | Wall time | Run |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-09-03 | `cd0fbd52a` | Whole run | PHercParis4 1024 | 101.036 mm | 6 | 16.839 mm | 16.667% | 21.41 s | [record](fiber_benchmark_runs/2026-09-03-cd0fbd52a-reference-distance-per-failure.md) |
+| 2026-09-03 | `d1c52f1b0` | Whole run, superseded metrics | PHercParis4 1024 | 101.036 mm | 6 | N/A | N/A | 21.58 s | [record](fiber_benchmark_runs/2026-09-03-d1c52f1b0-reference-whole-run-replay.md) |
+| 2026-09-03 | `1a70f9e57` | First failure, superseded | PHercParis4 1024 | 101.036 mm | 5 | N/A | N/A | 21.37 s | [record](fiber_benchmark_runs/2026-09-03-1a70f9e57-reference-endpoint-replay.md) |
 
 ## Oracle piece pruning
 
