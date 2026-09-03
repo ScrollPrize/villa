@@ -2,6 +2,16 @@ Segmentation growth and editing is now supported within the segmentation widget.
 
 This is relatively untested, but (should) work. It's possible to easily create relatively large segmentations rather quickly -- i created this nearly 22cm segmentation in less than 5 minutes. ![grow_example.png](grow_example.png)
 
+**rotate and flip a surface**
+
+Select a segmentation, then open `Actions > Transforms > Rotate`. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation and flip preview remain available for surfaces with multipage `mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
+
+The captures below use sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog.
+
+| Original | Preview: 37° + horizontal flip | Persisted after Apply |
+| --- | --- | --- |
+| ![Original real-scroll surface](imgs/surface-transform-real-scroll-before.png) | ![Real-scroll transform preview](imgs/surface-transform-real-scroll-preview.png) | ![Persisted real-scroll transform](imgs/surface-transform-real-scroll-after.png) |
+
 **prerequisites** 
 - you must have computed normal grids in the volpkg directory stored as `/path/to/example.volpkg/normal_grids/`
   - to compute these, run `/path/to/build/bin/vc_compute_normal_grids` , use the help option to see the options (or just enter it without any arguments)
