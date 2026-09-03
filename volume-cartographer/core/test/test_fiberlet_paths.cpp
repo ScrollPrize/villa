@@ -2546,7 +2546,7 @@ TEST_CASE("fiberlet replay benchmark requires an endpoint-window seed")
     CHECK(benchmark.completedReferenceArcBase == doctest::Approx(0.0));
 }
 
-TEST_CASE("fiberlet replay benchmark stops at its first route failure")
+TEST_CASE("fiberlet replay benchmark can continue after multiple route failures")
 {
     auto report = graphPathReport();
     addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0.6, 0}, {2, 0.6, 0}}, 1.0);
@@ -2556,13 +2556,14 @@ TEST_CASE("fiberlet replay benchmark stops at its first route failure")
     config.beamStepDistanceBaseVoxels = 1.0;
     config.lookaheadDistanceBaseVoxels = 0.25;
     config.errorThresholdBaseVoxels = 0.5;
-    config.stopAtFirstFailure = true;
+    config.stopAtFirstFailure = false;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {6, 0, 0}}, replayYNormals(), 1.0, config);
-    REQUIRE(replay.failures.size() == 1);
+    REQUIRE(replay.failures.size() >= 2);
     CHECK(replay.failures.front().reason == "distance_above_threshold");
-    CHECK(replay.completedReferenceArcBase == doctest::Approx(replay.failures.front().referenceArcBase));
-    CHECK(replay.completedReferenceArcBase < replay.referenceEndArcBase);
+    for (std::size_t index = 0; index < replay.failures.size(); ++index)
+        CHECK(replay.failures[index].index == index);
+    CHECK(replay.completedReferenceArcBase == doctest::Approx(replay.referenceEndArcBase));
 }
 
 TEST_CASE("fiberlet DP preloads each scoring voxel once")

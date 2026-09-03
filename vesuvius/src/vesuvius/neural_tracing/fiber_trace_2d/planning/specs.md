@@ -6199,16 +6199,24 @@
   lookahead. The first replay seed must occur in the ordinary initial seed
   window and pass the shared Lasagna-normal ellipsoid threshold. A missing
   endpoint seed is a zero-length failure.
-- Benchmark replay stops at the first failure of any kind. A failed direction
-  receives the first failure's reference arc; a successful direction receives
-  its full run length. Ordinary replay keeps its restart behavior unless the
-  benchmark-only flags are enabled.
-- Length-weighted success is `100 * sum(credited directed length) /
-  sum(full directed length)`. The report also gives binary direction completion,
-  mean credited length over every direction, and mean first-failure length over
-  failed directions. Millimeter conversion requires an explicit positive base
-  voxel size.
-- Results are emitted as deterministic, versioned JSON including cases,
-  threshold geometry, effective search settings, inputs, worker count, and
-  summary metrics. External-data runs are manual scientific benchmarks, not CI
-  performance gates.
+- After any failure, benchmark replay uses the ordinary deterministic reset and
+  seed scan to continue through the remainder of the directional reference run.
+  It retains every failure in stable arc order. This mode does not alter the
+  ordinary replay implementation or defaults.
+- Credited length is the interval union of every seeded replay segment from its
+  first match search-begin arc through its segment end. Missing-seed gaps and
+  unseeded tails receive no credit. Length-weighted success remains
+  `100 * sum(credited directed length) / sum(full directed length)`, where the
+  denominator is twice the sum of all undirected in-crop run lengths.
+- Evaluation completion, failure-free direction status, total failures,
+  failures per directed millimeter, mean seeded-span length, and mean span to a
+  failure are separate metrics. A successful terminal suffix contributes to
+  mean seeded-span length but not mean failed-span length; an unseeded failure
+  contributes a zero failed span. Millimeter conversion requires an explicit
+  positive base voxel size.
+- Results use JSON schema version 2 and include every failure's reason, stable
+  indices, directional and source-oriented reference arc/fraction, reference
+  and optional evaluator position, and optional anisotropic threshold
+  measurement. They also include threshold geometry, effective search/reset
+  settings, seed window, inputs, worker count, and summary metrics. External-
+  data runs are manual scientific benchmarks, not CI performance gates.

@@ -1911,7 +1911,8 @@ provide an adequate unsupervised stopping rule.
 Use `reference-replay-benchmark` to start the current Fiberlet search from both
 ends of every tagged reference run inside a crop. The command uses the same
 lookahead-padded graph materialization and Lasagna-normal ellipsoid as replay,
-but requires a seed near the endpoint and stops at the first failure.
+requires a seed near the endpoint, records each failure, resets, and continues
+until the complete directional reference run has been evaluated.
 
 ```bash
 vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
@@ -1923,9 +1924,12 @@ vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
   --output reference-replay.json
 ```
 
-The JSON report contains one forward and reverse case per contiguous in-crop
-reference run. `length_weighted_success_percent` is the credited directed
-length divided by full directed reference length. Successful cases contribute
-their complete length; failed cases contribute their first-failure arc. The
-report separately includes direction completion, mean credited length over all
-cases, and mean failure length over failed cases.
+The version-2 JSON report contains one forward and reverse case per contiguous
+in-crop reference run. A case contains every ordered failure with directional
+and source-oriented reference arcs, positions, and anisotropic errors. Credited
+length is the union of actual seeded replay intervals, excluding missing-seed
+gaps and unseeded tails; `length_weighted_success_percent` divides that length
+by the full directed reference length. The report separately distinguishes
+whole-run evaluation completion from failure-free directions and gives total
+failures, failures per directed millimeter, mean seeded-span length, and mean
+span ending at a failure.

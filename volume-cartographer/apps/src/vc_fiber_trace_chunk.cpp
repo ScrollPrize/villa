@@ -10488,7 +10488,7 @@ int main(int argc, char** argv)
             replayConfig.errorThresholdBaseVoxels = options.replayFailureThresholdBaseVoxels;
             replayConfig.matchRefineSteps = options.replayMatchRefineSteps;
             replayConfig.requireInitialSeedInFirstWindow = true;
-            replayConfig.stopAtFirstFailure = true;
+            replayConfig.stopAtFirstFailure = false;
 
             std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome> outcomes(cases.size());
             std::atomic<std::size_t> next{0};
@@ -10527,8 +10527,13 @@ int main(int argc, char** argv)
 
             const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(
                 selection.fibers.size(), outcomes, *options.baseVoxelSizeUm);
+            const double seedWindowBaseVoxels = std::max(
+                replayConfig.minimumResetAdvanceBaseVoxels,
+                static_cast<double>(materialized.graph->anchorCellSizePredictionVoxels()) *
+                    materialized.graph->predictionToBaseScale());
             auto output = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
-                summary, outcomes, replayConfig, options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
+                summary, outcomes, replayConfig, seedWindowBaseVoxels,
+                options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
             output["inputs"] = {
                 {"fiberlet_dataset", options.input.string()},
                 {"normal_manifest", options.normalManifest},
@@ -10543,10 +10548,11 @@ int main(int argc, char** argv)
             vc::core::util::atomicWriteString(options.output, output.dump(2) + "\n");
             std::cout << std::fixed << std::setprecision(3)
                       << "fiber reference replay benchmark\n"
-                      << "cases  completed  failed  completion_%  mean_credited_mm  mean_failed_mm  success_length_%\n"
-                      << summary.directedCases << "  " << summary.completedCases << "  " << summary.failedCases << "  "
-                      << summary.completedCasesPercent << "  " << summary.meanCreditedLengthMillimeters << "  "
-                      << summary.meanFailureLengthMillimeters << "  " << summary.lengthWeightedSuccessPercent << '\n'
+                      << "cases  evaluated  failure_free  failures  failures/mm  mean_span_mm  mean_failed_span_mm  success_length_%\n"
+                      << summary.directedCases << "  " << summary.evaluatedCases << "  " << summary.failureFreeCases << "  "
+                      << summary.totalFailures << "  " << summary.failuresPerDirectedMillimeter << "  "
+                      << summary.meanSeededSpanLengthMillimeters << "  " << summary.meanFailedSpanLengthMillimeters << "  "
+                      << summary.lengthWeightedSuccessPercent << '\n'
                       << "output=" << options.output << '\n';
             if (profileThread.joinable()) {
                 profileThread.request_stop();

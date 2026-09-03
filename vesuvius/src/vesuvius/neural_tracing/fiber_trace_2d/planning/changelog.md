@@ -1948,3 +1948,12 @@
   and length-weighted success with explicit physical voxel size.
 - Added reproducible per-run Markdown records and a separate combined benchmark
   result index for endpoint replay and 1024-crop oracle pruning.
+
+## 2026-09-03 - Whole-run endpoint replay evaluation
+
+- Changed the endpoint benchmark to resume with the ordinary deterministic
+  replay reset after every failure and evaluate the full directional reference
+  run.
+- Added version-2 JSON accounting for every failure, seeded interval coverage,
+  failure density, and failure-free span lengths while preserving the prior
+  first-failure record as historical data.

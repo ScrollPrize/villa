@@ -1,59 +1,52 @@
 # Plan
 
-1. Extract reusable reference-run preparation and directed replay aggregation
-   into the Fiber tracer core. Clip tagged reference polylines to the half-open
-   crop, preserve every contiguous run, and generate forward and reversed
-   directed cases without duplicating replay or threshold logic.
-2. Add a `reference-replay-benchmark` mode to `vc_fiber_trace_chunk`. Reuse the
-   crop graph materialization and `traceFiberletGraphReplay`, expose the crop,
-   reference selection, base-voxel size, replay search settings, and anisotropic
-   normal threshold, and default worker counts to host CPUs.
-3. Add opt-in shared replay controls to require the initial seed in the first
-   ordinary seed window and to stop at the first failure. A valid seed's
-   threshold-checked endpoint offset is credited; failure to find that seed is
-   a zero-length result. Preserve ordinary restart behavior by default.
-4. Define deterministic aggregation: each directed run stops at its first
-   failure; full success contributes the complete run length. Report direction
-   counts, failures by reason, total/full/traced base length, mean credited
-   length over all directions, mean first-failure length over failed directions,
-   binary completion rate, millimeters, and length-weighted `100*traced/full`
-   success.
-5. Emit a versioned JSON summary. Add focused core and CLI tests for clipping,
-   maximum-face closure, exit/re-entry, bidirectional accounting, reversed
-   failure arcs, no endpoint seed, non-distance failures, physical conversion,
-   empty inputs, and threshold metadata.
-6. Record each invocation as Markdown from machine-readable output where
-   available, with Git revision, exact command, effective configuration,
-   artifact identities, clean/dirty state, host/build metadata, cache state,
-   repetition, timing, and results. Run both the new endpoint benchmark and
-   existing oracle-pruning benchmark without rerunning prediction, Fiberlet
-   generation, or crop tracing.
-7. Add a separate benchmark-results Markdown table linking the individual run
-   records. Run both benchmarks on the frozen PHercParis4 1024 crop and record
-   their measured results.
+1. Reuse the existing deterministic replay restart path after failures while
+   retaining the endpoint-window requirement for the first seed.
+2. Replace first-failure-only benchmark outcomes with all failure events and
+   actual seeded replay intervals over the complete directional reference run.
+   Credited length is the union of `[first match search begin, segment end]`
+   intervals for seeded segments; missing-seed gaps and unseeded tails receive
+   no credit. A failed span is the corresponding seeded interval ending at a
+   failure; an unseeded failure has length zero.
+3. Report total failures, failure density per directed millimeter, directions
+   with and without failures, failure reasons, credited traced length, mean
+   failed-span length, and mean seeded-span length in base voxels and
+   millimeters. Exclude a successful terminal suffix from mean failed-span
+   length but include it in mean seeded-span length. Preserve separate whole-run
+   evaluation-complete and failure-free semantics in JSON.
+4. Add focused aggregation and replay regression tests proving that ordered
+   multiple failures in one direction are retained, reverse source arcs are
+   correct, missing gaps are not credited, terminal suffixes are handled, and
+   replay reaches the reference end.
+5. Emit incompatible benchmark schema version 2. Serialize every failure's
+   reason, directional and source-oriented arc/fraction, reference/evaluator
+   points, and anisotropic threshold measurement.
+6. Update the spec, CLI documentation, benchmark documentation, task log, and
+   changelog. Build and run focused Release tests, then rerun and record the
+   endpoint benchmark on the frozen PHercParis4 1024 crop.
 
 ## Spec Update
 
-Specify reference clipping, directed endpoint cases, first-failure length,
-anisotropic threshold reuse, aggregate success denominator, required physical
-voxel size, deterministic ordering, machine-readable results, and Markdown run
-provenance. Mark these external-data evaluations as manual scientific
-benchmarks rather than CI performance gates.
+Replace first-failure termination with deterministic continuation through the
+entire directional run. Specify all-failure serialization and failure-free span
+metrics without changing ordinary replay behavior.
 
 ## Docs Update
 
-Document the new CLI mode and benchmark-record workflow in the Fiberlet crop
-tracing documentation. Keep the benchmark result index separate from the
-reproduction guide and per-run records.
+Document continuation, the distinction between a completed whole run and a
+failure-free direction, and the revised result fields. Supersede the prior
+first-failure benchmark row with a new reproducible run record.
 
 ## Changelog
 
-Record the reference-endpoint replay benchmark and reproducible Markdown
-benchmark recording workflow.
+Record whole-run reference replay and multi-failure benchmark accounting.
 
 ## Validation
 
-Build Release targets, run focused unit/CLI tests, validate Markdown and shell
-commands, execute both benchmarks against the frozen PHercParis4 1024-crop
-artifacts, and report exact
-commands, inputs, build type, timing, and results.
+Build the Release CLI and focused tests; run unit tests for multiple failures,
+aggregation, and JSON; execute the 1024-crop endpoint benchmark and record its
+command, revision, artifact identities, timing, and results.
+
+Create the canonical external-data record only after committing the measured
+implementation. Keep the historical first-failure record unchanged and mark it
+as superseded in the result index.

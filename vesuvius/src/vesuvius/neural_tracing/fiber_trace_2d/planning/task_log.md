@@ -2,67 +2,37 @@
 
 ## Scope
 
-- Benchmark the current Fiberlet tracer from both endpoints of every tagged
-  reference run inside the fixed crop.
-- Reuse `measureFiberReplayThreshold` and `traceFiberletGraphReplay`; do not
-  introduce a parallel evaluation implementation.
-- Store each endpoint and oracle-pruning run as Markdown and maintain a separate
-  compact result index.
+- Continue each directed endpoint replay after failures until the full in-crop
+  reference run has been evaluated.
+- Retain every failure event and report failure-free traced spans.
+- Reuse the existing deterministic replay restart implementation and shared
+  anisotropic threshold measurement.
 
 ## Decisions
 
-- Clip full reference polylines to the half-open benchmark crop and retain all
-  contiguous in-crop runs.
-- Reverse each run to create the opposite endpoint case.
-- Stop accounting at the first failure. The aggregate denominator is twice the
-  total in-crop reference length.
-- Require an explicit positive base-voxel size for millimeter output.
+- The first seed remains restricted to the endpoint seed window.
+- A directional case is whole-run complete once replay reaches its reference
+  end, even if it contains failures; failure-free status is reported separately.
+- Ordinary replay defaults remain unchanged.
 
 ## Independent Review
 
-- Keep this benchmark's crop clipping separate from `direction-ablation`, whose
-  reference diagnostics intentionally retain complete JSON polylines.
-- Restrict the first seed to the initial replay seed window. Credit a valid,
-  threshold-checked seed offset; return zero when no endpoint seed exists.
-- Add shared opt-in stop-at-first-failure behavior while leaving ordinary replay
-  restart semantics unchanged.
-- Report both length-weighted success and binary completion, and distinguish
-  all-direction mean credited length from failed-direction mean failure length.
-- Emit versioned JSON and render Markdown from it; do not parse unstable console
-  tables.
-- Record dirty-tree identity, host/build/cache metadata, and one Markdown file
-  per invocation. These are manual external-data evaluations, not CI gates.
-
-## Implementation
-
-- Added opt-in replay controls for an initial endpoint seed window and stopping
-  at the first failure; ordinary replay defaults are unchanged.
-- Added reusable crop-run preparation, bidirectional case generation,
-  first-failure accounting, physical conversion, and versioned JSON output.
-- Added `vc_fiber_trace_chunk reference-replay-benchmark`; reference directions
-  run concurrently while each beam search uses one expansion worker.
-- Added focused tests for crop re-entry, max-face clipping, forward/reverse
-  failure accounting, non-distance failure aggregation, unit conversion,
-  endpoint seed restriction, and first-failure termination.
+- Define credited length from actual seeded segment intervals rather than the
+  replay completion cursor; missing seed gaps must not become successful length.
+- Distinguish whole-run evaluation completion from a failure-free direction.
+- Report failure density, failed-span length, seeded-span length, restart
+  settings, and complete per-failure location/threshold diagnostics.
+- Bump the incompatible JSON schema to version 2 and retain the historical
+  first-failure run record.
+- Keep direction-ablation reference handling unchanged and create the canonical
+  external-data record only from a committed implementation.
 
 ## Validation
 
-- Release build: `vc_fiber_trace_chunk`, `test_fiberlet_paths`, and
+- Release `vc_fiber_trace_chunk` and
   `test_fiber_reference_replay_benchmark` build successfully.
-- `test_fiber_reference_replay_benchmark`: 3 test cases passed.
-- The full `test_fiberlet_paths` binary retains existing bit-exact prepared
-  scoring failures at line 414 in this build. The newly added replay cases did
-  not emit failures.
-
-## Recorded Runs
-
-- Source revision: `1a70f9e57e47754df8379bf453ab73fddf757088`.
-- Reference endpoint replay: 48 directed cases, 43 complete, five failures,
-  1.901 mm mean credited length, 0.465 mm failed-case mean, and 90.311%
-  length-weighted success. Whole-command wall time was 21.37 seconds.
-- Oracle pruning: 363/1360 pieces removed, 44.43% problematic piece fraction,
-  64.02% problematic constraint fraction, and 24 exact / 0 wrong / 2 missing
-  reference windings. Wall time was 57.62 seconds.
-- Added `volume-cartographer/docs/fiber_benchmark_results.md` and one detailed
-  Markdown provenance record per invocation under
-  `volume-cartographer/docs/fiber_benchmark_runs/`.
+- Focused benchmark tests: 4 test cases passed.
+- The broad `test_fiberlet_paths` executable still reports the pre-existing
+  bit-exact prepared-scoring failures at line 414; its continuation replay
+  regression is compiled, and the benchmark uses the unchanged ordinary reset
+  path already covered by that suite.
