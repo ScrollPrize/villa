@@ -476,12 +476,21 @@ struct FiberTraceConstraintAgreementCounts {
     std::size_t infringed = 0;
 };
 
+struct FiberTraceConstraintAgreementState {
+    bool prepared = false;
+    bool evaluated = false;
+    bool defectNeutralized = false;
+    bool infringed = false;
+};
+
 struct FiberTraceConstraintAgreementSummary {
     std::array<
         FiberTraceConstraintAgreementCounts,
         static_cast<std::size_t>(FiberTraceConstraintAgreementClass::Count)>
         classes;
     FiberTraceConstraintAgreementCounts total;
+    FiberTraceConstraintAgreementCounts uniqueConstraints;
+    std::vector<FiberTraceConstraintAgreementState> constraintStates;
 };
 
 [[nodiscard]] FiberTraceConstraintEvidenceSummary
@@ -839,6 +848,48 @@ struct FiberTraceReferenceWindingBenchmark {
     std::vector<FiberTraceReferenceSourceBenchmark> references;
     FiberTraceReferenceBenchmarkCounts sum;
 };
+
+struct FiberTraceReferenceWindingPopulation {
+    double winding = 0.0;
+    std::size_t pieces = 0;
+};
+
+struct FiberTraceReferenceRangeBenchmark {
+    double minimumReferenceWinding = 0.0;
+    double maximumReferenceWinding = 0.0;
+    std::vector<FiberTraceReferenceWindingPopulation> windings;
+    std::size_t initialPieces = 0;
+    std::size_t retainedPieces = 0;
+    std::size_t removedPieces = 0;
+    std::size_t retainedInRangePieces = 0;
+    std::size_t retainedOtherPieces = 0;
+    std::size_t activeUncalibratedPieces = 0;
+};
+
+[[nodiscard]] FiberTraceReferenceRangeBenchmark
+summarizeFiberTraceReferenceRangeBenchmark(
+    const FiberTraceInterleavedWindingReport& retainedWinding,
+    const FiberTraceReferenceWindingBenchmark& retainedCalibration,
+    std::size_t initialPieces,
+    double minimumReferenceWinding,
+    double maximumReferenceWinding);
+
+struct FiberTracePruningConstraintBenchmark {
+    std::size_t initialConstraints = 0;
+    std::size_t removedIncidentConstraints = 0;
+    std::size_t retainedFulfilledConstraints = 0;
+    std::size_t retainedInfringedConstraints = 0;
+    std::size_t retainedDefectConstraints = 0;
+    std::size_t problematicConstraints = 0;
+};
+
+[[nodiscard]] FiberTracePruningConstraintBenchmark
+summarizeFiberTracePruningConstraintBenchmark(
+    std::size_t initialConstraints,
+    std::span<const std::size_t> retainedOrdinaryConstraintIndices,
+    const FiberTraceConstraintReport& conditionedConstraints,
+    const FiberTraceInterleavedWindingReport& conditionedWinding,
+    std::size_t ordinaryConstraintOffset);
 
 struct FiberTraceReferenceOracleScore {
     std::size_t exact = 0;

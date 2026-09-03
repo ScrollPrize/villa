@@ -5172,6 +5172,14 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
         return value == FiberTraceFixedOrientation::Horizontal ||
             value == FiberTraceFixedOrientation::Vertical;
     };
+    std::vector<unsigned char> seenConstraint(
+        constraints.constraints.size(), 0);
+    std::vector<unsigned char> evaluatedConstraint(
+        constraints.constraints.size(), 0);
+    std::vector<unsigned char> neutralizedConstraint(
+        constraints.constraints.size(), 0);
+    std::vector<unsigned char> infringedConstraint(
+        constraints.constraints.size(), 0);
     for (const auto& diagnostic : winding.factorDiagnostics) {
         if (diagnostic.constraintIndex >= constraints.constraints.size() ||
             diagnostic.pieceA >= pieceCount ||
@@ -5202,13 +5210,18 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
             : 0.0;
         const auto emit = [&](FiberTraceConstraintAgreementClass itemClass,
                               bool infringed) {
+            seenConstraint[diagnostic.constraintIndex] = 1;
             FiberTraceConstraintAgreementCounts counts;
             counts.prepared = 1;
             if (active) {
                 counts.evaluated = 1;
                 counts.infringed = infringed ? 1 : 0;
+                evaluatedConstraint[diagnostic.constraintIndex] = 1;
+                if (infringed)
+                    infringedConstraint[diagnostic.constraintIndex] = 1;
             } else {
                 counts.defectNeutralized = 1;
+                neutralizedConstraint[diagnostic.constraintIndex] = 1;
             }
             add(result.classes[static_cast<std::size_t>(itemClass)], counts);
             add(result.total, counts);
@@ -5262,6 +5275,25 @@ FiberTraceConstraintAgreementSummary summarizeFiberTraceConstraintAgreement(
                 FiberTraceConstraintAgreementClass::ParallelSign,
                 active && signTerm.target * latentDelta <= 0.0);
         }
+    }
+    result.uniqueConstraints.prepared = static_cast<std::size_t>(std::count(
+        seenConstraint.begin(), seenConstraint.end(), 1));
+    result.uniqueConstraints.evaluated = static_cast<std::size_t>(std::count(
+        evaluatedConstraint.begin(), evaluatedConstraint.end(), 1));
+    result.uniqueConstraints.defectNeutralized =
+        static_cast<std::size_t>(std::count(
+            neutralizedConstraint.begin(), neutralizedConstraint.end(), 1));
+    result.uniqueConstraints.infringed = static_cast<std::size_t>(std::count(
+        infringedConstraint.begin(), infringedConstraint.end(), 1));
+    result.constraintStates.resize(constraints.constraints.size());
+    for (std::size_t constraint = 0;
+         constraint < result.constraintStates.size(); ++constraint) {
+        result.constraintStates[constraint] = {
+            seenConstraint[constraint] != 0,
+            evaluatedConstraint[constraint] != 0,
+            neutralizedConstraint[constraint] != 0,
+            infringedConstraint[constraint] != 0,
+        };
     }
     return result;
 }
@@ -6670,6 +6702,162 @@ FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::sp
             }
         }
     }
+    return result;
+}
+
+FiberTraceReferenceRangeBenchmark
+summarizeFiberTraceReferenceRangeBenchmark(
+    const FiberTraceInterleavedWindingReport& retainedWinding,
+    const FiberTraceReferenceWindingBenchmark& retainedCalibration,
+    std::size_t initialPieces,
+    double minimumReferenceWinding,
+    double maximumReferenceWinding)
+{
+    if (!std::isfinite(minimumReferenceWinding) ||
+        !std::isfinite(maximumReferenceWinding) ||
+        minimumReferenceWinding > maximumReferenceWinding) {
+        throw std::invalid_argument(
+            "Reference winding population interval is invalid");
+    }
+    const double minimumInHalfSteps = 2.0 * minimumReferenceWinding;
+    const double maximumInHalfSteps = 2.0 * maximumReferenceWinding;
+    if (std::abs(minimumInHalfSteps - std::round(minimumInHalfSteps)) >
+            kEpsilon ||
+        std::abs(maximumInHalfSteps - std::round(maximumInHalfSteps)) >
+            kEpsilon) {
+        throw std::invalid_argument(
+            "Reference winding population interval is not on the half-winding grid");
+    }
+    const double spanInHalfSteps =
+        2.0 * (maximumReferenceWinding - minimumReferenceWinding);
+    const auto maximumIndex = static_cast<std::size_t>(
+        std::llround(spanInHalfSteps));
+    if (std::abs(spanInHalfSteps - static_cast<double>(maximumIndex)) >
+        kEpsilon) {
+        throw std::invalid_argument(
+            "Reference winding population interval is not on the half-winding grid");
+    }
+    const std::size_t retainedPieces = retainedWinding.windingValid.size();
+    if (retainedWinding.mapLatentCoordinate.size() != retainedPieces ||
+        retainedWinding.mapOrientationByPiece.size() != retainedPieces ||
+        retainedWinding.integerGaugeByPiece.size() != retainedPieces ||
+        initialPieces < retainedPieces ||
+        (retainedCalibration.globalSign != -1 &&
+         retainedCalibration.globalSign != 1)) {
+        throw std::invalid_argument(
+            "Reference winding population inputs are incompatible");
+    }
+    std::map<std::size_t, double> offsetByGauge;
+    for (const auto& gauge : retainedCalibration.gauges) {
+        if (!std::isfinite(gauge.offset) ||
+            !offsetByGauge.emplace(gauge.integerGauge, gauge.offset).second) {
+            throw std::invalid_argument(
+                "Reference winding population calibration is invalid");
+        }
+    }
+    FiberTraceReferenceRangeBenchmark result;
+    result.minimumReferenceWinding = minimumReferenceWinding;
+    result.maximumReferenceWinding = maximumReferenceWinding;
+    result.initialPieces = initialPieces;
+    result.retainedPieces = retainedPieces;
+    result.removedPieces = initialPieces - retainedPieces;
+    result.windings.resize(maximumIndex + 1);
+    for (std::size_t index = 0; index <= maximumIndex; ++index)
+        result.windings[index].winding =
+            minimumReferenceWinding + 0.5 * static_cast<double>(index);
+    for (std::size_t piece = 0; piece < retainedPieces; ++piece) {
+        if (retainedWinding.windingValid[piece] == 0 ||
+            retainedWinding.mapOrientationByPiece[piece] ==
+                FiberTraceFixedOrientation::Mixed) {
+            continue;
+        }
+        if (!std::isfinite(retainedWinding.mapLatentCoordinate[piece])) {
+            throw std::invalid_argument(
+                "Reference winding population has a nonfinite active coordinate");
+        }
+        const auto offset = offsetByGauge.find(
+            retainedWinding.integerGaugeByPiece[piece]);
+        if (offset == offsetByGauge.end()) {
+            ++result.activeUncalibratedPieces;
+            continue;
+        }
+        const double referenceWinding =
+            static_cast<double>(retainedCalibration.globalSign) *
+            (retainedWinding.mapLatentCoordinate[piece] - offset->second);
+        if (referenceWinding < minimumReferenceWinding - kEpsilon ||
+            referenceWinding > maximumReferenceWinding + kEpsilon) {
+            continue;
+        }
+        const double relativeHalfStep =
+            2.0 * (referenceWinding - minimumReferenceWinding);
+        if (std::abs(relativeHalfStep - std::round(relativeHalfStep)) >
+            kEpsilon) {
+            throw std::invalid_argument(
+                "Reference winding population assignment is not on the half-winding grid");
+        }
+        const auto windingIndex = static_cast<long long>(
+            std::llround(relativeHalfStep));
+        if (windingIndex < 0 ||
+            windingIndex > static_cast<long long>(maximumIndex)) {
+            continue;
+        }
+        auto& row = result.windings[static_cast<std::size_t>(windingIndex)];
+        ++row.pieces;
+        ++result.retainedInRangePieces;
+    }
+    result.retainedOtherPieces =
+        result.retainedPieces - result.retainedInRangePieces;
+    return result;
+}
+
+FiberTracePruningConstraintBenchmark
+summarizeFiberTracePruningConstraintBenchmark(
+    std::size_t initialConstraints,
+    std::span<const std::size_t> retainedOrdinaryConstraintIndices,
+    const FiberTraceConstraintReport& conditionedConstraints,
+    const FiberTraceInterleavedWindingReport& conditionedWinding,
+    std::size_t ordinaryConstraintOffset)
+{
+    if (initialConstraints < retainedOrdinaryConstraintIndices.size() ||
+        ordinaryConstraintOffset > conditionedConstraints.constraints.size()) {
+        throw std::invalid_argument(
+            "Pruning constraint benchmark range is invalid");
+    }
+    std::set<std::size_t> retainedIdentities;
+    for (const std::size_t constraint : retainedOrdinaryConstraintIndices) {
+        if (constraint >= initialConstraints ||
+            ordinaryConstraintOffset + constraint >=
+                conditionedConstraints.constraints.size() ||
+            !retainedIdentities.insert(constraint).second) {
+            throw std::invalid_argument(
+                "Pruning retained constraint mapping is invalid");
+        }
+    }
+    const auto agreement = summarizeFiberTraceConstraintAgreement(
+        conditionedConstraints, conditionedWinding);
+    FiberTracePruningConstraintBenchmark result;
+    result.initialConstraints = initialConstraints;
+    result.removedIncidentConstraints =
+        initialConstraints - retainedOrdinaryConstraintIndices.size();
+    for (const std::size_t constraint : retainedOrdinaryConstraintIndices) {
+        const auto& state = agreement.constraintStates.at(
+            ordinaryConstraintOffset + constraint);
+        if (!state.prepared) {
+            throw std::invalid_argument(
+                "Retained constraint has no factor diagnostic");
+        }
+        if (state.defectNeutralized) {
+            ++result.retainedDefectConstraints;
+        } else if (state.infringed) {
+            ++result.retainedInfringedConstraints;
+        } else {
+            ++result.retainedFulfilledConstraints;
+        }
+    }
+    result.problematicConstraints =
+        result.removedIncidentConstraints +
+        result.retainedInfringedConstraints +
+        result.retainedDefectConstraints;
     return result;
 }
 

@@ -6128,6 +6128,21 @@
   collective offenders. After exact-count maximization, an explicit missing
   reference is preferable to preserving a known wrong winding. Direct and
   fresh artifacts use `_oracle` and `_oracle_fresh`.
+- Direct conditioned-inlier diagnostics must group final active H/V pieces by
+  their assigned half-winding in the inclusive annotated reference interval
+  `0..0.5*(reference_count-1)`, using the final result's benchmark global sign
+  and integer-gauge offsets. The piece benchmark compares every removed
+  original piece with final active in-range pieces, reporting both
+  `removed/(removed+in_range)` and `removed/in_range`. It must not aggregate
+  piece-level removal into source-fiber counts. Active final pieces without a
+  calibrated gauge are reported separately.
+- The companion constraint benchmark counts every original graph constraint
+  once, independently of how many orientation, magnitude, or sign terms it
+  emits. A constraint is problematic if either endpoint was removed, a retained
+  endpoint is final Defect, or any evaluated term is infringed by the
+  authoritative conditioned result. All other retained constraints are
+  fulfilled. Report both `problematic/(problematic+fulfilled)` and
+  `problematic/fulfilled`.
 
 ## Experimental sign-only ordered winding cuts
 

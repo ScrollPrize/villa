@@ -1294,7 +1294,9 @@ FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(const FiberTra
     }
 
     result.report.constraints.reserve(constraints.constraints.size());
-    for (const auto& original : constraints.constraints) {
+    for (std::size_t originalIndex = 0;
+         originalIndex < constraints.constraints.size(); ++originalIndex) {
+        const auto& original = constraints.constraints[originalIndex];
         if (original.pieceA >= constraints.pieces.size() || original.pieceB >= constraints.pieces.size() || original.pieceA == original.pieceB) {
             throw std::invalid_argument("Constraint subset link references an invalid piece pair");
         }
@@ -1312,6 +1314,7 @@ FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(const FiberTra
             ++result.report.skippedSignedWindingConstraints;
         }
         result.report.constraints.push_back(std::move(constraint));
+        result.retainedConstraintIndices.push_back(originalIndex);
     }
     return result;
 }

@@ -1129,6 +1129,49 @@ TEST_CASE("Constraint agreement separates infringed and Defect-neutralized facto
     CHECK(summary.total.evaluated == 4);
     CHECK(summary.total.defectNeutralized == 3);
     CHECK(summary.total.infringed == 1);
+    CHECK(summary.uniqueConstraints.prepared == 4);
+    CHECK(summary.uniqueConstraints.evaluated == 2);
+    CHECK(summary.uniqueConstraints.defectNeutralized == 2);
+    CHECK(summary.uniqueConstraints.infringed == 1);
+    const std::array<std::size_t, 4> retainedConstraints{0, 1, 2, 3};
+    const auto benchmark = summarizeFiberTracePruningConstraintBenchmark(
+        6, retainedConstraints, report, winding, 0);
+    CHECK(benchmark.initialConstraints == 6);
+    CHECK(benchmark.removedIncidentConstraints == 2);
+    CHECK(benchmark.retainedInfringedConstraints == 1);
+    CHECK(benchmark.retainedDefectConstraints == 2);
+    CHECK(benchmark.problematicConstraints == 5);
+    CHECK(benchmark.retainedFulfilledConstraints == 1);
+
+    const std::array<std::size_t, 3> sparseRetainedConstraints{0, 2, 3};
+    const auto sparseBenchmark = summarizeFiberTracePruningConstraintBenchmark(
+        6, sparseRetainedConstraints, report, winding, 0);
+    CHECK(sparseBenchmark.initialConstraints == 6);
+    CHECK(sparseBenchmark.removedIncidentConstraints == 3);
+    CHECK(sparseBenchmark.retainedInfringedConstraints == 0);
+    CHECK(sparseBenchmark.retainedDefectConstraints == 2);
+    CHECK(sparseBenchmark.problematicConstraints == 5);
+    CHECK(sparseBenchmark.retainedFulfilledConstraints == 1);
+
+    auto prefixedReport = report;
+    prefixedReport.constraints.insert(
+        prefixedReport.constraints.begin(), report.constraints.front());
+    auto prefixedWinding = winding;
+    for (auto& factor : prefixedWinding.factorDiagnostics)
+        ++factor.constraintIndex;
+    auto prefixFactor = diagnostic(0, 0, 1);
+    prefixedWinding.factorDiagnostics.insert(
+        prefixedWinding.factorDiagnostics.begin(), prefixFactor);
+    const auto prefixedSparseBenchmark =
+        summarizeFiberTracePruningConstraintBenchmark(
+            6, sparseRetainedConstraints, prefixedReport,
+            prefixedWinding, 1);
+    CHECK(prefixedSparseBenchmark.initialConstraints == 6);
+    CHECK(prefixedSparseBenchmark.removedIncidentConstraints == 3);
+    CHECK(prefixedSparseBenchmark.retainedInfringedConstraints == 0);
+    CHECK(prefixedSparseBenchmark.retainedDefectConstraints == 2);
+    CHECK(prefixedSparseBenchmark.problematicConstraints == 5);
+    CHECK(prefixedSparseBenchmark.retainedFulfilledConstraints == 1);
 }
 
 TEST_CASE("Largest winding component uses effective factors and deterministic ties")
@@ -5067,6 +5110,89 @@ TEST_CASE("Gauge alignment transforms integer and interleaved latent coordinates
     CHECK(transformed.componentPhaseSign == std::vector<int>{-1});
     CHECK(transformed.componentPositivePhaseSignProbability[0] ==
           doctest::Approx(0.2));
+}
+
+TEST_CASE("Reference winding range benchmark uses calibrated final pieces")
+{
+    FiberTraceInterleavedWindingReport initial;
+    initial.windingValid = {1, 1, 1, 1, 0, 1};
+    initial.mapLatentCoordinate = {10.0, 9.5, 18.5, 8.0, 9.0, 7.0};
+    initial.integerGaugeByPiece = {0, 0, 1, 0, 0, 2};
+    initial.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    FiberTraceReferenceWindingBenchmark initialCalibration;
+    initialCalibration.globalSign = -1;
+    initialCalibration.gauges = {{0, 10.0, 0, 0}, {1, 20.0, 0, 0}};
+    const auto benchmark = summarizeFiberTraceReferenceRangeBenchmark(
+        initial,
+        initialCalibration,
+        9,
+        0.0,
+        1.5);
+    REQUIRE(benchmark.windings.size() == 4);
+    CHECK(benchmark.windings[0].winding == 0.0);
+    CHECK(benchmark.windings[0].pieces == 1);
+    CHECK(benchmark.windings[1].winding == 0.5);
+    CHECK(benchmark.windings[1].pieces == 1);
+    CHECK(benchmark.windings[2].pieces == 0);
+    CHECK(benchmark.windings[3].winding == 1.5);
+    CHECK(benchmark.windings[3].pieces == 1);
+    CHECK(benchmark.initialPieces == 9);
+    CHECK(benchmark.retainedPieces == 6);
+    CHECK(benchmark.removedPieces == 3);
+    CHECK(benchmark.retainedInRangePieces == 3);
+    CHECK(benchmark.retainedOtherPieces == 3);
+    CHECK(benchmark.activeUncalibratedPieces == 1);
+
+    initial.mapLatentCoordinate[0] =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        summarizeFiberTraceReferenceRangeBenchmark(
+            initial, initialCalibration, 9, 0.0, 1.5),
+        std::invalid_argument);
+}
+
+TEST_CASE("Reference winding range retention validates its half-winding cohort")
+{
+    FiberTraceInterleavedWindingReport report;
+    report.windingValid = {1, 1, 1};
+    report.mapLatentCoordinate = {2.0, 2.0, 2.5};
+    report.integerGaugeByPiece = {3, 3, 3};
+    report.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Mixed,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    FiberTraceReferenceWindingBenchmark calibration;
+    calibration.globalSign = 1;
+    calibration.gauges = {{3, 2.0, 0, 0}};
+    const auto zeroWidth = summarizeFiberTraceReferenceRangeBenchmark(
+        report, calibration, 3, 0.0, 0.0);
+    REQUIRE(zeroWidth.windings.size() == 1);
+    CHECK(zeroWidth.retainedInRangePieces == 1);
+    CHECK(zeroWidth.removedPieces == 0);
+    CHECK_THROWS_AS(
+        summarizeFiberTraceReferenceRangeBenchmark(
+            report, calibration, 3, 0.25, 0.75),
+        std::invalid_argument);
+
+    report.mapLatentCoordinate[0] = 2.25;
+    CHECK_THROWS_AS(
+        summarizeFiberTraceReferenceRangeBenchmark(
+            report, calibration, 3, 0.0, 0.5),
+        std::invalid_argument);
+    report.mapLatentCoordinate[0] = 2.0;
+    calibration.globalSign = 0;
+    CHECK_THROWS_AS(
+        summarizeFiberTraceReferenceRangeBenchmark(
+            report, calibration, 3, 0.0, 0.5),
+        std::invalid_argument);
 }
 
 }  // namespace

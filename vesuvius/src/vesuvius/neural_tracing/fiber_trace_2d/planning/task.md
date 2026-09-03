@@ -1,16 +1,11 @@
-# Current task: oracle construction of a correct winding working set
+# Task: Reference-Winding Population Retention
 
-The sign-consistent conditioned inlier selector improves the 1024 reference
-benchmark from 16/26 to 20/26 exact windings but is still insufficient. Build a
-reference-supervised oracle pruning mode that finds a retained ordinary
-fiber-piece set whose conditioned solve has no wrong identifiable reference
-winding. References that lose all correct support must be reported as missing,
-not retained under a known false label.
+Convert the supervised conditioned-oracle population diagnostics into a compact
+piece-and-constraint pruning benchmark.
 
-Reference sign constraints are authoritative. Winding-magnitude constraints
-may be biased and may be weighted or disabled while ranking removals. Preserve
-as much retained fiber arc as possible after first maximizing exact references
-and eliminating wrong labels.
-Re-solve after pruning rounds rather than assuming one conditioned assignment
-remains valid. Report the trajectory, final retained geometry, direct
-conditioned benchmark, and fresh reference-free stability benchmark.
+Report final retained active pieces per annotated reference winding. Compare all
+removed pieces against retained in-range pieces as both a problematic fraction
+and a problematic/retained magnitude. Count each graph constraint once and
+classify constraints incident to removed/final-Defect pieces or infringed by the
+authoritative final solution as problematic, versus retained fulfilled
+constraints. Do not aggregate pieces into source-fiber counts.

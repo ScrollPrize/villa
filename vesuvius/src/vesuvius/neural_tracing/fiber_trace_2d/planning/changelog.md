@@ -1925,3 +1925,10 @@
 - Added supervised oracle inlier diagnostics. The 1024 reference crop retained
   997/1360 pieces and reached 24 exact, 0 wrong, and 2 missing references over
   the full 26-reference set in the direct conditioned result.
+
+## 2026-09-03 - Reference-winding population retention
+
+- Added a calibrated per-winding final-piece benchmark and a unique-constraint
+  pruning benchmark for the annotated reference interval. Both report a
+  problematic fraction and problematic-to-retained magnitude without
+  source-fiber or multi-term constraint double counting.

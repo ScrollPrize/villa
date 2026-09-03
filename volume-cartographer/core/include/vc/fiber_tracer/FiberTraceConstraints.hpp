@@ -145,6 +145,7 @@ struct FiberTraceConstraintSubsetResult {
     FiberTraceConstraintReport report;
     std::vector<std::size_t> retainedPieceIndices;
     std::vector<std::size_t> retainedTraceIndices;
+    std::vector<std::size_t> retainedConstraintIndices;
 };
 
 using FiberTraceWindingDistance = std::function<double(

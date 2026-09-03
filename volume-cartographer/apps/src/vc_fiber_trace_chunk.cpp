@@ -4214,6 +4214,7 @@ struct FixedReferenceConditionedProblem {
     std::vector<vc::fiber_tracer::FiberTraceFixedWindingState> fixedStates;
     std::size_t referencePieces = 0;
     std::size_t crossConstraints = 0;
+    std::size_t ordinaryConstraintOffset = 0;
 };
 
 using WindingWeightTuple = std::array<double, 7>;
@@ -4701,6 +4702,7 @@ FixedReferenceConditionedProblem makeFixedReferenceConditionedProblem(
         if (source.hardContinuity)
             result.constraints.constraints.push_back(source);
     }
+    result.ordinaryConstraintOffset = result.constraints.constraints.size();
     for (const auto& source : bpConstraints.constraints) {
         auto remapped = source;
         remapped.pieceA += result.referencePieces;
@@ -8763,7 +8765,7 @@ int main(int argc, char** argv)
                                     throw std::runtime_error(
                                         "Fixed-reference conditioned solve requires fixed phase and scale");
                                 }
-                                const auto conditionedProblem =
+                                auto conditionedProblem =
                                     makeFixedReferenceConditionedProblem(
                                         *referenceDiagnostics,
                                         *referenceBpConstraints,
@@ -9208,6 +9210,7 @@ int main(int argc, char** argv)
                                                 selection.brokenOrdinaryPieceIndices.push_back(piece);
                                         }
                                         conditioned = std::move(accepted->conditioned);
+                                        conditionedProblem = std::move(accepted->problem);
                                         oracleLocalGaugeMapping.resize(retained.size());
                                         std::iota(oracleLocalGaugeMapping.begin(), oracleLocalGaugeMapping.end(), 0);
                                         rounds << "terminal=" << terminal
@@ -9270,6 +9273,12 @@ int main(int argc, char** argv)
                                         directInlierReport;
                                     std::optional<ReferencePruneArtifactReport>
                                         directArtifactReport;
+                                    std::optional<vc::fiber_tracer::
+                                        FiberTraceReferenceRangeBenchmark>
+                                            referenceRangeBenchmark;
+                                    std::optional<vc::fiber_tracer::
+                                        FiberTracePruningConstraintBenchmark>
+                                            constraintBenchmark;
                                     if (conditionedInliers) {
                                         std::vector<std::size_t> directIndices;
                                         const std::span<const std::size_t> conditionedIndices = [&]() -> std::span<const std::size_t> {
@@ -9284,6 +9293,46 @@ int main(int argc, char** argv)
                                                 conditioned,
                                                 conditionedProblem.referencePieces,
                                                 conditionedIndices);
+                                        if (referenceDiagnostics->sourceNames.empty()) {
+                                            throw std::logic_error(
+                                                "Reference winding population requires at least one reference");
+                                        }
+                                        const auto finalReferenceCalibration =
+                                            vc::fiber_tracer::
+                                                calibrateFiberTraceReferenceWindings(
+                                                    makeReferenceBpWindingObservations(
+                                                        *referenceDiagnostics,
+                                                        prunedCross,
+                                                        *directInlierReport,
+                                                        windingConfig));
+                                        referenceRangeBenchmark = vc::fiber_tracer::
+                                            summarizeFiberTraceReferenceRangeBenchmark(
+                                                *directInlierReport,
+                                                finalReferenceCalibration,
+                                                bpConstraints.pieces.size(),
+                                                0.0,
+                                                0.5 * static_cast<double>(
+                                                    referenceDiagnostics->sourceNames.size() - 1));
+                                        std::vector<std::size_t> directConstraintIndices;
+                                        const std::span<const std::size_t>
+                                            conditionedConstraintIndices = [&]()
+                                            -> std::span<const std::size_t> {
+                                            if (!oracleInliers)
+                                                return subset.retainedConstraintIndices;
+                                            directConstraintIndices.resize(
+                                                subset.report.constraints.size());
+                                            std::iota(
+                                                directConstraintIndices.begin(),
+                                                directConstraintIndices.end(), 0);
+                                            return directConstraintIndices;
+                                        }();
+                                        constraintBenchmark = vc::fiber_tracer::
+                                            summarizeFiberTracePruningConstraintBenchmark(
+                                                bpConstraints.constraints.size(),
+                                                conditionedConstraintIndices,
+                                                conditionedProblem.constraints,
+                                                conditioned,
+                                                conditionedProblem.ordinaryConstraintOffset);
                                         directArtifactReport = publishReferencePruneArtifacts(
                                             options.output,
                                             referencePruneArtifactSuffix(
@@ -9446,6 +9495,88 @@ int main(int argc, char** argv)
                                                << "status=" << (subset.report.pieces.empty() ? "empty" : finalPruned.status)
                                                << " output_base=" << std::quoted(artifactReport.outputBase.string()) << '\n';
                                     if (conditionedInliers) {
+                                        const auto percentText = [](std::size_t numerator,
+                                                                    std::size_t denominator) {
+                                            if (denominator == 0)
+                                                return std::string{"NA"};
+                                            std::ostringstream value;
+                                            value.imbue(std::locale::classic());
+                                            value << std::fixed << std::setprecision(2)
+                                                  << 100.0 * static_cast<double>(numerator) /
+                                                         static_cast<double>(denominator);
+                                            return value.str();
+                                        };
+                                        const auto ratioText = [](std::size_t numerator,
+                                                                  std::size_t denominator) {
+                                            if (denominator == 0)
+                                                return std::string{"NA"};
+                                            std::ostringstream value;
+                                            value.imbue(std::locale::classic());
+                                            value << std::fixed << std::setprecision(3)
+                                                  << static_cast<double>(numerator) /
+                                                         static_cast<double>(denominator);
+                                            return value.str();
+                                        };
+                                        const auto windingRow = [&](std::string_view winding,
+                                                                    const vc::fiber_tracer::
+                                                                        FiberTraceReferenceWindingPopulation& row) {
+                                            diagnostic << std::left << std::setw(10) << winding
+                                                       << std::right << std::setw(10) << row.pieces
+                                                       << '\n';
+                                        };
+                                        diagnostic << "reference winding-area retained pieces"
+                                                   << " minimum=" << std::fixed << std::setprecision(1)
+                                                   << referenceRangeBenchmark->minimumReferenceWinding
+                                                   << " maximum="
+                                                   << referenceRangeBenchmark->maximumReferenceWinding
+                                                   << " cohort=final_active_pieces\n"
+                                                   << std::left << std::setw(10) << "winding"
+                                                   << std::right << std::setw(10) << "pieces" << '\n';
+                                        for (const auto& row :
+                                             referenceRangeBenchmark->windings) {
+                                            std::ostringstream winding;
+                                            winding << std::fixed << std::setprecision(1)
+                                                    << row.winding;
+                                            windingRow(winding.str(), row);
+                                        }
+                                        diagnostic << std::left << std::setw(10) << "sum"
+                                                   << std::right << std::setw(10)
+                                                   << referenceRangeBenchmark->retainedInRangePieces
+                                                   << '\n'
+                                                   << "fiber piece pruning benchmark\n"
+                                                   << "initial  retained_all  removed  retained_ref  retained_other  problematic_%  problematic/ref\n"
+                                                   << referenceRangeBenchmark->initialPieces << "  "
+                                                   << referenceRangeBenchmark->retainedPieces << "  "
+                                                   << referenceRangeBenchmark->removedPieces << "  "
+                                                   << referenceRangeBenchmark->retainedInRangePieces << "  "
+                                                   << referenceRangeBenchmark->retainedOtherPieces << "  "
+                                                   << percentText(
+                                                          referenceRangeBenchmark->removedPieces,
+                                                          referenceRangeBenchmark->removedPieces +
+                                                              referenceRangeBenchmark->retainedInRangePieces)
+                                                   << "  " << ratioText(
+                                                          referenceRangeBenchmark->removedPieces,
+                                                          referenceRangeBenchmark->retainedInRangePieces)
+                                                   << '\n'
+                                                   << "final_active_uncalibrated="
+                                                   << referenceRangeBenchmark->activeUncalibratedPieces
+                                                   << '\n'
+                                                   << "constraint pruning benchmark\n"
+                                                   << "initial  removed_incident  retained_infringed  retained_defect  problematic  retained_fulfilled  problematic_%  problematic/retained\n"
+                                                   << constraintBenchmark->initialConstraints << "  "
+                                                   << constraintBenchmark->removedIncidentConstraints << "  "
+                                                   << constraintBenchmark->retainedInfringedConstraints << "  "
+                                                   << constraintBenchmark->retainedDefectConstraints << "  "
+                                                   << constraintBenchmark->problematicConstraints << "  "
+                                                   << constraintBenchmark->retainedFulfilledConstraints << "  "
+                                                   << percentText(
+                                                          constraintBenchmark->problematicConstraints,
+                                                          constraintBenchmark->problematicConstraints +
+                                                              constraintBenchmark->retainedFulfilledConstraints)
+                                                   << "  " << ratioText(
+                                                          constraintBenchmark->problematicConstraints,
+                                                          constraintBenchmark->retainedFulfilledConstraints)
+                                                   << '\n';
                                         diagnostic << "direct_output_base="
                                                    << std::quoted(directArtifactReport->outputBase.string())
                                                    << "\n\nreference conditioned-inlier result benchmark\n"
