@@ -6,5 +6,5 @@
 - [x] Implement shared replay support for greedy and Lasagna backends.
 - [x] Add and run focused tests.
 - [x] Update specifications, documentation, and changelog.
-- [ ] Run and record the two 1024-crop reference benchmarks.
-- [ ] Commit the completed change.
+- [x] Run and record the two 1024-crop reference benchmarks.
+- [x] Commit the completed change.
