@@ -592,9 +592,13 @@ private:
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode,
                         SeedOrigin seedOrigin = SeedOrigin::NewPlacement);
+    // lineAnchor: linePosition's 3D point on the line the caller measured it
+    // on (see LineAnnotationDialog::generatedControlPointRequested). Absent,
+    // the position is used as given.
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
-                                     double linePosition);
+                                     double linePosition,
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);

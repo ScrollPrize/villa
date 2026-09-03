@@ -23,9 +23,22 @@ finished fiber. If no inference dataset is selected or uniquely attached,
 seed creation remains Lasagna and does not open a dataset picker.
 
 The fallback order is `trace -> lasagna -> cspline` or `lasagna -> cspline`.
-For global Lasagna/trace goals only, endpoint distance below 100 base voxels
-selects `cspline` immediately; exactly 100 voxels still attempts the global
-mode. Explicit goals never use this shortcut. Adjacent cubic-spline spans are
+For the Global goal only, a span shorter than the global mode's own minimum
+selects `cspline` immediately: in trace mode 12 tracer steps
+(`kMinimumTraceSteps * stepVoxels * traceToBaseScale`, 48 base voxels with the
+default 4 vx step), in Lasagna mode two Lasagna segments
+(`kMinimumLasagnaSegments * segmentLength`, about 63 base voxels with the
+default discretization). A span exactly at the minimum still attempts the
+mode (48.0 vx is traced, 47.9 vx is a spline). In trace mode a Global-goal
+span whose trace is not accepted falls back
+to Lasagna only when it is at least the Lasagna minimum long; a shorter one
+goes straight to `cspline` (message `short span, trace -> cspline`, counted as
+`cspline_fallback_segments`, the trace failure metadata kept on the span).
+Explicit goals never use these shortcuts. The tracer's endpoint acceptance is
+bounded per span to a quarter of the start-to-target distance
+(`kEndpointAcceptSpanFraction`; a 50 vx span accepts an endpoint miss of at
+most 12.5 vx, spans of 80 vx and more keep the configured 20 vx), so a short
+accepted trace must actually reach its target. Adjacent cubic-spline spans are
 interpolated jointly with exact CPs, shared internal tangents, and hard boundary
 directions from neighboring stored geometry. The spline helper uses no normal
 or prediction data.
@@ -78,22 +91,25 @@ retain every annotation control point and both line endpoints. The optimized
 line points between adjacent controls define the polyline path but are not
 mandatory columns. Each control-point span is resampled by polyline arclength
 using the interval count whose physical spacing is closest to the
-32-base-voxel target; a short span remains one interval with both controls
-unchanged. Explicit
+8-base-voxel along-line target; a short span remains one interval with both
+controls unchanged. Explicit
 support arclengths provide a bidirectional mapping that keeps control points,
 span labels, hover positions, cut planes, and saved line positions in the
 original fractional point-index coordinate. The strip grid always declares an
-along-line scale of `1/32`, so a short physical control-point span expands to
+along-line scale of `1/8`, so a short physical control-point span expands to
 one nominal display interval instead of changing the scale of the rest of the
 strip. Both ribbons have a fixed seven-row cross grid at 32 voxels per row,
 giving a 192-base-voxel first-to-last-row extent close to the previous typical
-width without depending on optimized-line spacing.
+width without depending on optimized-line spacing. The along-line target and
+the cross-row spacing are independent constants
+(`kLineViewAlongSamplingDistanceBaseVoxels`, `kLineViewCrossRowSpacingBaseVoxels`).
 
 Clicking to place a control point uses optimized-polyline arclength in base
-voxels. Every existing control within an inclusive 32-voxel radius is collapsed
-into one control at the clicked location. This keeps adjacent control spans from
-becoming shorter than the generated strip's nominal sampling distance. Seed,
-surviving span policy, and branch links follow the collapsed control.
+voxels. Every existing control within an inclusive 8-voxel radius (the strip's
+along-line sampling distance) is collapsed into one control at the clicked
+location. This keeps adjacent control spans from becoming shorter than the
+generated strip's nominal sampling distance. Seed, surviving span policy, and
+branch links follow the collapsed control.
 
 With automatic reoptimization, VC3D prepares the edit before changing the live
 session. The same local update is used for insertion, one-control replacement,
@@ -141,7 +157,10 @@ more hop, to the Max extrap CP distance allowance or the end of the extrapolated
 line, whichever is shorter. The boundary is converted from base-voxel
 arclength back into optimized-line position. Pressing the opposite arrow
 mid-pan decelerates through zero and reverses. Up and Down scale the cruising
-speed (default 12 line positions per second, roughly 360 voxels per second),
+speed (default 96 base voxels of optimized-polyline arclength per second, the same
+physical speed in 4 vx trace spans and ~32 vx cspline spans; shift+wheel in the
+current cut and the Space snap use the same arclength unit, one strip column
+(8 vx) per notch and a quarter column for the snap),
 which is shown in a transient badge and remembered between sessions. A Left or
 Right press pauses the mouse hover-follow exactly as the space bar does, so the
 ❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow

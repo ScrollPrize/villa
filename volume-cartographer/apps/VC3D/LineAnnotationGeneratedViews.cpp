@@ -236,15 +236,15 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
     return overlay;
 }
 
-void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
-                           const std::string& surfaceName,
-                           const GeneratedOverlay& overlay)
+std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
+                                  const std::string& surfaceName,
+                                  const GeneratedOverlay& overlay)
 {
     if (!viewer) {
-        return;
+        return {};
     }
 
-    const auto key = "line_annotation_overlay_" + surfaceName;
+    const std::string key = generatedOverlayGroupKey(surfaceName);
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
     size_t branchPointCount = 0;
     for (const auto& branch : overlay.branchLinePoints) {
@@ -647,7 +647,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
-        const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
+        const auto controlRange = overlay.lineTailControlRange.has_value()
+            ? overlay.lineTailControlRange
+            : generatedControlLinePositionRange(overlay.controlPoints);
         // Consecutive non-tail segments accumulate into one polyline
         // primitive per run (same pattern as the branch lines above): a
         // primitive per segment meant one QGraphicsPathItem per segment,
@@ -710,6 +712,7 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     ViewerOverlayControllerBase::applyPrimitives(viewer, key, std::move(primitives));
+    return key;
 }
 
 void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
