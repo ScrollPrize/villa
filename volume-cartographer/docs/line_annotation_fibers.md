@@ -157,7 +157,10 @@ more hop, to the Max extrap CP distance allowance or the end of the extrapolated
 line, whichever is shorter. The boundary is converted from base-voxel
 arclength back into optimized-line position. Pressing the opposite arrow
 mid-pan decelerates through zero and reverses. Up and Down scale the cruising
-speed (default 12 line positions per second, roughly 360 voxels per second),
+speed (default 96 base voxels of optimized-polyline arclength per second, the same
+physical speed in 4 vx trace spans and ~32 vx cspline spans; shift+wheel in the
+current cut and the Space snap use the same arclength unit, one strip column
+(8 vx) per notch and a quarter column for the snap),
 which is shown in a transient badge and remembered between sessions. A Left or
 Right press pauses the mouse hover-follow exactly as the space bar does, so the
 ❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow

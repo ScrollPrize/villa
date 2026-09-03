@@ -365,6 +365,10 @@ private:
     bool controlPointPlacementAllowedAt(double linePosition) const;
     vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
+    // Cumulative base-voxel arclengths of the displayed line (one per point),
+    // or an empty vector when no usable map exists; along-line motion (wheel,
+    // arrow pan, Space snap) is measured in these units.
+    const std::vector<double>& currentLineArclengths() const;
     void rebuildGeneratedStaticStripOverlays();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
                                          bool updateSpanLabels = true);
@@ -573,6 +577,9 @@ private:
     // (space, edits): only a landed pan may hand back to a still-held key.
     bool _arrowPanEndedByLanding = false;
     double _arrowPanVelocity = 0.0;
+    // Unit the running pan's velocity is in (true: base-voxel arclength,
+    // false: line positions); a change mid-gesture cancels the pan.
+    std::optional<bool> _arrowPanArclengthUnits;
     std::optional<double> _arrowPanStopTarget;
     double _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
     double _arrowPanCruiseSpeed =

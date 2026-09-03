@@ -1105,20 +1105,29 @@ inline std::optional<GeneratedParallaxGhost> generatedParallaxGhost(
 // ramp. Everything below is pure arithmetic so it can be exercised without Qt.
 // ---------------------------------------------------------------------------
 
+// The integrator is unit-agnostic; the dialog runs it in base-voxel arclength
+// along the optimized polyline (LineStripPositionMap::originalArclengths) so
+// the pan covers the same physical distance per second in 4 vx trace spans and
+// ~32 vx cspline spans alike, and converts the result back to a line position.
+
 // Seconds spent ramping from rest to the cruise speed (acceleration = cruise / this).
 inline constexpr double kGeneratedArrowPanRampSeconds = 0.25;
-// Cruise-speed bounds and default, in line positions per second (1 unit ~ 30 voxels).
-inline constexpr double kGeneratedArrowPanMinimumSpeed = 1.0;
-inline constexpr double kGeneratedArrowPanMaximumSpeed = 500.0;
-inline constexpr double kGeneratedArrowPanDefaultSpeed = 12.0;
+// Cruise-speed bounds and default, in base voxels of arclength per second. The
+// default matches the previous 12 positions/s at one strip column (8 vx) per
+// position.
+inline constexpr double kGeneratedArrowPanMinimumSpeed = 8.0;
+inline constexpr double kGeneratedArrowPanMaximumSpeed = 4000.0;
+inline constexpr double kGeneratedArrowPanDefaultSpeed = 96.0;
 // Multiplicative step applied by the Up/Down arrows.
 inline constexpr double kGeneratedArrowPanSpeedStep = 1.25;
-// Distance below which a stop target counts as reached.
-inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-9;
+// Distance below which a stop target counts as reached, in the integrator's
+// unit (base voxels in the dialog): far below anything visible, well above
+// double rounding on arclengths of ~1e4.
+inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-3;
 
 struct GeneratedArrowPanState {
     double position = 0.0;
-    // Signed, in line positions per second.
+    // Signed, in the integrator's unit per second.
     double velocity = 0.0;
     // True once the step consumed the stop target exactly.
     bool landed = false;

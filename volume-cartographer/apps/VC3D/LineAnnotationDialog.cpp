@@ -825,8 +825,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const double savedArrowPanSpeed =
-            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED,
-                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_DEFAULT)
+            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX,
+                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX_DEFAULT)
                 .toDouble();
         _arrowPanCruiseSpeed =
             (std::isfinite(savedArrowPanSpeed) && savedArrowPanSpeed > 0.0)
@@ -2618,11 +2618,13 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
-    const double position = vc3d::line_annotation::shiftedLinePosition(
+    // Arclength units: one notch is one strip column of base voxels wherever
+    // the dense line's vertex spacing happens to be (see LineAnnotationShiftScroll.hpp).
+    const double position = vc3d::line_annotation::shiftedLinePositionByArclength(
         _currentLinePosition,
         steps,
         sliceStepSize,
-        static_cast<int>(_generatedViews.linePoints.size()));
+        currentLineArclengths());
     _currentCutNormalOffsetVx = 0.0;
     if (_currentCutViewer) {
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -2834,28 +2836,63 @@ void LineAnnotationDialog::tickArrowPan()
     }
     const double acceleration =
         _arrowPanCruiseSpeed / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
-    const auto step = vc3d::line_annotation::generatedArrowPanStep(_currentLinePosition,
-                                                                   _arrowPanVelocity,
-                                                                   _arrowPanDirection,
-                                                                   _arrowPanCruiseSpeed,
-                                                                   acceleration,
-                                                                   dtSeconds,
-                                                                   _arrowPanStopTarget);
-    _arrowPanVelocity = step.velocity;
-    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
-    const double position = std::clamp(step.position, 0.0, maxPosition);
-    const bool hitLineEnd = (position != step.position);
-    if (step.landed) {
-        finishArrowPan(position);
+    // The integrator runs in base-voxel arclength (speed is vx/s); positions
+    // and the stop target are converted through the current position map each
+    // tick, so an edit that renumbered the line between ticks cannot desync
+    // them. Without a usable map the line positions stand in for arclength.
+    const auto& arclengths = currentLineArclengths();
+    const bool arclengthUnits = !arclengths.empty();
+    // The map only changes with the line geometry, whose in-place update
+    // cancels the pan, so the unit cannot flip mid-gesture; if it ever did the
+    // velocity would be in the wrong unit, so stop rather than lurch.
+    if (_arrowPanArclengthUnits.has_value() && *_arrowPanArclengthUnits != arclengthUnits) {
+        cancelArrowPan();
         return;
     }
+    _arrowPanArclengthUnits = arclengthUnits;
+    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double maxCoordinate = arclengthUnits ? arclengths.back() : maxPosition;
+    const auto toCoordinate = [&](double linePosition) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::arclengthAtLinePosition(arclengths, linePosition)
+            : linePosition;
+    };
+    const auto toLinePosition = [&](double coordinate) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::linePositionAtArclength(arclengths, coordinate)
+            : coordinate;
+    };
+    std::optional<double> stopTargetCoordinate;
+    if (_arrowPanStopTarget) {
+        stopTargetCoordinate = toCoordinate(*_arrowPanStopTarget);
+    }
+    const auto step = vc3d::line_annotation::generatedArrowPanStep(
+        toCoordinate(_currentLinePosition),
+        _arrowPanVelocity,
+        _arrowPanDirection,
+        _arrowPanCruiseSpeed,
+        acceleration,
+        dtSeconds,
+        stopTargetCoordinate);
+    _arrowPanVelocity = step.velocity;
+    const double coordinate = std::clamp(step.position, 0.0, maxCoordinate);
+    const bool hitLineEnd = (coordinate != step.position);
+    if (step.landed) {
+        // Land on the target's own line position: the round trip through
+        // arclength would otherwise leave a rounding residue on the control.
+        finishArrowPan(_arrowPanStopTarget
+                           ? std::clamp(*_arrowPanStopTarget, 0.0, maxPosition)
+                           : std::clamp(toLinePosition(coordinate), 0.0, maxPosition));
+        return;
+    }
+    const double position = std::clamp(toLinePosition(coordinate), 0.0, maxPosition);
     if (hitLineEnd) {
         // Only stop at the line end while the travel still points out of it. A
         // reversal pressed near the end is still shedding outward velocity, so
         // pin the position to the edge and keep integrating until the velocity
         // crosses zero and carries it back inside.
         const bool reversingBackInside =
-            (step.position > maxPosition && _arrowPanDirection < 0) ||
+            (step.position > maxCoordinate && _arrowPanDirection < 0) ||
             (step.position < 0.0 && _arrowPanDirection > 0);
         if (!reversingBackInside) {
             finishArrowPan(position);
@@ -2900,6 +2937,7 @@ void LineAnnotationDialog::cancelArrowPan()
     _arrowPanVelocity = 0.0;
     _arrowPanStopTarget.reset();
     _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    _arrowPanArclengthUnits.reset();
     _arrowPanEndedByLanding = false;
 }
 
@@ -2914,7 +2952,7 @@ void LineAnnotationDialog::adjustArrowPanCruiseSpeed(double factor)
     if (updated != _arrowPanCruiseSpeed) {
         _arrowPanCruiseSpeed = updated;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED, updated);
+        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX, updated);
     }
     // Flash the badge even when the value clamped, so the key press is answered.
     updateArrowPanSpeedIndicator();
@@ -2956,7 +2994,7 @@ void LineAnnotationDialog::updateArrowPanSpeedIndicator()
         _arrowPanSpeedLabel = label;
     }
     _arrowPanSpeedLabel->setText(
-        tr("pan speed %1 /s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
+        tr("pan speed %1 vx/s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
     _arrowPanSpeedLabel->adjustSize();
     // Top-center of the top strip; the pause badge sits on the bottom strip.
     _arrowPanSpeedLabel->move(
@@ -3567,7 +3605,19 @@ double LineAnnotationDialog::snappedControlPointPosition(double position) const
     for (const auto& control : _generatedViews.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    return vc3d::line_annotation::snappedControlPointLinePosition(position, controlLinePositions);
+    return vc3d::line_annotation::snappedControlPointLinePositionByArclength(
+        position, controlLinePositions, currentLineArclengths());
+}
+
+const std::vector<double>& LineAnnotationDialog::currentLineArclengths() const
+{
+    // The position map's cumulative arclengths, one per displayed line point;
+    // empty (callers fall back to index units) while no usable map exists.
+    static const std::vector<double> kNone;
+    const auto& arclengths = _generatedViews.stripPositionMap.originalArclengths;
+    return vc3d::line_annotation::lineArclengthsUsable(arclengths, _generatedViews.linePoints.size())
+        ? arclengths
+        : kNone;
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
@@ -4698,6 +4748,7 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     // paused -- so, like the shift-click snap, it has to stop the pan itself:
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
+    // The key places ON the line, so its point is also the position's anchor.
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
                                         _currentLinePosition,

@@ -456,6 +456,73 @@ TEST_CASE("line annotation shift scroll uses viewer slice step size")
     CHECK(vc3d::line_annotation::shiftedLinePosition(2.0, -2, 5, 101) == 0.0);
 }
 
+TEST_CASE("line annotation shift scroll by arclength moves one strip column per notch")
+{
+    using vc3d::line_annotation::kShiftScrollLineStepBaseVoxels;
+    using vc3d::line_annotation::shiftedLinePositionByArclength;
+    CHECK(kShiftScrollLineStepBaseVoxels == doctest::Approx(8.0));
+
+    // Mixed density: 4 vx vertices for positions 0..10 (arclength 0..40),
+    // then 32 vx vertices for positions 11..15 (arclength 72..200).
+    std::vector<double> arclengths;
+    for (int i = 0; i <= 10; ++i) {
+        arclengths.push_back(4.0 * i);
+    }
+    for (int i = 1; i <= 5; ++i) {
+        arclengths.push_back(40.0 + 32.0 * i);
+    }
+    REQUIRE(arclengths.size() == 16);
+
+    // One notch = 8 vx: two vertices in the dense region, a quarter vertex in
+    // the sparse one.
+    CHECK(shiftedLinePositionByArclength(2.0, 1, 1, arclengths) == doctest::Approx(4.0));
+    CHECK(shiftedLinePositionByArclength(12.0, 1, 1, arclengths) == doctest::Approx(12.25));
+    CHECK(shiftedLinePositionByArclength(12.0, -1, 1, arclengths) == doctest::Approx(11.75));
+    // Step size scales the notch; crossing the density boundary stays exact.
+    CHECK(shiftedLinePositionByArclength(8.0, 1, 5, arclengths) == doctest::Approx(11.0));
+    // Clamped at both ends.
+    CHECK(shiftedLinePositionByArclength(15.0, 3, 1, arclengths) == doctest::Approx(15.0));
+    CHECK(shiftedLinePositionByArclength(0.5, -1, 1, arclengths) == doctest::Approx(0.0));
+    // Without a usable map the index step applies.
+    const std::vector<double> none;
+    CHECK(shiftedLinePositionByArclength(3.0, 2, 1, none) == doctest::Approx(3.0));
+}
+
+TEST_CASE("line annotation arclength snap uses a quarter strip column")
+{
+    using vc3d::line_annotation::kControlPointSnapArclengthBaseVoxels;
+    using vc3d::line_annotation::snappedControlPointLinePositionByArclength;
+    CHECK(kControlPointSnapArclengthBaseVoxels == doctest::Approx(2.0));
+
+    const std::vector<double> controlPositions{12.0, 20.0, 40.0};
+    std::vector<double> dense;  // 4 vx per position: 2 vx = half a position
+    for (int i = 0; i <= 50; ++i) {
+        dense.push_back(4.0 * i);
+    }
+    CHECK(snappedControlPointLinePositionByArclength(19.5, controlPositions, dense) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(20.5, controlPositions, dense) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(19.49, controlPositions, dense) ==
+          doctest::Approx(19.49));
+
+    std::vector<double> sparse;  // 32 vx per position: 2 vx = 1/16 position
+    for (int i = 0; i <= 50; ++i) {
+        sparse.push_back(32.0 * i);
+    }
+    CHECK(snappedControlPointLinePositionByArclength(20.0625, controlPositions, sparse) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(20.07, controlPositions, sparse) ==
+          doctest::Approx(20.07));
+
+    // Without a usable map the quarter-position rule applies.
+    const std::vector<double> none;
+    CHECK(snappedControlPointLinePositionByArclength(19.75, controlPositions, none) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(19.7, controlPositions, none) ==
+          doctest::Approx(19.7));
+}
+
 TEST_CASE("line annotation straight shift scroll moves cut origin along plane normal")
 {
     const cv::Vec3f origin{1.0f, 2.0f, 3.0f};
