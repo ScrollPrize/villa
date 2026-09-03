@@ -49,6 +49,47 @@ wholly absent sparse chunks are empty. A present anchor/prefix/route tuple must
 be complete and valid. The original Fiber manifest and an expected-chunk index
 are not inputs.
 
+## Transient staged filtering
+
+Repeat `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` on `trace` to run the existing
+exact chunk-route reduction passes before crop graph materialization. Stage
+coordinates are global base-XYZ coordinates. The final stage includes every
+box on its global lattice that intersects the half-open `--bbox`; earlier
+stages are expanded recursively to cover every later box plus the dataset's
+maximum endpoint reach. Missing upper-layer chunks inherit the preceding
+layer, while explicit empty chunks shadow it. The source combined Zarr is
+read-only, and every transient layer is removed after the output artifact has
+been written.
+
+Transient rewrites use the float32 cache profile even when the source uses
+compact directions and fixed-width costs. This preserves the exact decoded
+source geometry and cost while records pass through repeated reduction layers;
+untouched chunks continue to fall through to the compact source. The ordered
+stage list and effective filter policy are stored under `preprocessing` in the
+trace artifact metadata.
+
+For the PHercParis4 1024 crop, this schedule first filters the aligned 256
+grid, then its half-offset grid, and finally the 512 grid whose boxes straddle
+the crop faces:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk trace \
+  /path/to/fiberlets.zarr \
+  --normal-manifest /path/to/las_008.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --output crop_traces.zarr \
+  --obj traces.obj \
+  --stage 256,0,0,0 \
+  --stage 256,128,128,128 \
+  --stage 512,256,256,256
+```
+
+The optional filter controls are `--join-angle DEG`, `--cost-profile stored`
+or `sqrt-u16`, and `--max-states N`. They are only valid when at least one
+stage is present. The command reports progress and aggregate input/output
+record counts for each stage. Because boxes overlap, those counts are
+per-processed-box totals rather than unique dataset populations.
+
 Crop materialization reads prefix and route owner chunks from the bounded
 dependency halo around the lookahead-expanded search box, filters those records
 to Fiberlets incident to an actual search-box anchor, and only then loads their

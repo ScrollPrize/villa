@@ -40,6 +40,7 @@
 #include <numeric>
 #include <numbers>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <span>
@@ -91,6 +92,12 @@ struct Options {
         vc::fiber_tracer::kFiberDirectionDominanceFraction;
     int threads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
     std::size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::vector<vc::fiber_tracer::FiberletFilterStageSpec> filterStages;
+    float filterMaximumJoinAngleDegrees = 45.0F;
+    vc::fiber_tracer::FiberletChunkRouteEdgeCostView filterEdgeCostView =
+        vc::fiber_tracer::FiberletChunkRouteEdgeCostView::Stored;
+    std::size_t filterMaximumStatesPerEntry = 5'000'000;
+    bool hasFilterPolicyOption = false;
     vc::fiber_tracer::FiberletCropTraceConfig trace;
     vc::fiber_tracer::FiberTraceConstraintConfig constraints;
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
@@ -204,6 +211,31 @@ struct Options {
     bool hasWindingCutoffOption = false;
     bool hasOrderedCutsOption = false;
     bool hasDirectReplayOption = false;
+};
+
+struct TransientCropFilter {
+    std::filesystem::path root;
+    std::shared_ptr<vc::fiber_tracer::FiberletChunkWriteBackCache> writeBack;
+    std::vector<vc::fiber_tracer::FiberletTransientLayer> layers;
+
+    ~TransientCropFilter()
+    {
+        for (auto iterator = layers.rbegin(); iterator != layers.rend();
+             ++iterator) {
+            if (iterator->anchorCache)
+                iterator->anchorCache->cancelPendingAndWait();
+            if (iterator->fiberletCache)
+                iterator->fiberletCache->cancelPendingAndWait();
+        }
+        if (writeBack) {
+            try {
+                writeBack->finish();
+            } catch (...) {
+            }
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -324,6 +356,10 @@ void usage(const char* executable)
               << "  --remote-cache-dir PATH    cache for a remote normal manifest\n"
               << "  --threads N                graph preparation and trace workers [host CPUs]\n"
               << "  --cache-gib N              decoded graph/normal cache [8]\n"
+              << "  --stage N,OX,OY,OZ        repeatable transient filter side/XYZ offset\n"
+              << "  --join-angle DEG          filter route join angle [45]\n"
+              << "  --cost-profile NAME       filter edge cost: stored or sqrt-u16 [stored]\n"
+              << "  --max-states N            filter states per entering Fiberlet [5000000]\n"
               << "  --profile-memory          print graph/cache memory counters every second\n"
               << "  --beam N                   retained lookahead candidates [16]\n"
               << "  --lookahead N              lookahead in base voxels [384]\n"
@@ -487,6 +523,31 @@ std::array<int, 2> integerPair(
             fail(std::string(option) + " requires two comma-separated integers");
     }
     return result;
+}
+
+vc::fiber_tracer::FiberletFilterStageSpec parseFilterStage(
+    const std::string& input)
+{
+    std::array<std::int64_t, 4> values{};
+    std::stringstream stream(input);
+    std::string token;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (!std::getline(stream, token, ',') || token.empty())
+            fail("--stage requires SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z");
+        std::size_t parsed = 0;
+        try {
+            values[index] = std::stoll(token, &parsed);
+        } catch (const std::exception&) {
+            fail("--stage requires four signed 64-bit integers");
+        }
+        if (parsed != token.size())
+            fail("--stage requires four signed 64-bit integers");
+    }
+    if (std::getline(stream, token, ','))
+        fail("--stage requires exactly four integers");
+    if (values[0] <= 0)
+        fail("--stage SIDE must be positive");
+    return {values[0], {values[1], values[2], values[3]}};
 }
 
 std::vector<double> numberList(
@@ -723,6 +784,39 @@ Options parse(int argc, char** argv)
                 fail("--cache-gib must be positive");
             options.cacheBytes = static_cast<std::size_t>(gib * 1024.0 * 1024.0 * 1024.0);
             options.hasSharedRuntimeOption = true;
+        } else if (argument == "--stage") {
+            options.filterStages.push_back(parseFilterStage(
+                value(index, argc, argv, "--stage")));
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--join-angle") {
+            options.filterMaximumJoinAngleDegrees = static_cast<float>(
+                number(index, argc, argv, "--join-angle"));
+            if (!(options.filterMaximumJoinAngleDegrees >= 0.0F) ||
+                !(options.filterMaximumJoinAngleDegrees <= 180.0F)) {
+                fail("--join-angle must be in [0, 180]");
+            }
+            options.hasFilterPolicyOption = true;
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--cost-profile") {
+            const auto profile = value(index, argc, argv, "--cost-profile");
+            if (profile == "stored") {
+                options.filterEdgeCostView = vc::fiber_tracer::
+                    FiberletChunkRouteEdgeCostView::Stored;
+            } else if (profile == "sqrt-u16") {
+                options.filterEdgeCostView = vc::fiber_tracer::
+                    FiberletChunkRouteEdgeCostView::SqrtUint16Max256;
+            } else {
+                fail("--cost-profile must be stored or sqrt-u16");
+            }
+            options.hasFilterPolicyOption = true;
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--max-states") {
+            options.filterMaximumStatesPerEntry =
+                count(index, argc, argv, "--max-states");
+            if (options.filterMaximumStatesPerEntry == 0)
+                fail("--max-states must be positive");
+            options.hasFilterPolicyOption = true;
+            options.hasTraceOnlyOption = true;
         } else if (argument == "--profile-memory") {
             options.profileMemory = true;
             options.hasTraceOnlyOption = true;
@@ -1796,6 +1890,8 @@ Options parse(int argc, char** argv)
         fail("trace does not accept --quality-fraction");
     if (options.hasConstraintOnlyOption)
         fail("trace does not accept constraint extraction options");
+    if (options.hasFilterPolicyOption && options.filterStages.empty())
+        fail("filter policy options require at least one --stage");
     if (!options.hasBounds)
         fail("--bbox is required");
     if (options.obj.empty()) {
@@ -10656,9 +10752,181 @@ int main(int argc, char** argv)
 
         vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
         cacheOptions.service.decodedByteCapacity = options.cacheBytes;
+        auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
+            options.cacheBytes);
+        cacheOptions.service.decodedByteBudget = graphBudget;
         cacheOptions.service.fetchConcurrency.workerCapacity = static_cast<std::size_t>(options.threads);
         cacheOptions.service.fetchConcurrency.maxConcurrentReads = static_cast<std::size_t>(options.threads);
-        vc::fiber_tracer::FiberletStoredReplayGraphSource graph(dataset, cacheOptions);
+        std::shared_ptr<TransientCropFilter> transientFilter;
+        std::unique_ptr<vc::fiber_tracer::FiberletStoredReplayGraphSource> graph;
+        nlohmann::json filterProvenance;
+        if (options.filterStages.empty()) {
+            graph = std::make_unique<
+                vc::fiber_tracer::FiberletStoredReplayGraphSource>(
+                dataset, cacheOptions);
+        } else {
+            const auto& metadata = dataset->metadata();
+            const double cellSideBase =
+                static_cast<double>(metadata.spatialChunkSideBaseVoxels) /
+                static_cast<double>(metadata.coordinateUnitsPerChunkZYX[0]);
+            cv::Vec3d volumeMaximumBaseXYZ;
+            cv::Vec3d maximumEndpointReachBaseXYZ;
+            for (int xyz = 0; xyz < 3; ++xyz) {
+                const int zyx = 2 - xyz;
+                volumeMaximumBaseXYZ[xyz] =
+                    static_cast<double>(metadata.coordinateOriginZYX[zyx] +
+                        static_cast<std::int64_t>(metadata.chunkGridShapeZYX[zyx]) *
+                            metadata.coordinateUnitsPerChunkZYX[zyx]) *
+                    cellSideBase;
+                maximumEndpointReachBaseXYZ[xyz] =
+                    static_cast<double>(
+                        metadata.maximumEndpointReachCoordinateUnitsZYX[zyx]) *
+                    cellSideBase;
+            }
+            vc::fiber_tracer::FiberletChunkRouteAnalysisConfig analysis;
+            analysis.maximumJoinAngleDegrees =
+                options.filterMaximumJoinAngleDegrees;
+            analysis.edgeCostView = options.filterEdgeCostView;
+            analysis.parallelThreads = static_cast<std::size_t>(options.threads);
+            analysis.maximumGeneratedStatesPerEntry =
+                options.filterMaximumStatesPerEntry;
+            const auto plan = vc::fiber_tracer::planFiberletFilterStagesForBox(
+                options.filterStages, options.trace.minimumBaseXYZ,
+                options.trace.maximumBaseXYZ, volumeMaximumBaseXYZ,
+                maximumEndpointReachBaseXYZ, analysis);
+
+            transientFilter = std::make_shared<TransientCropFilter>();
+            const auto parent = options.output.parent_path().empty()
+                ? std::filesystem::path{"."}
+                : options.output.parent_path();
+            std::filesystem::create_directories(parent);
+            std::mt19937_64 random(std::random_device{}());
+            do {
+                transientFilter->root = parent /
+                    (".fiberlet-crop-filter-" + std::to_string(random()));
+            } while (std::filesystem::exists(transientFilter->root));
+            std::filesystem::create_directories(transientFilter->root);
+            transientFilter->writeBack =
+                vc::fiber_tracer::FiberletChunkWriteBackCache::create({
+                    options.cacheBytes, 1, graphBudget, {}});
+            transientFilter->layers.push_back(
+                vc::fiber_tracer::createStoredCombinedFiberletLayerView(
+                    transientFilter->root, dataset, cacheOptions));
+
+            filterProvenance = {
+                {"contract", "transient_crop_filter_v1"},
+                {"target_minimum_base_xyz",
+                 {options.trace.minimumBaseXYZ[0],
+                  options.trace.minimumBaseXYZ[1],
+                  options.trace.minimumBaseXYZ[2]}},
+                {"target_maximum_base_xyz",
+                 {options.trace.maximumBaseXYZ[0],
+                  options.trace.maximumBaseXYZ[1],
+                  options.trace.maximumBaseXYZ[2]}},
+                {"maximum_join_angle_degrees",
+                 options.filterMaximumJoinAngleDegrees},
+                {"edge_cost_view",
+                 options.filterEdgeCostView == vc::fiber_tracer::
+                         FiberletChunkRouteEdgeCostView::Stored
+                     ? "stored"
+                     : "sqrt_u16_max256"},
+                {"maximum_generated_states_per_entry",
+                 options.filterMaximumStatesPerEntry},
+                {"stages", nlohmann::json::array()},
+            };
+            for (std::size_t stageIndex = 0;
+                 stageIndex < options.filterStages.size(); ++stageIndex) {
+                const auto& specification = options.filterStages[stageIndex];
+                const auto& boxes = plan.stageBoxes[stageIndex];
+                filterProvenance["stages"].push_back({
+                    {"side_base_voxels", specification.sideBaseVoxels},
+                    {"offset_base_xyz", specification.offsetBaseXYZ},
+                    {"box_count", boxes.size()},
+                });
+                std::cout << "fiberlet crop filter stage=" << stageIndex + 1
+                          << '/' << options.filterStages.size()
+                          << " boxes=" << boxes.size()
+                          << " status=started\n" << std::flush;
+                const auto stageStarted = std::chrono::steady_clock::now();
+                auto lastPrinted = stageStarted;
+                std::size_t inputAnchors = 0;
+                std::size_t retainedAnchors = 0;
+                std::size_t inputFiberlets = 0;
+                std::size_t retainedFiberlets = 0;
+                nlohmann::json reduction = {
+                    {"contract", "transient_crop_filter_v1"},
+                    {"stage_index", stageIndex},
+                    {"side_base_voxels", specification.sideBaseVoxels},
+                    {"offset_base_xyz", specification.offsetBaseXYZ},
+                    {"maximum_join_angle_degrees",
+                     options.filterMaximumJoinAngleDegrees},
+                    {"edge_cost_view",
+                     options.filterEdgeCostView == vc::fiber_tracer::
+                             FiberletChunkRouteEdgeCostView::Stored
+                         ? "stored"
+                         : "sqrt_u16_max256"},
+                    {"maximum_generated_states_per_entry",
+                     options.filterMaximumStatesPerEntry},
+                };
+                const auto stageRoot = transientFilter->root /
+                    ("stage-" + std::to_string(stageIndex + 1));
+                const auto previous = transientFilter->layers.back();
+                transientFilter->layers.push_back(
+                    vc::fiber_tracer::applyTransientFiberletReductionStage(
+                        previous, stageRoot, std::move(reduction), boxes,
+                        vc::fiber_tracer::fiberletPathConfigFromDatasetMetadata(
+                            metadata, options.threads),
+                        cacheOptions, transientFilter->writeBack,
+                        [&](std::size_t boxIndex, const auto&, const auto& written,
+                            double, double) {
+                            inputAnchors += written.inputAnchors;
+                            retainedAnchors += written.retainedAnchors;
+                            inputFiberlets += written.inputFiberlets;
+                            retainedFiberlets += written.retainedFiberlets;
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now - lastPrinted < std::chrono::seconds(1) &&
+                                boxIndex + 1 != boxes.size()) {
+                                return;
+                            }
+                            lastPrinted = now;
+                            const double elapsed =
+                                std::chrono::duration<double>(now - stageStarted)
+                                    .count();
+                            const double rate = static_cast<double>(boxIndex + 1) /
+                                std::max(elapsed, 1.0e-9);
+                            const double eta = rate > 0.0
+                                ? static_cast<double>(boxes.size() - boxIndex - 1) /
+                                    rate
+                                : std::numeric_limits<double>::infinity();
+                            std::cout << "fiberlet crop filter stage="
+                                      << stageIndex + 1
+                                      << " boxes=" << boxIndex + 1 << '/'
+                                      << boxes.size()
+                                      << " elapsed="
+                                      << formatProgressDuration(elapsed)
+                                      << " eta=" << formatProgressDuration(eta)
+                                      << '\n' << std::flush;
+                        }));
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - stageStarted).count();
+                std::cout << "fiberlet crop filter stage=" << stageIndex + 1
+                          << " status=complete"
+                          << " anchors=" << inputAnchors << "->"
+                          << retainedAnchors
+                          << " fiberlets=" << inputFiberlets << "->"
+                          << retainedFiberlets
+                          << " elapsed=" << formatProgressDuration(elapsed)
+                          << '\n' << std::flush;
+            }
+            const auto& final = transientFilter->layers.back();
+            graph = std::make_unique<
+                vc::fiber_tracer::FiberletStoredReplayGraphSource>(
+                final.anchors, final.anchorCache, final.fiberlets,
+                final.fiberletCache,
+                vc::fiber_tracer::fiberletPathConfigFromDatasetMetadata(
+                    metadata, options.threads),
+                options.filterMaximumJoinAngleDegrees);
+        }
 
         vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
         normalOptions.workingToBaseScale = dataset->metadata().predictionToBaseScale;
@@ -10681,7 +10949,7 @@ int main(int argc, char** argv)
                         std::chrono::steady_clock::now() - profileStarted)
                                                .count();
                     const auto line = formatGraphMemoryProfile(
-                        elapsed, graphDiagnostics, graph.cacheStats(),
+                        elapsed, graphDiagnostics, graph->cacheStats(),
                         normalChunkCache->stats(), processMemoryStats());
                     std::cout << line << std::flush;
                     for (int tenth = 0;
@@ -10698,7 +10966,7 @@ int main(int argc, char** argv)
         const auto searchBox =
             vc::fiber_tracer::fiberletCropTraceSearchBox(options.trace);
         auto materialized =
-            graph.materializeBaseBoxForSeeds(
+            graph->materializeBaseBoxForSeeds(
                 searchBox.minimumBaseXYZ,
                 searchBox.maximumBaseXYZ,
                 options.trace.minimumBaseXYZ,
@@ -10899,7 +11167,10 @@ int main(int argc, char** argv)
         const double traceCpuSeconds = static_cast<double>(std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
 
         vc::fiber_tracer::
-            writeFiberletCropTraceArtifact(options.output, dataset->metadata(), normalDataset.manifest().raw, options.trace, result.lines);
+            writeFiberletCropTraceArtifact(
+                options.output, dataset->metadata(),
+                normalDataset.manifest().raw, options.trace, result.lines,
+                filterProvenance);
         const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.output);
         const auto visualization = visualize(
             artifact.lines, options.obj, options.directionDominance);

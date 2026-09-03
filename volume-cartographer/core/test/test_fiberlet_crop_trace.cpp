@@ -1055,9 +1055,16 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
         };
     }
     const auto output = directory.path / "crop-traces.zarr";
-    writeFiberletCropTraceArtifact(output, source, nlohmann::json{{"version", 2}}, config, lines);
+    const nlohmann::json preprocessing{
+        {"contract", "transient_crop_filter_v1"},
+        {"stages", nlohmann::json::array({{{"side_base_voxels", 256}}})},
+    };
+    writeFiberletCropTraceArtifact(
+        output, source, nlohmann::json{{"version", 2}}, config, lines,
+        preprocessing);
     const auto artifact = readFiberletCropTraceArtifact(output);
     CHECK(artifact.minimumBaseXYZ == config.minimumBaseXYZ);
+    CHECK(artifact.metadata.processing.at("preprocessing") == preprocessing);
     CHECK(artifact.maximumBaseXYZ == config.maximumBaseXYZ);
     REQUIRE(artifact.lines.size() == lines.size());
     for (std::size_t index = 0; index < lines.size(); ++index) {

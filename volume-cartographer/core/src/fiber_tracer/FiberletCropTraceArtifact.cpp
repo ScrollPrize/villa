@@ -103,7 +103,8 @@ FiberletDatasetMetadata traceMetadata(
     const nlohmann::json& normalManifest,
     const FiberletCropTraceConfig& config,
     const std::vector<ChunkCoordinate>& populated,
-    std::size_t traceCount)
+    std::size_t traceCount,
+    const nlohmann::json& preprocessing)
 {
     if (!finite(config.minimumBaseXYZ) || !finite(config.maximumBaseXYZ))
         throw std::invalid_argument("Fiber trace crop bounds must be finite");
@@ -173,6 +174,8 @@ FiberletDatasetMetadata traceMetadata(
              {"populated_chunks_zyx", std::move(inventory)},
          }},
     };
+    if (!preprocessing.empty())
+        result.processing["preprocessing"] = preprocessing;
     finalizeFiberletDatasetIdentity(result);
     return result;
 }
@@ -227,12 +230,15 @@ void writeFiberletCropTraceArtifact(
     const FiberletDatasetMetadata& sourceMetadata,
     const nlohmann::json& normalManifest,
     const FiberletCropTraceConfig& config,
-    const std::vector<FiberletCropTraceLine>& lines)
+    const std::vector<FiberletCropTraceLine>& lines,
+    const nlohmann::json& preprocessing)
 {
     if (std::filesystem::exists(output))
         throw std::invalid_argument("Fiber trace output already exists: " + output.string());
     std::map<ChunkCoordinate, std::vector<FiberletStoredTrace>> grouped;
-    FiberletDatasetMetadata layout = traceMetadata(sourceMetadata, normalManifest, config, {}, lines.size());
+    FiberletDatasetMetadata layout = traceMetadata(
+        sourceMetadata, normalManifest, config, {}, lines.size(),
+        preprocessing);
     for (std::size_t index = 0; index < lines.size(); ++index) {
         const auto& line = lines[index];
         grouped[ownerFor(layout, line.seedBaseXYZ)].push_back({
@@ -250,7 +256,9 @@ void writeFiberletCropTraceArtifact(
         (void)traces;
         populated.push_back(coordinate);
     }
-    auto metadata = traceMetadata(sourceMetadata, normalManifest, config, populated, lines.size());
+    auto metadata = traceMetadata(
+        sourceMetadata, normalManifest, config, populated, lines.size(),
+        preprocessing);
 
     const auto parent = output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path();
     std::filesystem::create_directories(parent);
@@ -288,8 +296,22 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
         throw std::invalid_argument("Fiber trace source metadata is invalid");
     }
     const auto& processing = metadata.processing;
-    requireObjectKeys(
-        processing, {"trace_contract_version", "coordinate_order", "crop", "trace", "artifact"}, "Fiber trace processing metadata");
+    if (processing.contains("preprocessing")) {
+        requireObjectKeys(
+            processing,
+            {"trace_contract_version", "coordinate_order", "crop", "trace",
+             "artifact", "preprocessing"},
+            "Fiber trace processing metadata");
+        if (!processing.at("preprocessing").is_object())
+            throw std::invalid_argument(
+                "Fiber trace preprocessing metadata is not an object");
+    } else {
+        requireObjectKeys(
+            processing,
+            {"trace_contract_version", "coordinate_order", "crop", "trace",
+             "artifact"},
+            "Fiber trace processing metadata");
+    }
     if (processing.at("trace_contract_version") != kFiberletCropTraceArtifactContractVersion ||
         processing.at("coordinate_order") != "zyx_storage_xyz_vectors") {
         throw std::invalid_argument("Fiber trace processing contract is unsupported");

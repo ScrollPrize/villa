@@ -1783,6 +1783,51 @@ TEST_CASE("Fiberlet replay filter coverage is independent of storage chunks")
     CHECK(std::find(owners.begin(), owners.end(), vc::render::ChunkKey{0, 5, 5, 5}) != owners.end());
 }
 
+TEST_CASE("Fiberlet crop filter stages close dependencies around an offset final grid")
+{
+    const std::vector<FiberletFilterStageSpec> stages{
+        {256, {0, 0, 0}},
+        {256, {128, 128, 128}},
+        {512, {256, 256, 256}},
+    };
+    FiberletChunkRouteAnalysisConfig analysis;
+    const cv::Vec3d cropMinimum{10240.0, 22016.0, 6144.0};
+    const cv::Vec3d cropMaximum{11264.0, 23040.0, 7168.0};
+    const auto plan = planFiberletFilterStagesForBox(
+        stages, cropMinimum, cropMaximum,
+        {32696.0, 32696.0, 75784.0}, {128.0, 128.0, 128.0},
+        analysis);
+
+    REQUIRE(plan.stageBoxes.size() == 3);
+    CHECK(plan.stageBoxes[0].size() == 512);
+    CHECK(plan.stageBoxes[1].size() == 343);
+    CHECK(plan.stageBoxes[2].size() == 27);
+
+    const auto bounds = [](const auto& boxes) {
+        cv::Vec3d minimum{
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity()};
+        cv::Vec3d maximum{-minimum[0], -minimum[1], -minimum[2]};
+        for (const auto& box : boxes) {
+            for (int axis = 0; axis < 3; ++axis) {
+                minimum[axis] = std::min(minimum[axis], box.minimumBaseXYZ[axis]);
+                maximum[axis] = std::max(maximum[axis], box.maximumBaseXYZ[axis]);
+            }
+        }
+        return std::pair{minimum, maximum};
+    };
+    CHECK(bounds(plan.stageBoxes[2]) == std::pair{
+        cv::Vec3d{9984.0, 21760.0, 5888.0},
+        cv::Vec3d{11520.0, 23296.0, 7424.0}});
+    CHECK(bounds(plan.stageBoxes[1]) == std::pair{
+        cv::Vec3d{9856.0, 21632.0, 5760.0},
+        cv::Vec3d{11648.0, 23424.0, 7552.0}});
+    CHECK(bounds(plan.stageBoxes[0]) == std::pair{
+        cv::Vec3d{9728.0, 21504.0, 5632.0},
+        cv::Vec3d{11776.0, 23552.0, 7680.0}});
+}
+
 TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima")
 {
     std::mt19937_64 random(std::random_device{}());
@@ -2385,6 +2430,49 @@ TEST_CASE("Fiberlet sparse overlays fall through and enforce monotone records")
                 inheritedPaths.payload)->prefixes.size() == 1);
     layerAnchorCache->cancelPendingAndWait();
     layerPathCache->cancelPendingAndWait();
+
+    auto combinedMetadata = anchorMetadata;
+    combinedMetadata.kind = FiberletDatasetKind::Combined;
+    combinedMetadata.profile =
+        FiberletStorageProfile::CompactDirectionsFixedCost;
+    combinedMetadata.costBits = 16;
+    finalizeFiberletDatasetIdentity(combinedMetadata);
+    auto combined = FiberletChunkDataset::createOrOpen(
+        root / "combined", combinedMetadata);
+    combined->publishChunk(
+        FiberletStorageChunkKind::Anchors, owner,
+        serializeFiberletAnchors(
+            combined->codecConfig(FiberletStorageChunkKind::Anchors, owner),
+            std::array{first, second}));
+    combined->publishFiberletChunkPair(
+        owner,
+        materialized(
+            FiberletStorageChunkKind::FiberletPrefix,
+            serializeFiberletPrefixes(
+                combined->codecConfig(
+                    FiberletStorageChunkKind::FiberletPrefix, owner),
+                std::array{prefix})),
+        routeOwner,
+        materialized(
+            FiberletStorageChunkKind::FiberletRoutes,
+            serializeFiberletRoutes(
+                combined->codecConfig(
+                    FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+                std::array{route})));
+    auto combinedAnchorCache = createStoredFiberletAnchorChunkCache(combined);
+    auto combinedPathCache = createStoredFiberletPathChunkCache(combined);
+    auto combinedOverlayAnchors = createOverlayFiberletAnchorChunkCache(
+        layerAnchors, combined, combinedAnchorCache);
+    auto combinedOverlayPaths = createOverlayFiberletPathChunkCache(
+        layerPaths, combined, combinedPathCache);
+    CHECK(combinedOverlayAnchors->getChunkBlocking(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+    CHECK(combinedOverlayPaths->getChunkBlocking(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+    combinedOverlayAnchors->cancelPendingAndWait();
+    combinedOverlayPaths->cancelPendingAndWait();
+    combinedAnchorCache->cancelPendingAndWait();
+    combinedPathCache->cancelPendingAndWait();
 
     const auto currentAnchors = materialized(
         FiberletStorageChunkKind::Anchors,

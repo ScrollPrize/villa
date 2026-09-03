@@ -1983,3 +1983,13 @@
 - Kept raw counts and separate algorithm/measurement provenance in an
   extensible data file, and marked unexecuted direct crop policies as assumed
   floor markers without fabricated measurements.
+
+## 2026-09-03 - Transient staged crop filtering
+
+- Added repeatable box-driven Fiberlet reduction stages to crop tracing, with
+  recursive dependency closure, progress, and trace-artifact provenance.
+- Reused the shared staged reduction implementation for analysis and tracing,
+  and promoted transient rewrites to a lossless float32 overlay so repeated
+  stages cannot requantize compact source geometry.
+- Ran the 256-aligned, 256-half-offset, and 512-half-offset schedule over the
+  PHercParis4 1024 crop and produced a 2,000-trace output.

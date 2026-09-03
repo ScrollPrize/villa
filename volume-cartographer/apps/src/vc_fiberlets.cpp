@@ -1683,12 +1683,7 @@ ChunkRouteStagePopulation collectChunkRouteStagePopulation(
     return result;
 }
 
-struct TransientFiberletLayer {
-    std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> anchors;
-    std::shared_ptr<vc::render::ChunkCache> anchorCache;
-    std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> fiberlets;
-    std::shared_ptr<vc::render::ChunkCache> fiberletCache;
-};
+using TransientFiberletLayer = vc::fiber_tracer::FiberletTransientLayer;
 
 TransientFiberletLayer createTransientEvaluatedAnchorLayer(
     const std::filesystem::path& root,
@@ -1736,73 +1731,6 @@ TransientFiberletLayer createTransientEvaluatedAnchorLayer(
     return {
         std::move(dataset), std::move(cache), preprocessor->fiberletDataset(),
         preprocessor->fiberletCache()};
-}
-
-template <typename BoxCompleted>
-TransientFiberletLayer applyTransientFiberletReductionStage(
-    const TransientFiberletLayer& previous,
-    const std::filesystem::path& stageRoot,
-    nlohmann::json reduction,
-    std::span<const vc::fiber_tracer::FiberletChunkRouteAnalysisConfig> boxes,
-    const vc::fiber_tracer::FiberletPathConfig& paths,
-    const vc::fiber_tracer::FiberletChunkCacheOptions& cacheOptions,
-    const std::shared_ptr<vc::fiber_tracer::FiberletChunkWriteBackCache>&
-        writeBack,
-    BoxCompleted&& boxCompleted)
-{
-    using namespace vc::fiber_tracer;
-    if (boxes.empty())
-        throw std::invalid_argument("transient Fiberlet stage is empty");
-    auto anchorMetadata = previous.anchors->metadata();
-    auto fiberletMetadata = previous.fiberlets->metadata();
-    anchorMetadata.processing["reduction"] = reduction;
-    anchorMetadata.processing["reduction"]["source_dataset_fingerprint"] =
-        fingerprintHex(previous.anchors->metadata().datasetFingerprint);
-    fiberletMetadata.processing["reduction"] = std::move(reduction);
-    fiberletMetadata.processing["reduction"]["source_dataset_fingerprint"] =
-        fingerprintHex(previous.fiberlets->metadata().datasetFingerprint);
-    finalizeFiberletDatasetIdentity(anchorMetadata);
-    finalizeFiberletDatasetIdentity(fiberletMetadata);
-    auto stageAnchors = FiberletChunkDataset::createOrOpen(
-        stageRoot / "anchors.zarr", anchorMetadata, writeBack);
-    auto stageFiberlets = FiberletChunkDataset::createOrOpen(
-        stageRoot / "fiberlets.zarr", fiberletMetadata, writeBack);
-
-    for (std::size_t boxIndex = 0; boxIndex < boxes.size(); ++boxIndex) {
-        auto stageAnchorCache = createOverlayFiberletAnchorChunkCache(
-            stageAnchors, previous.anchors, previous.anchorCache,
-            cacheOptions);
-        auto stageFiberletCache = createOverlayFiberletPathChunkCache(
-            stageFiberlets, previous.fiberlets, previous.fiberletCache,
-            cacheOptions);
-        FiberletChunkGraphSource graph(
-            stageAnchors, stageAnchorCache, stageFiberlets,
-            stageFiberletCache, paths);
-        const auto reduced = analyzeAndSimplifyFiberletChunkRoutes(
-            graph, boxes[boxIndex]);
-        const auto writeStarted = std::chrono::steady_clock::now();
-        const double writeCpuStarted = processCpuSeconds();
-        const auto written = writeFiberletReductionOverlayBox(
-            graph, stageAnchors, stageFiberlets, boxes[boxIndex],
-            reduced.analysis.physicalFiberletIds,
-            reduced.simplification.livePhysicalFiberletIds);
-        const double writeWallSeconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - writeStarted).count();
-        const double writeCpuSeconds = processCpuSeconds() - writeCpuStarted;
-        boxCompleted(
-            boxIndex, reduced, written, writeWallSeconds, writeCpuSeconds);
-        stageAnchorCache->cancelPendingAndWait();
-        stageFiberletCache->cancelPendingAndWait();
-    }
-    return {
-        stageAnchors,
-        createOverlayFiberletAnchorChunkCache(
-            stageAnchors, previous.anchors, previous.anchorCache,
-            cacheOptions),
-        stageFiberlets,
-        createOverlayFiberletPathChunkCache(
-            stageFiberlets, previous.fiberlets, previous.fiberletCache,
-            cacheOptions)};
 }
 
 int runStagedChunkRouteReduction(

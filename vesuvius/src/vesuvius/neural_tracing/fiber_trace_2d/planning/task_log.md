@@ -1,60 +1,51 @@
 # Task Log
 
-## Scope
+## 2026-09-03
 
-- Add two percentage-versus-time step plots without changing either benchmark.
-- Keep all new work uncommitted at the user's request.
-
-## Decisions
-
-- Use algorithm completion dates rather than the later benchmark execution
-  date: Lasagna transport `2026-06-01`, greedy direct `2026-07-30`, and the
-  current Fiberlet replay default `2026-08-22`. The crop Fiberlet-plus-BP point
-  instead uses `2026-09-02`, when reference-conditioned pruning was completed.
-- Replay uses the recorded distance-per-failure percentage directly.
-- Crop preserves and negates the recorded
-  `100 * problematic / retained_fulfilled` ratio: Fiberlet is `-177.9331%`
-  from 44,284 problematic and 24,888 retained fulfilled constraints. Direct
-  greedy and Lasagna are visibly marked as unmeasured floor points without
-  numeric metric values.
-
-## Independent Review
-
-- Separate historical algorithm provenance from later measurement provenance.
-- Derive plot scores from raw fields, preserve the exact metric names, validate
-  their domains, and retain cohort identity. The review initially proposed a
-  bounded fulfilled fraction; the user corrected this to the benchmark's
-  existing problematic/retained ratio before finalization.
-- Treat crop floor markers as assumptions in a separate visual style and do
-  not imply they were crop measurements or give them fabricated metric values.
-- Date the crop point to the complete BP/pruning method rather than the earlier
-  Fiberlet replay milestone. Keep the two percentage families on separate axes
-  and state that they are not numerically comparable.
-
-## Implementation
-
-- Added `volume-cartographer/docs/fiber_benchmark_plot_data.json` with raw
-  benchmark counts, cohort identity, separate algorithm/measurement
-  provenance, run-record links, and explicit assumed-floor rationales.
-- Added `volume-cartographer/scripts/plot_fiber_benchmarks.py`. It validates
-  source data, derives scores, orders algorithm milestones, and emits two
-  deterministic accessible SVG step plots. Measured and assumed crop points
-  differ by marker, fill, color, and line style.
-- Embedded and documented the plots in the benchmark index. No benchmark
-  implementation, recorded run, or result value was changed.
-
-## Validation
-
-- `python volume-cartographer/scripts/plot_fiber_benchmarks.py --check` derives
-  replay scores `1.754386%`, `7.692308%`, and `16.666667%`, plus two unmeasured
-  crop floors and the Fiberlet crop score `-177.933140%`.
-- Generated both SVGs twice; SHA-256 remained
-  `9463e3197aeeb38c14c68e01ae1020a718a79c4d44a8f6113c630f95adc3590f`
-  for replay and
-  `aecc709ead62b053c866687846cbf7f27e60f3dad17527754a385a3786924f7b`
-  for crop.
-- Python compilation, XML parsing of both SVGs, and `git diff --check` passed.
-- Visual inspection used temporary PNG conversions and confirmed readable
-  labels, distinct assumed markers, and non-overlapping plot content.
-- The user reviewed the corrected `-177.933140%` crop-error presentation and
-  requested that the completed visualization changes be committed.
+- Confirmed the source combined dataset records a 512-base storage chunk, 16
+  coordinate units per chunk, and maximum endpoint reach of 4 units: 128 base
+  voxels per axis.
+- Converted the available input extent from ZYX to XYZ:
+  `[7168,17408,3072) .. [13824,24064,9728)`.
+- Confirmed the target crop is
+  `[10240,22016,6144) .. [11264,23040,7168)` and therefore has source margins
+  `(3072,4608,3072)` below and `(2560,1024,2560)` above in XYZ.
+- The final 512 lattice needs global offset `(256,256,256)` for its boxes to
+  straddle the target crop boundaries; the source margins are sufficient for
+  lattice overhang and endpoint dependency closure.
+- Independent review fixed final-stage selection to the target crop rather
+  than the padded search box. This produces exactly 27 final 512 boxes; graph
+  materialization remains padded separately and falls through to unfiltered
+  source data outside the overlay.
+- Sparse absence is valid dataset semantics but cannot prove that a partial
+  local mirror contains every intended remote chunk. The supplied encoded
+  extent is geometrically sufficient; completeness still depends on the
+  producer/inventory guarantee.
+- Implemented exact box-driven planning. For the requested crop, the three
+  passes contain 512, 343, and 27 boxes. Their unions are respectively
+  `[9728,21504,5632)..[11776,23552,7680)`,
+  `[9856,21632,5760)..[11648,23424,7552)`, and
+  `[9984,21760,5888)..[11520,23296,7424)` in base XYZ.
+- Extracted the existing transient reduction pass into reusable core code and
+  layered it directly over a combined stored Fiberlet dataset. Crop tracing
+  now accepts repeatable `--stage` values and records their complete policy in
+  the trace artifact.
+- The first requested run exposed compact-direction requantization across
+  transient layers: one source-valid route no longer matched the curved-domain
+  lattice after repeated decode/encode cycles. Transient rewritten chunks now
+  use the lossless float32 cache profile, while untouched chunks continue to
+  fall through to the compact source. A cross-profile overlay regression was
+  added.
+- A smoke run of all three stages over a 128-base crop passed filtering, graph
+  reconstruction, tracing, artifact publication, and artifact reread.
+- The Release 1024-crop run completed with stage totals:
+  `5903905 -> 4011983`, `2082011 -> 1292725`, and
+  `632703 -> 448512` Fiberlets. Filtering took approximately 2m45s, 1m04s,
+  and 11s; final graph materialization took 4.58s and tracing 2.0s.
+- The final output contains 2,000 accepted traces at
+  `data/workdir3/fiber-crop-1024-staged/crop_traces.zarr`; visualization is
+  `data/workdir3/fiber-crop-1024-staged/traces.obj`.
+- Validation: Release build of `vc_fiber_trace_chunk`, `vc_fiberlets`,
+  `test_fiberlet_storage`, and `test_fiberlet_crop_trace`; 41 storage cases and
+  81 crop-trace cases passed. The subproject has no current `planning/spec.md`,
+  so the behavioral contract was documented in `docs/fiber_chunk_tracing.md`.

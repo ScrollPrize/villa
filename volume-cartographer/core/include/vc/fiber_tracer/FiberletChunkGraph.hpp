@@ -221,6 +221,13 @@ public:
         std::shared_ptr<FiberletChunkDataset> dataset,
         FiberletChunkCacheOptions cacheOptions = {},
         float maximumJoinAngleDegrees = 45.0F);
+    FiberletStoredReplayGraphSource(
+        std::shared_ptr<FiberletChunkDataset> anchorDataset,
+        std::shared_ptr<vc::render::ChunkCache> anchorCache,
+        std::shared_ptr<FiberletChunkDataset> fiberletDataset,
+        std::shared_ptr<vc::render::ChunkCache> fiberletCache,
+        FiberletPathConfig pathConfig,
+        float maximumJoinAngleDegrees = 45.0F);
 
     [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return false; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override;
@@ -313,6 +320,16 @@ struct FiberletFilterPlan {
     std::span<const FiberletFilterStageSpec> stages,
     std::span<const cv::Vec3d> referenceBaseXYZ,
     double corridorRadiusBaseVoxels,
+    const cv::Vec3d& volumeMaximumBaseXYZ,
+    const cv::Vec3d& maximumEndpointReachBaseXYZ,
+    const FiberletChunkRouteAnalysisConfig& analysisTemplate);
+
+// Select final-stage boxes intersecting a half-open base-space box, then
+// close every preceding stage over the maximum endpoint reach.
+[[nodiscard]] FiberletFilterPlan planFiberletFilterStagesForBox(
+    std::span<const FiberletFilterStageSpec> stages,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ,
     const cv::Vec3d& volumeMaximumBaseXYZ,
     const cv::Vec3d& maximumEndpointReachBaseXYZ,
     const FiberletChunkRouteAnalysisConfig& analysisTemplate);
@@ -512,6 +529,39 @@ struct FiberletReductionOverlayBoxWriteReport {
     std::size_t inputFiberlets = 0;
     std::size_t retainedFiberlets = 0;
 };
+
+struct FiberletTransientLayer {
+    std::shared_ptr<FiberletChunkDataset> anchors;
+    std::shared_ptr<vc::render::ChunkCache> anchorCache;
+    std::shared_ptr<FiberletChunkDataset> fiberlets;
+    std::shared_ptr<vc::render::ChunkCache> fiberletCache;
+};
+
+// Present a combined stored dataset as separate anchor/path inputs without
+// copying payloads into the transient tree.
+[[nodiscard]] FiberletTransientLayer createStoredCombinedFiberletLayerView(
+    const std::filesystem::path& root,
+    const std::shared_ptr<FiberletChunkDataset>& combined,
+    const FiberletChunkCacheOptions& cacheOptions);
+
+using FiberletReductionBoxCompleted = std::function<void(
+    std::size_t,
+    const FiberletChunkRouteReductionReport&,
+    const FiberletReductionOverlayBoxWriteReport&,
+    double,
+    double)>;
+
+// Apply one ordered stage to a read-only layer. Boxes are processed in order;
+// later overlapping boxes see removals written by earlier boxes.
+[[nodiscard]] FiberletTransientLayer applyTransientFiberletReductionStage(
+    const FiberletTransientLayer& previous,
+    const std::filesystem::path& stageRoot,
+    nlohmann::json reduction,
+    std::span<const FiberletChunkRouteAnalysisConfig> boxes,
+    const FiberletPathConfig& paths,
+    const FiberletChunkCacheOptions& cacheOptions,
+    const std::shared_ptr<FiberletChunkWriteBackCache>& writeBack,
+    const FiberletReductionBoxCompleted& boxCompleted = {});
 
 // Rewrite every storage chunk intersecting config into a temporary sparse
 // overlay. Only records whose stored base-space owner position is inside the

@@ -29,7 +29,8 @@ void writeFiberletCropTraceArtifact(
     const FiberletDatasetMetadata& sourceMetadata,
     const nlohmann::json& normalManifest,
     const FiberletCropTraceConfig& config,
-    const std::vector<FiberletCropTraceLine>& lines);
+    const std::vector<FiberletCropTraceLine>& lines,
+    const nlohmann::json& preprocessing = nlohmann::json::object());
 
 [[nodiscard]] FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::path& input);
 

@@ -836,8 +836,20 @@ void requireOverlayCompatible(
     const FiberletDatasetMetadata& lower,
     FiberletDatasetKind expectedKind)
 {
-    if (layer.kind != expectedKind || lower.kind != expectedKind ||
-        layer.profile != lower.profile ||
+    const bool sameStorageProfile =
+        layer.profile == lower.profile &&
+        layer.costBits == lower.costBits &&
+        layer.positionQuantumBaseVoxels ==
+            lower.positionQuantumBaseVoxels;
+    const bool losslessFloatPromotion =
+        layer.profile == FiberletStorageProfile::Float32Cache &&
+        layer.costBits == 32 &&
+        layer.positionQuantumBaseVoxels == 0 &&
+        lower.profile != FiberletStorageProfile::Float64Traces;
+    if (layer.kind != expectedKind ||
+        (lower.kind != expectedKind &&
+         lower.kind != FiberletDatasetKind::Combined) ||
+        (!sameStorageProfile && !losslessFloatPromotion) ||
         layer.chunkGridShapeZYX != lower.chunkGridShapeZYX ||
         layer.coordinateOriginZYX != lower.coordinateOriginZYX ||
         layer.coordinateUnitsPerChunkZYX !=
@@ -850,9 +862,6 @@ void requireOverlayCompatible(
         layer.deltaBits != lower.deltaBits ||
         layer.routeCountBits != lower.routeCountBits ||
         layer.routeLatticeBits != lower.routeLatticeBits ||
-        layer.costBits != lower.costBits ||
-        layer.positionQuantumBaseVoxels !=
-            lower.positionQuantumBaseVoxels ||
         layer.predictionToBaseScale != lower.predictionToBaseScale ||
         layer.sources != lower.sources) {
         throw std::invalid_argument(
