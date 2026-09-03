@@ -63,6 +63,7 @@
       "title": "1024-crop constraint error",
       "metric": "negative_problematic_per_retained_fulfilled_percent",
       "y_label": "Negative problematic / retained fulfilled (%)",
+      "annotation_rotation_degrees": 28,
       "points": [
         {
           "algorithm": "Lasagna transport",
@@ -80,6 +81,7 @@
         },
         {
           "algorithm": "Fiberlet + BP oracle pruning",
+          "plot_label": "Fiberlet + BP",
           "algorithm_date": "2026-09-02",
           "algorithm_revision": "41052ac96e2841fe030708c7f4a8452baabdd9f9",
           "measurement_status": "measured",
@@ -91,6 +93,7 @@
         },
         {
           "algorithm": "Fiberlet + staged filtering + BP oracle pruning",
+          "plot_label": "Staged Fiberlet + BP",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
           "measurement_status": "measured",

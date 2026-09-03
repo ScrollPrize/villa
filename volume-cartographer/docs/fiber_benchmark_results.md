@@ -35,6 +35,9 @@ python volume-cartographer/scripts/plot_fiber_benchmarks.py
 
 Add later results to `docs/fiber_benchmark_plot_data.json`; scores are derived
 from raw failure or unique-constraint counts rather than copied percentages.
+Markers show every measured result at its actual score. The step line is the
+cumulative best result, so a later regression remains visible without lowering
+the historical progress line.
 
 ## Reference endpoint replay
 

@@ -24,6 +24,7 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}")
 @dataclass(frozen=True)
 class PlotPoint:
     algorithm: str
+    plot_label: str
     algorithm_date: date
     score_percent: float | None
     measured: bool
@@ -50,6 +51,9 @@ def _score_point(
     algorithm = raw.get("algorithm")
     if not isinstance(algorithm, str) or not algorithm.strip():
         raise ValueError("every point requires a nonempty algorithm")
+    plot_label = raw.get("plot_label", algorithm)
+    if not isinstance(plot_label, str) or not plot_label.strip():
+        raise ValueError(f"{algorithm}: plot_label must be a nonempty string")
     algorithm_date = _require_date(raw.get("algorithm_date"), "algorithm_date")
     _require_revision(raw.get("algorithm_revision"), "algorithm_revision")
     status = raw.get("measurement_status")
@@ -100,7 +104,16 @@ def _score_point(
             raise ValueError(f"{algorithm}: replay score must be in [0, 100]")
         if metric == CROP_METRIC and score > 0.0:
             raise ValueError(f"{algorithm}: crop error score must not exceed zero")
-    return PlotPoint(algorithm, algorithm_date, score, measured)
+    return PlotPoint(algorithm, plot_label, algorithm_date, score, measured)
+
+
+def _best_so_far(scores: list[float]) -> list[float]:
+    best = -math.inf
+    result = []
+    for score in scores:
+        best = max(best, score)
+        result.append(best)
+    return result
 
 
 def load_plot_data(path: Path) -> tuple[dict[str, Any], dict[str, list[PlotPoint]]]:
@@ -163,6 +176,7 @@ def render_plot(
     y_label: str,
     points: list[PlotPoint],
     description: str,
+    annotation_rotation_degrees: float = 0.0,
 ) -> None:
     os.environ.setdefault(
         "MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "vc-matplotlib-cache")
@@ -199,13 +213,14 @@ def render_plot(
         point.score_percent if point.score_percent is not None else assumed_floor
         for point in points
     ]
+    progress_scores = _best_so_far(scores)
 
     figure, axis = plt.subplots(figsize=(9.0, 4.8), constrained_layout=True)
     line_color = "#777777" if assumed else "#16786f"
     line_style = "--" if assumed else "-"
     axis.step(
         dates,
-        scores,
+        progress_scores,
         where="post",
         color=line_color,
         linestyle=line_style,
@@ -236,6 +251,7 @@ def render_plot(
             label="Assumed floor (not measured)",
         )
     zero_label = 0
+    measured_label = 0
     for index, point in enumerate(points):
         display_score = (
             point.score_percent
@@ -245,6 +261,9 @@ def render_plot(
         if point.score_percent is None:
             vertical = 12 + zero_label * 17
             zero_label += 1
+        elif annotation_rotation_degrees:
+            vertical = 10 + measured_label * 18
+            measured_label += 1
         else:
             vertical = 10 if index % 2 == 0 else -18
         value_label = (
@@ -253,13 +272,15 @@ def render_plot(
             else "assumed floor"
         )
         axis.annotate(
-            f"{point.algorithm}\n{value_label}",
+            f"{point.plot_label}\n{value_label}",
             (point.algorithm_date, display_score),
             xytext=(5, vertical),
             textcoords="offset points",
             ha="left",
             va="bottom" if vertical >= 0 else "top",
             fontsize=9,
+            rotation=annotation_rotation_degrees,
+            rotation_mode="anchor",
         )
 
     axis.set_title(title, loc="left", fontsize=15, fontweight="bold")
@@ -339,12 +360,18 @@ def main() -> int:
         ),
     }
     for name, output in outputs.items():
+        annotation_rotation = float(
+            benchmarks[name].get("annotation_rotation_degrees", 0.0)
+        )
+        if not math.isfinite(annotation_rotation):
+            raise ValueError(f"{name}: annotation rotation must be finite")
         render_plot(
             output,
             benchmarks[name]["title"],
             benchmarks[name]["y_label"],
             points[name],
             descriptions[name],
+            annotation_rotation,
         )
         print(output)
     return 0
