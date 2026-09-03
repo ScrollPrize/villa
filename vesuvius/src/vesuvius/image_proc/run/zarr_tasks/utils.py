@@ -112,16 +112,27 @@ def create_level_dataset(
     if overwrite and level_path.exists():
         shutil.rmtree(level_path)
 
-    store = zarr.NestedDirectoryStore(str(level_path))
+    # zarr 3 removed NestedDirectoryStore (and DirectoryStore). Its only purpose here was
+    # nested chunk paths, which both zarr 2 and 3 express as dimension_separator="/".
+    # zarr 3 also defaults new arrays to v3, where `compressor=` is rejected outright, so the
+    # format has to be stated. zarr 2 has no zarr_format argument and warns if given one, so
+    # it is passed only where it is understood. pyproject allows zarr>=2.18.7,<4; before this
+    # change every task using this helper raised on the 3.x half of that range.
+    kwargs = {}
+    if int(zarr.__version__.split(".")[0]) >= 3:
+        kwargs["zarr_format"] = 2
+
     return zarr.open(
-        store=store,
+        str(level_path),
         shape=shape,
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
+        dimension_separator="/",
         mode="w",
         write_empty_chunks=False,
         fill_value=0,
+        **kwargs,
     )
 
 
