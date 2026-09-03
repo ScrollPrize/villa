@@ -187,6 +187,23 @@ TEST_CASE("ThreadPool indexed batch propagates worker exceptions")
         std::runtime_error);
 }
 
+TEST_CASE("ThreadPool destruction right after a batch does not lose the stop wakeup")
+{
+    // ~ThreadPool() used to request stop and notify without holding the queue
+    // mutex, so a worker between its wait predicate and cv_.wait() missed the
+    // wakeup and the jthread join never returned. Workers are in exactly that
+    // window while leaving run_indexed_batch(); with the old destructor this
+    // loop hung within a few hundred rounds.
+    std::atomic<size_t> sum{0};
+    for (int round = 0; round < 3000; ++round) {
+        utils::ThreadPool pool(4);
+        pool.run_indexed_batch(17, [&](size_t index) {
+            sum.fetch_add(index, std::memory_order_relaxed);
+        });
+    }
+    CHECK(sum.load(std::memory_order_relaxed) == 3000u * 136u);
+}
+
 TEST_CASE("ChunkedPlaneSampler fine-to-coarse fills missing high-res from coarse level")
 {
     PyramidChunkedArray array(vc::render::ChunkStatus::Missing, 0,
