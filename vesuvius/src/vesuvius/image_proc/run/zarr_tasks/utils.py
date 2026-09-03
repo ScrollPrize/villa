@@ -262,25 +262,56 @@ def inverse_permutation(perm: List[int]) -> List[int]:
     return inv
 
 
+def _candidate_chunk_paths(zarr_path: str, chunk_indices: Tuple[int, ...]):
+    """Yield the on-disk locations a chunk may occupy, most likely first.
+
+    The key layout depends on the zarr format and its separator, and this
+    package supports zarr>=2.18.7,<4:
+
+        zarr v3, default chunk_key_encoding   ->  c/0/0/0
+        zarr v2, dimension_separator "/"      ->  0/0/0
+        zarr v2, dimension_separator "." (v2
+        default)                              ->  0.0.0
+
+    Probing is cheaper and more robust than parsing zarr.json/.zarray on every
+    call, and the three layouts are mutually exclusive in practice.
+    """
+    root = Path(zarr_path)
+    parts = [str(i) for i in chunk_indices]
+    yield root.joinpath("c", *parts)
+    yield root.joinpath(*parts)
+    yield root / ".".join(parts)
+
+
 def delete_chunk_file(
     zarr_path: str,
     chunk_coords: Tuple[Tuple[int, int], ...],
     chunks: Tuple[int, ...],
-) -> None:
-    """Delete the chunk file for given coordinates (nested directory structure).
+) -> bool:
+    """Delete the chunk file for given coordinates.
+
+    Handles every chunk key layout this package can produce. The previous
+    implementation assumed zarr v2 nested storage ("0/0/0") and therefore did
+    nothing at all for zarr v3 ("c/0/0/0") or for v2's own default separator
+    ("0.0.0"), silently skipping the deletion.
 
     Args:
         zarr_path: Path to zarr array
         chunk_coords: Chunk coordinates as (start, stop) pairs
         chunks: Chunk sizes
+
+    Returns:
+        True if a chunk file was removed, False if none was found.
     """
     chunk_indices = tuple(
         start // chunk_size
         for (start, _), chunk_size in zip(chunk_coords, chunks)
     )
-    chunk_path = Path(zarr_path) / "/".join(str(i) for i in chunk_indices)
-    if chunk_path.exists():
-        chunk_path.unlink()
+    for chunk_path in _candidate_chunk_paths(zarr_path, chunk_indices):
+        if chunk_path.is_file():
+            chunk_path.unlink()
+            return True
+    return False
 
 
 def update_compressor_metadata(zarr_path: str, compressor) -> None:
