@@ -148,6 +148,8 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
             outcome.tracedLengthBaseVoxels > outcome.referenceLengthBaseVoxels + kEpsilon) {
             throw std::invalid_argument("reference replay outcome length is invalid");
         }
+        if (!outcome.evaluationComplete || outcome.evaluatedThroughBaseVoxels < outcome.referenceLengthBaseVoxels - kEpsilon)
+            throw std::invalid_argument("reference replay benchmark requires complete directional evaluation");
         const auto key = std::pair{outcome.sourceIndex, outcome.runIndex};
         const auto [found, inserted] = runs.emplace(key, outcome.referenceLengthBaseVoxels);
         if (!inserted && std::abs(found->second - outcome.referenceLengthBaseVoxels) > kEpsilon) {
@@ -204,6 +206,12 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
     if (summary.directedReferenceLengthBaseVoxels > 0.0)
         summary.failuresPerDirectedMillimeter =
             static_cast<double>(summary.totalFailures) / (summary.directedReferenceLengthBaseVoxels * baseToMillimeters);
+    if (summary.directedReferenceLengthBaseVoxels > 0.0) {
+        const double divisor = static_cast<double>(std::max<std::size_t>(summary.totalFailures, 1));
+        summary.meanDistancePerFailureBaseVoxels = summary.directedReferenceLengthBaseVoxels / divisor;
+        summary.meanDistancePerFailureMillimeters = summary.meanDistancePerFailureBaseVoxels * baseToMillimeters;
+        summary.meanDistancePerFailurePercent = 100.0 * summary.meanDistancePerFailureBaseVoxels / summary.directedReferenceLengthBaseVoxels;
+    }
     summary.failureReasons.assign(reasons.begin(), reasons.end());
     return summary;
 }
@@ -301,6 +309,10 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
              {"length_weighted_success_percent", summary.lengthWeightedSuccessPercent},
              {"failure_free_cases_percent", summary.failureFreeCasesPercent},
              {"failures_per_directed_mm", summary.failuresPerDirectedMillimeter},
+             {"mean_distance_per_failure_base_voxels", summary.meanDistancePerFailureBaseVoxels},
+             {"mean_distance_per_failure_mm", summary.meanDistancePerFailureMillimeters},
+             {"mean_distance_per_failure_percent", summary.meanDistancePerFailurePercent},
+             {"zero_failure_convention_applied", summary.totalFailures == 0},
              {"failure_reasons", std::move(reasons)},
          }},
         {"cases", std::move(cases)},

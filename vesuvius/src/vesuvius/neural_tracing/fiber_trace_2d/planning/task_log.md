@@ -2,44 +2,22 @@
 
 ## Scope
 
-- Continue each directed endpoint replay after failures until the full in-crop
-  reference run has been evaluated.
-- Retain every failure event and report failure-free traced spans.
-- Reuse the existing deterministic replay restart implementation and shared
-  anisotropic threshold measurement.
-
-## Decisions
-
-- The first seed remains restricted to the endpoint seed window.
-- A directional case is whole-run complete once replay reaches its reference
-  end, even if it contains failures; failure-free status is reported separately.
-- Ordinary replay defaults remain unchanged.
-
-## Independent Review
-
-- Define credited length from actual seeded segment intervals rather than the
-  replay completion cursor; missing seed gaps must not become successful length.
-- Distinguish whole-run evaluation completion from a failure-free direction.
-- Report failure density, failed-span length, seeded-span length, restart
-  settings, and complete per-failure location/threshold diagnostics.
-- Bump the incompatible JSON schema to version 2 and retain the historical
-  first-failure run record.
-- Keep direction-ablation reference handling unchanged and create the canonical
-  external-data record only from a committed implementation.
+- Make total tested distance per failure the primary whole-run replay metric.
+- Report that value in millimeters and as a percentage of total tested length.
+- Retain detailed failure events as diagnostics.
 
 ## Validation
 
-- Release `vc_fiber_trace_chunk` and
-  `test_fiber_reference_replay_benchmark` build successfully.
-- Focused benchmark tests: 4 test cases passed.
-- `ctest --test-dir volume-cartographer/build -R
-  '^test_fiber_reference_replay_benchmark$' --output-on-failure`: passed.
-- The broad `test_fiberlet_paths` executable still reports the pre-existing
-  bit-exact prepared-scoring failures at line 414; its continuation replay
-  regression is compiled, and the benchmark uses the unchanged ordinary reset
-  path already covered by that suite.
-- Committed implementation `d1c52f1b0` evaluated all 48 directions on the
-  frozen PHercParis4 1024 crop in 21.58 seconds wall time. All directions
-  reached the reference end; 43 were failure-free and 5 contained 6 total
-  failures. Source 0 reverse contained two failures, proving whole-run
-  continuation exposes an error hidden by the first-failure benchmark.
+- Release `vc_fiber_trace_chunk` and the focused benchmark test build.
+- Focused CTest passes: 5 test cases cover zero, one, and four failures,
+  physical conversion, incomplete-evaluation rejection, and JSON output.
+
+## Independent Review
+
+- Use full evaluated directed reference length, including forward and reverse
+  as separate tested distances, and reject incomplete case evaluation.
+- Count every failure reason consistently.
+- Preserve existing version-2 fields and add the corrected metric rather than
+  reinterpreting old fields.
+- Record that the percentage is `100 / max(failures, 1)`: zero and one failure
+  both produce 100 percent, while zero failures use a censored convention.

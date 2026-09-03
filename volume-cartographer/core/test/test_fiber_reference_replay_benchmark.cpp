@@ -84,8 +84,44 @@ TEST_CASE("reference replay summary includes successes and explicit voxel scale"
     CHECK(summary.meanFailedSpanLengthMillimeters == doctest::Approx(0.125));
     CHECK(summary.lengthWeightedSuccessPercent == doctest::Approx(87.5));
     CHECK(summary.failuresPerDirectedMillimeter == doctest::Approx(1.0));
+    CHECK(summary.meanDistancePerFailureBaseVoxels == doctest::Approx(200.0));
+    CHECK(summary.meanDistancePerFailureMillimeters == doctest::Approx(1.0));
+    CHECK(summary.meanDistancePerFailurePercent == doctest::Approx(100.0));
     REQUIRE(summary.failureReasons.size() == 1);
     CHECK(summary.failureReasons.front().first == "route_state_limit");
+}
+
+TEST_CASE("reference replay distance per failure handles zero and multiple failures")
+{
+    vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
+    outcome.referenceLengthBaseVoxels = 200.0;
+    outcome.tracedLengthBaseVoxels = 200.0;
+    outcome.evaluatedThroughBaseVoxels = 200.0;
+    outcome.evaluationComplete = true;
+    outcome.failureFree = true;
+
+    const std::array zeroFailureOutcomes{outcome};
+    const auto zero = vc::fiber_tracer::summarizeFiberReferenceReplay(1, zeroFailureOutcomes, 2.4);
+    CHECK(zero.meanDistancePerFailureBaseVoxels == doctest::Approx(200.0));
+    CHECK(zero.meanDistancePerFailureMillimeters == doctest::Approx(0.48));
+    CHECK(zero.meanDistancePerFailurePercent == doctest::Approx(100.0));
+
+    outcome.failureFree = false;
+    outcome.failures.resize(4);
+    for (std::size_t index = 0; index < outcome.failures.size(); ++index) {
+        outcome.failures[index].index = index;
+        outcome.failures[index].reason = "distance_above_threshold";
+    }
+    const std::array fourFailureOutcomes{outcome};
+    const auto four = vc::fiber_tracer::summarizeFiberReferenceReplay(1, fourFailureOutcomes, 2.4);
+    CHECK(four.meanDistancePerFailureBaseVoxels == doctest::Approx(50.0));
+    CHECK(four.meanDistancePerFailureMillimeters == doctest::Approx(0.12));
+    CHECK(four.meanDistancePerFailurePercent == doctest::Approx(25.0));
+
+    outcome.evaluationComplete = false;
+    outcome.evaluatedThroughBaseVoxels = 100.0;
+    const std::array incompleteOutcomes{outcome};
+    CHECK_THROWS_AS(vc::fiber_tracer::summarizeFiberReferenceReplay(1, incompleteOutcomes, 2.4), std::invalid_argument);
 }
 
 TEST_CASE("reference replay JSON version two preserves failure diagnostics")
@@ -114,6 +150,8 @@ TEST_CASE("reference replay JSON version two preserves failure diagnostics")
 
     CHECK(json.at("version") == 2);
     CHECK(json.at("config").at("seed_window_base_voxels") == doctest::Approx(8.0));
+    CHECK(json.at("summary").at("mean_distance_per_failure_mm") == doctest::Approx(0.024));
+    CHECK_FALSE(json.at("summary").at("zero_failure_convention_applied").get<bool>());
     const auto& failureJson = json.at("cases").at(0).at("failures").at(0);
     CHECK(failureJson.at("source_reference_arc_base_voxels") == doctest::Approx(7.0));
     CHECK(failureJson.at("threshold_measurement").at("normal_error_base_voxels") == doctest::Approx(3.0));

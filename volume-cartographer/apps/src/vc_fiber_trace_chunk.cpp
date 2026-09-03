@@ -10548,11 +10548,9 @@ int main(int argc, char** argv)
             vc::core::util::atomicWriteString(options.output, output.dump(2) + "\n");
             std::cout << std::fixed << std::setprecision(3)
                       << "fiber reference replay benchmark\n"
-                      << "cases  evaluated  failure_free  failures  failures/mm  mean_span_mm  mean_failed_span_mm  success_length_%\n"
-                      << summary.directedCases << "  " << summary.evaluatedCases << "  " << summary.failureFreeCases << "  "
-                      << summary.totalFailures << "  " << summary.failuresPerDirectedMillimeter << "  "
-                      << summary.meanSeededSpanLengthMillimeters << "  " << summary.meanFailedSpanLengthMillimeters << "  "
-                      << summary.lengthWeightedSuccessPercent << '\n'
+                      << "mean_distance_per_failure_mm  distance_per_failure_%\n"
+                      << summary.meanDistancePerFailureMillimeters << "  "
+                      << summary.meanDistancePerFailurePercent << '\n'
                       << "output=" << options.output << '\n';
             if (profileThread.joinable()) {
                 profileThread.request_stop();

@@ -1,7 +1,5 @@
-# Task: Whole-Run Reference Replay Benchmark
+# Task: Reference Replay Reliability Metric
 
-Update the reference endpoint replay benchmark so a failure does not terminate
-the directional case. Resume replay after each failure and evaluate the entire
-in-crop reference run, because one reference fiber may contain multiple failure
-locations. Preserve both endpoint directions and the existing anisotropic
-normal/tangential failure criterion.
+Replace the whole-run endpoint replay headline metrics with mean tested distance
+per failure and that distance as a percentage of total tested directed length.
+For a zero-failure run, report the complete tested length and 100 percent.

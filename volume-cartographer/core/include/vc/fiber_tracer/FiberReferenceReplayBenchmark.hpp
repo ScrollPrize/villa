@@ -74,6 +74,9 @@ struct FiberReferenceReplaySummary {
     double lengthWeightedSuccessPercent = 0.0;
     double failureFreeCasesPercent = 0.0;
     double failuresPerDirectedMillimeter = 0.0;
+    double meanDistancePerFailureBaseVoxels = 0.0;
+    double meanDistancePerFailureMillimeters = 0.0;
+    double meanDistancePerFailurePercent = 0.0;
     std::vector<std::pair<std::string, std::size_t>> failureReasons;
 };
 

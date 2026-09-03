@@ -6214,6 +6214,14 @@
   mean seeded-span length but not mean failed-span length; an unseeded failure
   contributes a zero failed span. Millimeter conversion requires an explicit
   positive base voxel size.
+- The primary whole-run reliability value is mean tested distance per failure:
+  `sum(full directed reference length) / max(total failures, 1)`. Its reported
+  percentage is `100 * mean distance per failure / total tested directed
+  length`, equivalently `100 / max(total failures, 1)`. A zero-failure run
+  therefore reports the complete tested directed length and 100 percent as a
+  censored lower bound. Exactly one failure also produces 100 percent by this
+  definition. Every failure reason contributes to the count, and the benchmark
+  rejects incomplete directional evaluation before calculating the metric.
 - Results use JSON schema version 2 and include every failure's reason, stable
   indices, directional and source-oriented reference arc/fraction, reference
   and optional evaluator position, and optional anisotropic threshold

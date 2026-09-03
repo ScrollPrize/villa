@@ -1957,3 +1957,10 @@
 - Added version-2 JSON accounting for every failure, seeded interval coverage,
   failure density, and failure-free span lengths while preserving the prior
   first-failure record as historical data.
+
+## 2026-09-03 - Endpoint replay reliability metric
+
+- Made total evaluated directed length per failure, plus its percentage of
+  tested length, the endpoint benchmark's only CLI headline metrics.
+- Defined zero failures as the complete tested length and 100 percent while
+  retaining detailed failure and coverage diagnostics in version-2 JSON.

@@ -1933,3 +1933,11 @@ by the full directed reference length. The report separately distinguishes
 whole-run evaluation completion from failure-free directions and gives total
 failures, failures per directed millimeter, mean seeded-span length, and mean
 span ending at a failure.
+
+The CLI headline reports only `mean_distance_per_failure_mm` and
+`distance_per_failure_%`. These are `total tested directed length /
+max(failures, 1)` and that distance divided by total tested directed length.
+Consequently a zero-failure run reports the complete tested length and 100%;
+the JSON failure count identifies this as a censored lower bound. Exactly one
+failure also reports 100% under this definition. Detailed counts, locations,
+and coverage diagnostics remain in the JSON.
