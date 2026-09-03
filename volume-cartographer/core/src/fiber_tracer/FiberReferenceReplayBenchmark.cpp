@@ -130,6 +130,102 @@ FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(const FiberRefere
     return outcome;
 }
 
+FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(
+    const FiberReferenceReplayCase& replayCase,
+    const FiberReplayTraceResult& replay)
+{
+    if (!(replayCase.referenceLengthBaseVoxels > 0.0) ||
+        !std::isfinite(replayCase.referenceLengthBaseVoxels)) {
+        throw std::invalid_argument(
+            "reference replay case length must be positive and finite");
+    }
+    if (std::abs(replay.referenceBeginArcBase) > kEpsilon ||
+        std::abs(replay.referenceEndArcBase -
+                 replayCase.referenceLengthBaseVoxels) > kEpsilon) {
+        throw std::invalid_argument(
+            "reference replay result interval does not match its case");
+    }
+
+    FiberReferenceReplayOutcome outcome;
+    outcome.sourceIndex = replayCase.sourceIndex;
+    outcome.runIndex = replayCase.runIndex;
+    outcome.reverse = replayCase.reverse;
+    outcome.referenceLengthBaseVoxels = replayCase.referenceLengthBaseVoxels;
+    outcome.evaluatedThroughBaseVoxels = std::clamp(
+        replay.completedReferenceArcBase - replay.referenceBeginArcBase,
+        0.0, replayCase.referenceLengthBaseVoxels);
+    outcome.evaluationComplete = outcome.evaluatedThroughBaseVoxels >=
+        replayCase.referenceLengthBaseVoxels - kEpsilon;
+    outcome.failureFree = replay.failures.empty();
+
+    std::vector<std::pair<double, double>> tracedIntervals;
+    for (const auto& segment : replay.segments) {
+        if (segment.matches.empty())
+            continue;
+        const double begin = std::clamp(
+            segment.matches.front().searchBeginArcBase -
+                replay.referenceBeginArcBase,
+            0.0, replayCase.referenceLengthBaseVoxels);
+        const double end = std::clamp(
+            segment.endReferenceArcBase - replay.referenceBeginArcBase,
+            0.0, replayCase.referenceLengthBaseVoxels);
+        if (end > begin + kEpsilon)
+            tracedIntervals.emplace_back(begin, end);
+    }
+    std::sort(tracedIntervals.begin(), tracedIntervals.end());
+    outcome.seededSpans = tracedIntervals.size();
+    for (std::size_t index = 0; index < tracedIntervals.size();) {
+        const double begin = tracedIntervals[index].first;
+        double end = tracedIntervals[index].second;
+        ++index;
+        while (index < tracedIntervals.size() &&
+               tracedIntervals[index].first <= end + kEpsilon) {
+            end = std::max(end, tracedIntervals[index].second);
+            ++index;
+        }
+        outcome.tracedLengthBaseVoxels += end - begin;
+    }
+
+    double previousDirectionalArc = -1.0;
+    for (const auto& failure : replay.failures) {
+        if (failure.index != outcome.failures.size() ||
+            failure.segmentIndex >= replay.segments.size()) {
+            throw std::invalid_argument(
+                "reference replay failures are not in stable segment order");
+        }
+        const auto& segment = replay.segments[failure.segmentIndex];
+        const double begin = !segment.matches.empty()
+            ? segment.matches.front().searchBeginArcBase
+            : failure.referenceArcBase;
+        const double directionalArc = std::clamp(
+            failure.referenceArcBase - replay.referenceBeginArcBase,
+            0.0, replayCase.referenceLengthBaseVoxels);
+        if (directionalArc + kEpsilon < previousDirectionalArc) {
+            throw std::invalid_argument(
+                "reference replay failures are not in directional arc order");
+        }
+        previousDirectionalArc = directionalArc;
+        const double sourceArc = replayCase.reverse
+            ? replayCase.referenceLengthBaseVoxels - directionalArc
+            : directionalArc;
+        outcome.failures.push_back({
+            failure.index,
+            failure.segmentIndex,
+            failure.reason,
+            directionalArc,
+            directionalArc / replayCase.referenceLengthBaseVoxels,
+            sourceArc,
+            sourceArc / replayCase.referenceLengthBaseVoxels,
+            std::clamp(failure.referenceArcBase - begin, 0.0,
+                       replayCase.referenceLengthBaseVoxels),
+            failure.referencePointBase,
+            failure.evaluatorPointBase,
+            failure.thresholdMeasurement,
+        });
+    }
+    return outcome;
+}
+
 FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSources, std::span<const FiberReferenceReplayOutcome> outcomes, double baseVoxelSizeUm)
 {
     if (!(baseVoxelSizeUm > 0.0) || !std::isfinite(baseVoxelSizeUm)) {
@@ -219,8 +315,9 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
 nlohmann::json fiberReferenceReplayBenchmarkJson(
     const FiberReferenceReplaySummary& summary,
     std::span<const FiberReferenceReplayOutcome> outcomes,
-    const FiberletGraphReplayConfig& replayConfig,
-    double seedWindowBaseVoxels,
+    std::string_view tracer,
+    const nlohmann::json& commonConfig,
+    const nlohmann::json& backendConfig,
     const cv::Vec3d& minimumBaseXYZ,
     const cv::Vec3d& maximumBaseXYZ)
 {
@@ -239,7 +336,9 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
                 {"traced_span_base_voxels", failure.tracedSpanBaseVoxels},
                 {"reference_point_base_xyz", pointJson(failure.referencePointBaseXYZ)},
                 {"evaluator_point_base_xyz", optionalPointJson(failure.evaluatorPointBaseXYZ)},
-                {"threshold_measurement", fiberReplayOptionalThresholdMeasurementJson(failure.thresholdMeasurement, replayConfig.errorThresholdBaseVoxels)},
+                {"threshold_measurement", fiberReplayOptionalThresholdMeasurementJson(
+                    failure.thresholdMeasurement,
+                    commonConfig.at("error_threshold_base_voxels").get<double>())},
             });
         }
         cases.push_back({
@@ -260,7 +359,8 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
         reasons[reason] = count;
     return {
         {"format", "vc_fiber_reference_replay_benchmark"},
-        {"version", 2},
+        {"version", 3},
+        {"tracer", tracer},
         {"coordinates",
          {
              {"order", "XYZ"},
@@ -269,20 +369,10 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
              {"minimum_base_xyz", pointJson(minimumBaseXYZ)},
              {"maximum_base_xyz", pointJson(maximumBaseXYZ)},
          }},
-        {"threshold", fiberReplayThresholdDescriptorJson(replayConfig.errorThresholdBaseVoxels)},
-        {"config",
-         {
-             {"beam_width", replayConfig.beamWidth},
-             {"beam_step_distance_base_voxels", replayConfig.beamStepDistanceBaseVoxels},
-             {"lookahead_distance_base_voxels", replayConfig.lookaheadDistanceBaseVoxels},
-             {"maximum_generated_states_per_iteration", replayConfig.maximumGeneratedStatesPerIteration},
-             {"match_refine_steps", replayConfig.matchRefineSteps},
-             {"require_initial_seed_in_first_window", replayConfig.requireInitialSeedInFirstWindow},
-             {"stop_at_first_failure", replayConfig.stopAtFirstFailure},
-             {"minimum_reset_advance_base_voxels", replayConfig.minimumResetAdvanceBaseVoxels},
-             {"seed_window_base_voxels", seedWindowBaseVoxels},
-             {"post_failure_seed_scan", "successive seed windows through remaining reference"},
-         }},
+        {"threshold", fiberReplayThresholdDescriptorJson(
+            commonConfig.at("error_threshold_base_voxels").get<double>())},
+        {"config", commonConfig},
+        {"backend_config", backendConfig},
         {"summary",
          {
              {"selected_sources", summary.selectedSources},

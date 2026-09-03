@@ -2,8 +2,33 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberReferenceReplayBenchmark.hpp"
+#include "vc/lasagna/LineOptimizer.hpp"
 
 #include <cmath>
+
+namespace
+{
+
+class ConstantNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    explicit ConstantNormalSampler(cv::Vec3d normal, bool valid = true)
+        : normal_(normal), valid_(valid)
+    {
+    }
+
+    vc::lasagna::NormalSample sampleNormal(
+        const cv::Vec3d&) const override
+    {
+        return {normal_, valid_, valid_ ? "" : "missing"};
+    }
+
+private:
+    cv::Vec3d normal_;
+    bool valid_ = true;
+};
+
+}  // namespace
 
 TEST_CASE("reference replay preparation retains crop re-entry runs in both directions")
 {
@@ -124,7 +149,7 @@ TEST_CASE("reference replay distance per failure handles zero and multiple failu
     CHECK_THROWS_AS(vc::fiber_tracer::summarizeFiberReferenceReplay(1, incompleteOutcomes, 2.4), std::invalid_argument);
 }
 
-TEST_CASE("reference replay JSON version two preserves failure diagnostics")
+TEST_CASE("reference replay JSON version three preserves failure diagnostics")
 {
     vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
     outcome.referenceLengthBaseVoxels = 10.0;
@@ -144,15 +169,80 @@ TEST_CASE("reference replay JSON version two preserves failure diagnostics")
     outcome.failures.push_back(failure);
     const std::array outcomes{outcome};
     const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(1, outcomes, 2.4);
-    vc::fiber_tracer::FiberletGraphReplayConfig config;
-    config.errorThresholdBaseVoxels = 2.0;
-    const auto json = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(summary, outcomes, config, 8.0, {0, 0, 0}, {10, 10, 10});
+    const nlohmann::json commonConfig = {
+        {"error_threshold_base_voxels", 2.0},
+        {"match_refine_steps", 1.0},
+    };
+    const auto json = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
+        summary, outcomes, "fiberlet", commonConfig,
+        {{"beam_width", 16}}, {0, 0, 0}, {10, 10, 10});
 
-    CHECK(json.at("version") == 2);
-    CHECK(json.at("config").at("seed_window_base_voxels") == doctest::Approx(8.0));
+    CHECK(json.at("version") == 3);
+    CHECK(json.at("tracer") == "fiberlet");
+    CHECK(json.at("backend_config").at("beam_width") == 16);
     CHECK(json.at("summary").at("mean_distance_per_failure_mm") == doctest::Approx(0.024));
     CHECK_FALSE(json.at("summary").at("zero_failure_convention_applied").get<bool>());
     const auto& failureJson = json.at("cases").at(0).at("failures").at(0);
     CHECK(failureJson.at("source_reference_arc_base_voxels") == doctest::Approx(7.0));
     CHECK(failureJson.at("threshold_measurement").at("normal_error_base_voxels") == doctest::Approx(3.0));
+}
+
+TEST_CASE("direct replay outcomes use the common benchmark accounting")
+{
+    vc::fiber_tracer::FiberReferenceReplayCase replayCase;
+    replayCase.referenceLengthBaseVoxels = 10.0;
+    vc::fiber_tracer::FiberReplayTraceResult replay;
+    replay.referenceEndArcBase = 10.0;
+    replay.completedReferenceArcBase = 10.0;
+    replay.segments.resize(1);
+    replay.segments[0].endReferenceArcBase = 10.0;
+    replay.segments[0].matches.push_back(
+        {0, 0.0, 0.0, {}, 0.0, 1.0, {}});
+
+    const auto outcome =
+        vc::fiber_tracer::measureFiberReferenceReplayOutcome(
+            replayCase, replay);
+    CHECK(outcome.evaluationComplete);
+    CHECK(outcome.failureFree);
+    CHECK(outcome.seededSpans == 1);
+    CHECK(outcome.tracedLengthBaseVoxels == doctest::Approx(10.0));
+}
+
+TEST_CASE("Lasagna replay transports a reference tangent on a planar normal field")
+{
+    ConstantNormalSampler normals({0.0, 0.0, 1.0});
+    vc::fiber_tracer::LasagnaReplayTraceRequest request;
+    request.referencePointsBase = {{0, 0, 0}, {40, 0, 0}};
+    request.stepBaseVoxels = 4.0;
+    request.errorThresholdBaseVoxels = 1.0;
+    const auto replay = vc::fiber_tracer::traceLasagnaReplay(normals, request);
+
+    CHECK(replay.completedReferenceArcBase == doctest::Approx(40.0));
+    CHECK(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    CHECK(replay.segments.front().tracePointsBase.back()[0] ==
+          doctest::Approx(40.0));
+}
+
+TEST_CASE("Lasagna replay retains direction across invalid normal samples")
+{
+    ConstantNormalSampler normals({0.0, 0.0, 0.0}, false);
+    vc::fiber_tracer::LasagnaReplayTraceRequest request;
+    request.referencePointsBase = {{0, 0, 0}, {20, 0, 0}};
+    request.stepBaseVoxels = 4.0;
+    request.errorThresholdBaseVoxels = 1.0;
+    const auto replay = vc::fiber_tracer::traceLasagnaReplay(normals, request);
+
+    CHECK(replay.completedReferenceArcBase == doctest::Approx(20.0));
+    CHECK(replay.failures.empty());
+}
+
+TEST_CASE("Lasagna tangent transport resolves antipodal normal encodings")
+{
+    const cv::Vec3d direction{1.0, 0.0, 0.0};
+    const auto same = vc::lasagna::transportDirectionToNormalPlane(
+        direction, {0.0, 0.0, 1.0}, {0.0, 0.0, -1.0});
+    CHECK(same[0] == doctest::Approx(1.0));
+    CHECK(same[1] == doctest::Approx(0.0));
+    CHECK(same[2] == doctest::Approx(0.0));
 }

@@ -1908,11 +1908,11 @@ provide an adequate unsupervised stopping rule.
 
 ## Reference endpoint replay
 
-Use `reference-replay-benchmark` to start the current Fiberlet search from both
-ends of every tagged reference run inside a crop. The command uses the same
-lookahead-padded graph materialization and Lasagna-normal ellipsoid as replay,
-requires a seed near the endpoint, records each failure, resets, and continues
-until the complete directional reference run has been evaluated.
+Use `reference-replay-benchmark` to run Fiberlet, direct greedy, or Lasagna
+normal-transport tracing from both ends of every tagged reference run inside a
+crop. Fiberlet remains the default. The two direct controls are selected with
+`--replay-tracer greedy` or `--replay-tracer lasagna` and are intentionally not
+available to crop pruning.
 
 ```bash
 vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
@@ -1924,7 +1924,41 @@ vc_fiber_trace_chunk reference-replay-benchmark fiberlets.zarr \
   --output reference-replay.json
 ```
 
-The version-2 JSON report contains one forward and reverse case per contiguous
+Direct greedy replay consumes the dense Fiber prediction manifest and forces
+the historical greedy policy of beam width one and lookahead one:
+
+```bash
+vc_fiber_trace_chunk reference-replay-benchmark - \
+  --replay-tracer greedy \
+  --fiber-manifest fiber-prediction.lasagna.json \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers \
+  --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 \
+  --output reference-greedy.json
+```
+
+Lasagna replay is a control, not an independent fiber-direction predictor. It
+starts exactly at each reference endpoint using the endpoint tangent, predicts
+the next point along that tangent, samples the sheet normal, resolves its sign
+against the preceding normal, transports the tangent into the new tangent
+plane, and advances by `--lasagna-step` base voxels (default 16). Invalid
+normal samples retain the previous direction. It does not run global line
+optimization:
+
+```bash
+vc_fiber_trace_chunk reference-replay-benchmark - \
+  --replay-tracer lasagna \
+  --normal-manifest normals.lasagna.json \
+  --bbox 10240 22016 6144 11264 23040 7168 \
+  --reference-fiber-dir reference-fibers \
+  --reference-fiber-tag hendrik_crop1 \
+  --base-voxel-size-um 2.4 \
+  --output reference-lasagna.json
+```
+
+The version-3 JSON report contains one forward and reverse case per contiguous
 in-crop reference run. A case contains every ordered failure with directional
 and source-oriented reference arcs, positions, and anisotropic errors. Credited
 length is the union of actual seeded replay intervals, excluding missing-seed
@@ -1941,3 +1975,12 @@ Consequently a zero-failure run reports the complete tested length and 100%;
 the JSON failure count identifies this as a censored lower bound. Exactly one
 failure also reports 100% under this definition. Detailed counts, locations,
 and coverage diagnostics remain in the JSON.
+
+All backends use the same forward reference matcher, Lasagna-normal anisotropic
+threshold, complete-run requirement, and metric aggregation. Their native
+sampling/reset increments and initialization differ: Fiberlet searches for an
+aligned anchor in a seed window, while greedy and Lasagna start at the exact
+reference endpoint and reset by their respective evaluation step. JSON records
+the tracer, common evaluator settings, backend settings, and only the consumed
+input artifacts. Sampling cadence can affect observed failures and must be
+considered when comparing backends.

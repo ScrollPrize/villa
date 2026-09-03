@@ -1,5 +1,6 @@
-# Task: Reference Replay Reliability Metric
+# Task: Direct Tracer Reference Replay Benchmarks
 
-Replace the whole-run endpoint replay headline metrics with mean tested distance
-per failure and that distance as a percentage of total tested directed length.
-For a zero-failure run, report the complete tested length and 100 percent.
+Extend the reference-fiber replay benchmark to evaluate the older direct greedy
+Fiber tracer and the Lasagna normal-transport tracer in addition to the
+Fiberlet tracer. These additional backends apply only to reference replay; the
+1024-crop oracle-pruning benchmark remains Fiberlet-only.

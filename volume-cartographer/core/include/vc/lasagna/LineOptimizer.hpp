@@ -167,6 +167,14 @@ struct LineControlPointUpdateResult {
     const NormalSampler& sampler,
     const LineOptimizationConfig& config);
 
+// Parallel-transport a directed line tangent into the tangent plane of the
+// next sampled sheet normal. Antipodal normal encodings are resolved against
+// the previous normal before transport.
+[[nodiscard]] cv::Vec3d transportDirectionToNormalPlane(
+    const cv::Vec3d& direction,
+    const cv::Vec3d& previousNormal,
+    const cv::Vec3d& targetNormal);
+
 class LineOptimizer {
 public:
     explicit LineOptimizer(const NormalSampler& normalSampler);

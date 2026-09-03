@@ -467,6 +467,14 @@ struct FiberReplayTraceRequest {
     FiberTraceConfig config;
 };
 
+struct LasagnaReplayTraceRequest {
+    std::vector<cv::Vec3d> referencePointsBase;
+    double stepBaseVoxels = 16.0;
+    double errorThresholdBaseVoxels = 20.0;
+    double matchRefineSteps = 1.0;
+    double maxStepFactor = 3.0;
+};
+
 struct FiberReplayFailure {
     size_t index = 0;
     size_t segmentIndex = 0;
@@ -608,6 +616,14 @@ struct CandidateScoreDebug {
     const FiberReplayTraceRequest& request,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
+    const FiberTraceProgressCallback& progress = {},
+    const FiberReplayFailureCallback& failure = {});
+
+// Reference-tangent-initialized normal-transport control. Invalid normal
+// samples retain the previous transported direction.
+[[nodiscard]] FiberReplayTraceResult traceLasagnaReplay(
+    const vc::lasagna::NormalSampler& normalSampler,
+    const LasagnaReplayTraceRequest& request,
     const FiberTraceProgressCallback& progress = {},
     const FiberReplayFailureCallback& failure = {});
 

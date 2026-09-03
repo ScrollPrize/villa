@@ -1,36 +1,53 @@
 # Plan
 
-1. Define mean distance per failure as total tested directed reference length
-   divided by `max(total failures, 1)`.
-2. Define its percentage as `100 * distance per failure / total tested directed
-   reference length`; therefore a zero-failure run reports the entire tested
-   length and 100 percent.
-3. Make these the only headline reliability values in CLI and benchmark result
-   tables. Preserve failure counts, locations, and seeded-coverage fields in
-   versioned JSON as supporting diagnostics.
-4. Update unit tests, specifications, documentation, changelog, and benchmark
-   records, then rebuild and run focused tests.
+1. Generalize reference replay so Fiberlet, direct greedy, and Lasagna use the
+   same directed cases, forward-reference matcher, anisotropic threshold,
+   failure accounting, completion requirement, and distance-per-failure
+   summary. Preserve each backend's native seed and reset increment, but record
+   these differences explicitly.
+2. Add an explicit replay tracer selection to `vc_fiber_trace_chunk`. Keep the
+   current Fiberlet backend as the default; require a Fiber prediction manifest
+   only for direct greedy replay. Lasagna replay uses the normal manifest.
+3. Reuse the existing direct greedy `traceFiberReplay` implementation with a
+   synthetic two-control-point input for each clipped directed run. Extract the
+   existing Lasagna normal-transport step into a public helper, port its current
+   caller to that helper, and drive it through the same reset-capable replay
+   implementation. Lasagna starts exactly at the reference endpoint tangent,
+   keeps the previous direction across invalid normal samples, and is reported
+   as a normal-transport control.
+4. Version benchmark JSON to version 3 so it records tracer identity, common
+   evaluator settings, actual evaluation/reset spacing, backend-specific
+   effective settings, and only the inputs consumed by that backend. Keep
+   headline metrics identical across backends and retain version-2 Fiberlet
+   records as historical artifacts.
+5. Add focused synthetic tests for direct-result adapter semantics, constant
+   and invalid-normal Lasagna replay, antipodal normal transport, and JSON
+   tracer provenance. Re-run the existing greedy replay and Lasagna optimizer
+   tests, then smoke-test CLI validation and both direct backends on the frozen
+   external dataset.
+6. Build Release targets, run focused tests, then run and record the greedy and
+   Lasagna reference benchmarks on the frozen PHercParis4 1024 crop if the
+   required local prediction input is discoverable.
 
-All replay failure events count, regardless of reason. Full directed reference
-length is used only when every directional case completed evaluation. The
-percentage deliberately reduces to `100 / max(total failures, 1)`, so both zero
-and one failure report 100 percent; the zero-failure value is a censored lower
-bound and remains identifiable from the failure count in JSON.
+The crop-pruning command and its benchmark schema are intentionally unchanged.
 
 ## Spec Update
 
-Specify the exact distance-per-failure formula and zero-failure convention.
+Specify the three reference replay backends, common metric/evaluation policy,
+backend inputs, and the fact that crop pruning remains Fiberlet-only.
 
 ## Docs Update
 
-Replace ambiguous mean failed-span and seeded-coverage headline reporting with
-distance per failure and its percentage of tested length.
+Document commands and effective settings for Fiberlet, greedy, and Lasagna
+reference replay. Add reproducible run records and index rows for completed
+external-data runs.
 
 ## Changelog
 
-Record the corrected whole-run reliability metric.
+Record direct greedy and Lasagna reference replay support.
 
 ## Validation
 
-Test runs with zero, one, and multiple failures and verify physical conversion,
-percentage calculation, JSON fields, and CLI output.
+Run the focused C++ tests and the frozen 1024-crop replay command for both new
+backends. Record wall/CPU time, source revision, artifact identities, failure
+count, mean distance per failure, and percentage.

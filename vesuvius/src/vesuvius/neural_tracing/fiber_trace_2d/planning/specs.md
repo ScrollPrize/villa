@@ -6192,9 +6192,11 @@
 # Reference endpoint replay benchmark
 
 - `vc_fiber_trace_chunk reference-replay-benchmark` evaluates tagged VC3D
-  reference fibers against a combined Fiberlet dataset in a half-open base-XYZ
-  crop. It clips each reference into every contiguous in-crop run and evaluates
-  both directions of every nondegenerate run.
+  reference fibers with `fiberlet` (default), `greedy`, or `lasagna` tracing in
+  a half-open base-XYZ crop. It clips each reference into every contiguous
+  in-crop run and evaluates both directions of every nondegenerate run. Replay
+  backend selection does not apply to crop tracing, direction inference, or
+  oracle pruning.
 - The graph support is the requested crop padded on every face by the configured
   lookahead. The first replay seed must occur in the ordinary initial seed
   window and pass the shared Lasagna-normal ellipsoid threshold. A missing
@@ -6203,6 +6205,22 @@
   seed scan to continue through the remainder of the directional reference run.
   It retains every failure in stable arc order. This mode does not alter the
   ordinary replay implementation or defaults.
+- Direct greedy replay requires `--fiber-manifest`, constructs a two-control-
+  point fiber from each directed clipped run, starts at the exact endpoint, and
+  forces beam width and lookahead to one. Its prediction/trace scales and all
+  effective trace settings are serialized.
+- Lasagna replay is a reference-tangent-initialized normal-transport control.
+  At each fixed base-voxel step it predicts along the current tangent, samples
+  the sheet normal, resolves antipodal normal sign against the prior normal,
+  transports the tangent into the new normal plane, and advances. An invalid
+  normal retains the previous direction. It starts exactly at the reference
+  endpoint and does not perform global line optimization. Normals alone are not
+  treated as a fiber-direction prediction.
+- All backends share forward reference matching and the anisotropic threshold.
+  Fiberlet retains its seed-window/reset policy; direct backends reset by their
+  native evaluation step. Backend initialization, evaluation spacing, reset
+  advance, and invalid-data policy are explicit JSON fields because these can
+  affect comparative failure counts.
 - Credited length is the interval union of every seeded replay segment from its
   first match search-begin arc through its segment end. Missing-seed gaps and
   unseeded tails receive no credit. Length-weighted success remains
@@ -6222,7 +6240,8 @@
   censored lower bound. Exactly one failure also produces 100 percent by this
   definition. Every failure reason contributes to the count, and the benchmark
   rejects incomplete directional evaluation before calculating the metric.
-- Results use JSON schema version 2 and include every failure's reason, stable
+- Results use JSON schema version 3 and include tracer identity, common and
+  backend configuration, and every failure's reason, stable
   indices, directional and source-oriented reference arc/fraction, reference
   and optional evaluator position, and optional anisotropic threshold
   measurement. They also include threshold geometry, effective search/reset

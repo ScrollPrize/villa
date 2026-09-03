@@ -1,11 +1,13 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberGraph.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include <cstddef>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -85,14 +87,19 @@ struct FiberReferenceReplaySummary {
 
 [[nodiscard]] FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(const FiberReferenceReplayCase& replayCase, const FiberletGraphReplayResult& replay);
 
+[[nodiscard]] FiberReferenceReplayOutcome measureFiberReferenceReplayOutcome(
+    const FiberReferenceReplayCase& replayCase,
+    const FiberReplayTraceResult& replay);
+
 [[nodiscard]] FiberReferenceReplaySummary summarizeFiberReferenceReplay(
     std::size_t selectedSources, std::span<const FiberReferenceReplayOutcome> outcomes, double baseVoxelSizeUm);
 
 [[nodiscard]] nlohmann::json fiberReferenceReplayBenchmarkJson(
     const FiberReferenceReplaySummary& summary,
     std::span<const FiberReferenceReplayOutcome> outcomes,
-    const FiberletGraphReplayConfig& replayConfig,
-    double seedWindowBaseVoxels,
+    std::string_view tracer,
+    const nlohmann::json& commonConfig,
+    const nlohmann::json& backendConfig,
     const cv::Vec3d& minimumBaseXYZ,
     const cv::Vec3d& maximumBaseXYZ);
 

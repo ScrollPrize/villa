@@ -1964,3 +1964,13 @@
   tested length, the endpoint benchmark's only CLI headline metrics.
 - Defined zero failures as the complete tested length and 100 percent while
   retaining detailed failure and coverage diagnostics in version-2 JSON.
+
+## 2026-09-03 - Direct tracer reference replay
+
+- Added direct greedy and reference-tangent Lasagna normal-transport controls
+  to the whole-run reference replay benchmark without enabling them for crop
+  pruning.
+- Shared forward matching, anisotropic failure evaluation, deterministic reset
+  accounting, and distance-per-failure aggregation across direct backends;
+  version-3 JSON records tracer-specific initialization, spacing, settings, and
+  inputs.
