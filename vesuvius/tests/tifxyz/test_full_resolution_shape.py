@@ -87,6 +87,25 @@ def test_extent_is_at_least_one() -> None:
     assert _full_resolution_extent(1, 4.0) == 1
 
 
+@pytest.mark.parametrize("scale", [1e-46, 0.0, -0.05, float("inf"), float("nan")])
+def test_unusable_scale_falls_back_to_stored_extent(scale: float) -> None:
+    # 1e-46 underflows float32 to 0; none of these can size a canvas
+    assert _full_resolution_extent(152, scale) == 152
+
+
+def test_label_transfer_surface_agrees_with_tifxyz() -> None:
+    """Both packages must report one canvas; they used to differ near .5 quotients."""
+    from vesuvius.tifxyz_label_transfer.core import Surface
+
+    stored_h, stored_w, scale = 3681, 2001, 0.3313977  # 3681 / scale = 11107.4999...
+    zeros = np.zeros((stored_h, stored_w), dtype=np.float32)
+    ones = np.ones((stored_h, stored_w), dtype=np.float32)
+    lt_surface = Surface(x=ones, y=ones, z=ones, scale_yx=(scale, scale))
+    tifxyz_surface = _surface(stored_h, stored_w, scale)
+    assert lt_surface.full_resolution_shape == tifxyz_surface.full_resolution_shape
+    assert lt_surface.full_resolution_shape == (11107, 6038)
+
+
 def test_shape_properties_agree() -> None:
     surface = _surface(202, 215, FLOAT32_SCALE)
     assert surface.full_resolution_shape == (4040, 4300)
