@@ -16,11 +16,24 @@ def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, A
     different on-disk layout (``zarr.json`` instead of ``.zgroup``/``.zarray``).
     Every writer in this package predates zarr 3 and its consumers (VC3D,
     ``vesuvius.data.utils.open_zarr``, the eigenanalysis readers) expect v2,
-    so ask for ``zarr_format=2`` whenever the group may be created. zarr 2 has
-    no ``zarr_format`` argument, and an existing store keeps its own format.
+    so ask for ``zarr_format=2`` whenever the group is created. Append modes
+    (``'a'``, ``'r+'``) keep the format of an existing store and only fall
+    back to v2 when nothing is there yet. zarr 2 has no ``zarr_format``
+    argument.
     """
-    if _ZARR_V3 and mode in ('w', 'w-', 'a', 'r+') and 'zarr_format' not in kwargs:
-        kwargs['zarr_format'] = 2
+    if _ZARR_V3 and 'zarr_format' not in kwargs:
+        if mode in ('w', 'w-'):
+            kwargs['zarr_format'] = 2
+        elif mode in ('a', 'r+'):
+            # Appending: keep whatever format the store already has. Forcing
+            # v2 here would write a second .zgroup next to an existing
+            # zarr.json and leave a store that reads as v3 and empty.
+            try:
+                kwargs['zarr_format'] = zarr.open_group(
+                    path, mode='r', storage_options=storage_options
+                ).metadata.zarr_format
+            except FileNotFoundError:  # GroupNotFoundError: nothing there yet
+                kwargs['zarr_format'] = 2
     if storage_options is not None:
         kwargs['storage_options'] = storage_options
     return zarr.open_group(path, mode=mode, **kwargs)
