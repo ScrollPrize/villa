@@ -137,6 +137,11 @@ def test_retries_disabled_with_one_attempt() -> None:
         "Connection reset by peer",
         "read operation timed out",
         "An error occurred (503) when calling GetObject: SlowDown",
+        "ClientResponseError: 503, message='Service Unavailable'",
+        "ClientResponseError: 429, message='Too Many Requests'",
+        "An error occurred (500) when calling the GetObject operation (InternalError)",
+        "HTTP 502",
+        "status: 504",
     ],
 )
 def test_transient_messages_detected(message: str) -> None:
@@ -149,7 +154,34 @@ def test_transient_messages_detected(message: str) -> None:
         IndexError("index 99 is out of bounds"),
         KeyError("no such array: 0"),
         ValueError("patch_size must be a tuple of 3 integers"),
+        IndexError("index out of bounds for dimension with length 504"),
+        IndexError("index out of bounds for dimension with length 5000"),
+        IndexError("index 500 is out of bounds for axis 0 with size 429"),
+        ValueError("cannot reshape array of size 5030 into shape (3,4)"),
+        KeyError("0/503/12"),
+        TypeError("unsupported operand type(s) for +: 'int' and 'str' (code 502)"),
+        OSError("read 5040 bytes"),
     ],
 )
 def test_deterministic_errors_not_flagged(exc: BaseException) -> None:
     assert not _is_transient_read_error(exc)
+
+
+def test_deterministic_error_with_status_like_length_fails_fast() -> None:
+    """The exact repro from PR #1698 review: a 504-long axis and a bad index."""
+
+    class BoundsCheckError(IndexError):
+        pass
+
+    volume = _FlakyVolume(
+        [BoundsCheckError("index out of bounds for dimension with length 504")]
+    )
+    with pytest.raises(BoundsCheckError):
+        read_bbox_with_padding(volume, _bbox())
+    assert volume.reads == 1
+
+
+def test_transient_cause_behind_deterministic_wrapper_is_still_detected() -> None:
+    outer = ValueError("failed decoding chunk")
+    outer.__cause__ = OSError("Connection reset by peer")
+    assert _is_transient_read_error(outer)
