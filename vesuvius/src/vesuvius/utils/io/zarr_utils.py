@@ -83,18 +83,41 @@ def zarr_array_exists(zarr_path):
         zarr_path: Path to the zarr array directory
 
     Returns:
-        bool: True if the zarr array exists, False otherwise
+        bool: True if the zarr array exists, False if it is absent.
+
+    Raises:
+        RuntimeError: if existence could not be determined at all (credentials,
+            permissions, network). Reporting that as False would be
+            indistinguishable from the array being absent.
     """
-    try:
-        if zarr_path.startswith('s3://'):
-            fs = fsspec.filesystem('s3', anon=False)
-            # Check if .zarray file exists within the zarr directory
-            return fs.exists(os.path.join(zarr_path, '.zarray'))
-        else:
-            # For local paths, check if the .zarray file exists
-            return os.path.exists(os.path.join(zarr_path, '.zarray'))
-    except Exception:
-        return False
+    # Accept str or os.PathLike. The previous implementation caught the
+    # AttributeError this would otherwise raise and returned False for every
+    # Path argument, so coercing here keeps that input working and answers it.
+    zarr_path = os.fspath(zarr_path)
+    marker = os.path.join(zarr_path, '.zarray')
+
+    if not zarr_path.startswith('s3://'):
+        # For local paths, check if the .zarray file exists
+        return os.path.exists(marker)
+
+    # The open-data bucket is published public-read, so a machine with no AWS
+    # credentials must still be able to answer this. Try the configured
+    # credentials first, then fall back to anonymous access.
+    last_error = None
+    for anon in (False, True):
+        try:
+            return fsspec.filesystem('s3', anon=anon).exists(marker)
+        except Exception as exc:
+            last_error = exc
+
+    # Reporting a credentials or network failure as "the array does not exist"
+    # sends callers down the wrong path entirely: wait_for_zarr_creation() below
+    # would sit out its full timeout and then report that the array was never
+    # created, when the truth is that we were never able to look.
+    raise RuntimeError(
+        f"Could not determine whether a zarr array exists at {zarr_path}: "
+        f"{type(last_error).__name__}: {last_error}"
+    ) from last_error
 
 
 def wait_for_zarr_creation(zarr_path, max_wait_time=300, sleep_interval=5, verbose=True, part_id=None):
