@@ -20,6 +20,24 @@ from numpy.typing import NDArray
 InterpolationMethod = Literal["linear", "bspline", "catmull_rom"]
 
 
+def _full_resolution_extent(stored: int, scale: float) -> int:
+    """Stored grid extent -> full-resolution canvas extent, as VC3D computes it.
+
+    ``QuadSurface::size()`` in volume-cartographer evaluates
+    ``static_cast<int>(_points->cols / _scale[0])`` with ``_scale`` held as
+    ``cv::Vec2f``, i.e. a *float32* division followed by truncation. Tracer
+    meshes store ``scale`` as the float32 value 0.05 (``0.05000000074505806``),
+    and ``stored / scale`` in float64 then lands just below the integer
+    (``152 / 0.05000000074505806 == 3039.99995...``), so ``int()`` on the
+    float64 quotient is one pixel short of the canvas ``vc_render_tifxyz``
+    and the published surface volumes use. Doing the division in float32
+    reproduces the C++ result exactly rather than approximating it with
+    ``round``.
+    """
+    quotient = np.float32(stored) / np.float32(scale)
+    return int(quotient)
+
+
 @dataclass
 class Tifxyz:
     """A 3D surface represented as a 2D grid of (x, y, z) coordinates.
@@ -177,11 +195,7 @@ class Tifxyz:
         if self.resolution == "stored":
             return self._x.shape  # type: ignore[return-value]
         # Full resolution
-        h, w = self._x.shape
-        scale_y, scale_x = self._scale
-        if scale_y == 0 or scale_x == 0:
-            return (h, w)
-        return (int(h / scale_y), int(w / scale_x))
+        return self.full_resolution_shape
 
     @property
     def full_resolution_shape(self) -> Tuple[int, int]:
@@ -194,7 +208,10 @@ class Tifxyz:
         scale_y, scale_x = self._scale
         if scale_y == 0 or scale_x == 0:
             return (h, w)
-        return (int(h / scale_y), int(w / scale_x))
+        return (
+            _full_resolution_extent(h, scale_y),
+            _full_resolution_extent(w, scale_x),
+        )
 
     @property
     def _stored_shape(self) -> Tuple[int, int]:
