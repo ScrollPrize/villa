@@ -1399,8 +1399,10 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
         dropSurfaceCaches();
         clearIntersectionItems();
         _measurement = {};
-        _scene->clear();
+        // Forget the overlay groups before the scene deletes their items, so
+        // no group ever names a freed item (translateOverlayGroup walks them).
         _overlayGroups.clear();
+        _scene->clear();
         _cursorCrosshair = nullptr;
         _lineAnnotationPlacementMarker = nullptr;
         _focusMarker = nullptr;
@@ -5298,23 +5300,42 @@ void CChunkedVolumeViewer::setOverlayGroup(const std::string& key, const std::ve
     }
 }
 
+bool CChunkedVolumeViewer::translateOverlayGroup(const std::string& key, const QPointF& delta)
+{
+    const auto it = _overlayGroups.find(key);
+    if (it == _overlayGroups.end())
+        return false;
+    if (delta.isNull())
+        return true;
+    for (auto* item : it->second) {
+        if (item)
+            item->moveBy(delta.x(), delta.y());
+    }
+    return true;
+}
+
 void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
 {
     auto it = _overlayGroups.find(key);
     if (it == _overlayGroups.end())
         return;
-    for (auto* item : it->second)
-        delete item;
+    // Detach before deleting: the map must never name a freed item
+    // (translateOverlayGroup walks the registered items).
+    const std::vector<QGraphicsItem*> items = std::move(it->second);
     _overlayGroups.erase(it);
+    for (auto* item : items)
+        delete item;
 }
 
 void CChunkedVolumeViewer::clearAllOverlayGroups()
 {
-    for (auto& [_, items] : _overlayGroups) {
+    // Detach before deleting, as in clearOverlayGroup.
+    const auto groups = std::move(_overlayGroups);
+    _overlayGroups.clear();
+    for (const auto& [_, items] : groups) {
         for (auto* item : items)
             delete item;
     }
-    _overlayGroups.clear();
 }
 
 std::vector<std::pair<QRectF, QColor>> CChunkedVolumeViewer::selections() const

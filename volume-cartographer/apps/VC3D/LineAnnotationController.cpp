@@ -330,8 +330,12 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// Arclength radius within which a placement click replaces the existing
+// control(s) instead of adding one. Tied to the strip's along-line sampling
+// so no control span can be created shorter than one strip column (#1484:
+// such a span would be drawn stretched to a full column).
 constexpr double kMinimumControlPointSpacingBaseVoxels =
-    vc::lasagna::kLineViewSamplingDistanceBaseVoxels;
+    vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
 
 std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
     const CState* state)
@@ -2495,8 +2499,11 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
             this,
-            [this](const std::string& name, cv::Vec3f volumePoint, double linePosition) {
-                handleGeneratedControlPoint(name, volumePoint, linePosition);
+            [this](const std::string& name,
+                   cv::Vec3f volumePoint,
+                   double linePosition,
+                   cv::Vec3f lineAnchor) {
+                handleGeneratedControlPoint(name, volumePoint, linePosition, lineAnchor);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointDeleteRequested,
@@ -7247,7 +7254,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
 
 void LineAnnotationController::handleGeneratedControlPoint(const std::string& surfaceName,
                                                           cv::Vec3f volumePoint,
-                                                          double linePosition)
+                                                          double linePosition,
+                                                          std::optional<cv::Vec3f> lineAnchor)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -7285,17 +7293,23 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     for (const auto& point : session.optimizedLine.points) {
         currentLinePoints.push_back(point.position);
     }
-    {
+    if (lineAnchor && std::isfinite((*lineAnchor)[0]) && std::isfinite((*lineAnchor)[1]) &&
+        std::isfinite((*lineAnchor)[2])) {
         // A rapid second click arrives while the previous edit's geometric
         // splice is still waiting for its landing: its line position was
         // measured on the previously DISPLAYED line, and the splice may have
-        // renumbered since. The 3D click point is frame-independent, so when
-        // the two disagree materially, trust the point.
-        const size_t nearestIndex = vc3d::fiber_slice::nearestLinePointIndex(
-            currentLinePoints, toVec3d(volumePoint));
-        if (std::abs(static_cast<double>(nearestIndex) - linePosition) > 2.0) {
-            linePosition = static_cast<double>(nearestIndex);
-        }
+        // renumbered since. Resolve it on the session line through the
+        // position's own 3D line point (index-continuous nearest match, the
+        // same remap the landing applies to the pane position). Where the
+        // frames agree the anchor sits exactly on the line and the position
+        // is unchanged. The CLICKED point must not drive this: a click is
+        // deliberately off the line, and where another pass of the same fiber
+        // runs through the cut plane the click can be nearer to that pass,
+        // which sent the control point thousands of vertices away -- or
+        // collapsed it into that pass's control point -- with nothing
+        // visible happening at the cut the user was looking at.
+        linePosition = vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor(
+            currentLinePoints, toVec3d(*lineAnchor), linePosition);
     }
     const auto cumulativeArclengths =
         vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
@@ -11869,6 +11883,39 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.stripPositionMap = views.stripPositionMap;
     generatedViews.lineNormals = std::move(orientedNormals);
+    {
+        // Winding angles for the side cut's half-wrap window (see the side
+        // overlay in LineAnnotationDialog). Same center reference chain as
+        // orientedLineNormalsForSession, which already loaded the umbilicus:
+        // umbilicus, else the volume center; with neither the angles stay NaN
+        // and the side cut shows the whole line as before.
+        constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+        cv::Vec2f volumeCenterXY{kNanF, kNanF};
+        try {
+            if (const auto volume = _state->currentVolume()) {
+                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f,
+                                  static_cast<float>(volume->sliceHeight()) * 0.5f};
+            }
+        } catch (...) {
+        }
+        generatedViews.lineWindingAngles =
+            vc3d::line_annotation::unwrappedGeneratedWindingAngles(
+                generatedViews.linePoints,
+                [this, volumeCenterXY](const cv::Vec3f& point) -> cv::Vec3f {
+                    if (_scrollUmbilicus) {
+                        try {
+                            return _scrollUmbilicus->vector_to_umbilicus(point);
+                        } catch (...) {
+                        }
+                    }
+                    if (std::isfinite(volumeCenterXY[0])) {
+                        return {volumeCenterXY[0] - point[0],
+                                volumeCenterXY[1] - point[1],
+                                0.0f};
+                    }
+                    return {kNanF, kNanF, kNanF};
+                });
+    }
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
     generatedViews.seedPoint = seedPoint;

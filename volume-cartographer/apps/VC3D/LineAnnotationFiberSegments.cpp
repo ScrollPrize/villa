@@ -205,26 +205,57 @@ char segmentInterpolationModeMarker(SegmentInterpolationMode mode) noexcept
     return '?';
 }
 
+SegmentInterpolationCutoffs segmentInterpolationCutoffs(
+    const vc::fiber_tracer::FiberTraceConfig& traceConfig,
+    const vc::lasagna::LineOptimizationConfig& lasagnaConfig,
+    double traceToBaseScale)
+{
+    SegmentInterpolationCutoffs cutoffs;
+    cutoffs.traceMinimumSpanBaseVoxels = static_cast<double>(kMinimumTraceSteps) *
+        traceConfig.stepVoxels * traceToBaseScale;
+    cutoffs.lasagnaMinimumSpanBaseVoxels =
+        static_cast<double>(kMinimumLasagnaSegments) * lasagnaConfig.segmentLength;
+    if (!std::isfinite(cutoffs.traceMinimumSpanBaseVoxels) ||
+        cutoffs.traceMinimumSpanBaseVoxels <= 0.0) {
+        throw std::invalid_argument(
+            "trace minimum span must be finite and positive (check stepVoxels and traceToBaseScale)");
+    }
+    if (!std::isfinite(cutoffs.lasagnaMinimumSpanBaseVoxels) ||
+        cutoffs.lasagnaMinimumSpanBaseVoxels <= 0.0) {
+        throw std::invalid_argument(
+            "lasagna minimum span must be finite and positive (check segmentLength)");
+    }
+    return cutoffs;
+}
+
 SegmentInterpolationMode resolveSegmentInterpolationMode(
     SegmentInterpolationGoal goal,
     FiberOptimizationMode globalMode,
-    double endpointDistanceBaseVoxels)
+    double endpointDistanceBaseVoxels,
+    const SegmentInterpolationCutoffs& cutoffs)
 {
     if (!std::isfinite(endpointDistanceBaseVoxels) ||
         endpointDistanceBaseVoxels < 0.0) {
         throw std::invalid_argument("segment endpoint distance must be finite and non-negative");
     }
-    if (goal == SegmentInterpolationGoal::Cspline ||
-        (goal == SegmentInterpolationGoal::Global &&
-         endpointDistanceBaseVoxels < 100.0)) {
+    if (goal == SegmentInterpolationGoal::Cspline) {
         return SegmentInterpolationMode::Cspline;
     }
-    if (goal == SegmentInterpolationGoal::Lasagna ||
-        (goal == SegmentInterpolationGoal::Global &&
-         globalMode == FiberOptimizationMode::Lasagna)) {
+    if (goal == SegmentInterpolationGoal::Lasagna) {
         return SegmentInterpolationMode::Lasagna;
     }
-    return SegmentInterpolationMode::Trace;
+    if (goal == SegmentInterpolationGoal::Trace) {
+        return SegmentInterpolationMode::Trace;
+    }
+    // Global goal: the mode's own regime decides the minimum span.
+    if (globalMode == FiberOptimizationMode::Lasagna) {
+        return endpointDistanceBaseVoxels < cutoffs.lasagnaMinimumSpanBaseVoxels
+            ? SegmentInterpolationMode::Cspline
+            : SegmentInterpolationMode::Lasagna;
+    }
+    return endpointDistanceBaseVoxels < cutoffs.traceMinimumSpanBaseVoxels
+        ? SegmentInterpolationMode::Cspline
+        : SegmentInterpolationMode::Trace;
 }
 
 bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept
@@ -357,6 +388,7 @@ void appendFiberModeReport(FiberModeOptimizationResult& output)
     message << output.optimization.report.message
             << "\nfiber_mode native_segments=" << output.nativeSegments
             << " lasagna_fallback_segments=" << output.lasagnaFallbackSegments
+            << " cspline_fallback_segments=" << output.csplineFallbackSegments
             << " native_extrapolations=" << output.nativeExtrapolations
             << " lasagna_fallback_extrapolations="
             << output.lasagnaFallbackExtrapolations;
@@ -661,6 +693,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                 attempt[index] = true;
         }
     }
+    const SegmentInterpolationCutoffs cutoffs = segmentInterpolationCutoffs(
+        request.traceConfig, request.lasagnaConfig, request.traceToBaseScale);
     std::vector<bool> fixedSpan(spans.size(), false);
     for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
         throwIfCancelled();
@@ -675,11 +709,13 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             fixedSpan[spanIndex] = true;
             continue;
         }
+        const double endpointDistanceBaseVoxels = pointDistance(
+            owner.volumePoint, request.controlPoints[spanIndex + 1].volumePoint);
         const SegmentInterpolationMode requestedMode = resolveSegmentInterpolationMode(
             goal,
             request.globalMode,
-            pointDistance(owner.volumePoint,
-                          request.controlPoints[spanIndex + 1].volumePoint));
+            endpointDistanceBaseVoxels,
+            cutoffs);
         if (requestedMode == SegmentInterpolationMode::Cspline) {
             modes[spanIndex] = SegmentInterpolationMode::Cspline;
             metadata.interpMode = SegmentInterpolationMode::Cspline;
@@ -755,6 +791,22 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                       request.traceConfig,
                       std::move(traceException));
             owner.segmentToNext->interpGoal = goal;
+            if (goal == SegmentInterpolationGoal::Global &&
+                endpointDistanceBaseVoxels < cutoffs.lasagnaMinimumSpanBaseVoxels) {
+                // Too short for the Lasagna fallback's discretization (it would
+                // be a spline with solver cost and its own failure mode): go
+                // straight to cspline. The trace failure metadata stays on the
+                // span so the diagnostics show what was attempted.
+                auto& metadata = *owner.segmentToNext;
+                modes[spanIndex] = SegmentInterpolationMode::Cspline;
+                metadata.interpMode = SegmentInterpolationMode::Cspline;
+                metadata.metric.reset();
+                if (!metadata.message.empty())
+                    metadata.message += " -> ";
+                metadata.message += "short span, trace -> cspline";
+                ++output.csplineFallbackSegments;
+                continue;
+            }
             modes[spanIndex] = SegmentInterpolationMode::Lasagna;
             ++output.lasagnaFallbackSegments;
             continue;

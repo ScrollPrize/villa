@@ -456,6 +456,120 @@ TEST_CASE("line annotation shift scroll uses viewer slice step size")
     CHECK(vc3d::line_annotation::shiftedLinePosition(2.0, -2, 5, 101) == 0.0);
 }
 
+TEST_CASE("line annotation shift scroll by arclength moves one strip column per notch")
+{
+    using vc3d::line_annotation::kShiftScrollLineStepBaseVoxels;
+    using vc3d::line_annotation::shiftedLinePositionByArclength;
+    CHECK(kShiftScrollLineStepBaseVoxels == doctest::Approx(8.0));
+
+    // Mixed density: 4 vx vertices for positions 0..10 (arclength 0..40),
+    // then 32 vx vertices for positions 11..15 (arclength 72..200).
+    std::vector<double> arclengths;
+    for (int i = 0; i <= 10; ++i) {
+        arclengths.push_back(4.0 * i);
+    }
+    for (int i = 1; i <= 5; ++i) {
+        arclengths.push_back(40.0 + 32.0 * i);
+    }
+    REQUIRE(arclengths.size() == 16);
+
+    // One notch = 8 vx: two vertices in the dense region, a quarter vertex in
+    // the sparse one.
+    CHECK(shiftedLinePositionByArclength(2.0, 1, 1, arclengths) == doctest::Approx(4.0));
+    CHECK(shiftedLinePositionByArclength(12.0, 1, 1, arclengths) == doctest::Approx(12.25));
+    CHECK(shiftedLinePositionByArclength(12.0, -1, 1, arclengths) == doctest::Approx(11.75));
+    // Step size scales the notch; crossing the density boundary stays exact.
+    CHECK(shiftedLinePositionByArclength(8.0, 1, 5, arclengths) == doctest::Approx(11.0));
+    // Clamped at both ends.
+    CHECK(shiftedLinePositionByArclength(15.0, 3, 1, arclengths) == doctest::Approx(15.0));
+    CHECK(shiftedLinePositionByArclength(0.5, -1, 1, arclengths) == doctest::Approx(0.0));
+    // Without a usable map the index step applies.
+    const std::vector<double> none;
+    CHECK(shiftedLinePositionByArclength(3.0, 2, 1, none) == doctest::Approx(3.0));
+}
+
+TEST_CASE("line annotation arclength snap uses a quarter strip column")
+{
+    using vc3d::line_annotation::kControlPointSnapArclengthBaseVoxels;
+    using vc3d::line_annotation::snappedControlPointLinePositionByArclength;
+    CHECK(kControlPointSnapArclengthBaseVoxels == doctest::Approx(2.0));
+
+    const std::vector<double> controlPositions{12.0, 20.0, 40.0};
+    std::vector<double> dense;  // 4 vx per position: 2 vx = half a position
+    for (int i = 0; i <= 50; ++i) {
+        dense.push_back(4.0 * i);
+    }
+    CHECK(snappedControlPointLinePositionByArclength(19.5, controlPositions, dense) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(20.5, controlPositions, dense) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(19.49, controlPositions, dense) ==
+          doctest::Approx(19.49));
+
+    std::vector<double> sparse;  // 32 vx per position: 2 vx = 1/16 position
+    for (int i = 0; i <= 50; ++i) {
+        sparse.push_back(32.0 * i);
+    }
+    CHECK(snappedControlPointLinePositionByArclength(20.0625, controlPositions, sparse) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(20.07, controlPositions, sparse) ==
+          doctest::Approx(20.07));
+
+    // Without a usable map the quarter-position rule applies.
+    const std::vector<double> none;
+    CHECK(snappedControlPointLinePositionByArclength(19.75, controlPositions, none) ==
+          doctest::Approx(20.0));
+    CHECK(snappedControlPointLinePositionByArclength(19.7, controlPositions, none) ==
+          doctest::Approx(19.7));
+}
+
+TEST_CASE("line annotation overlay group key is the registration key")
+{
+    // Registration (applyGeneratedOverlay) and the pan-time translation must
+    // address the viewer group by the same string; both go through this helper.
+    CHECK(vc3d::line_annotation::generatedOverlayGroupKey("line_surface_x") ==
+          "line_annotation_overlay_line_surface_x");
+}
+
+TEST_CASE("line annotation static overlay pan translation shifts at fixed zoom only")
+{
+    using vc3d::line_annotation::GeneratedOverlayCameraBaseline;
+    using vc3d::line_annotation::generatedOverlayPanTranslation;
+
+    GeneratedOverlayCameraBaseline baseline;
+    baseline.referenceScene = QPointF(100.0, 50.0);
+    baseline.scale = 2.0;
+
+    SUBCASE("a camera pan is a common scene delta")
+    {
+        const auto delta = generatedOverlayPanTranslation(baseline, QPointF(90.0, 50.0), 2.0);
+        REQUIRE(delta.has_value());
+        CHECK(delta->x() == doctest::Approx(-10.0));
+        CHECK(delta->y() == doctest::Approx(0.0));
+    }
+
+    SUBCASE("an unchanged camera yields a zero delta")
+    {
+        const auto delta = generatedOverlayPanTranslation(baseline, QPointF(100.0, 50.0), 2.0);
+        REQUIRE(delta.has_value());
+        CHECK(delta->isNull());
+    }
+
+    SUBCASE("a zoom change requires a rebuild")
+    {
+        CHECK_FALSE(generatedOverlayPanTranslation(baseline, QPointF(90.0, 50.0), 2.5).has_value());
+    }
+
+    SUBCASE("an unknown baseline requires a rebuild")
+    {
+        const GeneratedOverlayCameraBaseline unknown;
+        CHECK_FALSE(generatedOverlayPanTranslation(unknown, QPointF(90.0, 50.0), 2.0).has_value());
+        CHECK_FALSE(generatedOverlayPanTranslation(
+                        baseline, QPointF(std::numeric_limits<double>::quiet_NaN(), 0.0), 2.0)
+                        .has_value());
+    }
+}
+
 TEST_CASE("line annotation straight shift scroll moves cut origin along plane normal")
 {
     const cv::Vec3f origin{1.0f, 2.0f, 3.0f};
@@ -985,6 +1099,217 @@ TEST_CASE("line annotation remapped line position follows the same fiber spot")
         // projects the anchor to its clamped start.
         CHECK(remappedGeneratedLinePosition(oldLine, newLine, 4.25) ==
               doctest::Approx(5.0));
+    }
+}
+
+TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber pass")
+{
+    using vc3d::line_annotation::remappedGeneratedLinePositionFromAnchor;
+
+    // Two passes of the same fiber through one cut plane: an outbound pass
+    // along y=0 (indices 0..10) and a return pass along y=6 (indices 11..21).
+    // The pane reports position 5 on the outbound pass; the click that
+    // requests the control point lands 5.5 units off that pass, i.e. within
+    // half a unit of the return pass.
+    std::vector<cv::Vec3d> line;
+    for (int i = 0; i <= 10; ++i) {
+        line.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+    for (int i = 0; i <= 10; ++i) {
+        line.push_back({static_cast<double>(10 - i), 6.0, 0.0});
+    }
+    const cv::Vec3d click(5.0, 5.5, 0.0);
+    const cv::Vec3d anchor(5.0, 0.0, 0.0);
+
+    SUBCASE("the clicked point is nearer to the other pass")
+    {
+        // The regression this guards: resolving the position through the
+        // click picked the return pass, thousands of vertices away on a real
+        // fiber, so the edit collapsed into that pass's control point.
+        CHECK(vc3d::fiber_slice::nearestLinePointIndex(line, click) == 16);
+    }
+
+    SUBCASE("the anchor keeps the position on the outbound pass")
+    {
+        CHECK(remappedGeneratedLinePositionFromAnchor(line, anchor, 5.0) ==
+              doctest::Approx(5.0));
+    }
+
+    SUBCASE("a renumbered line still resolves through the anchor")
+    {
+        // The session line resampled the outbound pass at half spacing while
+        // the pane still measured position 4.25 on the old line: the anchor
+        // (4.25, 0, 0) lives at index 8.5 now.
+        std::vector<cv::Vec3d> renumbered;
+        for (int i = 0; i <= 20; ++i) {
+            renumbered.push_back({static_cast<double>(i) * 0.5, 0.0, 0.0});
+        }
+        for (int i = 0; i <= 10; ++i) {
+            renumbered.push_back({static_cast<double>(10 - i), 6.0, 0.0});
+        }
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  renumbered, cv::Vec3d(4.25, 0.0, 0.0), 4.25) ==
+              doctest::Approx(8.5));
+    }
+
+    SUBCASE("a non-finite anchor falls back to the clamped position")
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  line, cv::Vec3d(nan, 0.0, 0.0), 5.0) == doctest::Approx(5.0));
+        CHECK(remappedGeneratedLinePositionFromAnchor(
+                  line, cv::Vec3d(nan, 0.0, 0.0), 99.0) == doctest::Approx(21.0));
+    }
+}
+
+TEST_CASE("line annotation winding angles unwrap along the line and window half a wrap")
+{
+    using vc3d::line_annotation::generatedLineIndexRangeWithinWinding;
+    using vc3d::line_annotation::kGeneratedSideCutHalfWrapAngle;
+    using vc3d::line_annotation::unwrappedGeneratedWindingAngles;
+    constexpr double kPi = kGeneratedSideCutHalfWrapAngle;
+
+    // A spiral of 1.5 wraps about the origin, one point every quarter turn
+    // (13 points, angles 0 .. 3*pi), radius growing slowly.
+    std::vector<cv::Vec3f> spiral;
+    for (int i = 0; i <= 12; ++i) {
+        const double angle = static_cast<double>(i) * kPi / 4.0;
+        const double radius = 100.0 + static_cast<double>(i);
+        spiral.push_back({static_cast<float>(radius * std::cos(angle)),
+                          static_cast<float>(radius * std::sin(angle)),
+                          static_cast<float>(i)});
+    }
+    const auto towardOrigin = [](const cv::Vec3f& point) {
+        return cv::Vec3f{-point[0], -point[1], 0.0f};
+    };
+
+    SUBCASE("angles accumulate past pi instead of wrapping")
+    {
+        const auto angles = unwrappedGeneratedWindingAngles(spiral, towardOrigin);
+        REQUIRE(angles.size() == spiral.size());
+        for (int i = 0; i <= 12; ++i) {
+            CHECK(angles[static_cast<size_t>(i)] ==
+                  doctest::Approx(static_cast<double>(i) * kPi / 4.0).epsilon(1e-6));
+        }
+    }
+
+    SUBCASE("a point without a center direction is NaN and does not break the chain")
+    {
+        std::vector<cv::Vec3f> withHole = spiral;
+        withHole[6] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        const auto angles = unwrappedGeneratedWindingAngles(withHole, towardOrigin);
+        CHECK(std::isnan(angles[6]));
+        CHECK(angles[7] == doctest::Approx(7.0 * kPi / 4.0).epsilon(1e-6));
+        CHECK(angles[12] == doctest::Approx(3.0 * kPi).epsilon(1e-6));
+    }
+
+    SUBCASE("the half-wrap window keeps only the stretch within pi of the position")
+    {
+        const auto angles = unwrappedGeneratedWindingAngles(spiral, towardOrigin);
+        // At index 4 (angle pi) the window is [0, 2*pi] -> indices 0..8.
+        auto range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 4.0,
+                                                          kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 8);
+        // At index 6 (1.5*pi) the window is [0.5*pi, 2.5*pi] -> indices 2..10.
+        range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 6.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 2);
+        CHECK(range.second == 10);
+        // A fractional position interpolates its reference angle.
+        range = generatedLineIndexRangeWithinWinding(angles, spiral.size(), 6.5,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 3);
+        CHECK(range.second == 10);
+    }
+
+    SUBCASE("without usable angles the whole line qualifies")
+    {
+        const std::vector<double> empty;
+        auto range = generatedLineIndexRangeWithinWinding(empty, spiral.size(), 4.0,
+                                                          kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 12);
+        const auto allNan = unwrappedGeneratedWindingAngles(spiral, nullptr);
+        range = generatedLineIndexRangeWithinWinding(allNan, spiral.size(), 4.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 12);
+        range = generatedLineIndexRangeWithinWinding(allNan, 0, 4.0,
+                                                     kGeneratedSideCutHalfWrapAngle);
+        CHECK(range.first == 0);
+        CHECK(range.second == 0);
+    }
+}
+
+TEST_CASE("segment interpolation mode uses regime-specific minimum spans")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    using vc3d::line_annotation::SegmentInterpolationGoal;
+    using vc3d::line_annotation::SegmentInterpolationMode;
+    using vc3d::line_annotation::resolveSegmentInterpolationMode;
+    using vc3d::line_annotation::segmentInterpolationCutoffs;
+
+    vc::fiber_tracer::FiberTraceConfig traceConfig;  // stepVoxels 4
+    vc::lasagna::LineOptimizationConfig lasagnaConfig;
+    lasagnaConfig.segmentLength = 31.5;
+    const auto cutoffs = segmentInterpolationCutoffs(traceConfig, lasagnaConfig, 1.0);
+    CHECK(cutoffs.traceMinimumSpanBaseVoxels == doctest::Approx(48.0));
+    CHECK(cutoffs.lasagnaMinimumSpanBaseVoxels == doctest::Approx(63.0));
+
+    SUBCASE("trace-to-base scale converts the tracer step into base voxels")
+    {
+        const auto scaled = segmentInterpolationCutoffs(traceConfig, lasagnaConfig, 2.0);
+        CHECK(scaled.traceMinimumSpanBaseVoxels == doctest::Approx(96.0));
+        CHECK(scaled.lasagnaMinimumSpanBaseVoxels == doctest::Approx(63.0));
+    }
+
+    SUBCASE("global goal in trace mode uses the trace minimum")
+    {
+        const auto mode = FiberOptimizationMode::NativeFiberTrace3d;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 47.9, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 48.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 100.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+    }
+
+    SUBCASE("global goal in lasagna mode uses the lasagna minimum")
+    {
+        const auto mode = FiberOptimizationMode::Lasagna;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 62.9, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global, mode, 63.0, cutoffs) ==
+              SegmentInterpolationMode::Lasagna);
+    }
+
+    SUBCASE("explicit goals ignore the cutoffs")
+    {
+        const auto mode = FiberOptimizationMode::NativeFiberTrace3d;
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Trace, mode, 10.0, cutoffs) ==
+              SegmentInterpolationMode::Trace);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Lasagna, mode, 10.0, cutoffs) ==
+              SegmentInterpolationMode::Lasagna);
+        CHECK(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Cspline, mode, 1000.0, cutoffs) ==
+              SegmentInterpolationMode::Cspline);
+    }
+
+    SUBCASE("degenerate configs are rejected")
+    {
+        vc::fiber_tracer::FiberTraceConfig zeroStep = traceConfig;
+        zeroStep.stepVoxels = 0.0;
+        CHECK_THROWS_AS(segmentInterpolationCutoffs(zeroStep, lasagnaConfig, 1.0),
+                        std::invalid_argument);
+        vc::lasagna::LineOptimizationConfig zeroSegment = lasagnaConfig;
+        zeroSegment.segmentLength = 0.0;
+        CHECK_THROWS_AS(segmentInterpolationCutoffs(traceConfig, zeroSegment, 1.0),
+                        std::invalid_argument);
+        CHECK_THROWS_AS(resolveSegmentInterpolationMode(SegmentInterpolationGoal::Global,
+                                                        FiberOptimizationMode::NativeFiberTrace3d,
+                                                        -1.0,
+                                                        cutoffs),
+                        std::invalid_argument);
     }
 }
 
@@ -2928,25 +3253,73 @@ TEST_CASE("native seed tracing requires native mode and configured inference")
     CHECK_FALSE(shouldRunNativeSeedTrace(FiberOptimizationMode::Lasagna, true, 1));
 }
 
-TEST_CASE("segment interpolation resolution applies short fallback only to global goals")
+TEST_CASE("fiber mode sends a failed short global-goal trace straight to cspline")
 {
-    using namespace vc3d::line_annotation;
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Global,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              99.999) == SegmentInterpolationMode::Cspline);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Global,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              100.0) == SegmentInterpolationMode::Trace);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Trace,
-              FiberOptimizationMode::Lasagna,
-              1.0) == SegmentInterpolationMode::Trace);
-    CHECK(resolveSegmentInterpolationMode(
-              SegmentInterpolationGoal::Lasagna,
-              FiberOptimizationMode::NativeFiberTrace3d,
-              1.0) == SegmentInterpolationMode::Lasagna);
+    // Trace minimum 12 * 4 = 48 vx, Lasagna minimum 2 * 40 = 80 vx. Two
+    // 64 vx Global-goal spans: both long enough to trace; the second one's
+    // trace throws (invalid prediction at x = 96) and, being shorter than the
+    // Lasagna minimum, goes to cspline instead of the Lasagna fallback.
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions(96.0);
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {18.0, {64.0, 0.0, 0.0}, false, 18},
+        {34.0, {128.0, 0.0, 0.0}, false, 34},
+    };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Global;
+    request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Global;
+    for (int x = -8; x <= 136; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.normalManifestLocation = "normal.lasagna.json";
+    request.fiberManifestLocation = "fiber.lasagna.json";
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.retraceAll = true;
+    request.globalMode = vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 40.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 3);
+    CHECK(result.nativeSegments == 1);
+    CHECK(result.lasagnaFallbackSegments == 0);
+    CHECK(result.csplineFallbackSegments == 1);
+    REQUIRE(result.controlPoints[0].segmentToNext.has_value());
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[0].segmentToNext));
+    REQUIRE(result.controlPoints[1].segmentToNext.has_value());
+    const auto& gated = *result.controlPoints[1].segmentToNext;
+    CHECK(gated.interpMode == vc3d::line_annotation::SegmentInterpolationMode::Cspline);
+    CHECK(gated.interpGoal == vc3d::line_annotation::SegmentInterpolationGoal::Global);
+    // The trace failure stays on the span; the message records the gate.
+    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[1].segmentToNext));
+    CHECK_FALSE(gated.failureCode.empty());
+    CHECK(gated.message.find("short span, trace -> cspline") != std::string::npos);
+    CHECK(result.optimization.report.message.find("cspline_fallback_segments=1") !=
+          std::string::npos);
 }
 
 TEST_CASE("fiber mode falls back only the failed native span")

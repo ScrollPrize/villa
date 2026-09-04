@@ -50,10 +50,39 @@ enum class SegmentInterpolationMode {
 [[nodiscard]] std::string segmentInterpolationModeToString(SegmentInterpolationMode mode);
 [[nodiscard]] SegmentInterpolationMode segmentInterpolationModeFromString(const std::string& value);
 [[nodiscard]] char segmentInterpolationModeMarker(SegmentInterpolationMode mode) noexcept;
+// Shortest control-point span (straight endpoint distance, base voxels) each
+// fiber-model regime is attempted on under the Global goal; shorter spans are
+// cubic splines. Native trace: kMinimumTraceSteps tracer steps (48 vx with the
+// default 4 vx step), enough room for the beam to correct while the
+// span-bounded endpoint acceptance still has to be earned. Lasagna:
+// kMinimumLasagnaSegments Ceres segments of the line discretization (~63 vx
+// with the default ~31.6 vx segment); below that Lasagna is a spline with
+// solver cost. The two regimes are independent; no ordering is required.
+inline constexpr int kMinimumTraceSteps = 12;
+inline constexpr int kMinimumLasagnaSegments = 2;
+
+struct SegmentInterpolationCutoffs {
+    double traceMinimumSpanBaseVoxels = 0.0;
+    double lasagnaMinimumSpanBaseVoxels = 0.0;
+};
+
+// Derives both cutoffs from the request's tracer and Lasagna configs; throws
+// std::invalid_argument when either is not finite and positive. Precondition:
+// lasagnaConfig.segmentLength > 0 (LineOptimizationConfig defaults to 16 and
+// the controller's request builder sets it from initialLineDiscretization) and
+// traceConfig.stepVoxels > 0 (validated by the tracer as well).
+[[nodiscard]] SegmentInterpolationCutoffs segmentInterpolationCutoffs(
+    const vc::fiber_tracer::FiberTraceConfig& traceConfig,
+    const vc::lasagna::LineOptimizationConfig& lasagnaConfig,
+    double traceToBaseScale);
+
+// Global goal: the global mode's regime when the span reaches that regime's
+// cutoff, else Cspline. Explicit goals are returned as-is regardless of span.
 [[nodiscard]] SegmentInterpolationMode resolveSegmentInterpolationMode(
     SegmentInterpolationGoal goal,
     FiberOptimizationMode globalMode,
-    double endpointDistanceBaseVoxels);
+    double endpointDistanceBaseVoxels,
+    const SegmentInterpolationCutoffs& cutoffs);
 
 [[nodiscard]] std::string fiberOptimizationModeToString(FiberOptimizationMode mode);
 [[nodiscard]] FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value);
@@ -249,6 +278,9 @@ struct FiberModeOptimizationResult {
     vc::lasagna::LineOptimizationResult optimization;
     int nativeSegments = 0;
     int lasagnaFallbackSegments = 0;
+    // Global-goal spans whose trace was attempted and not accepted, and that
+    // are too short for the Lasagna fallback: they went straight to cspline.
+    int csplineFallbackSegments = 0;
     int nativeExtrapolations = 0;
     int lasagnaFallbackExtrapolations = 0;
 };

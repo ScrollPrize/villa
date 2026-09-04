@@ -329,10 +329,12 @@ namespace line_annotation {
     // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    // Cruise speed of the Left/Right arrow pan between control points, in line
-    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
-    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
-    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
+    // Cruise speed of the Left/Right arrow pan between control points, in base
+    // voxels of optimized-polyline arclength per second. Up/Down adjust it.
+    // "_vx" retires the line-positions-per-second key: its values would be 4x
+    // to 32x off in the new unit, so they are neither read nor migrated.
+    constexpr auto ARROW_PAN_SPEED_VX = "lineAnnotation/arrow_pan_speed_vx";
+    constexpr double ARROW_PAN_SPEED_VX_DEFAULT = 96.0;
     // "_v2" retires ratios saved before the fixed top strip / smaller bottom
     // strip layout; old values would override the new default proportions.
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
