@@ -666,3 +666,23 @@ TEST_CASE("LasagnaChannelChunkCache prefetch drains all workers when a source re
     }
     fs::remove_all(dir);
 }
+
+TEST_CASE("lasagnaReadWorkersFromSetting parses VC_LASAGNA_READ_WORKERS with clamps and fallback")
+{
+    using vc::lasagna::lasagnaReadWorkersFromSetting;
+    // Default: hardware threads capped at 8, zero detected -> 4.
+    CHECK(lasagnaReadWorkersFromSetting(nullptr, 32) == 8);
+    CHECK(lasagnaReadWorkersFromSetting(nullptr, 6) == 6);
+    CHECK(lasagnaReadWorkersFromSetting(nullptr, 0) == 4);
+    CHECK(lasagnaReadWorkersFromSetting("", 32) == 8);
+    // Explicit values are clamped to [1, 64].
+    CHECK(lasagnaReadWorkersFromSetting("16", 32) == 16);
+    CHECK(lasagnaReadWorkersFromSetting(" 32 ", 32) == 32);
+    CHECK(lasagnaReadWorkersFromSetting("1", 32) == 1);
+    CHECK(lasagnaReadWorkersFromSetting("999", 32) == 64);
+    // Garbage and zero fall back to the default.
+    CHECK(lasagnaReadWorkersFromSetting("0", 32) == 8);
+    CHECK(lasagnaReadWorkersFromSetting("-4", 32) == 8);
+    CHECK(lasagnaReadWorkersFromSetting("lots", 32) == 8);
+    CHECK(lasagnaReadWorkersFromSetting("12abc", 32) == 8);
+}

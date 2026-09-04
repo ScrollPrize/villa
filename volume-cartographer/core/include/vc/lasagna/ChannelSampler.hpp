@@ -240,7 +240,14 @@ private:
     int parallelThreads = 0,
     bool collectLocalityStats = false);
 
+// Per-channel read workers for the shared lasagna chunk pool (pool width is
+// three times this). Resolved once from VC_LASAGNA_READ_WORKERS; see
+// lasagnaReadWorkersFromSetting for the parsing rule.
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
+// Pure parsing rule behind lasagnaReadWorkersPerChannel: `setting` is the raw
+// environment value (may be null), `hardwareThreads` the detected core count.
+// Unset/invalid -> clamp(hardwareThreads or 4, 1, 8); valid -> clamp(value, 1, 64).
+[[nodiscard]] size_t lasagnaReadWorkersFromSetting(const char* setting, unsigned hardwareThreads);
 [[nodiscard]] std::shared_ptr<LasagnaChannelChunkCache>
 sharedLasagnaChannelChunkCache(size_t capacityBytes);
 

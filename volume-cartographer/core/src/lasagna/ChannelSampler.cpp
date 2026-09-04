@@ -17,6 +17,9 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <charconv>
+#include <cstdlib>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 
@@ -1066,11 +1069,42 @@ void LasagnaLocalChunkResolver::resolve(LasagnaCubeRequest& request)
     }
 }
 
+size_t lasagnaReadWorkersFromSetting(const char* setting, unsigned hardwareThreads)
+{
+    // Default: one worker per hardware thread, capped at 8 per channel (the
+    // historical value). VC_LASAGNA_READ_WORKERS overrides the cap for remote
+    // datasets where the fetch is latency-bound and more in-flight requests
+    // help; clamped to [1, 64]. Anything unparsable falls back to the default.
+    const size_t fallback = std::clamp<size_t>(
+        hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads), 1, 8);
+    if (setting == nullptr || *setting == '\0') {
+        return fallback;
+    }
+    std::string_view text(setting);
+    while (!text.empty() && text.front() == ' ') {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && text.back() == ' ') {
+        text.remove_suffix(1);
+    }
+    unsigned long parsed = 0;
+    const auto* begin = text.data();
+    const auto* end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, parsed);
+    if (result.ec != std::errc{} || result.ptr != end || parsed == 0) {
+        return fallback;
+    }
+    return std::clamp<size_t>(static_cast<size_t>(parsed), 1, 64);
+}
+
 size_t lasagnaReadWorkersPerChannel()
 {
-    const unsigned hardwareThreads = std::thread::hardware_concurrency();
-    return std::clamp<size_t>(
-        hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads), 1, 8);
+    // Resolved once: lasagnaReadPool() sizes itself from this value on first
+    // use, so a later change to the environment must not desynchronize the
+    // per-channel worker budget from the pool width.
+    static const size_t workers = lasagnaReadWorkersFromSetting(
+        std::getenv("VC_LASAGNA_READ_WORKERS"), std::thread::hardware_concurrency());
+    return workers;
 }
 
 std::shared_ptr<LasagnaChannelChunkCache>
