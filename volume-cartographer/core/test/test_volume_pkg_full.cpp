@@ -217,15 +217,6 @@ TEST_CASE("VolumePkg::setSegmentsChangedCallback fires on segment list changes")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg::setRemoteCacheRoot just exercises the path")
-{
-    auto p = VolumePkg::newEmpty();
-    auto d = tmpDir("remote_cache");
-    p->setRemoteCacheRoot(d);
-    CHECK(true);
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg::addVolume directly inserts a constructed Volume")
 {
     auto d = tmpDir("addvol_direct");

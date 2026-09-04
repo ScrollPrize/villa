@@ -522,8 +522,7 @@ auto main(int argc, char* argv[]) -> int
         limits.minimumFreeBytes = settings.value(
             perf::REMOTE_CACHE_MIN_FREE_GIB,
             perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
-        const auto cacheRoot = vc3d::remoteCachePath(
-            settings.value(viewer::REMOTE_CACHE_DIR).toString()).toStdString();
+        const auto cacheRoot = vc3d::remoteCachePath().toStdString();
         vc::render::PersistentZarrCacheBudget::configure(cacheRoot, limits);
     }
     if (parser.isSet(cacheSizeOption)) {

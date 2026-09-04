@@ -2,6 +2,7 @@
 
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSegmentCacheIO.hpp"
+#include "VCSettings.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -347,7 +348,7 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const auto manualLocation = pkg.selectedLasagnaDataset();
     if (manualLocation.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = pkg.remoteCacheRootOrEmpty();
+    options.remoteCacheRoot = vc3d::remoteCachePath().toStdString();
     const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
         ? manualLocation
         : vc::project::resolveLocalPath(
@@ -620,7 +621,6 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                 }
                 const auto result = pkg.attachPreparedLasagnaDataset(
                     manifest.string(), tags, fiberInference, volumes,
-                    remoteCacheRoot,
                     true, true,
                     {std::string(kOpenDataLasagnaArtifactTagPrefix),
                      std::string(kOpenDataLasagnaModelTagPrefix),
