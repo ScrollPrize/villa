@@ -25,15 +25,24 @@ def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, A
         if mode in ('w', 'w-'):
             kwargs['zarr_format'] = 2
         elif mode in ('a', 'r+'):
-            # Appending: keep whatever format the store already has. Forcing
-            # v2 here would write a second .zgroup next to an existing
-            # zarr.json and leave a store that reads as v3 and empty.
+            # Appending: keep the format of a store that already holds data.
+            # Forcing v2 would write a second .zgroup next to an existing
+            # zarr.json and leave a store that reads as v3 and empty. An
+            # *empty* v3 group, though, is what a failed run on zarr 3 leaves
+            # behind (zarr.json only); there is nothing to keep, so recreate
+            # it as v2 rather than write a v3 store no consumer reads.
             try:
-                kwargs['zarr_format'] = zarr.open_group(
+                existing = zarr.open_group(
                     path, mode='r', storage_options=storage_options
-                ).metadata.zarr_format
+                )
             except FileNotFoundError:  # GroupNotFoundError: nothing there yet
                 kwargs['zarr_format'] = 2
+            else:
+                fmt = int(existing.metadata.zarr_format)
+                if fmt != 2 and len(existing) == 0:
+                    mode, kwargs['zarr_format'] = 'w', 2
+                else:
+                    kwargs['zarr_format'] = fmt
     if storage_options is not None:
         kwargs['storage_options'] = storage_options
     return zarr.open_group(path, mode=mode, **kwargs)
