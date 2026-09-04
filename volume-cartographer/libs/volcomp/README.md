@@ -12,7 +12,7 @@ Files:
   (`volcomp_lib_encode`, `volcomp_lib_decode`, `volcomp_lib_decode_block`,
   `volcomp_lib_is_chunk`, `volcomp_lib_chunk_q`, `volcomp_lib_kernels`).
 - `utils/volcomp_codec.hpp` (in `utils/`) — the C++ shim used by `VcDataset`,
-  `ZarrChunkFetcher` and `vc_zarr_recompress`, mirroring `c3d_codec.hpp`.
+  and `ZarrChunkFetcher`, mirroring `c3d_codec.hpp`.
 
 ## Portability
 
@@ -34,7 +34,6 @@ clang/GCC on x86-64), so cached `.volcomp` chunks are portable across hosts.
   uint8 and 128³ chunks).
 - The streaming fetcher persists volcomp chunks verbatim in the disk cache
   (`.volcomp`), like `.c3d`.
-- `vc_zarr_recompress in out --codec volcomp --q 8` writes 1024³/128³ shards.
 
 ## Updating
 
