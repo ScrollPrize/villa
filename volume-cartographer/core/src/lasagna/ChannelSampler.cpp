@@ -50,6 +50,28 @@ constexpr float kFloatEpsilon = 1.0e-6f;
     return *pool;
 }
 
+// Waits for every submitted prefetch worker before returning or throwing.
+// The worker lambdas capture the caller's request vectors by reference; if
+// the first `get()` threw while later tasks were still queued, those tasks
+// would run against a destroyed stack frame. Drain everything, keep the first
+// error, rethrow it once all workers are done.
+void joinLasagnaPrefetchWorkers(std::vector<std::future<void>>& futures)
+{
+    std::exception_ptr firstError;
+    for (auto& future : futures) {
+        try {
+            future.get();
+        } catch (...) {
+            if (!firstError) {
+                firstError = std::current_exception();
+            }
+        }
+    }
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+}
+
 [[nodiscard]] uint32_t checkedChunkIndex(size_t value)
 {
     if (value > std::numeric_limits<uint32_t>::max()) {
@@ -808,30 +830,32 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchResolved(
     report.chunksRead = missing.size();
     if (!missing.empty()) {
         maxWorkers = std::clamp<size_t>(maxWorkers, 1, missing.size());
+        // Each worker writes its loaded chunk into a per-key slot. The map is
+        // filled from the slots after the join rather than by re-looking the
+        // keys up in the LRU: the shared cache is trimmed on every store, so a
+        // concurrent consumer (prediction field, trace-scale sampler) can evict
+        // an early chunk of this batch before the join, and the old lookup then
+        // silently dropped it from the resolved set. Holding the shared_ptr
+        // pins the bytes regardless of residency.
+        std::vector<std::shared_ptr<const LasagnaCachedChunk>> loaded(missing.size());
         std::vector<std::future<void>> futures;
         futures.reserve(maxWorkers);
         std::atomic<size_t> next{0};
         for (size_t worker = 0; worker < maxWorkers; ++worker) {
             futures.push_back(lasagnaReadPool().submit(
-                [this, &binding, &array, &missing, &next]() {
+                [this, &binding, &array, &missing, &loaded, &next]() {
                     while (true) {
                         const size_t index = next.fetch_add(1);
                         if (index >= missing.size()) {
                             return;
                         }
-                        const LasagnaChannelChunkKey key = missing[index];
-                        (void)load(binding, array, key);
+                        loaded[index] = load(binding, array, missing[index]);
                     }
                 }));
         }
-        for (auto& future : futures) {
-            future.get();
-        }
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& key : missing) {
-            if (auto it = entries_.find(key); it != entries_.end()) {
-                resolved.emplace(key, it->second.bytes);
-            }
+        joinLasagnaPrefetchWorkers(futures);
+        for (size_t index = 0; index < missing.size(); ++index) {
+            resolved.emplace(missing[index], loaded[index]);
         }
     }
     return report;
@@ -875,9 +899,7 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchInterleaved(
             }
         }));
     }
-    for (auto& future : futures) {
-        future.get();
-    }
+    joinLasagnaPrefetchWorkers(futures);
     return report;
 }
 
@@ -1592,11 +1614,13 @@ void appendLasagnaInterpolationChunkKeys(
     const cv::Vec3d& volumePoint,
     std::vector<LasagnaChannelChunkKey>& keys)
 {
-    const LasagnaCubeRequest request = prepareLasagnaCubeRequest(binding, volumePoint);
-    if (!request.valid) {
-        return;
-    }
-    keys.insert(keys.end(), request.keys.begin(), request.keys.end());
+    // prepareLasagnaCubeRequest fills only keys[0] for a single-chunk cube;
+    // the other seven slots stay default-initialized ({arrayId 0, ...}).
+    // Appending the whole array therefore used to enqueue a bogus zero key
+    // that resolved to physical chunk (0,0,0) of an unrelated binding on every
+    // prefetch. Honor singleChunk and drop duplicates instead.
+    appendUniqueLasagnaCubeRequestChunkKeys(
+        prepareLasagnaCubeRequest(binding, volumePoint), keys);
 }
 
 std::optional<double> sampleLasagnaChannel(

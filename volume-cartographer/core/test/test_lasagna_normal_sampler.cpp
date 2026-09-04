@@ -459,3 +459,210 @@ TEST_CASE("LasagnaNormalSampler integrates with LineOptimizer")
     CHECK(result.line.points[1].sampledNormal.normal[2] == doctest::Approx(1.0));
     fs::remove_all(dir);
 }
+
+// --- LasagnaChannelChunkCache regression tests -------------------------------
+
+#include "vc/lasagna/ChannelSampler.hpp"
+
+#include <exception>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <unordered_set>
+
+namespace {
+
+fs::path writeTinyThreeChannelDataset(const std::string& tag)
+{
+    const auto dir = tmpDir(tag);
+    createConstantChunkedU8Zarr(dir / "grad_mag.zarr", {4, 4, 4}, {2, 2, 2}, 255);
+    createConstantChunkedU8Zarr(dir / "nx.zarr", {4, 4, 4}, {2, 2, 2}, 128);
+    createConstantChunkedU8Zarr(dir / "ny.zarr", {4, 4, 4}, {2, 2, 2}, 128);
+    writeText(dir / "dataset.lasagna.json", R"({
+        "version": 2,
+        "grad_mag_encode_scale": 255.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+    return dir;
+}
+
+std::vector<vc::lasagna::LasagnaChannelChunkKey> allChunkKeys(
+    const vc::lasagna::LasagnaChannelBinding& binding)
+{
+    std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
+    for (uint32_t z = 0; z < 2; ++z) {
+        for (uint32_t y = 0; y < 2; ++y) {
+            for (uint32_t x = 0; x < 2; ++x) {
+                vc::lasagna::LasagnaChannelChunkKey key;
+                key.arrayId = binding.arrayId;
+                key.channelIndex = static_cast<uint32_t>(binding.channelIndex);
+                key.z = z;
+                key.y = y;
+                key.x = x;
+                keys.push_back(key);
+            }
+        }
+    }
+    return keys;
+}
+
+bool isZarrMetadataKey(const std::string& key)
+{
+    return key.ends_with(".zarray") || key.ends_with(".zattrs") ||
+           key.ends_with(".zgroup") || key.ends_with("zarr.json");
+}
+
+// Serves metadata and the origin chunk; throws for every other chunk.
+class OriginOnlyStore final : public utils::Store {
+public:
+    explicit OriginOnlyStore(fs::path root) : inner_(std::move(root)) {}
+
+    [[nodiscard]] bool exists(const std::string& key) const override { return inner_.exists(key); }
+    [[nodiscard]] std::vector<std::byte> get(const std::string& key) const override
+    {
+        auto bytes = get_if_exists(key);
+        if (!bytes) {
+            throw std::runtime_error("missing key: " + key);
+        }
+        return std::move(*bytes);
+    }
+    [[nodiscard]] std::optional<std::vector<std::byte>> get_if_exists(
+        const std::string& key) const override
+    {
+        if (isZarrMetadataKey(key) || key.find("0.0.0") != std::string::npos ||
+            key.find("0/0/0") != std::string::npos) {
+            return inner_.get_if_exists(key);
+        }
+        throw std::runtime_error("simulated source read failure: " + key);
+    }
+    void set(const std::string& key, std::span<const std::byte> value) override { inner_.set(key, value); }
+    void erase(const std::string& key) override { inner_.erase(key); }
+
+private:
+    utils::FileSystemStore inner_;
+};
+
+} // namespace
+
+TEST_CASE("appendLasagnaInterpolationChunkKeys honors single-chunk cubes and drops duplicates")
+{
+    const auto dir = writeTinyThreeChannelDataset("append_keys");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(dir / "dataset.lasagna.json");
+    const auto binding = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "grad_mag");
+    REQUIRE(binding.arrayId != 0);
+
+    // Interior of chunk (0,0,0): x0 = 0, x1 = 1 lie in the same chunk.
+    {
+        const cv::Vec3d point{0.5, 0.5, 0.5};
+        const auto request = vc::lasagna::prepareLasagnaCubeRequest(binding, point);
+        REQUIRE(request.valid);
+        CHECK(request.singleChunk);
+        std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
+        vc::lasagna::appendLasagnaInterpolationChunkKeys(binding, point, keys);
+        REQUIRE(keys.size() == 1);
+        CHECK(keys.front() == request.keys.front());
+        CHECK(keys.front().arrayId == binding.arrayId);
+    }
+
+    // Straddling all three chunk boundaries: eight distinct chunks, none bogus.
+    {
+        const cv::Vec3d point{1.5, 1.5, 1.5};
+        const auto request = vc::lasagna::prepareLasagnaCubeRequest(binding, point);
+        REQUIRE(request.valid);
+        CHECK_FALSE(request.singleChunk);
+        std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
+        vc::lasagna::appendLasagnaInterpolationChunkKeys(binding, point, keys);
+        REQUIRE(keys.size() == 8);
+        std::unordered_set<vc::lasagna::LasagnaChannelChunkKey,
+                           vc::lasagna::LasagnaChannelChunkKeyHash> unique(keys.begin(), keys.end());
+        CHECK(unique.size() == 8);
+        for (const auto& key : keys) {
+            CHECK(key.arrayId == binding.arrayId);
+            CHECK(key.channelIndex == static_cast<uint32_t>(binding.channelIndex));
+        }
+        const auto expected = allChunkKeys(binding);
+        for (const auto& key : expected) {
+            CHECK(unique.count(key) == 1);
+        }
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaChannelChunkCache::prefetchResolved pins every loaded chunk under eviction")
+{
+    const auto dir = writeTinyThreeChannelDataset("prefetch_pin");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(dir / "dataset.lasagna.json");
+    const auto binding = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "grad_mag");
+    const auto keys = allChunkKeys(binding);
+    REQUIRE(keys.size() == 8);
+
+    // Each chunk is 2*2*2 = 8 bytes; the cache holds two of them. Loading
+    // eight chunks therefore evicts six before the join finishes.
+    vc::lasagna::LasagnaChannelChunkCache cache(16);
+    vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap resolved;
+    const auto report = cache.prefetchResolved(binding, *binding.array, keys, 4, resolved);
+
+    CHECK(report.requestedChunks == 8);
+    CHECK(report.chunksRead == 8);
+    REQUIRE(resolved.size() == 8);
+    for (const auto& key : keys) {
+        auto it = resolved.find(key);
+        REQUIRE(it != resolved.end());
+        REQUIRE(it->second);
+        REQUIRE(it->second->values.size() == 8);
+        for (const auto value : it->second->values) {
+            CHECK(value == 255);
+        }
+    }
+
+    // Further traffic evicts the remaining residents; pinned pointers stay valid.
+    for (const auto& key : keys) {
+        (void)cache.get(binding, *binding.array, key);
+    }
+    for (const auto& key : keys) {
+        const auto& chunk = resolved.at(key);
+        REQUIRE(chunk);
+        CHECK(chunk->values.front() == 255);
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaChannelChunkCache prefetch drains all workers when a source read throws")
+{
+    const auto dir = writeTinyThreeChannelDataset("prefetch_throw");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(dir / "dataset.lasagna.json");
+    auto binding = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "grad_mag");
+    binding.array = std::make_shared<utils::ZarrArray>(utils::ZarrArray::open(
+        std::make_shared<OriginOnlyStore>(dir / "grad_mag.zarr"), ""));
+    const auto keys = allChunkKeys(binding);
+
+    vc::lasagna::LasagnaChannelChunkCache cache(1024);
+    vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap resolved;
+    CHECK_THROWS_AS(
+        (void)cache.prefetchResolved(binding, *binding.array, keys, 4, resolved),
+        std::runtime_error);
+
+    std::vector<vc::lasagna::LasagnaChannelChunkCache::PrefetchRequest> requests;
+    for (const auto& key : keys) {
+        requests.emplace_back(&binding, key);
+    }
+    CHECK_THROWS_AS((void)cache.prefetchInterleaved(requests), std::runtime_error);
+
+    // The cache stays usable afterwards: the origin chunk resolves and no
+    // failed key was cached as data.
+    resolved.clear();
+    const auto report = cache.prefetchResolved(binding, *binding.array, {keys.front()}, 1, resolved);
+    CHECK(report.requestedChunks == 1);
+    REQUIRE(resolved.size() == 1);
+    REQUIRE(resolved.begin()->second);
+    CHECK(resolved.begin()->second->values.front() == 255);
+    for (size_t index = 1; index < keys.size(); ++index) {
+        CHECK_THROWS_AS((void)cache.get(binding, *binding.array, keys[index]), std::runtime_error);
+    }
+    fs::remove_all(dir);
+}
