@@ -869,6 +869,8 @@ vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_remote_url)
 
+vc_add_test(NAME test_remote_volume_metadata)
+
 vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)

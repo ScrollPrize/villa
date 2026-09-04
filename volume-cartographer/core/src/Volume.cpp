@@ -30,6 +30,7 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteVolumeMetadata.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -128,20 +129,9 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
             }
         }
         if (!hasVoxelSize) {
-            const utils::Json* current = &json;
-            for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
-                if (!current->is_object() || !current->contains(key)) {
-                    current = nullptr;
-                    break;
-                }
-                current = &(*current)[key];
-            }
-            if (current && current->is_object() &&
-                current->contains("samplePixelSize") &&
-                (*current)["samplePixelSize"].is_number()) {
-                const double millimeters = (*current)["samplePixelSize"].get_double();
-                if (std::isfinite(millimeters) && millimeters > 0.0)
-                    json["voxelsize"] = millimeters * 1000.0;
+            if (const auto millimeters =
+                    vc::findUnambiguousSamplePixelSizeMillimeters(json)) {
+                json["voxelsize"] = *millimeters * 1000.0;
             }
         }
         return json;
