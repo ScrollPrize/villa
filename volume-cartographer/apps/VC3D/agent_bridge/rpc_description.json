@@ -2968,6 +2968,34 @@
         "type": "object"
       }
     },
+    "segments.create_editable_copy": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_create_editable_segment_copy"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
     "segments.delete": {
       "errors": [
         -32602,

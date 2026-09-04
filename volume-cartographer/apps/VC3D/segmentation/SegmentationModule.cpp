@@ -126,9 +126,15 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
     }
 
     const std::filesystem::path activeSegmentsRoot = state->vpkg()->outputSegmentsPath();
+    const auto registeredCatalogRoot =
+        vc3d::opendata::registeredOpenDataCatalogRootForSegment(
+            *state->vpkg(), surface->path);
+    const auto copySourceRoot = registeredCatalogRoot.empty()
+        ? activeSegmentsRoot
+        : registeredCatalogRoot;
     const std::filesystem::path defaultPath =
         vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-            surface->path, activeSegmentsRoot);
+            surface->path, copySourceRoot);
 
     QMessageBox prompt(QApplication::activeWindow());
     prompt.setWindowTitle(QObject::tr("Open Data Segment"));
@@ -163,11 +169,12 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
     }
 
     try {
-        vc3d::opendata::copyCatalogSegmentToEditableDirectory(surface->path, editablePath);
+        vc3d::opendata::copyCatalogSegmentToEditableDirectory(
+            *state->vpkg(), surface->path, editablePath);
         const std::filesystem::path editableRoot = editablePath.parent_path();
         auto pkg = state->vpkg();
-        pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"});
-        pkg->setOutputSegments(editableRoot.string());
+        vc3d::opendata::attachEditableOpenDataSegmentRoot(
+            *pkg, surface->path, editableRoot, true);
 
         const std::string segmentId = surface->id.empty()
             ? editablePath.filename().string()

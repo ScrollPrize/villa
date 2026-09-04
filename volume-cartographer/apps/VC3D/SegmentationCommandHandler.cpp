@@ -5654,7 +5654,13 @@ void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)
     }
     if (err == QLatin1String("name unchanged"))
         return;
-    if (err == QLatin1String("invalid name")) {
+    if (err == QLatin1String("immutable catalog segment")) {
+        QMessageBox::warning(
+            _parentWidget,
+            tr("Open Data Segment"),
+            tr("This catalog segment is immutable. Create an editable copy "
+               "before renaming it."));
+    } else if (err == QLatin1String("invalid name")) {
         QMessageBox::warning(_parentWidget, tr("Invalid Name"),
             tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
     } else if (err == QLatin1String("name exists")) {
@@ -5689,6 +5695,9 @@ bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ
     auto seg = _state->vpkg()->segmentation(oldId);
     if (!seg)
         return fail(QStringLiteral("segment not found"));
+
+    if (vc3d::opendata::isOpenDataCatalogSegmentDirectory(seg->path()))
+        return fail(QStringLiteral("immutable catalog segment"));
 
     const std::string newId = newName.toStdString();
 

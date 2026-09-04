@@ -126,6 +126,27 @@ async def vc3d_activate_segment(
 
 
 @mcp.tool()
+async def vc3d_create_editable_segment_copy(segment_id: str) -> dict[str, Any]:
+    """Copy a fetched, immutable Open Data catalog segment into the project's
+    editable segment directory, attach it to the project, and activate it.
+
+    Open Data catalog files are shared cache objects and cannot safely be
+    edited or renamed in place. Call this after vc3d_fetch_segment when
+    vc3d_enable_editing or vc3d_rename_segment reports error -32009 with
+    action="segments.create_editable_copy". Retrying is idempotent: an existing
+    editable copy is reused and activated instead of copied again.
+
+    segment_id: a fetched catalog segment id returned by vc3d_list_segments.
+
+    Returns the source and editable paths plus created/alreadyExisted and
+    activated flags. Errors: -32004 (editing is enabled), -32007 (unknown
+    segment), -32009 (not a fetched catalog segment), -32005/-32010 (copy,
+    persistence, or activation failure).
+    """
+    return await _call("segments.create_editable_copy", {"segmentId": segment_id})
+
+
+@mcp.tool()
 async def vc3d_delete_segment(segment_id: str, confirm: bool = False) -> dict[str, Any]:
     """Permanently delete a segment from the open volume package, removing it
     from the surface panel AND deleting its files on disk.
