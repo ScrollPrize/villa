@@ -853,6 +853,8 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+vc_add_test(NAME test_seg_add_overlap_metrics)
+
 # End-to-end CLI contract for the same tool: exit codes, report
 # serialization, collection envelope. Needs the binary, so it only exists
 # in configurations that build the apps -- the test shards configure with
@@ -863,6 +865,13 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_seg_add_overlap)
+    vc_add_test(NAME test_seg_add_overlap_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
+    add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
