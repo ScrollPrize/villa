@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,10 @@ import numpy as np
 import zarr
 
 from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
+from vesuvius.data._transient_reads import _read_array_with_retry
 
 
+_LOGGER = logging.getLogger(__name__)
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
@@ -231,11 +234,15 @@ def read_bbox_with_padding(
     if any(stop <= start for start, stop in zip(starts, stops)):
         return output, None
     crop = np.asarray(
-        volume[
-            starts[0] : stops[0],
-            starts[1] : stops[1],
-            starts[2] : stops[2],
-        ]
+        _read_array_with_retry(
+            volume,
+            (
+                slice(starts[0], stops[0]),
+                slice(starts[1], stops[1]),
+                slice(starts[2], stops[2]),
+            ),
+            warn=_LOGGER.warning,
+        )
     )
     destination_starts = starts[0] - z0, starts[1] - y0, starts[2] - x0
     destination = tuple(
