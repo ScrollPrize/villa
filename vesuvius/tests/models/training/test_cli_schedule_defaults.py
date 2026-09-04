@@ -101,3 +101,6 @@ def test_full_epoch_still_clears_step_limits(tmp_path):
 def test_val_every_n_below_one_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="--val-every-n must be >= 1"):
         _resolve(tmp_path, {}, ["--val-every-n", "0"])
+    # the YAML value is live now, so it gets the same check
+    with pytest.raises(ValueError, match="tr_config.val_every_n must be >= 1"):
+        _resolve(tmp_path, {"val_every_n": 0}, [])

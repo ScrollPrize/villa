@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the vesuvius.train argument parser.
 
     Schedule flags (--max-epoch, --max-steps-per-epoch, --max-val-steps-per-epoch,
-    --val-every-n) default to None so a value set in the YAML ``tr_config`` is
+    --val-every-n, --early-stopping-patience) default to None so a value set in the YAML ``tr_config`` is
     kept unless the flag is passed explicitly; see update_config_from_args for
     the fallback used when neither sets it.
     """

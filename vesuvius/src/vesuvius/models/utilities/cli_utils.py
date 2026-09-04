@@ -104,15 +104,18 @@ def update_config_from_args(mgr, args):
         setattr(mgr, key, value)
         mgr.tr_configs[key] = value
 
-    # Validation frequency
+    # Validation frequency: flag wins, otherwise the YAML value ConfigManager
+    # already loaded. Validate whichever source it came from, since the YAML
+    # value is now live too.
     val_every_n = getattr(args, 'val_every_n', None)
     if val_every_n is not None:
-        if int(val_every_n) < 1:
-            raise ValueError(f"--val-every-n must be >= 1, got {val_every_n}")
         mgr.val_every_n = int(val_every_n)
         mgr.tr_configs["val_every_n"] = int(val_every_n)
         if mgr.verbose:
             print(f"Validate every {val_every_n} epoch(s)")
+    if int(getattr(mgr, 'val_every_n', 1)) < 1:
+        source = "--val-every-n" if val_every_n is not None else "tr_config.val_every_n"
+        raise ValueError(f"{source} must be >= 1, got {mgr.val_every_n}")
 
     if getattr(args, 'profile_augmentations', False):
         mgr.profile_augmentations = True
