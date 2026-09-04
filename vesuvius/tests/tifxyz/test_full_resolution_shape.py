@@ -70,6 +70,24 @@ def test_non_round_obj2tifxyz_scales_match_vc_render_tifxyz(stored_wh, scale_xy,
     assert surface.full_resolution_shape == (rh, rw)
 
 
+@pytest.mark.parametrize(
+    ("stored", "scale", "rendered"),
+    [
+        # crafted near-.5 quotients measured against `vc_render_tifxyz --scale 1 -g 0`
+        # by @Bullo27 on PR #1699; the float64 lround core.py used before was off
+        # by one on every one of them.
+        (4, 1.6, 2),
+        (6, 0.9230769, 6),
+        (10, 0.2247191, 44),
+        (12, 0.5106383, 24),
+        (16, 0.256, 62),
+        (17, 2.2666667, 8),
+    ],
+)
+def test_near_half_quotients_match_vc_render_tifxyz(stored: int, scale: float, rendered: int) -> None:
+    assert _full_resolution_extent(stored, scale) == rendered
+
+
 def test_exact_half_rounds_away_from_zero_like_lround() -> None:
     # 7 x 5 grid at scale 2.0: 3.5 -> 4 and 2.5 -> 3 (round() would give 4 and 2)
     assert _full_resolution_extent(7, 2.0) == 4
