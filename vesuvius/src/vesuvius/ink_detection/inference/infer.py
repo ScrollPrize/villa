@@ -42,6 +42,7 @@ from vesuvius.ink_detection.volume_io import (
     open_volume_root,
     select_volume_level,
 )
+from vesuvius.data._transient_reads import _read_array_with_retry
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -345,7 +346,9 @@ def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
     """Collapse a 2D/3D low-resolution array to a 2D occupancy mask."""
 
     shape = tuple(int(value) for value in array.shape)
-    values = np.asarray(array[:])
+    values = np.asarray(
+        _read_array_with_retry(array, (slice(None),), warn=LOGGER.warning)
+    )
     if len(shape) == 2:
         return values != 0
     if len(shape) != 3:
@@ -439,20 +442,32 @@ class FlatPatchReader:
 
     def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         array = self._ensure_array()
+
+        def read(selection):
+            return _read_array_with_retry(
+                array, selection, warn=LOGGER.warning
+            )
+
         if self.depth_axis_first:
             if self._read_mode == "ascending":
-                block = array[self._z_start : self._z_stop, y0:y1, x0:x1]
+                block = read(
+                    (slice(self._z_start, self._z_stop), slice(y0, y1), slice(x0, x1))
+                )
             elif self._read_mode == "descending":
-                block = array[self._z_start : self._z_stop, y0:y1, x0:x1][::-1]
+                block = read(
+                    (slice(self._z_start, self._z_stop), slice(y0, y1), slice(x0, x1))
+                )[::-1]
             else:
-                block = array[self.layer_indices, y0:y1, x0:x1]
+                block = read((self.layer_indices, slice(y0, y1), slice(x0, x1)))
             return np.transpose(np.asarray(block), (1, 2, 0))
         if self._read_mode == "ascending":
-            block = array[y0:y1, x0:x1, self._z_start : self._z_stop]
+            block = read((slice(y0, y1), slice(x0, x1), slice(self._z_start, self._z_stop)))
         elif self._read_mode == "descending":
-            block = array[y0:y1, x0:x1, self._z_start : self._z_stop][..., ::-1]
+            block = read(
+                (slice(y0, y1), slice(x0, x1), slice(self._z_start, self._z_stop))
+            )[..., ::-1]
         else:
-            block = array[y0:y1, x0:x1, self.layer_indices]
+            block = read((slice(y0, y1), slice(x0, x1), self.layer_indices))
         return np.asarray(block)
 
     def read(self, y0: int, x0: int, out_h: int, out_w: int) -> np.ndarray:
