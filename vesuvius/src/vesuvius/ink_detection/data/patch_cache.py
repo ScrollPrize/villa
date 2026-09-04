@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -11,6 +13,61 @@ from vesuvius.ink_detection.types import Patch, Segment
 
 
 _CACHE_VERSION = "v6"
+
+
+def label_asset_fingerprint(paths: Iterable[Path | str | None]) -> str:
+    """Return a short digest of the label assets' on-disk layout.
+
+    A cached split is identified by the label *paths* it was found under, which catches
+    pointing a run at a different tree and misses regenerating a mask in place. The split
+    is then reused against labels it no longer describes, and nothing looks wrong: the
+    patch count and the bounding boxes are the old ones, so training continues over
+    supervision that has been deleted.
+
+    Hashing each asset's relative file names and sizes catches that, because rewriting a
+    zarr changes chunk sizes and dropping annotation deletes chunks outright when the
+    store does not write empty ones. It reads no chunk contents, so it costs one
+    directory walk -- ``os.scandir`` carries the size on Windows and Linux alike -- and it
+    cannot tell apart two different labels that compress to identical sizes under
+    identical names. A byte-identical copy of a tree fingerprints the same as its source,
+    which is the wanted behaviour.
+    """
+
+    digest = hashlib.sha256()
+    for path in sorted(str(value) for value in paths if value):
+        root = Path(path)
+        digest.update(root.name.encode())
+        if not root.exists():
+            digest.update(b"\0missing")
+            continue
+        entries: list[tuple[str, int]] = []
+        stack = [("", str(root))]
+        while stack:
+            relative, current = stack.pop()
+            try:
+                children = sorted(os.scandir(current), key=lambda entry: entry.name)
+            except OSError:
+                continue
+            for child in children:
+                name = f"{relative}/{child.name}" if relative else child.name
+                if child.is_dir(follow_symlinks=False):
+                    stack.append((name, child.path))
+                    continue
+                try:
+                    size = child.stat().st_size
+                except OSError:
+                    size = -1
+                entries.append((name, size))
+        for name, size in sorted(entries):
+            digest.update(name.encode())
+            digest.update(str(size).encode())
+    return digest.hexdigest()[:16]
+
+
+def _segment_label_fingerprint(segment: Segment) -> str:
+    return label_asset_fingerprint(
+        (segment.inklabels, segment.supervision_mask, segment.validation_mask)
+    )
 
 
 def patch_finding_cache_token(config: InkDataConfig) -> str:
@@ -59,8 +116,14 @@ def save_patch_cache(path: str | Path, patches: Iterable[Patch]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     records = []
+    fingerprints: dict[tuple[int, str, int, str, str, str], str] = {}
     for patch in patches:
         segment = patch.segment
+        fingerprint = fingerprints.get(segment.cache_key)
+        if fingerprint is None:
+            fingerprint = fingerprints.setdefault(
+                segment.cache_key, _segment_label_fingerprint(segment)
+            )
         records.append(
             {
                 "dataset_idx": segment.dataset_idx,
@@ -73,6 +136,7 @@ def save_patch_cache(path: str | Path, patches: Iterable[Patch]) -> None:
                 "validation_mask_path": (
                     "" if segment.validation_mask is None else str(segment.validation_mask)
                 ),
+                "label_fingerprint": fingerprint,
                 "active_supervision_mask_path": (
                     "" if patch.supervision_mask is None else str(patch.supervision_mask)
                 ),
@@ -99,7 +163,10 @@ def load_patch_cache(
         records = json.load(stream)
     if not isinstance(records, list):
         raise ValueError(f"patch cache {path} must contain a JSON array")
-    segments_by_key = {segment.cache_key: segment for segment in segments}
+    segments_by_key = {
+        (*segment.cache_key, _segment_label_fingerprint(segment)): segment
+        for segment in segments
+    }
     expected_token = patch_finding_cache_token(config)
     patches: list[Patch] = []
     for record in records:
@@ -114,6 +181,7 @@ def load_patch_cache(
             str(record.get("inklabels_path", "")),
             str(record.get("supervision_mask_path", "")),
             str(record.get("validation_mask_path", "")),
+            str(record.get("label_fingerprint", "")),
         )
         segment = segments_by_key.get(key)
         if segment is None:
