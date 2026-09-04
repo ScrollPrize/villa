@@ -423,3 +423,207 @@ def test_missing_node_error_has_zarr2_fallback(monkeypatch):
     assert isinstance(
         volume_io._missing_node_error("missing"), CompatiblePathError
     )
+
+
+RECIPE_TAG = "level2-zmean4-21slice-v1"
+
+
+def _prepared_root(tmp_path, attrs, name="input.zarr"):
+    """A prepared input is a group carrying the stamp `prepare_9um` writes."""
+
+    root = zarr.open_group(str(tmp_path / name), mode="w")
+    root.attrs.update(attrs)
+    return root
+
+
+def _ome_attrs(scales):
+    """Minimal OME metadata of a rendered surface volume: micrometre axes per level."""
+
+    return {
+        "multiscales": [
+            {
+                "axes": [
+                    {"name": "z", "type": "space", "unit": "micrometer"},
+                    {"name": "y", "type": "space", "unit": "micrometer"},
+                    {"name": "x", "type": "space", "unit": "micrometer"},
+                ],
+                "datasets": [
+                    {
+                        "path": str(level),
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [scales[0], um, um]},
+                            {"type": "translation", "translation": [0.0, 0.0, 0.0]},
+                        ],
+                    }
+                    for level, um in enumerate(scales)
+                ],
+            }
+        ]
+    }
+
+
+def test_input_at_the_scale_the_recipe_trains_at_is_silent(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "2", "source": "render.zarr"},
+    )
+    reader = lambda path: _ome_attrs([2.399, 4.798, 9.596])
+    assert (
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", attrs_reader=reader
+        )
+        is None
+    )
+
+
+def test_input_prepared_at_the_wrong_level_reports_the_numbers(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "render.zarr"},
+    )
+    reader = lambda path: _ome_attrs([2.399, 4.798, 9.596])
+    message = volume_io.check_flat_input_scale(
+        root, source="input.zarr", attrs_reader=reader
+    )
+    assert message is not None
+    assert "2.399 um in-plane" in message
+    assert "9.596 or 9.362 um" in message
+    assert "nearest 9.362" in message  # nearest in relative distance
+    assert "factor 0.256" in message
+
+
+def test_strict_refuses_what_the_default_reports(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "render.zarr"},
+    )
+    reader = lambda path: _ome_attrs([2.399, 4.798, 9.596])
+    with pytest.raises(ValueError, match="factor 0.25"):
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", strict=True, attrs_reader=reader
+        )
+
+
+def test_unreachable_source_falls_back_and_never_raises(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "gone.zarr"},
+    )
+
+    def reader(path):
+        raise FileNotFoundError(path)
+
+    message = volume_io.check_flat_input_scale(
+        root, source="input.zarr", attrs_reader=reader
+    )
+    assert message is not None
+    assert "absolute scale not checked" in message
+    assert "source unreachable" in message
+
+
+def test_unreachable_source_at_the_expected_level_is_silent(tmp_path):
+    # Nothing is known about the scale and nothing is inconsistent: say nothing.
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "2", "source": "gone.zarr"},
+    )
+
+    def reader(path):
+        raise FileNotFoundError(path)
+
+    assert (
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", attrs_reader=reader
+        )
+        is None
+    )
+
+
+def test_input_with_no_attrs_at_all_is_left_alone(tmp_path):
+    # What anyone preparing inputs by other means will hand this code.
+    root = _prepared_root(tmp_path, {})
+    assert volume_io.check_flat_input_scale(root, source="input.zarr") is None
+
+
+def test_bare_array_without_attrs_is_left_alone(tmp_path):
+    array = zarr.open_array(
+        str(tmp_path / "bare.zarr"), mode="w", shape=(21, 8, 8), dtype="uint8"
+    )
+    assert volume_io.check_flat_input_scale(array, source="bare.zarr") is None
+
+
+def test_input_without_known_format_tag_is_left_alone(tmp_path):
+    root = _prepared_root(tmp_path, _ome_attrs([2.399, 4.798, 9.596]))
+    assert volume_io.check_flat_input_scale(root, source="input.zarr") is None
+
+
+def test_missing_source_level_is_reported(tmp_path):
+    root = _prepared_root(tmp_path, {"format": RECIPE_TAG, "source": "render.zarr"})
+    message = volume_io.check_flat_input_scale(root, source="input.zarr")
+    assert message is not None and "records no source_level" in message
+
+
+def test_source_recording_only_a_voxel_size_is_scaled_by_level(tmp_path):
+    # A store that records its scale outside OME metadata, as Volume::normalize reads it.
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "2", "source": "volume.zarr"},
+    )
+    reader = lambda path: {"voxelsize": 2.399}
+    assert (
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", attrs_reader=reader
+        )
+        is None
+    )
+
+
+def test_sample_pixel_size_is_read_in_millimetres(tmp_path):
+    doc = {"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.002399}}}}}
+    assert volume_io.voxel_size_um_from_document(doc) == pytest.approx(2.399)
+
+
+def test_native_nine_micron_render_at_level_zero_is_silent(tmp_path):
+    """The recipe's second documented family: a 9.362 um render used at level 0.
+
+    prepare_9um stamps the same tag whatever `--level` it was run with, so this input
+    carries a level-2 tag with source_level 0 and is still correct.
+    """
+
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "native9.zarr"},
+    )
+    reader = lambda path: _ome_attrs([9.362])
+    assert (
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", attrs_reader=reader
+        )
+        is None
+    )
+
+
+def test_native_nine_micron_recorded_as_voxel_size_is_silent(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "native9.zarr"},
+    )
+    reader = lambda path: {"voxelsize": 9.362}
+    assert (
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", attrs_reader=reader
+        )
+        is None
+    )
+
+
+def test_refusal_uses_a_dedicated_exception(tmp_path):
+    root = _prepared_root(
+        tmp_path,
+        {"format": RECIPE_TAG, "source_level": "0", "source": "render.zarr"},
+    )
+    reader = lambda path: _ome_attrs([2.399, 4.798, 9.596])
+    with pytest.raises(volume_io.InputScaleRefused):
+        volume_io.check_flat_input_scale(
+            root, source="input.zarr", strict=True, attrs_reader=reader
+        )
