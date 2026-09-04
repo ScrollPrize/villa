@@ -96,6 +96,11 @@ def test_retries_disabled_with_one_attempt() -> None:
         "Connection reset by peer",
         "botocore error: An error occurred (503) when calling GetObject: SlowDown",
         "read operation timed out",
+        "ClientResponseError: 503, message='Service Unavailable'",
+        "ClientResponseError: 429, message='Too Many Requests'",
+        "An error occurred (500) when calling the GetObject operation (InternalError)",
+        "HTTP 502",
+        "status: 504",
     ],
 )
 def test_transient_messages_detected(message: str) -> None:
@@ -108,10 +113,42 @@ def test_transient_messages_detected(message: str) -> None:
         IndexError("index 99 is out of bounds"),
         KeyError("no such array: 0"),
         ValueError("patch_size must be a tuple of 3 integers"),
+        # zarr BoundsCheckError subclasses IndexError; the length used to match ' 504'
+        IndexError("index out of bounds for dimension with length 504"),
+        IndexError("index out of bounds for dimension with length 5000"),
+        IndexError("index 500 is out of bounds for axis 0 with size 429"),
+        ValueError("cannot reshape array of size 5030 into shape (3,4)"),
+        KeyError("0/503/12"),
+        TypeError("unsupported operand type(s) for +: 'int' and 'str' (code 502)"),
+        # a non-status number in an OSError text must not count either
+        OSError("read 5040 bytes"),
     ],
 )
 def test_deterministic_errors_not_flagged(exc: BaseException) -> None:
     assert not _is_transient_read_error(exc)
+
+
+def test_deterministic_error_with_status_like_length_fails_fast() -> None:
+    """The exact repro from PR #1698 review: a 504-long axis and a bad index."""
+
+    class BoundsCheckError(IndexError):
+        pass
+
+    store = _FlakyStore([BoundsCheckError("index out of bounds for dimension with length 504")])
+    with pytest.raises(BoundsCheckError):
+        _make_volume(store)[_idx()]
+    assert store.reads == 1
+
+
+def test_transient_cause_behind_deterministic_wrapper_is_still_detected() -> None:
+    # The wrapper type is deterministic, but the chain carries a real transport error.
+    try:
+        try:
+            raise OSError("Connection reset by peer")
+        except OSError as inner:
+            raise ValueError("failed decoding chunk") from inner
+    except ValueError as wrapped:
+        assert _is_transient_read_error(wrapped)
 
 
 def test_transient_cause_detected_through_wrapper() -> None:
