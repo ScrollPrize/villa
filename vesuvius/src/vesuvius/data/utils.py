@@ -6,6 +6,109 @@ from typing import Union, Dict, Any, Optional, Tuple
 
 _ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
 
+
+def open_zarr_group(path, mode: str = 'r', storage_options: Optional[Dict[str, Any]] = None,
+                    **kwargs) -> "zarr.Group":
+    """``zarr.open_group`` that yields a Zarr v2 group under both zarr majors.
+
+    zarr 3 creates *v3* groups by default, and arrays created inside a v3
+    group reject the numcodecs compressors this package uses and produce a
+    different on-disk layout (``zarr.json`` instead of ``.zgroup``/``.zarray``).
+    Every writer in this package predates zarr 3 and its consumers (VC3D,
+    ``vesuvius.data.utils.open_zarr``, the eigenanalysis readers) expect v2,
+    so ask for ``zarr_format=2`` whenever the group may be created. zarr 2 has
+    no ``zarr_format`` argument, and an existing store keeps its own format.
+    """
+    if _ZARR_V3 and mode in ('w', 'w-', 'a', 'r+') and 'zarr_format' not in kwargs:
+        kwargs['zarr_format'] = 2
+    if storage_options is not None:
+        kwargs['storage_options'] = storage_options
+    return zarr.open_group(path, mode=mode, **kwargs)
+
+
+def _v3_compressor(group, compressor):
+    """Translate a numcodecs compressor for ``Group.create_array`` under zarr 3."""
+    if compressor is None:
+        return None
+    if int(getattr(group.metadata, 'zarr_format', 2)) == 2:
+        # v2 arrays still take numcodecs codecs as-is.
+        return compressor
+    # A v3-format group (only reachable when appending to a store somebody
+    # else created as v3): numcodecs.Blosc has a direct v3 equivalent.
+    from zarr.codecs import BloscCodec
+    name = type(compressor).__name__.lower()
+    if name == 'blosc':
+        shuffle = {0: 'noshuffle', 1: 'shuffle', 2: 'bitshuffle'}.get(int(compressor.shuffle), 'shuffle')
+        return BloscCodec(cname=compressor.cname, clevel=int(compressor.clevel), shuffle=shuffle,
+                          blocksize=int(getattr(compressor, 'blocksize', 0)))
+    raise TypeError(
+        f"cannot use numcodecs compressor {compressor!r} in a Zarr v3 group; "
+        "open the group with open_zarr_group() so it is created as v2"
+    )
+
+
+def create_zarr_array(group, name: str, *, shape=None, data=None, chunks=None, dtype=None,
+                      compressor=None, fill_value=None, write_empty_chunks=None,
+                      overwrite: bool = False, dimension_separator: Optional[str] = None,
+                      **kwargs) -> zarr.Array:
+    """``Group.create_dataset`` for zarr 2 *and* zarr 3, same on-disk result.
+
+    zarr 3 removed ``Group.create_dataset``/``require_dataset`` and moved
+    ``write_empty_chunks`` into ``config`` and ``dimension_separator`` into
+    ``chunk_key_encoding``. This wraps both APIs so callers keep one code path
+    and the array is written exactly as before (v2 metadata, same chunk keys).
+    """
+    if data is not None:
+        data = np.asarray(data)
+        if shape is None:
+            shape = data.shape
+        if dtype is None:
+            dtype = data.dtype
+    if _ZARR_V3:
+        create_kwargs: Dict[str, Any] = dict(shape=shape, dtype=dtype, overwrite=overwrite, **kwargs)
+        if chunks is not None:
+            create_kwargs['chunks'] = chunks
+        if fill_value is not None:
+            create_kwargs['fill_value'] = fill_value
+        create_kwargs['compressors'] = _v3_compressor(group, compressor)
+        if dimension_separator is not None:
+            create_kwargs['chunk_key_encoding'] = {'name': 'v2', 'separator': dimension_separator}
+        if write_empty_chunks is not None:
+            create_kwargs['config'] = {'write_empty_chunks': bool(write_empty_chunks)}
+        array = group.create_array(name, **create_kwargs)
+        if data is not None:
+            array[...] = data
+        return array
+    create_kwargs = dict(shape=shape, chunks=chunks, dtype=dtype, compressor=compressor,
+                         overwrite=overwrite, **kwargs)
+    if data is not None:
+        create_kwargs['data'] = data
+    if fill_value is not None:
+        create_kwargs['fill_value'] = fill_value
+    if dimension_separator is not None:
+        create_kwargs['dimension_separator'] = dimension_separator
+    if write_empty_chunks is not None:
+        create_kwargs['write_empty_chunks'] = write_empty_chunks
+    return group.create_dataset(name, **create_kwargs)
+
+
+def require_zarr_array(group, name: str, *, shape, **kwargs) -> zarr.Array:
+    """``Group.require_dataset`` for both zarr majors.
+
+    Returns the existing array when one of that name and shape is present,
+    otherwise creates it through :func:`create_zarr_array`. ``overwrite=True``
+    always (re)creates, matching zarr 2's ``require_dataset(..., overwrite=True)``.
+    """
+    overwrite = bool(kwargs.pop('overwrite', False))
+    if not overwrite and name in group:
+        existing = group[name]
+        if tuple(existing.shape) != tuple(shape):
+            raise TypeError(
+                f"array {name!r} exists with shape {tuple(existing.shape)}, requested {tuple(shape)}"
+            )
+        return existing
+    return create_zarr_array(group, name, shape=shape, overwrite=overwrite, **kwargs)
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """

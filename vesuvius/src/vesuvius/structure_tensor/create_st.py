@@ -13,7 +13,7 @@ import zarr
 import numcodecs
 
 from vesuvius.models.run.inference import Inferer
-from vesuvius.data.utils import open_zarr
+from vesuvius.data.utils import open_zarr, open_zarr_group, create_zarr_array
 from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     _get_gaussian_kernel_3d,
@@ -196,14 +196,15 @@ class StructureTensorInferer(Inferer, nn.Module):
             print(f"Chunk shape: {output_chunks}")
             
             # Create the root group
-            root_store = zarr.open_group(
+            root_store = open_zarr_group(
                 main_store_path,
                 mode='w',
                 storage_options={'anon': False} if main_store_path.startswith('s3://') else None
             )
             
             # Create the structure_tensor array within the group
-            self.output_store = root_store.create_dataset(
+            self.output_store = create_zarr_array(
+                root_store,
                 'structure_tensor',
                 shape=output_shape,
                 chunks=output_chunks,
@@ -592,8 +593,8 @@ def _finalize_structure_tensor_torch(
         for axg in (gz, gy, gx):
             if ome_scale in axg:
                 del axg[ome_scale]
-            axg.create_dataset(
-                ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
+            create_zarr_array(
+                axg, ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
                 dtype=np.uint8, compressor=compressor, write_empty_chunks=False
             )
         return gz[ome_scale], gy[ome_scale], gx[ome_scale]
@@ -606,15 +607,16 @@ def _finalize_structure_tensor_torch(
         conf_group = root_store.require_group("confidence")
         if ome_scale in conf_group:
             del conf_group[ome_scale]
-        conf_ds = conf_group.create_dataset(
-            ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
+        conf_ds = create_zarr_array(
+            conf_group, ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
             dtype=np.uint8, compressor=compressor, write_empty_chunks=False
         )
 
     # ---- Optional: keep full-precision eigen* arrays (float32) ----
     if keep_eigen:
         out_chunks = (1, cz, cy, cx)
-        eigenvectors_arr = root_store.create_dataset(
+        eigenvectors_arr = create_zarr_array(
+            root_store,
             'eigenvectors',
             shape=(9, Z, Y, X),
             chunks=out_chunks,
@@ -623,7 +625,8 @@ def _finalize_structure_tensor_torch(
             write_empty_chunks=False,
             overwrite=True
         )
-        eigenvalues_arr = root_store.create_dataset(
+        eigenvalues_arr = create_zarr_array(
+            root_store,
             'eigenvalues',
             shape=(3, Z, Y, X),
             chunks=out_chunks,
@@ -975,6 +978,12 @@ def main():
             else:
                 logits_path = result
             
+            if not logits_path:
+                # infer() already printed the traceback; do not let the
+                # runner report "Completed Successfully" on an empty store.
+                print(f"\n--- Structure Tensor Computation Failed ---")
+                return 1
+
             if logits_path:
                 print(f"\n--- Structure Tensor Computation Finished ---")
                 print(f"Structure tensor saved to: {logits_path}/structure_tensor")
