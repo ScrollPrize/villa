@@ -1,4 +1,4 @@
-# Reference replay distance per failure: 2026-09-03
+# Reference replay mean segment length: 2026-09-03
 
 ## Provenance
 
@@ -51,12 +51,13 @@
 | --- | ---: |
 | Total tested directed length | 101.036 mm |
 | Failure events | 6 |
-| Mean distance per failure | 16.839 mm |
-| Distance per failure / tested length | 16.667% |
+| Mean segment length | 14.434 mm |
+| Mean segment length / tested length | 14.286% |
 | Whole command | 21.41 s wall, 117.98 s user, 14.28 s system |
 | Maximum RSS | 13,276,964 KiB |
 
-The formula is `tested directed length / max(failures, 1)`. A zero-failure run
-therefore reports its complete tested length and 100 percent. The generated
-version-2 JSON had SHA-256
+The corrected formula is `tested directed length / (failures + 1)`. These two
+rows are recomputed from the archived total length and failure count. The
+generated version-2 JSON used the deprecated distance-per-failure fields and
+had SHA-256
 `a08cc553dd80ef0000bba2d1b490576252566aa64f5505f386763694c05c48f5`.

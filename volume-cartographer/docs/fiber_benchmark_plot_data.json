@@ -9,11 +9,13 @@
   "benchmarks": {
     "reference_replay": {
       "title": "Reference-fiber replay reliability",
-      "metric": "distance_per_failure_percent",
-      "y_label": "Distance per failure / tested length (%)",
+      "metric": "mean_segment_length_percent",
+      "y_label": "Mean segment length / tested length (%)",
       "points": [
         {
           "algorithm": "Lasagna transport",
+          "method_id": "lasagna_transport",
+          "method_label": "Lasagna transport",
           "algorithm_date": "2026-06-01",
           "algorithm_revision": "e5e925774911d3c3c5591513e4592e5ddab503f1",
           "measurement_status": "measured",
@@ -25,6 +27,8 @@
         },
         {
           "algorithm": "Greedy direct",
+          "method_id": "greedy_direct",
+          "method_label": "Greedy direct",
           "algorithm_date": "2026-07-30",
           "algorithm_revision": "196829918631fb802e5cda68d7209a7d5448820e",
           "measurement_status": "measured",
@@ -36,6 +40,8 @@
         },
         {
           "algorithm": "Fiberlet",
+          "method_id": "fiberlet",
+          "method_label": "Fiberlet",
           "algorithm_date": "2026-08-22",
           "algorithm_revision": "ebb5bf071ec0584de7b2a37a43ca135e78a2028b",
           "measurement_status": "measured",
@@ -47,6 +53,8 @@
         },
         {
           "algorithm": "Fiberlet + staged filtering",
+          "method_id": "staged_fiberlet",
+          "method_label": "Fiberlet + staged filtering",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
           "measurement_status": "measured",
@@ -63,10 +71,12 @@
       "title": "1024-crop constraint error",
       "metric": "negative_problematic_per_retained_fulfilled_percent",
       "y_label": "Negative problematic / retained fulfilled (%)",
-      "annotation_rotation_degrees": 28,
+      "label_suffix": " + BP",
       "points": [
         {
           "algorithm": "Lasagna transport",
+          "method_id": "lasagna_transport",
+          "method_label": "Lasagna transport",
           "algorithm_date": "2026-06-01",
           "algorithm_revision": "e5e925774911d3c3c5591513e4592e5ddab503f1",
           "measurement_status": "assumed_floor",
@@ -74,6 +84,8 @@
         },
         {
           "algorithm": "Greedy direct",
+          "method_id": "greedy_direct",
+          "method_label": "Greedy direct",
           "algorithm_date": "2026-07-30",
           "algorithm_revision": "196829918631fb802e5cda68d7209a7d5448820e",
           "measurement_status": "assumed_floor",
@@ -81,7 +93,8 @@
         },
         {
           "algorithm": "Fiberlet + BP oracle pruning",
-          "plot_label": "Fiberlet + BP",
+          "method_id": "fiberlet",
+          "method_label": "Fiberlet",
           "algorithm_date": "2026-09-02",
           "algorithm_revision": "41052ac96e2841fe030708c7f4a8452baabdd9f9",
           "measurement_status": "measured",
@@ -93,7 +106,8 @@
         },
         {
           "algorithm": "Fiberlet + staged filtering + BP oracle pruning",
-          "plot_label": "Staged Fiberlet + BP",
+          "method_id": "staged_fiberlet",
+          "method_label": "Fiberlet + staged filtering",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "3046918b556c6a1af42b50b59e7c95853954c9f3",
           "measurement_status": "measured",
@@ -106,7 +120,8 @@
         },
         {
           "algorithm": "Fiberlet + baseline quality threshold + BP oracle pruning",
-          "plot_label": "Baseline q0.25",
+          "method_id": "baseline_q025",
+          "method_label": "Baseline q0.25",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "measurement_status": "measured",
@@ -119,7 +134,8 @@
         },
         {
           "algorithm": "Fiberlet + no-overtrace + quality threshold + BP oracle pruning",
-          "plot_label": "No-overtrace q0.35",
+          "method_id": "no_overtrace_q035",
+          "method_label": "No-overtrace q0.35",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "measurement_status": "measured",
@@ -129,18 +145,33 @@
           "problematic_unique_constraints": 6822,
           "retained_fulfilled_unique_constraints": 6925,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + ambiguity stop + quality threshold + BP oracle pruning",
+          "method_id": "ambiguity_m040_q021",
+          "method_label": "Ambiguity 40% q0.21",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "07dba8fef63e340ecb893619062c5f5b589e6b8b",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "07dba8fef63e340ecb893619062c5f5b589e6b8b",
+          "cohort": "PHercParis4 1024 ambiguity margin 0.40 quality<=0.21",
+          "problematic_unique_constraints": 15140,
+          "retained_fulfilled_unique_constraints": 16832,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-07dba8fef-ambiguity-m040-q021.md"
         }
       ]
     },
     "pre_pruning_reference": {
       "title": "1024-crop reference accuracy before pruning",
       "metric": "pre_pruning_exact_reference_percent",
-      "y_label": "Exact / (exact + wrong) references (%)",
-      "annotation_rotation_degrees": 20,
+      "y_label": "Exact / all reference fibers (%)",
+      "label_suffix": " + BP",
       "points": [
         {
           "algorithm": "Fiberlet + BP oracle pruning",
-          "plot_label": "Fiberlet + BP",
+          "method_id": "fiberlet",
+          "method_label": "Fiberlet",
           "algorithm_date": "2026-09-02",
           "algorithm_revision": "41052ac96e2841fe030708c7f4a8452baabdd9f9",
           "measurement_status": "measured",
@@ -148,12 +179,13 @@
           "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "exact_references": 20,
           "wrong_references": 5,
-          "missing_references": 0,
+          "missing_references": 1,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
         },
         {
           "algorithm": "Fiberlet + baseline quality threshold",
-          "plot_label": "Baseline q0.25",
+          "method_id": "baseline_q025",
+          "method_label": "Baseline q0.25",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "measurement_status": "measured",
@@ -161,21 +193,36 @@
           "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "exact_references": 22,
           "wrong_references": 3,
-          "missing_references": 0,
+          "missing_references": 1,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-baseline-q025-oracle-pruning.md"
         },
         {
           "algorithm": "Fiberlet + no-overtrace + quality threshold",
-          "plot_label": "No-overtrace q0.35",
+          "method_id": "no_overtrace_q035",
+          "method_label": "No-overtrace q0.35",
           "algorithm_date": "2026-09-03",
           "algorithm_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "measurement_status": "measured",
           "measurement_date": "2026-09-03",
           "measurement_revision": "a5e6f5d498a67ff7a2a400314f2bfd96260df5e8",
           "exact_references": 21,
-          "wrong_references": 4,
+          "wrong_references": 5,
           "missing_references": 0,
           "run_record": "docs/fiber_benchmark_runs/2026-09-03-a5e6f5d49-no-overtrace-q035-oracle-pruning.md"
+        },
+        {
+          "algorithm": "Fiberlet + ambiguity stop + quality threshold",
+          "method_id": "ambiguity_m040_q021",
+          "method_label": "Ambiguity 40% q0.21",
+          "algorithm_date": "2026-09-03",
+          "algorithm_revision": "07dba8fef63e340ecb893619062c5f5b589e6b8b",
+          "measurement_status": "measured",
+          "measurement_date": "2026-09-03",
+          "measurement_revision": "07dba8fef63e340ecb893619062c5f5b589e6b8b",
+          "exact_references": 24,
+          "wrong_references": 1,
+          "missing_references": 1,
+          "run_record": "docs/fiber_benchmark_runs/2026-09-03-07dba8fef-ambiguity-m040-q021.md"
         }
       ]
     }

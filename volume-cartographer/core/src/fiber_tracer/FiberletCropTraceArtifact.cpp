@@ -51,6 +51,19 @@ void requireObjectKeys(const nlohmann::json& value, std::initializer_list<std::s
     }
 }
 
+void requireObjectKeys(
+    const nlohmann::json& value,
+    const std::vector<std::string_view>& keys,
+    const char* name)
+{
+    if (!value.is_object() || value.size() != keys.size())
+        throw std::invalid_argument(std::string(name) + " has unknown or missing fields");
+    for (const auto key : keys) {
+        if (!value.contains(key))
+            throw std::invalid_argument(std::string(name) + " is missing " + std::string(key));
+    }
+}
+
 ChunkCoordinate ownerFor(const FiberletDatasetMetadata& metadata, const cv::Vec3d& seedBaseXYZ)
 {
     ChunkCoordinate owner{};
@@ -104,7 +117,8 @@ FiberletDatasetMetadata traceMetadata(
     const FiberletCropTraceConfig& config,
     const std::vector<ChunkCoordinate>& populated,
     std::size_t traceCount,
-    const nlohmann::json& preprocessing)
+    const nlohmann::json& preprocessing,
+    const nlohmann::json& traceSummary)
 {
     if (!finite(config.minimumBaseXYZ) || !finite(config.maximumBaseXYZ))
         throw std::invalid_argument("Fiber trace crop bounds must be finite");
@@ -166,6 +180,12 @@ FiberletDatasetMetadata traceMetadata(
              {"coverage_normal_radius_base", config.coverageNormalRadiusBaseVoxels},
              {"coverage_direction_degrees", config.coverageDirectionDegrees},
              {"stop_at_covered_anchors", config.stopAtCoveredAnchors},
+             {"ambiguity_relative_cost_margin",
+              config.ambiguityRelativeCostMargin
+                  ? nlohmann::json(*config.ambiguityRelativeCostMargin)
+                  : nlohmann::json(nullptr)},
+             {"ambiguity_normal_radius_base",
+              config.ambiguityNormalRadiusBaseVoxels},
              {"maximum_accepted_cost_density",
               config.maximumAcceptedCostDensity
                   ? nlohmann::json(*config.maximumAcceptedCostDensity)
@@ -181,6 +201,8 @@ FiberletDatasetMetadata traceMetadata(
     };
     if (!preprocessing.empty())
         result.processing["preprocessing"] = preprocessing;
+    if (!traceSummary.empty())
+        result.processing["artifact"]["trace_summary"] = traceSummary;
     finalizeFiberletDatasetIdentity(result);
     return result;
 }
@@ -236,14 +258,15 @@ void writeFiberletCropTraceArtifact(
     const nlohmann::json& normalManifest,
     const FiberletCropTraceConfig& config,
     const std::vector<FiberletCropTraceLine>& lines,
-    const nlohmann::json& preprocessing)
+    const nlohmann::json& preprocessing,
+    const nlohmann::json& traceSummary)
 {
     if (std::filesystem::exists(output))
         throw std::invalid_argument("Fiber trace output already exists: " + output.string());
     std::map<ChunkCoordinate, std::vector<FiberletStoredTrace>> grouped;
     FiberletDatasetMetadata layout = traceMetadata(
         sourceMetadata, normalManifest, config, {}, lines.size(),
-        preprocessing);
+        preprocessing, traceSummary);
     for (std::size_t index = 0; index < lines.size(); ++index) {
         const auto& line = lines[index];
         grouped[ownerFor(layout, line.seedBaseXYZ)].push_back({
@@ -263,7 +286,7 @@ void writeFiberletCropTraceArtifact(
     }
     auto metadata = traceMetadata(
         sourceMetadata, normalManifest, config, populated, lines.size(),
-        preprocessing);
+        preprocessing, traceSummary);
 
     const auto parent = output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path();
     std::filesystem::create_directories(parent);
@@ -326,44 +349,27 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
     const bool hasCoveredStop = trace.contains("stop_at_covered_anchors");
     const bool hasQualityThreshold =
         trace.contains("maximum_accepted_cost_density");
-    if (hasCoveredStop && hasQualityThreshold) {
-        requireObjectKeys(
-            trace,
-            {"beam_width", "lookahead_distance_base",
-             "maximum_generated_states_per_step",
-             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
-             "coverage_direction_degrees", "stop_at_covered_anchors",
-             "maximum_accepted_cost_density", "maximum_attempts",
-             "maximum_fibers"},
-            "Fiber trace parameters");
-    } else if (hasCoveredStop) {
-        requireObjectKeys(
-            trace,
-            {"beam_width", "lookahead_distance_base",
-             "maximum_generated_states_per_step",
-             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
-             "coverage_direction_degrees", "stop_at_covered_anchors",
-             "maximum_attempts", "maximum_fibers"},
-            "Fiber trace parameters");
-    } else if (hasQualityThreshold) {
-        requireObjectKeys(
-            trace,
-            {"beam_width", "lookahead_distance_base",
-             "maximum_generated_states_per_step",
-             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
-             "coverage_direction_degrees", "maximum_accepted_cost_density",
-             "maximum_attempts", "maximum_fibers"},
-            "Fiber trace parameters");
-    } else {
-        requireObjectKeys(
-            trace,
-            {"beam_width", "lookahead_distance_base",
-             "maximum_generated_states_per_step",
-             "maximum_fiberlets_per_side", "coverage_normal_radius_base",
-             "coverage_direction_degrees", "maximum_attempts",
-             "maximum_fibers"},
-            "Fiber trace parameters");
+    const bool hasAmbiguityMargin =
+        trace.contains("ambiguity_relative_cost_margin");
+    const bool hasAmbiguityRadius =
+        trace.contains("ambiguity_normal_radius_base");
+    if (hasAmbiguityMargin != hasAmbiguityRadius)
+        throw std::invalid_argument(
+            "Fiber trace ambiguity parameters are only partially present");
+    std::vector<std::string_view> traceKeys{
+        "beam_width", "lookahead_distance_base",
+        "maximum_generated_states_per_step", "maximum_fiberlets_per_side",
+        "coverage_normal_radius_base", "coverage_direction_degrees",
+        "maximum_attempts", "maximum_fibers"};
+    if (hasCoveredStop)
+        traceKeys.push_back("stop_at_covered_anchors");
+    if (hasAmbiguityMargin) {
+        traceKeys.push_back("ambiguity_relative_cost_margin");
+        traceKeys.push_back("ambiguity_normal_radius_base");
     }
+    if (hasQualityThreshold)
+        traceKeys.push_back("maximum_accepted_cost_density");
+    requireObjectKeys(trace, traceKeys, "Fiber trace parameters");
     if (hasCoveredStop && !trace.at("stop_at_covered_anchors").is_boolean())
         throw std::invalid_argument(
             "Fiber trace covered-anchor parameter is not boolean");
@@ -375,7 +381,31 @@ FiberletCropTraceArtifact readFiberletCropTraceArtifact(const std::filesystem::p
         throw std::invalid_argument(
             "Fiber trace quality threshold parameter is invalid");
     }
-    requireObjectKeys(processing.at("artifact"), {"trace_count", "populated_chunks_zyx"}, "Fiber trace artifact metadata");
+    if (hasAmbiguityMargin &&
+        ((!trace.at("ambiguity_relative_cost_margin").is_null() &&
+          (!trace.at("ambiguity_relative_cost_margin").is_number() ||
+           !std::isfinite(trace.at("ambiguity_relative_cost_margin").get<double>()) ||
+           trace.at("ambiguity_relative_cost_margin").get<double>() < 0.0)) ||
+         !trace.at("ambiguity_normal_radius_base").is_number() ||
+         !(trace.at("ambiguity_normal_radius_base").get<double>() > 0.0) ||
+         !std::isfinite(trace.at("ambiguity_normal_radius_base").get<double>()))) {
+        throw std::invalid_argument(
+            "Fiber trace ambiguity parameters are invalid");
+    }
+    const auto& artifactMetadata = processing.at("artifact");
+    if (artifactMetadata.contains("trace_summary")) {
+        requireObjectKeys(
+            artifactMetadata,
+            {"trace_count", "populated_chunks_zyx", "trace_summary"},
+            "Fiber trace artifact metadata");
+        if (!artifactMetadata.at("trace_summary").is_object())
+            throw std::invalid_argument(
+                "Fiber trace summary metadata is not an object");
+    } else {
+        requireObjectKeys(
+            artifactMetadata, {"trace_count", "populated_chunks_zyx"},
+            "Fiber trace artifact metadata");
+    }
     FiberletCropTraceArtifact result;
     result.metadata = metadata;
     result.minimumBaseXYZ = parseVector(processing.at("crop").at("minimum_base_xyz"), "Fiber trace crop minimum");

@@ -63,10 +63,9 @@ coverage: the trace run took 683.01 seconds wall, 14,931.97 seconds user, and
 12.59 GiB peak RSS.
 
 Before any oracle-pruning removal, reference round zero produced 21 exact,
-four wrong, and zero missing estimates among the 25 evaluable references. One
-of the complete 26-reference stack lacked sufficient evidence. A controlled
+five wrong, and zero missing estimates across all 26 references. A controlled
 rerun of the old 25%-fraction cohort with the same binary produced 20 exact,
-five wrong, and zero missing among the same 25 evaluable references.
+five wrong, and one missing across all 26 references.
 
 | Piece metric | Result |
 | --- | ---: |
@@ -88,15 +87,15 @@ five wrong, and zero missing among the same 25 evaluable references.
 | Retained fulfilled | 6,925 |
 | Problematic / retained-fulfilled | 98.51% |
 
-The oracle reached 24 exact, zero wrong, and one missing reference after seven
-accepted removal checkpoints. The pruning run took 27.11 seconds wall, 747.43
-seconds user, and 5.78 seconds system.
+The oracle reached 24 exact, one wrong, and one missing reference after seven
+accepted removal checkpoints. The all-reference verification rerun took 27.17
+seconds wall.
 
 ## Interpretation
 
 This threshold was selected using the reference crop, so the result is a tuned
 operating point rather than an unbiased benchmark. It improves the controlled
-pre-pruning reference result from 80% to 84% exact and the final result from
-24/0/2 to 24/0/1 relative to the historical fixed-quarter benchmark. It also
+pre-pruning reference result from 76.92% to 80.77% exact. The final result is
+24/1/1 across all references. It also
 reduces the problematic-to-retained-fulfilled constraint ratio from 177.93% to
 98.51%, while retaining a smaller, higher-quality candidate graph.

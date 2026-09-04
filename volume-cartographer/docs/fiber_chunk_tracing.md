@@ -59,6 +59,35 @@ line result uses termination `covered_anchor`; the current trace Zarr does not
 persist per-side termination metadata. The final CLI summary reports the number
 of stopped sides as `covered_anchor_stops`.
 
+Pass `--ambiguity-margin F` to stop a side before committing its next Fiberlet
+when a genuinely different lookahead route has cost density within relative
+gap `F` of the selected route. `--ambiguity-radius N` selects the normal radius
+in base voxels and defaults to 20; the tangent-plane radius is `4*N`. The mode
+reuses the replay Lasagna-normal ellipsoid and isotropic invalid-normal
+fallback. It compares both polylines at their stored vertices and every 16 base
+voxels, using exact closest-segment projections. Only the cheapest completion
+for each different first Fiberlet participates, and it must reach the full
+lookahead horizon. Paths sharing the selected first Fiberlet are reconsidered
+at the next anchor before their first divergent Fiberlet is committed. Short
+dead ends, search-box exits, and state-limited fronts do not compete with a
+complete route.
+
+The selected route and normal beam ranking are unchanged. A qualifying
+alternative produces side termination `ambiguous_route` before the selected
+edge is added. Seed-level alternatives must also form a valid central join
+with the already selected opposite initial edge. The CLI reports all ambiguity
+decisions made by computed candidates, comparisons performed, and ambiguity
+terminations retained by accepted lines; the trace artifact records those
+aggregate diagnostics and the exact settings. Because geometry comparison
+samples Lasagna normals during candidate work, parallel crop tracing requires
+both the graph and normal sampler to support concurrent queries.
+
+For the 1024-crop benchmark, ambiguity is the trace-generation variable. Do
+not pass the online trace quality threshold. Generate the complete ambiguity-
+stopped artifact first, then pass `--quality-threshold 0.25` to the stored
+`direction-ablation` evaluation so its quality selection matches the ordinary
+baseline protocol.
+
 The combined Fiberlet Zarr is authoritative. Present tuples contain graph data;
 wholly absent sparse chunks are empty. A present anchor/prefix/route tuple must
 be complete and valid. The original Fiber manifest and an expected-chunk index
@@ -2026,7 +2055,7 @@ vc_fiber_trace_chunk reference-replay-benchmark - \
   --output reference-lasagna.json
 ```
 
-The version-3 JSON report contains one forward and reverse case per contiguous
+The version-4 JSON report contains one forward and reverse case per contiguous
 in-crop reference run. A case contains every ordered failure with directional
 and source-oriented reference arcs, positions, and anisotropic errors. Credited
 length is the union of actual seeded replay intervals, excluding missing-seed
@@ -2036,13 +2065,13 @@ whole-run evaluation completion from failure-free directions and gives total
 failures, failures per directed millimeter, mean seeded-span length, and mean
 span ending at a failure.
 
-The CLI headline reports only `mean_distance_per_failure_mm` and
-`distance_per_failure_%`. These are `total tested directed length /
-max(failures, 1)` and that distance divided by total tested directed length.
-Consequently a zero-failure run reports the complete tested length and 100%;
-the JSON failure count identifies this as a censored lower bound. Exactly one
-failure also reports 100% under this definition. Detailed counts, locations,
-and coverage diagnostics remain in the JSON.
+The CLI headline reports only `mean_segment_length_mm` and
+`mean_segment_length_%`. The complete tested directed corpus is treated as one
+interval split into `failures + 1` segments. Mean segment length is therefore
+`total tested directed length / (failures + 1)`, and its normalized percentage
+is `100 / (failures + 1)`. Only zero failures reports the complete tested length
+and 100%; one failure reports 50%. Detailed counts, locations, and coverage
+diagnostics remain in the JSON.
 
 All backends use the same forward reference matcher, Lasagna-normal anisotropic
 threshold, complete-run requirement, and metric aggregation. Their native

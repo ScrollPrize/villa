@@ -63,13 +63,14 @@ JSON does not embed filter provenance.
 | Directed cases | 48 |
 | Failure events | 7 |
 | Cases with failures | 6 |
-| Mean distance per failure | 14.434 mm |
-| Distance per failure / tested length | 14.286% |
+| Mean segment length | 12.629 mm |
+| Mean segment length / tested length | 12.500% |
 | Whole command | 243.75 s wall, 601.77 s user, 39.97 s system |
 | Maximum RSS | 8,366,164 KiB |
 
 The output JSON SHA-256 was
 `5ccbfe34655cb13f81274289031b9b56b5e6f7111395127c0c0059e63c1a2998`.
-The run evaluated all 48 directed cases completely. The metric is
-`tested directed length / max(failures, 1)`; zero failures therefore means
-100 percent.
+The run evaluated all 48 directed cases completely. The corrected metric is
+`tested directed length / (failures + 1)`. The two summary rows above are
+recomputed from the archived total length and failure count; the archived
+version-3 JSON uses the deprecated distance-per-failure fields.

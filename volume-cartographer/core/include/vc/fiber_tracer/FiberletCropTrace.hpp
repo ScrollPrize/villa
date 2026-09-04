@@ -26,6 +26,8 @@ struct FiberletCropTraceConfig {
     double coverageNormalRadiusBaseVoxels = 20.0;
     double coverageDirectionDegrees = 25.0;
     bool stopAtCoveredAnchors = false;
+    std::optional<double> ambiguityRelativeCostMargin;
+    double ambiguityNormalRadiusBaseVoxels = 20.0;
     std::optional<double> maximumAcceptedCostDensity;
     std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
@@ -64,6 +66,11 @@ struct FiberletCropTraceResult {
     std::size_t oneSidedLines = 0;
     std::size_t bidirectionalLines = 0;
     std::size_t coveredAnchorStops = 0;
+    std::size_t ambiguityDecisions = 0;
+    std::size_t ambiguityRouteComparisons = 0;
+    std::size_t acceptedAmbiguityStops = 0;
+    std::optional<double> minimumAmbiguityRelativeCostGap;
+    double maximumAmbiguityThresholdRatio = 0.0;
     std::size_t qualityRejectedAnchors = 0;
     double candidateBatchSeconds = 0.0;
     double candidateBatchCpuSeconds = 0.0;

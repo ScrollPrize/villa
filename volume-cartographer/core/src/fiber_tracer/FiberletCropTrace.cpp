@@ -185,6 +185,7 @@ struct LookaheadRouteNode {
     FiberletStorageKey anchor;
     DirectedFiberletStorageId arcFromParent;
     std::size_t parent = kNoLookaheadRouteNode;
+    double includedFraction = 0.0;
 };
 
 struct LookaheadState {
@@ -197,16 +198,39 @@ struct LookaheadState {
 };
 
 struct LookaheadCompletion {
+    enum class Termination {
+        Horizon,
+        SearchBoxExit,
+        GraphExhausted,
+        StateLimit,
+    };
+
     DirectedFiberletStorageId first;
     std::size_t routeNode = kNoLookaheadRouteNode;
     std::size_t depth = 0;
     double loss = 0.0;
     double lengthPrediction = 0.0;
+    Termination termination = Termination::GraphExhausted;
 };
 
 struct LookaheadStatistics {
     std::size_t maximumRouteNodes = 0;
     std::size_t maximumRouteBytes = 0;
+    std::size_t ambiguityDecisions = 0;
+    std::size_t ambiguityRouteComparisons = 0;
+    std::optional<double> minimumAmbiguityRelativeCostGap;
+    double maximumAmbiguityThresholdRatio = 0.0;
+};
+
+struct LookaheadSearch {
+    std::vector<LookaheadRouteNode> routes;
+    std::vector<LookaheadCompletion> completed;
+};
+
+enum class InitialTraceSide {
+    None,
+    Negative,
+    Positive,
 };
 
 bool rolloutContains(
@@ -271,19 +295,21 @@ bool completionLess(
     return left.depth < right.depth;
 }
 
-std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
+LookaheadSearch collectLookaheadCompletions(
     const FiberletReplayGraphSource& graph,
     const FiberletStorageKey& source,
     const std::optional<FiberletReplaySourceArc>& incoming,
     const std::set<FiberletStorageKey>& alreadyVisited,
     const std::optional<cv::Vec3d>& initialDirection,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
+    const std::optional<DirectedFiberletStorageId>& pairedFirst,
+    InitialTraceSide initialSide,
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceSearchBox& searchBox,
     LookaheadStatistics& statistics)
 {
     const double horizonPrediction = config.lookaheadDistanceBaseVoxels / graph.predictionToBaseScale();
-    std::vector<LookaheadRouteNode> routes{{source, {}, kNoLookaheadRouteNode}};
+    std::vector<LookaheadRouteNode> routes{{source, {}, kNoLookaheadRouteNode, 0.0}};
     std::vector<LookaheadState> frontier{{0, incoming, {}, 0, 0.0, 0.0}};
     std::vector<LookaheadCompletion> completed;
     std::size_t generated = 0;
@@ -317,6 +343,23 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                         continue;
                     }
                 }
+                if (state.depth == 0 && pairedFirst.has_value()) {
+                    std::optional<FiberletReplaySourceTransition> central;
+                    if (initialSide == InitialTraceSide::Negative) {
+                        auto incomingId = id;
+                        incomingId.reverse = !incomingId.reverse;
+                        central = graph.transition(
+                            graph.arc(incomingId), graph.arc(*pairedFirst));
+                    } else if (initialSide == InitialTraceSide::Positive) {
+                        auto incomingId = *pairedFirst;
+                        incomingId.reverse = !incomingId.reverse;
+                        central = graph.transition(graph.arc(incomingId), edge);
+                    }
+                    if (initialSide == InitialTraceSide::None ||
+                        !central.has_value()) {
+                        continue;
+                    }
+                }
                 const auto clipped = clipAtFirstExit(
                     graph.routePointView(id),
                     searchBox.minimumBaseXYZ,
@@ -331,7 +374,8 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                     continue;
                 const double includedFraction = includedLength / edgeLength;
                 const std::size_t candidateRouteNode = routes.size();
-                routes.push_back({edge.target, id, state.routeNode});
+                routes.push_back(
+                    {edge.target, id, state.routeNode, includedFraction});
                 LookaheadState candidate{
                     candidateRouteNode,
                     edge,
@@ -347,9 +391,15 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                 ++generated;
                 expanded = true;
 
-                const bool terminal = clipped.exited || candidate.lengthPrediction >= horizonPrediction - kEpsilon;
-                if (terminal) {
-                    completed.push_back({candidate.first, candidate.routeNode, candidate.depth, candidate.loss, candidate.lengthPrediction});
+                const bool reachedHorizon =
+                    candidate.lengthPrediction >= horizonPrediction - kEpsilon;
+                if (clipped.exited || reachedHorizon) {
+                    completed.push_back(
+                        {candidate.first, candidate.routeNode, candidate.depth,
+                         candidate.loss, candidate.lengthPrediction,
+                         reachedHorizon
+                             ? LookaheadCompletion::Termination::Horizon
+                             : LookaheadCompletion::Termination::SearchBoxExit});
                 } else {
                     next.push_back(std::move(candidate));
                 }
@@ -357,7 +407,10 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                     break;
             }
             if (!expanded && state.depth > 0) {
-                completed.push_back({state.first, state.routeNode, state.depth, state.loss, state.lengthPrediction});
+                completed.push_back(
+                    {state.first, state.routeNode, state.depth, state.loss,
+                     state.lengthPrediction,
+                     LookaheadCompletion::Termination::GraphExhausted});
             }
             if (generated >= config.maximumGeneratedStatesPerStep)
                 break;
@@ -390,7 +443,10 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
     }
     for (const auto& state : frontier) {
         if (state.depth > 0) {
-            completed.push_back({state.first, state.routeNode, state.depth, state.loss, state.lengthPrediction});
+            completed.push_back(
+                {state.first, state.routeNode, state.depth, state.loss,
+                 state.lengthPrediction,
+                 LookaheadCompletion::Termination::StateLimit});
         }
     }
     statistics.maximumRouteNodes = std::max(
@@ -398,14 +454,217 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
     statistics.maximumRouteBytes = std::max(
         statistics.maximumRouteBytes,
         routes.capacity() * sizeof(LookaheadRouteNode));
-    if (completed.empty())
-        return std::nullopt;
-    const auto best = std::min_element(
-        completed.begin(), completed.end(),
-        [&routes](const auto& left, const auto& right) {
-            return completionLess(routes, left, right);
+    return {std::move(routes), std::move(completed)};
+}
+
+const LookaheadCompletion* bestCompletion(const LookaheadSearch& search)
+{
+    if (search.completed.empty())
+        return nullptr;
+    return &*std::min_element(
+        search.completed.begin(), search.completed.end(),
+        [&](const auto& left, const auto& right) {
+            return completionLess(search.routes, left, right);
         });
-    return best->first;
+}
+
+std::vector<cv::Vec3d> completionPoints(
+    const FiberletReplayGraphSource& graph,
+    const LookaheadSearch& search,
+    const LookaheadCompletion& completion)
+{
+    std::vector<std::size_t> nodes;
+    nodes.reserve(completion.depth);
+    std::size_t node = completion.routeNode;
+    while (node != kNoLookaheadRouteNode &&
+           search.routes[node].parent != kNoLookaheadRouteNode) {
+        nodes.push_back(node);
+        node = search.routes[node].parent;
+    }
+    std::reverse(nodes.begin(), nodes.end());
+
+    std::vector<cv::Vec3d> points;
+    for (const auto routeNode : nodes) {
+        const auto& step = search.routes[routeNode];
+        const auto view = graph.routePointView(step.arcFromParent);
+        std::vector<cv::Vec3d> edgePoints;
+        edgePoints.reserve(view.size());
+        for (std::size_t index = 0; index < view.size(); ++index)
+            edgePoints.push_back(view[index]);
+        const auto geometry = makePolylineArcGeometry(edgePoints);
+        const auto clipped = slicePolylineArc(
+            geometry, 0.0, geometry.length() * step.includedFraction);
+        for (const auto& point : clipped) {
+            if (points.empty() || length(point - points.back()) > kEpsilon)
+                points.push_back(point);
+        }
+    }
+    return points;
+}
+
+struct RouteSeparation {
+    bool distinct = false;
+    double maximumThresholdRatio = 0.0;
+};
+
+RouteSeparation directedRouteSeparation(
+    const PolylineArcGeometry& evaluator,
+    const PolylineArcGeometry& reference,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    double normalRadiusBaseVoxels)
+{
+    constexpr double kSampleStepBaseVoxels = 16.0;
+    std::vector<double> arcs = evaluator.vertexArcs;
+    for (double arc = kSampleStepBaseVoxels;
+         arc < evaluator.length() - kEpsilon;
+         arc += kSampleStepBaseVoxels) {
+        arcs.push_back(arc);
+    }
+    std::sort(arcs.begin(), arcs.end());
+    arcs.erase(
+        std::unique(arcs.begin(), arcs.end(), [](double left, double right) {
+            return std::abs(left - right) <= kEpsilon;
+        }),
+        arcs.end());
+
+    RouteSeparation result;
+    for (const double arc : arcs) {
+        const auto sample = samplePolylineArc(evaluator, arc);
+        const auto matched = projectPointToPolylineArc(
+            reference, sample.point, 0.0, reference.length());
+        const auto measurement = measureFiberReplayThreshold(
+            sample.point, matched.point, normalSampler,
+            normalWorkingToBaseScale, normalRadiusBaseVoxels);
+        result.maximumThresholdRatio = std::max(
+            result.maximumThresholdRatio, measurement.thresholdErrorRatio);
+        result.distinct = result.distinct ||
+            fiberReplayThresholdExceeded(measurement, normalRadiusBaseVoxels);
+    }
+    return result;
+}
+
+RouteSeparation routeSeparation(
+    const std::vector<cv::Vec3d>& left,
+    const std::vector<cv::Vec3d>& right,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    double normalRadiusBaseVoxels)
+{
+    const auto leftGeometry = makePolylineArcGeometry(left);
+    const auto rightGeometry = makePolylineArcGeometry(right);
+    const auto leftFromRight = directedRouteSeparation(
+        leftGeometry, rightGeometry, normalSampler,
+        normalWorkingToBaseScale, normalRadiusBaseVoxels);
+    const auto rightFromLeft = directedRouteSeparation(
+        rightGeometry, leftGeometry, normalSampler,
+        normalWorkingToBaseScale, normalRadiusBaseVoxels);
+    return {
+        leftFromRight.distinct || rightFromLeft.distinct,
+        std::max(leftFromRight.maximumThresholdRatio,
+                 rightFromLeft.maximumThresholdRatio),
+    };
+}
+
+struct LookaheadSelection {
+    std::optional<DirectedFiberletStorageId> first;
+    bool ambiguous = false;
+};
+
+LookaheadSelection selectLookaheadFirstArc(
+    const FiberletReplayGraphSource& graph,
+    const FiberletStorageKey& source,
+    const std::optional<FiberletReplaySourceArc>& incoming,
+    const std::set<FiberletStorageKey>& alreadyVisited,
+    const std::optional<cv::Vec3d>& initialDirection,
+    const std::optional<DirectedFiberletStorageId>& forcedFirst,
+    const std::optional<DirectedFiberletStorageId>& pairedFirst,
+    InitialTraceSide initialSide,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    const FiberletCropTraceConfig& config,
+    const FiberletCropTraceSearchBox& searchBox,
+    LookaheadStatistics& statistics)
+{
+    auto selectedSearch = collectLookaheadCompletions(
+        graph, source, incoming, alreadyVisited, initialDirection,
+        forcedFirst, pairedFirst, initialSide, config, searchBox, statistics);
+    const auto* best = bestCompletion(selectedSearch);
+    if (best == nullptr)
+        return {};
+    LookaheadSelection result{best->first, false};
+    if (!config.ambiguityRelativeCostMargin.has_value() ||
+        best->termination != LookaheadCompletion::Termination::Horizon) {
+        return result;
+    }
+
+    std::optional<LookaheadSearch> alternativeSearch;
+    const LookaheadSearch* candidates = &selectedSearch;
+    if (forcedFirst.has_value()) {
+        alternativeSearch = collectLookaheadCompletions(
+            graph, source, incoming, alreadyVisited, initialDirection,
+            std::nullopt, pairedFirst, initialSide, config, searchBox,
+            statistics);
+        candidates = &*alternativeSearch;
+    }
+
+    const double bestDensity = best->loss / best->lengthPrediction;
+    std::map<DirectedFiberletStorageId, const LookaheadCompletion*>
+        bestByFirstArc;
+    for (const auto& candidate : candidates->completed) {
+        if (candidate.termination !=
+                LookaheadCompletion::Termination::Horizon ||
+            candidate.first == best->first) {
+            continue;
+        }
+        const auto [found, inserted] = bestByFirstArc.emplace(
+            candidate.first, &candidate);
+        if (!inserted && completionLess(
+                candidates->routes, candidate, *found->second)) {
+            found->second = &candidate;
+        }
+    }
+    std::vector<const LookaheadCompletion*> ranked;
+    ranked.reserve(bestByFirstArc.size());
+    for (const auto& [first, candidate] : bestByFirstArc)
+        ranked.push_back(candidate);
+    std::sort(ranked.begin(), ranked.end(), [&](const auto* left, const auto* right) {
+        return completionLess(candidates->routes, *left, *right);
+    });
+    const auto winnerPoints = completionPoints(graph, selectedSearch, *best);
+    for (const auto* candidate : ranked) {
+        const double candidateDensity =
+            candidate->loss / candidate->lengthPrediction;
+        const bool withinMargin = bestDensity == 0.0
+            ? candidateDensity == 0.0
+            : candidateDensity <= bestDensity *
+                (1.0 + *config.ambiguityRelativeCostMargin);
+        if (!withinMargin)
+            break;
+        ++statistics.ambiguityRouteComparisons;
+        const auto candidatePoints = completionPoints(
+            graph, *candidates, *candidate);
+        const auto separation = routeSeparation(
+            winnerPoints, candidatePoints, normalSampler,
+            normalWorkingToBaseScale,
+            config.ambiguityNormalRadiusBaseVoxels);
+        statistics.maximumAmbiguityThresholdRatio = std::max(
+            statistics.maximumAmbiguityThresholdRatio,
+            separation.maximumThresholdRatio);
+        if (!separation.distinct)
+            continue;
+        const double relativeGap = bestDensity == 0.0
+            ? 0.0
+            : (candidateDensity - bestDensity) / bestDensity;
+        if (!statistics.minimumAmbiguityRelativeCostGap.has_value() ||
+            relativeGap < *statistics.minimumAmbiguityRelativeCostGap) {
+            statistics.minimumAmbiguityRelativeCostGap = relativeGap;
+        }
+        ++statistics.ambiguityDecisions;
+        result.ambiguous = true;
+        return result;
+    }
+    return result;
 }
 
 struct SideTrace {
@@ -429,6 +688,10 @@ SideTrace traceSide(
     const FiberletStoredAnchor& seed,
     const cv::Vec3d& direction,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
+    const std::optional<DirectedFiberletStorageId>& pairedFirst,
+    InitialTraceSide initialSide,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceSearchBox& searchBox,
     LookaheadStatistics& statistics)
@@ -440,13 +703,24 @@ SideTrace traceSide(
     std::optional<FiberletReplaySourceArc> incoming;
     std::set<FiberletStorageKey> visited{seed.key};
     for (std::size_t step = 0; step < config.maximumFiberletsPerSide; ++step) {
-        const auto selected =
-            selectLookaheadFirstArc(graph, current, incoming, visited, incoming.has_value() ? std::nullopt : std::make_optional(direction), incoming.has_value() ? std::nullopt : forcedFirst, config, searchBox, statistics);
-        if (!selected.has_value()) {
+        const auto selected = selectLookaheadFirstArc(
+            graph, current, incoming, visited,
+            incoming.has_value() ? std::nullopt
+                                 : std::make_optional(direction),
+            incoming.has_value() ? std::nullopt : forcedFirst,
+            incoming.has_value() ? std::nullopt : pairedFirst,
+            incoming.has_value() ? InitialTraceSide::None : initialSide,
+            normalSampler, normalWorkingToBaseScale, config, searchBox,
+            statistics);
+        if (!selected.first.has_value()) {
             result.termination = result.fiberlets == 0 ? "no_usable_edge" : "graph_exhausted";
             return result;
         }
-        const auto edge = graph.arc(*selected);
+        if (selected.ambiguous) {
+            result.termination = "ambiguous_route";
+            return result;
+        }
+        const auto edge = graph.arc(*selected.first);
         if (incoming.has_value()) {
             const auto join = graph.transition(*incoming, edge);
             if (!join.has_value()) {
@@ -456,7 +730,7 @@ SideTrace traceSide(
             result.totalMetricCost += join->cost.total();
         }
         const auto clipped = clipAtFirstExit(
-            graph.routePointView(*selected),
+            graph.routePointView(*selected.first),
             config.minimumBaseXYZ,
             config.maximumBaseXYZ,
             &result.points);
@@ -618,6 +892,8 @@ InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const Fibe
 TraceCandidate traceCandidate(
     const FiberletReplayGraphSource& graph,
     const FiberletStoredAnchor& seed,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceSearchBox& searchBox)
 {
@@ -634,16 +910,18 @@ TraceCandidate traceCandidate(
     const cv::Vec3d axis = normalized(seed.fittedAxisXYZ);
     if (initial.negative.has_value()) {
         result.negative = traceSide(
-            graph, seed, -axis, initial.negative, config, searchBox,
-            result.lookahead);
+            graph, seed, -axis, initial.negative, initial.positive,
+            InitialTraceSide::Negative, normalSampler,
+            normalWorkingToBaseScale, config, searchBox, result.lookahead);
     } else {
         result.negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         result.negative.termination = "no_usable_edge";
     }
     if (initial.positive.has_value()) {
         result.positive = traceSide(
-            graph, seed, axis, initial.positive, config, searchBox,
-            result.lookahead);
+            graph, seed, axis, initial.positive, initial.negative,
+            InitialTraceSide::Positive, normalSampler,
+            normalWorkingToBaseScale, config, searchBox, result.lookahead);
     } else {
         result.positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         result.positive.termination = "no_usable_edge";
@@ -791,6 +1069,11 @@ FiberletCropTraceResult traceFiberletCrop(
     if (config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
         config.maximumFiberletsPerSide == 0 || !(config.coverageNormalRadiusBaseVoxels > 0.0) ||
         !(config.coverageDirectionDegrees >= 0.0) || !(config.coverageDirectionDegrees <= 90.0) || !(normalWorkingToBaseScale > 0.0) ||
+        !(config.ambiguityNormalRadiusBaseVoxels > 0.0) ||
+        !std::isfinite(config.ambiguityNormalRadiusBaseVoxels) ||
+        (config.ambiguityRelativeCostMargin &&
+         (!std::isfinite(*config.ambiguityRelativeCostMargin) ||
+          *config.ambiguityRelativeCostMargin < 0.0)) ||
         (config.maximumAcceptedCostDensity &&
          (!std::isfinite(*config.maximumAcceptedCostDensity) ||
           *config.maximumAcceptedCostDensity < 0.0))) {
@@ -820,7 +1103,11 @@ FiberletCropTraceResult traceFiberletCrop(
     const std::size_t requestedThreads = config.parallelThreads == 0
         ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
         : config.parallelThreads;
-    const std::size_t workerCount = graph.supportsConcurrentQueries()
+    const bool ambiguitySamplingIsConcurrent =
+        !config.ambiguityRelativeCostMargin.has_value() ||
+        normalSampler.supportsConcurrentSampling();
+    const std::size_t workerCount = graph.supportsConcurrentQueries() &&
+            ambiguitySamplingIsConcurrent
         ? std::min(requestedThreads, std::max<std::size_t>(1, anchors.size()))
         : 1;
     struct Completion {
@@ -838,6 +1125,10 @@ FiberletCropTraceResult traceFiberletCrop(
         double maximumTaskSeconds = 0.0;
         std::size_t maximumLookaheadRouteNodes = 0;
         std::size_t maximumLookaheadRouteBytes = 0;
+        std::size_t ambiguityDecisions = 0;
+        std::size_t ambiguityRouteComparisons = 0;
+        std::optional<double> minimumAmbiguityRelativeCostGap;
+        double maximumAmbiguityThresholdRatio = 0.0;
     } completions;
 
     std::optional<utils::ThreadPool> pool;
@@ -867,7 +1158,8 @@ FiberletCropTraceResult traceFiberletCrop(
             const auto started = std::chrono::steady_clock::now();
             try {
                 completion.candidate = traceCandidate(
-                    graph, anchors[anchorIndex], config, searchBox);
+                    graph, anchors[anchorIndex], normalSampler,
+                    normalWorkingToBaseScale, config, searchBox);
             } catch (...) {
                 completion.failure = std::current_exception();
             }
@@ -886,6 +1178,21 @@ FiberletCropTraceResult traceFiberletCrop(
                 completions.maximumLookaheadRouteBytes = std::max(
                     completions.maximumLookaheadRouteBytes,
                     completion.candidate.lookahead.maximumRouteBytes);
+                completions.ambiguityDecisions +=
+                    completion.candidate.lookahead.ambiguityDecisions;
+                completions.ambiguityRouteComparisons +=
+                    completion.candidate.lookahead.ambiguityRouteComparisons;
+                const auto gap = completion.candidate.lookahead.
+                    minimumAmbiguityRelativeCostGap;
+                if (gap &&
+                    (!completions.minimumAmbiguityRelativeCostGap ||
+                     *gap < *completions.minimumAmbiguityRelativeCostGap)) {
+                    completions.minimumAmbiguityRelativeCostGap = gap;
+                }
+                completions.maximumAmbiguityThresholdRatio = std::max(
+                    completions.maximumAmbiguityThresholdRatio,
+                    completion.candidate.lookahead.
+                        maximumAmbiguityThresholdRatio);
                 completions.byTicket.emplace(
                     ticket, std::move(completion));
             }
@@ -972,6 +1279,10 @@ FiberletCropTraceResult traceFiberletCrop(
                         candidate.negative.termination == "covered_anchor";
                     result.coveredAnchorStops +=
                         candidate.positive.termination == "covered_anchor";
+                    result.acceptedAmbiguityStops +=
+                        candidate.negative.termination == "ambiguous_route";
+                    result.acceptedAmbiguityStops +=
+                        candidate.positive.termination == "ambiguous_route";
                     if (bidirectional)
                         ++result.bidirectionalLines;
                     else
@@ -1006,6 +1317,13 @@ FiberletCropTraceResult traceFiberletCrop(
             completions.maximumLookaheadRouteNodes;
         result.maximumLookaheadRouteBytes =
             completions.maximumLookaheadRouteBytes;
+        result.ambiguityDecisions = completions.ambiguityDecisions;
+        result.ambiguityRouteComparisons =
+            completions.ambiguityRouteComparisons;
+        result.minimumAmbiguityRelativeCostGap =
+            completions.minimumAmbiguityRelativeCostGap;
+        result.maximumAmbiguityThresholdRatio =
+            completions.maximumAmbiguityThresholdRatio;
     }
     result.candidateBatchSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - schedulerStarted).count();

@@ -303,10 +303,10 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
         summary.failuresPerDirectedMillimeter =
             static_cast<double>(summary.totalFailures) / (summary.directedReferenceLengthBaseVoxels * baseToMillimeters);
     if (summary.directedReferenceLengthBaseVoxels > 0.0) {
-        const double divisor = static_cast<double>(std::max<std::size_t>(summary.totalFailures, 1));
-        summary.meanDistancePerFailureBaseVoxels = summary.directedReferenceLengthBaseVoxels / divisor;
-        summary.meanDistancePerFailureMillimeters = summary.meanDistancePerFailureBaseVoxels * baseToMillimeters;
-        summary.meanDistancePerFailurePercent = 100.0 * summary.meanDistancePerFailureBaseVoxels / summary.directedReferenceLengthBaseVoxels;
+        const double segmentCount = static_cast<double>(summary.totalFailures + 1);
+        summary.meanSegmentLengthBaseVoxels = summary.directedReferenceLengthBaseVoxels / segmentCount;
+        summary.meanSegmentLengthMillimeters = summary.meanSegmentLengthBaseVoxels * baseToMillimeters;
+        summary.meanSegmentLengthPercent = 100.0 * summary.meanSegmentLengthBaseVoxels / summary.directedReferenceLengthBaseVoxels;
     }
     summary.failureReasons.assign(reasons.begin(), reasons.end());
     return summary;
@@ -359,7 +359,7 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
         reasons[reason] = count;
     return {
         {"format", "vc_fiber_reference_replay_benchmark"},
-        {"version", 3},
+        {"version", 4},
         {"tracer", tracer},
         {"coordinates",
          {
@@ -399,10 +399,10 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
              {"length_weighted_success_percent", summary.lengthWeightedSuccessPercent},
              {"failure_free_cases_percent", summary.failureFreeCasesPercent},
              {"failures_per_directed_mm", summary.failuresPerDirectedMillimeter},
-             {"mean_distance_per_failure_base_voxels", summary.meanDistancePerFailureBaseVoxels},
-             {"mean_distance_per_failure_mm", summary.meanDistancePerFailureMillimeters},
-             {"mean_distance_per_failure_percent", summary.meanDistancePerFailurePercent},
-             {"zero_failure_convention_applied", summary.totalFailures == 0},
+             {"reliability_segments", summary.totalFailures + 1},
+             {"mean_segment_length_base_voxels", summary.meanSegmentLengthBaseVoxels},
+             {"mean_segment_length_mm", summary.meanSegmentLengthMillimeters},
+             {"mean_segment_length_percent", summary.meanSegmentLengthPercent},
              {"failure_reasons", std::move(reasons)},
          }},
         {"cases", std::move(cases)},

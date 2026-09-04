@@ -57,11 +57,12 @@ fiber tracer, and it does not run Lasagna's global line optimization.
 | Total tested directed length | 101.036 mm |
 | Failure events | 57 |
 | Cases with failures | 34 / 48 |
-| Mean distance per failure | 1.773 mm |
-| Distance per failure / tested length | 1.754% |
+| Mean segment length | 1.742 mm |
+| Mean segment length / tested length | 1.724% |
 | Whole command | 0.09 s wall, 0.09 s user, 1.27 s system |
 | Maximum RSS | 70,776 KiB |
 
-All 57 events were anisotropic distance failures. The generated version-3 JSON
-had SHA-256
+All 57 events were anisotropic distance failures. The corrected summary rows
+above use `tested directed length / (failures + 1)`; the archived version-3
+JSON uses the deprecated distance-per-failure fields and had SHA-256
 `1183903ffe2eba7946ebc101e16847dc49165dc26f8d3afcbc7dde77071dd951`.

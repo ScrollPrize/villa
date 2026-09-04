@@ -48,13 +48,13 @@
 All candidates use the same stored traces, inputs, Release binary, and pruning
 settings. Accuracy is the oracle round-zero result before any piece removal.
 
-| Maximum density | Traces | Exact | Wrong | Missing | Exact / estimated | Wall time |
+| Maximum density | Traces | Exact | Wrong | Missing | Exact / all 26 | Wall time |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0.245 | 416 | 22 | 3 | 0 | 88.0% | 38.62 s |
-| **0.250** | **451** | **22** | **3** | **0** | **88.0%** | **40.99 s** |
-| 0.2525 | 468 | 20 | 5 | 0 | 80.0% | 60.43 s |
-| 0.256482 | 500 | 20 | 5 | 0 | 80.0% | 58.60 s |
-| 0.260 | 525 | 21 | 4 | 0 | 84.0% | 295.89 s |
+| 0.245 | 416 | 22 | 3 | 1 | 84.62% | 38.62 s |
+| **0.250** | **451** | **22** | **3** | **1** | **84.62%** | **40.99 s** |
+| 0.2525 | 468 | 20 | 5 | 1 | 76.92% | 60.43 s |
+| 0.256482 | 500 | 20 | 5 | 1 | 76.92% | 58.60 s |
+| 0.260 | 525 | 21 | 4 | 1 | 80.77% | 295.89 s |
 
 `0.250` is selected because it ties the best reference accuracy and retains
 more traces than `0.245`. This is reference-tuned selection on the benchmark
@@ -81,8 +81,8 @@ crop, not an unbiased validation result.
 | Retained fulfilled | 22,198 |
 | Problematic / retained-fulfilled | 160.80% |
 
-Round zero produced 22 exact, three wrong, and zero missing estimates among the
-25 evaluable references. Oracle pruning reached 24 exact, zero wrong, and one
+Round zero produced 22 exact, three wrong, and one missing estimate across all
+26 references. Oracle pruning reached 24 exact, zero wrong, and two
 missing after three accepted removal checkpoints. The run took 40.99 seconds
 wall, 915.51 seconds user, 5.52 seconds system, and 541,476 KiB peak RSS.
 
@@ -90,7 +90,7 @@ wall, 915.51 seconds user, 5.52 seconds system, and 541,476 KiB peak RSS.
 
 For completeness, applying `0.25` during ordinary trace generation accepted
 674 traces only after attempting 13,915 candidates and rejecting 13,233. It
-took 988.04 seconds wall and produced 20 exact, five wrong, and zero missing at
+took 988.04 seconds wall and produced 20 exact, five wrong, and one missing at
 oracle round zero. It is not the selected baseline point because online
 rejection changes seed coverage; baseline tuning intentionally filters the
 complete stored trace cohort only when BP loads it.

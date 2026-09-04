@@ -61,11 +61,12 @@ so this run does not claim identical learned predictions between policies.
 | Total tested directed length | 101.036 mm |
 | Failure events | 13 |
 | Cases with failures | 11 / 48 |
-| Mean distance per failure | 7.772 mm |
-| Distance per failure / tested length | 7.692% |
+| Mean segment length | 7.217 mm |
+| Mean segment length / tested length | 7.143% |
 | Whole command | 0.49 s wall, 3.51 s user, 6.42 s system |
 | Maximum RSS | 274,592 KiB |
 
-All 13 events were anisotropic distance failures. The generated version-3 JSON
-had SHA-256
+All 13 events were anisotropic distance failures. The corrected summary rows
+above use `tested directed length / (failures + 1)`; the archived version-3
+JSON uses the deprecated distance-per-failure fields and had SHA-256
 `9d31363a262eb01a7e4fc093e2a1bcf100a15ac3dedcea7f25da760e48a25a92`.

@@ -41,7 +41,21 @@ FiberletStorageKey key(std::int64_t x, std::uint8_t variant = 0)
 class ZNormalSampler final : public vc::lasagna::NormalSampler
 {
 public:
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
+    {
+        return true;
+    }
     [[nodiscard]] vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0, 0, 1}, true, {}}; }
+};
+
+class SerialZNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    [[nodiscard]] vc::lasagna::NormalSample sampleNormal(
+        const cv::Vec3d&) const override
+    {
+        return {{0, 0, 1}, true, {}};
+    }
 };
 
 class TestGraph final : public FiberletReplayGraphSource
@@ -166,6 +180,40 @@ FiberletStoredAnchor anchor(FiberletStorageKey id, cv::Vec3f point, cv::Vec3f ax
     return result;
 }
 
+void addAmbiguityTestGraph(
+    TestGraph& graph,
+    double alternativeOffsetZ,
+    float alternativeDensity,
+    bool shortAlternative = false)
+{
+    const auto leftEnd = key(-100);
+    const auto leftMiddle = key(-50);
+    const auto seed = key(0);
+    const auto bestMiddle = key(50);
+    const auto bestEnd = key(100);
+    const auto alternativeMiddle = key(50, 1);
+    const auto alternativeEnd = key(100, 1);
+    graph.addAnchor(leftEnd, {-100, 0, 0});
+    graph.addAnchor(leftMiddle, {-50, 0, 0});
+    graph.addAnchor(seed, {0, 0, 0});
+    graph.addAnchor(bestMiddle, {50, 0, 0});
+    graph.addAnchor(bestEnd, {100, 0, 0});
+    graph.addAnchor(alternativeMiddle, {50, 0, alternativeOffsetZ});
+    graph.addAnchor(alternativeEnd, {100, 0, alternativeOffsetZ});
+    graph.connect(leftEnd, leftMiddle);
+    graph.connect(leftMiddle, seed);
+    graph.connect(seed, bestMiddle);
+    graph.connect(bestMiddle, bestEnd);
+    graph.connect(seed, alternativeMiddle);
+    if (!shortAlternative)
+        graph.connect(alternativeMiddle, alternativeEnd);
+    graph.setCostDensity(seed, alternativeMiddle, alternativeDensity);
+    if (!shortAlternative) {
+        graph.setCostDensity(
+            alternativeMiddle, alternativeEnd, alternativeDensity);
+    }
+}
+
 struct TemporaryDirectory {
     explicit TemporaryDirectory(std::string_view tag)
     {
@@ -263,6 +311,115 @@ TEST_CASE("Fiberlet crop search box expands every face by exact lookahead")
     config.maximumBaseXYZ[1] = config.minimumBaseXYZ[1];
     CHECK_THROWS_AS(
         fiberletCropTraceSearchBox(config), std::invalid_argument);
+}
+
+TEST_CASE("Fiberlet crop tracing stops before a close distinct lookahead route")
+{
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -200};
+    config.maximumBaseXYZ = {200, 200, 200};
+    config.lookaheadDistanceBaseVoxels = 80.0;
+    config.maximumAttempts = 1;
+    config.parallelThreads = 1;
+    config.ambiguityRelativeCostMargin = 0.1;
+    config.ambiguityNormalRadiusBaseVoxels = 20.0;
+
+    TestGraph graph;
+    addAmbiguityTestGraph(graph, 25.0, 1.05F);
+    const auto result = traceFiberletCrop(
+        graph, {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals, 1.0, config);
+
+    REQUIRE(result.lines.size() == 1);
+    const auto& line = result.lines.front();
+    CHECK(line.negativeTermination == "graph_exhausted");
+    CHECK(line.positiveTermination == "ambiguous_route");
+    CHECK(line.negativeFiberlets == 2);
+    CHECK(line.positiveFiberlets == 0);
+    CHECK(line.pointsBaseXYZ.front() == cv::Vec3d{-100, 0, 0});
+    CHECK(line.pointsBaseXYZ.back() == cv::Vec3d{0, 0, 0});
+    CHECK(result.ambiguityDecisions == 1);
+    CHECK(result.acceptedAmbiguityStops == 1);
+    CHECK(result.ambiguityRouteComparisons >= 1);
+    REQUIRE(result.minimumAmbiguityRelativeCostGap.has_value());
+    CHECK(*result.minimumAmbiguityRelativeCostGap ==
+          doctest::Approx(0.05).epsilon(1.0e-5));
+    CHECK(result.maximumAmbiguityThresholdRatio > 1.0);
+
+    graph.concurrentQueries = true;
+    config.parallelThreads = 4;
+    const auto parallel = traceFiberletCrop(
+        graph, {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals, 1.0, config);
+    REQUIRE(parallel.lines.size() == 1);
+    CHECK(parallel.lines.front().pointsBaseXYZ == line.pointsBaseXYZ);
+    CHECK(parallel.lines.front().negativeTermination ==
+          line.negativeTermination);
+    CHECK(parallel.lines.front().positiveTermination ==
+          line.positiveTermination);
+    CHECK(parallel.ambiguityDecisions == result.ambiguityDecisions);
+    CHECK(parallel.acceptedAmbiguityStops == result.acceptedAmbiguityStops);
+}
+
+TEST_CASE("Fiberlet crop ambiguity ignores ineligible alternatives")
+{
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-200, -200, -200};
+    config.maximumBaseXYZ = {200, 200, 200};
+    config.lookaheadDistanceBaseVoxels = 80.0;
+    config.maximumAttempts = 1;
+    config.parallelThreads = 1;
+    config.ambiguityRelativeCostMargin = 0.1;
+    config.ambiguityNormalRadiusBaseVoxels = 20.0;
+
+    SUBCASE("an alternative inside the anisotropic tube is equivalent")
+    {
+        TestGraph graph;
+        addAmbiguityTestGraph(graph, 10.0, 1.0F);
+        const auto result = traceFiberletCrop(
+            graph, {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals, 1.0, config);
+        REQUIRE(result.lines.size() == 1);
+        CHECK(result.lines.front().positiveTermination == "graph_exhausted");
+        CHECK(result.ambiguityDecisions == 0);
+        CHECK(result.acceptedAmbiguityStops == 0);
+    }
+
+    SUBCASE("an expensive distinct route is outside the cost margin")
+    {
+        TestGraph graph;
+        addAmbiguityTestGraph(graph, 25.0, 1.2F);
+        const auto result = traceFiberletCrop(
+            graph, {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals, 1.0, config);
+        REQUIRE(result.lines.size() == 1);
+        CHECK(result.lines.front().positiveTermination == "graph_exhausted");
+        CHECK(result.ambiguityDecisions == 0);
+    }
+
+    SUBCASE("a within-margin short dead end does not compete with a horizon route")
+    {
+        TestGraph graph;
+        addAmbiguityTestGraph(graph, 25.0, 1.05F, true);
+        const auto result = traceFiberletCrop(
+            graph, {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals, 1.0, config);
+        REQUIRE(result.lines.size() == 1);
+        CHECK(result.lines.front().positiveTermination == "graph_exhausted");
+        CHECK(result.ambiguityDecisions == 0);
+    }
+
+    config.ambiguityRelativeCostMargin = -0.1;
+    TestGraph invalidGraph;
+    addAmbiguityTestGraph(invalidGraph, 25.0, 1.05F);
+    CHECK_THROWS_AS(
+        traceFiberletCrop(
+            invalidGraph,
+            {anchor(key(0), {0, 0, 0}, {1, 0, 0}, 1.0F)},
+            normals, 1.0, config),
+        std::invalid_argument);
 }
 
 TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic directional coverage")
@@ -550,6 +707,15 @@ TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonicall
     parallelConfig.parallelThreads = 4;
     const auto unsupportedSource = traceFiberletCrop(graph, anchors, normals, 1.0, parallelConfig);
     CHECK(unsupportedSource.attemptedAnchors == 2);
+    CHECK(graph.maximumConcurrentQueries.load() == 1);
+
+    graph.concurrentQueries = true;
+    graph.maximumConcurrentQueries = 0;
+    parallelConfig.ambiguityRelativeCostMargin = 0.1;
+    SerialZNormalSampler serialNormals;
+    const auto unsupportedNormals = traceFiberletCrop(
+        graph, anchors, serialNormals, 1.0, parallelConfig);
+    CHECK(unsupportedNormals.attemptedAnchors == 2);
     CHECK(graph.maximumConcurrentQueries.load() == 1);
 }
 
@@ -1356,6 +1522,8 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
     config.minimumBaseXYZ = {64, 128, 192};
     config.maximumBaseXYZ = {256, 320, 384};
     config.stopAtCoveredAnchors = true;
+    config.ambiguityRelativeCostMargin = 0.1;
+    config.ambiguityNormalRadiusBaseVoxels = 24.0;
     config.maximumAcceptedCostDensity = 0.35;
     std::vector<FiberletCropTraceLine> lines(3);
     lines[0].seedBaseXYZ = {127.5, 191.5, 255.5};
@@ -1376,17 +1544,27 @@ TEST_CASE("Crop trace artifact publishes sparse chunks and restores ordinal orde
         {"contract", "transient_crop_filter_v1"},
         {"stages", nlohmann::json::array({{{"side_base_voxels", 256}}})},
     };
+    const nlohmann::json traceSummary{
+        {"ambiguity_decisions", 7},
+        {"accepted_ambiguity_stops", 5},
+    };
     writeFiberletCropTraceArtifact(
         output, source, nlohmann::json{{"version", 2}}, config, lines,
-        preprocessing);
+        preprocessing, traceSummary);
     const auto artifact = readFiberletCropTraceArtifact(output);
     CHECK(artifact.minimumBaseXYZ == config.minimumBaseXYZ);
     CHECK(artifact.metadata.processing.at("preprocessing") == preprocessing);
     CHECK(artifact.maximumBaseXYZ == config.maximumBaseXYZ);
     const auto& traceMetadata = artifact.metadata.processing.at("trace");
     CHECK(traceMetadata.at("stop_at_covered_anchors") == true);
+    CHECK(traceMetadata.at("ambiguity_relative_cost_margin").get<double>() ==
+          doctest::Approx(0.1));
+    CHECK(traceMetadata.at("ambiguity_normal_radius_base").get<double>() ==
+          doctest::Approx(24.0));
     CHECK(traceMetadata.at("maximum_accepted_cost_density").get<double>() ==
           doctest::Approx(0.35));
+    CHECK(artifact.metadata.processing.at("artifact").at("trace_summary") ==
+          traceSummary);
     REQUIRE(artifact.lines.size() == lines.size());
     for (std::size_t index = 0; index < lines.size(); ++index) {
         CHECK(artifact.lines[index].seedBaseXYZ == lines[index].seedBaseXYZ);

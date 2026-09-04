@@ -4754,6 +4754,34 @@
   requested threshold, input/retained counts, effective fraction, and maximum
   observed retained density. The density is comparable only for a fixed tracer
   and cost configuration; it is not a universal confidence value.
+- Crop tracing optionally accepts an ambiguity relative-cost margin and a
+  positive normal-radius threshold. The option is disabled by default and must
+  not alter ordinary completion generation, pruning, density ranking, or
+  deterministic ties. At each side checkpoint, the selected completion is
+  compared only with the cheapest completion for each different first
+  Fiberlet that reaches the exact lookahead horizon and whose density `a`
+  satisfies `a <= b*(1+margin)` for selected density `b`;
+  when `b == 0`, `a` must also equal zero. Search-box exits, graph-exhausted
+  paths, and state-limit frontier paths cannot trigger ambiguity. Completions
+  sharing the selected first Fiberlet cannot change the current commit and are
+  reconsidered at the next anchor before their first divergent Fiberlet.
+- Ambiguity geometry contains exactly the route prefix charged by lookahead,
+  including fractional final Fiberlets. It is sampled at all stored vertices
+  and fixed 16-base-voxel arc intervals. Each route is projected exactly onto
+  the complete other polyline in both directions. A comparison is distinct if
+  either direction exceeds the shared replay ellipsoid, using the configured
+  normal radius, four-times-larger tangential radius, Lasagna normals sampled
+  at the matched route, and isotropic fallback for invalid normals.
+- A qualifying distinct completion stops the side before its next selected
+  Fiberlet is committed and reports `ambiguous_route`. At the seed, the
+  bidirectional initial-pair winner stays fixed while compatible alternative
+  first edges are evaluated separately; an alternative must preserve the
+  central join to the selected opposite side. Later checkpoints use the normal
+  shared rollout. Ambiguity never excludes graph data or biases the winner.
+  Candidate parallelism additionally requires concurrent normal sampling when
+  ambiguity is enabled. Runtime diagnostics distinguish all computed ambiguity
+  decisions from accepted-line ambiguity terminations and persist settings and
+  aggregate counts in trace metadata.
 
 ## Stored crop-trace H/V constraint diagnostics
 
@@ -6264,15 +6292,18 @@
   mean seeded-span length but not mean failed-span length; an unseeded failure
   contributes a zero failed span. Millimeter conversion requires an explicit
   positive base voxel size.
-- The primary whole-run reliability value is mean tested distance per failure:
-  `sum(full directed reference length) / max(total failures, 1)`. Its reported
-  percentage is `100 * mean distance per failure / total tested directed
-  length`, equivalently `100 / max(total failures, 1)`. A zero-failure run
-  therefore reports the complete tested directed length and 100 percent as a
-  censored lower bound. Exactly one failure also produces 100 percent by this
-  definition. Every failure reason contributes to the count, and the benchmark
-  rejects incomplete directional evaluation before calculating the metric.
-- Results use JSON schema version 3 and include tracer identity, common and
+- The primary whole-run reliability value is mean segment length. Treat the
+  complete tested directed reference corpus as one interval split into
+  `total_failures + 1` segments, so the value is
+  `sum(full directed reference length) / (total_failures + 1)`. Its percentage
+  is equivalently `100 / (total_failures + 1)`. Only a zero-failure run reports
+  the complete tested length and 100 percent; one failure reports 50 percent.
+  Every failure reason contributes to the count, and the benchmark rejects
+  incomplete directional evaluation before calculating the metric.
+- Version 4 replaces the deprecated `mean_distance_per_failure_*` and
+  `zero_failure_convention_applied` summary fields with
+  `reliability_segments=total_failures+1` and `mean_segment_length_*`.
+- Results use JSON schema version 4 and include tracer identity, common and
   backend configuration, and every failure's reason, stable
   indices, directional and source-oriented reference arc/fraction, reference
   and optional evaluator position, and optional anisotropic threshold
@@ -6286,14 +6317,14 @@
   `algorithm_revision` separately from `measurement_date`,
   `measurement_revision`, and the reproducible run record. Plot dates are
   algorithm milestones; benchmark table dates remain execution dates.
-- Reference replay plots derive `distance_per_failure_percent` as
-  `100/max(failures,1)` after complete evaluation. Crop plots preserve the
+- Reference replay plots derive `mean_segment_length_percent` as
+  `100/(failures+1)` after complete evaluation. Crop plots preserve the
   existing problematic-to-retained error ratio but negate it as
   `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
   Pre-pruning reference-accuracy plots derive
-  `100*exact/(exact+wrong)` from the raw round-zero counts before supervised
-  oracle removal; missing references have no estimate and are excluded from
-  that fraction. These three percentages are not comparable metrics.
+  `100*exact/(exact+wrong+missing)` from the raw round-zero counts before
+  supervised oracle removal. These three percentages are not comparable
+  metrics.
 - A crop point with `measurement_status=assumed_floor` is not a measurement.
   It must carry an explicit rationale, no measurement revision or run record,
   and must be visually distinguishable by marker and line style. This permits
@@ -6307,3 +6338,15 @@
 - Every measured result remains visible at its actual score. The progress line
   for each metric is the cumulative best-so-far envelope, so a later regression
   cannot lower the historical line.
+- Plot points use consecutive integer experiment steps after a stable sort by
+  algorithm completion date; same-date records retain source order. Every step
+  number is shown, with representative dates on spaced steps. Strict measured
+  score improvements form the historical Pareto frontier and are the only
+  annotated points. Every non-frontier result uses its own marker and named
+  legend entry. Unmeasured floor assumptions are individually named and marked,
+  never establish or advance the measured envelope, and leave it absent before
+  the first measured point. The legend is placed below the axes.
+- Every algorithm variant carries a stable `method_id` and base
+  `method_label`. All occurrences of one method must use the same base label.
+  Benchmark-stage suffixes are appended without reordering or rewriting that
+  base label; unmeasured floor assumptions do not claim an unexecuted stage.

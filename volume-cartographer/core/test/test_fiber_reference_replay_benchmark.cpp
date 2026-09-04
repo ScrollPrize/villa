@@ -109,14 +109,14 @@ TEST_CASE("reference replay summary includes successes and explicit voxel scale"
     CHECK(summary.meanFailedSpanLengthMillimeters == doctest::Approx(0.125));
     CHECK(summary.lengthWeightedSuccessPercent == doctest::Approx(87.5));
     CHECK(summary.failuresPerDirectedMillimeter == doctest::Approx(1.0));
-    CHECK(summary.meanDistancePerFailureBaseVoxels == doctest::Approx(200.0));
-    CHECK(summary.meanDistancePerFailureMillimeters == doctest::Approx(1.0));
-    CHECK(summary.meanDistancePerFailurePercent == doctest::Approx(100.0));
+    CHECK(summary.meanSegmentLengthBaseVoxels == doctest::Approx(100.0));
+    CHECK(summary.meanSegmentLengthMillimeters == doctest::Approx(0.5));
+    CHECK(summary.meanSegmentLengthPercent == doctest::Approx(50.0));
     REQUIRE(summary.failureReasons.size() == 1);
     CHECK(summary.failureReasons.front().first == "route_state_limit");
 }
 
-TEST_CASE("reference replay distance per failure handles zero and multiple failures")
+TEST_CASE("reference replay mean segment length handles zero and multiple failures")
 {
     vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
     outcome.referenceLengthBaseVoxels = 200.0;
@@ -127,9 +127,9 @@ TEST_CASE("reference replay distance per failure handles zero and multiple failu
 
     const std::array zeroFailureOutcomes{outcome};
     const auto zero = vc::fiber_tracer::summarizeFiberReferenceReplay(1, zeroFailureOutcomes, 2.4);
-    CHECK(zero.meanDistancePerFailureBaseVoxels == doctest::Approx(200.0));
-    CHECK(zero.meanDistancePerFailureMillimeters == doctest::Approx(0.48));
-    CHECK(zero.meanDistancePerFailurePercent == doctest::Approx(100.0));
+    CHECK(zero.meanSegmentLengthBaseVoxels == doctest::Approx(200.0));
+    CHECK(zero.meanSegmentLengthMillimeters == doctest::Approx(0.48));
+    CHECK(zero.meanSegmentLengthPercent == doctest::Approx(100.0));
 
     outcome.failureFree = false;
     outcome.failures.resize(4);
@@ -139,9 +139,9 @@ TEST_CASE("reference replay distance per failure handles zero and multiple failu
     }
     const std::array fourFailureOutcomes{outcome};
     const auto four = vc::fiber_tracer::summarizeFiberReferenceReplay(1, fourFailureOutcomes, 2.4);
-    CHECK(four.meanDistancePerFailureBaseVoxels == doctest::Approx(50.0));
-    CHECK(four.meanDistancePerFailureMillimeters == doctest::Approx(0.12));
-    CHECK(four.meanDistancePerFailurePercent == doctest::Approx(25.0));
+    CHECK(four.meanSegmentLengthBaseVoxels == doctest::Approx(40.0));
+    CHECK(four.meanSegmentLengthMillimeters == doctest::Approx(0.096));
+    CHECK(four.meanSegmentLengthPercent == doctest::Approx(20.0));
 
     outcome.evaluationComplete = false;
     outcome.evaluatedThroughBaseVoxels = 100.0;
@@ -149,7 +149,7 @@ TEST_CASE("reference replay distance per failure handles zero and multiple failu
     CHECK_THROWS_AS(vc::fiber_tracer::summarizeFiberReferenceReplay(1, incompleteOutcomes, 2.4), std::invalid_argument);
 }
 
-TEST_CASE("reference replay JSON version three preserves failure diagnostics")
+TEST_CASE("reference replay JSON version four preserves failure diagnostics")
 {
     vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
     outcome.referenceLengthBaseVoxels = 10.0;
@@ -177,11 +177,15 @@ TEST_CASE("reference replay JSON version three preserves failure diagnostics")
         summary, outcomes, "fiberlet", commonConfig,
         {{"beam_width", 16}}, {0, 0, 0}, {10, 10, 10});
 
-    CHECK(json.at("version") == 3);
+    CHECK(json.at("version") == 4);
     CHECK(json.at("tracer") == "fiberlet");
     CHECK(json.at("backend_config").at("beam_width") == 16);
-    CHECK(json.at("summary").at("mean_distance_per_failure_mm") == doctest::Approx(0.024));
-    CHECK_FALSE(json.at("summary").at("zero_failure_convention_applied").get<bool>());
+    CHECK(json.at("summary").at("reliability_segments") == 2);
+    CHECK(json.at("summary").at("mean_segment_length_mm") == doctest::Approx(0.012));
+    CHECK_FALSE(json.at("summary").contains("mean_distance_per_failure_base_voxels"));
+    CHECK_FALSE(json.at("summary").contains("mean_distance_per_failure_mm"));
+    CHECK_FALSE(json.at("summary").contains("mean_distance_per_failure_percent"));
+    CHECK_FALSE(json.at("summary").contains("zero_failure_convention_applied"));
     const auto& failureJson = json.at("cases").at(0).at("failures").at(0);
     CHECK(failureJson.at("source_reference_arc_base_voxels") == doctest::Approx(7.0));
     CHECK(failureJson.at("threshold_measurement").at("normal_error_base_voxels") == doctest::Approx(3.0));

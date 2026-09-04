@@ -369,6 +369,8 @@ void usage(const char* executable)
               << "  --coverage N               normal coverage radius in base voxels [20]\n"
               << "  --coverage-angle N         parallel-axis coverage angle [25]\n"
               << "  --stop-at-covered          stop output after reaching a covered anchor\n"
+              << "  --ambiguity-margin F       stop before a distinct route within relative cost gap F\n"
+              << "  --ambiguity-radius N       distinct-route normal radius in base voxels [20]\n"
               << "  --max-attempts N           anchor attempt limit; zero is unlimited [0]\n"
               << "  --max-fibers N             accepted line limit; zero is unlimited [0]\n"
               << "  --texture-max N            maximum bbox texture dimension [4096]\n\n"
@@ -845,6 +847,18 @@ Options parse(int argc, char** argv)
             options.hasTraceOnlyOption = true;
         } else if (argument == "--stop-at-covered") {
             options.trace.stopAtCoveredAnchors = true;
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--ambiguity-margin") {
+            options.trace.ambiguityRelativeCostMargin = number(
+                index, argc, argv, "--ambiguity-margin");
+            if (*options.trace.ambiguityRelativeCostMargin < 0.0)
+                fail("--ambiguity-margin must be nonnegative");
+            options.hasTraceOnlyOption = true;
+        } else if (argument == "--ambiguity-radius") {
+            options.trace.ambiguityNormalRadiusBaseVoxels = number(
+                index, argc, argv, "--ambiguity-radius");
+            if (!(options.trace.ambiguityNormalRadiusBaseVoxels > 0.0))
+                fail("--ambiguity-radius must be positive");
             options.hasTraceOnlyOption = true;
         } else if (argument == "--max-attempts") {
             options.trace.maximumAttempts = count(index, argc, argv, "--max-attempts");
@@ -9104,6 +9118,7 @@ int main(int argc, char** argv)
                                             vc::fiber_tracer::FiberTraceInterleavedWindingReport conditioned;
                                             std::vector<vc::fiber_tracer::FiberletCropTraceLine> sourceLines;
                                             vc::fiber_tracer::FiberTraceReferenceOracleScore score;
+                                            vc::fiber_tracer::FiberTraceReferenceOracleScore allReferenceScore;
                                         };
                                         const auto buildOracleState = [&](const std::vector<std::size_t>& retained,
                                                                           std::span<const unsigned char> required) {
@@ -9165,6 +9180,10 @@ int main(int argc, char** argv)
                                                 observations,
                                                 referenceDiagnostics->sourceNames.size(),
                                                 required);
+                                            state.allReferenceScore = vc::fiber_tracer::
+                                                scoreFiberTraceReferenceOracle(
+                                                    observations,
+                                                    referenceDiagnostics->sourceNames.size());
                                             return state;
                                         };
 
@@ -9185,9 +9204,9 @@ int main(int argc, char** argv)
                                                << std::left << std::setw(7) << "round"
                                                << std::setw(10) << "pieces"
                                                << std::setw(9) << "removed"
-                                               << std::setw(8) << "exact"
-                                               << std::setw(8) << "wrong"
-                                               << std::setw(9) << "missing"
+                                               << std::setw(11) << "all_exact"
+                                               << std::setw(11) << "all_wrong"
+                                               << std::setw(12) << "all_missing"
                                                << std::setw(13) << "right"
                                                << std::setw(13) << "constraints"
                                                << std::setw(15) << "conditioned"
@@ -9278,9 +9297,9 @@ int main(int argc, char** argv)
                                             rounds << std::setw(7) << round
                                                    << std::setw(10) << retained.size()
                                                    << std::setw(9) << (haveAccepted ? accepted->subset.retainedPieceIndices.size() - retained.size() : 0)
-                                                   << std::setw(8) << state.score.exact
-                                                   << std::setw(8) << state.score.wrong
-                                                   << std::setw(9) << state.score.missing
+                                                   << std::setw(11) << state.allReferenceScore.exact
+                                                   << std::setw(11) << state.allReferenceScore.wrong
+                                                   << std::setw(12) << state.allReferenceScore.missing
                                                    << std::setw(13) << state.score.constraintRight
                                                    << std::setw(13) << state.score.constraintRight + state.score.constraintWrong
                                                    << std::setw(15) << state.conditioned.status
@@ -9371,11 +9390,11 @@ int main(int argc, char** argv)
                                             if (acceptedScore.exact == requiredCount &&
                                                 acceptedScore.wrong == 0 &&
                                                 acceptedScore.missing == 0) {
-                                                terminal = "zero_errors";
+                                                terminal = "zero_required_errors";
                                                 break;
                                             }
                                             if (acceptedScore.wrong == 0) {
-                                                terminal = "zero_wrong_with_missing";
+                                                terminal = "zero_required_wrong_with_missing";
                                                 break;
                                             }
                                             std::vector<double> arc(retained.size(), 0.0);
@@ -9453,8 +9472,10 @@ int main(int argc, char** argv)
                                         oracleLocalGaugeMapping.resize(retained.size());
                                         std::iota(oracleLocalGaugeMapping.begin(), oracleLocalGaugeMapping.end(), 0);
                                         rounds << "terminal=" << terminal
-                                               << " required_references="
+                                               << " optimization_required_references="
                                                << std::count(requiredReferences.begin(), requiredReferences.end(), 1)
+                                               << " all_references="
+                                               << referenceDiagnostics->sourceNames.size()
                                                << " min_observations="
                                                << options.referencePruneConfig.oracleMinimumReferenceObservations
                                                << '\n';
@@ -10769,9 +10790,9 @@ int main(int argc, char** argv)
             std::cout << std::fixed << std::setprecision(3)
                       << "fiber reference replay benchmark tracer=" << tracer
                       << '\n'
-                      << "mean_distance_per_failure_mm  distance_per_failure_%\n"
-                      << summary.meanDistancePerFailureMillimeters << "  "
-                      << summary.meanDistancePerFailurePercent << '\n'
+                      << "mean_segment_length_mm  mean_segment_length_%\n"
+                      << summary.meanSegmentLengthMillimeters << "  "
+                      << summary.meanSegmentLengthPercent << '\n'
                       << "output=" << options.output << '\n';
             return 0;
         }
@@ -11125,9 +11146,9 @@ int main(int argc, char** argv)
             vc::core::util::atomicWriteString(options.output, output.dump(2) + "\n");
             std::cout << std::fixed << std::setprecision(3)
                       << "fiber reference replay benchmark tracer=fiberlet\n"
-                      << "mean_distance_per_failure_mm  distance_per_failure_%\n"
-                      << summary.meanDistancePerFailureMillimeters << "  "
-                      << summary.meanDistancePerFailurePercent << '\n'
+                      << "mean_segment_length_mm  mean_segment_length_%\n"
+                      << summary.meanSegmentLengthMillimeters << "  "
+                      << summary.meanSegmentLengthPercent << '\n'
                       << "output=" << options.output << '\n';
             if (profileThread.joinable()) {
                 profileThread.request_stop();
@@ -11195,6 +11216,8 @@ int main(int argc, char** argv)
                           << " covered=" << current.coveredAnchors
                           << " quality_rejected="
                           << current.qualityRejectedAnchors
+                          << " ambiguity_stops="
+                          << current.acceptedAmbiguityStops
                           << " remaining=" << remaining
                           << " elapsed=" << formatProgressDuration(elapsed)
                           << " eta_current="
@@ -11205,11 +11228,22 @@ int main(int argc, char** argv)
         const double traceSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStarted).count();
         const double traceCpuSeconds = static_cast<double>(std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
 
-        vc::fiber_tracer::
-            writeFiberletCropTraceArtifact(
+        const nlohmann::json traceSummary = {
+            {"ambiguity_decisions", result.ambiguityDecisions},
+            {"ambiguity_route_comparisons",
+             result.ambiguityRouteComparisons},
+            {"accepted_ambiguity_stops", result.acceptedAmbiguityStops},
+            {"minimum_ambiguity_relative_cost_gap",
+             result.minimumAmbiguityRelativeCostGap
+                 ? nlohmann::json(*result.minimumAmbiguityRelativeCostGap)
+                 : nlohmann::json(nullptr)},
+            {"maximum_ambiguity_threshold_ratio",
+             result.maximumAmbiguityThresholdRatio},
+        };
+        vc::fiber_tracer::writeFiberletCropTraceArtifact(
                 options.output, dataset->metadata(),
                 normalDataset.manifest().raw, options.trace, result.lines,
-                filterProvenance);
+                filterProvenance, traceSummary);
         const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.output);
         const auto visualization = visualize(
             artifact.lines, options.obj, options.directionDominance);
@@ -11231,6 +11265,17 @@ int main(int argc, char** argv)
                   << " computed=" << result.computedCandidates << " discarded=" << result.discardedCandidates
                   << " accepted=" << artifact.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
                   << " bidirectional=" << result.bidirectionalLines << " covered_anchor_stops=" << result.coveredAnchorStops
+                  << " ambiguity_decisions=" << result.ambiguityDecisions
+                  << " ambiguity_comparisons="
+                  << result.ambiguityRouteComparisons
+                  << " ambiguity_stops=" << result.acceptedAmbiguityStops
+                  << " ambiguity_min_gap="
+                  << (result.minimumAmbiguityRelativeCostGap
+                          ? std::to_string(
+                                *result.minimumAmbiguityRelativeCostGap)
+                          : std::string("NA"))
+                  << " ambiguity_max_ratio="
+                  << result.maximumAmbiguityThresholdRatio
                   << " quality_rejected=" << result.qualityRejectedAnchors
                   << " trace_output=" << options.output << " obj_output=" << options.obj << '\n';
         printDirectionReport(visualization.directions, options.obj);

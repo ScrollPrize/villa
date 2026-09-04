@@ -1,3 +1,15 @@
+# 2026-09-04: benchmark experiment-step plots
+
+- Changed fiber benchmark progress plots from calendar-distance coordinates to
+  stable chronological experiment steps. Only strict measured Pareto-frontier
+  points are annotated, regressions and assumptions use distinct markers, and
+  legends are placed below the plots.
+- Corrected reference replay reliability to mean segment length over total
+  tested length, `100/(failures+1)`, and migrated benchmark JSON output to the
+  corresponding version-4 summary fields.
+- Made benchmark labels compositional from a validated stable method label plus
+  an optional BP-stage suffix.
+
 # 2026-09-02: conditioned-reference pruning variants
 
 - Added and evaluated union-MAP and conditioned-posterior offender selection on
@@ -2010,3 +2022,13 @@
   to 88% while retaining 451 traces.
 - Added a raw-count-derived pre-pruning exact-reference progress plot alongside
   the existing replay and crop-constraint plots.
+
+## 2026-09-03 - Optional ambiguity-stopping crop tracing
+
+- Added opt-in pre-commit stopping when a geometrically distinct exact-horizon
+  route is within a configured relative cost-density margin of the selected
+  Fiberlet route, without changing beam expansion or ranking.
+- Added anisotropic route comparison, diagnostics and artifact provenance, and
+  selected margin `0.40` with stored quality threshold `0.21` on the reference
+  crop after a joint sweep. This tuned point reached 24/24 exact estimates at
+  oracle round zero and remains disabled by default.
