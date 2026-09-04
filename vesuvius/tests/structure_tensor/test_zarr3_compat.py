@@ -38,6 +38,35 @@ def test_open_zarr_group_creates_v2_layout(tmp_path):
         assert root.metadata.zarr_format == 2
 
 
+def test_open_zarr_group_append_creates_v2_when_missing(tmp_path):
+    root = open_zarr_group(str(tmp_path / "new.zarr"), mode="a")
+    assert os.path.exists(tmp_path / "new.zarr" / ".zgroup")
+    assert not os.path.exists(tmp_path / "new.zarr" / "zarr.json")
+    create_zarr_array(root, "U", shape=(2, 2), chunks=(2, 2), dtype=np.float32, compressor=Blosc())
+    assert _is_v2_array_dir(str(tmp_path / "new.zarr" / "U"))
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
+def test_open_zarr_group_append_keeps_existing_v3_store(tmp_path):
+    """Appending must not write a second .zgroup beside an existing zarr.json."""
+    path = str(tmp_path / "v3.zarr")
+    v3 = zarr.open_group(path, mode="w", zarr_format=3)
+    v3.create_array("existing", shape=(2, 2), chunks=(2, 2), dtype=np.uint8)
+
+    root = open_zarr_group(path, mode="a")
+    assert root.metadata.zarr_format == 3
+    assert not os.path.exists(tmp_path / "v3.zarr" / ".zgroup")
+    # numcodecs Blosc is translated to the v3 BloscCodec on this branch
+    arr = create_zarr_array(
+        root, "new", shape=(2, 2), chunks=(2, 2), dtype=np.float32,
+        compressor=Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE),
+    )
+    arr[...] = 1.0
+    reopened = zarr.open_group(path, mode="r")
+    assert sorted(reopened.keys()) == ["existing", "new"]
+    np.testing.assert_array_equal(reopened["new"][:], 1.0)
+
+
 def test_create_zarr_array_matches_create_dataset_layout(tmp_path):
     root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
     arr = create_zarr_array(
