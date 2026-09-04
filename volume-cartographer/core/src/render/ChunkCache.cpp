@@ -562,6 +562,11 @@ bool hasLegacyCacheFootprint(const std::filesystem::path& root)
     return false;
 }
 
+bool isLegacyPersistentLayout(PersistentCacheLayout layout)
+{
+    return layout == PersistentCacheLayout::Legacy;
+}
+
 bool hasNativeZarrMetadata(const std::filesystem::path& root)
 {
     std::error_code ec;
@@ -3919,6 +3924,10 @@ void ChunkCache::dispatchStorageObjectResult(
             persistenceSucceeded = writeMirrorEmpty(*state, object);
         }
     }
+    // The exact source object (or .empty marker) is the Zarr-mirror payload.
+    // Decoded-store and missing-store paths must not also write legacy
+    // level_N/z/y/x.{bin,empty} files beside it.
+    fetch.persistentWriteHandled = true;
 
     StorageObjectTransfer transfer;
     {
@@ -4023,6 +4032,7 @@ void ChunkCache::queueStorageObjectDecode(
                     decoded.status = ChunkFetchStatus::DecodeError;
                     decoded.message = error.what();
                 }
+                decoded.persistentWriteHandled = true;
                 FetchContext context{
                     consumer.generation, consumer.fetcherGeneration,
                     consumer.fetchSerial, consumer.schedulerEpoch,
@@ -4485,6 +4495,8 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
         return false;
+    if (!isLegacyPersistentLayout(state->persistentLayout_))
+        return false;
     if (persistentEntryIsRaw(*state, key) &&
         bytes->size() != expectedChunkBytes(*state, key))
         return false;
@@ -4768,6 +4780,8 @@ bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath)
         return false;
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror)
+        return false;
 
     state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
     persistentCacheWriterPool().enqueue([state, key] {
@@ -4807,6 +4821,8 @@ bool ChunkCache::queuePersistentSourceWrite(
     std::shared_ptr<PersistenceOperation> operation)
 {
     if (!state || !state->options_.persistentCachePath || !bytes || !operation)
+        return false;
+    if (!isLegacyPersistentLayout(state->persistentLayout_))
         return false;
     operation->writeQueued.store(true, std::memory_order_release);
     const std::size_t retainedBytes = bytes->size();
@@ -4905,6 +4921,8 @@ bool ChunkCache::queuePersistentSourceEmptyWrite(
 bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes)
 {
     if (!state.options_.persistentCachePath)
+        return false;
+    if (!isLegacyPersistentLayout(state.persistentLayout_))
         return false;
     const bool rawEntry = persistentEntryIsRaw(state, key);
     if (rawEntry && bytes.size() != expectedChunkBytes(state, key))
@@ -5065,6 +5083,8 @@ bool ChunkCache::writePersistentSource(
 {
     if (!state.options_.persistentCachePath)
         return false;
+    if (!isLegacyPersistentLayout(state.persistentLayout_))
+        return false;
 
     const auto path = persistentSourcePath(state, key);
     std::vector<std::filesystem::path> replacements{
@@ -5136,6 +5156,8 @@ bool ChunkCache::writePersistentSource(
 bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
 {
     if (!state.options_.persistentCachePath)
+        return false;
+    if (state.persistentLayout_ == PersistentCacheLayout::ZarrMirror)
         return false;
 
     const auto path = state.persistentLayout_ == PersistentCacheLayout::Delta3d

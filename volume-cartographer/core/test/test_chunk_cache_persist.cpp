@@ -1046,6 +1046,7 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
     REQUIRE(waitForResolved(*mirror, 0, 0, 0, 0).status == ChunkStatus::Data);
     mirror->waitForPersistentWrites();
     REQUIRE(fs::is_regular_file(persist / "scale0" / "0.0.0"));
+    CHECK_FALSE(fs::exists(persist / "level_0"));
     REQUIRE(budget->stats().managedBytes > 0);
     writeSizedFile(bookkeeping, 3);
 
@@ -1103,4 +1104,23 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
     CHECK(fs::is_regular_file(sibling));
     restored.reset();
     fs::remove_all(parent);
+}
+
+TEST_CASE("Zarr mirror does not write legacy level_N payloads")
+{
+    auto persist = tmpDir("mirror_no_legacy");
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    auto fetcher = std::make_shared<MirrorFetcher>();
+    fetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeMirrorCache(fetcher, persist);
+    REQUIRE(cache->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::ZarrMirror);
+    REQUIRE(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    cache->waitForPersistentWrites();
+    REQUIRE(fs::is_regular_file(persist / "scale0" / "0.0.0"));
+    CHECK_FALSE(fs::exists(persist / "level_0"));
+    cache.reset();
+    fs::remove_all(persist);
 }

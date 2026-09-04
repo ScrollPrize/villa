@@ -436,6 +436,8 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     CHECK(readBytes(mirror / "0" / "zarr.json") ==
           readBytes(source / "0" / "zarr.json"));
     CHECK(cache->storageObjectRepresentatives(0).size() == 1);
+    cache->waitForPersistentWrites();
+    CHECK_FALSE(fs::exists(mirror / "level_0"));
 
     fs::remove(sourceShard);
     const auto sibling = cache->getChunkBlocking(0, 0, 0, 1);
@@ -680,8 +682,10 @@ TEST_CASE("missing whole shard creates one physical empty marker")
           vc::render::ChunkStatus::Missing);
     CHECK(cache->getChunkBlocking(0, 0, 0, 1).status ==
           vc::render::ChunkStatus::Missing);
+    cache->waitForPersistentWrites();
     CHECK_FALSE(fs::exists(mirror / object.key));
     CHECK(fs::is_regular_file((mirror / object.key).string() + ".empty"));
+    CHECK_FALSE(fs::exists(mirror / "level_0"));
 
     cache.reset();
     vc::render::processChunkCacheService()->invalidateSource(identity);
@@ -785,7 +789,9 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
     REQUIRE(cache);
     const auto first = cache->getChunkBlocking(0, 0, 0, 0);
     REQUIRE(first.status == vc::render::ChunkStatus::Data);
+    cache->waitForPersistentWrites();
     CHECK(readBytes(mirror / object.key) == readBytes(sourceObject));
+    CHECK_FALSE(fs::exists(mirror / "level_0"));
 
     fs::remove(sourceObject);
     cache.reset();
