@@ -66,6 +66,20 @@ _VC3D_SOURCE_HEADER = "X-VC3D-Source"
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
 
 
+def _gpu_pause_or_null():
+    """Return the GPU-pause context, or a no-op where pausing is disabled.
+
+    gpu_pause is imported here rather than at module scope because it is
+    built on fcntl and unix sockets. A host started with --no-gpu-pause has
+    nothing to coordinate with and may not have either.
+    """
+    if not _gpu_pause_enabled:
+        from contextlib import nullcontext
+        return nullcontext()
+    from gpu_pause import gpu_pause_context
+    return gpu_pause_context()
+
+
 def _mib(n_bytes: int) -> float:
     return float(n_bytes) / (1024.0 * 1024.0)
 
@@ -1901,11 +1915,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             kwargs["cancel_fn"] = _check_cancel
             return _orig_optimize(**kwargs)
 
-        from contextlib import nullcontext
-        from gpu_pause import gpu_pause_context
-
         opt_mod.optimize = _patched_optimize
-        with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+        with _gpu_pause_or_null():
             try:
                 import fit as fit_mod
                 job.set_running("loading", 0, 0, 0.0)
@@ -2348,9 +2359,7 @@ class _Handler(BaseHTTPRequestHandler):
                         data_input = str(candidate)
 
             import lasagna_analyze
-            from contextlib import nullcontext
-            from gpu_pause import gpu_pause_context
-            with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+            with _gpu_pause_or_null():
                 lasagna_analyze.export_vis_obj(
                     model_path=str(model_input),
                     data_path=str(data_input),
