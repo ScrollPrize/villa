@@ -8,6 +8,7 @@ import logging
 from glob import glob
 from itertools import repeat, product
 from numcodecs import Blosc
+from vesuvius.data.utils import open_zarr_group, create_zarr_array
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from numba import jit, set_num_threads
@@ -1533,8 +1534,7 @@ def main():
     label_datasets = []
     label_dataset_name = None
     if args.format == "zarr":
-        label_store = zarr.DirectoryStore(out_path)
-        label_root = zarr.group(store=label_store, overwrite=True)
+        label_root = open_zarr_group(out_path, mode='w')
         label_base_shape = (z_dim, h, w)
         label_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1548,7 +1548,8 @@ def main():
             level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = label_root.create_dataset(
+            ds = create_zarr_array(
+                label_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1585,8 +1586,7 @@ def main():
 
     normals_datasets = []
     if args.output_normals:
-        normals_store = zarr.DirectoryStore(normals_out_path)
-        normals_root = zarr.group(store=normals_store, overwrite=True)
+        normals_root = open_zarr_group(normals_out_path, mode='w')
         normals_base_shape = (z_dim, h, w, 3)
         normals_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1601,7 +1601,8 @@ def main():
             level_shape = compute_level_shape(normals_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = normals_root.create_dataset(
+            ds = create_zarr_array(
+                normals_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1636,8 +1637,7 @@ def main():
     surface_frame_dataset_name = None
 
     if args.output_surface_frame:
-        surface_frame_store = zarr.DirectoryStore(surface_frame_out_path)
-        surface_frame_root = zarr.group(store=surface_frame_store, overwrite=True)
+        surface_frame_root = open_zarr_group(surface_frame_out_path, mode='w')
         surface_frame_base_shape = (z_dim, h, w, 3, 3)
         surface_frame_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1653,7 +1653,8 @@ def main():
             level_shape = compute_level_shape(surface_frame_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = surface_frame_root.create_dataset(
+            ds = create_zarr_array(
+                surface_frame_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
