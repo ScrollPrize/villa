@@ -95,13 +95,16 @@ struct ChunkSampler {
         bool allFill = false;
     };
 
-    IChunkedArray& cache;
-    int level;
+    IChunkedArray* cache = nullptr;
+    int level = -1;
     VolumeShape shape;
     std::array<int, 3> chunkShape{};
     int chunkStrideY = 0;
     int chunkStrideZ = 0;
     std::unique_ptr<HotSlot[]> slots;
+    // Slot indices that have held a chunk since the last bind(), so rebinding
+    // costs O(chunks actually visited) rather than O(kSlots).
+    std::vector<int> touched;
     int lastCz = std::numeric_limits<int>::min();
     int lastCy = 0;
     int lastCx = 0;
@@ -109,17 +112,49 @@ struct ChunkSampler {
     const T* data = nullptr;
     bool allFill = false;
 
-    ChunkSampler(IChunkedArray& c, int lvl)
-        : cache(c), level(lvl), shape(c, lvl),
-          chunkShape(c.chunkShape(lvl)),
-          chunkStrideY(chunkShape[2]),
-          chunkStrideZ(chunkShape[1] * chunkShape[2]),
-          slots(std::make_unique<HotSlot[]>(kSlots))
-    {
-    }
+    // Default-constructed samplers are bound later, for callers that keep one
+    // sampler per worker thread across many calls. Constructing a sampler
+    // allocates and value-initialises kSlots HotSlots -- each holding a
+    // shared_ptr -- which is roughly half a megabyte of pure overhead when it
+    // happens once per thread per call.
+    ChunkSampler() = default;
+
+    ChunkSampler(IChunkedArray& c, int lvl) { bind(c, lvl); }
 
     ChunkSampler(const ChunkSampler&) = delete;
     ChunkSampler& operator=(const ChunkSampler&) = delete;
+
+    // Point the sampler at (cache, level) and drop every cached chunk
+    // reference, reusing the slot storage. Dropping the references matters as
+    // much as the reset: a slot holds a shared_ptr to decoded chunk bytes, so
+    // stale slots would pin chunks the array has since evicted and let memory
+    // grow without bound.
+    void bind(IChunkedArray& c, int lvl) {
+        if (!slots) {
+            slots = std::make_unique<HotSlot[]>(kSlots);
+            touched.reserve(1024);
+        }
+        for (int idx : touched) {
+            HotSlot& s = slots[idx];
+            s.key = UINT64_MAX;
+            s.data = nullptr;
+            s.bytes.reset();
+            s.allFill = false;
+        }
+        touched.clear();
+        cache = &c;
+        level = lvl;
+        shape = VolumeShape(c, lvl);
+        chunkShape = c.chunkShape(lvl);
+        chunkStrideY = chunkShape[2];
+        chunkStrideZ = chunkShape[1] * chunkShape[2];
+        lastCz = std::numeric_limits<int>::min();
+        lastCy = 0;
+        lastCx = 0;
+        lastKey = UINT64_MAX;
+        data = nullptr;
+        allFill = false;
+    }
 
     VC_FORCE_INLINE static uint64_t packKey(int cz, int cy, int cx) {
         return (uint64_t(uint32_t(cz)) << 42) | (uint64_t(uint32_t(cy)) << 21) | uint64_t(uint32_t(cx));
@@ -147,7 +182,11 @@ struct ChunkSampler {
             return;
         }
 
-        const ChunkResult result = cache.getChunkBlocking(level, cz, cy, cx);
+        // First use of this slot since bind(): record it so the next bind()
+        // releases only the slots that actually hold something.
+        if (slot.key == UINT64_MAX) touched.push_back(idx);
+
+        const ChunkResult result = cache->getChunkBlocking(level, cz, cy, cx);
         slot.bytes.reset();
         slot.data = nullptr;
         slot.allFill = false;
@@ -714,6 +753,11 @@ void readMultiSliceImpl(
     float maxOff = *std::max_element(offsets.begin(), offsets.end());
     float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
     float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
+    // min and max over floats are associative and commutative and round
+    // nothing, so the parallel reduction is bit-identical to the serial scan.
+    // It covers every pixel of the tile and used to run on one thread.
+    #pragma omp parallel for schedule(static) \
+        reduction(min:minVx,minVy,minVz) reduction(max:maxVx,maxVy,maxVz)
     for (int y = 0; y < h; y++) {
         const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
         const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
@@ -734,8 +778,21 @@ void readMultiSliceImpl(
 
     #pragma omp parallel
     {
-        ChunkSampler<T> s(*cache, level);
-        #pragma omp for schedule(dynamic, 16)
+        // One sampler per worker thread, kept alive across calls. Callers
+        // invoke this once per output band, so constructing a fresh sampler
+        // here meant every thread in the pool -- including the ones the
+        // schedule never gave any rows to -- allocated, value-initialised and
+        // destroyed a full slot table per band. bind() reuses the storage.
+        static thread_local ChunkSampler<T> s;
+        s.bind(*cache, level);
+
+        // schedule(dynamic, 16) over a band only h rows tall yields h/16 work
+        // units, so with the usual 128-row band the loop could never occupy
+        // more than 8 threads however large the pool was. One row per unit
+        // fixes that; rows still vary a lot in cost (pixels that miss the
+        // surface are nearly free) so dynamic still beats static, and a row of
+        // w * nSlices samples dwarfs the scheduling atomic.
+        #pragma omp for schedule(dynamic, 1)
         for (int y = 0; y < h; y++) {
             const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
             const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);

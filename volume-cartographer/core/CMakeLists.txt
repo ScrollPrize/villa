@@ -10,6 +10,7 @@ add_library(vc_core
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
         src/Logging.cpp
+        src/OpenMPConfig.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
         src/UnixSocket.cpp

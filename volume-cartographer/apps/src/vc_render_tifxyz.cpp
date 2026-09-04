@@ -5,6 +5,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
+#include "vc/core/util/OpenMPConfig.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
@@ -19,6 +20,8 @@
 #include <algorithm>
 #include <atomic>
 #include <boost/program_options.hpp>
+#include <cstdlib>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <cmath>
@@ -219,6 +222,9 @@ static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
 
 static void normalizeNormals(cv::Mat_<cv::Vec3f>& nrm)
 {
+    // Per-pixel and in place, so rows are independent and the result does not
+    // depend on the order they are visited. Runs over a whole band per band.
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < nrm.rows; y++)
         for (int x = 0; x < nrm.cols; x++) {
             auto& v = nrm(y, x);
@@ -278,8 +284,11 @@ static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv
                                 bool hasAffine, const AffineTransform& aff,
                                 cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
 {
-    base = pts.clone(); base *= scale_seg;
-    dirs = nrm.clone();
+    // copyTo rather than clone so a caller that reuses base/dirs keeps its
+    // buffers: the create() inside copyTo is a no-op once the size and type
+    // match, whereas clone() always allocates a fresh Mat.
+    pts.copyTo(base); base *= scale_seg;
+    nrm.copyTo(dirs);
     // --flip-normals: negate on the private clone (safe under OpenMP), never on
     // gen()'s shared scratch view. Negation commutes with the affine + the
     // subsequent normalization, so applying it here is identical to flipping
@@ -645,6 +654,14 @@ static void renderBands(
     uint32_t bandStart = uint32_t(partId) * bandsPerPart;
     uint32_t bandEnd = std::min(bandStart + bandsPerPart, numBands);
 
+    // Per-band working set, hoisted out of the loop and reused. Every band but
+    // the last has identical dimensions, so cv::Mat::create() and copyTo()
+    // become no-ops after the first band instead of allocating and freeing
+    // (base + dirs) plus numSlices full-width planes on every iteration.
+    cv::Mat_<cv::Vec3f> base, dirs;
+    std::vector<cv::Mat_<T>> raw;
+    std::vector<cv::Mat> slices;
+
     for (uint32_t bi = bandStart; bi < bandEnd; bi++) {
         uint32_t y0 = bi * bandH;
         uint32_t dy = std::min(bandH, uint32_t(tgtSize.height) - y0);
@@ -655,10 +672,7 @@ static void renderBands(
         cv::Mat_<cv::Vec3f> bandPts, bandNrm;
         genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
 
-        cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
-
-        std::vector<cv::Mat> slices;
 
         if (isComposite) {
             // Composite mode: always u8 — callers always instantiate with T=uint8_t.
@@ -676,7 +690,6 @@ static void renderBands(
             slices = {s};
         } else {
             // Normal: bulk read + accumulate
-            std::vector<cv::Mat_<T>> raw;
             readMultiSlice(raw, cache, level, base, dirs, allOffsets);
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
@@ -714,17 +727,35 @@ static void writeTifBand(std::vector<TiffWriter>& writers,
                           uint32_t srcHeight, int rotQuad, int flipAxis)
 {
     uint32_t numTiffTiles = (srcHeight + tiffTileH - 1) / tiffTileH;
-    for (size_t zi = 0; zi < slices.size(); zi++) {
-        for (uint32_t ty = 0; ty < uint32_t(slices[zi].rows); ty += tiffTileH) {
-            uint32_t tdy = std::min(tiffTileH, uint32_t(slices[zi].rows) - ty);
-            cv::Mat sub = slices[zi](cv::Rect(0, ty, slices[zi].cols, tdy));
-            int dstBx, dstBy, rBX, rBY;
-            uint32_t srcTileIdx = (bandY0 + ty) / tiffTileH;
-            mapTileIndex(0, int(srcTileIdx), 1, int(numTiffTiles),
-                         std::max(rotQuad, 0), flipAxis, dstBx, dstBy, rBX, rBY);
-            writers[zi].writeTile(0, uint32_t(dstBy) * tiffTileH, sub);
+
+    // Each output slice has its own TiffWriter, its own TIFF handle and its own
+    // tile buffer, so the slices are independent and can be encoded
+    // concurrently. This was the band loop's largest serial block: one
+    // compressed tile per tiffTileH rows, times every slice, all on one thread
+    // while the rest of the pool waited.
+    //
+    // writeTile() throws on libtiff failure and an exception must not leave an
+    // OpenMP region, so the first one is captured and rethrown after the join.
+    // A write error therefore still fails the render loudly.
+    std::exception_ptr firstError;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int zi = 0; zi < int(slices.size()); zi++) {
+        try {
+            for (uint32_t ty = 0; ty < uint32_t(slices[zi].rows); ty += tiffTileH) {
+                uint32_t tdy = std::min(tiffTileH, uint32_t(slices[zi].rows) - ty);
+                cv::Mat sub = slices[zi](cv::Rect(0, ty, slices[zi].cols, tdy));
+                int dstBx, dstBy, rBX, rBY;
+                uint32_t srcTileIdx = (bandY0 + ty) / tiffTileH;
+                mapTileIndex(0, int(srcTileIdx), 1, int(numTiffTiles),
+                             std::max(rotQuad, 0), flipAxis, dstBx, dstBy, rBX, rBY);
+                writers[zi].writeTile(0, uint32_t(dstBy) * tiffTileH, sub);
+            }
+        } catch (...) {
+            #pragma omp critical(vc_tif_write_error)
+            if (!firstError) firstError = std::current_exception();
         }
     }
+    if (firstError) std::rethrow_exception(firstError);
 }
 
 
@@ -1079,6 +1110,12 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
 
 int main(int argc, char *argv[])
 {
+    // Must happen before the first parallel region. See OpenMPConfig.hpp:
+    // a static initializer in OpenCV turns on dynamic team sizing, which
+    // makes libgomp shrink every team -- to a single thread once the load
+    // average reaches the thread cap -- regardless of OMP_NUM_THREADS.
+    vc::core::util::disableOpenMPDynamicTeams();
+
     // clang-format off
     po::options_description required("Required arguments");
     required.add_options()
@@ -1095,6 +1132,8 @@ int main(int argc, char *argv[])
         ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
+        ("threads", po::value<int>()->default_value(0),
+            "Worker threads (0 = pick a default). Overridden by VC_RENDER_NUM_THREADS when that is set.")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
         ("slice-step", po::value<float>()->default_value(1.0f), "Spacing between slices along normal")
         ("accum", po::value<float>()->default_value(0.0f), "Accumulation sub-step (0 = disabled)")
@@ -1243,6 +1282,24 @@ int main(int argc, char *argv[])
 
     if (!parsed.count("segmentation")) { logPrintf(stderr, "Error: --segmentation required\n"); return EXIT_FAILURE; }
     std::filesystem::path seg_path = parsed["segmentation"].as<std::string>();
+
+    // With dynamic team sizing switched off (see main()'s first statement) the
+    // team is exactly nthreads-var, so the value now actually matters. Wall
+    // time flattens well before one thread per core while CPU-seconds keep
+    // climbing, and several renders sharing a host oversubscribe it badly, so
+    // expose a cap. 0 keeps libgomp's default of one thread per hardware
+    // thread.
+    {
+        int nthreads = parsed["threads"].as<int>();
+        if (const char* e = std::getenv("VC_RENDER_NUM_THREADS")) {
+            const int v = std::atoi(e);
+            if (v > 0) nthreads = v;
+        }
+        if (nthreads > 0)
+            omp_set_num_threads(nthreads);
+        logPrintf(stdout, "Worker threads: %d (omp_dynamic=%d)\n",
+                  omp_get_max_threads(), omp_get_dynamic() ? 1 : 0);
+    }
 
     float tgt_scale = parsed["scale"].as<float>();
     int group_idx = parsed["group-idx"].as<int>();
