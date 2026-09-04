@@ -67,6 +67,23 @@ def test_open_zarr_group_append_keeps_existing_v3_store(tmp_path):
     np.testing.assert_array_equal(reopened["new"][:], 1.0)
 
 
+@pytest.mark.skipif(not _ZARR_V3, reason="zarr 3 stores only exist under zarr 3")
+def test_open_zarr_group_append_recreates_empty_v3_leftover_as_v2(tmp_path):
+    """A failed run on zarr 3 leaves an empty zarr.json-only group; re-running
+    on the same --output must produce the v2 store the consumers read."""
+    path = str(tmp_path / "leftover.zarr")
+    zarr.open_group(path, mode="w", zarr_format=3)
+    assert os.path.exists(tmp_path / "leftover.zarr" / "zarr.json")
+
+    root = open_zarr_group(path, mode="a")
+    assert root.metadata.zarr_format == 2
+    create_zarr_array(root, "U", shape=(2, 2), chunks=(2, 2), dtype=np.float32, compressor=Blosc())
+    assert not os.path.exists(tmp_path / "leftover.zarr" / "zarr.json")
+    assert os.path.exists(tmp_path / "leftover.zarr" / ".zgroup")
+    assert _is_v2_array_dir(str(tmp_path / "leftover.zarr" / "U"))
+    assert list(zarr.open_group(path, mode="r").keys()) == ["U"]
+
+
 def test_create_zarr_array_matches_create_dataset_layout(tmp_path):
     root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
     arr = create_zarr_array(
