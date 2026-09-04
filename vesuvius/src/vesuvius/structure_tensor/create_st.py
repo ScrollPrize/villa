@@ -984,30 +984,29 @@ def main():
                 print(f"\n--- Structure Tensor Computation Failed ---")
                 return 1
 
-            if logits_path:
-                print(f"\n--- Structure Tensor Computation Finished ---")
-                print(f"Structure tensor saved to: {logits_path}/structure_tensor")
+            print(f"\n--- Structure Tensor Computation Finished ---")
+            print(f"Structure tensor saved to: {logits_path}/structure_tensor")
                 
-                # Run eigenanalysis automatically unless --structure-tensor-only is specified
-                if not args.structure_tensor_only:
-                    print("\n--- Running Eigenanalysis ---")
-                    _finalize_structure_tensor_torch(
-                        zarr_path=logits_path,
-                        chunk_size=chunk_size,
-                        num_workers=args.num_workers,
-                        compressor=compressor,
-                        verbose=args.verbose,
-                        swap_eigenvectors=args.swap_eigenvectors,
-                        device=args.device
-                    )
-                    print("\n--- All computations completed successfully ---")
-                    print(f"Final output contains:")
-                    print(f"  - Structure tensor: {logits_path}/structure_tensor")
-                    if args.ome_out:
-                        print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
-                    if args.keep_eigen:
-                        print(f"  - Eigenvectors: {logits_path}/eigenvectors")
-                        print(f"  - Eigenvalues: {logits_path}/eigenvalues")
+            # Run eigenanalysis automatically unless --structure-tensor-only is specified
+            if not args.structure_tensor_only:
+                print("\n--- Running Eigenanalysis ---")
+                _finalize_structure_tensor_torch(
+                    zarr_path=logits_path,
+                    chunk_size=chunk_size,
+                    num_workers=args.num_workers,
+                    compressor=compressor,
+                    verbose=args.verbose,
+                    swap_eigenvectors=args.swap_eigenvectors,
+                    device=args.device
+                )
+                print("\n--- All computations completed successfully ---")
+                print(f"Final output contains:")
+                print(f"  - Structure tensor: {logits_path}/structure_tensor")
+                if args.ome_out:
+                    print(f"  - first_component/, second_component/, normal/, confidence/ (scale '{args.ome_scale}', ds={args.ome_downsample})")
+                if args.keep_eigen:
+                    print(f"  - Eigenvectors: {logits_path}/eigenvectors")
+                    print(f"  - Eigenvalues: {logits_path}/eigenvalues")
                 
         except Exception as e:
             print(f"\n--- Structure Tensor Computation Failed ---")

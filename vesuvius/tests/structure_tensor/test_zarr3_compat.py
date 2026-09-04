@@ -125,16 +125,56 @@ def test_create_zarr_array_with_data_and_nested_separator(tmp_path):
     np.testing.assert_array_equal(zarr.open_group(str(tmp_path / "g.zarr"), mode="r")["labels"][:], data)
 
 
-def test_require_zarr_array_returns_existing_or_creates(tmp_path):
+def test_require_zarr_array_reuses_existing_like_require_dataset(tmp_path):
+    """zarr 2's require_dataset returns an existing array (shape + dtype-cast
+    checked) and never consults overwrite; a resumed compute_vf run keeps its
+    chunks. The helper must do the same under either major."""
     root = open_zarr_group(str(tmp_path / "g.zarr"), mode="a")
     first = require_zarr_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 2, 2, 2), dtype=np.float32, compressor=None)
     first[...] = 7.0
-    again = require_zarr_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 2, 2, 2), dtype=np.float32, compressor=None)
+    again = require_zarr_array(
+        root, "U", shape=(3, 2, 2, 2), chunks=(3, 1, 1, 1), dtype=np.float32, compressor=Blosc(), overwrite=True
+    )
     np.testing.assert_array_equal(again[...], 7.0)
-    with pytest.raises(TypeError):
+    assert tuple(again.chunks) == (3, 2, 2, 2)  # existing layout kept
+    with pytest.raises(TypeError, match="shape"):
         require_zarr_array(root, "U", shape=(3, 1, 1, 1), dtype=np.float32)
-    fresh = require_zarr_array(root, "U", shape=(3, 2, 2, 2), chunks=(3, 2, 2, 2), dtype=np.float32, compressor=None, overwrite=True)
-    assert float(fresh[0, 0, 0, 0]) == 0.0
+    with pytest.raises(TypeError, match="dtype"):
+        require_zarr_array(root, "U", shape=(3, 2, 2, 2), dtype=np.uint8)
+    root.require_group("sub")
+    with pytest.raises(TypeError, match="group, not an array"):
+        require_zarr_array(root, "sub", shape=(1,), dtype=np.uint8)
+
+
+def test_create_zarr_array_writes_empty_chunks_like_zarr2_by_default(tmp_path):
+    root = open_zarr_group(str(tmp_path / "g.zarr"), mode="w")
+    arr = create_zarr_array(root, "z", shape=(4, 4), chunks=(2, 2), dtype=np.uint8, compressor=None)
+    arr[...] = 0
+    chunk_files = sorted(f for f in os.listdir(tmp_path / "g.zarr" / "z") if not f.startswith("."))
+    assert chunk_files == ["0.0", "0.1", "1.0", "1.1"]
+
+
+def test_voxelize_rechunk_keeps_store_v2(tmp_path):
+    """--chunk_size N routes level 0 through a dask rechunk; that must not leave
+    a v3 array or a root zarr.json in the v2 label store (issue #1448 follow-up)."""
+    from vesuvius.image_proc.run.voxelize_objs import _rechunk_with_dask
+
+    path = str(tmp_path / "labels.zarr")
+    root = open_zarr_group(path, mode="w")
+    level0 = create_zarr_array(root, "0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=np.uint16, compressor=Blosc())
+    expected = np.arange(8 * 8 * 8, dtype=np.uint16).reshape(8, 8, 8)
+    level0[...] = expected
+    level0.attrs["note"] = "kept"
+
+    rechunked = _rechunk_with_dask(level0, 4, "labels", num_workers=1)
+    assert tuple(rechunked.chunks) == (4, 4, 4)
+    assert not os.path.exists(tmp_path / "labels.zarr" / "zarr.json")
+    assert _is_v2_array_dir(str(tmp_path / "labels.zarr" / "0"))
+    reopened = zarr.open_group(path, mode="r")
+    assert list(reopened.keys()) == ["0"]
+    np.testing.assert_array_equal(reopened["0"][:], expected)
+    np.testing.assert_array_equal(rechunked[:], expected)
+    assert reopened["0"].attrs["note"] == "kept"
 
 
 def test_eigenanalysis_writes_ome_and_eigen_arrays(tmp_path):

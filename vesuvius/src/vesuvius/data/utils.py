@@ -78,7 +78,9 @@ def create_zarr_array(group, name: str, *, shape=None, data=None, chunks=None, d
     zarr 3 removed ``Group.create_dataset``/``require_dataset`` and moved
     ``write_empty_chunks`` into ``config`` and ``dimension_separator`` into
     ``chunk_key_encoding``. This wraps both APIs so callers keep one code path
-    and the array is written exactly as before (v2 metadata, same chunk keys).
+    and the array is written as zarr 2 wrote it (v2 metadata, same chunk keys,
+    and empty chunks materialised unless ``write_empty_chunks=False`` is
+    passed, which is zarr 2's default but not zarr 3's).
     """
     if data is not None:
         data = np.asarray(data)
@@ -95,8 +97,11 @@ def create_zarr_array(group, name: str, *, shape=None, data=None, chunks=None, d
         create_kwargs['compressors'] = _v3_compressor(group, compressor)
         if dimension_separator is not None:
             create_kwargs['chunk_key_encoding'] = {'name': 'v2', 'separator': dimension_separator}
-        if write_empty_chunks is not None:
-            create_kwargs['config'] = {'write_empty_chunks': bool(write_empty_chunks)}
+        # zarr 2 defaults write_empty_chunks=True, zarr 3 defaults False; pin
+        # zarr 2's behaviour so the chunk files on disk match across majors.
+        create_kwargs['config'] = {
+            'write_empty_chunks': True if write_empty_chunks is None else bool(write_empty_chunks)
+        }
         array = group.create_array(name, **create_kwargs)
         if data is not None:
             array[...] = data
@@ -117,19 +122,27 @@ def create_zarr_array(group, name: str, *, shape=None, data=None, chunks=None, d
 def require_zarr_array(group, name: str, *, shape, **kwargs) -> zarr.Array:
     """``Group.require_dataset`` for both zarr majors.
 
-    Returns the existing array when one of that name and shape is present,
-    otherwise creates it through :func:`create_zarr_array`. ``overwrite=True``
-    always (re)creates, matching zarr 2's ``require_dataset(..., overwrite=True)``.
+    Same contract as zarr 2's ``require_dataset``: an existing array of that
+    name is returned after a shape check and a dtype cast check (its chunks
+    and compressor are left as they are, and ``overwrite`` is not consulted);
+    otherwise the array is created through :func:`create_zarr_array`. A
+    resumed ``compute_vf`` run therefore keeps the chunks it already wrote.
     """
-    overwrite = bool(kwargs.pop('overwrite', False))
-    if not overwrite and name in group:
+    if name in group:
         existing = group[name]
-        if tuple(existing.shape) != tuple(shape):
+        if not hasattr(existing, 'shape'):
+            raise TypeError(f"{name!r} exists in {group.path!r} but is a group, not an array")
+        if tuple(int(v) for v in existing.shape) != tuple(int(v) for v in shape):
             raise TypeError(
                 f"array {name!r} exists with shape {tuple(existing.shape)}, requested {tuple(shape)}"
             )
+        dtype = kwargs.get('dtype')
+        if dtype is not None and not np.can_cast(existing.dtype, np.dtype(dtype), casting='safe'):
+            raise TypeError(
+                f"array {name!r} exists with dtype {existing.dtype}, requested {np.dtype(dtype)}"
+            )
         return existing
-    return create_zarr_array(group, name, shape=shape, overwrite=overwrite, **kwargs)
+    return create_zarr_array(group, name, shape=shape, **kwargs)
 
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
