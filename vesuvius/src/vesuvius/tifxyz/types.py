@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,21 +22,25 @@ InterpolationMethod = Literal["linear", "bspline", "catmull_rom"]
 
 
 def _full_resolution_extent(stored: int, scale: float) -> int:
-    """Stored grid extent -> full-resolution canvas extent, as VC3D computes it.
+    """Stored grid extent -> full-resolution canvas extent, as vc_render_tifxyz sizes it.
 
-    ``QuadSurface::size()`` in volume-cartographer evaluates
-    ``static_cast<int>(_points->cols / _scale[0])`` with ``_scale`` held as
-    ``cv::Vec2f``, i.e. a *float32* division followed by truncation. Tracer
-    meshes store ``scale`` as the float32 value 0.05 (``0.05000000074505806``),
-    and ``stored / scale`` in float64 then lands just below the integer
-    (``152 / 0.05000000074505806 == 3039.99995...``), so ``int()`` on the
-    float64 quotient is one pixel short of the canvas ``vc_render_tifxyz``
-    and the published surface volumes use. Doing the division in float32
-    reproduces the C++ result exactly rather than approximating it with
-    ``round``.
+    The renderer (``vc_render_tifxyz.cpp``, "Compute render scale") does::
+
+        double sx = render_scale / surf->_scale[0];      // _scale is cv::Vec2f
+        full_size.width = std::max(1, int(std::lround(full_size.width * sx)));
+
+    i.e. the stored scale is a float32, the reciprocal is taken in double,
+    the product is rounded half away from zero, and the result is at least 1.
+    Tracer meshes store ``scale`` as float32 0.05 (``0.05000000074505806``);
+    ``stored / scale`` in float64 then lands just below the integer
+    (``152 / 0.05000000074505806 == 3039.99995...``), so truncating it is one
+    pixel short of the canvas the renderer and the published surface volumes
+    use. Plain ``round()`` is not equivalent either: Python rounds half to
+    even, ``std::lround`` half away from zero, and exact halves occur with
+    integer scales (7 x 5 at scale 2.0 renders as 4 x 3).
     """
-    quotient = np.float32(stored) / np.float32(scale)
-    return int(quotient)
+    quotient = float(stored) * (1.0 / float(np.float32(scale)))
+    return max(1, int(math.floor(quotient + 0.5)))
 
 
 @dataclass
