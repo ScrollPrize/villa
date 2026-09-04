@@ -10,19 +10,18 @@ Files:
 - `volcomp.h` — upstream single header (all functions `static`).
 - `volcomp_lib.{h,c}` — compiles the header once and exports a plain C surface
   (`volcomp_lib_encode`, `volcomp_lib_decode`, `volcomp_lib_decode_block`,
-  `volcomp_lib_is_chunk`, `volcomp_lib_chunk_q`, `volcomp_lib_available`).
+  `volcomp_lib_is_chunk`, `volcomp_lib_chunk_q`, `volcomp_lib_kernels`).
 - `utils/volcomp_codec.hpp` (in `utils/`) — the C++ shim used by `VcDataset`,
   `ZarrChunkFetcher` and `vc_zarr_recompress`, mirroring `c3d_codec.hpp`.
 
-## Platform gate
+## Portability
 
-The upstream kernels are explicit AVX2+FMA, so the codec is built only on
-x86-64 with GCC/Clang (the TU gets `-mavx2 -mfma`; the rest of VC keeps its
-own arch flags). Elsewhere the `volcomp` target still exists and every entry
-point returns `VOLCOMP_LIB_UNSUPPORTED`; `utils::volcomp_available()` reports
-false, encode/decode throw, and `vc_zarr_recompress --codec volcomp` refuses
-to start. The check also covers x86-64 CPUs without AVX2 at runtime. A portable
-scalar path is an upstream item, not a VC one.
+No arch flags: on x86-64 the header compiles its AVX2+FMA kernels with a
+target attribute and selects them at runtime when the CPU has them; arm64,
+Windows/MinGW and x86-64 CPUs without AVX2 use its plain C kernels (about half
+the AVX2 speed). `utils::volcomp_kernels()` reports `"avx2"` or `"c"`. Both
+kernel sets decode to within ±1 LSB of each other (identical bytes with
+clang/GCC on x86-64), so cached `.volcomp` chunks are portable across hosts.
 
 ## Where it plugs in
 

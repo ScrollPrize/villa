@@ -10,6 +10,8 @@
  *
  * Source, destination and encoded buffers passed to one call must not overlap
  * (they are declared restrict).
+ * Portable: AVX2+FMA kernels are used at runtime on x86-64 CPUs that have
+ * them (no compiler flags needed), plain C kernels everywhere else.
  * The only configuration is the quantiser step q in [1,255] (1/256 precision).
  * volcomp_encode performs one VOLCOMP_MALLOC/VOLCOMP_FREE of scratch;
  * decoding allocates nothing.
@@ -25,10 +27,28 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(__AVX2__) || !defined(__FMA__)
-#error "volcomp.h requires AVX2 and FMA: compile with -mavx2 -mfma (or -march=native on a capable host)"
-#endif
+/* ---- SIMD kernels: AVX2+FMA on x86-64 when the CPU has it, plain C otherwise ----
+ * Both kernel sets are compiled into any x86-64 build (the AVX2 ones carry a
+ * target attribute, so no -mavx2 is needed) and selected at runtime per call
+ * with __builtin_cpu_supports; a TU built with -mavx2 -mfma calls the AVX2
+ * kernels directly. Non-x86 targets get the C kernels only. Define
+ * VOLCOMP_NO_AVX2 to force the C kernels (testing). The two kernel sets agree
+ * to within +-1 LSB (spec "Cross-build agreement"); encoded bytes may differ. */
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(VOLCOMP_NO_AVX2) && !defined(_MSC_VER)
+#define VF_HAVE_AVX2 1
 #include <immintrin.h>
+#if defined(__AVX2__) && defined(__FMA__)
+#define VF_AVX2_STATIC 1
+#define VF_TARGET_AVX2
+#else
+#define VF_AVX2_STATIC 0
+#define VF_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#endif
+#else
+#define VF_HAVE_AVX2 0
+#define VF_AVX2_STATIC 0
+#define VF_TARGET_AVX2
+#endif
 
 #ifndef VOLCOMP_MALLOC
 #define VOLCOMP_MALLOC(n) malloc(n)
@@ -82,6 +102,8 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
  * whether to run it. Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
  * PSNR, blocking amplification 1.5x -> ~1.1x, ~5% of decode time. */
 static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q);
+/* Which kernel set this process will use: "avx2" or "c". */
+static inline const char *volcomp_kernels(void);
 
 /* ======================================================================== */
 /*                          implementation                                  */
@@ -1019,7 +1041,7 @@ static inline bool vf_rdec_finished(const vf_rdec *d) {
   return vf_br_finished(&d->br) && d->x[0] == 0 && d->x[1] == 0;
 }
 
-/* ---- 16-point orthonormal DCT-II, separable over 16^3 (AVX2) ----
+/* ---- 16-point orthonormal DCT-II, separable over 16^3  ----
  * Factored (Lee's even/odd recursion, 32 multiplies per 16-point transform;
  * the inverse is the exact transpose network). One straight-line kernel on
  * eight lanes (__m256): the y and z passes feed it eight contiguous x lanes at
@@ -1027,256 +1049,265 @@ static inline bool vf_rdec_finished(const vf_rdec *d) {
  * kernel serves all three axes. */
 /* generated: 16-point DCT-II, Lee recursion (forward) and its transpose (inverse), UNNORMALISED:
  * the orthonormal scale s0 = 1/4, sk = sqrt(2)/4 per axis is folded into the quantiser tables. */
-__attribute__((always_inline)) static inline void vf_dct16_v8_fwd(const __m256 in[16], __m256 out[16]) {
-  __m256 t1 = in[0] + in[15];
-  __m256 t2 = in[1] + in[14];
-  __m256 t3 = in[2] + in[13];
-  __m256 t4 = in[3] + in[12];
-  __m256 t5 = in[4] + in[11];
-  __m256 t6 = in[5] + in[10];
-  __m256 t7 = in[6] + in[9];
-  __m256 t8 = in[7] + in[8];
-  __m256 t9 = (in[0] - in[15]) * 5.024192862e-01f;
-  __m256 t10 = (in[1] - in[14]) * 5.224986149e-01f;
-  __m256 t11 = (in[2] - in[13]) * 5.669440348e-01f;
-  __m256 t12 = (in[3] - in[12]) * 6.468217834e-01f;
-  __m256 t13 = (in[4] - in[11]) * 7.881546235e-01f;
-  __m256 t14 = (in[5] - in[10]) * 1.060677686e+00f;
-  __m256 t15 = (in[6] - in[9]) * 1.722447098e+00f;
-  __m256 t16 = (in[7] - in[8]) * 5.101148619e+00f;
-  __m256 t17 = t1 + t8;
-  __m256 t18 = t2 + t7;
-  __m256 t19 = t3 + t6;
-  __m256 t20 = t4 + t5;
-  __m256 t21 = (t1 - t8) * 5.097955791e-01f;
-  __m256 t22 = (t2 - t7) * 6.013448869e-01f;
-  __m256 t23 = (t3 - t6) * 8.999762231e-01f;
-  __m256 t24 = (t4 - t5) * 2.562915448e+00f;
-  __m256 t25 = t17 + t20;
-  __m256 t26 = t18 + t19;
-  __m256 t27 = (t17 - t20) * 5.411961001e-01f;
-  __m256 t28 = (t18 - t19) * 1.306562965e+00f;
-  __m256 t29 = t25 + t26;
-  __m256 t30 = (t25 - t26) * 7.071067812e-01f;
-  __m256 t31 = t27 + t28;
-  __m256 t32 = (t27 - t28) * 7.071067812e-01f;
-  __m256 t33 = t31 + t32;
-  __m256 t34 = t21 + t24;
-  __m256 t35 = t22 + t23;
-  __m256 t36 = (t21 - t24) * 5.411961001e-01f;
-  __m256 t37 = (t22 - t23) * 1.306562965e+00f;
-  __m256 t38 = t34 + t35;
-  __m256 t39 = (t34 - t35) * 7.071067812e-01f;
-  __m256 t40 = t36 + t37;
-  __m256 t41 = (t36 - t37) * 7.071067812e-01f;
-  __m256 t42 = t40 + t41;
-  __m256 t43 = t38 + t42;
-  __m256 t44 = t42 + t39;
-  __m256 t45 = t39 + t41;
-  __m256 t46 = t9 + t16;
-  __m256 t47 = t10 + t15;
-  __m256 t48 = t11 + t14;
-  __m256 t49 = t12 + t13;
-  __m256 t50 = (t9 - t16) * 5.097955791e-01f;
-  __m256 t51 = (t10 - t15) * 6.013448869e-01f;
-  __m256 t52 = (t11 - t14) * 8.999762231e-01f;
-  __m256 t53 = (t12 - t13) * 2.562915448e+00f;
-  __m256 t54 = t46 + t49;
-  __m256 t55 = t47 + t48;
-  __m256 t56 = (t46 - t49) * 5.411961001e-01f;
-  __m256 t57 = (t47 - t48) * 1.306562965e+00f;
-  __m256 t58 = t54 + t55;
-  __m256 t59 = (t54 - t55) * 7.071067812e-01f;
-  __m256 t60 = t56 + t57;
-  __m256 t61 = (t56 - t57) * 7.071067812e-01f;
-  __m256 t62 = t60 + t61;
-  __m256 t63 = t50 + t53;
-  __m256 t64 = t51 + t52;
-  __m256 t65 = (t50 - t53) * 5.411961001e-01f;
-  __m256 t66 = (t51 - t52) * 1.306562965e+00f;
-  __m256 t67 = t63 + t64;
-  __m256 t68 = (t63 - t64) * 7.071067812e-01f;
-  __m256 t69 = t65 + t66;
-  __m256 t70 = (t65 - t66) * 7.071067812e-01f;
-  __m256 t71 = t69 + t70;
-  __m256 t72 = t67 + t71;
-  __m256 t73 = t71 + t68;
-  __m256 t74 = t68 + t70;
-  __m256 t75 = t58 + t72;
-  __m256 t76 = t72 + t62;
-  __m256 t77 = t62 + t73;
-  __m256 t78 = t73 + t59;
-  __m256 t79 = t59 + t74;
-  __m256 t80 = t74 + t61;
-  __m256 t81 = t61 + t70;
-  out[0] = t29;
-  out[1] = t75;
-  out[2] = t43;
-  out[3] = t76;
-  out[4] = t33;
-  out[5] = t77;
-  out[6] = t44;
-  out[7] = t78;
-  out[8] = t30;
-  out[9] = t79;
-  out[10] = t45;
-  out[11] = t80;
-  out[12] = t32;
-  out[13] = t81;
-  out[14] = t41;
+/* The kernel bodies are macros over the lane type VT so the same straight-line
+ * network serves the AVX2 path (VT = __m256, eight lanes) and the C path
+ * (VT = float). */
+#define VF_DCT16_FWD_BODY(VT) \
+  VT t1 = in[0] + in[15]; \
+  VT t2 = in[1] + in[14]; \
+  VT t3 = in[2] + in[13]; \
+  VT t4 = in[3] + in[12]; \
+  VT t5 = in[4] + in[11]; \
+  VT t6 = in[5] + in[10]; \
+  VT t7 = in[6] + in[9]; \
+  VT t8 = in[7] + in[8]; \
+  VT t9 = (in[0] - in[15]) * 5.024192862e-01f; \
+  VT t10 = (in[1] - in[14]) * 5.224986149e-01f; \
+  VT t11 = (in[2] - in[13]) * 5.669440348e-01f; \
+  VT t12 = (in[3] - in[12]) * 6.468217834e-01f; \
+  VT t13 = (in[4] - in[11]) * 7.881546235e-01f; \
+  VT t14 = (in[5] - in[10]) * 1.060677686e+00f; \
+  VT t15 = (in[6] - in[9]) * 1.722447098e+00f; \
+  VT t16 = (in[7] - in[8]) * 5.101148619e+00f; \
+  VT t17 = t1 + t8; \
+  VT t18 = t2 + t7; \
+  VT t19 = t3 + t6; \
+  VT t20 = t4 + t5; \
+  VT t21 = (t1 - t8) * 5.097955791e-01f; \
+  VT t22 = (t2 - t7) * 6.013448869e-01f; \
+  VT t23 = (t3 - t6) * 8.999762231e-01f; \
+  VT t24 = (t4 - t5) * 2.562915448e+00f; \
+  VT t25 = t17 + t20; \
+  VT t26 = t18 + t19; \
+  VT t27 = (t17 - t20) * 5.411961001e-01f; \
+  VT t28 = (t18 - t19) * 1.306562965e+00f; \
+  VT t29 = t25 + t26; \
+  VT t30 = (t25 - t26) * 7.071067812e-01f; \
+  VT t31 = t27 + t28; \
+  VT t32 = (t27 - t28) * 7.071067812e-01f; \
+  VT t33 = t31 + t32; \
+  VT t34 = t21 + t24; \
+  VT t35 = t22 + t23; \
+  VT t36 = (t21 - t24) * 5.411961001e-01f; \
+  VT t37 = (t22 - t23) * 1.306562965e+00f; \
+  VT t38 = t34 + t35; \
+  VT t39 = (t34 - t35) * 7.071067812e-01f; \
+  VT t40 = t36 + t37; \
+  VT t41 = (t36 - t37) * 7.071067812e-01f; \
+  VT t42 = t40 + t41; \
+  VT t43 = t38 + t42; \
+  VT t44 = t42 + t39; \
+  VT t45 = t39 + t41; \
+  VT t46 = t9 + t16; \
+  VT t47 = t10 + t15; \
+  VT t48 = t11 + t14; \
+  VT t49 = t12 + t13; \
+  VT t50 = (t9 - t16) * 5.097955791e-01f; \
+  VT t51 = (t10 - t15) * 6.013448869e-01f; \
+  VT t52 = (t11 - t14) * 8.999762231e-01f; \
+  VT t53 = (t12 - t13) * 2.562915448e+00f; \
+  VT t54 = t46 + t49; \
+  VT t55 = t47 + t48; \
+  VT t56 = (t46 - t49) * 5.411961001e-01f; \
+  VT t57 = (t47 - t48) * 1.306562965e+00f; \
+  VT t58 = t54 + t55; \
+  VT t59 = (t54 - t55) * 7.071067812e-01f; \
+  VT t60 = t56 + t57; \
+  VT t61 = (t56 - t57) * 7.071067812e-01f; \
+  VT t62 = t60 + t61; \
+  VT t63 = t50 + t53; \
+  VT t64 = t51 + t52; \
+  VT t65 = (t50 - t53) * 5.411961001e-01f; \
+  VT t66 = (t51 - t52) * 1.306562965e+00f; \
+  VT t67 = t63 + t64; \
+  VT t68 = (t63 - t64) * 7.071067812e-01f; \
+  VT t69 = t65 + t66; \
+  VT t70 = (t65 - t66) * 7.071067812e-01f; \
+  VT t71 = t69 + t70; \
+  VT t72 = t67 + t71; \
+  VT t73 = t71 + t68; \
+  VT t74 = t68 + t70; \
+  VT t75 = t58 + t72; \
+  VT t76 = t72 + t62; \
+  VT t77 = t62 + t73; \
+  VT t78 = t73 + t59; \
+  VT t79 = t59 + t74; \
+  VT t80 = t74 + t61; \
+  VT t81 = t61 + t70; \
+  out[0] = t29; \
+  out[1] = t75; \
+  out[2] = t43; \
+  out[3] = t76; \
+  out[4] = t33; \
+  out[5] = t77; \
+  out[6] = t44; \
+  out[7] = t78; \
+  out[8] = t30; \
+  out[9] = t79; \
+  out[10] = t45; \
+  out[11] = t80; \
+  out[12] = t32; \
+  out[13] = t81; \
+  out[14] = t41; \
   out[15] = t70;
-}
-__attribute__((always_inline)) static inline void vf_dct16_v8_inv(const __m256 in[16], __m256 out[16]) {
-  __m256 t1 = in[0];
-  __m256 t2 = in[1];
-  __m256 t3 = in[2];
-  __m256 t4 = in[3];
-  __m256 t5 = in[4];
-  __m256 t6 = in[5];
-  __m256 t7 = in[6];
-  __m256 t8 = in[7];
-  __m256 t9 = in[8];
-  __m256 t10 = in[9];
-  __m256 t11 = in[10];
-  __m256 t12 = in[11];
-  __m256 t13 = in[12];
-  __m256 t14 = in[13];
-  __m256 t15 = in[14];
-  __m256 t16 = in[15];
-  __m256 t17 = t4 + t2;
-  __m256 t18 = t6 + t4;
-  __m256 t19 = t8 + t6;
-  __m256 t20 = t10 + t8;
-  __m256 t21 = t12 + t10;
-  __m256 t22 = t14 + t12;
-  __m256 t23 = t16 + t14;
-  __m256 t24 = t7 + t3;
-  __m256 t25 = t11 + t7;
-  __m256 t26 = t15 + t11;
-  __m256 t27 = t13 + t5;
-  __m256 t28 = t9 * 7.071067812e-01f;
-  __m256 t29 = t1 + t28;
-  __m256 t30 = t1 - t28;
-  __m256 t31 = t27 * 7.071067812e-01f;
-  __m256 t32 = t5 + t31;
-  __m256 t33 = t5 - t31;
-  __m256 t34 = t32 * 5.411961001e-01f;
-  __m256 t35 = t29 + t34;
-  __m256 t36 = t29 - t34;
-  __m256 t37 = t33 * 1.306562965e+00f;
-  __m256 t38 = t30 + t37;
-  __m256 t39 = t30 - t37;
-  __m256 t40 = t26 + t24;
-  __m256 t41 = t25 * 7.071067812e-01f;
-  __m256 t42 = t3 + t41;
-  __m256 t43 = t3 - t41;
-  __m256 t44 = t40 * 7.071067812e-01f;
-  __m256 t45 = t24 + t44;
-  __m256 t46 = t24 - t44;
-  __m256 t47 = t45 * 5.411961001e-01f;
-  __m256 t48 = t42 + t47;
-  __m256 t49 = t42 - t47;
-  __m256 t50 = t46 * 1.306562965e+00f;
-  __m256 t51 = t43 + t50;
-  __m256 t52 = t43 - t50;
-  __m256 t53 = t48 * 5.097955791e-01f;
-  __m256 t54 = t35 + t53;
-  __m256 t55 = t35 - t53;
-  __m256 t56 = t51 * 6.013448869e-01f;
-  __m256 t57 = t38 + t56;
-  __m256 t58 = t38 - t56;
-  __m256 t59 = t52 * 8.999762231e-01f;
-  __m256 t60 = t39 + t59;
-  __m256 t61 = t39 - t59;
-  __m256 t62 = t49 * 2.562915448e+00f;
-  __m256 t63 = t36 + t62;
-  __m256 t64 = t36 - t62;
-  __m256 t65 = t19 + t17;
-  __m256 t66 = t21 + t19;
-  __m256 t67 = t23 + t21;
-  __m256 t68 = t22 + t18;
-  __m256 t69 = t20 * 7.071067812e-01f;
-  __m256 t70 = t2 + t69;
-  __m256 t71 = t2 - t69;
-  __m256 t72 = t68 * 7.071067812e-01f;
-  __m256 t73 = t18 + t72;
-  __m256 t74 = t18 - t72;
-  __m256 t75 = t73 * 5.411961001e-01f;
-  __m256 t76 = t70 + t75;
-  __m256 t77 = t70 - t75;
-  __m256 t78 = t74 * 1.306562965e+00f;
-  __m256 t79 = t71 + t78;
-  __m256 t80 = t71 - t78;
-  __m256 t81 = t67 + t65;
-  __m256 t82 = t66 * 7.071067812e-01f;
-  __m256 t83 = t17 + t82;
-  __m256 t84 = t17 - t82;
-  __m256 t85 = t81 * 7.071067812e-01f;
-  __m256 t86 = t65 + t85;
-  __m256 t87 = t65 - t85;
-  __m256 t88 = t86 * 5.411961001e-01f;
-  __m256 t89 = t83 + t88;
-  __m256 t90 = t83 - t88;
-  __m256 t91 = t87 * 1.306562965e+00f;
-  __m256 t92 = t84 + t91;
-  __m256 t93 = t84 - t91;
-  __m256 t94 = t89 * 5.097955791e-01f;
-  __m256 t95 = t76 + t94;
-  __m256 t96 = t76 - t94;
-  __m256 t97 = t92 * 6.013448869e-01f;
-  __m256 t98 = t79 + t97;
-  __m256 t99 = t79 - t97;
-  __m256 t100 = t93 * 8.999762231e-01f;
-  __m256 t101 = t80 + t100;
-  __m256 t102 = t80 - t100;
-  __m256 t103 = t90 * 2.562915448e+00f;
-  __m256 t104 = t77 + t103;
-  __m256 t105 = t77 - t103;
-  __m256 t106 = t95 * 5.024192862e-01f;
-  __m256 t107 = t54 + t106;
-  __m256 t108 = t54 - t106;
-  __m256 t109 = t98 * 5.224986149e-01f;
-  __m256 t110 = t57 + t109;
-  __m256 t111 = t57 - t109;
-  __m256 t112 = t101 * 5.669440348e-01f;
-  __m256 t113 = t60 + t112;
-  __m256 t114 = t60 - t112;
-  __m256 t115 = t104 * 6.468217834e-01f;
-  __m256 t116 = t63 + t115;
-  __m256 t117 = t63 - t115;
-  __m256 t118 = t105 * 7.881546235e-01f;
-  __m256 t119 = t64 + t118;
-  __m256 t120 = t64 - t118;
-  __m256 t121 = t102 * 1.060677686e+00f;
-  __m256 t122 = t61 + t121;
-  __m256 t123 = t61 - t121;
-  __m256 t124 = t99 * 1.722447098e+00f;
-  __m256 t125 = t58 + t124;
-  __m256 t126 = t58 - t124;
-  __m256 t127 = t96 * 5.101148619e+00f;
-  __m256 t128 = t55 + t127;
-  __m256 t129 = t55 - t127;
-  out[0] = t107;
-  out[1] = t110;
-  out[2] = t113;
-  out[3] = t116;
-  out[4] = t119;
-  out[5] = t122;
-  out[6] = t125;
-  out[7] = t128;
-  out[8] = t129;
-  out[9] = t126;
-  out[10] = t123;
-  out[11] = t120;
-  out[12] = t117;
-  out[13] = t114;
-  out[14] = t111;
+#define VF_DCT16_INV_BODY(VT) \
+  VT t1 = in[0]; \
+  VT t2 = in[1]; \
+  VT t3 = in[2]; \
+  VT t4 = in[3]; \
+  VT t5 = in[4]; \
+  VT t6 = in[5]; \
+  VT t7 = in[6]; \
+  VT t8 = in[7]; \
+  VT t9 = in[8]; \
+  VT t10 = in[9]; \
+  VT t11 = in[10]; \
+  VT t12 = in[11]; \
+  VT t13 = in[12]; \
+  VT t14 = in[13]; \
+  VT t15 = in[14]; \
+  VT t16 = in[15]; \
+  VT t17 = t4 + t2; \
+  VT t18 = t6 + t4; \
+  VT t19 = t8 + t6; \
+  VT t20 = t10 + t8; \
+  VT t21 = t12 + t10; \
+  VT t22 = t14 + t12; \
+  VT t23 = t16 + t14; \
+  VT t24 = t7 + t3; \
+  VT t25 = t11 + t7; \
+  VT t26 = t15 + t11; \
+  VT t27 = t13 + t5; \
+  VT t28 = t9 * 7.071067812e-01f; \
+  VT t29 = t1 + t28; \
+  VT t30 = t1 - t28; \
+  VT t31 = t27 * 7.071067812e-01f; \
+  VT t32 = t5 + t31; \
+  VT t33 = t5 - t31; \
+  VT t34 = t32 * 5.411961001e-01f; \
+  VT t35 = t29 + t34; \
+  VT t36 = t29 - t34; \
+  VT t37 = t33 * 1.306562965e+00f; \
+  VT t38 = t30 + t37; \
+  VT t39 = t30 - t37; \
+  VT t40 = t26 + t24; \
+  VT t41 = t25 * 7.071067812e-01f; \
+  VT t42 = t3 + t41; \
+  VT t43 = t3 - t41; \
+  VT t44 = t40 * 7.071067812e-01f; \
+  VT t45 = t24 + t44; \
+  VT t46 = t24 - t44; \
+  VT t47 = t45 * 5.411961001e-01f; \
+  VT t48 = t42 + t47; \
+  VT t49 = t42 - t47; \
+  VT t50 = t46 * 1.306562965e+00f; \
+  VT t51 = t43 + t50; \
+  VT t52 = t43 - t50; \
+  VT t53 = t48 * 5.097955791e-01f; \
+  VT t54 = t35 + t53; \
+  VT t55 = t35 - t53; \
+  VT t56 = t51 * 6.013448869e-01f; \
+  VT t57 = t38 + t56; \
+  VT t58 = t38 - t56; \
+  VT t59 = t52 * 8.999762231e-01f; \
+  VT t60 = t39 + t59; \
+  VT t61 = t39 - t59; \
+  VT t62 = t49 * 2.562915448e+00f; \
+  VT t63 = t36 + t62; \
+  VT t64 = t36 - t62; \
+  VT t65 = t19 + t17; \
+  VT t66 = t21 + t19; \
+  VT t67 = t23 + t21; \
+  VT t68 = t22 + t18; \
+  VT t69 = t20 * 7.071067812e-01f; \
+  VT t70 = t2 + t69; \
+  VT t71 = t2 - t69; \
+  VT t72 = t68 * 7.071067812e-01f; \
+  VT t73 = t18 + t72; \
+  VT t74 = t18 - t72; \
+  VT t75 = t73 * 5.411961001e-01f; \
+  VT t76 = t70 + t75; \
+  VT t77 = t70 - t75; \
+  VT t78 = t74 * 1.306562965e+00f; \
+  VT t79 = t71 + t78; \
+  VT t80 = t71 - t78; \
+  VT t81 = t67 + t65; \
+  VT t82 = t66 * 7.071067812e-01f; \
+  VT t83 = t17 + t82; \
+  VT t84 = t17 - t82; \
+  VT t85 = t81 * 7.071067812e-01f; \
+  VT t86 = t65 + t85; \
+  VT t87 = t65 - t85; \
+  VT t88 = t86 * 5.411961001e-01f; \
+  VT t89 = t83 + t88; \
+  VT t90 = t83 - t88; \
+  VT t91 = t87 * 1.306562965e+00f; \
+  VT t92 = t84 + t91; \
+  VT t93 = t84 - t91; \
+  VT t94 = t89 * 5.097955791e-01f; \
+  VT t95 = t76 + t94; \
+  VT t96 = t76 - t94; \
+  VT t97 = t92 * 6.013448869e-01f; \
+  VT t98 = t79 + t97; \
+  VT t99 = t79 - t97; \
+  VT t100 = t93 * 8.999762231e-01f; \
+  VT t101 = t80 + t100; \
+  VT t102 = t80 - t100; \
+  VT t103 = t90 * 2.562915448e+00f; \
+  VT t104 = t77 + t103; \
+  VT t105 = t77 - t103; \
+  VT t106 = t95 * 5.024192862e-01f; \
+  VT t107 = t54 + t106; \
+  VT t108 = t54 - t106; \
+  VT t109 = t98 * 5.224986149e-01f; \
+  VT t110 = t57 + t109; \
+  VT t111 = t57 - t109; \
+  VT t112 = t101 * 5.669440348e-01f; \
+  VT t113 = t60 + t112; \
+  VT t114 = t60 - t112; \
+  VT t115 = t104 * 6.468217834e-01f; \
+  VT t116 = t63 + t115; \
+  VT t117 = t63 - t115; \
+  VT t118 = t105 * 7.881546235e-01f; \
+  VT t119 = t64 + t118; \
+  VT t120 = t64 - t118; \
+  VT t121 = t102 * 1.060677686e+00f; \
+  VT t122 = t61 + t121; \
+  VT t123 = t61 - t121; \
+  VT t124 = t99 * 1.722447098e+00f; \
+  VT t125 = t58 + t124; \
+  VT t126 = t58 - t124; \
+  VT t127 = t96 * 5.101148619e+00f; \
+  VT t128 = t55 + t127; \
+  VT t129 = t55 - t127; \
+  out[0] = t107; \
+  out[1] = t110; \
+  out[2] = t113; \
+  out[3] = t116; \
+  out[4] = t119; \
+  out[5] = t122; \
+  out[6] = t125; \
+  out[7] = t128; \
+  out[8] = t129; \
+  out[9] = t126; \
+  out[10] = t123; \
+  out[11] = t120; \
+  out[12] = t117; \
+  out[13] = t114; \
+  out[14] = t111; \
   out[15] = t108;
-}
 
+/* C kernels: one 16-point transform on scalars */
+static inline void vf_dct16_c_fwd(const float in[16], float out[16]) { VF_DCT16_FWD_BODY(float) }
+static inline void vf_dct16_c_inv(const float in[16], float out[16]) { VF_DCT16_INV_BODY(float) }
+#if VF_HAVE_AVX2
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_dct16_v8_fwd(const __m256 in[16], __m256 out[16]) { VF_DCT16_FWD_BODY(__m256) }
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_dct16_v8_inv(const __m256 in[16], __m256 out[16]) { VF_DCT16_INV_BODY(__m256) }
+#endif
+#if VF_HAVE_AVX2
 
 /* in-register 8x8 transpose of v[0..7] */
-__attribute__((always_inline)) static inline void vf_transpose8(__m256 v[8]) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_transpose8(__m256 v[8]) {
   __m256 a0 = _mm256_unpacklo_ps(v[0], v[1]), a1 = _mm256_unpackhi_ps(v[0], v[1]);
   __m256 a2 = _mm256_unpacklo_ps(v[2], v[3]), a3 = _mm256_unpackhi_ps(v[2], v[3]);
   __m256 a4 = _mm256_unpacklo_ps(v[4], v[5]), a5 = _mm256_unpackhi_ps(v[4], v[5]);
@@ -1296,7 +1327,7 @@ __attribute__((always_inline)) static inline void vf_transpose8(__m256 v[8]) {
 }
 /* x pass: eight consecutive lines (stride 16 floats) per call, transposed in
  * and out through two 8x8 tiles */
-__attribute__((always_inline)) static inline void vf_dct16_x8(float *l, bool inverse) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_dct16_x8(float *l, bool inverse) {
   __m256 in[16], out[16];
   for (int y = 0; y < 8; y++) {
     in[y] = _mm256_loadu_ps(l + y * 16);
@@ -1316,7 +1347,7 @@ __attribute__((always_inline)) static inline void vf_dct16_x8(float *l, bool inv
   }
 }
 /* y or z pass: eight contiguous x lanes, elements `es` floats apart */
-__attribute__((always_inline)) static inline void vf_dct16_l8(float *p, ptrdiff_t es, bool inverse) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_dct16_l8(float *p, ptrdiff_t es, bool inverse) {
   __m256 in[16], out[16];
   for (int t = 0; t < 16; t++) in[t] = _mm256_loadu_ps(p + t * es);
   if (inverse)
@@ -1325,7 +1356,7 @@ __attribute__((always_inline)) static inline void vf_dct16_l8(float *p, ptrdiff_
     vf_dct16_v8_fwd(in, out);
   for (int t = 0; t < 16; t++) _mm256_storeu_ps(p + t * es, out[t]);
 }
-__attribute__((noinline)) static void vf_dct16_fwd(float blk[VF_BLKV]) {
+__attribute__((noinline)) VF_TARGET_AVX2 static void vf_dct16_fwd_avx2(float blk[VF_BLKV]) {
   VF_FASTMATH_BEGIN
   for (int z = 0; z < 16; z++) {
     float *pl = blk + z * 256;
@@ -1341,7 +1372,7 @@ __attribute__((noinline)) static void vf_dct16_fwd(float blk[VF_BLKV]) {
 }
 /* z pass of the inverse, out of place: coefficient planes at stride 256 in
  * `blk` (zero planes are not loaded) to the same layout in `out` */
-__attribute__((always_inline)) static inline void vf_dct16_l8z(const float *p, uint32_t zmask, float *o) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_dct16_l8z(const float *p, uint32_t zmask, float *o) {
   __m256 in[16], out[16];
   for (int t = 0; t < 16; t++)
     in[t] = zmask >> t & 1u ? _mm256_loadu_ps(p + t * 256) : _mm256_setzero_ps();
@@ -1354,8 +1385,8 @@ __attribute__((always_inline)) static inline void vf_dct16_l8z(const float *p, u
  * both skip them, and the x pass skips a plane's upper eight lines when they
  * are empty; the z pass reads every plane and writes the voxels to `out`, so
  * `blk` keeps only the zmask planes dirty. */
-__attribute__((noinline)) static void vf_dct16_inv(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask,
-                                                   float out[VF_BLKV]) {
+__attribute__((noinline)) VF_TARGET_AVX2 static void vf_dct16_inv_avx2(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask,
+                                                                   float out[VF_BLKV]) {
   VF_FASTMATH_BEGIN
   for (int z = 0; z < 16; z++) {
     if (!(zmask >> z & 1u)) continue;
@@ -1369,6 +1400,78 @@ __attribute__((noinline)) static void vf_dct16_inv(float blk[VF_BLKV], uint32_t 
     vf_dct16_l8z(blk + y * 16, zmask, out + y * 16);
     vf_dct16_l8z(blk + y * 16 + 8, zmask, out + y * 16 + 8);
   }
+}
+#endif /* VF_HAVE_AVX2 */
+
+/* ---- C transform passes (same structure and skip logic as the AVX2 ones) ---- */
+__attribute__((noinline)) static void vf_dct16_fwd_c(float blk[VF_BLKV]) {
+  VF_FASTMATH_BEGIN
+  float in[16], out[16];
+  for (int z = 0; z < 16; z++) {
+    float *pl = blk + z * 256;
+    for (int y = 0; y < 16; y++) { /* x lines */
+      vf_dct16_c_fwd(pl + y * 16, out);
+      memcpy(pl + y * 16, out, sizeof out);
+    }
+    for (int x = 0; x < 16; x++) { /* y lines */
+      for (int t = 0; t < 16; t++) in[t] = pl[t * 16 + x];
+      vf_dct16_c_fwd(in, out);
+      for (int t = 0; t < 16; t++) pl[t * 16 + x] = out[t];
+    }
+  }
+  for (int i = 0; i < 256; i++) { /* z lines */
+    for (int t = 0; t < 16; t++) in[t] = blk[t * 256 + i];
+    vf_dct16_c_fwd(in, out);
+    for (int t = 0; t < 16; t++) blk[t * 256 + i] = out[t];
+  }
+}
+__attribute__((noinline)) static void vf_dct16_inv_c(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask,
+                                                     float out[VF_BLKV]) {
+  VF_FASTMATH_BEGIN
+  float in[16], o[16];
+  for (int z = 0; z < 16; z++) {
+    if (!(zmask >> z & 1u)) continue;
+    float *pl = blk + z * 256;
+    const int ny = hmask >> z & 1u ? 16 : 8; /* upper eight x lines are empty */
+    for (int y = 0; y < ny; y++) {
+      vf_dct16_c_inv(pl + y * 16, o);
+      memcpy(pl + y * 16, o, sizeof o);
+    }
+    for (int x = 0; x < 16; x++) {
+      for (int t = 0; t < 16; t++) in[t] = pl[t * 16 + x];
+      vf_dct16_c_inv(in, o);
+      for (int t = 0; t < 16; t++) pl[t * 16 + x] = o[t];
+    }
+  }
+  for (int i = 0; i < 256; i++) {
+    for (int t = 0; t < 16; t++) in[t] = zmask >> t & 1u ? blk[t * 256 + i] : 0.0f;
+    vf_dct16_c_inv(in, o);
+    for (int t = 0; t < 16; t++) out[t * 256 + i] = o[t];
+  }
+}
+/* ---- kernel selection ---- */
+static inline bool vf_use_avx2(void) {
+#if !VF_HAVE_AVX2
+  return false;
+#elif VF_AVX2_STATIC
+  return true;
+#else
+  __builtin_cpu_init();
+  return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+}
+static inline const char *volcomp_kernels(void) { return vf_use_avx2() ? "avx2" : "c"; }
+static inline void vf_dct16_fwd(float blk[VF_BLKV]) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) { vf_dct16_fwd_avx2(blk); return; }
+#endif
+  vf_dct16_fwd_c(blk);
+}
+static inline void vf_dct16_inv(float blk[VF_BLKV], uint32_t zmask, uint32_t hmask, float out[VF_BLKV]) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) { vf_dct16_inv_avx2(blk, zmask, hmask, out); return; }
+#endif
+  vf_dct16_inv_c(blk, zmask, hmask, out);
 }
 /* re-zero the coefficient planes a block left dirty */
 static inline void vf_clear_planes(float blk[VF_BLKV], uint32_t zmask) {
@@ -1393,14 +1496,15 @@ __attribute__((always_inline)) static inline float vf_dequant_ac(uint32_t mag, f
 }
 __attribute__((always_inline)) static inline float vf_dequant_dc(uint32_t mag, float step) { return (float)mag * step; }
 
-/* ---- block gather / scatter (AVX2) ---- */
+/* ---- block gather / scatter ---- */
 static inline size_t vf_row_off(uint32_t bz, uint32_t by, uint32_t bx, uint32_t z, uint32_t y) {
   return ((size_t)(bz * 16u + z) * VOLCOMP_CHUNK_DIM + (by * 16u + y)) * VOLCOMP_CHUNK_DIM +
          (size_t)bx * 16u;
 }
+#if VF_HAVE_AVX2
 /* u8 -> float - 128; returns true iff every voxel equals src[0] of the block */
-static bool vf_gather_block(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx,
-                            float *blk) {
+VF_TARGET_AVX2 static bool vf_gather_block_avx2(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx,
+                                                float *blk) {
   const __m256 bias = _mm256_set1_ps(128.0f);
   __m128i mn = _mm_set1_epi8(-1), mx = _mm_setzero_si128();
   for (uint32_t z = 0; z < 16; z++)
@@ -1418,14 +1522,14 @@ static bool vf_gather_block(const uint8_t *src, uint32_t bz, uint32_t by, uint32
          _mm_movemask_epi8(_mm_cmpeq_epi8(mn, _mm_set1_epi8((char)src[vf_row_off(bz, by, bx, 0, 0)]))) == 0xffff;
 }
 /* +128.5, clamp to [0,255], truncate: one 32-byte pack per pair of rows */
-__attribute__((always_inline)) static inline __m256i vf_round8(const float *p) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline __m256i vf_round8(const float *p) {
   __m256 v = _mm256_add_ps(_mm256_loadu_ps(p), _mm256_set1_ps(128.5f));
   v = _mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(255.0f));
   return _mm256_cvttps_epi32(v);
 }
 /* row = dst + z*zs + y*ys */
-static void vf_scatter_block(uint8_t *restrict dst, size_t zs, size_t ys,
-                             const float *restrict blk) {
+VF_TARGET_AVX2 static void vf_scatter_block_avx2(uint8_t *restrict dst, size_t zs, size_t ys,
+                                                 const float *restrict blk) {
   const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
   for (uint32_t z = 0; z < 16; z++)
     for (uint32_t y = 0; y < 16; y += 2) {
@@ -1437,6 +1541,45 @@ static void vf_scatter_block(uint8_t *restrict dst, size_t zs, size_t ys,
       _mm_storeu_si128((__m128i *)row, _mm256_castsi256_si128(b));
       _mm_storeu_si128((__m128i *)(row + ys), _mm256_extracti128_si256(b, 1));
     }
+}
+#endif /* VF_HAVE_AVX2 */
+static bool vf_gather_block_c(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx, float *blk) {
+  const uint8_t v0 = src[vf_row_off(bz, by, bx, 0, 0)];
+  bool flat = true;
+  for (uint32_t z = 0; z < 16; z++)
+    for (uint32_t y = 0; y < 16; y++) {
+      const uint8_t *row = src + vf_row_off(bz, by, bx, z, y);
+      float *o = blk + (size_t)z * 256 + (size_t)y * 16;
+      for (uint32_t x = 0; x < 16; x++) {
+        flat &= row[x] == v0;
+        o[x] = (float)row[x] - 128.0f;
+      }
+    }
+  return flat;
+}
+static void vf_scatter_block_c(uint8_t *restrict dst, size_t zs, size_t ys, const float *restrict blk) {
+  for (uint32_t z = 0; z < 16; z++)
+    for (uint32_t y = 0; y < 16; y++) {
+      const float *in = blk + (size_t)z * 256 + (size_t)y * 16;
+      uint8_t *row = dst + z * zs + y * ys;
+      for (uint32_t x = 0; x < 16; x++) {
+        float v = in[x] + 128.5f;
+        v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+        row[x] = (uint8_t)(int32_t)v;
+      }
+    }
+}
+static inline bool vf_gather_block(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx, float *blk) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) return vf_gather_block_avx2(src, bz, by, bx, blk);
+#endif
+  return vf_gather_block_c(src, bz, by, bx, blk);
+}
+static inline void vf_scatter_block(uint8_t *restrict dst, size_t zs, size_t ys, const float *restrict blk) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) { vf_scatter_block_avx2(dst, zs, ys, blk); return; }
+#endif
+  vf_scatter_block_c(dst, zs, ys, blk);
 }
 /* unnormalised IDCT of a DC-only block is the constant blk[0] (scale already folded) */
 static inline uint8_t vf_flat_value(float dc) {
@@ -1577,30 +1720,14 @@ static inline uint32_t vf_q_raw(float q) {
   return r > (float)VF_Q_RAW_MAX ? VF_Q_RAW_MAX : (uint32_t)r;
 }
 
-/* transform + quantise one block into scan-order levels and the ascending
- * nonzero AC position list (single fused pass over the scan table) */
-static uint32_t vf_analyse_block(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx,
-                                 const float *rstep, int32_t *lvl, uint16_t *npos) {
-  /* lvl[0] = DC level; lvl[1..n] = level of npos[0..n-1] (scan positions, ascending) */
-  float blk[VF_BLKV];
-  int32_t qn[VF_BLKV];
-  if (vf_gather_block(src, bz, by, bx, blk)) { /* constant block: DC only, skip the transform */
-    float c0 = blk[0] * 4096.0f;              /* unnormalised DC of a constant block */
-    float a = fabsf(c0) * rstep[0] + VF_DZ_Q_DC;
-    int32_t l = (int32_t)a;
-    lvl[0] = c0 < 0.0f ? -l : l;
-    return 0;
-  }
-  vf_dct16_fwd(blk);
-  { /* DC: round to nearest (a whole-block level shift is the costliest error) */
-    float a = fabsf(blk[0]) * rstep[0] + VF_DZ_Q_DC;
-    int32_t l = (int32_t)a;
-    lvl[0] = blk[0] < 0.0f ? -l : l;
-  }
-  /* quantise (reciprocal multiply + dead zone: a = |v| r + 0.2 truncates to 0
-   * below 1) and compact the nonzeros in natural order via 32-wide bitmasks;
-   * the ctz walk touches only nonzeros (typically 50-500 per block), mapped
-   * to scan positions and sorted — no 4096-wide permutation */
+/* quantise (reciprocal multiply + dead zone: a = |v| r + 0.2 truncates to 0
+ * below 1) into qn (natural order) and list the nonzero AC positions in
+ * scan coordinates, natural order (DC excluded); returns the count. */
+#if VF_HAVE_AVX2
+/* 32-wide bitmasks; the ctz walk touches only nonzeros (typically 50-500 per
+ * block) — no 4096-wide permutation */
+VF_TARGET_AVX2 static uint32_t vf_quantise_block_avx2(const float *blk, const float *rstep, int32_t *qn,
+                                                      uint16_t *npos) {
   const __m256 dz = _mm256_set1_ps(VF_DZ_Q), absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
   const __m256i zero = _mm256_setzero_si256();
   uint32_t n = 0;
@@ -1622,6 +1749,48 @@ static uint32_t vf_analyse_block(const uint8_t *src, uint32_t bz, uint32_t by, u
       m &= m - 1;
     }
   }
+  return n;
+}
+#endif /* VF_HAVE_AVX2 */
+static uint32_t vf_quantise_block_c(const float *blk, const float *rstep, int32_t *qn, uint16_t *npos) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < VF_BLKV; i++) {
+    float v = blk[i];
+    int32_t l = (int32_t)(fabsf(v) * rstep[i] + VF_DZ_Q);
+    if (v < 0.0f) l = -l;
+    qn[i] = l;
+    if (l != 0 && i != 0) npos[n++] = VF_ISCAN16[i];
+  }
+  return n;
+}
+static inline uint32_t vf_quantise_block(const float *blk, const float *rstep, int32_t *qn, uint16_t *npos) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) return vf_quantise_block_avx2(blk, rstep, qn, npos);
+#endif
+  return vf_quantise_block_c(blk, rstep, qn, npos);
+}
+
+/* transform + quantise one block into scan-order levels and the ascending
+ * nonzero AC position list (single fused pass over the scan table) */
+static uint32_t vf_analyse_block(const uint8_t *src, uint32_t bz, uint32_t by, uint32_t bx,
+                                 const float *rstep, int32_t *lvl, uint16_t *npos) {
+  /* lvl[0] = DC level; lvl[1..n] = level of npos[0..n-1] (scan positions, ascending) */
+  float blk[VF_BLKV];
+  int32_t qn[VF_BLKV];
+  if (vf_gather_block(src, bz, by, bx, blk)) { /* constant block: DC only, skip the transform */
+    float c0 = blk[0] * 4096.0f;              /* unnormalised DC of a constant block */
+    float a = fabsf(c0) * rstep[0] + VF_DZ_Q_DC;
+    int32_t l = (int32_t)a;
+    lvl[0] = c0 < 0.0f ? -l : l;
+    return 0;
+  }
+  vf_dct16_fwd(blk);
+  { /* DC: round to nearest (a whole-block level shift is the costliest error) */
+    float a = fabsf(blk[0]) * rstep[0] + VF_DZ_Q_DC;
+    int32_t l = (int32_t)a;
+    lvl[0] = blk[0] < 0.0f ? -l : l;
+  }
+  uint32_t n = vf_quantise_block(blk, rstep, qn, npos);
   /* sort scan positions ascending: insertion sort for sparse blocks, LSD
    * radix (two 6-bit passes) for dense ones */
   if (n < 64) {
@@ -1833,8 +2002,9 @@ __attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint
   *p0 = (uint8_t)(P0 + delta);
   *q0 = (uint8_t)(Q0 - delta);
 }
+#if VF_HAVE_AVX2
 /* 16 contiguous face positions at once (lines adjacent in memory) */
-__attribute__((always_inline)) static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
   const __m256i P1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p0 - s)));
   const __m256i P0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p0));
   const __m256i Q0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)q0));
@@ -1855,8 +2025,8 @@ __attribute__((always_inline)) static inline void vf_deblock_16(uint8_t *p0, uin
   _mm_storeu_si128((__m128i *)p0, _mm256_castsi256_si128(pk));
   _mm_storeu_si128((__m128i *)q0, _mm256_extracti128_si256(pk, 1));
 }
-static void vf_deblock_axis(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                            size_t s_outer, size_t s_mid, size_t s_in, int c) {
+VF_TARGET_AVX2 static void vf_deblock_axis_avx2(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
+                                                size_t s_outer, size_t s_mid, size_t s_in, int c) {
   /* filters planes along the "in" axis; (outer, mid) enumerate the lines */
   for (size_t f = 16; f < n_in; f += 16)
     for (size_t o = 0; o < n_outer; o++) {
@@ -1868,6 +2038,23 @@ static void vf_deblock_axis(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n
       for (; m < n_mid; m++)
         vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
     }
+}
+#endif /* VF_HAVE_AVX2 */
+static void vf_deblock_axis_c(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
+                              size_t s_outer, size_t s_mid, size_t s_in, int c) {
+  for (size_t f = 16; f < n_in; f += 16)
+    for (size_t o = 0; o < n_outer; o++) {
+      uint8_t *base = vol + o * s_outer + f * s_in;
+      for (size_t m = 0; m < n_mid; m++)
+        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
+    }
+}
+static inline void vf_deblock_axis(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
+                                   size_t s_outer, size_t s_mid, size_t s_in, int c) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) { vf_deblock_axis_avx2(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c); return; }
+#endif
+  vf_deblock_axis_c(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c);
 }
 static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
   if (!vol || nz < 2 || ny < 2 || nx < 2) return;

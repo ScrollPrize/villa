@@ -801,7 +801,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (g_codec == OutCodec::Volcomp && !utils::volcomp_available()) {
-        fprintf(stderr, "volcomp codec is not available on this host (needs an x86-64 AVX2 build)\n");
+        fprintf(stderr, "volcomp codec is not available on this host\n");
         return 1;
     }
     if (stats_pct < 0) stats_pct = 0;
@@ -870,8 +870,8 @@ int main(int argc, char** argv) {
         printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
                (double)target_ratio, SHARD_DIM, CHUNK_DIM);
     else
-        printf("Codec: volcomp (q %.2f), shard: %zu³, chunk: %zu³\n",
-               (double)volcomp_q, SHARD_DIM, CHUNK_DIM);
+        printf("Codec: volcomp (q %.2f, %s kernels), shard: %zu³, chunk: %zu³\n",
+               (double)volcomp_q, utils::volcomp_kernels(), SHARD_DIM, CHUNK_DIM);
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
     if (world > 1) printf("Fanout: rank %d / world %d (sz %% %d == %d)\n",
                            rank, world, world, rank);

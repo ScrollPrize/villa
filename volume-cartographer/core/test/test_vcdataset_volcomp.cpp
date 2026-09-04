@@ -1,7 +1,7 @@
 // volcomp codec through VcDataset: v2 round trip at q, v3 sharded arrays with
 // the index at the end of the shard (the zarr default and the layout of the
-// volcomp exports), and the shim's guards. Skips when the codec is not
-// available on this host (non-x86-64 build or a CPU without AVX2).
+// volcomp exports), and the shim's guards. The codec is portable (AVX2 at
+// runtime on x86-64, plain C elsewhere), so nothing here is skipped.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -73,10 +73,8 @@ void put_le64(std::vector<std::byte>& out, uint64_t v)
 
 TEST_CASE("volcomp: v2 dataset round trip at q, q recorded in .zarray")
 {
-    if (!utils::volcomp_available()) {
-        MESSAGE("Skipping: volcomp codec not available on this host");
-        return;
-    }
+    REQUIRE(utils::volcomp_available());
+    MESSAGE("volcomp kernels: " << utils::volcomp_kernels());
     auto d = tmpDir("v2");
     auto ds = vc::createZarrDataset(d, "arr", {256, 128, 128}, {128, 128, 128},
                                     vc::VcDtype::uint8, "volcomp", "/", 0,

@@ -1,11 +1,11 @@
 /* volcomp_lib.h — linkable C surface over the single-header volcomp codec.
  *
- * volcomp.h is header-only (every function is static) and requires AVX2+FMA
- * at compile time. This wrapper compiles the header exactly once, in a TU
- * built with the right flags on x86-64, and exposes plain C entry points so
- * C++ consumers need neither the header nor the flags. On targets where the
- * codec is not built (non-x86-64, MSVC) every entry point reports
- * VOLCOMP_LIB_UNSUPPORTED; volcomp_lib_available() lets callers check.
+ * volcomp.h is header-only (every function is static); this wrapper compiles
+ * it exactly once and exposes plain C entry points so C++ consumers need
+ * neither the header nor any compiler flags. The codec is portable: on x86-64
+ * it selects its AVX2+FMA kernels at runtime when the CPU has them and falls
+ * back to plain C otherwise (arm64 always uses the C kernels);
+ * volcomp_lib_kernels() reports which set is active.
  *
  * Upstream: https://github.com/SuperOptimizer/volume-compressor (volcomp.h
  * vendored verbatim beside this file). */
@@ -32,11 +32,14 @@ enum {
     VOLCOMP_LIB_ERR_VERSION = 3,
     VOLCOMP_LIB_ERR_NOMEM = 4,
     VOLCOMP_LIB_ERR_SHORT_BUF = 5,
-    VOLCOMP_LIB_UNSUPPORTED = 100, /* not compiled in, or the CPU lacks AVX2/FMA */
+    VOLCOMP_LIB_UNSUPPORTED = 100, /* kept for ABI; never returned since the codec is portable */
 };
 
-/* 1 when the codec is compiled in and the running CPU supports it. */
+/* Always 1: the codec is available on every target (kept for callers that
+ * were written against the AVX2-gated version). */
 int volcomp_lib_available(void);
+/* "avx2" or "c": the kernel set this process uses. */
+const char *volcomp_lib_kernels(void);
 const char *volcomp_lib_status_string(int status);
 /* Capacity that always suffices for volcomp_lib_encode. */
 size_t volcomp_lib_encode_bound(void);

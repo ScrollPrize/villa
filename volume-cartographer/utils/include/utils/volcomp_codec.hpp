@@ -28,9 +28,11 @@ struct VolcompCodecParams {
     float q = 8.0f;
 };
 
-// True when the codec is compiled in for this target and the CPU supports it
-// (AVX2+FMA on x86-64).  Encode/decode throw when it is false.
+// Always true: the codec is portable (AVX2 kernels picked at runtime on x86-64,
+// plain C elsewhere).  Kept so call sites can stay defensive.
 [[nodiscard]] bool volcomp_available() noexcept;
+// "avx2" or "c": which kernel set this process uses.
+[[nodiscard]] const char* volcomp_kernels() noexcept;
 
 [[nodiscard]] std::vector<std::byte> volcomp_encode(
     std::span<const std::byte> raw, const VolcompCodecParams& params);

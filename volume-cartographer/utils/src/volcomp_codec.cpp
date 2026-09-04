@@ -16,6 +16,8 @@ namespace {
 
 bool volcomp_available() noexcept { return volcomp_lib_available() != 0; }
 
+const char* volcomp_kernels() noexcept { return volcomp_lib_kernels(); }
+
 bool is_volcomp_compressed(std::span<const std::byte> data) noexcept
 {
     return volcomp_lib_is_chunk(data.data(), data.size()) != 0;
