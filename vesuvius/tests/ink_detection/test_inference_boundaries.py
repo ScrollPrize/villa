@@ -18,6 +18,7 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.inference.inference_runtime import (
     checkpoint_amp_dtype,
+    maybe_compile_model,
     parse_gpu_ids,
     prepare_model_for_inference,
 )
@@ -124,6 +125,77 @@ def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monke
 
     assert prepared is source
     assert device.type in {"cpu", "cuda"}
+
+
+class _BackendThatFailsWhenItRuns(nn.Module):
+    """What torch.compile returns when the backend cannot build: it raises on call."""
+
+    def __init__(self, message: str = "Cannot find a working triton installation") -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.calls += 1
+        raise RuntimeError("Cannot find a working triton installation")
+
+
+def test_compile_falls_back_when_the_backend_fails_on_the_first_forward(monkeypatch, caplog):
+    """torch.compile returns lazily, so a broken backend raises at the first call."""
+
+    eager = nn.Linear(3, 2).eval()
+    broken = _BackendThatFailsWhenItRuns()
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: broken)
+
+    compiled, enabled = maybe_compile_model(eager, enabled=True, mode="default")
+    assert enabled is True
+    assert compiled is not eager
+
+    batch = torch.randn(4, 3)
+    with caplog.at_level("WARNING"):
+        first = compiled(batch)
+    second = compiled(batch)
+
+    expected = eager(batch)
+    torch.testing.assert_close(first, expected)
+    torch.testing.assert_close(second, expected)
+    assert broken.calls == 1, "the failed backend must not be retried on every forward"
+    assert "continuing eagerly" in caplog.text
+
+
+def test_compile_keeps_using_a_backend_that_works(monkeypatch, caplog):
+    eager = nn.Linear(3, 2).eval()
+    calls = []
+
+    class _Working(nn.Module):
+        def forward(self, *args, **kwargs):
+            calls.append(1)
+            return eager(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: _Working())
+
+    compiled, enabled = maybe_compile_model(eager, enabled=True, mode="default")
+    batch = torch.randn(4, 3)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            torch.testing.assert_close(compiled(batch), eager(batch))
+
+    assert enabled is True
+    assert len(calls) == 3, "every forward should go to the compiled module"
+    assert caplog.text == ""
+
+
+def test_compile_wrapper_keeps_module_behaviour(monkeypatch):
+    """The eager module is the registered child, so .eval() and .to() still reach it."""
+
+    eager = nn.Linear(3, 2)
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: _BackendThatFailsWhenItRuns())
+
+    compiled, _ = maybe_compile_model(eager, enabled=True, mode="default")
+    compiled.eval()
+
+    assert eager.training is False
+    assert compiled.model is eager
+    assert list(compiled.parameters()) == list(eager.parameters())
 
 
 def test_root_volume_view_and_level_selection_share_one_open(tmp_path):
