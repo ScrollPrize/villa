@@ -40,6 +40,8 @@ def open_zarr(path: str, mode: str = 'r',
               verbose: bool = False,
               cache: bool = False,
               cache_size_mb: int = 256,
+              chunk_cache_dir: Optional[Union[str, os.PathLike]] = None,
+              chunk_cache_max_gb: Optional[float] = None,
               # Additional zarr creation parameters
               shape: Optional[Tuple] = None,
               chunks: Optional[Tuple] = None,
@@ -63,14 +65,38 @@ def open_zarr(path: str, mode: str = 'r',
     verbose : bool, default False
         Whether to print verbose information about opening the zarr array.
     cache : bool, default False
-        If True (read mode only), wrap the store in an in-memory LRU chunk
-        cache (zarr's ``CacheStore``) so repeated reads of the same region
-        are served locally instead of re-fetched from the remote store.
-        Byte-exact: caches the compressed chunks as stored, so decoded
-        values are identical with or without it.
+        In-memory chunk cache. If True (read mode only), wrap the store in an
+        in-memory LRU chunk cache (zarr's ``CacheStore``) so repeated reads of
+        the same region are served locally instead of re-fetched from the
+        remote store. Byte-exact: caches the compressed chunks as stored, so
+        decoded values are identical with or without it. Requires zarr>=3 and
+        lives for the life of the process: nothing is shared with DataLoader
+        workers or later runs.
     cache_size_mb : int, default 256
-        Maximum size of the LRU chunk cache, in megabytes. Ignored unless
-        ``cache=True``.
+        Maximum size of the in-memory LRU chunk cache, in megabytes. Ignored
+        unless ``cache=True``.
+    chunk_cache_dir : Optional[Union[str, os.PathLike]], default None
+        Persistent on-disk chunk cache. If set, and the path is a remote URL
+        opened in read mode, chunks are mirrored into this directory as they
+        are fetched and served from there on every later read, by any process.
+        Unlike ``cache=True`` this works on both zarr 2 and zarr 3, survives
+        process exit, and is shared across DataLoader workers and separate
+        runs. Entries are namespaced by the source URL, so one directory can
+        back many volumes. The published scroll volumes are immutable, so
+        cached entries are never revalidated against the remote; delete the
+        directory to reset the cache. Ignored (falls through to existing
+        behavior) for local paths, for write modes, and when
+        ``chunk_cache_max_gb=0`` (or negative). If both ``chunk_cache_dir``
+        and ``cache=True`` are given, the disk cache wins.
+    chunk_cache_max_gb : Optional[float], default None
+        Size cap for the ``chunk_cache_dir`` tree, in GiB, enforced by
+        least-recently-used eviction. Default None means unbounded. 0 (or a
+        negative value) disables the disk cache entirely, so the call behaves
+        as if ``chunk_cache_dir`` had not been passed, mirroring how
+        ``cache_size_mb=0`` makes the in-memory cache retain nothing. Ignored
+        unless ``chunk_cache_dir`` is set. Eviction only sweeps a directory
+        the cache created or that carries its stamp file, so give the cache a
+        directory of its own if you want the cap enforced.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
     zarr_format : Optional[int], default 2
@@ -178,6 +204,38 @@ def open_zarr(path: str, mode: str = 'r',
         return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
+        if (chunk_cache_dir is not None and mode == 'r' and is_remote
+                and (chunk_cache_max_gb is None or chunk_cache_max_gb > 0)):
+            # Mirror fetched chunks into a local directory, keyed by the source
+            # URL. Unlike the in-memory cache below this outlives the process,
+            # so repeat epochs, DataLoader workers and separate runs all reuse
+            # the same bytes, and it works on zarr 2 as well as zarr 3.
+            from vesuvius.data.chunk_cache import DiskCacheStore
+            # A positive cap must not round down to 0, which the store rejects.
+            max_bytes = (max(1, int(chunk_cache_max_gb * 2**30))
+                         if chunk_cache_max_gb is not None else None)
+            # Zarr turns every exception in this tuple into a None from
+            # store.get, which DiskCacheStore then records as a missing chunk.
+            # Anything wider makes a transient network failure a permanent miss.
+            missing_exceptions = (KeyError, FileNotFoundError)
+            if _ZARR_V3:
+                from zarr.storage import FsspecStore
+                inner = FsspecStore.from_url(
+                    path.rstrip('/'),
+                    storage_options=storage_options,
+                    read_only=True,
+                    allowed_exceptions=missing_exceptions,
+                )
+            else:
+                inner = zarr.storage.FSStore(
+                    path.rstrip('/'), mode='r',
+                    exceptions=missing_exceptions,
+                    **(storage_options or {}),
+                )
+            store = DiskCacheStore(inner, cache_dir=str(chunk_cache_dir), url=path, max_bytes=max_bytes)
+            if verbose:
+                print(f"Wrapping store in persistent disk chunk cache at {chunk_cache_dir}")
+            return zarr.open(store, mode=mode, **kwargs)
         if cache and mode == 'r':
             if not _ZARR_V3:
                 raise NotImplementedError(
