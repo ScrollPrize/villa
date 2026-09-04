@@ -3,11 +3,14 @@ import math
 import numpy as np
 import os
 import trimesh
+import shutil
 import zarr
+from pathlib import Path
 import logging
 from glob import glob
 from itertools import repeat, product
 from numcodecs import Blosc
+from vesuvius.data.utils import open_zarr_group, create_zarr_array
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from numba import jit, set_num_threads
@@ -377,13 +380,26 @@ def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
     if tmp_component in parent_group:
         del parent_group[tmp_component]
 
-    delayed = da.to_zarr(
-        dask_array,
-        zarr_array.store,
-        component=tmp_component_full,
+    # Create the temporary target ourselves (Zarr v2 under either major) and
+    # hand dask the array object: letting dask create it by path writes a
+    # Zarr v3 array plus a root zarr.json under zarr 3, after which the
+    # existing v2 level arrays are no longer visible in the store.
+    compressors = getattr(zarr_array, 'compressors', None)  # zarr 3
+    if compressors is not None:
+        compressor = compressors[0] if compressors else None
+    else:
+        compressor = zarr_array.compressor  # zarr 2
+    tmp_array = create_zarr_array(
+        parent_group,
+        tmp_component,
+        shape=zarr_array.shape,
+        chunks=target_chunks,
+        dtype=zarr_array.dtype,
+        compressor=compressor,
+        fill_value=zarr_array.fill_value,
         overwrite=True,
-        compute=False,
     )
+    delayed = da.to_zarr(dask_array, tmp_array, compute=False)
 
     with ProgressBar():
         delayed.compute(scheduler="threads", num_workers=max(1, num_workers))
@@ -395,10 +411,32 @@ def _rechunk_with_dask(zarr_array, chunk_size, desc, num_workers):
     dataset_name = zarr_array.path.rpartition("/")[2] or zarr_array.path
     if dataset_name in parent_group:
         del parent_group[dataset_name]
-    parent_group.move(tmp_component, dataset_name)
+    _rename_child(parent_group, tmp_component, dataset_name)
 
     refreshed = parent_group[dataset_name]
     return refreshed
+
+
+def _rename_child(group, old_name, new_name):
+    """Rename a child array of ``group`` under either zarr major.
+
+    zarr 3's ``Group.move`` raises NotImplementedError; a Zarr v2 array in a
+    local store is a directory, so rename it on disk and let the group
+    re-read it. Remote stores fall back to ``move`` where it is implemented.
+    """
+    store = group.store
+    root = getattr(store, "root", None) or getattr(store, "path", None)
+    if root is not None:
+        base = Path(str(root))
+        if group.path:
+            base = base / group.path
+        source, destination = base / old_name, base / new_name
+        if source.is_dir():
+            if destination.exists():
+                shutil.rmtree(destination)
+            os.rename(source, destination)
+            return
+    group.move(old_name, new_name)
 
 
 def _build_tmp_component_name(path):
@@ -1533,8 +1571,7 @@ def main():
     label_datasets = []
     label_dataset_name = None
     if args.format == "zarr":
-        label_store = zarr.DirectoryStore(out_path)
-        label_root = zarr.group(store=label_store, overwrite=True)
+        label_root = open_zarr_group(out_path, mode='w')
         label_base_shape = (z_dim, h, w)
         label_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1548,7 +1585,8 @@ def main():
             level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = label_root.create_dataset(
+            ds = create_zarr_array(
+                label_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1585,8 +1623,7 @@ def main():
 
     normals_datasets = []
     if args.output_normals:
-        normals_store = zarr.DirectoryStore(normals_out_path)
-        normals_root = zarr.group(store=normals_store, overwrite=True)
+        normals_root = open_zarr_group(normals_out_path, mode='w')
         normals_base_shape = (z_dim, h, w, 3)
         normals_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1601,7 +1638,8 @@ def main():
             level_shape = compute_level_shape(normals_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = normals_root.create_dataset(
+            ds = create_zarr_array(
+                normals_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1636,8 +1674,7 @@ def main():
     surface_frame_dataset_name = None
 
     if args.output_surface_frame:
-        surface_frame_store = zarr.DirectoryStore(surface_frame_out_path)
-        surface_frame_root = zarr.group(store=surface_frame_store, overwrite=True)
+        surface_frame_root = open_zarr_group(surface_frame_out_path, mode='w')
         surface_frame_base_shape = (z_dim, h, w, 3, 3)
         surface_frame_axes = [
             {"name": "z", "type": "space", "unit": "index"},
@@ -1653,7 +1690,8 @@ def main():
             level_shape = compute_level_shape(surface_frame_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = surface_frame_root.create_dataset(
+            ds = create_zarr_array(
+                surface_frame_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
