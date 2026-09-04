@@ -24,13 +24,14 @@ def _maybe_set_spawn_start_method(argv):
             pass
 
 
-def main(argv=None):
-    """Main entry point for the training script."""
-    if argv is None:
-        argv = sys.argv[1:]
+def build_parser() -> argparse.ArgumentParser:
+    """Build the vesuvius.train argument parser.
 
-    _maybe_set_spawn_start_method(argv)
-
+    Schedule flags (--max-epoch, --max-steps-per-epoch, --max-val-steps-per-epoch,
+    --val-every-n) default to None so a value set in the YAML ``tr_config`` is
+    kept unless the flag is passed explicitly; see update_config_from_args for
+    the fallback used when neither sets it.
+    """
     parser = argparse.ArgumentParser(
         description="Train Vesuvius neural networks for ink detection and segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -104,20 +105,26 @@ def main(argv=None):
                            help="Type of pooling in encoder ('conv' = strided conv)")
 
     # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=1000,
-                           help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=250,
-                           help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=50,
-                           help="Max validation steps per epoch (use all data if unset)")
+    grp_train.add_argument("--max-epoch", type=int, default=None,
+                           help="Maximum number of epochs (overrides tr_config.max_epoch; "
+                                "1000 if neither is set)")
+    grp_train.add_argument("--max-steps-per-epoch", type=int, default=None,
+                           help="Max training steps per epoch (overrides tr_config.max_steps_per_epoch; "
+                                "250 if neither is set)")
+    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=None,
+                           help="Max validation steps per epoch (overrides tr_config.max_val_steps_per_epoch; "
+                                "50 if neither is set)")
     grp_train.add_argument("--full-epoch", action="store_true",
                            help="Iterate over entire train/val set per epoch (overrides max-steps)")
-    grp_train.add_argument("--early-stopping-patience", type=int, default=0,
-                           help="Epochs to wait for val loss improvement (0 disables)")
+    grp_train.add_argument("--early-stopping-patience", type=int, default=None,
+                           help="Epochs to wait for val loss improvement (overrides "
+                                "tr_config.early_stopping_patience; 0 disables, and is the "
+                                "default if neither is set)")
     grp_train.add_argument("--ddp", action="store_true",
                            help="Enable DistributedDataParallel (use with torchrun)")
-    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
-                           help="Perform validation every N epochs (1=every epoch)")
+    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=None,
+                           help="Perform validation every N epochs (overrides tr_config.val_every_n; "
+                                "1=every epoch if neither is set)")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
     grp_train.add_argument("--nproc-per-node", type=int, default=None,
@@ -176,6 +183,17 @@ def main(argv=None):
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 
+    return parser
+
+
+def main(argv=None):
+    """Main entry point for the training script."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    _maybe_set_spawn_start_method(argv)
+
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     mgr = ConfigManager(verbose=args.verbose)
@@ -211,15 +229,6 @@ def main(argv=None):
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     update_config_from_args(mgr, args)
-
-    # Validation frequency
-    if hasattr(args, 'val_every_n') and args.val_every_n is not None:
-        if int(args.val_every_n) < 1:
-            raise ValueError(f"--val-every-n must be >= 1, got {args.val_every_n}")
-        setattr(mgr, 'val_every_n', int(args.val_every_n))
-        mgr.tr_configs["val_every_n"] = int(args.val_every_n)
-        if args.verbose:
-            print(f"Validate every {args.val_every_n} epoch(s)")
 
     # Enable DDP if requested or if torchrun sets WORLD_SIZE>1
     if getattr(args, 'ddp', False) or int(os.environ.get('WORLD_SIZE', '1')) > 1:
