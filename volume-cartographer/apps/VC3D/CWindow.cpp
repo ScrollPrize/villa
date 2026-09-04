@@ -26,7 +26,6 @@
 #include <optional>
 
 #include "VCSettings.hpp"
-#include "RemoteVolumeCachePaths.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -2684,13 +2683,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
     auto updatePersistentCacheSpace = [this]() {
-        auto root = vc3d::remoteCacheRootForState(_state);
-        if (_state) {
-            if (const auto volume = _state->currentVolume();
-                volume && !volume->remoteCacheRoot().empty()) {
-                root = volume->remoteCacheRoot();
-            }
-        }
+        const std::filesystem::path root(
+            vc3d::remoteCachePath().toStdString());
         auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root);
         if (!budget)
             return;
@@ -4193,7 +4187,6 @@ CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
     const std::shared_ptr<Volume>& volume,
     const QString& location,
     std::vector<std::string> tags,
-    const QString& remoteCacheRoot,
     const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg() || !volume) {
@@ -4203,8 +4196,7 @@ CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
     const auto result = _state->vpkg()->attachPreparedVolume(
         location.toStdString(),
         std::move(tags),
-        volume,
-        remoteCacheRoot.toStdString());
+        volume);
     if (result == VolumePkg::AttachVolumeResult::VolumeIdConflict)
         return VolumeAttachResult::VolumeIdConflict;
 
@@ -8709,7 +8701,8 @@ bool CWindow::OpenVolume(const QString& path,
     std::shared_ptr<VolumePkg> package;
     QString loadError;
     try {
-        package = VolumePkg::load(aVpkgPath.toStdString());
+        vc::project::LoadOptions options;
+        package = VolumePkg::load(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
         loadError = QString::fromUtf8(e.what());

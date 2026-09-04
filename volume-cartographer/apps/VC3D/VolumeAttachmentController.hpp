@@ -17,11 +17,6 @@ enum class VolumeAttachmentSelection {
     SelectAttached,
 };
 
-enum class VolumeAttachmentPresentation {
-    Silent,
-    Interactive,
-};
-
 enum class VolumeAttachmentPreparationFailure {
     None,
     NoProject,
@@ -54,7 +49,6 @@ public:
     bool prepare(
         const QString& location,
         std::vector<std::string> tags,
-        VolumeAttachmentPresentation presentation,
         VolumeAttachmentRequest* request,
         QString* errorMessage = nullptr,
         VolumeAttachmentPreparationFailure* failure = nullptr);
@@ -68,13 +62,8 @@ public:
         const QString& url,
         vc::HttpAuth* authOut,
         QString* errorMessage = nullptr) const;
-    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
-
 private:
     struct TaskResult;
-
-    QString configuredRemoteCacheDirectory() const;
-    QString suggestedRemoteCacheDirectory() const;
 
     CWindow* _window{nullptr};
     bool _inFlight{false};
