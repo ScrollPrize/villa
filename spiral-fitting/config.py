@@ -142,6 +142,13 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_gap_expander_min_gap": 1.0,
     "model_gap_expander_softplus_bias": 4.0,
 })
+# The flow-gradient conditioning settings postdate durable checkpoints;
+# missing means off, which is exactly the earlier behaviour.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "optimizer_flow_grad_smoothing": False,
+    "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
+    "optimizer_flow_lazy_moments": False,
+})
 
 _GAP_EXPANDER_DESCRIPTIONS = {
     "model_gap_expander_num_windings": (
@@ -155,6 +162,28 @@ _GAP_EXPANDER_DESCRIPTIONS = {
         "minimum-spacing loss remains the separate geological preference."),
     "model_gap_expander_softplus_bias": (
         "Bias of the stable lower-bounded softplus gap parameterisation."),
+}
+
+_OPTIMIZER_DESCRIPTIONS = {
+    "optimizer_flow_grad_smoothing": (
+        "Gaussian-smooth the flow lattices' gradient before each optimizer "
+        "step (gradient descent in a Sobolev metric, as in diffeomorphic "
+        "registration). The loss is unchanged; every update to the flow is "
+        "smooth at the configured width instead of moving each lattice cell "
+        "on its own noisy gradient. Cylindrical lattices smooth along z and "
+        "around each ring, not across rings."),
+    "optimizer_flow_grad_smoothing_sigma_voxels": (
+        "Width (standard deviation, scroll voxels) of the flow gradient "
+        "smoothing kernel. Applies to both lattices at the same physical "
+        "width; a high-resolution flow cell is model_flow_voxel_resolution "
+        "voxels."),
+    "optimizer_flow_lazy_moments": (
+        "Lazy Adam moments for the flow lattices (torch SparseAdam's masked "
+        "update on the dense gradient): cells no sample touched this step "
+        "keep their moments and value instead of decaying the second moment "
+        "toward zero, which otherwise makes a cell's first update after a "
+        "quiet spell disproportionately large. Weight decay still applies to "
+        "every cell."),
 }
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
@@ -293,6 +322,8 @@ def _field_spec(key, default):
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
+    elif key in _OPTIMIZER_DESCRIPTIONS:
+        spec["description"] = _OPTIMIZER_DESCRIPTIONS[key]
     return spec
 
 
@@ -309,6 +340,12 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
+        # Flow-lattice gradient conditioning (see _OPTIMIZER_DESCRIPTIONS).
+        # Both are read live every step, so they apply at a run boundary
+        # without a rebuild. Off by default.
+        self.optimizer_flow_grad_smoothing = False
+        self.optimizer_flow_grad_smoothing_sigma_voxels = 32.0
+        self.optimizer_flow_lazy_moments = False
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1

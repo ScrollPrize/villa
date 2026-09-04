@@ -48,6 +48,7 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     Config, FitConfig, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
+from lazy_moment_adamw import LazyMomentAdamW
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
@@ -2260,7 +2261,10 @@ class FitContext:
                       'to enable it (some of these losses also need the '
                       'phase/SDT assets, see any warnings above).')
 
-    def _apply_high_res_lr_scale(self, iteration):
+    def _apply_flow_group_settings(self, iteration):
+        """Per-step optimizer settings of the two flow-lattice groups: the
+        high-resolution LR scale and the lazy-moment flag. Read from the
+        live configuration every step, so both are run-boundary settings."""
         scale = get_flow_field_high_res_lr_scale(self.config, iteration)
         low_res_group = next(
             group for group in self.optimiser.param_groups
@@ -2268,6 +2272,11 @@ class FitContext:
         high_res_group = next(
             group for group in self.optimiser.param_groups
             if any(param is self.high_res_flow_params[0] for param in group['params']))
+        # A loaded checkpoint's groups replace the live hyperparameters, so
+        # the flag is re-applied here rather than kept in the group.
+        lazy_moments = bool(self.config.get('optimizer_flow_lazy_moments', False))
+        low_res_group['lazy_moments'] = lazy_moments
+        high_res_group['lazy_moments'] = lazy_moments
         set_optimizer_group_lr_scale(
             self.optimiser,
             self.lr_scheduler,
@@ -2800,7 +2809,10 @@ class FitContext:
             },
         ]
         progress.begin('loading', 'Creating optimizer')
-        self.optimiser = torch.optim.AdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
+        # AdamW for every group; the flow groups may additionally be stepped
+        # with lazy moments (optimizer_flow_lazy_moments, applied per step by
+        # _apply_flow_group_settings), which keeps AdamW's state format.
+        self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
         # Influence masks are scoped to one interactive Run request. They are
         # created from that run's pending inputs and discarded before its autosave.
         self.influence_state = None
@@ -4153,7 +4165,7 @@ class FitContext:
 
     def step(self, iteration):
         self.step_timer.start('fwd')
-        flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
+        flow_field_high_res_lr_scale = self._apply_flow_group_settings(iteration)
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -4591,6 +4603,15 @@ class FitContext:
         self.step_timer.start('comm')
         allreduce_grads_(self.dist_grad_params, self.dist.world_size)
         self.step_timer.stop('comm')
+
+        if self.config.get('optimizer_flow_grad_smoothing', False):
+            # After the all-reduce (smoothing is linear, and every rank then
+            # smooths identical gradients) and before the influence masks, so
+            # smoothing cannot leak gradient outside a masked region.
+            self.step_timer.start('smooth')
+            self.spiral_and_transform.smooth_flow_grad_(
+                float(self.config['optimizer_flow_grad_smoothing_sigma_voxels']))
+            self.step_timer.stop('smooth')
 
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
         for name, p in self.dist_grad_named:

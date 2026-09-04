@@ -78,6 +78,28 @@ layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
 
+## Flow-gradient conditioning
+
+Two optional optimizer settings condition the flow fit without changing the
+loss. Both are read live every step, so they apply at a run boundary (the
+VC3D profile editor shows them as checkboxes in the optimizer group) and
+default to off:
+
+- `optimizer_flow_grad_smoothing` Gaussian-smooths the flow lattices'
+  gradient before the optimizer step, i.e. gradient descent in a Sobolev
+  metric as in diffeomorphic registration. Every update to the flow is then
+  smooth at `optimizer_flow_grad_smoothing_sigma_voxels` (scroll voxels,
+  applied at the same physical width to both lattices of every flow stage).
+  Cylindrical lattices smooth along z and around each ring, not across rings.
+  Runs after the DDP all-reduce and before influence masks, as fused Triton
+  kernels on CUDA (`flow_grad_smoothing.py`; a conv fallback serves CPU and
+  as the reference).
+- `optimizer_flow_lazy_moments` gives the flow groups torch SparseAdam's
+  masked update on their dense gradients (`lazy_moment_adamw.LazyMomentAdamW`):
+  cells no sample touched this step keep their moments and value instead of
+  decaying the second moment toward zero. State stays in AdamW's format, so
+  checkpoints round-trip and the flag can be toggled between runs.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same

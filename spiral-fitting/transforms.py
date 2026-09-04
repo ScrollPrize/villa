@@ -611,6 +611,19 @@ class SpiralAndTransform(nn.Module):
         return lower_bounded_dr(
             self.dr_per_winding_logit, self.gap_min_gap)
 
+    def smooth_flow_grad_(self, sigma_voxels):
+        """Gaussian-smooth the flow lattices' gradients in place.
+
+        ``sigma_voxels`` is in scroll voxels; a high-resolution flow cell is
+        model_flow_voxel_resolution voxels wide, so the width converts to
+        cells here and each flow field scales it for its coarser lattice.
+        Applies to every flow stage. Call after apply_accumulated_field_grad
+        (and after any all-reduce) and before the optimizer step.
+        """
+        cell_voxels = float(self.cfg['model_flow_voxel_resolution'])
+        for flow_field in self.flow_fields:
+            flow_field.smooth_grad_(float(sigma_voxels) / cell_voxels)
+
     def get_shared_transform_tensors(self):
         """The tiny graph paths every evaluation of one transform instance
         shares: the dr-per-winding softplus, the scaled linear logits, and the
