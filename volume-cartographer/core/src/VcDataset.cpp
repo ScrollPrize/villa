@@ -19,6 +19,7 @@
 #include <lz4.h>
 #include <zlib.h>
 #include <utils/c3d_codec.hpp>
+#include <utils/volcomp_codec.hpp>
 
 #include "vc/core/util/CacheCompression.hpp"
 
@@ -38,7 +39,7 @@ std::vector<std::byte> bloscCompressForTest(
 // Compressor configuration (parsed from .zarray JSON)
 // ============================================================================
 
-enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d, Delta3d };
+enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d, Delta3d, Volcomp };
 
 struct CompressorConfig {
     CompressorId id = CompressorId::None;
@@ -52,6 +53,8 @@ struct CompressorConfig {
     int level = 3;
     // c3d target compression ratio (> 1.0). Default 50 ≈ 40 dB on scroll CT.
     float c3d_target_ratio = 50.0f;
+    // volcomp quantiser step (1..255). Default 8 ≈ 40 dB / ~40x on scroll CT.
+    float volcomp_q = 8.0f;
 };
 
 namespace {
@@ -247,6 +250,19 @@ std::vector<std::byte> c3dCompress(std::span<const std::byte> input,
     return utils::c3d_encode(input, p);
 }
 
+std::vector<std::byte> volcompDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    return utils::volcomp_decode(input, outputSize);
+}
+
+std::vector<std::byte> volcompCompress(std::span<const std::byte> input,
+                                       const CompressorConfig& cfg)
+{
+    utils::VolcompCodecParams p;
+    p.q = cfg.volcomp_q;
+    return utils::volcomp_encode(input, p);
+}
+
 void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     z_stream stream{};
@@ -290,6 +306,8 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
         return gzipDecompress(input, outputSize);
     case CompressorId::C3d:
         return c3dDecompress(input, outputSize);
+    case CompressorId::Volcomp:
+        return volcompDecompress(input, outputSize);
     case CompressorId::Delta3d: {
         auto decoded = vc::cacheDecompress(input, outputSize);
         if (!decoded) {
@@ -331,6 +349,9 @@ bool decompressBytesInto(const CompressorConfig& cfg,
         return true;
     case CompressorId::C3d:
         return false;
+    case CompressorId::Volcomp:
+        utils::volcomp_decode_into(input, output);
+        return true;
     case CompressorId::Delta3d:
         if (!vc::cacheDecompressInto(input, output)) {
             throw std::runtime_error(
@@ -357,6 +378,8 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return gzipCompress(input, cfg);
     case CompressorId::C3d:
         return c3dCompress(input, cfg);
+    case CompressorId::Volcomp:
+        return volcompCompress(input, cfg);
     case CompressorId::Delta3d:
         // Encoding needs the chunk shape, which this byte-oriented layer
         // does not have. Volumes are written in this format by
@@ -407,6 +430,9 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
             cfg.level = meta.compression_level > 0 ? meta.compression_level : 5;
         } else if (meta.compressor_id == "c3d") {
             cfg.id = CompressorId::C3d;
+        } else if (meta.compressor_id == "volcomp") {
+            cfg.id = CompressorId::Volcomp;
+            if (meta.codec_q > 0.0f) cfg.volcomp_q = meta.codec_q;
         } else if (vc::isDelta3dCodecName(meta.compressor_id)) {
             cfg.id = CompressorId::Delta3d;
         } else {
@@ -432,6 +458,14 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
                     && cc.configuration->contains("target_ratio")) {
                     cfg.c3d_target_ratio = cc.configuration->value(
                         "target_ratio", cfg.c3d_target_ratio);
+                }
+                return true;
+            }
+            if (cc.name == "volcomp") {
+                cfg.id = CompressorId::Volcomp;
+                if (cc.configuration && cc.configuration->is_object()
+                    && cc.configuration->contains("q")) {
+                    cfg.volcomp_q = cc.configuration->value("q", cfg.volcomp_q);
                 }
                 return true;
             }
@@ -474,13 +508,14 @@ utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize)
 {
     utils::ZarrArray::CodecRegistry reg;
     for (const char* name :
-         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d",
+         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d", "volcomp",
           vc::kDelta3dCodecName, vc::kVcz1CodecName}) {
         CompressorConfig cfg;
         if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
         else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
         else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
         else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
+        else if (std::string(name) == "volcomp") cfg.id = CompressorId::Volcomp;
         else if (vc::isDelta3dCodecName(name))
             cfg.id = CompressorId::Delta3d;
         else                                   cfg.id = CompressorId::Gzip;
@@ -534,15 +569,26 @@ struct VcDataset::Impl {
             auto meta = utils::detail::parse_zarray(readTextFile(path / ".zarray"));
             auto registry = buildZarrCodecRegistry(/*dtypeSize guess*/1);
             utils::ZarrArray::Codec codec;
-            if (!meta.compressor_id.empty()) {
+            if (meta.compressor_id == "volcomp") {
+                // The registry entry carries the default q; writes must use
+                // the q recorded in the metadata (decoding reads it from
+                // each chunk header and needs no parameter).
+                codec = codecFromConfig(compressorFromMeta(meta, 1));
+            } else if (!meta.compressor_id.empty()) {
                 auto it = registry.find(meta.compressor_id);
                 if (it != registry.end()) codec = it->second;
             }
             zarrArray_ = std::make_unique<utils::ZarrArray>(
                 utils::ZarrArray::open_with_metadata(path, std::move(meta), std::move(codec)));
         } else {
-            zarrArray_ = std::make_unique<utils::ZarrArray>(
-                utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1)));
+            auto arr = utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1));
+            if (utils::is_canonical_volcomp(arr.metadata())) {
+                // Same as above for v3: pick up configuration.q for writes.
+                auto meta = arr.metadata();
+                auto codec = codecFromConfig(compressorFromMeta(meta, 1));
+                arr = utils::ZarrArray::open_with_metadata(path, std::move(meta), std::move(codec));
+            }
+            zarrArray_ = std::make_unique<utils::ZarrArray>(std::move(arr));
         }
         const auto& meta = zarrArray_->metadata();
 
@@ -666,6 +712,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             break;
         }
 
+        case CompressorId::Volcomp:
         case CompressorId::Delta3d: {
             auto out = std::span<std::byte>(
                 reinterpret_cast<std::byte*>(output), outBytes);
@@ -1079,6 +1126,15 @@ std::unique_ptr<VcDataset> createZarrDataset(
         // Default level 3 (blosc/zstd) preserves prior behaviour; an explicit
         // compressionLevel > 0 overrides it.
         meta.compression_level = compressionLevel > 0 ? compressionLevel : 3;
+        if (compressor == "volcomp") {
+            // volcomp's atom is a 128^3 u8 chunk; its "level" is the quantiser step q.
+            if (dtype != VcDtype::uint8 || chunks.size() != 3 ||
+                chunks[0] != 128 || chunks[1] != 128 || chunks[2] != 128) {
+                throw std::runtime_error(
+                    "createZarrDataset: volcomp requires uint8 data and 128^3 chunks");
+            }
+            meta.codec_q = compressionLevel > 0 ? static_cast<float>(compressionLevel) : 8.0f;
+        }
     }
 
     // ZarrArray::create writes the .zarray file for us.

@@ -1,12 +1,13 @@
-// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with c3d sharding.
+// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 sharded lossy codecs.
 //
 // Reads zarr v2 chunks (blosc/zstd/raw) from S3 or local filesystem,
-// recompresses with c3d into zarr v3 shards (4096³ shards, 256³ inner chunks),
-// writes zarr v3 output to S3 or local filesystem.
+// recompresses with c3d (4096³ shards, 256³ inner chunks) or volcomp (1024³
+// shards, 128³ inner chunks) into zarr v3 shards, writes zarr v3 output to S3
+// or local filesystem.
 //
-// Each 256³ inner chunk is c3d-encoded individually (C3DC header + c3d
-// bitstream). Shards have a fixed-size index at the start (16 bytes per
-// entry: u64 offset + u64 size, little-endian).
+// Each inner chunk is encoded individually (C3DC / VOLC header + bitstream).
+// Shards have a fixed-size index at the start (16 bytes per entry: u64
+// offset + u64 size, little-endian).
 //
 // Shard index encoding:
 //   (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF) = missing chunk (not present)
@@ -27,8 +28,11 @@
 //   s3+us-east-1://bucket/...     (S3 with explicit region)
 //
 // Options:
+//   --codec NAME      c3d (default) or volcomp
 //   --target-ratio R  c3d target compression ratio [default: 50]
 //                     (50 ≈ 40 dB PSNR on scroll CT)
+//   --q Q             volcomp quantiser step 1..255 [default: 8]
+//                     (8 ≈ 40 dB PSNR / ~40x on scroll CT; 4 near-transparent)
 //   --verify          Verify roundtrip (decode after encode)
 //   --jobs N          Outer worker threads (shards in flight) [default: 8]
 //   --inner-jobs K    Inner worker threads per shard (chunks in flight)
@@ -64,19 +68,34 @@
 #include <blosc.h>
 
 #include "utils/c3d_codec.hpp"
+#include "utils/volcomp_codec.hpp"
 #include "utils/http_fetch.hpp"
 #include "utils/zarr.hpp"
 
 namespace fs = std::filesystem;
 using Json = utils::Json;
 
-// c3d canonical geometry: 4096³ shards with 256³ inner chunks.
-static constexpr size_t SHARD_DIM = 4096;
-static constexpr size_t CHUNK_DIM = 256;
-static constexpr size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;                 // 16
-static constexpr size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
-                                     * CHUNKS_PER_SHARD;                          // 4096
-static constexpr size_t CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
+// Output codec and its canonical geometry. c3d: 4096³ shards with 256³ inner
+// chunks; volcomp: 1024³ shards with 128³ inner chunks. Fixed once at startup
+// from --codec before any worker runs.
+enum class OutCodec { C3d, Volcomp };
+static OutCodec g_codec = OutCodec::C3d;
+static size_t SHARD_DIM = 4096;
+static size_t CHUNK_DIM = 256;
+static size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;                 // 16
+static size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
+                           * CHUNKS_PER_SHARD;                          // 4096
+static size_t CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
+
+static void set_codec_geometry(OutCodec c) {
+    g_codec = c;
+    SHARD_DIM = (c == OutCodec::C3d) ? 4096 : 1024;
+    CHUNK_DIM = (c == OutCodec::C3d) ? 256 : 128;
+    CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;
+    INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD;
+    CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
+}
+static const char* codec_name() { return g_codec == OutCodec::C3d ? "c3d" : "volcomp"; }
 
 // ============================================================================
 // I/O abstraction: local filesystem or S3
@@ -377,7 +396,7 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
 // ============================================================================
 
 static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
-                                         float target_ratio) {
+                                         float target_ratio, float volcomp_q) {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v3;
     meta.shape = shape;
@@ -392,9 +411,15 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
 
     utils::ZarrCodecConfig codec_cfg;
-    codec_cfg.name = "c3d";
-    codec_cfg.configuration = std::make_shared<utils::JsonValue>(
-        utils::JsonValue{{"target_ratio", Json((double)target_ratio)}});
+    if (g_codec == OutCodec::C3d) {
+        codec_cfg.name = "c3d";
+        codec_cfg.configuration = std::make_shared<utils::JsonValue>(
+            utils::JsonValue{{"target_ratio", Json((double)target_ratio)}});
+    } else {
+        codec_cfg.name = "volcomp";
+        codec_cfg.configuration = std::make_shared<utils::JsonValue>(
+            utils::JsonValue{{"q", Json((double)volcomp_q)}});
+    }
     sc.sub_codecs.push_back(codec_cfg);
     meta.shard_config = sc;
 
@@ -672,7 +697,9 @@ int main(int argc, char** argv) {
                   << "Input/output: local path or s3://bucket/path\n"
                   << "\n"
                   << "Options:\n"
+                  << "  --codec NAME      c3d (4096^3 shards / 256^3 chunks) or volcomp (1024^3 / 128^3). [c3d]\n"
                   << "  --target-ratio R  c3d target compression ratio (>1.0). [50]\n"
+                  << "  --q Q             volcomp quantiser step 1..255. [8]\n"
                   << "  --verify         Verify roundtrip after encoding\n"
                   << "  --jobs N         Outer workers (shards in flight) [8]\n"
                   << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
@@ -724,6 +751,8 @@ int main(int argc, char** argv) {
     int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
     std::string occupancy_file; // external occupancy bitmap (coordinator-built)
     float target_ratio = 50.0f; // c3d target compression ratio (>1.0)
+    float volcomp_q = 8.0f;     // volcomp quantiser step (1..255)
+    std::string codec_arg = "c3d";
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -740,14 +769,15 @@ int main(int argc, char** argv) {
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
         else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
         else if (arg == "--target-ratio" && i + 1 < argc) target_ratio = (float)std::atof(argv[++i]);
-        else if (arg == "--codec" || arg == "--qp" || arg == "--air-clamp" || arg == "--bit-shift") {
-            // Legacy h265 flags: removed in the c3d-only switch. Fail fast
-            // so orchestration scripts that still pass them don't silently
-            // inherit --target-ratio defaults and produce mis-encoded data.
+        else if (arg == "--q" && i + 1 < argc) volcomp_q = (float)std::atof(argv[++i]);
+        else if (arg == "--codec" && i + 1 < argc) codec_arg = argv[++i];
+        else if (arg == "--qp" || arg == "--air-clamp" || arg == "--bit-shift") {
+            // Legacy h265 flags: removed in the c3d switch. Fail fast so
+            // orchestration scripts that still pass them don't silently
+            // inherit defaults and produce mis-encoded data.
             fprintf(stderr,
                 "Error: flag %s was removed along with the H.265 codec path.\n"
-                "       The recompress tool is c3d-only now; use --target-ratio "
-                "instead of --qp, and drop --codec / --air-clamp / --bit-shift.\n",
+                "       Use --codec c3d --target-ratio R or --codec volcomp --q Q.\n",
                 arg.c_str());
             return 1;
         }
@@ -756,8 +786,22 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (codec_arg == "c3d") set_codec_geometry(OutCodec::C3d);
+    else if (codec_arg == "volcomp") set_codec_geometry(OutCodec::Volcomp);
+    else {
+        fprintf(stderr, "--codec must be c3d or volcomp, got %s\n", codec_arg.c_str());
+        return 1;
+    }
     if (!(target_ratio > 1.0f)) {
         fprintf(stderr, "--target-ratio must be > 1.0, got %g\n", (double)target_ratio);
+        return 1;
+    }
+    if (!(volcomp_q >= 1.0f && volcomp_q <= 255.0f)) {
+        fprintf(stderr, "--q must be in [1, 255], got %g\n", (double)volcomp_q);
+        return 1;
+    }
+    if (g_codec == OutCodec::Volcomp && !utils::volcomp_available()) {
+        fprintf(stderr, "volcomp codec is not available on this host (needs an x86-64 AVX2 build)\n");
         return 1;
     }
     if (stats_pct < 0) stats_pct = 0;
@@ -822,8 +866,12 @@ int main(int argc, char** argv) {
 
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
-    printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
-           (double)target_ratio, SHARD_DIM, CHUNK_DIM);
+    if (g_codec == OutCodec::C3d)
+        printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
+               (double)target_ratio, SHARD_DIM, CHUNK_DIM);
+    else
+        printf("Codec: volcomp (q %.2f), shard: %zu³, chunk: %zu³\n",
+               (double)volcomp_q, SHARD_DIM, CHUNK_DIM);
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
     if (world > 1) printf("Fanout: rank %d / world %d (sz %% %d == %d)\n",
                            rank, world, world, rank);
@@ -927,7 +975,7 @@ int main(int argc, char** argv) {
         // coordinator writes it once before fanning out workers).
         if (one_shard_arg.empty() && shard_file.empty()) {
             output->write_string(std::to_string(l) + "/zarr.json",
-                                  make_zarr_v3_metadata(shape, target_ratio));
+                                  make_zarr_v3_metadata(shape, target_ratio, volcomp_q));
         }
 
         // Reuse cached .zarray from discovery phase (saves a GET per worker).
@@ -1315,8 +1363,10 @@ int main(int argc, char** argv) {
                         std::to_string(task.src_base_x);
                     try {
                         auto data = t_input->read(src_key);
-                        if (utils::is_c3d_compressed(
-                                std::span<const std::byte>(data))) {
+                        const bool same_codec = (g_codec == OutCodec::C3d)
+                            ? utils::is_c3d_compressed(std::span<const std::byte>(data))
+                            : utils::is_volcomp_compressed(std::span<const std::byte>(data));
+                        if (same_codec) {
                             total_raw.fetch_add(CHUNK_VOXELS);
                             total_compressed.fetch_add(data.size());
                             processed_chunks.fetch_add(1);
@@ -1423,6 +1473,8 @@ int main(int argc, char** argv) {
 
                 std::vector<std::byte> compressed;
                 auto decode_cb = [&](std::vector<std::byte>& enc) {
+                    if (g_codec == OutCodec::Volcomp)
+                        return utils::volcomp_decode(std::span<const std::byte>(enc), CHUNK_VOXELS);
                     utils::C3dCodecParams p;
                     p.target_ratio = target_ratio;
                     p.depth = (int)CHUNK_DIM;
@@ -1432,7 +1484,12 @@ int main(int argc, char** argv) {
                                              CHUNK_VOXELS, p);
                 };
 
-                {
+                if (g_codec == OutCodec::Volcomp) {
+                    utils::VolcompCodecParams p;
+                    p.q = volcomp_q;
+                    compressed = utils::volcomp_encode(
+                        std::span<const std::byte>(task.raw), p);
+                } else {
                     utils::C3dCodecParams p;
                     p.target_ratio = target_ratio;
                     p.depth = (int)CHUNK_DIM;

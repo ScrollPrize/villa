@@ -388,6 +388,13 @@ public:
                                       bytes->begin() + static_cast<std::ptrdiff_t>(offset + count));
     }
 
+    std::optional<std::size_t> size_of(const std::string& key) const override
+    {
+        auto bytes = get_if_exists(key);  // served from the local cache after the first fetch
+        if (!bytes) return std::nullopt;
+        return bytes->size();
+    }
+
     void set(const std::string&, std::span<const std::byte>) override
     {
         throw std::runtime_error("Remote Lasagna cache store is read-only");

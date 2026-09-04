@@ -69,11 +69,12 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored c3d codec.
+# utils header-only library + vendored c3d and volcomp codecs.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
     $<BUILD_INTERFACE:utils_c3d_codec>
     vc_delta3d::vc_delta3d
+    $<BUILD_INTERFACE:utils_volcomp_codec>
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc
