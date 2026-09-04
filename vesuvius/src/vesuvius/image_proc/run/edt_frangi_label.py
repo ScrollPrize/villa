@@ -3,6 +3,7 @@ import os
 import glob
 import argparse
 import multiprocessing
+import sys
 
 import numpy as np
 import tifffile
@@ -96,6 +97,10 @@ def main():
         print(f"{len(failures)} files failed:")
         for fail in failures:
             print(f"File: {fail[0]}, Error: {fail[2]}")
+        # Exit non-zero so a caller can tell a failed batch from a clean one:
+        # per-file errors are swallowed by process_file(), so the exit code is
+        # the only signal a script driving this command ever sees.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
