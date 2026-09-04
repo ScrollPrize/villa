@@ -32,6 +32,24 @@
 namespace vc::lasagna {
 namespace {
 
+// Process-wide logical fetch counters behind remoteStoreStats(); see the
+// header for semantics. Atomics: every PersistentHttpStore instance and every
+// reader thread updates them without taking the in-flight mutex.
+struct RemoteStoreCounters {
+    std::atomic<std::uint64_t> owned{0};
+    std::atomic<std::uint64_t> joined{0};
+    std::atomic<std::uint64_t> fromDisk{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> ownerNs{0};
+    std::atomic<std::uint64_t> failures{0};
+};
+
+RemoteStoreCounters& remoteStoreCounters() noexcept
+{
+    static RemoteStoreCounters counters;
+    return counters;
+}
+
 [[nodiscard]] bool startsWithNoCase(std::string_view value, std::string_view prefix)
 {
     if (value.size() < prefix.size())
@@ -280,12 +298,15 @@ public:
     {
         const auto relative = checkedRelativePath(key);
         const auto path = cachePath(relative);
-        if (auto bytes = readIfExists(path, !isMetadataPath(relative)))
+        if (auto bytes = readIfExists(path, !isMetadataPath(relative))) {
+            remoteStoreCounters().fromDisk.fetch_add(1, std::memory_order_relaxed);
             return bytes;
+        }
         if (isMetadataPath(relative)) {
             const auto legacyPath = cacheRoot_ / relative;
             if (auto bytes = readIfExists(legacyPath, false)) {
                 publish(path, *bytes, false);
+                remoteStoreCounters().fromDisk.fetch_add(1, std::memory_order_relaxed);
                 return bytes;
             }
         }
@@ -298,8 +319,10 @@ public:
         bool announceStreaming = false;
         {
             std::lock_guard<std::mutex> lock(inFlightMutex_);
-            if (auto bytes = readIfExists(path, !isMetadataPath(relative)))
+            if (auto bytes = readIfExists(path, !isMetadataPath(relative))) {
+                remoteStoreCounters().fromDisk.fetch_add(1, std::memory_order_relaxed);
                 return bytes;
+            }
             if (auto it = inFlight_.find(requestKey); it != inFlight_.end()) {
                 request = it->second;
             } else {
@@ -324,9 +347,11 @@ public:
             lock.unlock();
             if (error)
                 std::rethrow_exception(error);
+            remoteStoreCounters().joined.fetch_add(1, std::memory_order_relaxed);
             return found ? std::move(sharedBytes) : std::nullopt;
         }
 
+        const auto fetchStart = std::chrono::steady_clock::now();
         std::optional<std::vector<std::byte>> bytes;
         std::exception_ptr error;
         try {
@@ -356,6 +381,23 @@ public:
             error = std::current_exception();
         }
 
+        {
+            auto& counters = remoteStoreCounters();
+            const auto elapsed = std::chrono::steady_clock::now() - fetchStart;
+            counters.ownerNs.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                std::memory_order_relaxed);
+            if (error) {
+                counters.failures.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Owner fetch (origin GET incl. disk publish). A not-found
+                // object counts as owned with zero bytes.
+                counters.owned.fetch_add(1, std::memory_order_relaxed);
+                if (bytes)
+                    counters.bytes.fetch_add(bytes->size(), std::memory_order_relaxed);
+            }
+        }
         size_t cachedCount = 0;
         {
             std::lock_guard<std::mutex> lock(inFlightMutex_);
@@ -548,6 +590,19 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
 }
 
 } // namespace
+
+RemoteStoreStats remoteStoreStats() noexcept
+{
+    const auto& counters = remoteStoreCounters();
+    RemoteStoreStats stats;
+    stats.objectsOwned = counters.owned.load(std::memory_order_relaxed);
+    stats.objectsJoined = counters.joined.load(std::memory_order_relaxed);
+    stats.objectsFromDisk = counters.fromDisk.load(std::memory_order_relaxed);
+    stats.bytesOwned = counters.bytes.load(std::memory_order_relaxed);
+    stats.ownerNanoseconds = counters.ownerNs.load(std::memory_order_relaxed);
+    stats.failures = counters.failures.load(std::memory_order_relaxed);
+    return stats;
+}
 
 LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
     : manifest_(std::move(manifest))

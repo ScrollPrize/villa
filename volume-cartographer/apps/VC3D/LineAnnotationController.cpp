@@ -403,6 +403,42 @@ constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 // REOPTIMIZE_TAG) when it had to synthesize line_points it cannot fit to
 // the volume; keep the literal in sync with that module.
 constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
+
+// Opt-in per-solve / per-open performance log lines (VC3D_LINE_PERF_LOG=1).
+// Diagnostics only; nothing else reads the flag.
+bool lineAnnotationPerfLogEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("VC3D_LINE_PERF_LOG");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    return enabled;
+}
+
+double elapsedMsSince(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+// Formats the delta of two remote-store snapshots for a log line. The
+// counters are process-wide, so concurrent work (metrics, other panes,
+// prefetch) is included; treat the numbers as an upper bound for one solve.
+std::string remoteStoreDeltaString(const vc::lasagna::RemoteStoreStats& before,
+                                   const vc::lasagna::RemoteStoreStats& after)
+{
+    const auto owned = after.objectsOwned - before.objectsOwned;
+    const auto joined = after.objectsJoined - before.objectsJoined;
+    const auto disk = after.objectsFromDisk - before.objectsFromDisk;
+    const auto bytes = after.bytesOwned - before.bytesOwned;
+    const double ownerMs =
+        static_cast<double>(after.ownerNanoseconds - before.ownerNanoseconds) / 1.0e6;
+    const auto failures = after.failures - before.failures;
+    return std::format(
+        "remote_owned={} remote_joined={} remote_disk_hits={} remote_kib={:.0f} "
+        "remote_owner_ms_sum={:.0f} remote_failures={}",
+        owned, joined, disk, static_cast<double>(bytes) / 1024.0, ownerMs, failures);
+}
 using Clock = std::chrono::steady_clock;
 
 struct InitialLineDiscretization {
@@ -2901,14 +2937,31 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         ? std::optional<cv::Vec3d>{}
         : std::optional<cv::Vec3d>{it->controlPoints[it->controlPoints.size() / 2]};
 
+    // Rung 2 instrumentation (VC3D_LINE_PERF_LOG=1): the two GUI-thread stalls
+    // of a stored-fiber open are dataset/sampler construction and the
+    // whole-line normal pass below.
+    const bool perfLog = lineAnnotationPerfLogEnabled();
+    const auto openStart = std::chrono::steady_clock::now();
+    const auto storeBefore = perfLog ? vc::lasagna::remoteStoreStats()
+                                     : vc::lasagna::RemoteStoreStats{};
     if (!ensureDatasetForSession(*session)) {
         return;
     }
+    const double datasetMs = elapsedMsSince(openStart);
 
     try {
+        const auto normalPassStart = std::chrono::steady_clock::now();
         session->optimizedLine = lineModelFromPoints(it->linePoints, session->normalSampler.get());
         ++session->lineRevision;
         session->fiberMetricsMatchStoredFiber = true;
+        if (perfLog) {
+            Logger()->info(
+                "Line annotation fiber open perf: fiber={} points={} controls={} "
+                "dataset_sampler_ms={:.0f} normal_pass_ms={:.0f} open_total_ms={:.0f} {}",
+                it->fileName, it->linePoints.size(), it->controlPoints.size(), datasetMs,
+                elapsedMsSince(normalPassStart), elapsedMsSince(openStart),
+                remoteStoreDeltaString(storeBefore, vc::lasagna::remoteStoreStats()));
+        }
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
                       .arg(fiberId)
@@ -10589,6 +10642,22 @@ void LineAnnotationController::startFiberModeOptimization(
             task.manifestPath = manifestPath;
             task.eventName = "native_fiber_trace3d_fiber_mode";
             task.focusBoundsBase = focusBoundsBase;
+            // Rung 2 instrumentation: opt-in wall breakdown of the worker
+            // transaction (optimizer, post-solve normal pass) plus the
+            // process-wide remote-store delta. The trace profile is attached
+            // only when logging so the untouched path stays identical.
+            const bool perfLog = lineAnnotationPerfLogEnabled();
+            const auto workerStart = std::chrono::steady_clock::now();
+            const auto storeBefore = perfLog ? vc::lasagna::remoteStoreStats()
+                                             : vc::lasagna::RemoteStoreStats{};
+            vc::fiber_tracer::FiberTraceProfile traceProfile;
+            if (perfLog) {
+                request.traceConfig.profile = &traceProfile;
+            }
+            const bool retraceAll = request.retraceAll;
+            const size_t dirtyCount = request.dirtySegments ? request.dirtySegments->size() : 0;
+            const bool dirtyEngaged = request.dirtySegments.has_value();
+            const size_t controlCount = request.controlPoints.size();
             try {
                 (void)predictionField;
                 (void)normalSampler;
@@ -10597,6 +10666,7 @@ void LineAnnotationController::startFiberModeOptimization(
                 auto optimized =
                     vc3d::line_annotation::optimizeFiberWithNativeFallback(
                         std::move(request));
+                const double optimizerMs = elapsedMsSince(workerStart);
                 task.controlPoints = std::move(optimized.controlPoints);
                 std::vector<cv::Vec3d> points;
                 points.reserve(optimized.optimization.line.points.size());
@@ -10604,9 +10674,38 @@ void LineAnnotationController::startFiberModeOptimization(
                     points.push_back(point.position);
                 }
                 task.result = std::move(optimized.optimization);
+                const auto normalPassStart = std::chrono::steady_clock::now();
                 task.result.line = LineAnnotationController::lineModelFromPoints(
                     points, normalSampler.get());
                 task.ok = true;
+                if (perfLog) {
+                    const double normalPassMs = elapsedMsSince(normalPassStart);
+                    const auto storeAfter = vc::lasagna::remoteStoreStats();
+                    Logger()->info(
+                        "Line annotation fiber-mode perf: retrace_all={} dirty_engaged={} "
+                        "dirty_spans={} controls={} points={} worker_ms={:.0f} "
+                        "optimizer_ms={:.0f} span_trace_ms={:.0f} reinit_ms={:.0f} "
+                        "tail_trace_ms={:.0f} tail_normal_pass_ms={:.0f} "
+                        "final_normal_pass_ms={:.0f} native_segments={} lasagna_fallback={} "
+                        "native_tails={} lasagna_tails={} trace_calls={} "
+                        "trace_pred_prefetch_ms={:.0f} trace_normal_prefetch_ms={:.0f} "
+                        "trace_score_ms={:.0f} report_ceres_ms={:.0f} "
+                        "report_prefetch_ms={:.0f} report_chunks_read={} {}",
+                        retraceAll, dirtyEngaged, dirtyCount, controlCount, points.size(),
+                        elapsedMsSince(workerStart), optimizerMs, optimized.spanTraceMs,
+                        optimized.reinitMs, optimized.tailTraceMs, optimized.tailNormalPassMs,
+                        normalPassMs, optimized.nativeSegments,
+                        optimized.lasagnaFallbackSegments, optimized.nativeExtrapolations,
+                        optimized.lasagnaFallbackExtrapolations, traceProfile.oneWayCalls,
+                        traceProfile.predictionPrefetchSeconds * 1000.0,
+                        traceProfile.normalPrefetchSeconds * 1000.0,
+                        traceProfile.candidateScoreSeconds * 1000.0,
+                        task.result.report.ceresSolveMs,
+                        task.result.report.normalChunkPrefetchMs +
+                            task.result.report.normalMaterializeMs,
+                        task.result.report.normalPrefetchChunksRead,
+                        remoteStoreDeltaString(storeBefore, storeAfter));
+                }
             } catch (const std::exception& ex) {
                 task.error = ex.what();
             } catch (...) {

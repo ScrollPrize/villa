@@ -5,6 +5,7 @@
 #include "vc/lasagna/LineSpline.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <sstream>
@@ -549,12 +550,15 @@ int replaceOpenTailsWithNative(
     output.optimization.line.displayFrameAnchorIndex =
         static_cast<int>(combined.size() / 2);
     output.optimization.line.points.reserve(combined.size());
+    const auto normalPassStart = std::chrono::steady_clock::now();
     for (const auto& point : combined) {
         vc::lasagna::LinePoint linePoint;
         linePoint.position = point;
         linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
         output.optimization.line.points.push_back(std::move(linePoint));
     }
+    output.tailNormalPassMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - normalPassStart).count();
     return static_cast<int>(leftTail.size()) - 1 - firstControl;
 }
 
@@ -764,10 +768,13 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                 throw std::runtime_error(
                     "fiber prediction or trace-normal sampler is unavailable");
             }
+            const auto traceStart = std::chrono::steady_clock::now();
             traced = vc::fiber_tracer::traceFiberSegment(
                 *request.predictions,
                 traceRequest,
                 request.traceNormalSampler);
+            output.spanTraceMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - traceStart).count();
         } catch (const std::exception& ex) {
             traceException = ex.what();
             traced.reset();
@@ -934,11 +941,14 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                                           -rightDirection});
             }
         }
+        const auto reinitStart = std::chrono::steady_clock::now();
         reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
             std::move(stitched), optimizerControlPoints(request.controlPoints),
             controlIndices, controlIndices[controlIndices.size() / 2],
             request.lasagnaConfig, std::move(protectedSpans),
             std::move(hardDirections));
+        output.reinitMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - reinitStart).count();
         if (!reinitialized.failed)
             break;
         // A cancelled solve reports failure through the candidate machinery;
@@ -1004,8 +1014,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             static_cast<double>(reinitialized.fixedPointIndices[index]);
     }
     if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+        const auto tailStart = std::chrono::steady_clock::now();
         const int shift = replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
+        output.tailTraceMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tailStart).count();
         for (auto& control : request.controlPoints) {
             control.optimizedIndex += shift;
             control.linePosition += static_cast<double>(shift);

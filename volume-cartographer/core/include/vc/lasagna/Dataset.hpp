@@ -3,6 +3,7 @@
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -53,6 +54,23 @@ public:
 private:
     LasagnaDatasetManifest manifest_;
 };
+
+// Process-wide counters for the remote read-through store (all
+// PersistentHttpStore instances). Logical objects, not HTTP attempts: one
+// "owned" per fetch that went to the origin, one "joined" per caller that
+// waited on another caller's in-flight fetch, one "fromDisk" per disk-cache
+// hit. Monotonic; consumers take before/after deltas. Overlapping work
+// (metrics, other panes) is included in a delta, so treat it as a process
+// total, not an exact per-operation count.
+struct RemoteStoreStats {
+    std::uint64_t objectsOwned = 0;
+    std::uint64_t objectsJoined = 0;
+    std::uint64_t objectsFromDisk = 0;
+    std::uint64_t bytesOwned = 0;
+    std::uint64_t ownerNanoseconds = 0;
+    std::uint64_t failures = 0;
+};
+[[nodiscard]] RemoteStoreStats remoteStoreStats() noexcept;
 
 // Open a channel group's Zarr through the local filesystem or, for a
 // manifest-backed catalog cache, through its persistent read-through store.

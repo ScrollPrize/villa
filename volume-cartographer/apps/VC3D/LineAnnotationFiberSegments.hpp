@@ -283,6 +283,12 @@ struct FiberModeOptimizationResult {
     int csplineFallbackSegments = 0;
     int nativeExtrapolations = 0;
     int lasagnaFallbackExtrapolations = 0;
+    // Wall-clock breakdown of one fiber-mode solve (inclusive, non-additive
+    // with the optimizer's own report). Diagnostics only.
+    double spanTraceMs = 0.0;       // native traceFiberSegment calls, summed
+    double reinitMs = 0.0;          // reinitializeAndOptimizeExistingLine calls, summed
+    double tailTraceMs = 0.0;       // replaceOpenTailsWithNative incl. its normal pass
+    double tailNormalPassMs = 0.0;  // the per-point sampleNormal loop inside it
 };
 
 [[nodiscard]] FiberModeOptimizationResult optimizeFiberWithNativeFallback(
