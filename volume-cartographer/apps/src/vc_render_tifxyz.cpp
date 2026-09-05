@@ -1664,6 +1664,7 @@ int main(int argc, char *argv[])
             }
         }
 
+        bool exactPrefetchComplete = false;
         if (prefetchRemote) {
             constexpr uint32_t kPrefetchBandH = 128;
             uint32_t rowStart = 0;
@@ -1701,14 +1702,18 @@ int main(int argc, char *argv[])
             if (!prefetchChunkKeys(chunk_cache, prefetchKeys)) {
                 return false;
             }
+            exactPrefetchComplete = true;
         }
 
         // ---- Render pass ----
         {
+            vc::render::prefetch::PrefetchedArrayView prefetchedView(*chunk_cache);
+            auto* renderingCache = exactPrefetchComplete
+                ? static_cast<vc::render::IChunkedArray*>(&prefetchedView) : chunk_cache;
             if (wantZarr) {
                 // Tile-based: OMP-parallel over output zarr chunks
                 if (useU16)
-                    renderTiles<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderTiles<uint16_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1718,7 +1723,7 @@ int main(int argc, char *argv[])
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
                 else
-                    renderTiles<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderTiles<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1750,13 +1755,13 @@ int main(int argc, char *argv[])
                 };
 
                 if (useU16)
-                    renderBands<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderBands<uint16_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
                 else
-                    renderBands<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
+                    renderBands<uint8_t>(surf.get(), chunk_cache, renderingCache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,

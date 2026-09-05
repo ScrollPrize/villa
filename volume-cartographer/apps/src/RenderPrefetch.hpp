@@ -8,9 +8,49 @@
 #include <cstddef>
 #include <cstdint>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace vc::render::prefetch {
+
+// Blocking samplers may submit coarse speculative requests of their own.
+// Use this view only after the CLI's exact prefetch has completed. All real
+// reads still reach the source, including cache misses after RAM eviction.
+// The source must outlive the view; no cache or process-wide setting is changed.
+class PrefetchedArrayView final : public IChunkedArray {
+public:
+    explicit PrefetchedArrayView(IChunkedArray& source) : source_(source) {}
+    int numLevels() const override { return source_.numLevels(); }
+    std::array<int, 3> shape(int level) const override { return source_.shape(level); }
+    std::array<int, 3> chunkShape(int level) const override { return source_.chunkShape(level); }
+    ChunkDtype dtype() const override { return source_.dtype(); }
+    double fillValue() const override { return source_.fillValue(); }
+    LevelTransform levelTransform(int level) const override { return source_.levelTransform(level); }
+    ChunkResult tryGetChunk(int level, int z, int y, int x) override
+    { return source_.tryGetChunk(level, z, y, x); }
+    ChunkResult tryGetChunk(int level, int z, int y, int x, const ChunkRequestContext& request) override
+    { return source_.tryGetChunk(level, z, y, x, request); }
+    ChunkResult getChunkIfCached(int level, int z, int y, int x) override
+    { return source_.getChunkIfCached(level, z, y, x); }
+    ChunkResult getChunkBlocking(int level, int z, int y, int x) override
+    { return source_.getChunkBlocking(level, z, y, x); }
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int = 0) override {}
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int, const ChunkRequestContext&) override {}
+    void replaceViewDemand(const ChunkRequestContext& request, const std::array<float, 2>& focus,
+                           std::vector<ChunkViewportSample> samples) override
+    { source_.replaceViewDemand(request, focus, std::move(samples)); }
+    void markViewActive(std::uint64_t viewId) override { source_.markViewActive(viewId); }
+    void clearSourceViewDemand(std::uint64_t viewId, std::uint64_t version = 0) override
+    { source_.clearSourceViewDemand(viewId, version); }
+    void clearViewDemand(std::uint64_t viewId, std::uint64_t version = 0) override
+    { source_.clearViewDemand(viewId, version); }
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback callback) override
+    { return source_.addChunkReadyListener(std::move(callback)); }
+    void removeChunkReadyListener(ChunkReadyCallbackId id) override
+    { source_.removeChunkReadyListener(id); }
+private:
+    IChunkedArray& source_;
+};
 
 // readMultiSlice/sampleTileSlices use Trilinear; readCompositeFast uses Nearest.
 inline vc::Sampling samplingForRender(bool composite)
