@@ -930,6 +930,7 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 

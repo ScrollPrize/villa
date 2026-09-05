@@ -1,4 +1,5 @@
 #include <iostream>
+#include "RenderPrefetch.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -361,88 +362,8 @@ static std::vector<float> buildCompositeOffsetList(
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep));
+        out.push_back(float(zi) * float(sliceStep));
     return out;
-}
-
-struct ChunkRegion {
-    int minIz = 0, maxIz = -1;
-    int minIy = 0, maxIy = -1;
-    int minIx = 0, maxIx = -1;
-
-    [[nodiscard]] bool valid() const
-    {
-        return minIz <= maxIz && minIy <= maxIy && minIx <= maxIx;
-    }
-};
-
-static ChunkRegion computeChunkRegionForSamples(
-    const cv::Mat_<cv::Vec3f>& base,
-    const cv::Mat_<cv::Vec3f>& dirs,
-    const std::vector<float>& offsets,
-    vc::render::IChunkedArray* ds,
-    int level)
-{
-    ChunkRegion invalid;
-    if (!ds || base.empty() || offsets.empty()) return invalid;
-
-    float loX = std::numeric_limits<float>::max();
-    float loY = std::numeric_limits<float>::max();
-    float loZ = std::numeric_limits<float>::max();
-    float hiX = std::numeric_limits<float>::lowest();
-    float hiY = std::numeric_limits<float>::lowest();
-    float hiZ = std::numeric_limits<float>::lowest();
-    bool found = false;
-
-    auto updateBounds = [&](int r, int c) {
-        const auto& pt = base(r, c);
-        if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2])) return;
-
-        const auto& dir = dirs(r, c);
-        for (float off : offsets) {
-            float px = pt[0] + dir[0] * off;
-            float py = pt[1] + dir[1] * off;
-            float pz = pt[2] + dir[2] * off;
-            loX = std::min(loX, px); hiX = std::max(hiX, px);
-            loY = std::min(loY, py); hiY = std::max(hiY, py);
-            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
-            found = true;
-        }
-    };
-
-    const int h = base.rows;
-    const int w = base.cols;
-    for (int c = 0; c < w; c++) {
-        updateBounds(0, c);
-        updateBounds(h - 1, c);
-    }
-    for (int r = 1; r < h - 1; r++) {
-        updateBounds(r, 0);
-        updateBounds(r, w - 1);
-    }
-    for (int r = 32; r < h - 1; r += 32)
-        for (int c = 32; c < w - 1; c += 32)
-            updateBounds(r, c);
-
-    if (!found) return invalid;
-
-    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
-    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
-
-    const auto chunkShape = ds->chunkShape(level);
-    const auto shape = ds->shape(level);
-
-    ChunkRegion region;
-    region.minIx = std::max(0, int(std::floor(loX / double(chunkShape[2]))));
-    region.maxIx = std::min(int(std::ceil(hiX / double(chunkShape[2]))),
-                            int((shape[2] - 1) / chunkShape[2]));
-    region.minIy = std::max(0, int(std::floor(loY / double(chunkShape[1]))));
-    region.maxIy = std::min(int(std::ceil(hiY / double(chunkShape[1]))),
-                            int((shape[1] - 1) / chunkShape[1]));
-    region.minIz = std::max(0, int(std::floor(loZ / double(chunkShape[0]))));
-    region.maxIz = std::min(int(std::ceil(hiZ / double(chunkShape[0]))),
-                            int((shape[0] - 1) / chunkShape[0]));
-    return region;
 }
 
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
@@ -513,7 +434,8 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     const std::vector<float>& accumOffsets,
     bool isComposite,
     int compositeStart,
-    int compositeEnd)
+    int compositeEnd,
+    vc::Sampling method)
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
@@ -539,13 +461,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
-        auto region = computeChunkRegionForSamples(base, dirs, offsets, ds, level);
-        if (region.valid()) {
-            for (int iz = region.minIz; iz <= region.maxIz; iz++)
-                for (int iy = region.minIy; iy <= region.maxIy; iy++)
-                    for (int ix = region.minIx; ix <= region.maxIx; ix++)
-                        uniq.insert(vc::render::ChunkKey{level, iz, iy, ix});
-        }
+        vc::render::prefetch::insertExactChunksForSamples(base, dirs, offsets, ds, level, method, uniq);
 
         auto now = std::chrono::steady_clock::now();
         double since = std::chrono::duration<double>(now - lastPrint).count();
@@ -669,7 +585,7 @@ static void renderBands(
                 readCompositeFast(compOut, cache, level, base, dirs,
                                   float(sliceStep),
                                   compositeStart, compositeEnd,
-                                  compositeParams);
+                                  compositeParams, vc::render::prefetch::samplingForRender(true));
             }
             cv::Mat s = compOut;
             rotateFlipIfNeeded(s, rotQuad, flipAxis);
@@ -878,7 +794,7 @@ static void renderTiles(
                     readCompositeFast(compOut, cache, level, base, dirs,
                                       float(sliceStep),
                                       compositeStart, compositeEnd,
-                                      compositeParams);
+                                      compositeParams, vc::render::prefetch::samplingForRender(true));
                     raw.resize(1);
                     raw[0] = compOut;
                 }
@@ -1750,7 +1666,8 @@ int main(int argc, char *argv[])
                 hasAffine, affineTransform,
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
-                isCompositeMode, compositeStart, compositeEnd);
+                isCompositeMode, compositeStart, compositeEnd,
+                vc::render::prefetch::samplingForRender(isCompositeMode));
 
             logPrintf(stdout, "Prefetch: %zu chunk(s) across rows %u..%u\n",
                       prefetchKeys.size(),
