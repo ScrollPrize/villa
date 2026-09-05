@@ -2397,6 +2397,19 @@ void ChunkCache::unregisterStateBudget(State& state)
     }
 }
 
+void ChunkCache::waitForPendingChunks() const
+{
+    auto state = state_;
+    std::unique_lock lock(state->mutex_);
+    state->cv_.wait(lock, [&] {
+        return std::none_of(state->entries_.begin(), state->entries_.end(),
+                            [](const auto& item) {
+                                return item.second.status == EntryStatus::InFlight;
+                            }) &&
+               state->persistentWritesInFlight_.load(std::memory_order_acquire) == 0;
+    });
+}
+
 void ChunkCache::waitForPersistentWrites() const
 {
     auto state = state_;

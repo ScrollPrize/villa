@@ -1889,6 +1889,11 @@ int main(int argc, char *argv[])
     if (!process_one(seg_path))
         return EXIT_FAILURE;
 
+    // Band prefetch can outlive the final sampled pixel. Let its downloads and
+    // cache writes finish before the cache destructor invalidates the requests.
+    if (useRemoteCache && ownedChunkCache && ownedChunkCache->stats().persistentCacheEnabled)
+        ownedChunkCache->waitForPendingChunks();
+
     stopLogFlusher();
     return EXIT_SUCCESS;
 }
