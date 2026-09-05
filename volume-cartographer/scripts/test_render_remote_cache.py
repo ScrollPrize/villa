@@ -88,6 +88,7 @@ def main():
     shutil.copytree(mirror, legacy)
     render('legacy-no-source', legacy, reject=True)
     render('legacy-unfetched-group', legacy, reject=True, group=2)
+    render('legacy-unfetched-level-directory', legacy / '2', reject=True, group=0)
     assert render('legacy-explicit-b', legacy, args.source_b) == b
     summary = {'source_a_sha256': a, 'source_b_sha256': b,
                'source_a_payloads': len(first_payloads), 'both_payloads': len(combined)}

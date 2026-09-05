@@ -464,20 +464,26 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
 static bool isPartialRemoteCache(const std::filesystem::path& path)
 {
     if (!std::filesystem::is_directory(path)) return false;
-    for (const auto& component : std::filesystem::weakly_canonical(path)) {
-        if (component == "remote_sources") return true;
-    }
-    if (std::filesystem::exists(path / "remote_sources") ||
-        std::filesystem::exists(path / ".remote_source.json")) return true;
-    // Older versions staged directly in -v and also published Zarr metadata.
-    // Those directories can contain only a subset of the source chunks.
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-        const auto name = entry.path().filename().string();
-        if (entry.is_directory() && name.starts_with("level_") &&
-            name.size() > 6 &&
-            std::all_of(name.begin() + 6, name.end(), [](unsigned char ch) {
-                return std::isdigit(ch);
-            })) return true;
+    if (std::filesystem::exists(path / "remote_sources")) return true;
+    // A caller can open a pyramid level directly, including through a symlink.
+    // Inspect its ancestors so an unfetched level of an old cache cannot be
+    // mistaken for a complete local array and silently rendered as zeros.
+    for (auto current = std::filesystem::weakly_canonical(path);
+         current != current.root_path(); current = current.parent_path()) {
+        if (current.filename() == "remote_sources" ||
+            std::filesystem::exists(current / ".remote_source.json")) return true;
+        // Older caches published Zarr metadata alongside level_N payloads.
+        if (!std::filesystem::exists(current / ".zgroup") &&
+            !std::filesystem::exists(current / ".zarray") &&
+            !std::filesystem::exists(current / "zarr.json")) continue;
+        for (const auto& entry : std::filesystem::directory_iterator(current)) {
+            const auto name = entry.path().filename().string();
+            if (entry.is_directory() && name.starts_with("level_") &&
+                name.size() > 6 &&
+                std::all_of(name.begin() + 6, name.end(), [](unsigned char ch) {
+                    return std::isdigit(ch);
+                })) return true;
+        }
     }
     return false;
 }
