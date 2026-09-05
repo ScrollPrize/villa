@@ -26,7 +26,13 @@ def close_memmap(array: object) -> None:
     live; Windows refuses with a sharing violation. Any mapping this module
     opens therefore needs an explicit end of life rather than relying on the
     owner happening to hold the last reference to the array.
+
+    Pass the array that owns the mapping. NumPy propagates ``_mmap`` to
+    views, so closing through a view would close the parent out from under
+    everyone else holding it; a view is rejected rather than honoured.
     """
+    if isinstance(getattr(array, "base", None), np.memmap):
+        raise ValueError("close_memmap needs the owning array, not a view of it")
     mapping = getattr(array, "_mmap", None)
     if mapping is not None and not mapping.closed:
         mapping.close()
@@ -38,9 +44,14 @@ def _read_tiff(path: Path) -> NDArray:
     This used to memory-map the file, which handed every caller of
     :func:`load_surface`, :func:`read_image` and :func:`load_tifxyz_mask` an
     array that pinned its backing file for as long as they kept it, with no
-    close path. The mapped branch only ever applied to uncompressed files --
-    this module writes its own TIFFs zlib-compressed, so those already took
-    the eager fallback -- and every caller materialises the result anyway.
+    close path -- issue #1671's list of locked files starts with ``x.tif``.
+    The mapped branch applied to exactly the files that matter here: the
+    uncompressed ``x/y/z.tif`` grids that VC's C++ QuadSurface writes. Nothing
+    reads them lazily, though -- ``core``'s neighbour arithmetic differences
+    the whole grid against itself -- so the mapping only ever deferred a read
+    that always happened. The trade is evictable page cache for resident RAM
+    of the same size: three float32 grids per surface, and ``register_render``
+    loads two surfaces at once.
     """
     return tifffile.imread(path)
 

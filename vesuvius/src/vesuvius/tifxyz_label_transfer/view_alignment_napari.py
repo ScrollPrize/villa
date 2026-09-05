@@ -614,6 +614,10 @@ def read_render_array(path: Path) -> np.ndarray:
     array: POSIX still allows the file to be unlinked or replaced, Windows
     refuses with a sharing violation, so a mapping that escapes this module
     has no end of life anyone can reach.
+
+    The cost is that an uncompressed cache is now resident rather than paged:
+    one render per call, the largest being ``load_middle_three_max``'s level-2
+    composites (>200 MiB, see ``prepare_canvas_offset_evidence``).
     """
 
     render = read_render_tiff(path)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +11,7 @@ import numpy as np
 import tifffile
 
 from vesuvius.tifxyz_label_transfer.io import (
+    close_memmap,
     load_surface,
     read_image,
     read_image_shape,
@@ -167,6 +169,7 @@ class SurfaceIoTests(unittest.TestCase):
             return False
 
         temporary = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
         surface_path = temporary / "surface.tifxyz"
         surface_path.mkdir()
         grid = np.zeros((2, 3), dtype=np.float32)
@@ -203,6 +206,24 @@ class SurfaceIoTests(unittest.TestCase):
         surface_path.rmdir()
         temporary.rmdir()
         self.assertFalse(temporary.exists())
+
+    def test_close_memmap_refuses_a_view_of_the_mapping(self) -> None:
+        """Closing through a view would close the parent for everyone.
+
+        NumPy copies ``_mmap`` onto every view, so the naive call succeeds and
+        leaves the owner reading freed pages -- a segfault, not an exception.
+        """
+        temporary = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        raster = TemporaryRaster(
+            temporary, (2, 3), np.dtype(np.uint8), 0, ".probe-"
+        )
+        self.addCleanup(raster.close)
+
+        with self.assertRaises(ValueError):
+            close_memmap(raster.array[:1])
+
+        self.assertFalse(raster.array._mmap.closed)
 
 
 if __name__ == "__main__":

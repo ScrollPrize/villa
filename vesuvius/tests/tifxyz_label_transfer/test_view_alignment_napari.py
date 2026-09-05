@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -377,6 +378,7 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
         and on Windows the cache can then be neither replaced nor deleted.
         """
         temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
         path = temp_dir / "render.tif"
         expected = np.arange(12, dtype=np.uint8).reshape(3, 4)
         tifffile.imwrite(path, expected, metadata=None)
