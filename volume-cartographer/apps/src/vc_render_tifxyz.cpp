@@ -1,4 +1,5 @@
 #include <iostream>
+#include "RenderPrefetch.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -34,12 +35,6 @@
 
 namespace po = boost::program_options;
 using Json = utils::Json;
-
-// The sampling mode this tool renders with, shared by the render call and the
-// prefetch planner so the plan cannot describe a different neighbourhood than
-// the read. readCompositeFast already defaults to Nearest; naming it here makes
-// that default explicit and gives the planner something to follow.
-static constexpr vc::Sampling kRenderSampling = vc::Sampling::Nearest;
 
 // ============================================================
 // Logging infrastructure
@@ -367,7 +362,7 @@ static std::vector<float> buildCompositeOffsetList(
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep));
+        out.push_back(float(zi) * float(sliceStep));
     return out;
 }
 
@@ -419,170 +414,6 @@ static bool pathsEquivalent(const std::filesystem::path& a, const std::filesyste
     return a.lexically_normal() == b.lexically_normal();
 }
 
-// Chunks the samples actually reach, for the sampling mode the render will
-// use. A sample p = base + dir * off reads a different voxel neighbourhood per
-// mode -- Nearest one voxel at round(p), Trilinear the 2^3 cube at floor(p),
-// Tricubic the 4^3 cube at floor(p)-1 -- and a chunk is needed exactly when it
-// holds one of those voxels. This replaces an axis-aligned region fill, which
-// for a band spanning a whole winding took the bounding box of an annulus
-// while the surface is a thin ring inside it.
-//
-// The mode is passed in rather than assumed, and the caller hands the same
-// value to readCompositeFast, so the plan cannot drift from what the render
-// does. Planning a wider neighbourhood than the renderer reads fetches chunks
-// nothing looks at; planning a narrower one would miss chunks it does read.
-//
-// Samples outside the volume are skipped rather than clamped to the edge
-// chunk: sampleOne() returns 0 for them without touching the array
-// (Slicing.cpp, "Out-of-bounds and missing-block return 0"), so an edge chunk
-// pulled in on their behalf is never read.
-//
-// The bitmap domain comes from walking every sample rather than from the
-// region helper that used to serve here, because that helper sampled only the
-// band border and every 32nd interior point and could therefore under-size a
-// domain defined by it.
-static void insertExactChunksForSamples(
-    const cv::Mat_<cv::Vec3f>& base,
-    const cv::Mat_<cv::Vec3f>& dirs,
-    const std::vector<float>& offsets,
-    vc::render::IChunkedArray* ds,
-    int level,
-    vc::Sampling method,
-    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>& uniq)
-{
-    if (!ds || base.empty() || offsets.empty()) return;
-    const auto chunkShape = ds->chunkShape(level);
-    const auto shape = ds->shape(level);
-    if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) return;
-    const int maxCx = int((shape[2] - 1) / chunkShape[2]);
-    const int maxCy = int((shape[1] - 1) / chunkShape[1]);
-    const int maxCz = int((shape[0] - 1) / chunkShape[0]);
-
-    // Clamp in double before narrowing. A coordinate TIFF holding something
-    // like FLT_MAX passes the isfinite check, and int(std::floor(3.4e38/128))
-    // is undefined: x86-64 yields INT_MIN, which then survives the `> maxC`
-    // test and poisons the bounds, while arm64 saturates to INT_MAX. Two
-    // architectures the project supports, two different behaviours.
-    auto chunkOfVoxel = [](double v, double dim, int maxC) -> int {
-        if (!(v >= 0.0)) v = 0.0;
-        const double c = std::floor(v / dim);
-        if (!(c < double(maxC))) return maxC;
-        return int(c);
-    };
-
-    // Axis order here is x, y, z; shape is z, y, x.
-    const double extent[3] = { double(shape[2]), double(shape[1]), double(shape[0]) };
-
-    // The same test the renderer applies before it reads anything: outside
-    // this, sampleOne() returns 0 and touches no chunk.
-    auto inBounds = [&extent](const double p[3]) {
-        return p[0] >= 0.0 && p[1] >= 0.0 && p[2] >= 0.0
-            && p[0] < extent[0] && p[1] < extent[1] && p[2] < extent[2];
-    };
-
-    // Voxel index range one in-bounds sample reaches on one axis. Mirrors
-    // sampleNearest / sampleTrilinear / sampleTricubic. readCompositeFast
-    // routes every mode it does not implement onto Nearest; so does this.
-    auto voxelSpan = [method](double p, double ext, double& v0, double& v1) {
-        switch (method) {
-            case vc::Sampling::Trilinear:
-                v0 = std::floor(p); v1 = v0 + 1.0; break;
-            case vc::Sampling::Tricubic:
-                v0 = std::floor(p) - 1.0; v1 = std::floor(p) + 2.0; break;
-            default: {
-                double v = std::floor(p + 0.5);
-                if (v > ext - 1.0) v = ext - 1.0;
-                v0 = v1 = v;
-                break;
-            }
-        }
-    };
-
-    const int h = base.rows, w = base.cols;
-    int lo[3] = {0, 0, 0}, hi[3] = {-1, -1, -1};
-    // One flag per axis, not one shared between them: an axis's low bound is
-    // only meaningful once that axis has seen a sample. A single flag would be
-    // set by the first axis of the first sample, leaving the other two holding
-    // the zero they were declared with, and the bitmap domain would then start
-    // at chunk zero on those axes instead of at the band's own range. The
-    // emitted set stays correct either way -- only stamped cells are emitted --
-    // but the domain would be larger than it needs to be.
-    bool found[3] = {false, false, false};
-
-    // Pass 1: chunk-index bounds over every in-bounds sample.
-    for (int r = 0; r < h; ++r) {
-        for (int c = 0; c < w; ++c) {
-            const auto& pt = base(r, c);
-            if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2]))
-                continue;
-            const auto& dir = dirs(r, c);
-            for (float off : offsets) {
-                const double p[3] = {
-                    double(pt[0]) + double(dir[0]) * off,
-                    double(pt[1]) + double(dir[1]) * off,
-                    double(pt[2]) + double(dir[2]) * off };
-                if (!inBounds(p)) continue;
-                const double dim[3] = { double(chunkShape[2]), double(chunkShape[1]), double(chunkShape[0]) };
-                const int maxC[3] = { maxCx, maxCy, maxCz };
-                for (int a = 0; a < 3; ++a) {
-                    double v0, v1;
-                    voxelSpan(p[a], extent[a], v0, v1);
-                    const int c0 = chunkOfVoxel(v0, dim[a], maxC[a]);
-                    const int c1 = chunkOfVoxel(v1, dim[a], maxC[a]);
-                    if (!found[a]) { lo[a] = hi[a] = c0; found[a] = true; }
-                    if (c0 < lo[a]) lo[a] = c0;
-                    if (c0 > hi[a]) hi[a] = c0;
-                    if (c1 < lo[a]) lo[a] = c1;
-                    if (c1 > hi[a]) hi[a] = c1;
-                }
-            }
-        }
-    }
-    if (!found[0] || !found[1] || !found[2]) return;
-
-    // Pass 2: stamp each sample's 2x2x2 chunk neighbourhood into a bitmap
-    // over [lo, hi], then insert exactly the stamped chunks.
-    const int W = hi[0] - lo[0] + 1, H = hi[1] - lo[1] + 1, D = hi[2] - lo[2] + 1;
-    std::vector<uint8_t> bits(size_t(W) * H * D, 0);
-    auto stamp = [&](int cx, int cy, int cz) {
-        if (cx < lo[0] || cx > hi[0] || cy < lo[1] || cy > hi[1] || cz < lo[2] || cz > hi[2])
-            return;
-        bits[(size_t(cz - lo[2]) * H + (cy - lo[1])) * W + (cx - lo[0])] = 1;
-    };
-    for (int r = 0; r < h; ++r) {
-        for (int c = 0; c < w; ++c) {
-            const auto& pt = base(r, c);
-            if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2]))
-                continue;
-            const auto& dir = dirs(r, c);
-            for (float off : offsets) {
-                const double p[3] = {
-                    double(pt[0]) + double(dir[0]) * off,
-                    double(pt[1]) + double(dir[1]) * off,
-                    double(pt[2]) + double(dir[2]) * off };
-                if (!inBounds(p)) continue;
-                double v0[3], v1[3];
-                for (int a = 0; a < 3; ++a) voxelSpan(p[a], extent[a], v0[a], v1[a]);
-                const int cx0 = chunkOfVoxel(v0[0], chunkShape[2], maxCx);
-                const int cx1 = chunkOfVoxel(v1[0], chunkShape[2], maxCx);
-                const int cy0 = chunkOfVoxel(v0[1], chunkShape[1], maxCy);
-                const int cy1 = chunkOfVoxel(v1[1], chunkShape[1], maxCy);
-                const int cz0 = chunkOfVoxel(v0[2], chunkShape[0], maxCz);
-                const int cz1 = chunkOfVoxel(v1[2], chunkShape[0], maxCz);
-                for (int cz = cz0; cz <= cz1; ++cz)
-                    for (int cy = cy0; cy <= cy1; ++cy)
-                        for (int cx = cx0; cx <= cx1; ++cx)
-                            stamp(cx, cy, cz);
-            }
-        }
-    }
-    for (int cz = lo[2]; cz <= hi[2]; ++cz)
-        for (int cy = lo[1]; cy <= hi[1]; ++cy)
-            for (int cx = lo[0]; cx <= hi[0]; ++cx)
-                if (bits[(size_t(cz - lo[2]) * H + (cy - lo[1])) * W + (cx - lo[0])])
-                    uniq.insert(vc::render::ChunkKey{level, cz, cy, cx});
-}
-
 static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     QuadSurface* surf,
     vc::render::IChunkedArray* ds,
@@ -630,7 +461,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
-        insertExactChunksForSamples(base, dirs, offsets, ds, level, method, uniq);
+        vc::render::prefetch::insertExactChunksForSamples(base, dirs, offsets, ds, level, method, uniq);
 
         auto now = std::chrono::steady_clock::now();
         double since = std::chrono::duration<double>(now - lastPrint).count();
@@ -754,7 +585,7 @@ static void renderBands(
                 readCompositeFast(compOut, cache, level, base, dirs,
                                   float(sliceStep),
                                   compositeStart, compositeEnd,
-                                  compositeParams, kRenderSampling);
+                                  compositeParams, vc::render::prefetch::samplingForRender(true));
             }
             cv::Mat s = compOut;
             rotateFlipIfNeeded(s, rotQuad, flipAxis);
@@ -963,7 +794,7 @@ static void renderTiles(
                     readCompositeFast(compOut, cache, level, base, dirs,
                                       float(sliceStep),
                                       compositeStart, compositeEnd,
-                                      compositeParams, kRenderSampling);
+                                      compositeParams, vc::render::prefetch::samplingForRender(true));
                     raw.resize(1);
                     raw[0] = compOut;
                 }
@@ -1835,7 +1666,8 @@ int main(int argc, char *argv[])
                 hasAffine, affineTransform,
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
-                isCompositeMode, compositeStart, compositeEnd, kRenderSampling);
+                isCompositeMode, compositeStart, compositeEnd,
+                vc::render::prefetch::samplingForRender(isCompositeMode));
 
             logPrintf(stdout, "Prefetch: %zu chunk(s) across rows %u..%u\n",
                       prefetchKeys.size(),
