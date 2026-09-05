@@ -7,7 +7,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import vc
+try:
+    import vc
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    vc = None
+
+_VC_MISSING = (
+    "this module reads volumes through the volume-cartographer bindings (vc), "
+    "which are not installed. They come with the `neural-tracing` extra, which "
+    "builds volume-cartographer from the monorepo and needs its C++ toolchain; "
+    "`models` alone does not pull them in."
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,8 @@ class VolumeSlabExtractor:
         return transform
 
     def _volume(self, volume_idx: int) -> vc.Volume:
+        if vc is None:
+            raise ImportError(_VC_MISSING)
         # DataLoader workers must not inherit another process's cache and I/O
         # thread pool, so handles are deliberately opened lazily per process.
         key = (os.getpid(), volume_idx)
