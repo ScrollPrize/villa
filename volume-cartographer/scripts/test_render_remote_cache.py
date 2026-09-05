@@ -59,8 +59,12 @@ def main():
         return digest
 
     def payloads():
+        # The exact Zarr objects are authoritative. Decoded level_N/*.bin
+        # copies may be added or retired by cache maintenance on a warm read.
         return {p.relative_to(work / 'staged'): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in (work / 'staged').rglob('*.bin')}
+                for p in (work / 'staged').rglob('*')
+                if p.is_file() and not p.name.startswith('.') and '.tmp.' not in p.name
+                and not any(part.startswith('level_') for part in p.relative_to(work / 'staged').parts)}
 
     a = render('a-cold', 'staged', args.source_a)
     first_payloads = payloads()
