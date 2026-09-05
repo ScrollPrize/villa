@@ -98,6 +98,28 @@ def test_too_many_classes_for_uint8_is_rejected():
         apply_finalization(logits, 300, FinalizeConfig(mode="multiclass"))
 
 
+def test_cli_main_keeps_its_parser(monkeypatch, tmp_path):
+    """`vesuvius.finalize_outputs` crashed with NameError('parser') before reaching
+    finalize_logits on main 23adee0: main() built the parser inline and then
+    referred to a name it never bound."""
+    import sys
+
+    from vesuvius.models.run import finalize_outputs
+
+    calls = {}
+    monkeypatch.setattr(finalize_outputs, "finalize_logits", lambda **kw: calls.update(kw))
+    monkeypatch.setattr(sys, "argv", ["vesuvius.finalize_outputs", str(tmp_path / "in.zarr"),
+                                      str(tmp_path / "out.zarr"), "--mode", "multiclass", "--threshold"])
+    assert finalize_outputs.main() == 0
+    assert calls["mode"] == "multiclass" and calls["threshold"] == 0.5
+
+    monkeypatch.setattr(sys, "argv", ["vesuvius.finalize_outputs", "in.zarr", "out.zarr",
+                                      "--num_parts", "2", "--part_id", "5"])
+    with pytest.raises(SystemExit) as excinfo:  # parser.error, not NameError
+        finalize_outputs.main()
+    assert excinfo.value.code == 2
+
+
 def test_binary_path_is_unchanged():
     logits = np.zeros((2, 1, 1, 2), dtype=np.float32)
     logits[1, 0, 0, 0] = 20.0
