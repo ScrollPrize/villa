@@ -37,7 +37,7 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
-        self.num_flow_timesteps = getattr(flow_field, 'model_num_flow_timesteps', 1)
+        self.num_flow_timesteps = flow_field.num_flow_timesteps
         # Cached sampler/integrator closure at t=0 for the num_flow_timesteps==1 fast path.
         # Built once per diffeomorphism instance (one per training iteration), shared across
         # forward and inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling)

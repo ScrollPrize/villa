@@ -359,6 +359,10 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
         connect(_state, &CState::poiChanged, chunkedViewer, &CChunkedVolumeViewer::onPOIChanged);
         connect(_state, &CState::volumeChanged, chunkedViewer, &CChunkedVolumeViewer::OnVolumeChanged);
         connect(_state, &CState::volumeClosing, chunkedViewer, &CChunkedVolumeViewer::onVolumeClosing);
+        connect(_state, &CState::focusBoundsChanged, chunkedViewer,
+                [chunkedViewer]() {
+                    chunkedViewer->requestRender("focus bounds changed");
+                });
     }
 
     // Restore persisted viewer preferences

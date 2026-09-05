@@ -34,6 +34,7 @@
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
@@ -170,6 +171,11 @@ public:
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
+    // Moves every item registered under `key` by `delta` scene units; false
+    // when no group is registered under that key. Overlay scene coordinates
+    // are affine in the camera pointer at a fixed zoom, so a pan can shift a
+    // group in place instead of rebuilding it.
+    bool translateOverlayGroup(const std::string& key, const QPointF& delta);
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
@@ -409,6 +415,9 @@ private:
         std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
         std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
         std::uint64_t surfaceCacheEpoch = 0;
+        // Effective launch-time bounds. Null for disabled bounds and for view
+        // types outside the supported plane/annotation scope.
+        std::optional<Rect3D> focusBoundsBase;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;

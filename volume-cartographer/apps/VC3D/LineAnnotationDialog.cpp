@@ -9,6 +9,7 @@
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -825,8 +826,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const double savedArrowPanSpeed =
-            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED,
-                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_DEFAULT)
+            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX,
+                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX_DEFAULT)
                 .toDouble();
         _arrowPanCruiseSpeed =
             (std::isfinite(savedArrowPanSpeed) && savedArrowPanSpeed > 0.0)
@@ -1528,13 +1529,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 if (_arrowPanDirection != 0) {
-                    // During a keyboard pan every tick already rebuilds the
-                    // dynamic overlays (via setCurrentLinePosition), so only
-                    // the static strip overlays need to track the scrolling
-                    // camera here. The side-strip intersection request (which
-                    // clones geometry and snapshots+hashes every fiber per
-                    // call) waits for the landing's full refresh.
-                    rebuildGeneratedStaticStripOverlays();
+                    // During a keyboard pan every tick rebuilds the dynamic
+                    // overlays and shifts the static strip overlays with the
+                    // camera right after the camera move (tickArrowPan), so a
+                    // rebuild here would only re-place the control-point dots
+                    // at an arbitrary phase relative to the ticks. The
+                    // side-strip intersection request (which clones geometry
+                    // and snapshots+hashes every fiber per call) waits for the
+                    // landing's full refresh.
                     return;
                 }
                 rebuildGeneratedOverlays();
@@ -2085,7 +2087,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(currentViewer);
@@ -2144,7 +2147,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(sideViewer);
@@ -2259,7 +2263,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
-                            emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                            emit generatedControlPointRequested(surfaceName,
+                                                                volumePoint,
+                                                                position,
+                                                                interpolatedLinePoint(position));
                         }
                     }
                 });
@@ -2498,14 +2505,14 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
-void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
-                                                 CChunkedVolumeViewer* viewer,
-                                                 const GeneratedOverlay& overlay)
+std::string LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
+                                                        CChunkedVolumeViewer* viewer,
+                                                        const GeneratedOverlay& overlay)
 {
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
-        return;
+        return {};
     }
-    vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
+    return vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
 void LineAnnotationDialog::clearControlPointContextPreview(const std::string& surfaceName,
@@ -2613,11 +2620,13 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
-    const double position = vc3d::line_annotation::shiftedLinePosition(
+    // Arclength units: one notch is one strip column of base voxels wherever
+    // the dense line's vertex spacing happens to be (see LineAnnotationShiftScroll.hpp).
+    const double position = vc3d::line_annotation::shiftedLinePositionByArclength(
         _currentLinePosition,
         steps,
         sliceStepSize,
-        static_cast<int>(_generatedViews.linePoints.size()));
+        currentLineArclengths());
     _currentCutNormalOffsetVx = 0.0;
     if (_currentCutViewer) {
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -2829,28 +2838,63 @@ void LineAnnotationDialog::tickArrowPan()
     }
     const double acceleration =
         _arrowPanCruiseSpeed / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
-    const auto step = vc3d::line_annotation::generatedArrowPanStep(_currentLinePosition,
-                                                                   _arrowPanVelocity,
-                                                                   _arrowPanDirection,
-                                                                   _arrowPanCruiseSpeed,
-                                                                   acceleration,
-                                                                   dtSeconds,
-                                                                   _arrowPanStopTarget);
-    _arrowPanVelocity = step.velocity;
-    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
-    const double position = std::clamp(step.position, 0.0, maxPosition);
-    const bool hitLineEnd = (position != step.position);
-    if (step.landed) {
-        finishArrowPan(position);
+    // The integrator runs in base-voxel arclength (speed is vx/s); positions
+    // and the stop target are converted through the current position map each
+    // tick, so an edit that renumbered the line between ticks cannot desync
+    // them. Without a usable map the line positions stand in for arclength.
+    const auto& arclengths = currentLineArclengths();
+    const bool arclengthUnits = !arclengths.empty();
+    // The map only changes with the line geometry, whose in-place update
+    // cancels the pan, so the unit cannot flip mid-gesture; if it ever did the
+    // velocity would be in the wrong unit, so stop rather than lurch.
+    if (_arrowPanArclengthUnits.has_value() && *_arrowPanArclengthUnits != arclengthUnits) {
+        cancelArrowPan();
         return;
     }
+    _arrowPanArclengthUnits = arclengthUnits;
+    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double maxCoordinate = arclengthUnits ? arclengths.back() : maxPosition;
+    const auto toCoordinate = [&](double linePosition) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::arclengthAtLinePosition(arclengths, linePosition)
+            : linePosition;
+    };
+    const auto toLinePosition = [&](double coordinate) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::linePositionAtArclength(arclengths, coordinate)
+            : coordinate;
+    };
+    std::optional<double> stopTargetCoordinate;
+    if (_arrowPanStopTarget) {
+        stopTargetCoordinate = toCoordinate(*_arrowPanStopTarget);
+    }
+    const auto step = vc3d::line_annotation::generatedArrowPanStep(
+        toCoordinate(_currentLinePosition),
+        _arrowPanVelocity,
+        _arrowPanDirection,
+        _arrowPanCruiseSpeed,
+        acceleration,
+        dtSeconds,
+        stopTargetCoordinate);
+    _arrowPanVelocity = step.velocity;
+    const double coordinate = std::clamp(step.position, 0.0, maxCoordinate);
+    const bool hitLineEnd = (coordinate != step.position);
+    if (step.landed) {
+        // Land on the target's own line position: the round trip through
+        // arclength would otherwise leave a rounding residue on the control.
+        finishArrowPan(_arrowPanStopTarget
+                           ? std::clamp(*_arrowPanStopTarget, 0.0, maxPosition)
+                           : std::clamp(toLinePosition(coordinate), 0.0, maxPosition));
+        return;
+    }
+    const double position = std::clamp(toLinePosition(coordinate), 0.0, maxPosition);
     if (hitLineEnd) {
         // Only stop at the line end while the travel still points out of it. A
         // reversal pressed near the end is still shedding outward velocity, so
         // pin the position to the edge and keep integrating until the velocity
         // crosses zero and carries it back inside.
         const bool reversingBackInside =
-            (step.position > maxPosition && _arrowPanDirection < 0) ||
+            (step.position > maxCoordinate && _arrowPanDirection < 0) ||
             (step.position < 0.0 && _arrowPanDirection > 0);
         if (!reversingBackInside) {
             finishArrowPan(position);
@@ -2864,6 +2908,13 @@ void LineAnnotationDialog::tickArrowPan()
     // centered right after - a ~60 Hz flicker that reads as two green lines.
     centerStripsOnLinePosition(position, false);
     setCurrentLinePosition(position, false);
+    // The static strip overlays (control-point dots) bake the camera in too.
+    // Left to the coalesced post-render refresh they trail the camera by up to
+    // one tick and then snap - a jiggle that grows with the pan speed. Their
+    // scene placement is affine in the camera pointer at a fixed zoom, so the
+    // tick shifts the existing items by the camera delta (no item churn) and
+    // rebuilds only when the zoom changed; the landing does the full rebuild.
+    updateStaticStripOverlaysForPan();
 }
 
 void LineAnnotationDialog::finishArrowPan(double position)
@@ -2895,6 +2946,8 @@ void LineAnnotationDialog::cancelArrowPan()
     _arrowPanVelocity = 0.0;
     _arrowPanStopTarget.reset();
     _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    _arrowPanArclengthUnits.reset();
+    _staticStripOverlayPanFallbackWarned = false;
     _arrowPanEndedByLanding = false;
 }
 
@@ -2909,7 +2962,7 @@ void LineAnnotationDialog::adjustArrowPanCruiseSpeed(double factor)
     if (updated != _arrowPanCruiseSpeed) {
         _arrowPanCruiseSpeed = updated;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED, updated);
+        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX, updated);
     }
     // Flash the badge even when the value clamped, so the key press is answered.
     updateArrowPanSpeedIndicator();
@@ -2951,7 +3004,7 @@ void LineAnnotationDialog::updateArrowPanSpeedIndicator()
         _arrowPanSpeedLabel = label;
     }
     _arrowPanSpeedLabel->setText(
-        tr("pan speed %1 /s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
+        tr("pan speed %1 vx/s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
     _arrowPanSpeedLabel->adjustSize();
     // Top-center of the top strip; the pause badge sits on the bottom strip.
     _arrowPanSpeedLabel->move(
@@ -3562,7 +3615,19 @@ double LineAnnotationDialog::snappedControlPointPosition(double position) const
     for (const auto& control : _generatedViews.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    return vc3d::line_annotation::snappedControlPointLinePosition(position, controlLinePositions);
+    return vc3d::line_annotation::snappedControlPointLinePositionByArclength(
+        position, controlLinePositions, currentLineArclengths());
+}
+
+const std::vector<double>& LineAnnotationDialog::currentLineArclengths() const
+{
+    // The position map's cumulative arclengths, one per displayed line point;
+    // empty (callers fall back to index units) while no usable map exists.
+    static const std::vector<double> kNone;
+    const auto& arclengths = _generatedViews.stripPositionMap.originalArclengths;
+    return vc3d::line_annotation::lineArclengthsUsable(arclengths, _generatedViews.linePoints.size())
+        ? arclengths
+        : kNone;
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
@@ -3596,6 +3661,7 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         return;
     }
 
+    _staticStripOverlayPlacements.assign(_stripViewers.size(), StaticStripOverlayPlacement{});
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
         auto* viewer = _stripViewers[i].data();
         if (!viewer) {
@@ -3616,15 +3682,68 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (sideStrip) {
             strip.fiberIntersections = stripViews.fiberIntersections;
         }
-        applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        auto& placement = _staticStripOverlayPlacements[i];
+        placement.groupKey = applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        // The camera these items were placed against; a pan tick shifts them
+        // from here instead of rebuilding (updateStaticStripOverlaysForPan).
+        placement.camera.referenceScene = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        placement.camera.scale = static_cast<double>(viewer->cameraState().scale);
     }
 
+}
+
+void LineAnnotationDialog::updateStaticStripOverlaysForPan()
+{
+    if (!kGeneratedLineAnnotationOverlaysEnabled) {
+        return;
+    }
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    if (_staticStripOverlayPlacements.size() != _stripViewers.size()) {
+        rebuildGeneratedStaticStripOverlays();
+        return;
+    }
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        auto* viewer = _stripViewers[i].data();
+        if (!viewer) {
+            continue;
+        }
+        auto& placement = _staticStripOverlayPlacements[i];
+        const QPointF reference = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        const auto delta = vc3d::line_annotation::generatedOverlayPanTranslation(
+            placement.camera, reference, static_cast<double>(viewer->cameraState().scale));
+        if (!delta) {
+            // The zoom changed under the pan: one ordinary rebuild re-records
+            // every placement.
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        if (placement.groupKey.empty() ||
+            !viewer->translateOverlayGroup(placement.groupKey, *delta)) {
+            // No group under the key registration returned. Legitimate only
+            // when the viewer dropped its groups (surface swap); anything else
+            // is a bookkeeping bug that would otherwise hide behind this
+            // rebuild, so say so once per pan.
+            if (!_staticStripOverlayPanFallbackWarned) {
+                _staticStripOverlayPanFallbackWarned = true;
+                Logger()->warn(
+                    "Line annotation: static strip overlay group '{}' missing during arrow pan; "
+                    "rebuilding instead of translating",
+                    placement.groupKey);
+            }
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        placement.camera.referenceScene = reference;
+    }
 }
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
 {
     _fastStripOverlayItems.clear();
     _fastCurrentCutOverlayItems = {};
+    _staticStripOverlayPlacements.clear();
 }
 
 void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
@@ -3947,6 +4066,42 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                                      _sideCutViewer,
                                                      sideViews.sideCutSurface.get());
         sideOverlay.linePoints = sideViews.linePoints;
+        // Only the stretch within half a wrap of the current position. The
+        // side cut's plane contains the sheet normal, so for a fiber annotated
+        // across several wraps EVERY wrap of this stretch lies (nearly) in the
+        // plane, and projecting the whole line drew them all on top of each
+        // other. Out-of-window points are blanked rather than erased so the
+        // point indices the tail detection keys on stay meaningful, and the
+        // tail range is taken from the plane-near controls BEFORE the window
+        // trims them, so interior spans do not turn into tails.
+        {
+            const auto window = vc3d::line_annotation::generatedLineIndexRangeWithinWinding(
+                sideViews.lineWindingAngles,
+                sideViews.linePoints.size(),
+                sidePosition,
+                vc3d::line_annotation::kGeneratedSideCutHalfWrapAngle);
+            const size_t pointCount = sideOverlay.linePoints.size();
+            if (pointCount > 0 && (window.first > 0 || window.second + 1 < pointCount)) {
+                constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+                const cv::Vec3f blank{kNanF, kNanF, kNanF};
+                for (size_t i = 0; i < window.first; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                for (size_t i = window.second + 1; i < pointCount; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                sideOverlay.lineTailControlRange =
+                    vc3d::line_annotation::generatedControlLinePositionRange(
+                        sideOverlay.controlPoints);
+                const double lowPosition = static_cast<double>(window.first) - 0.5;
+                const double highPosition = static_cast<double>(window.second) + 0.5;
+                std::erase_if(sideOverlay.controlPoints, [&](const auto& control) {
+                    return std::isfinite(control.linePosition) &&
+                           (control.linePosition < lowPosition ||
+                            control.linePosition > highPosition);
+                });
+            }
+        }
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
         // position so the highlight tracks the cursor as it moves along the line. Use the
@@ -4657,9 +4812,11 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     // paused -- so, like the shift-click snap, it has to stop the pan itself:
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
+    // The key places ON the line, so its point is also the position's anchor.
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
-                                        _currentLinePosition);
+                                        _currentLinePosition,
+                                        volumePoint);
     return true;
 }
 

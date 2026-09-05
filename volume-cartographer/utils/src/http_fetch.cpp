@@ -308,6 +308,13 @@ HttpResponse perform(const HttpClient::Config& config,
                          static_cast<long>(config.connect_timeout.count()));
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                          static_cast<long>(config.transfer_timeout.count()));
+        if (config.low_speed_limit_bytes_per_second > 0 &&
+            config.low_speed_time.count() > 0) {
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT,
+                             static_cast<long>(config.low_speed_limit_bytes_per_second));
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,
+                             static_cast<long>(config.low_speed_time.count()));
+        }
 
         // TCP keepalive: keeps idle-pooled connections from being torn
         // down between bursts of S3 fetches so we reuse the TLS session.
@@ -501,6 +508,13 @@ HttpResponse HttpClient::put_file(std::string_view url,
                          static_cast<long>(config_.connect_timeout.count()));
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                          static_cast<long>(config_.transfer_timeout.count()));
+        if (config_.low_speed_limit_bytes_per_second > 0 &&
+            config_.low_speed_time.count() > 0) {
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT,
+                             static_cast<long>(config_.low_speed_limit_bytes_per_second));
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,
+                             static_cast<long>(config_.low_speed_time.count()));
+        }
         curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
         // Keep TCP connections alive so back-to-back fetches against
