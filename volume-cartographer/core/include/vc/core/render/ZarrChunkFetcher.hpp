@@ -94,6 +94,7 @@ std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
 // Volume::createChunkCacheConfigured does for VC3D. Callers that open a remote
 // pyramid directly rather than through Volume otherwise re-download every chunk
 // on each run.
+// The path must be absolute and specific to the source and its base scale.
 std::unique_ptr<ChunkCache> createChunkCache(
     OpenedChunkedZarr opened,
     std::size_t decodedByteCapacity,
