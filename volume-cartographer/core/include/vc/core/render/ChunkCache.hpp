@@ -281,6 +281,9 @@ public:
     Stats stats() const;
     void invalidate();
     void waitForPersistentWrites() const;
+    // Finish queued/running chunk requests and their writes without invalidating
+    // them. Call after the producer stops submitting requests, before shutdown.
+    void waitForPendingChunks() const;
     // Uses the service's shared source scheduler and keyed transfer registry.
     // This request never decodes or populates decoded RAM by itself.
     PersistentRequestResult persistChunkBlocking(

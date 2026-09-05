@@ -5,6 +5,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
@@ -458,6 +459,33 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
     } catch (...) {
     }
     return {};
+}
+
+static bool isPartialRemoteCache(const std::filesystem::path& path)
+{
+    if (!std::filesystem::is_directory(path)) return false;
+    if (std::filesystem::exists(path / "remote_sources")) return true;
+    // A caller can open a pyramid level directly, including through a symlink.
+    // Inspect its ancestors so an unfetched level of an old cache cannot be
+    // mistaken for a complete local array and silently rendered as zeros.
+    for (auto current = std::filesystem::weakly_canonical(path);
+         current != current.root_path(); current = current.parent_path()) {
+        if (current.filename() == "remote_sources" ||
+            std::filesystem::exists(current / ".remote_source.json")) return true;
+        // Older caches published Zarr metadata alongside level_N payloads.
+        if (!std::filesystem::exists(current / ".zgroup") &&
+            !std::filesystem::exists(current / ".zarray") &&
+            !std::filesystem::exists(current / "zarr.json")) continue;
+        for (const auto& entry : std::filesystem::directory_iterator(current)) {
+            const auto name = entry.path().filename().string();
+            if (entry.is_directory() && name.starts_with("level_") &&
+                name.size() > 6 &&
+                std::all_of(name.begin() + 6, name.end(), [](unsigned char ch) {
+                    return std::isdigit(ch);
+                })) return true;
+        }
+    }
+    return false;
 }
 
 // Sparse pyramids (e.g. lasagna prediction zarrs holding only their scaledown
@@ -1092,7 +1120,7 @@ int main(int argc, char *argv[])
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
+        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL; chunks are staged under --volume/remote_sources (required unless a source marker exists)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1372,9 +1400,15 @@ int main(int argc, char *argv[])
     if (useRemoteCache) {
         try {
             vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
+            // Isolate sources even when the same -v directory is reused.
+            const auto spec = vc::parseRemoteVolumeSpec(remoteUrl);
+            auto persistentPath = std::filesystem::absolute(vol_path) /
+                vc::core::util::remoteFileCachePath(remoteUrl);
+            if (spec.baseScaleLevel > 0)
+                persistentPath /= ".vc-base-scale-" + std::to_string(spec.baseScaleLevel);
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
-                cache_bytes);
+                cache_bytes, 16, persistentPath);
             chunk_cache = ownedChunkCache.get();
             if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
                 logPrintf(stderr,
@@ -1389,6 +1423,11 @@ int main(int argc, char *argv[])
         }
     } else {
         try {
+            if (isPartialRemoteCache(vol_path)) {
+                throw std::runtime_error(
+                    "--volume points to a partial remote cache; supply --remote-url "
+                    "to select the source and fetch missing chunks");
+            }
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openLocalZarrPyramid(vol_path),
                 cache_bytes);
@@ -1849,6 +1888,11 @@ int main(int argc, char *argv[])
 
     if (!process_one(seg_path))
         return EXIT_FAILURE;
+
+    // Band prefetch can outlive the final sampled pixel. Let its downloads and
+    // cache writes finish before the cache destructor invalidates the requests.
+    if (useRemoteCache && ownedChunkCache && ownedChunkCache->stats().persistentCacheEnabled)
+        ownedChunkCache->waitForPendingChunks();
 
     stopLogFlusher();
     return EXIT_SUCCESS;
