@@ -34,7 +34,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 from .core import transfer_array as transfer_surface_array
 from .estimate_canvas_offset import measure_render_shift
-from .io import load_surface as load_full_surface
+from .io import close_memmap, load_surface as load_full_surface
 from .prepare_canvas_offset_evidence import (
     DEFAULT_INK_ROOT,
     DEFAULT_OPEN_DATA_ROOT,
@@ -591,7 +591,12 @@ def preview_cache_name(name: str, factor: int) -> str:
 
 
 def read_render_tiff(path: Path) -> np.ndarray:
-    """Open a cached render without copying the complete raster into RAM."""
+    """Open a cached render without copying the complete raster into RAM.
+
+    The result may be a live mapping of ``path``, which pins the file until it
+    is released; pass it to :func:`close_memmap` when done, or call
+    :func:`read_render_array` instead to get an array that owns its memory.
+    """
 
     try:
         return tifffile.memmap(path, mode="r")
@@ -599,6 +604,25 @@ def read_render_tiff(path: Path) -> np.ndarray:
         # Externally supplied evidence may be tiled or compressed and therefore
         # cannot be memory-mapped.  Keep compatibility with those files.
         return tifffile.imread(path)
+
+
+def read_render_array(path: Path) -> np.ndarray:
+    """Read a cached render into an array this process owns.
+
+    Every render handed back to a caller goes through here. Returning the
+    mapping itself leaves ``path`` open for as long as the caller keeps the
+    array: POSIX still allows the file to be unlinked or replaced, Windows
+    refuses with a sharing violation, so a mapping that escapes this module
+    has no end of life anyone can reach.
+    """
+
+    render = read_render_tiff(path)
+    if not isinstance(render, np.memmap):
+        return render
+    try:
+        return np.array(render)
+    finally:
+        close_memmap(render)
 
 
 def read_tiff_nearest(path: Path, shape: tuple[int, int]) -> np.ndarray:
@@ -735,7 +759,7 @@ def load_middle_three_max(
         raise ValueError("plane_count must be a positive odd integer")
     if cache_path.is_file():
         print(f"Using cached middle-{plane_count} max: {cache_path}")
-        return read_render_tiff(cache_path)
+        return read_render_array(cache_path)
     if "://" not in root_url:
         info = inspect_rclone_zarr(root_url, preferred_level)
         middle = info.shape[0] // 2
@@ -755,7 +779,7 @@ def load_middle_three_max(
         print(
             f"Using rclone-backed middle-{plane_count} max: {cache_path}"
         )
-        return read_render_tiff(cache_path)
+        return read_render_array(cache_path)
 
     raise ValueError(
         "HTTP/URL zarr access is disabled; data must be read with "
@@ -807,7 +831,7 @@ def evidence_comparison_render(
             return None
         path = copied_path
     print(f"Using prepared {comparison_name} render: {path}")
-    return read_render_tiff(path)
+    return read_render_array(path)
 
 
 def evidence_center_render(case: Case, key: str) -> np.ndarray | None:
@@ -871,7 +895,7 @@ def _load_registered_render_cache(
         cache_report = json.loads(cache_report_path.read_text(encoding="utf-8"))
         comparable = {key: cache_report.get(key) for key in expected}
         if comparable == expected:
-            return read_render_tiff(cache)
+            return read_render_array(cache)
     except (OSError, ValueError, TypeError):
         pass
     return None
@@ -948,7 +972,7 @@ def register_render(
         encoding="utf-8",
     )
     print(f"Cached TIFXYZ-registered surface render -> {cache}")
-    return read_render_tiff(cache)
+    return read_render_array(cache)
 
 
 def report_affine_matrix(
@@ -1075,8 +1099,8 @@ def load_diagnostic_renders(
                 source_path = Path(self_report[source_key])
                 target_path = Path(self_report[target_key])
                 if source_path.is_file() and target_path.is_file():
-                    source_image = read_render_tiff(source_path)
-                    target_image = read_render_tiff(target_path)
+                    source_image = read_render_array(source_path)
+                    target_image = read_render_array(target_path)
                     plan_path = self_report_path.with_name("plan.json")
                     plan = json.loads(plan_path.read_text(encoding="utf-8"))
                     bounds = [
@@ -1282,7 +1306,7 @@ def prepare_case(
         source_render = matched_source_render
         if source_render is None:
             if source_cache.is_file():
-                source_render = read_render_tiff(source_cache)
+                source_render = read_render_array(source_cache)
                 source_render_kind = "middle3-max"
             else:
                 source_render = evidence_center_render(

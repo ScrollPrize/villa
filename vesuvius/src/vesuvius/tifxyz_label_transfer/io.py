@@ -19,11 +19,30 @@ import tifffile
 from .core import Surface
 
 
+def close_memmap(array: object) -> None:
+    """Release the file mapping behind ``array``, if it has one.
+
+    POSIX lets a mapped file be unlinked or replaced while the mapping is
+    live; Windows refuses with a sharing violation. Any mapping this module
+    opens therefore needs an explicit end of life rather than relying on the
+    owner happening to hold the last reference to the array.
+    """
+    mapping = getattr(array, "_mmap", None)
+    if mapping is not None and not mapping.closed:
+        mapping.close()
+
+
 def _read_tiff(path: Path) -> NDArray:
-    try:
-        return tifffile.memmap(path, mode="r")
-    except ValueError:
-        return tifffile.imread(path)
+    """Read a TIFF into an array this process owns.
+
+    This used to memory-map the file, which handed every caller of
+    :func:`load_surface`, :func:`read_image` and :func:`load_tifxyz_mask` an
+    array that pinned its backing file for as long as they kept it, with no
+    close path. The mapped branch only ever applied to uncompressed files --
+    this module writes its own TIFFs zlib-compressed, so those already took
+    the eager fallback -- and every caller materialises the result anyway.
+    """
+    return tifffile.imread(path)
 
 
 def load_tifxyz_mask(
@@ -234,7 +253,12 @@ class TemporaryRaster:
         self.array[:] = fill_value
 
     def close(self) -> None:
+        # Callers are handed ``self.array`` (core.py's optional output arrays),
+        # so dropping this one reference is not enough to release the mapping;
+        # on Windows the unlink below then fails. Every read of the raster
+        # happens before its owner closes, so ending the mapping here is safe.
         self.array.flush()
+        close_memmap(self.array)
         del self.array
         self.path.unlink(missing_ok=True)
 
