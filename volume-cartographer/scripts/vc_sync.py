@@ -48,7 +48,10 @@ SFTP sync (the ash-* commands):
     server. SFTP has no ETags or object versioning, so remote change
     detection uses one batched server-side `rclone md5sum` for
     annotation-sized JSON files (mtime+size for everything else), and merge
-    bases come only from the local .ashsync-base shadow copies.
+    bases come only from the local .ashsync-base shadow copies. The remote
+    shell type is pinned to unix with GNU md5sum/sha1sum (the ash server is
+    a Linux box); on a server without those commands, change detection
+    falls back to size+mtime with a one-time warning.
 
     Credentials live in a JSON file OUTSIDE the sync tree (default
     ~/.vc_ash_sftp.json, override at ash-init time with --creds). Keep it
@@ -95,6 +98,7 @@ import sqlite3
 import hashlib
 import argparse
 import tempfile
+import traceback
 import subprocess
 from datetime import datetime, timezone
 from enum import Enum
@@ -140,6 +144,29 @@ ASH_DEFAULT_CREDS = '~/.vc_ash_sftp.json'
 # Tag the merge puts on fibers whose line it could not re-fit; mirrored here
 # so hfsync still recognizes them when fiber_merge is unavailable.
 REOPTIMIZE_TAG = getattr(fiber_merge, 'REOPTIMIZE_TAG', 'needs_reoptimization')
+
+
+def _exception_location(ex):
+    """' at file.py:123 in func' for the innermost frame of `ex`, or ''.
+
+    Demotion reasons carry this so a merge-machinery bug reads as a bug
+    (with a place to look) instead of as undiagnosable annotation data —
+    a bare str(ex) once hid a crash behind weeks of manual conflicts."""
+    frames = traceback.extract_tb(getattr(ex, '__traceback__', None))
+    if not frames:
+        return ''
+    frame = frames[-1]
+    return (f" at {os.path.basename(frame.filename)}:{frame.lineno} "
+            f"in {frame.name}")
+
+
+def _print_debug_traceback():
+    """Full traceback for the exception being handled, only when the user
+    opted in (VC_SYNC_DEBUG=1): unconditional stacks would bury the merge
+    preview and the interactive conflict prompt."""
+    if os.environ.get('VC_SYNC_DEBUG'):
+        for line in traceback.format_exc().rstrip().splitlines():
+            print(f"      {line}")
 
 class SyncAction(Enum):
     UPLOAD = "upload"
@@ -758,7 +785,9 @@ class S3SyncManager:
             try:
                 result = fiber_merge.merge_fibers(base_doc, local_doc, remote_doc)
             except Exception as ex:
-                print(f"  ⚠️  merge failed for {path} ({ex}); manual resolution")
+                print(f"  ⚠️  merge failed for {path} "
+                      f"({ex}{_exception_location(ex)}); manual resolution")
+                _print_debug_traceback()
                 return None
             summary = fiber_merge.summarize(result)
             if dry_run:
@@ -958,7 +987,9 @@ class S3SyncManager:
                         if refreshed['b_changed']:
                             json.dumps(refreshed['b_doc'], allow_nan=False)
                 except Exception as ex:
-                    failure = f"refresh against {peer_name} failed ({ex})"
+                    failure = (f"refresh against {peer_name} failed "
+                               f"({ex}{_exception_location(ex)})")
+                    _print_debug_traceback()
                     break
                 if not refreshed['ok']:
                     failure = '; '.join(refreshed['conflicts'])
@@ -2490,6 +2521,19 @@ class SftpSyncManager(S3SyncManager):
         env['RCLONE_SFTP_USER'] = self._creds['user']
         env['RCLONE_SFTP_PORT'] = str(self._creds['port'])
         env['RCLONE_SFTP_PASS'] = self._sftp_pass_obscured
+        # Pin the server shell type and hash commands instead of letting
+        # rclone probe for them. The probe is lazy and per-connection, and
+        # an on-the-fly :sftp: backend has no config section to persist its
+        # result into (rclone's "Can't save config" notices) — so a batched
+        # `rclone md5sum` over N --checkers connections races the probe and
+        # most files come back "hash unsupported" (seen live: 1/70 hashed),
+        # degrading change detection to size+mtime. On a server without
+        # md5sum the pinned command fails cleanly per file and the
+        # server-side-hashing-unavailable fallback in _remote_md5sums
+        # still applies.
+        env['RCLONE_SFTP_SHELL_TYPE'] = 'unix'
+        env['RCLONE_SFTP_MD5SUM_COMMAND'] = 'md5sum'
+        env['RCLONE_SFTP_SHA1SUM_COMMAND'] = 'sha1sum'
         # Only set when a real path is configured (host-key pinning).
         # The "none" default must leave the variable UNSET: older rclone
         # treats any value as a literal path and fails to open "none";

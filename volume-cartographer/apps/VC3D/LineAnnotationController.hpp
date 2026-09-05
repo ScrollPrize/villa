@@ -67,6 +67,8 @@ public:
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
+        std::optional<Rect3D> focusBoundsBase;
+        bool focusBoundsApplied = false;
         std::string error;
         std::string eventName;
     };
@@ -439,6 +441,11 @@ private:
         Optimized,
     };
 
+    enum class SeedOrigin {
+        NewPlacement,
+        StoredFiber,
+    };
+
     // Intentionally opaque outside LineAnnotationController.cpp. Keeping session
     // state private prevents external code from mutating controlPoints/branches
     // without the branch metadata synchronization hook.
@@ -583,10 +590,15 @@ private:
                                    std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
-                        InitialDirectionMode directionMode);
+                        InitialDirectionMode directionMode,
+                        SeedOrigin seedOrigin = SeedOrigin::NewPlacement);
+    // lineAnchor: linePosition's 3D point on the line the caller measured it
+    // on (see LineAnnotationDialog::generatedControlPointRequested). Absent,
+    // the position is used as given.
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
-                                     double linePosition);
+                                     double linePosition,
+                                     std::optional<cv::Vec3f> lineAnchor = std::nullopt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
@@ -685,6 +697,8 @@ private:
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
+    bool placementAllowedByFocusBounds(const cv::Vec3d& point,
+                                       bool suppressErrorDialogs) const;
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,

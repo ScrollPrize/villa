@@ -117,6 +117,11 @@ struct GeneratedOverlay {
 
     std::vector<cv::Vec3f> linePoints;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
+    // Line-position range outside which linePoints segments are tails (not
+    // drawn). Defaults to the span of controlPoints; a caller that shows only
+    // a subset of the controls sets the full fiber's range here so interior
+    // spans are not mistaken for tails.
+    std::optional<std::pair<double, double>> lineTailControlRange;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -187,6 +192,10 @@ struct GeneratedViews {
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
     std::vector<cv::Vec3f> lineNormals;
+    // Unwrapped winding angle (radians) of each line point about the scroll
+    // center, or empty when no center reference exists. See
+    // unwrappedGeneratedWindingAngles.
+    std::vector<double> lineWindingAngles;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -460,6 +469,101 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
            linePoints[static_cast<size_t>(upper)] * t;
 }
 
+// The side cut shows the stretch of the fiber within this winding distance of
+// the current position, on either side: half a wrap.
+inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
+
+// Unwrapped winding angle (radians) of each line point about the scroll
+// center, accumulated along the line so adjacent wraps differ by ~2*pi instead
+// of aliasing onto the same value. towardCenter(point) returns the vector from
+// the point to the center at that point's z (non-finite when unknown). A point
+// without a usable direction gets NaN and does not break the chain: the next
+// finite angle continues from the last finite one. No towardCenter: all NaN.
+inline std::vector<double> unwrappedGeneratedWindingAngles(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
+{
+    constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
+    std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
+    if (!towardCenter) {
+        return angles;
+    }
+    std::optional<double> previous;
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        const cv::Vec3f& point = linePoints[i];
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+            continue;
+        }
+        const cv::Vec3f toCenter = towardCenter(point);
+        if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
+            continue;
+        }
+        // Radial direction, center -> point, in the slice plane (z is the axis).
+        const double dx = -static_cast<double>(toCenter[0]);
+        const double dy = -static_cast<double>(toCenter[1]);
+        if (dx * dx + dy * dy <= 1.0e-12) {
+            continue;
+        }
+        double angle = std::atan2(dy, dx);
+        if (previous) {
+            // Nearest equivalent to the previous angle: remainder lands in [-pi, pi].
+            angle = *previous + std::remainder(angle - *previous, kTwoPi);
+        }
+        angles[i] = angle;
+        previous = angle;
+    }
+    return angles;
+}
+
+// Inclusive index range [first, last] of the contiguous stretch of the line
+// around linePosition whose winding angle stays within maxAngleDelta of the
+// angle at linePosition. Without usable angles (empty, size mismatch, or no
+// finite angle at the position) the whole line qualifies. NaN angles inside
+// the stretch are kept so isolated unknown points do not split the run.
+inline std::pair<size_t, size_t> generatedLineIndexRangeWithinWinding(
+    const std::vector<double>& angles,
+    size_t pointCount,
+    double linePosition,
+    double maxAngleDelta)
+{
+    if (pointCount == 0) {
+        return {0, 0};
+    }
+    const std::pair<size_t, size_t> full{0, pointCount - 1};
+    if (angles.size() != pointCount || !std::isfinite(linePosition) ||
+        !(maxAngleDelta >= 0.0)) {
+        return full;
+    }
+    const double clamped = std::clamp(linePosition, 0.0, static_cast<double>(pointCount - 1));
+    const size_t lower = static_cast<size_t>(std::floor(clamped));
+    const size_t upper = std::min(lower + 1, pointCount - 1);
+    double reference = std::numeric_limits<double>::quiet_NaN();
+    if (std::isfinite(angles[lower]) && std::isfinite(angles[upper])) {
+        const double t = clamped - static_cast<double>(lower);
+        reference = angles[lower] * (1.0 - t) + angles[upper] * t;
+    } else if (std::isfinite(angles[lower])) {
+        reference = angles[lower];
+    } else if (std::isfinite(angles[upper])) {
+        reference = angles[upper];
+    }
+    if (!std::isfinite(reference)) {
+        return full;
+    }
+    const auto within = [&](size_t index) {
+        return !std::isfinite(angles[index]) ||
+               std::abs(angles[index] - reference) <= maxAngleDelta;
+    };
+    size_t first = lower;
+    while (first > 0 && within(first - 1)) {
+        --first;
+    }
+    size_t last = upper;
+    while (last + 1 < pointCount && within(last + 1)) {
+        ++last;
+    }
+    return {first, last};
+}
+
 // Content-anchored remap of a fractional line position across a line-geometry
 // change: re-optimization renumbers and moves the points, so the old numeric
 // position is ambiguous on the new line. The position's 3D point on the old
@@ -471,10 +575,23 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
 // geometry by a comparable amount, plain nearest-point could jump the anchor
 // onto the other wrap. Falls back to the clamped input position when either
 // polyline is unusable.
-inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
-                                            const std::vector<cv::Vec3f>& newLinePoints,
-                                            double oldPosition)
+//
+// remappedGeneratedLinePositionFromAnchor is the anchor-based core, shared with
+// the controller: a pane reports control-point edits at a line position it
+// measured on the DISPLAYED line, and the controller resolves that position on
+// the session line through the position's own 3D line point. Deliberately not
+// through the clicked point: a click is meant to be off the line, and where
+// another pass of the same fiber runs through the cut plane the clicked point
+// can be nearer to that pass than to the local one.
+template <typename Point>
+inline double remappedGeneratedLinePositionFromAnchor(const std::vector<Point>& newLinePoints,
+                                                      const Point& anchor,
+                                                      double oldPosition)
 {
+    using Scalar = typename Point::value_type;
+    const auto finite = [](const Point& p) {
+        return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+    };
     if (newLinePoints.empty()) {
         return 0.0;
     }
@@ -483,18 +600,17 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         return 0.0;
     }
     const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
-    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
-    if (!std::isfinite(anchor[0]) || !std::isfinite(anchor[1]) || !std::isfinite(anchor[2])) {
+    if (!finite(anchor)) {
         return fallback;
     }
     std::optional<size_t> nearestIndex;
     double nearestDistanceSq = std::numeric_limits<double>::max();
     for (size_t i = 0; i < newLinePoints.size(); ++i) {
-        const cv::Vec3f& point = newLinePoints[i];
-        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+        const Point& point = newLinePoints[i];
+        if (!finite(point)) {
             continue;
         }
-        const cv::Vec3f delta = point - anchor;
+        const Point delta = point - anchor;
         const double distanceSq = static_cast<double>(delta.dot(delta));
         if (distanceSq < nearestDistanceSq) {
             nearestDistanceSq = distanceSq;
@@ -515,12 +631,11 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         double chosenIndexDelta = std::abs(
             static_cast<double>(*nearestIndex) - oldPosition);
         for (size_t i = 0; i < newLinePoints.size(); ++i) {
-            const cv::Vec3f& point = newLinePoints[i];
-            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
-                !std::isfinite(point[2])) {
+            const Point& point = newLinePoints[i];
+            if (!finite(point)) {
                 continue;
             }
-            const cv::Vec3f delta = point - anchor;
+            const Point delta = point - anchor;
             const double distanceSq = static_cast<double>(delta.dot(delta));
             if (distanceSq > tieThresholdSq) {
                 continue;
@@ -544,21 +659,20 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         if (segmentStart + 1 >= newLinePoints.size()) {
             continue;
         }
-        const cv::Vec3f& a = newLinePoints[segmentStart];
-        const cv::Vec3f& b = newLinePoints[segmentStart + 1];
-        if (!std::isfinite(a[0]) || !std::isfinite(a[1]) || !std::isfinite(a[2]) ||
-            !std::isfinite(b[0]) || !std::isfinite(b[1]) || !std::isfinite(b[2])) {
+        const Point& a = newLinePoints[segmentStart];
+        const Point& b = newLinePoints[segmentStart + 1];
+        if (!finite(a) || !finite(b)) {
             continue;
         }
-        const cv::Vec3f segment = b - a;
+        const Point segment = b - a;
         const double lengthSq = static_cast<double>(segment.dot(segment));
         if (!(lengthSq > 0.0)) {
             continue;
         }
         const double t = std::clamp(
             static_cast<double>((anchor - a).dot(segment)) / lengthSq, 0.0, 1.0);
-        const cv::Vec3f projected = a + segment * static_cast<float>(t);
-        const cv::Vec3f delta = projected - anchor;
+        const Point projected = a + segment * static_cast<Scalar>(t);
+        const Point delta = projected - anchor;
         const double distanceSq = static_cast<double>(delta.dot(delta));
         if (distanceSq < bestDistanceSq) {
             bestDistanceSq = distanceSq;
@@ -566,6 +680,17 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         }
     }
     return std::clamp(bestPosition, 0.0, maxNewPosition);
+}
+
+inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
+                                            const std::vector<cv::Vec3f>& newLinePoints,
+                                            double oldPosition)
+{
+    if (newLinePoints.empty() || !std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
+    return remappedGeneratedLinePositionFromAnchor(newLinePoints, anchor, oldPosition);
 }
 
 // One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
@@ -980,20 +1105,62 @@ inline std::optional<GeneratedParallaxGhost> generatedParallaxGhost(
 // ramp. Everything below is pure arithmetic so it can be exercised without Qt.
 // ---------------------------------------------------------------------------
 
+// The integrator is unit-agnostic; the dialog runs it in base-voxel arclength
+// along the optimized polyline (LineStripPositionMap::originalArclengths) so
+// the pan covers the same physical distance per second in 4 vx trace spans and
+// ~32 vx cspline spans alike, and converts the result back to a line position.
+
 // Seconds spent ramping from rest to the cruise speed (acceleration = cruise / this).
 inline constexpr double kGeneratedArrowPanRampSeconds = 0.25;
-// Cruise-speed bounds and default, in line positions per second (1 unit ~ 30 voxels).
-inline constexpr double kGeneratedArrowPanMinimumSpeed = 1.0;
-inline constexpr double kGeneratedArrowPanMaximumSpeed = 500.0;
-inline constexpr double kGeneratedArrowPanDefaultSpeed = 12.0;
+// Cruise-speed bounds and default, in base voxels of arclength per second. The
+// default matches the previous 12 positions/s at one strip column (8 vx) per
+// position.
+inline constexpr double kGeneratedArrowPanMinimumSpeed = 8.0;
+inline constexpr double kGeneratedArrowPanMaximumSpeed = 4000.0;
+inline constexpr double kGeneratedArrowPanDefaultSpeed = 96.0;
 // Multiplicative step applied by the Up/Down arrows.
 inline constexpr double kGeneratedArrowPanSpeedStep = 1.25;
-// Distance below which a stop target counts as reached.
-inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-9;
+// Distance below which a stop target counts as reached, in the integrator's
+// unit (base voxels in the dialog): far below anything visible, well above
+// double rounding on arclengths of ~1e4.
+inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-3;
+
+// Camera baseline an overlay group was built against: the scene position of
+// a fixed reference surface point and the camera scale. A strip viewer maps
+// surface to scene as (surface - cameraPointer) * scale + viewportCenter, so
+// while the scale is unchanged every camera move (pan, linked-camera echo,
+// viewport recenter) shifts all overlay items by one common scene delta.
+struct GeneratedOverlayCameraBaseline {
+    QPointF referenceScene{std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::quiet_NaN()};
+    double scale = std::numeric_limits<double>::quiet_NaN();
+};
+
+// The scene delta that moves an overlay built at `baseline` to the camera
+// whose reference point now sits at `referenceScene`, or nullopt when the
+// items must be rebuilt instead: the scale changed (a zoom), or either state
+// is unknown.
+inline std::optional<QPointF> generatedOverlayPanTranslation(
+    const GeneratedOverlayCameraBaseline& baseline,
+    const QPointF& referenceScene,
+    double scale)
+{
+    const auto finitePoint = [](const QPointF& point) {
+        return std::isfinite(point.x()) && std::isfinite(point.y());
+    };
+    if (!finitePoint(baseline.referenceScene) || !std::isfinite(baseline.scale) ||
+        !finitePoint(referenceScene) || !std::isfinite(scale)) {
+        return std::nullopt;
+    }
+    if (scale != baseline.scale) {
+        return std::nullopt;
+    }
+    return referenceScene - baseline.referenceScene;
+}
 
 struct GeneratedArrowPanState {
     double position = 0.0;
-    // Signed, in line positions per second.
+    // Signed, in the integrator's unit per second.
     double velocity = 0.0;
     // True once the step consumed the stop target exactly.
     bool landed = false;
@@ -1309,9 +1476,18 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(const GeneratedVi
                                                                CChunkedVolumeViewer* viewer,
                                                                PlaneSurface* plane,
                                                                const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
-void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
-                           const std::string& surfaceName,
-                           const GeneratedOverlay& overlay);
+// The viewer overlay-group key applyGeneratedOverlay registers an overlay
+// under. Single source for registration and for anything that later addresses
+// the group (translateOverlayGroup during a pan).
+inline std::string generatedOverlayGroupKey(const std::string& surfaceName)
+{
+    return "line_annotation_overlay_" + surfaceName;
+}
+// Registers the overlay's items on the viewer and returns the group key they
+// were registered under (empty when nothing was registered).
+std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
+                                  const std::string& surfaceName,
+                                  const GeneratedOverlay& overlay);
 void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
                                               const std::string& surfaceName);
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(

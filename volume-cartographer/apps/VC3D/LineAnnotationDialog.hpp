@@ -199,9 +199,13 @@ public:
 signals:
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
+    // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
+    // controller can resolve the position on its own (possibly renumbered)
+    // line without consulting the clicked point.
     void generatedControlPointRequested(const std::string& surfaceName,
                                         cv::Vec3f volumePoint,
-                                        double linePosition);
+                                        double linePosition,
+                                        cv::Vec3f lineAnchor);
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
@@ -361,7 +365,14 @@ private:
     bool controlPointPlacementAllowedAt(double linePosition) const;
     vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
+    // Cumulative base-voxel arclengths of the displayed line (one per point),
+    // or an empty vector when no usable map exists; along-line motion (wheel,
+    // arrow pan, Space snap) is measured in these units.
+    const std::vector<double>& currentLineArclengths() const;
     void rebuildGeneratedStaticStripOverlays();
+    // Arrow-pan tick: shift the static strip overlays with the camera (exact
+    // while the zoom is unchanged), rebuilding only when it is not.
+    void updateStaticStripOverlaysForPan();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
                                          bool updateSpanLabels = true);
     void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
@@ -376,7 +387,8 @@ private:
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
     void restoreInitialGeneratedViewerCameras();
-    void applyOverlayForViewer(const std::string& overlayKey,
+    // Returns the viewer overlay-group key the items were registered under.
+    std::string applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
@@ -496,6 +508,18 @@ private:
     std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
+    // Per strip viewer: the viewer group the current static overlay was
+    // registered under (the key registration returned, used verbatim for the
+    // pan-time translation) and the camera it was built for.
+    struct StaticStripOverlayPlacement {
+        std::string groupKey;
+        vc3d::line_annotation::GeneratedOverlayCameraBaseline camera;
+    };
+    std::vector<StaticStripOverlayPlacement> _staticStripOverlayPlacements;
+    // A missing group during a pan means a registration/lookup mismatch, not a
+    // legitimate rebuild reason; warn once per pan so it cannot hide behind
+    // the rebuild fallback.
+    bool _staticStripOverlayPanFallbackWarned = false;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
@@ -569,6 +593,9 @@ private:
     // (space, edits): only a landed pan may hand back to a still-held key.
     bool _arrowPanEndedByLanding = false;
     double _arrowPanVelocity = 0.0;
+    // Unit the running pan's velocity is in (true: base-voxel arclength,
+    // false: line positions); a change mid-gesture cancels the pan.
+    std::optional<bool> _arrowPanArclengthUnits;
     std::optional<double> _arrowPanStopTarget;
     double _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
     double _arrowPanCruiseSpeed =

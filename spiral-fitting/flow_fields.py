@@ -509,6 +509,9 @@ class CylindricalFlowField(nn.Module):
         # (pinned field graph output, detached leaf) pairs armed by
         # get_sampler in training and consumed by apply_accumulated_field_grad.
         self._pending_field_graphs = None
+        self._lr_grad_acc = None
+        self._hr_grad_acc = None
+        self._pending_fused = False
 
     @staticmethod
     def _sample_lattice(field, ring_num_phi, ring_offsets, normalised_zyx):
@@ -582,6 +585,7 @@ class CylindricalFlowField(nn.Module):
         # the time-interpolated, axis-pinned LR & HR lattices so those one-time
         # costs amortise across the integrator's sample calls.
         if self.num_flow_timesteps == 1:
+            assert not self._pending_fused
             lr_field = self.flows[0][0]
             hr_field = self.flows[1][0]
         else:
@@ -624,7 +628,86 @@ class CylindricalFlowField(nn.Module):
             )
         return sample
 
+    def get_time_invariant_integrator(self):
+        """Return a lazy stationary RK4 integrator with a fused CUDA path."""
+        assert self.num_flow_timesteps == 1
+        fused_lattices = flow_triton.rk4_triton_available(
+            self.flows[0], self.flows[1])
+        mode = None
+        eager_sampler = None
+        fused_fields = fused_accs = None
+
+        def eager_integrate(y_flat, h, n_steps):
+            nonlocal eager_sampler
+            if eager_sampler is None:
+                eager_sampler = self.get_sampler(0.0)
+            y = y_flat
+            for _ in range(n_steps):
+                k1 = eager_sampler(y)
+                k2 = eager_sampler(y + (h / 2) * k1)
+                k3 = eager_sampler(y + (h / 2) * k2)
+                k4 = eager_sampler(y + h * k3)
+                y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+            return y
+
+        def integrate(y_flat, h, n_steps):
+            nonlocal mode, fused_fields, fused_accs
+            can_fuse = (
+                fused_lattices
+                and flow_triton.rk4_triton_available(y_flat)
+                and y_flat.device == self.flows[0].device
+                and self._lr_num_phi.is_cuda and self._hr_num_phi.is_cuda
+                and self._lr_offsets.is_cuda and self._hr_offsets.is_cuda)
+            if mode is None:
+                mode = 'fused' if can_fuse else 'eager'
+            if mode == 'eager':
+                return eager_integrate(y_flat, h, n_steps)
+            if not can_fuse:
+                raise RuntimeError(
+                    'a cylindrical integrator cannot mix fused and eager tensor types')
+
+            if fused_fields is None:
+                low, high = self.flows[0][0], self.flows[1][0]
+                training_field = torch.is_grad_enabled() and (
+                    self.flows[0].requires_grad or self.flows[1].requires_grad)
+                acc_low = acc_high = None
+                if training_field:
+                    assert self._pending_field_graphs is None
+                    if self._lr_grad_acc is None or self._lr_grad_acc.shape != low.shape:
+                        self._lr_grad_acc = torch.zeros_like(low)
+                    else:
+                        self._lr_grad_acc.zero_()
+                    if self._hr_grad_acc is None or self._hr_grad_acc.shape != high.shape:
+                        self._hr_grad_acc = torch.zeros_like(high)
+                    else:
+                        self._hr_grad_acc.zero_()
+                    acc_low, acc_high = self._lr_grad_acc, self._hr_grad_acc
+                    self._pending_fused = True
+                fused_fields = (low.contiguous(), high.contiguous())
+                fused_accs = (acc_low, acc_high)
+
+            low, high = fused_fields
+            acc_low, acc_high = fused_accs
+            return flow_triton.rk4_cylindrical_integrate(
+                y_flat, low, self._lr_num_phi, self._lr_offsets,
+                high, self._hr_num_phi, self._hr_offsets,
+                acc_low, acc_high, h, n_steps)
+
+        return integrate
+
     def apply_accumulated_field_grad(self):
+        if self._pending_fused:
+            self._pending_fused = False
+            for param, acc in (
+                    (self.flows[0], self._lr_grad_acc),
+                    (self.flows[1], self._hr_grad_acc)):
+                grad = acc.unsqueeze(0)
+                if param.grad is None:
+                    param.grad = grad
+                elif (param.grad.untyped_storage().data_ptr()
+                      != grad.untyped_storage().data_ptr()):
+                    param.grad.add_(grad)
+            return
         pending, self._pending_field_graphs = self._pending_field_graphs, None
         if not pending:
             return

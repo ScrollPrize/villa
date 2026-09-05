@@ -205,26 +205,57 @@ char segmentInterpolationModeMarker(SegmentInterpolationMode mode) noexcept
     return '?';
 }
 
+SegmentInterpolationCutoffs segmentInterpolationCutoffs(
+    const vc::fiber_tracer::FiberTraceConfig& traceConfig,
+    const vc::lasagna::LineOptimizationConfig& lasagnaConfig,
+    double traceToBaseScale)
+{
+    SegmentInterpolationCutoffs cutoffs;
+    cutoffs.traceMinimumSpanBaseVoxels = static_cast<double>(kMinimumTraceSteps) *
+        traceConfig.stepVoxels * traceToBaseScale;
+    cutoffs.lasagnaMinimumSpanBaseVoxels =
+        static_cast<double>(kMinimumLasagnaSegments) * lasagnaConfig.segmentLength;
+    if (!std::isfinite(cutoffs.traceMinimumSpanBaseVoxels) ||
+        cutoffs.traceMinimumSpanBaseVoxels <= 0.0) {
+        throw std::invalid_argument(
+            "trace minimum span must be finite and positive (check stepVoxels and traceToBaseScale)");
+    }
+    if (!std::isfinite(cutoffs.lasagnaMinimumSpanBaseVoxels) ||
+        cutoffs.lasagnaMinimumSpanBaseVoxels <= 0.0) {
+        throw std::invalid_argument(
+            "lasagna minimum span must be finite and positive (check segmentLength)");
+    }
+    return cutoffs;
+}
+
 SegmentInterpolationMode resolveSegmentInterpolationMode(
     SegmentInterpolationGoal goal,
     FiberOptimizationMode globalMode,
-    double endpointDistanceBaseVoxels)
+    double endpointDistanceBaseVoxels,
+    const SegmentInterpolationCutoffs& cutoffs)
 {
     if (!std::isfinite(endpointDistanceBaseVoxels) ||
         endpointDistanceBaseVoxels < 0.0) {
         throw std::invalid_argument("segment endpoint distance must be finite and non-negative");
     }
-    if (goal == SegmentInterpolationGoal::Cspline ||
-        (goal == SegmentInterpolationGoal::Global &&
-         endpointDistanceBaseVoxels < 100.0)) {
+    if (goal == SegmentInterpolationGoal::Cspline) {
         return SegmentInterpolationMode::Cspline;
     }
-    if (goal == SegmentInterpolationGoal::Lasagna ||
-        (goal == SegmentInterpolationGoal::Global &&
-         globalMode == FiberOptimizationMode::Lasagna)) {
+    if (goal == SegmentInterpolationGoal::Lasagna) {
         return SegmentInterpolationMode::Lasagna;
     }
-    return SegmentInterpolationMode::Trace;
+    if (goal == SegmentInterpolationGoal::Trace) {
+        return SegmentInterpolationMode::Trace;
+    }
+    // Global goal: the mode's own regime decides the minimum span.
+    if (globalMode == FiberOptimizationMode::Lasagna) {
+        return endpointDistanceBaseVoxels < cutoffs.lasagnaMinimumSpanBaseVoxels
+            ? SegmentInterpolationMode::Cspline
+            : SegmentInterpolationMode::Lasagna;
+    }
+    return endpointDistanceBaseVoxels < cutoffs.traceMinimumSpanBaseVoxels
+        ? SegmentInterpolationMode::Cspline
+        : SegmentInterpolationMode::Trace;
 }
 
 bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept
@@ -357,6 +388,7 @@ void appendFiberModeReport(FiberModeOptimizationResult& output)
     message << output.optimization.report.message
             << "\nfiber_mode native_segments=" << output.nativeSegments
             << " lasagna_fallback_segments=" << output.lasagnaFallbackSegments
+            << " cspline_fallback_segments=" << output.csplineFallbackSegments
             << " native_extrapolations=" << output.nativeExtrapolations
             << " lasagna_fallback_extrapolations="
             << output.lasagnaFallbackExtrapolations;
@@ -661,6 +693,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                 attempt[index] = true;
         }
     }
+    const SegmentInterpolationCutoffs cutoffs = segmentInterpolationCutoffs(
+        request.traceConfig, request.lasagnaConfig, request.traceToBaseScale);
     std::vector<bool> fixedSpan(spans.size(), false);
     for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
         throwIfCancelled();
@@ -675,11 +709,13 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             fixedSpan[spanIndex] = true;
             continue;
         }
+        const double endpointDistanceBaseVoxels = pointDistance(
+            owner.volumePoint, request.controlPoints[spanIndex + 1].volumePoint);
         const SegmentInterpolationMode requestedMode = resolveSegmentInterpolationMode(
             goal,
             request.globalMode,
-            pointDistance(owner.volumePoint,
-                          request.controlPoints[spanIndex + 1].volumePoint));
+            endpointDistanceBaseVoxels,
+            cutoffs);
         if (requestedMode == SegmentInterpolationMode::Cspline) {
             modes[spanIndex] = SegmentInterpolationMode::Cspline;
             metadata.interpMode = SegmentInterpolationMode::Cspline;
@@ -755,6 +791,22 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                       request.traceConfig,
                       std::move(traceException));
             owner.segmentToNext->interpGoal = goal;
+            if (goal == SegmentInterpolationGoal::Global &&
+                endpointDistanceBaseVoxels < cutoffs.lasagnaMinimumSpanBaseVoxels) {
+                // Too short for the Lasagna fallback's discretization (it would
+                // be a spline with solver cost and its own failure mode): go
+                // straight to cspline. The trace failure metadata stays on the
+                // span so the diagnostics show what was attempted.
+                auto& metadata = *owner.segmentToNext;
+                modes[spanIndex] = SegmentInterpolationMode::Cspline;
+                metadata.interpMode = SegmentInterpolationMode::Cspline;
+                metadata.metric.reset();
+                if (!metadata.message.empty())
+                    metadata.message += " -> ";
+                metadata.message += "short span, trace -> cspline";
+                ++output.csplineFallbackSegments;
+                continue;
+            }
             modes[spanIndex] = SegmentInterpolationMode::Lasagna;
             ++output.lasagnaFallbackSegments;
             continue;
@@ -1492,6 +1544,142 @@ std::optional<std::vector<size_t>> orderedControlPointLineIndices(
         nextLineIndex = *matched + 1;
     }
     return lineIndices;
+}
+
+bool constrainLineOpenTailsToBounds(
+    vc::lasagna::LineModel& line,
+    std::vector<LineControlPoint>& controls,
+    const Rect3D& focusBounds)
+{
+    if (controls.empty() || line.points.size() < 2) {
+        throw std::invalid_argument(
+            "focus-bounds constraint requires a control and at least two line points");
+    }
+
+    std::vector<cv::Vec3d> controlPositions;
+    controlPositions.reserve(controls.size());
+    for (const auto& control : controls) {
+        controlPositions.push_back(control.volumePoint);
+    }
+    std::vector<cv::Vec3d> linePositions;
+    linePositions.reserve(line.points.size());
+    for (const auto& point : line.points) {
+        linePositions.push_back(point.position);
+    }
+    const auto indices = orderedControlPointLineIndices(
+        controlPositions, linePositions);
+    if (!indices) {
+        throw std::runtime_error(
+            "focus-bounds constraint could not resolve controls on the line");
+    }
+
+    const size_t firstControl = indices->front();
+    const size_t lastControl = indices->back();
+    size_t keepBegin = firstControl;
+    size_t keepEnd = lastControl;
+
+    const bool singleOutsideControl = firstControl == lastControl &&
+        !contains_point(focusBounds, line.points[firstControl].position);
+    if (singleOutsideControl) {
+        bool enteredBounds = false;
+        for (size_t i = firstControl; i > 0;) {
+            --i;
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepBegin = i;
+                continue;
+            }
+            keepBegin = i;
+            if (!inside) {
+                break;
+            }
+        }
+
+        enteredBounds = false;
+        for (size_t i = lastControl + 1; i < line.points.size(); ++i) {
+            const bool inside = contains_point(focusBounds, line.points[i].position);
+            if (!enteredBounds) {
+                if (!inside) {
+                    continue;
+                }
+                enteredBounds = true;
+                keepEnd = i;
+                continue;
+            }
+            keepEnd = i;
+            if (!inside) {
+                break;
+            }
+        }
+    } else if (contains_point(focusBounds, line.points[firstControl].position)) {
+        while (keepBegin > 0) {
+            --keepBegin;
+            if (!contains_point(focusBounds, line.points[keepBegin].position)) {
+                break;
+            }
+        }
+    }
+    if (!singleOutsideControl &&
+        contains_point(focusBounds, line.points[lastControl].position)) {
+        while (keepEnd + 1 < line.points.size()) {
+            ++keepEnd;
+            if (!contains_point(focusBounds, line.points[keepEnd].position)) {
+                break;
+            }
+        }
+    }
+
+    // A one-control solve still needs a direction-bearing line. Prefer an
+    // adjacent in-bounds sample, then retain whichever neighbor exists.
+    if (keepBegin == keepEnd) {
+        const bool leftInside = keepBegin > 0 &&
+            contains_point(focusBounds, line.points[keepBegin - 1].position);
+        const bool rightInside = keepEnd + 1 < line.points.size() &&
+            contains_point(focusBounds, line.points[keepEnd + 1].position);
+        if (leftInside || (!rightInside && keepBegin > 0)) {
+            --keepBegin;
+        } else if (keepEnd + 1 < line.points.size()) {
+            ++keepEnd;
+        }
+    }
+
+    const bool changed = keepBegin != 0 || keepEnd + 1 != line.points.size();
+    if (!changed) {
+        for (size_t i = 0; i < controls.size(); ++i) {
+            controls[i].optimizedIndex = static_cast<int>((*indices)[i]);
+            controls[i].linePosition = static_cast<double>((*indices)[i]);
+        }
+        return false;
+    }
+
+    if (line.segmentSamples.size() + 1 == line.points.size()) {
+        line.segmentSamples = std::vector<vc::lasagna::LineSegmentSamples>(
+            line.segmentSamples.begin() + static_cast<std::ptrdiff_t>(keepBegin),
+            line.segmentSamples.begin() + static_cast<std::ptrdiff_t>(keepEnd));
+    } else {
+        line.segmentSamples.clear();
+    }
+    line.points = std::vector<vc::lasagna::LinePoint>(
+        line.points.begin() + static_cast<std::ptrdiff_t>(keepBegin),
+        line.points.begin() + static_cast<std::ptrdiff_t>(keepEnd + 1));
+
+    if (line.displayFrameAnchorIndex >= 0) {
+        const int clampedAnchor = std::clamp(
+            line.displayFrameAnchorIndex,
+            static_cast<int>(keepBegin),
+            static_cast<int>(keepEnd));
+        line.displayFrameAnchorIndex = clampedAnchor - static_cast<int>(keepBegin);
+    }
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const size_t rebased = (*indices)[i] - keepBegin;
+        controls[i].optimizedIndex = static_cast<int>(rebased);
+        controls[i].linePosition = static_cast<double>(rebased);
+    }
+    return true;
 }
 
 vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(

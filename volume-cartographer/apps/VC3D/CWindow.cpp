@@ -8236,6 +8236,26 @@ void CWindow::CreateWidgets(void)
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
+    const QRegularExpression coordinateTriple(
+        "^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$");
+    ui.focusBBoxMin->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMin));
+    ui.focusBBoxMax->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMax));
+    connect(ui.focusBBoxMin, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.focusBBoxMax, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.chkFocusBBox, &QCheckBox::toggled,
+            this, &CWindow::onFocusBoundsToggled);
+    connect(_state, &CState::focusBoundsChanged,
+            this, &CWindow::refreshFocusBoundsUi);
+    connect(_state, &CState::volumeChanged, this,
+            [this](std::shared_ptr<Volume>, const std::string&) {
+                refreshFocusBoundsUi();
+            });
+    refreshFocusBoundsUi();
+
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         bool showOverlays = settings.value(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS,
                                            vc3d::settings::viewer::SHOW_AXIS_OVERLAYS_DEFAULT).toBool();
@@ -10220,6 +10240,104 @@ void CWindow::onManualLocationChanged()
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();
     }
+}
+
+void CWindow::refreshFocusBoundsUi()
+{
+    if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
+        return;
+    }
+
+    std::optional<Rect3D> bounds = _state ? _state->focusBounds() : std::nullopt;
+    if (!bounds && _state && _state->currentVolume()) {
+        const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+        bounds = Rect3D{{0.0f, 0.0f, 0.0f},
+                        {static_cast<float>(std::max(0, width - 1)),
+                         static_cast<float>(std::max(0, height - 1)),
+                         static_cast<float>(std::max(0, depth - 1))}};
+    }
+
+    const QSignalBlocker checkBlocker(ui.chkFocusBBox);
+    const QSignalBlocker minBlocker(ui.focusBBoxMin);
+    const QSignalBlocker maxBlocker(ui.focusBBoxMax);
+    ui.chkFocusBBox->setChecked(_state && _state->focusBoundsEnabled());
+    const bool haveVolume = _state && _state->currentVolume();
+    ui.chkFocusBBox->setEnabled(haveVolume);
+    ui.focusBBoxMin->setEnabled(haveVolume);
+    ui.focusBBoxMax->setEnabled(haveVolume);
+    if (!bounds) {
+        ui.focusBBoxMin->clear();
+        ui.focusBBoxMax->clear();
+        return;
+    }
+    const auto formatPoint = [](const cv::Vec3f& point) {
+        return QStringLiteral("%1, %2, %3")
+            .arg(static_cast<int>(std::lround(point[0])))
+            .arg(static_cast<int>(std::lround(point[1])))
+            .arg(static_cast<int>(std::lround(point[2])));
+    };
+    ui.focusBBoxMin->setText(formatPoint(bounds->low));
+    ui.focusBBoxMax->setText(formatPoint(bounds->high));
+}
+
+void CWindow::onFocusBoundsEdited()
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto parsePoint = [](const QString& text) -> std::optional<cv::Vec3f> {
+        const QStringList parts = text.trimmed().split(',');
+        if (parts.size() != 3) {
+            return std::nullopt;
+        }
+        cv::Vec3f point;
+        for (int axis = 0; axis < 3; ++axis) {
+            bool ok = false;
+            const int value = parts[axis].trimmed().toInt(&ok);
+            if (!ok) {
+                return std::nullopt;
+            }
+            point[axis] = static_cast<float>(value);
+        }
+        return point;
+    };
+
+    auto low = parsePoint(ui.focusBBoxMin->text());
+    auto high = parsePoint(ui.focusBBoxMax->text());
+    if (!low || !high) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f volumeHigh{
+        static_cast<float>(std::max(0, width - 1)),
+        static_cast<float>(std::max(0, height - 1)),
+        static_cast<float>(std::max(0, depth - 1))};
+    for (int axis = 0; axis < 3; ++axis) {
+        (*low)[axis] = std::clamp((*low)[axis], 0.0f, volumeHigh[axis]);
+        (*high)[axis] = std::clamp((*high)[axis], 0.0f, volumeHigh[axis]);
+    }
+    _state->setFocusBounds(Rect3D{*low, *high});
+    refreshFocusBoundsUi();
+}
+
+void CWindow::onFocusBoundsToggled(bool enabled)
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+    if (enabled && !_state->focusBounds()) {
+        onFocusBoundsEdited();
+        if (!_state->focusBounds()) {
+            refreshFocusBoundsUi();
+            return;
+        }
+    }
+    _state->setFocusBoundsEnabled(enabled);
 }
 
 void CWindow::onZoomIn()
