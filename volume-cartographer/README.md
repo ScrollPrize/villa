@@ -180,6 +180,94 @@ Your folder structure should resemble this:
     ├── paths 
     └── config.json - REQUIRED!
 ```
+
+### Working on remote volumes from the command line
+
+`vc_grow_seg_from_seed` accepts the remote locators described above and
+`vc_render_tifxyz` streams through `--remote-url`, so a segment can be grown
+and rendered on a public OME-Zarr volume without downloading it or building a
+volpkg. The tools fetch only the chunks they touch, over anonymous HTTPS or
+S3. The GUI equivalent is `File -> Open Data Catalog…`, covered in the
+[VC3D tutorial](https://scrollprize.org/tutorial_VC3D).
+
+#### Finding a volume URL
+
+The catalog of the Vesuvius Challenge open-data bucket lives at
+`https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json` and
+describes the samples with their scans, volumes and segments. It is served
+gzip-encoded, hence `--compressed`. This lists the volumes of one sample with
+their level-0 shape and voxel size in micrometers:
+
+```bash
+curl -s --compressed https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json |
+  python3 -c 'import json, sys
+for v in json.load(sys.stdin)["samples"]["PHercParis4"]["volumes"].values():
+    print(v["long_id"], v["properties"]["shape"], v["properties"]["pixel_size_um"])'
+```
+
+A volume sits at `<sample>/volumes/<long_id>` in the bucket and can be
+addressed either way:
+
+```text
+https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/volumes/20260310173927-45.532um-11.0m-110keV-masked.zarr
+s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260310173927-45.532um-11.0m-110keV-masked.zarr
+```
+
+The examples below use this 45.532 µm PHercParis4 volume: level 0 is
+4066×2264×2264 voxels stored in 128³ chunks, and the pyramid has levels 0 to 5.
+
+#### Growing a segment
+
+```bash
+URL=https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/volumes/20260310173927-45.532um-11.0m-110keV-masked.zarr
+echo '{"mode": "seed", "cache_size": 2000000000, "generations": 8, "thread_limit": 4}' > params.json
+vc_grow_seg_from_seed -v "$URL" -t out/ -p params.json --seed 1408 1408 1024
+```
+
+The seed is given as `x y z` in level-0 voxel coordinates. `cache_size` caps
+the decoded chunk cache in bytes (default 1e9) and `thread_limit` the number
+of OpenMP threads. The tracer reads the voxel size from the volume's
+`metadata.json` (`voxelsize: 45.532` in the log) and writes the segment to
+`out/auto_grown_<timestamp>/` as `x.tif`, `y.tif`, `z.tif`, `generations.tif`
+and `meta.json`. It also keeps a copy of every chunk it fetches in VC3D's
+remote cache directory, `~/.VC3D/remote_cache/<volume>-<id>/` unless
+`remote_cache_dir` under `[viewer]` in `~/.VC3D/VC3D.ini` points elsewhere,
+and later runs on the same volume read from there. On this volume the eight
+generations take ten to twenty seconds on a 14-core workstation and fetch
+about 2 MiB the first time;
+`--resume out/auto_grown_<timestamp>` continues a segment against the remote
+volume in the same way.
+
+#### Rendering it
+
+```bash
+vc_render_tifxyz -v render_cache --remote-url "$URL" -s out/auto_grown_* \
+  --scale 1 -g 0 --voxel-size 45.532 --voxel-unit micrometer --tif-output render/
+```
+
+This writes `render/00.tif` (360×360 pixels for the segment above, about
+17 MiB fetched). Things to know:
+
+- `-v` is mandatory, but with `--remote-url` it is only consulted for a local
+  `meta.json`: a nonexistent or empty directory works and stays empty. Chunks
+  are cached in RAM only, sized by `--cache-gb` (default 16); the renderer
+  does not use the tracer's on-disk cache. `--prefetch-remote` fills the RAM
+  cache before rendering starts.
+- Remote volumes are not probed for a voxel size. Without `--voxel-size` the
+  log says `Voxel size: 1.0 (no metadata found; override with --voxel-size)`
+  and the TIFF carries no resolution tag. `--voxel-unit` defaults to
+  `nanometer`, so pass both flags; `--voxel-size 45.532` alone yields a TIFF
+  resolution 1000× too large.
+- `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
+  scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
+  not have fails immediately with
+  `Error: group index 6 not available in remote zarr (present levels: 0 1 2 3 4 5)`.
+- The `#vc-base-scale=N` selector described above applies to the tracer as
+  well: with `#vc-base-scale=2` it reports
+  `zarr dataset size for scale group 0 [1017, 566, 566]` and
+  `voxelsize: 182.128`, the seed is expected in level-2 coordinates, and the
+  segment's `meta.json` keeps the selector in `target_volume`.
+
 ### Opening a volume package and navigating the UI
 First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
 
