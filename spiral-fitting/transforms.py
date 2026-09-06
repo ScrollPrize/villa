@@ -11,7 +11,7 @@ from torchdiffeq import odeint
 
 import gap_triton
 import sample_spiral
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import BSplineFlowField, CartesianFlowField, CylindricalFlowField
 from geom_utils import expm_2x2, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
@@ -465,7 +465,11 @@ class SpiralAndTransform(nn.Module):
         self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['model_initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_field_cls = {
+            'cartesian': CartesianFlowField,
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+        }[config['model_flow_field_type']]
 
         def make_flow_field():
             return flow_field_cls(

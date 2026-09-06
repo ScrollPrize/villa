@@ -29,6 +29,8 @@ import time
 import numpy as np
 import torch
 
+from flow_fields import CartesianFlowField
+
 from sample_spiral import get_theta_and_radii
 
 
@@ -191,7 +193,10 @@ class InteractiveInfluenceState:
     def _allocate_masks(self, spiral_and_transform):
         flow_fields = spiral_and_transform.flow_fields
         for flow_field in flow_fields:
-            if not hasattr(flow_field, 'flows') or len(flow_field.flows) != 2:
+            # The masks assume the trilinear lattice's one-cell support; wider
+            # bases (b-spline) and non-cartesian lattices would need their own
+            # mask geometry.
+            if not isinstance(flow_field, CartesianFlowField):
                 raise RuntimeError(
                     'interactive influence regions require cartesian flow fields '
                     '(low-res + high-res lattices)')
