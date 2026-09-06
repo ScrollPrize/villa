@@ -22,6 +22,67 @@ def sample_field(normalised_zyx, field_for_grid_sample):
     return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
 
 
+_BSPLINE_CONSTS_CACHE = {}
+
+
+def _bspline_consts(field, pts_dtype):
+    # Per-(shape, device, dtype) constants for sample_field_bspline. The
+    # sampler runs for every RK4 stage of every transform call; rebuilding
+    # these tiny tensors each call would cost a pageable host->device copy
+    # plus a stream sync per tensor.
+    key = (tuple(field.shape[1:]), field.device, pts_dtype)
+    consts = _BSPLINE_CONSTS_CACHE.get(key)
+    if consts is None:
+        shape_m1 = torch.tensor(
+            [s - 1 for s in field.shape[1:]], device=field.device, dtype=pts_dtype)
+        consts = (shape_m1, torch.zeros_like(shape_m1))
+        _BSPLINE_CONSTS_CACHE[key] = consts
+    return consts
+
+
+def sample_field_bspline(field, normalised_zyx):
+    # field :: 3, Z, Y, X -- control points of a tricubic uniform B-spline,
+    #   placed at the same align_corners=True lattice positions sample_field
+    #   uses, with edge control points replicated outside the lattice
+    #   (matching padding_mode='border'). Every dimension must be >= 2.
+    # normalised_zyx :: *, 3 in [0, 1]
+    #
+    # Uses the two-fetches-per-axis decomposition (Sigg & Hadwiger 2005,
+    # Ruijters et al. 2008): the four cubic B-spline weights along one axis
+    # collapse into two linear interpolations at offset positions, so the
+    # 4x4x4 stencil is evaluated exactly as 8 trilinear fetches. Both offset
+    # positions along each axis stay inside a single lattice cell (or in the
+    # replicated border region), so each trilinear fetch reproduces its pair
+    # of stencil taps exactly. All 8 fetches run as ONE sample_field call on
+    # an 8x-widened point batch: one grid_sample kernel per lattice, and --
+    # since grid_sample's backward materialises a dense field-sized gradient
+    # per call -- one such transient instead of eight.
+    orig_shape = normalised_zyx.shape
+    pts = normalised_zyx.reshape(-1, 3)
+    shape_m1, zeros3 = _bspline_consts(field, pts.dtype)
+    x = (pts * shape_m1).clamp(min=zeros3, max=shape_m1)
+    lo = x.floor()
+    f = x - lo
+    f2 = f * f
+    f3 = f2 * f
+    w0 = (1. - f) ** 3 / 6.
+    w1 = (3. * f3 - 6. * f2 + 4.) / 6.
+    w2 = (-3. * f3 + 3. * f2 + 3. * f + 1.) / 6.
+    w3 = f3 / 6.
+    # Per axis: weights w0..w3 over taps lo-1..lo+2 become weights (g0, g1) on
+    # linear fetches at h0 in [lo-1, lo] and h1 in [lo+1, lo+2]. g0 and g1 are
+    # bounded in [1/6, 5/6], so the divisions are safe.
+    g0 = w0 + w1
+    g1 = w2 + w3
+    h0 = (lo - 1. + w1 / g0) / shape_m1
+    h1 = (lo + 1. + w3 / g1) / shape_m1
+    corner_is_hi = _corner_bits(pts.device).bool()[:, None, :]  # 8, 1, 3
+    pos = torch.where(corner_is_hi, h1[None], h0[None])  # 8, n, 3
+    weight = torch.where(corner_is_hi, g1[None], g0[None]).prod(-1)  # 8, n
+    fetched = sample_field(pos, field)  # 8, n, 3
+    return (fetched * weight.unsqueeze(-1)).sum(0).view(*orig_shape[:-1], 3)
+
+
 _CORNER_BITS_CACHE = {}
 
 
@@ -451,7 +512,56 @@ class CartesianFlowField(nn.Module):
             hr_param.grad.add_(hr_grad)
 
 
-class CylindricalFlowField(nn.Module):
+class _DirectSampledFlowField(nn.Module):
+
+    # Base for flow fields whose parameter lattices are sampled directly at
+    # query points (no upsampled full-resolution intermediate): provides the
+    # streamed-backward support such fields share. The time-invariant sampler
+    # is cached by the diffeomorphism and shared across every loss family in
+    # an iteration, so get_sampler implementations pass their per-iteration
+    # field tensors through _maybe_cut_field_leaves to cut the field graphs at
+    # detached leaves; each family's backward then owns its whole graph (no
+    # retain_graph), and the accumulated leaf gradients flow to the parameters
+    # when the training loop calls apply_accumulated_field_grad.
+
+    def __init__(self):
+        super().__init__()
+        # (pinned field graph output, detached leaf) pairs armed by
+        # _maybe_cut_field_leaves in training and consumed by
+        # apply_accumulated_field_grad.
+        self._pending_field_graphs = None
+
+    def _maybe_cut_field_leaves(self, fields):
+        if not (torch.is_grad_enabled() and any(f.requires_grad for f in fields)):
+            return fields
+        # Overwrites any previous pending record, matching CartesianFlowField's
+        # one-armed-record-per-iteration discipline.
+        leaves = [field.detach().requires_grad_(True) for field in fields]
+        self._pending_field_graphs = list(zip(fields, leaves))
+        return leaves
+
+    def _time_interpolated_fields(self, t):
+        t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (self.num_flow_timesteps - 1)
+        t_idx_before = int(t_scaled)
+        frac = t_scaled % 1.
+        return tuple(
+            torch.lerp(flow[t_idx_before], flow[t_idx_before + 1], frac)
+            for flow in self.flows
+        )
+
+    def apply_accumulated_field_grad(self):
+        pending, self._pending_field_graphs = self._pending_field_graphs, None
+        if not pending:
+            return
+        outputs = [output for output, leaf in pending if leaf.grad is not None]
+        if outputs:
+            torch.autograd.backward(
+                outputs,
+                [leaf.grad for _, leaf in pending if leaf.grad is not None],
+            )
+
+
+class CylindricalFlowField(_DirectSampledFlowField):
 
     # Flow field with parameters on a cylindrical lattice (z, r, phi). The cylinder axis lies
     # along z at the centre of the y, x box; the lattice spans z=[0,Z) and the inscribed disk in
@@ -589,11 +699,7 @@ class CylindricalFlowField(nn.Module):
             lr_field = self.flows[0][0]
             hr_field = self.flows[1][0]
         else:
-            t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (self.num_flow_timesteps - 1)
-            t_idx_before = int(t_scaled)
-            frac = t_scaled % 1.
-            lr_field = torch.lerp(self.flows[0][t_idx_before], self.flows[0][t_idx_before + 1], frac)
-            hr_field = torch.lerp(self.flows[1][t_idx_before], self.flows[1][t_idx_before + 1], frac)
+            lr_field, hr_field = self._time_interpolated_fields(t)
         # Pin the r=0 ring (axis singularity) to zero by replacing its flat-phi slice with a
         # constant zero, so no gradient flows to those parameters; they stay zero indefinitely.
         n0_lr = int(self._lr_num_phi[0])
@@ -601,19 +707,8 @@ class CylindricalFlowField(nn.Module):
         lr_field = torch.cat([torch.zeros_like(lr_field[:, :, :n0_lr]), lr_field[:, :, n0_lr:]], dim=2)
         hr_field = torch.cat([torch.zeros_like(hr_field[:, :, :n0_hr]), hr_field[:, :, n0_hr:]], dim=2)
 
-        if self.num_flow_timesteps == 1 and torch.is_grad_enabled() and (
-                self.flows[0].requires_grad or self.flows[1].requires_grad):
-            # The time-invariant sampler is cached by the diffeomorphism and
-            # shared across every loss family in an iteration. Cut the
-            # pinned field graphs at detached leaves so each family's
-            # backward owns its whole graph (no retain_graph); the accumulated
-            # leaf gradients flow to the parameters when the training loop
-            # calls apply_accumulated_field_grad. Overwrites any previous
-            # pending record, matching CartesianFlowField's one-armed-record-
-            # per-iteration discipline.
-            leaves = [field.detach().requires_grad_(True) for field in (lr_field, hr_field)]
-            self._pending_field_graphs = list(zip((lr_field, hr_field), leaves))
-            lr_field, hr_field = leaves
+        if self.num_flow_timesteps == 1:
+            lr_field, hr_field = self._maybe_cut_field_leaves((lr_field, hr_field))
 
         sample_lattice = self._sample_lattice
         lr_num_phi = self._lr_num_phi
@@ -717,3 +812,48 @@ class CylindricalFlowField(nn.Module):
                 outputs,
                 [leaf.grad for _, leaf in pending if leaf.grad is not None],
             )
+
+class BSplineFlowField(_DirectSampledFlowField):
+
+    # Flow field whose parameters are control points of a tricubic uniform
+    # B-spline lattice (see sample_field_bspline) instead of a trilinearly
+    # interpolated voxel grid. The C2 basis represents smooth deformations
+    # with a coarser lattice, so this is normally paired with a larger
+    # model_flow_voxel_resolution; note that at equal resolution it is a
+    # smoothed (approximating, not interpolating) version of the trilinear
+    # field. Keeps CartesianFlowField's two-level (low-res + high-res)
+    # parameter structure so optimizer grouping, the high-res LR schedule and
+    # checkpoint shape checks apply unchanged. Both lattices are sampled
+    # directly at query points; integration uses the diffeomorphism's generic
+    # cached-sampler RK4 loop (there is no fused Triton path). direct_lr is
+    # accepted for constructor parity and ignored.
+
+    def __init__(self, resolution, spatial_scale_factor=6, num_flow_timesteps=1, direct_lr=False):
+        super().__init__()
+        self.num_flow_timesteps = num_flow_timesteps
+        # Direct sampling needs >= 2 control points per axis
+        # (sample_field_bspline divides by shape-1), unlike the cartesian LR
+        # lattice, which is only ever an F.interpolate input.
+        hr_shape = [max(2, int(s)) for s in resolution]
+        lr_shape = [max(2, s // spatial_scale_factor) for s in hr_shape]
+        self.flows = nn.ParameterList([
+            nn.Parameter(torch.zeros([num_flow_timesteps, 3, *lr_shape])),
+            nn.Parameter(torch.zeros([num_flow_timesteps, 3, *hr_shape])),
+        ])
+
+    def get_sampler(self, t):
+        # Returns a callable mapping normalised zyx points in [0, 1] to flow
+        # velocity at time t, evaluating the B-spline lattices directly at
+        # each query point.
+        if self.num_flow_timesteps == 1:
+            lr_field, hr_field = self._maybe_cut_field_leaves(
+                (self.flows[0][0], self.flows[1][0]))
+        else:
+            lr_field, hr_field = self._time_interpolated_fields(t)
+
+        def sample(normalised_zyx):
+            return (
+                sample_field_bspline(lr_field, normalised_zyx)
+                + sample_field_bspline(hr_field, normalised_zyx)
+            )
+        return sample

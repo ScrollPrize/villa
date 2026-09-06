@@ -11,7 +11,7 @@ from torchdiffeq import odeint
 
 import gap_triton
 import sample_spiral
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import BSplineFlowField, CartesianFlowField, CylindricalFlowField
 from gap_parameterization import (
     calibrated_gap_softplus_scale,
     initial_dr_logit,
@@ -507,7 +507,11 @@ class SpiralAndTransform(nn.Module):
             float(config['model_initial_dr_per_winding']), self.gap_min_gap))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_field_cls = {
+            'cartesian': CartesianFlowField,
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+        }[config['model_flow_field_type']]
 
         def make_flow_field():
             return flow_field_cls(

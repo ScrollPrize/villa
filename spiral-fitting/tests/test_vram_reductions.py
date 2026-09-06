@@ -240,6 +240,9 @@ class SharedTransformLeafTests(unittest.TestCase):
     def test_cylindrical_streamed_leaf_backwards_match_combined(self):
         self._check_streamed_leaf_backwards_match_combined('cylindrical')
 
+    def test_bspline_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('bspline')
+
 
 class DevicePatchAtlasTests(unittest.TestCase):
     @classmethod
