@@ -2800,3 +2800,27 @@
 - Reference and optimized modes must return identical dependency sets, bytes,
   coverage and missing/error counts for transformed levels, non-power-of-two
   chunks, boundary and non-finite coordinates.
+
+# Native Fiber3D coordinate generation
+
+- The Fiber3D loader supports `geometry_backend = auto|native|eager`. `auto`
+  uses the native backend for eligible CPU/base-volume generation and retains
+  the eager Torch implementation as a compatibility fallback. Explicit
+  `native` fails clearly when the installed VC3D binding is stale or the input
+  contract is ineligible; explicit `eager` is the reference/debug path.
+- Native generation is one standalone, GIL-releasing CPU primitive. It accepts
+  output ZYX shape, local and volume centers, the output-to-source affine,
+  smooth mode/control arrays with origin and spacing, selected-to-base scale,
+  and base-volume shape. It returns contiguous float32 `(Z,Y,X,3)` base
+  coordinates and uint8 `(Z,Y,X)` validity.
+- Each output coordinate is evaluated directly from its integer index. Affine
+  mapping and optional 1D/2D/3D low-resolution smooth-control interpolation
+  happen in registers/cache in one traversal; full-resolution meshgrid,
+  affine, displacement, scale, and validity intermediates are forbidden.
+  Sampling remains in the existing shared VC3D coordinate sampler.
+- Agreement with the eager reference must have maximum coordinate error at
+  most `1e-3` base voxel and mean absolute error at most `1e-5`; validity must
+  match exactly for finite and boundary fixtures. On representative sampled
+  patches, mismatched valid voxels must be at most `1e-4` and maximum uint8
+  difference at most one. No fast-math flags are permitted, and scalar portable
+  behavior remains available on supported Ubuntu/macOS amd64/arm64 builds.

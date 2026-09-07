@@ -25,5 +25,9 @@
 - [x] Verify exact outputs and run the CPU-only S1a before/after benchmark.
 - [ ] Evaluate optimizations against quality per hour.
 - [x] Profile eager coordinate-generation operations independently.
-- [ ] Implement shared cache-local implicit coordinate evaluation.
-- [ ] Verify exact eager/fused equivalence and benchmark 1/128 workers.
+- [x] Implement and benchmark the intermediate cache-local Torch generator.
+- [x] Plan the custom C++ fused coordinate generator.
+- [x] Independently review the native generator plan and reconcile the superseded exact/implicit contract.
+- [x] Implement and test the portable native binding and loader backend.
+- [x] Benchmark native generation with 1 and 128 processes.
+- [x] Decide from measurements whether low-resolution 3D precomposition helps (defer: direct generation already exceeds the global target).

@@ -85,6 +85,7 @@ class FiberTrace3DConfig:
     augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
     geometry_tile_depth: int = 0
+    geometry_backend: str = "auto"
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
@@ -450,6 +451,7 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
+        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),
@@ -1178,6 +1180,8 @@ class FiberTrace3DLoader:
             raise ValueError("augment_smooth_displacement_control_spacing_zyx values must be > 0")
         if int(config.geometry_tile_depth) < 0:
             raise ValueError("geometry_tile_depth must be >= 0")
+        if str(config.geometry_backend) not in {"auto", "native", "eager"}:
+            raise ValueError("geometry_backend must be auto, native, or eager")
         if not (0.0 <= config.augment_smooth_displacement_probability <= 1.0):
             raise ValueError("augment_smooth_displacement_probability must be in [0,1]")
         if not (0.0 <= config.augment_anisotropic_blur_probability <= 1.0):
@@ -1688,6 +1692,68 @@ class FiberTrace3DLoader:
                 profile_timings_ms[name] = profile_timings_ms.get(name, 0.0) + (
                     time.perf_counter() - started
                 ) * 1000.0
+
+        backend = str(self.config.geometry_backend)
+        native_eligible = (
+            device.type == "cpu"
+            and volume_spacing_base is not None
+            and base_shape_zyx is not None
+        )
+        native_function = None
+        if native_eligible and backend in {"auto", "native"}:
+            try:
+                from vc.volume import generate_fiber3d_coords
+
+                native_function = generate_fiber3d_coords
+            except ImportError as exc:
+                if backend == "native":
+                    raise RuntimeError(
+                        "geometry_backend='native' requires a rebuilt volume-cartographer "
+                        "binding with generate_fiber3d_coords"
+                    ) from exc
+        elif backend == "native":
+            raise RuntimeError(
+                "geometry_backend='native' requires CPU generation with volume scale and shape"
+            )
+
+        if native_function is not None:
+            smooth = params.smooth
+            smooth_mode = "none" if smooth is None else str(smooth.mode)
+            smooth_controls = [] if smooth is None else [
+                np.ascontiguousarray(control, dtype=np.float32)
+                for control in smooth.controls
+            ]
+            smooth_origin = np.zeros((3,), dtype=np.float32) if smooth is None else np.ascontiguousarray(
+                smooth.control_min_zyx, dtype=np.float32
+            )
+            smooth_spacing = np.ones((3,), dtype=np.float32) if smooth is None else np.ascontiguousarray(
+                smooth.control_spacing_zyx, dtype=np.float32
+            )
+            started = time.perf_counter()
+            coords_base, valid_base = native_function(
+                patch_shape,
+                np.ascontiguousarray(params.cp_local_zyx, dtype=np.float32),
+                np.ascontiguousarray(params.cp_volume_zyx, dtype=np.float32),
+                np.ascontiguousarray(params.output_to_source_zyx, dtype=np.float32),
+                smooth_mode,
+                smooth_controls,
+                smooth_origin,
+                smooth_spacing,
+                float(volume_spacing_base),
+                tuple(int(v) for v in base_shape_zyx),
+            )
+            record("geometry_native_ms", started)
+            if profile_timings_ms is not None:
+                profile_timings_ms["geometry_native_used"] = 1.0
+                profile_timings_ms["geometry_tiles"] = 1.0
+            return _GeometryMaps3D(
+                backward_source_zyx=None,
+                params=params,
+                backward_source_base_zyx=np.asarray(coords_base, dtype=np.float32),
+                valid_base=np.asarray(valid_base, dtype=np.uint8).astype(bool, copy=False),
+            )
+        if profile_timings_ms is not None:
+            profile_timings_ms["geometry_native_used"] = 0.0
 
         start = time.perf_counter()
         cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
@@ -2765,6 +2831,7 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
+        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),

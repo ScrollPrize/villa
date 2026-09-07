@@ -174,6 +174,15 @@ them adds inner-loop bookkeeping. These controls do not alter cache I/O or
 decode admission. Returned stats include dependency, chunk-resolution and
 interpolation durations plus per-cache codec counter deltas for profiling.
 
+The `vc.volume` extension also exposes the standalone CPU helper
+`generate_fiber3d_coords(...)`. It generates a contiguous float32
+`(z, y, x, 3)` base-coordinate array and uint8 `(z, y, x)` validity mask in one
+native pass from the Fiber3D affine transform and optional low-resolution
+smooth controls. It evaluates controls directly for each output coordinate,
+does not construct full-resolution meshgrid or displacement intermediates, and
+releases the GIL. The Fiber3D loader selects it through `geometry_backend`
+(`auto`, `native`, or the reference `eager` implementation).
+
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
 mirror: metadata and fetched storage objects keep their source-relative paths
 and exact encoded bytes. Sharded arrays cache one complete outer shard and fan

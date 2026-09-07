@@ -1822,6 +1822,7 @@ def test_tiled_geometry_is_bitwise_identical_to_eager_geometry(
     mode: str, tile_depth: int
 ) -> None:
     common = {
+        "geometry_backend": "eager",
         "augment_smooth_displacement_mode": mode,
         "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
         "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
@@ -1863,6 +1864,7 @@ def test_tiled_geometry_is_bitwise_identical_to_eager_geometry(
 
 def test_tiled_geometry_is_bitwise_identical_for_training_patch_shape() -> None:
     common = {
+        "geometry_backend": "eager",
         "patch_shape_zyx": [128, 128, 128],
         "augment_smooth_displacement_mode": "3d",
         "augment_smooth_displacement_amplitude_zyx": [2.0, 2.0, 2.0],
@@ -1881,6 +1883,166 @@ def test_tiled_geometry_is_bitwise_identical_for_training_patch_shape() -> None:
         tiled_geometry.backward_source_zyx,
         eager_geometry.backward_source_zyx,
     )
+
+
+@pytest.mark.parametrize("mode", ("none", "1d", "2d", "3d"))
+def test_native_geometry_matches_eager_coordinates(mode: str) -> None:
+    native_module = pytest.importorskip("vc.volume")
+    if not hasattr(native_module, "generate_fiber3d_coords"):
+        pytest.skip("volume-cartographer binding lacks native Fiber3D geometry")
+    common = {
+        "patch_shape_zyx": [17, 15, 13],
+        "augment_smooth_displacement_mode": mode,
+        "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
+        "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
+        "augment_smooth_displacement_probability": 1.0,
+    }
+    eager = _loader_with_mapping({**common, "geometry_backend": "eager"})
+    native = _loader_with_mapping({**common, "geometry_backend": "native"})
+    record, _record_index, cp_index = eager.descriptor_for_sample_index(2)
+    params = eager._sample_augment_params(record, cp_index, 2)
+
+    eager_geometry = eager._build_geometry_maps(
+        params,
+        device=torch.device("cpu"),
+        volume_spacing_base=float(record.volume_spacing_base),
+        base_shape_zyx=record.base_shape_zyx,
+    )
+    timings: dict[str, float] = {}
+    native_geometry = native._build_geometry_maps(
+        params,
+        device=torch.device("cpu"),
+        volume_spacing_base=float(record.volume_spacing_base),
+        base_shape_zyx=record.base_shape_zyx,
+        profile_timings_ms=timings,
+    )
+    assert eager_geometry.backward_source_zyx is not None
+    expected = np.ascontiguousarray(
+        eager_geometry.backward_source_zyx.numpy()
+        * float(record.volume_spacing_base)
+    )
+    assert native_geometry.backward_source_base_zyx is not None
+    error = np.abs(native_geometry.backward_source_base_zyx - expected)
+    assert float(error.max()) <= 1.0e-3
+    assert float(error.mean()) <= 1.0e-5
+    assert native_geometry.valid_base is not None
+    base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
+    expected_valid = np.isfinite(expected).all(axis=-1)
+    for axis in range(3):
+        expected_valid &= (expected[..., axis] >= 0.0) & (
+            expected[..., axis] <= float(base_shape[axis] - 1.0)
+        )
+    assert np.array_equal(native_geometry.valid_base, expected_valid)
+    assert timings["geometry_native_used"] == 1.0
+
+
+def test_native_geometry_rejects_stale_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vc.volume
+
+    monkeypatch.delattr(vc.volume, "generate_fiber3d_coords", raising=False)
+    loader = _loader_with_mapping({"geometry_backend": "native"})
+    record, _record_index, cp_index = loader.descriptor_for_sample_index(0)
+    params = loader._sample_augment_params(record, cp_index, 0)
+    with pytest.raises(RuntimeError, match="requires a rebuilt volume-cartographer"):
+        loader._build_geometry_maps(
+            params,
+            device=torch.device("cpu"),
+            volume_spacing_base=float(record.volume_spacing_base),
+            base_shape_zyx=record.base_shape_zyx,
+        )
+
+
+def test_geometry_auto_prefers_native_and_falls_back_for_stale_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vc.volume
+
+    if not hasattr(vc.volume, "generate_fiber3d_coords"):
+        pytest.skip("volume-cartographer binding lacks native Fiber3D geometry")
+    loader = _loader_with_mapping({})
+    record, _record_index, cp_index = loader.descriptor_for_sample_index(0)
+    params = loader._sample_augment_params(record, cp_index, 0)
+    native_timings: dict[str, float] = {}
+    native_geometry = loader._build_geometry_maps(
+        params,
+        device=torch.device("cpu"),
+        volume_spacing_base=float(record.volume_spacing_base),
+        base_shape_zyx=record.base_shape_zyx,
+        profile_timings_ms=native_timings,
+    )
+    assert native_geometry.backward_source_base_zyx is not None
+    assert native_timings["geometry_native_used"] == 1.0
+
+    monkeypatch.delattr(vc.volume, "generate_fiber3d_coords")
+    eager_timings: dict[str, float] = {}
+    eager_geometry = loader._build_geometry_maps(
+        params,
+        device=torch.device("cpu"),
+        volume_spacing_base=float(record.volume_spacing_base),
+        base_shape_zyx=record.base_shape_zyx,
+        profile_timings_ms=eager_timings,
+    )
+    assert eager_geometry.backward_source_zyx is not None
+    assert eager_timings["geometry_native_used"] == 0.0
+
+
+def test_native_geometry_preserves_sampled_patch() -> None:
+    native_module = pytest.importorskip("vc.volume")
+    if not hasattr(native_module, "generate_fiber3d_coords"):
+        pytest.skip("volume-cartographer binding lacks native Fiber3D geometry")
+    common = {
+        "patch_shape_zyx": [17, 15, 13],
+        "augment_smooth_displacement_mode": "3d",
+        "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
+        "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
+        "augment_smooth_displacement_probability": 1.0,
+        "volume_sample_threads": 1,
+    }
+    eager = _loader_with_mapping({**common, "geometry_backend": "eager"})
+    native = _loader_with_mapping({**common, "geometry_backend": "native"})
+    eager_raw = eager.load_raw_sample(2, profile=True)
+    native_raw = native.load_raw_sample(2, profile=True)
+    assert torch.equal(native_raw.sample.valid_mask, eager_raw.sample.valid_mask)
+    difference = torch.abs(
+        native_raw.sample.volume.to(torch.int16)
+        - eager_raw.sample.volume.to(torch.int16)
+    )
+    mismatch = float(torch.count_nonzero(difference)) / float(difference.numel())
+    assert mismatch <= 1.0e-4
+    assert int(difference.max()) <= 1
+
+
+def test_native_geometry_binding_validates_arguments() -> None:
+    native_module = pytest.importorskip("vc.volume")
+    generate = getattr(native_module, "generate_fiber3d_coords", None)
+    if generate is None:
+        pytest.skip("volume-cartographer binding lacks native Fiber3D geometry")
+    vector = np.zeros((3,), dtype=np.float32)
+    matrix = np.eye(3, dtype=np.float32)
+    spacing = np.ones((3,), dtype=np.float32)
+    controls = [np.zeros((1, 1), dtype=np.float32) for _ in range(3)]
+    coords, valid = generate(
+        (2, 3, 4), vector, vector, matrix, "3d", controls,
+        vector, spacing, 1.0, (2, 3, 4),
+    )
+    assert coords.shape == (2, 3, 4, 3)
+    assert coords.dtype == np.float32
+    assert coords.flags.c_contiguous
+    assert valid.shape == (2, 3, 4)
+    assert valid.dtype == np.uint8
+    assert valid.flags.c_contiguous
+    with pytest.raises(ValueError, match="smooth_controls count"):
+        generate(
+            (2, 3, 4), vector, vector, matrix, "3d", [],
+            vector, spacing, 1.0, (2, 3, 4),
+        )
+    bad_matrix = matrix.copy()
+    bad_matrix[0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        generate(
+            (2, 3, 4), vector, vector, bad_matrix, "none", [],
+            vector, spacing, 1.0, (2, 3, 4),
+        )
 
 
 def test_anisotropic_blur_spreads_along_configured_axis() -> None:

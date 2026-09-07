@@ -208,3 +208,62 @@ Artifact:
 `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_133912_525705/result.json`.
 The final base-coordinate map is still materialized for the current sampler;
 removing that map requires the planned shared implicit coordinate provider.
+
+## Native fused coordinate generation
+
+The next implementation replaces the full-resolution Torch coordinate-map
+pipeline with `vc.generate_fiber3d_coords`. The scalar C++ loop releases the
+GIL and directly evaluates the affine transform plus optional low-resolution
+1D/2D/3D smooth controls for each output point. It emits only the final
+contiguous float32 base-coordinate map and uint8 validity mask; sampling still
+uses the shared VC3D requested-level sampler. `geometry_backend=native` selects
+it explicitly, `eager` retains the reference implementation, and `auto` uses
+native generation when the installed binding and input contract allow it.
+
+All runs below used the real S1a 128-cubed configuration, warm local data,
+Release GCC 13 VC3D bindings, one source-read/decode/sampling native thread per
+loader, and no visible GPUs. The one-worker runs measured 32 samples after 8
+warmup samples:
+
+| Backend | Raw samples/s | Geometry mean (p50/p95) | Coordinate maps/s |
+|---|---:|---:|---:|
+| eager cache-local | 3.04 | 177.57 ms (264.88/270.72) | 5.63 |
+| native fused | 4.72 | 56.07 ms (93.49/93.61) | 17.83 |
+
+The native artifact is
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_141944_055271/result.json`;
+the matched eager artifact is
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_141905_331255/result.json`.
+Smooth displacement is selected for half of the deterministic stream, so the
+native distribution remains bimodal: approximately 93 ms with smooth controls
+and 13 ms without them.
+
+The production-topology native run used 128 loader processes, 2,048 measured
+samples after 256 warmup samples, output queue 128, global in-flight limit 256,
+and disabled locality diagnostics. It reached **227.33 samples/s** while using
+73.47 summed CPU cores. This is 1.95x the previous cache-local fused Torch result
+of 116.53 samples/s and exceeds the 221 samples/s target. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_142050_133015/result.json`.
+The exact benchmark invocation was:
+
+```bash
+/home/hendrik/.venv_las/bin/python -m vesuvius.neural_tracing.fiber_trace_3d.pipeline_benchmark \
+  /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/training_baseline_s1a_20260729.json \
+  --output-root /ephemeral/hendrik/fiber3d_train2 \
+  --samples 2048 --warmup-samples 256 --verify-samples 0 \
+  --load-workers 128 --augment-workers 1 --raw-only \
+  --raw-queue-capacity 64 --result-queue-capacity 128 --max-in-flight 256 \
+  --cache-state warm --volume-io-threads 1 --volume-decode-threads 1 \
+  --volume-sample-threads 1 --disable-locality-stats \
+  --geometry-backend native --geometry-tile-depth 8
+```
+
+Deterministic none/1D/2D/3D fixtures differ from the eager coordinates by at
+most `3.8147e-6` base voxel (mean `4.5e-8` to `5.43e-8`), with identical
+validity masks. Focused tests also require no more than `1e-4` sampled-value
+mismatch and maximum uint8 difference one.
+
+Low-resolution 3D precomposition was considered but not added. Direct lookup
+of the already-small controls is simpler and the measured end-to-end loader
+capacity now exceeds the target. Precomposition should be reconsidered only if
+a future profile shows smooth-control evaluation dominating a new workload.

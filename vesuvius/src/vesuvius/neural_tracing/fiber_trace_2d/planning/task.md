@@ -55,9 +55,11 @@ Target coordinate generation and requested-level sampling capacity is at least
 20 samples/s each so their serial composition can sustain 10 samples/s. Do not
 use GPUs while they remain allocated to other work.
 
-Authorized next optimization: replace eager full-volume coordinate-map
-intermediates with cache-local fused generation from the affine augmentation
-metadata and low-resolution smooth-displacement controls. Preserve the exact
-coordinate, validity, dependency and sampling contracts; retain the current
-path as a matched oracle until equivalence is demonstrated. Profile the current
-generator's individual operations first and keep all work CPU-only.
+Authorized next optimization: replace the PyTorch coordinate generator with a
+custom C++ implementation that directly builds the final base-coordinate and
+validity arrays. Each output coordinate must be evaluated independently from
+the affine metadata and low-resolution smooth controls; do not implement the
+transform as full-resolution PyTorch layers. Approximate coordinate agreement
+with the existing generator is acceptable. Consider precomposing the smooth
+transforms on a low-resolution 3D lattice when it is measurably faster overall.
+Keep all work CPU-only while GPUs remain allocated elsewhere.

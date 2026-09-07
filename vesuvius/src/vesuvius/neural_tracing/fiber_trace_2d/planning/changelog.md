@@ -432,3 +432,10 @@
 - Reused adjacent dependency footprints and pinned chunk pointers in the exact
   VC3D scalar path, reducing isolated dependency/interpolation service from
   617ms to 98ms per S1a training sample without changing sampled bytes.
+
+## 2026-09-07 — Native Fiber3D coordinate generation
+
+- Added a fused GIL-free C++ coordinate generator and explicit
+  `auto|native|eager` loader selection. On the CPU-only S1a benchmark it raised
+  128-loader raw throughput from 116.53 to 227.33 samples/s while remaining
+  within 3.82e-6 base voxels of the eager reference.

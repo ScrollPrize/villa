@@ -220,6 +220,11 @@ validated.
 
 ## Cache-local fused coordinate generation
 
+Superseded for the current implementation by **Native fused coordinate
+generation** below. The completed cache-local Torch implementation remains the
+reference backend, but the former requirements for implicit sampler traversal,
+bitwise equality, and no final coordinate map no longer govern this task.
+
 - Profile `_build_geometry_maps` independently on deterministic S1a samples,
   separating grid creation, metadata conversion, centering, affine mapping,
   smooth-control interpolation, final translation, NumPy conversion/scaling,
@@ -266,6 +271,75 @@ validated.
 Document the implicit-coordinate contract, reference fallback, exactness tests,
 commands, artifacts and before/after results. Record any unmet 221-samples/s
 global target explicitly.
+
+## Native fused coordinate generation
+
+- Add one portable scalar C++ primitive to the existing `vc` Python package.
+  It accepts the output shape, float32 control point/affine metadata,
+  low-resolution smooth-control arrays, selected-to-base scale and base shape,
+  and returns contiguous final float32 base coordinates plus uint8 validity.
+  It must not depend on a `Volume` or duplicate volume sampling.
+- Traverse output coordinates once in contiguous order. Derive `(z,y,x)` from
+  loop indices, apply the affine transform in registers, evaluate the current
+  1D/2D/3D smooth controls directly from their cache-resident grids in the
+  existing sequential component order, translate, scale and validate, then
+  write only the final coordinate and mask. Do not allocate a meshgrid,
+  full-resolution displacement field, index tensors or intermediate maps.
+- Keep the C++ function reusable and independent of Fiber loader state. The
+  Fiber3D loader owns conversion of `_Augment3DParams` into the native call and
+  retains the eager implementation as an explicit reference backend.
+- Define `geometry_backend` as `auto`, `native`, or `eager`. `auto` is the
+  default and selects native when the new symbol is present, otherwise reports
+  and uses eager for source-tree compatibility. `native` fails clearly if the
+  binding is stale or absent. Every profile records the resolved backend.
+- Coordinate equality is no longer required. Validate finite/bounds semantics
+  exactly and compare native/eager coordinates using reported maximum and mean
+  absolute error, plus sampled image/mask agreement on deterministic fixtures.
+  Native acceptance requires maximum coordinate error <= 1e-3 base voxel,
+  mean error <= 1e-5 base voxel, exact validity masks on finite deterministic
+  fixtures, and sampled uint8 mismatch <= 1e-4 of valid voxels with maximum
+  intensity difference <= 1. Boundary-focused fixtures must retain exact masks;
+  any boundary disagreement fails rather than being averaged away. Do not use
+  fast-math or reduced precision. Scalar C++ is the portable
+  baseline on Ubuntu/macOS and amd64/arm64; SIMD is a later guarded option.
+- First benchmark direct sequential low-resolution control lookups. Only add a
+  precomposed low-resolution 3D vector field if isolated measurements show an
+  end-to-end benefit. Such composition is approximate because interpolation
+  and sequential coordinate displacement do not commute; record its error and
+  expose it as a separate backend rather than silently replacing direct mode.
+- Measure native versus eager generation in a single process and through the
+  same 128-process raw S1a pipeline. Report command, dataset, build type,
+  warmup/count, mean/p50/p95 generation time and end-to-end samples/s. Keep all
+  benchmark runs CPU-only.
+
+### Spec update
+
+Document the native coordinate backend, its input/output contract, direct
+smooth-control evaluation, explicit eager reference mode, numerical tolerance,
+and clear missing-binding failure.
+
+### Docs updates
+
+Document build/runtime selection, implementation structure, validation error,
+and before/after benchmark results. State whether low-resolution precomposition
+was implemented or rejected after measurement.
+
+### Testing
+
+Add native binding tests for none/1d/2d/3d smooth modes, singleton control
+axes, nontrivial affine/scale, negative and final-volume boundaries, invalid
+and nonfinite arguments, allocation overflow, and deterministic repeatability.
+The binding output contract is contiguous `(Z,Y,X,3)` float32 ZYX base
+coordinates and `(Z,Y,X)` uint8 validity; affine rows map output-relative ZYX
+to source-relative ZYX and backward 3D smooth controls are evaluated x, y, z.
+Add loader tests for backend
+selection and stale-binding errors. Run focused C++/Python tests,
+`git diff --check`, isolated generation benchmarks and the stable CPU-only S1a
+pipeline benchmark.
+
+### Changelog update
+
+Record the native fused coordinate generator and measured throughput gain.
 
 ## Two-GPU measurement implementation (authorized continuation)
 - Add opt-in per-rank JSONL iteration/stage wall timers and bounded CPU/CUDA
