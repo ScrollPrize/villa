@@ -2578,6 +2578,34 @@ class FitContext:
                 pieces.append(points[in_roi])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
+    def _umbilicus_clearance(self, patch):
+        """Smallest distance from a patch vertex to the umbilicus curve, and its z.
+
+        The theta potential is the polar angle about the umbilicus, so a cycle
+        of the patch grid picks up a non-zero winding residual exactly when the
+        umbilicus curve passes through the patch. A rejection therefore says as
+        much about the axis as about the patch, and the operator cannot tell
+        which without this number.
+
+        Returns (clearance_voxels, z) or None when it cannot be computed.
+        """
+        umbilicus = getattr(self, 'umbilicus', None)
+        if umbilicus is None:
+            return None
+        try:
+            zyxs = np.asarray(patch.zyxs, dtype=np.float64).reshape(-1, 3)
+            # tifxyz marks invalid vertices -1 on every axis, not NaN and not 0.
+            zyxs = zyxs[(zyxs > -0.5).all(axis=1)]
+            if zyxs.shape[0] == 0:
+                return None
+            centre_yx = np.asarray(umbilicus(zyxs[:, 0]), dtype=np.float64)
+            radii = np.linalg.norm(zyxs[:, 1:] - centre_yx.reshape(-1, 2), axis=1)
+            i = int(np.argmin(radii))
+            return float(radii[i]), float(zyxs[i, 0])
+        except Exception:
+            # A diagnostic must never be the reason a fit fails.
+            return None
+
     def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
         """Remove inconsistent patches from every active patch sampling pool."""
         warnings = []
@@ -2591,6 +2619,14 @@ class FitContext:
             warning = (
                 f'non-liftable patch {path!r} has theta cycle inconsistencies; '
                 'excluding it from this fit')
+            clearance = self._umbilicus_clearance(patch)
+            if clearance is not None:
+                warning += (
+                    f'. Its closest vertex is {clearance[0]:.1f} voxels from the '
+                    f'umbilicus curve at z={clearance[1]:.0f}; theta is the polar '
+                    'angle about that curve, so an axis running through or near a '
+                    'patch produces this rejection on its own. Check the umbilicus '
+                    'before treating this as a defect of the patch')
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.verified_patches[patch_id]
@@ -2603,6 +2639,14 @@ class FitContext:
             warning = (
                 f'non-liftable patch {path!r} has theta cycle inconsistencies; '
                 'excluding it from this fit')
+            clearance = self._umbilicus_clearance(patch)
+            if clearance is not None:
+                warning += (
+                    f'. Its closest vertex is {clearance[0]:.1f} voxels from the '
+                    f'umbilicus curve at z={clearance[1]:.0f}; theta is the polar '
+                    'angle about that curve, so an axis running through or near a '
+                    'patch produces this rejection on its own. Check the umbilicus '
+                    'before treating this as a defect of the patch')
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.unverified_patches[patch_id]
