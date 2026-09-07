@@ -42,17 +42,23 @@ _TRANSIENT_READ_MARKERS = (
 
 # HTTP statuses worth retrying, but only when the number appears as a status:
 # "ClientResponseError: 503, message=...", "An error occurred (503) when
-# calling GetObject", "HTTP 429", "status: 502". A bare " 504" also matched
-# "index out of bounds for dimension with length 504" and "size 5040", which
-# turned a coding error into four attempts and 3.5 s of backoff.
+# calling GetObject", "HTTP 429", "status: 502", urllib3's "too many 503
+# error responses". A bare " 504" also matched "index out of bounds for
+# dimension with length 504" and "size 5040", which turned a coding error
+# into four attempts and 3.5 s of backoff.
 _TRANSIENT_HTTP_STATUS = re.compile(
-    r'(?:(?:error|status|http|response|code)\W{0,4}|\(\s*)(?:429|500|502|503|504)(?!\d)'
+    r'(?:(?:error|status|http|response|code|returned|got|many)\W{0,4}|\(\s*)'
+    r'(?:429|500|502|503|504)(?!\d)'
 )
 
 # Exceptions that describe a bug or a bad request rather than a network
 # hiccup. Their messages are not scanned for markers (zarr's BoundsCheckError
 # is an IndexError whose text names the dimension length), but the cause
 # chain is still walked in case one wraps a genuine transport error.
+# Note ssl.SSLCertVerificationError (and aiohttp's
+# ClientConnectorCertificateError) inherit ValueError, so a certificate
+# failure now fails fast instead of being retried; that is deliberate, a bad
+# certificate does not fix itself on the next attempt.
 _DETERMINISTIC_ERROR_TYPES = (
     IndexError,
     KeyError,

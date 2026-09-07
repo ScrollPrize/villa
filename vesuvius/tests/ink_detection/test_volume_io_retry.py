@@ -142,10 +142,27 @@ def test_retries_disabled_with_one_attempt() -> None:
         "An error occurred (500) when calling the GetObject operation (InternalError)",
         "HTTP 502",
         "status: 504",
+        "Max retries exceeded with url: /x (Caused by ResponseError('too many 503 error responses'))",
+        "too many 429 error responses",
+        "server returned 502",
     ],
 )
 def test_transient_messages_detected(message: str) -> None:
     assert _is_transient_read_error(OSError(message))
+
+
+def test_certificate_failures_fail_fast() -> None:
+    """ssl.SSLCertVerificationError inherits ValueError; a bad certificate is
+    deterministic and must not burn the retry budget."""
+    import ssl
+
+    exc = ssl.SSLCertVerificationError(
+        1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate"
+    )
+    assert isinstance(exc, ValueError)
+    assert not _is_transient_read_error(exc)
+    # but a record-layer failure (plain SSLError, an OSError) is still transient
+    assert _is_transient_read_error(ssl.SSLError(1, "[SSL: RECORD_LAYER_FAILURE] record layer failure"))
 
 
 @pytest.mark.parametrize(
