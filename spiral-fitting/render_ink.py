@@ -548,6 +548,14 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, group_idx, num_sl
                 continue
             strip = comp.astype(np.float32)
             p95 = np.percentile(strip, 95)
+            if p95 <= 0:
+                # An entirely black strip is written and the run still exits 0,
+                # so a mesh that samples nowhere in the volume is indistinguishable
+                # from a fit that recovered no ink. Say so loudly.
+                print(f'[{n + 1}/{len(render_items)}] {name}: WARNING strip is '
+                      'entirely black (p95=0). The mesh may not be in the ink '
+                      "volume's frame; check --scale/--group-idx and the volume's "
+                      'level-0 shape against the mesh coordinates.')
             strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
             strip8 = strip.astype(np.uint8)
             width = strip8.shape[1]
