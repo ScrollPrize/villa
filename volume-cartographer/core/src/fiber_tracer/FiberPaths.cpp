@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -2024,16 +2025,23 @@ FiberletCandidateResult solveCandidate(
         checkedProduct(nodes.size(), stateCount,
             "fiberlet DP backpointer-state count"),
         missingState);
+    std::vector<FiberletPathCost> previousTransitionCosts(
+        checkedProduct(nodes.size(), stateCount,
+            "fiberlet DP backpointer-cost count"));
     const size_t backpointerBytes = checkedProduct(
         previousStates.capacity(), sizeof(uint8_t),
         "fiberlet DP backpointer-state byte count");
+    const size_t backpointerCostBytes = checkedProduct(
+        previousTransitionCosts.capacity(), sizeof(FiberletPathCost),
+        "fiberlet DP backpointer-cost byte count");
     const size_t finalInteriorLayer = domain.layers.size() - 2;
     NodeRange currentRange = layerRanges[1];
     std::vector<DpLayerState> currentStates(
         checkedProduct(currentRange.size(), stateCount,
             "fiberlet DP layer-state count"));
     profile.stateBytes = checkedSum(
-        backpointerBytes,
+        checkedSum(backpointerBytes, backpointerCostBytes,
+            "fiberlet DP backpointer byte count"),
         checkedProduct(currentStates.capacity(), sizeof(DpLayerState),
             "fiberlet DP layer-state byte count"),
         "fiberlet DP state byte count");
@@ -2057,10 +2065,14 @@ FiberletCandidateResult solveCandidate(
         auto& state = currentStates[
             (node - currentRange.begin) * stateCount + sourceState];
         state.reached = true;
-        state.cost = dpAccumulatedCost(pathStepCost(
+        const FiberletPathCost transitionCost = pathStepCost(
             nullptr, prediction, candidate.startAxisXYZ, stepLength,
             direction, stepLength, scoring.metricNormal,
-            (scoring.flags & kNodeNormalValid) != 0, config));
+            (scoring.flags & kNodeNormalValid) != 0, config);
+        state.cost = dpAccumulatedCost(transitionCost);
+        const size_t sourceOffset = node * stateCount + sourceState;
+        previousStates[sourceOffset] = static_cast<uint8_t>(sourceState);
+        previousTransitionCosts[sourceOffset] = transitionCost;
     }
 
     for (size_t layer = 1; layer < finalInteriorLayer; ++layer) {
@@ -2076,7 +2088,10 @@ FiberletCandidateResult solveCandidate(
             "fiberlet DP rolling-state byte count");
         profile.stateBytes = std::max(
             profile.stateBytes,
-            checkedSum(backpointerBytes, activeLayerBytes,
+            checkedSum(
+                checkedSum(backpointerBytes, backpointerCostBytes,
+                    "fiberlet DP backpointer byte count"),
+                activeLayerBytes,
                 "fiberlet DP state byte count"));
 
         for (size_t node = currentRange.begin; node < currentRange.end; ++node) {
@@ -2181,15 +2196,16 @@ FiberletCandidateResult solveCandidate(
                         outgoingAlignment.slotOfLane[lane];
                     const auto& edge = outgoing[transitionState];
                     const size_t next = edge.next;
-                    DpAccumulatedCost nextCost = currentState.cost;
-                    nextCost +=
+                    const FiberletPathCost transitionCost = fiberletPathCost(
                         detail::fiberLocalMetricCostFromPreparedAlignmentInline(
                             alignmentLosses[lane],
                             incomingMetric,
                             incoming.metricLength,
                             edge.metricLength,
                             edge.candidateMetric,
-                            metricConfig);
+                            metricConfig));
+                    DpAccumulatedCost nextCost = currentState.cost;
+                    nextCost += transitionCost;
                     auto& destination = nextStates[
                         (next - nextRange.begin) * stateCount +
                         transitionState];
@@ -2200,6 +2216,9 @@ FiberletCandidateResult solveCandidate(
                         destination.cost = nextCost;
                         previousStates[next * stateCount + transitionState] =
                             static_cast<uint8_t>(previousState);
+                        previousTransitionCosts[
+                            next * stateCount + transitionState] =
+                            transitionCost;
                     }
                 }
             }
@@ -2212,6 +2231,7 @@ FiberletCandidateResult solveCandidate(
     size_t bestNode = 0;
     size_t bestState = 0;
     FiberletPathCost bestCost;
+    FiberletPathCost bestTerminalCost;
     if (currentRange.begin != layerRanges[finalInteriorLayer].begin ||
         currentRange.end != layerRanges[finalInteriorLayer].end) {
         throw std::logic_error("fiberlet DP did not finish on its final layer");
@@ -2245,8 +2265,7 @@ FiberletCandidateResult solveCandidate(
             if (directedAngle(finalDirection, candidate.targetAxisXYZ) > maximumAngle + kEpsilon) {
                 continue;
             }
-            FiberletPathCost finalized = fiberletPathCost(state.cost);
-            finalized += pathStepCost(
+            const FiberletPathCost terminalCost = pathStepCost(
                 &prediction,
                 targetProxy,
                 incoming.direction,
@@ -2256,11 +2275,14 @@ FiberletCandidateResult solveCandidate(
                 nodeScoring.metricNormal,
                 (nodeScoring.flags & kNodeNormalValid) != 0,
                 config);
+            FiberletPathCost finalized = fiberletPathCost(state.cost);
+            finalized += terminalCost;
             if (!foundPath || betterCost(finalized.total(), bestCost.total())) {
                 foundPath = true;
                 bestNode = node;
                 bestState = stateIndex;
                 bestCost = finalized;
+                bestTerminalCost = terminalCost;
             }
         }
     }
@@ -2274,11 +2296,19 @@ FiberletCandidateResult solveCandidate(
     std::vector<cv::Vec3f> reversed;
     std::vector<size_t> reversedNodes;
     std::vector<std::array<std::int16_t, 2>> reversedLattice;
+    std::vector<FiberletPathCost> reversedTransitionCosts;
     size_t node = bestNode;
     size_t state = bestState;
     while (true) {
+        const size_t backpointerOffset = node * stateCount + state;
+        if (previousStates[backpointerOffset] == missingState) {
+            throw std::logic_error(
+                "fiberlet selected route has an unwritten transition cost");
+        }
         reversed.push_back(nodePoint(nodes[node]));
         reversedNodes.push_back(node);
+        reversedTransitionCosts.push_back(
+            previousTransitionCosts[backpointerOffset]);
         const auto local = unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
         if (local.transverseU < std::numeric_limits<std::int16_t>::min() ||
             local.transverseU > std::numeric_limits<std::int16_t>::max() ||
@@ -2290,8 +2320,7 @@ FiberletCandidateResult solveCandidate(
             static_cast<std::int16_t>(local.transverseV)});
         if (state == sourceState)
             break;
-        const uint8_t previousState =
-            previousStates[node * stateCount + state];
+        const uint8_t previousState = previousStates[backpointerOffset];
         if (previousState >= stateCount)
             throw std::logic_error("fiberlet DP state has an invalid predecessor state");
         node = predecessorNode(
@@ -2301,6 +2330,8 @@ FiberletCandidateResult solveCandidate(
     std::reverse(reversed.begin(), reversed.end());
     std::reverse(reversedNodes.begin(), reversedNodes.end());
     std::reverse(reversedLattice.begin(), reversedLattice.end());
+    std::reverse(
+        reversedTransitionCosts.begin(), reversedTransitionCosts.end());
     candidate.routeLatticeUV = std::move(reversedLattice);
     candidate.pointsPredictionXYZ.push_back(candidate.startPositionPredictionXYZ);
     for (const auto& point : reversed) {
@@ -2312,58 +2343,41 @@ FiberletCandidateResult solveCandidate(
     }
     if (!std::isfinite(bestCost.total()))
         throw std::runtime_error("fiberlet DP produced a non-finite path score");
-    candidate.segmentCosts.reserve(candidate.pointsPredictionXYZ.size() - 1);
-    for (size_t segment = 0; segment + 1 < candidate.pointsPredictionXYZ.size(); ++segment) {
-        const cv::Vec3f delta = candidate.pointsPredictionXYZ[segment + 1] - candidate.pointsPredictionXYZ[segment];
-        const float segmentLength = vectorLength(delta);
-        if (!(segmentLength > kEpsilon))
-            throw std::logic_error("fiberlet selected route contains a zero-length segment");
-        const cv::Vec3f segmentDirection = delta / segmentLength;
-        const cv::Vec3f previousDirection = segment == 0
-            ? candidate.startAxisXYZ
-            : normalized(candidate.pointsPredictionXYZ[segment] - candidate.pointsPredictionXYZ[segment - 1]);
-        const float previousLength = segment == 0
-            ? segmentLength
-            : vectorLength(candidate.pointsPredictionXYZ[segment] - candidate.pointsPredictionXYZ[segment - 1]);
-        const bool terminal = segment == reversedNodes.size();
-        const DpNodeScoring& scoring = dpNodes.at(dpNodes.existing(
-            terminal ? reversedNodes.back() : reversedNodes[segment]));
-        const FiberletPredictionSample* currentPrediction = nullptr;
-        FiberletPredictionSample currentStorage;
-        if (segment > 0) {
-            currentStorage = nodePrediction(dpNodes.at(dpNodes.existing(reversedNodes[segment - 1])));
-            currentPrediction = &currentStorage;
-        }
-        const FiberletPredictionSample nextPrediction = terminal
-            ? targetProxy
-            : nodePrediction(scoring);
-        candidate.segmentCosts.push_back(pathStepCost(
-            currentPrediction,
-            nextPrediction,
-            previousDirection,
-            previousLength,
-            segmentDirection,
-            segmentLength,
-            scoring.metricNormal,
-            (scoring.flags & kNodeNormalValid) != 0,
-            config));
+    candidate.segmentCosts = std::move(reversedTransitionCosts);
+    candidate.segmentCosts.push_back(bestTerminalCost);
+    if (candidate.segmentCosts.size() + 1 !=
+        candidate.pointsPredictionXYZ.size()) {
+        throw std::logic_error(
+            "fiberlet selected route cost count does not match its geometry");
     }
     FiberletPathCost decomposed;
     for (const auto& cost : candidate.segmentCosts)
         decomposed += cost;
     const std::array decomposition{
-        std::pair{decomposed.invalidPrediction, bestCost.invalidPrediction},
-        std::pair{decomposed.alignment, bestCost.alignment},
-        std::pair{decomposed.isotropicSmoothness, bestCost.isotropicSmoothness},
-        std::pair{decomposed.tangentSmoothness, bestCost.tangentSmoothness},
-        std::pair{decomposed.normalSmoothness, bestCost.normalSmoothness},
+        std::tuple{"invalid_prediction", decomposed.invalidPrediction, bestCost.invalidPrediction},
+        std::tuple{"alignment", decomposed.alignment, bestCost.alignment},
+        std::tuple{"isotropic_smoothness", decomposed.isotropicSmoothness, bestCost.isotropicSmoothness},
+        std::tuple{"tangent_smoothness", decomposed.tangentSmoothness, bestCost.tangentSmoothness},
+        std::tuple{"normal_smoothness", decomposed.normalSmoothness, bestCost.normalSmoothness},
     };
-    for (const auto [actual, expected] : decomposition) {
-        const float tolerance =
-            1.0e-4F * std::max(1.0F, std::abs(expected));
-        if (std::abs(actual - expected) > tolerance) {
-            throw std::logic_error(
-                "fiberlet selected-route costs do not reproduce the DP objective");
+    for (const auto [component, actual, expected] : decomposition) {
+        if (actual != expected) {
+            std::ostringstream message;
+            message << "fiberlet selected-route costs do not reproduce the DP objective"
+                    << ": component=" << component
+                    << " actual=" << actual
+                    << " expected=" << expected
+                    << " route_nodes=" << reversedNodes.size()
+                    << " route_segments=" << candidate.segmentCosts.size()
+                    << " start=" << candidate.start.cellZYX[0] << '/'
+                    << candidate.start.cellZYX[1] << '/'
+                    << candidate.start.cellZYX[2] << '/'
+                    << candidate.start.componentIndex
+                    << " target=" << candidate.target.cellZYX[0] << '/'
+                    << candidate.target.cellZYX[1] << '/'
+                    << candidate.target.cellZYX[2] << '/'
+                    << candidate.target.componentIndex;
+            throw std::logic_error(message.str());
         }
     }
     candidate.cost = bestCost;
@@ -3624,12 +3638,19 @@ FiberletPathReport traceFiberletPaths(
             checkedProduct(item.nodes.size(), stateCount,
                 "fiberlet DP backpointer byte estimate"),
             sizeof(uint8_t), "fiberlet DP backpointer byte estimate");
+        const size_t backpointerCostBytes = checkedProduct(
+            checkedProduct(item.nodes.size(), stateCount,
+                "fiberlet DP backpointer-cost byte estimate"),
+            sizeof(FiberletPathCost),
+            "fiberlet DP backpointer-cost byte estimate");
         const size_t activeStateBytes = checkedProduct(
             checkedProduct(item.maximumActiveLayerNodes, stateCount,
                 "fiberlet DP rolling-state byte estimate"),
             sizeof(DpLayerState), "fiberlet DP rolling-state byte estimate");
         const size_t stateBytes = checkedSum(
-            backpointerBytes, activeStateBytes,
+            checkedSum(backpointerBytes, backpointerCostBytes,
+                "fiberlet DP backpointer byte estimate"),
+            activeStateBytes,
             "fiberlet DP state byte estimate");
         const size_t nodeIndexBytes = checkedProduct(
             item.keyLayout.keyCount, sizeof(uint32_t),

@@ -1,38 +1,26 @@
-# Task log: benchmark experiment-step plots
+# Task log: resolve Fiberlet path-cost merge
 
-## 2026-09-04
+## 2026-09-07
 
-- The existing plot uses calendar dates directly and sorts same-date points by
-  algorithm name, collapsing and reordering experiments that should occupy
-  distinct steps.
-- The revised plot will use stable date ordering, strict measured best-so-far
-  points as the historical Pareto frontier, and will not allow unmeasured floor
-  assumptions to establish that frontier.
-- Independent review required integer step numbers to remain primary labels,
-  clarified that the measured envelope is absent before its first measurement,
-  and identified the existing benchmark specification as requiring an update.
-- Implemented one-based experiment coordinates, date-change tick metadata,
-  strict measured frontier selection, frontier-only 30-degree annotations,
-  diamond non-frontier markers, separately marked assumptions, and a legend
-  below each plot. The initial render exposed a clipped first annotation and a
-  redundant frontier legend entry; both were corrected before validation.
-- Corrected an initial misinterpretation that grouped all dominated measured
-  points under `Other measured result`: every non-frontier result now receives
-  an individual marker and named bottom-legend entry.
-- Replaced the censored `100/max(failures,1)` replay metric with mean segment
-  length `100/(failures+1)`. The benchmark treats the complete tested corpus as
-  one interval, so `N` failures create `N+1` segments. Renamed the C++ summary,
-  JSON fields, CLI headings, and plot metric accordingly; JSON is now version 4.
-- Independent review confirmed the aggregation and required the version-4
-  schema transition to be explicit. Added negative JSON assertions for every
-  removed legacy summary field and documented that historical values were
-  recomputed without rerunning or rewriting archived JSON provenance.
-- Replaced ad hoc plot labels with stable method IDs and base labels. BP-derived
-  plots now append only ` + BP`; specifically, the staged method is consistently
-  `Fiberlet + staged filtering` or `Fiberlet + staged filtering + BP`, never
-  reordered as `Staged Fiberlet`.
-- Validation: seven focused Python tests pass with external pytest plugin
-  autoload disabled; all nine focused C++ replay benchmark tests pass in the
-  Release build; benchmark JSON validation succeeds; two consecutive SVG
-  generations have identical SHA-256 digests; targeted `git diff --check`
-  passes; and all three rasterized SVGs were visually inspected.
+- Merge `a880b7c76bf5ff0140afee3425f6527389431ffb` was already in progress.
+- The only textual conflict is in `planning/todo.md`; the two sides added
+  independent todo sections, so both are retained.
+- The incoming source change retains the exact cost chosen for every DP
+  transition and uses those retained values when constructing the selected
+  route's segment-cost decomposition.
+- Independent review identified that zero-initialized unwritten cost slots were
+  indistinguishable from legitimate zero-cost transitions. Source and relaxed
+  states now mark the existing predecessor table when their corresponding cost
+  is written, and reconstruction rejects an unmarked slot before reading it.
+- The retained cost array substantially increases DP state memory. Updated the
+  specification, implementation documentation, and focused assertions for DP,
+  concurrent transient, and total owned-memory accounting.
+- Release build command:
+  `cmake --build volume-cartographer/build --target test_fiberlet_paths -j 16`
+  completed successfully.
+- The focused binary completed all merge-specific checks without a failure at
+  their source lines, but the overall executable remains nonzero because 295
+  checks fail at the unchanged line 414 legacy prepared-scoring bitwise
+  equivalence helper. Neither that helper nor the compared scoring
+  implementation is changed by this merge; all reported failures have that
+  single pre-existing site. This unrelated test debt was not silently relaxed.

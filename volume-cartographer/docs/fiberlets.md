@@ -324,9 +324,12 @@ positions, so they are not restricted to world axes or 26 quantized directions.
 The layered graph is acyclic. States 0 through 8 encode the incoming transverse
 step and state 9 is source-only. The predecessor packed key and incoming
 geometry are derived from that state; reconstruction retains one predecessor-
-state byte per node/state. Float32 cumulative costs roll through only the
-current and next interior layers because alignment and curvature need no older
-cost state. Source and sink transitions remain separate.
+state byte and the exact selected five-component `FiberletPathCost` per
+node/state. Float32 cumulative costs roll through only the current and next
+interior layers because alignment and curvature need no older accumulated-cost
+state. Reconstruction reuses the retained transition costs instead of
+recomputing them from the selected geometry. Source and sink transitions
+remain separate.
 
 Each interior geometry node occupies 16 bytes: one checked row-major `uint32`
 key and three `float32` prediction coordinates. On a lazy-cache miss, fiber and
@@ -1524,8 +1527,9 @@ Version 13 adds prepared-node counts, reached/generated/valid/reused edge
 counts, solve-local prepared-node/direct-index/state byte maxima, and separate
 node-preparation worker time. Lookup/visit counters omit dead outgoing work
 from the final interior layer, which transitions directly to the sink. Rolling
-state memory is the global predecessor bytes plus the largest adjacent pair of
-cost layers; those layer populations are collected during node generation.
+state memory is the global predecessor-state and retained transition-cost bytes
+plus the largest adjacent pair of cost layers; those layer populations are
+collected during node generation.
 On the canonical 5,000-base-voxel replay at 32 threads, three runs measured
 11.91 seconds median total wall time and 0.996 seconds median search wall time,
 versus 12.42 and about 1.85 seconds before solve-local reuse. Median total CPU

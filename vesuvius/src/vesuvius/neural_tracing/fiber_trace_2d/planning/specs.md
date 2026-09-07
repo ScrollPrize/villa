@@ -3159,12 +3159,14 @@
   voxels; exact multiples and curves shorter than 2 do not create duplicate
   planes. States 0 through 8 encode the incoming `(du,dv)` transition; state 9
   is source-only. The predecessor node is derived from the checked packed key
-  as `(layer-1,u-du,v-dv)`, while reconstruction stores only the predecessor's
-  state index. Cumulative costs are float32 and exist only for the current and
-  next interior layers; one predecessor-state byte per global node/state
-  remains until reconstruction. The exact source and sink stay outside this
-  rolling interior representation. Strict cost ties retain the first canonical
-  predecessor.
+  as `(layer-1,u-du,v-dv)`. Reconstruction retains the predecessor state index
+  and the exact five-component float32 transition cost selected by each
+  relaxation; it must replay those stored costs rather than recomputing them
+  from reconstructed geometry. Cumulative costs exist only for the current and
+  next interior layers. One predecessor-state byte and one
+  `FiberletPathCost` per global node/state remain until reconstruction. The
+  exact source and sink stay outside this rolling interior representation.
+  Strict cost ties retain the first canonical predecessor.
 - Arbitrary-position presence is the trilinear weighted sum of all positive-weight
   native corners. Unoriented prediction axes are normalized and combined as
   `T=sum(w*d*d^T)` without presence weighting; the deterministic shared
@@ -4119,9 +4121,10 @@
   node count, reached-node and generated/valid/reused-edge counts, and separate
   node-preparation worker time. DP visit/lookup counters exclude outgoing work
   from the final interior layer because that layer transitions directly to the
-  sink. State-memory accounting is the global predecessor bytes plus the two
-  largest adjacent rolling cost layers; adjacent-layer populations are counted
-  during parallel node generation rather than by a separate serial pass.
+  sink. State-memory accounting is the global predecessor-state bytes, exact
+  retained transition-cost bytes, and the two largest adjacent rolling cost
+  layers; adjacent-layer populations are counted during parallel node
+  generation rather than by a separate serial pass.
 - Version 14 changes `interpolatedScoringPoints` to actual endpoint plus unique
   lazy-node interpolations. It separately reports endpoint interpolations, lazy
   requests, unique materializations, cache hits, maximum node-to-cache index

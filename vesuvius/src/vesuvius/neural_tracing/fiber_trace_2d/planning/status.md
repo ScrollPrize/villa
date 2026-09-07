@@ -1,8 +1,9 @@
-# Status: benchmark experiment-step plots
+# Status: resolve Fiberlet path-cost merge
 
-- [x] Capture task and implementation plan
-- [x] Independently review plan against specifications
-- [x] Implement stable experiment steps and frontier presentation
-- [x] Add focused tests
-- [x] Regenerate benchmark SVGs and update docs
-- [x] Run validation and record results
+- [x] Inspect merge state and conflicting files
+- [x] Replace the active planning files
+- [x] Independently review the merge-resolution plan
+- [x] Resolve the todo conflict
+- [x] Review the incoming source changes
+- [x] Build and run focused tests
+- [x] Complete the merge resolution

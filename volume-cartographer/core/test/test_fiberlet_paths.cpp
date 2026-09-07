@@ -2590,6 +2590,15 @@ TEST_CASE("fiberlet DP preloads each scoring voxel once")
     REQUIRE(sampledIndices.size() == report.sampledVoxels);
     CHECK(report.samplingCoordinateBatches == 1);
     CHECK(report.peakCoordinateBatchVoxels == report.sampledVoxels);
+    REQUIRE(report.preparedCandidates == 1);
+    const size_t retainedBackpointerBytes =
+        report.retainedSearchNodes * 10 *
+        (sizeof(uint8_t) + sizeof(vc::fiber_tracer::FiberletPathCost));
+    CHECK(report.dpMaximumStateBytes >= retainedBackpointerBytes);
+    CHECK(report.peakSearchTransientBytes >=
+          report.dpMaximumStateBytes * report.candidateWorkers);
+    CHECK(report.estimatedPeakOwnedBytes >=
+          report.preparedGeometryBytes + report.peakSearchTransientBytes);
     REQUIRE(normals.sampledPoints.size() == sampledIndices.size());
     const std::set<std::array<size_t, 3>> unique(sampledIndices.begin(), sampledIndices.end());
     CHECK(unique.size() == sampledIndices.size());
@@ -3032,6 +3041,17 @@ TEST_CASE("fiberlet multiplicative alignment changes the selected route")
     CHECK(std::any_of(wide.candidates[0].pointsPredictionXYZ.begin(), wide.candidates[0].pointsPredictionXYZ.end(), [](const cv::Vec3f& point) {
         return point[1] > 4.25;
     }));
+    const auto& selected = wide.candidates[0];
+    REQUIRE(selected.segmentCosts.size() + 1 ==
+            selected.pointsPredictionXYZ.size());
+    vc::fiber_tracer::FiberletPathCost decomposed;
+    for (const auto& segment : selected.segmentCosts)
+        decomposed += segment;
+    CHECK(decomposed.invalidPrediction == selected.cost.invalidPrediction);
+    CHECK(decomposed.alignment == selected.cost.alignment);
+    CHECK(decomposed.isotropicSmoothness == selected.cost.isotropicSmoothness);
+    CHECK(decomposed.tangentSmoothness == selected.cost.tangentSmoothness);
+    CHECK(decomposed.normalSmoothness == selected.cost.normalSmoothness);
 }
 
 TEST_CASE("fiberlet local grid follows a narrow subvoxel corridor")

@@ -120,6 +120,30 @@
       mode
     - default to `joint-grid`; expose the current behavior as `alternating`
     - see `task_plan.md` for the implementation and validation contract
+# fiberlet artifact format
+- [ ] restore the final Fiberlet artifact contract
+    - [ ] write a separate final Fiberlet Zarr instead of treating the
+          temporary `anchors`, `prefix`, and `routes` construction arrays as
+          the published artifact
+    - [ ] make every final spatial chunk self-contained: it must include all
+          anchors, Fiberlet identifiers/index information, complete routes,
+          geometry, and costs needed to read and traverse that chunk without
+          joining it to another Zarr array; duplicate the required information
+          from the temporary construction datasets
+    - [ ] create each self-contained final chunk on the fly when its Fiberlet
+          chunk is written, rather than requiring a second whole-volume
+          conversion pass
+    - [ ] create the final Zarr metadata when processing starts, including an
+          explicit unfinished/partial marker, and atomically mark it complete
+          only after every expected chunk has been published
+    - [ ] use `/` as the Zarr chunk-key dimension separator (`z/y/x`), not `.`
+          (`z.y.x`), and declare that separator explicitly in the array
+          metadata
+    - [ ] allow the final artifact name/path to be selected by the caller;
+          readers, resume handling, provenance, validation, and upload must use
+          the recorded name rather than assuming `fiberlets.zarr`
+    - [ ] make `las_manager fiberlet run` follow the regular inference naming
+          convention by default, using the managed run name for the final
 
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular
