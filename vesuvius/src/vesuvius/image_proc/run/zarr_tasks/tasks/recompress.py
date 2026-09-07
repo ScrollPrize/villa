@@ -19,6 +19,7 @@ from numcodecs import Blosc
 from tqdm import tqdm
 from multiprocessing import Pool
 
+from vesuvius.data.utils import open_zarr
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import (
@@ -198,7 +199,7 @@ class RecompressTask(ZarrTask):
             print(f"  Shape: {read_z.shape}, Chunks: {read_z.chunks}")
 
             # Create temp zarr with new compressor
-            temp_z = zarr.open(
+            temp_z = open_zarr(
                 temp_path,
                 mode="w",
                 shape=read_z.shape,
