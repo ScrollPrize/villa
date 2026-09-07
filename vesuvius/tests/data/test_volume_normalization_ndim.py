@@ -70,18 +70,39 @@ def test_2d_and_3d_reads_agree_on_same_voxels(gradient_volume, scheme):
 
 
 @pytest.mark.unit
-def test_1d_read_is_not_collapsed_to_zeros(gradient_volume):
+@pytest.mark.parametrize("scheme", ["instance_zscore", "instance_minmax"])
+def test_1d_read_is_not_collapsed_to_a_constant(gradient_volume, scheme):
     from vesuvius.data.volume import Volume
 
     path, vol = gradient_volume
     ref = vol[4, 7].astype(np.float32)
-    expected = (ref - ref.mean()) / max(ref.std(), 1e-8)
+    if scheme == "instance_zscore":
+        expected = (ref - ref.mean()) / max(ref.std(), 1e-8)
+    else:
+        expected = (ref - ref.min()) / max(ref.max() - ref.min(), 1e-8)
 
-    v = Volume(type="zarr", path=path, normalization_scheme="instance_zscore")
+    v = Volume(type="zarr", path=path, normalization_scheme=scheme)
     got = np.asarray(v[4, 7, 0:16])
 
     assert got.shape == ref.shape
-    assert not np.allclose(got, 0.0), "1D read collapsed to zeros"
+    assert len(np.unique(got)) > 1, "1D read collapsed to a constant"
+    np.testing.assert_allclose(got, expected, atol=1e-5)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("scheme", ["none", "global_zscore"])
+def test_non_iterating_schemes_are_unaffected(gradient_volume, scheme):
+    """Schemes that do not loop over channels need no pseudo-channel axis."""
+    from vesuvius.data.volume import Volume
+
+    path, vol = gradient_volume
+    ref = vol[4].astype(np.float32)
+    kwargs = {"global_mean": 100.0, "global_std": 25.0} if scheme == "global_zscore" else {}
+    v = Volume(type="zarr", path=path, normalization_scheme=scheme, **kwargs)
+    got = np.asarray(v[4, 0:16, 0:16])
+
+    expected = ref if scheme == "none" else (ref - 100.0) / 25.0
+    assert got.shape == ref.shape
     np.testing.assert_allclose(got, expected, atol=1e-5)
 
 
