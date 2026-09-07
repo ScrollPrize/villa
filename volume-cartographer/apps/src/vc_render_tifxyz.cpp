@@ -43,6 +43,38 @@ static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
 static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
 static std::atomic<bool> g_logRunning{false};
+
+// Surface points that address a voxel outside the volume. A published tifxyz names the
+// volume it is aligned to in its own filename, but nothing guarantees it fits inside it:
+// the open-data catalogue publishes an overlap_ratio per surface/volume pair and many are
+// well under 1. Those samples read nothing and their pixels stay at the fill value, so a
+// render can come out mostly blank while every step reports success. Counted here so the
+// run can say so instead.
+static std::atomic<uint64_t> g_samplesFinite{0};
+static std::atomic<uint64_t> g_samplesOutside{0};
+
+// base is (x, y, z); ds->shape(level) is (z, y, x). Non-finite entries are the surface's
+// own holes and are not counted either way.
+static void countSamplesOutside(const cv::Mat_<cv::Vec3f>& base,
+                                vc::render::IChunkedArray* ds, int level)
+{
+    if (!ds || base.empty()) return;
+    const auto shape = ds->shape(level);
+    if (shape.size() < 3) return;
+    const float lx = float(shape[2]), ly = float(shape[1]), lz = float(shape[0]);
+    uint64_t finite = 0, outside = 0;
+    for (int r = 0; r < base.rows; r++) {
+        for (int c = 0; c < base.cols; c++) {
+            const auto& p = base(r, c);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+            finite++;
+            if (p[0] < 0.0f || p[0] >= lx || p[1] < 0.0f || p[1] >= ly ||
+                p[2] < 0.0f || p[2] >= lz) outside++;
+        }
+    }
+    g_samplesFinite.fetch_add(finite, std::memory_order_relaxed);
+    g_samplesOutside.fetch_add(outside, std::memory_order_relaxed);
+}
 static std::thread g_logFlushThread;
 
 // Log to file if active, otherwise to the given default stream.
@@ -657,6 +689,7 @@ static void renderBands(
 
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+        countSamplesOutside(base, ds, level);
 
         std::vector<cv::Mat> slices;
 
@@ -867,6 +900,7 @@ static void renderTiles(
             // 2. Prepare base coords and step directions
             cv::Mat_<cv::Vec3f> base, dirs;
             prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+            countSamplesOutside(base, ds, level);
 
             // 3. Sample all slices for this tile (single-threaded)
             std::vector<cv::Mat_<T>> raw;
@@ -1849,6 +1883,27 @@ int main(int argc, char *argv[])
 
     if (!process_one(seg_path))
         return EXIT_FAILURE;
+
+    // Say how much of the surface could not be sampled. Without this the run looks
+    // identical whether the surface sits inside the volume or half of it does not: the
+    // out-of-volume samples read nothing, their pixels keep the fill value, and every
+    // other line of output reports success.
+    const uint64_t finite = g_samplesFinite.load(std::memory_order_relaxed);
+    const uint64_t outside = g_samplesOutside.load(std::memory_order_relaxed);
+    if (finite > 0 && outside > 0) {
+        const double pct = 100.0 * double(outside) / double(finite);
+        logPrintf(stderr,
+                  "WARNING: %llu of %llu surface points (%.1f%%) fall outside the volume "
+                  "and were not rendered; those pixels are blank.\n",
+                  (unsigned long long)outside, (unsigned long long)finite, pct);
+        if (outside == finite) {
+            logPrintf(stderr,
+                      "ERROR: no part of this surface lies inside this volume. "
+                      "The output contains no data.\n");
+            stopLogFlusher();
+            return EXIT_FAILURE;
+        }
+    }
 
     stopLogFlusher();
     return EXIT_SUCCESS;
