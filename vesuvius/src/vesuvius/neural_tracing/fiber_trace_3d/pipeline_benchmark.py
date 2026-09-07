@@ -11,11 +11,12 @@ import platform
 import sys
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.analyze_training import distribution
@@ -111,6 +112,47 @@ def _assert_samples_equal(actual: FiberTrace3DSample, expected: FiberTrace3DSamp
     for name in tensor_fields:
         if not torch.equal(getattr(actual, name), getattr(expected, name)):
             raise AssertionError(f"pipeline sample tensor differs: {name}")
+
+
+def _assert_nested_equal(actual: Any, expected: Any, path: str) -> None:
+    if torch.is_tensor(actual) or torch.is_tensor(expected):
+        if not (torch.is_tensor(actual) and torch.is_tensor(expected)):
+            raise AssertionError(f"raw sample type differs: {path}")
+        if not torch.equal(actual, expected):
+            raise AssertionError(f"raw sample tensor differs: {path}")
+        return
+    if isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
+        if not (isinstance(actual, np.ndarray) and isinstance(expected, np.ndarray)):
+            raise AssertionError(f"raw sample type differs: {path}")
+        if actual.dtype != expected.dtype or actual.shape != expected.shape or not np.array_equal(
+            actual, expected, equal_nan=True
+        ):
+            raise AssertionError(f"raw sample array differs: {path}")
+        return
+    if is_dataclass(actual) or is_dataclass(expected):
+        if type(actual) is not type(expected):
+            raise AssertionError(f"raw sample dataclass type differs: {path}")
+        for field in fields(actual):
+            if field.name in {"load_wall_ms", "load_cpu_ms", "profile_timings_ms"}:
+                continue
+            _assert_nested_equal(
+                getattr(actual, field.name), getattr(expected, field.name), f"{path}.{field.name}"
+            )
+        return
+    if isinstance(actual, (tuple, list)) or isinstance(expected, (tuple, list)):
+        if type(actual) is not type(expected) or len(actual) != len(expected):
+            raise AssertionError(f"raw sample sequence differs: {path}")
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            _assert_nested_equal(actual_item, expected_item, f"{path}[{index}]")
+        return
+    if actual != expected:
+        raise AssertionError(f"raw sample value differs: {path}")
+
+
+def _assert_raw_samples_equal(
+    actual: FiberTrace3DRawSample, expected: FiberTrace3DRawSample
+) -> None:
+    _assert_nested_equal(actual, expected, "raw")
 
 
 def _resolved_config(reference: Path) -> tuple[dict[str, Any], str]:
@@ -242,6 +284,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify-samples", type=int, default=2)
     parser.add_argument("--load-workers", type=int, default=16)
     parser.add_argument("--augment-workers", type=int, default=32)
+    parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help="stop after raw sample loading; launch no augmentation workers",
+    )
     parser.add_argument("--raw-queue-capacity", type=int, default=64)
     parser.add_argument("--result-queue-capacity", type=int, default=64)
     parser.add_argument("--max-in-flight", type=int, default=128)
@@ -288,13 +335,14 @@ def main(argv: list[str] | None = None) -> int:
     for name in (
         "samples",
         "load_workers",
-        "augment_workers",
         "raw_queue_capacity",
         "result_queue_capacity",
         "max_in_flight",
     ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be > 0")
+    if not bool(args.raw_only) and int(args.augment_workers) <= 0:
+        raise ValueError("--augment-workers must be > 0 unless --raw-only is used")
     if int(args.warmup_samples) < 0 or int(args.verify_samples) < 0:
         raise ValueError("warmup/verify sample counts must be >= 0")
     if any(
@@ -332,21 +380,24 @@ def main(argv: list[str] | None = None) -> int:
     config_path = run_dir / "config.json"
     config_path.write_text(json.dumps(config_payload, indent=2) + "\n")
 
-    verify_expected: dict[int, FiberTrace3DSample] = {}
+    verify_expected: dict[int, FiberTrace3DSample | FiberTrace3DRawSample] = {}
     verify_started = time.perf_counter()
     if int(args.verify_samples) > 0:
         verifier = FiberTrace3DLoader(load_config(config_path))
         for offset in range(int(args.verify_samples)):
             index = int(args.start_index) + offset
-            verify_expected[index] = verifier.load_sample(
-                index,
-                sample_index_limit=(
+            load_kwargs = {
+                "sample_index_limit": (
                     None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
                 ),
-                sample_mode=str(args.sample_mode),
-                device="cpu",
-                profile=False,
-            )
+                "sample_mode": str(args.sample_mode),
+                "device": "cpu",
+                "profile": False,
+            }
+            if bool(args.raw_only):
+                verify_expected[index] = verifier.load_raw_sample(index, **load_kwargs)
+            else:
+                verify_expected[index] = verifier.load_sample(index, **load_kwargs)
     verify_seconds = time.perf_counter() - verify_started
 
     total_items = int(args.warmup_samples) + int(args.samples)
@@ -354,11 +405,11 @@ def main(argv: list[str] | None = None) -> int:
     startup_started = time.perf_counter()
     pipeline = OrderedTwoStageSamplePipeline(
         stage1_factory=_LoadFactory(str(config_path), sample_limit, str(args.sample_mode)),
-        stage2_factory=_AugmentFactory(str(config_path)),
+        stage2_factory=None if bool(args.raw_only) else _AugmentFactory(str(config_path)),
         start_index=int(args.start_index),
         item_count=total_items,
         stage1_workers=int(args.load_workers),
-        stage2_workers=int(args.augment_workers),
+        stage2_workers=0 if bool(args.raw_only) else int(args.augment_workers),
         raw_queue_capacity=int(args.raw_queue_capacity),
         result_queue_capacity=int(args.result_queue_capacity),
         max_in_flight=int(args.max_in_flight),
@@ -369,7 +420,9 @@ def main(argv: list[str] | None = None) -> int:
     startup_seconds = time.perf_counter() - startup_started
     print(
         "sample_pipeline: "
-        f"load_workers={args.load_workers} augment_workers={args.augment_workers} "
+        f"load_workers={args.load_workers} "
+        f"augment_workers={0 if args.raw_only else args.augment_workers} "
+        f"raw_only={bool(args.raw_only)} "
         f"raw_queue={args.raw_queue_capacity} result_queue={args.result_queue_capacity} "
         f"in_flight={args.max_in_flight} batch={batch_size} "
         f"warmup={args.warmup_samples} measure={args.samples} native_threads=1",
@@ -395,10 +448,17 @@ def main(argv: list[str] | None = None) -> int:
             all_completion_ns.append(int(result.stage2_finished_ns))
             expected = verify_expected.get(int(result.index))
             if expected is not None:
-                _assert_samples_equal(result.value, expected)
+                if bool(args.raw_only):
+                    _assert_raw_samples_equal(result.value, expected)
+                else:
+                    _assert_samples_equal(result.value, expected)
                 del verify_expected[int(result.index)]
             if ordinal >= int(args.warmup_samples):
-                timings = result.value.profile_timings_ms or {}
+                timings = (
+                    result.value.sample.profile_timings_ms
+                    if bool(args.raw_only)
+                    else result.value.profile_timings_ms
+                ) or {}
                 measured.append(
                     {
                         "stage1_service_ms": result.stage1_service_ms,
@@ -410,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
                         "reorder_wait_ms": result.reorder_wait_ms,
                         "stage1_worker": float(result.stage1_worker),
                         "stage2_worker": float(result.stage2_worker),
+                        "stage1_started_ns": float(result.stage1_started_ns),
+                        "stage1_finished_ns": float(result.stage1_finished_ns),
                         "stage2_finished_ns": float(result.stage2_finished_ns),
                         "delivered_ns": float(result.delivered_ns),
                         **{
@@ -419,8 +481,11 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     }
                 )
-                batch.append(result)
-                if len(batch) == batch_size or ordinal + 1 == total_items:
+                if not bool(args.raw_only):
+                    batch.append(result)
+                if not bool(args.raw_only) and (
+                    len(batch) == batch_size or ordinal + 1 == total_items
+                ):
                     stack_started = time.perf_counter()
                     volumes = torch.stack([item.value.volume for item in batch], dim=0)
                     masks = torch.stack([item.value.valid_mask for item in batch], dim=0)
@@ -450,12 +515,19 @@ def main(argv: list[str] | None = None) -> int:
         1.0e-9,
         (measurement_finished * 1.0e9 - float(pipeline.started_ns)) / 1.0e9,
     )
-    production_ns = sorted(all_completion_ns)[int(args.warmup_samples):]
+    production_ns = sorted(int(item["stage2_finished_ns"]) for item in measured)
     delivery_ns = sorted(int(item["delivered_ns"]) for item in measured)
     production_seconds = max(1.0e-9, (production_ns[-1] - production_ns[0]) / 1.0e9)
     delivery_seconds = max(1.0e-9, (delivery_ns[-1] - delivery_ns[0]) / 1.0e9)
     production_rate = max(0, len(production_ns) - 1) / production_seconds
     ordered_delivery_rate = max(0, len(measured) - 1) / delivery_seconds
+    measured_end_to_end_seconds = max(
+        1.0e-9,
+        (max(int(item["delivered_ns"]) for item in measured)
+         - min(int(item["stage1_started_ns"]) for item in measured))
+        / 1.0e9,
+    )
+    measured_end_to_end_rate = len(measured) / measured_end_to_end_seconds
 
     voxel_count = math.prod(int(value) for value in config_payload["patch_shape_zyx"])
     raw_sample_bytes = voxel_count * (4 + 1)
@@ -467,15 +539,22 @@ def main(argv: list[str] | None = None) -> int:
         "reference_kind": reference_kind,
         "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
         "run_dir": str(run_dir),
-        "topology": "one-host-global-cpu-pipeline",
+        "topology": (
+            "one-host-global-cpu-raw-loader"
+            if bool(args.raw_only)
+            else "one-host-global-cpu-pipeline"
+        ),
+        "raw_only": bool(args.raw_only),
         "cache_state_label": str(args.cache_state),
         "start_index": int(args.start_index),
         "warmup_samples": int(args.warmup_samples),
         "measured_samples": int(args.samples),
         "batch_size": batch_size,
         "load_workers": int(args.load_workers),
-        "augment_workers": int(args.augment_workers),
-        "worker_processes": int(args.load_workers) + int(args.augment_workers),
+        "augment_workers": 0 if bool(args.raw_only) else int(args.augment_workers),
+        "worker_processes": int(args.load_workers) + (
+            0 if bool(args.raw_only) else int(args.augment_workers)
+        ),
         "raw_queue_capacity": int(args.raw_queue_capacity),
         "result_queue_capacity": int(args.result_queue_capacity),
         "max_in_flight": int(args.max_in_flight),
@@ -501,15 +580,31 @@ def main(argv: list[str] | None = None) -> int:
         "pipeline_cold_seconds": pipeline_seconds,
         "pipeline_cold_samples_per_second": total_items / pipeline_seconds,
         "production_span_seconds": production_seconds,
-        "samples_per_second": production_rate,
+        "samples_per_second": measured_end_to_end_rate
+        if bool(args.raw_only)
+        else production_rate,
+        "completion_span_samples_per_second": production_rate,
         "ordered_delivery_samples_per_second": ordered_delivery_rate,
+        "measured_end_to_end_seconds": measured_end_to_end_seconds,
+        "measured_end_to_end_samples_per_second": measured_end_to_end_rate,
         "batches_per_second": production_rate / batch_size,
         "stage1_service_ms": distribution(item["stage1_service_ms"] for item in measured),
         "stage1_cpu_ms": distribution(item["stage1_cpu_ms"] for item in measured),
-        "raw_queue_ms": distribution(item["raw_queue_ms"] for item in measured),
-        "stage2_service_ms": distribution(item["stage2_service_ms"] for item in measured),
-        "stage2_cpu_ms": distribution(item["stage2_cpu_ms"] for item in measured),
-        "result_queue_ms": distribution(item["result_queue_ms"] for item in measured),
+        "raw_queue_ms": None
+        if bool(args.raw_only)
+        else distribution(item["raw_queue_ms"] for item in measured),
+        "output_queue_ms": distribution(item["raw_queue_ms"] for item in measured)
+        if bool(args.raw_only)
+        else None,
+        "stage2_service_ms": None
+        if bool(args.raw_only)
+        else distribution(item["stage2_service_ms"] for item in measured),
+        "stage2_cpu_ms": None
+        if bool(args.raw_only)
+        else distribution(item["stage2_cpu_ms"] for item in measured),
+        "result_queue_ms": None
+        if bool(args.raw_only)
+        else distribution(item["result_queue_ms"] for item in measured),
         "reorder_wait_ms": distribution(item["reorder_wait_ms"] for item in measured),
         "batch_delivery_wait_ms": distribution(batch_wait_ms),
         "batch_stack_ms": distribution(batch_stack_ms),
@@ -519,7 +614,9 @@ def main(argv: list[str] | None = None) -> int:
             for key in sorted({key for item in measured for key in item if key.startswith("sample_")})
         },
         "stage1_workers_used": len({item["stage1_worker"] for item in measured}),
-        "stage2_workers_used": len({item["stage2_worker"] for item in measured}),
+        "stage2_workers_used": 0
+        if bool(args.raw_only)
+        else len({item["stage2_worker"] for item in measured}),
         "summed_worker_cpu_cores": (
             sum(item["stage1_cpu_ms"] + item["stage2_cpu_ms"] for item in measured)
             / max(production_seconds * 1000.0, 1.0e-9)
@@ -543,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
     (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(
         f"sample_pipeline result samples_per_second={result['samples_per_second']:.2f} "
+        f"end_to_end_samples_per_second={result['measured_end_to_end_samples_per_second']:.2f} "
         f"production_seconds={production_seconds:.2f} cpu_cores={result['summed_worker_cpu_cores']:.1f} "
         f"reorder_highwater={pipeline.reorder_highwater} result={run_dir / 'result.json'}",
         flush=True,

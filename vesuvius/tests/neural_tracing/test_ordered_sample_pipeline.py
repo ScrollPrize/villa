@@ -134,3 +134,27 @@ def test_pipeline_early_close_with_saturated_queues_is_idempotent() -> None:
     pipeline.close()
     pipeline.close()
     assert pipeline.closed
+
+
+def test_pipeline_can_deliver_stage_one_values_without_second_stage() -> None:
+    pipeline = _pipeline(
+        stage2_factory=None,
+        stage2_workers=0,
+        stage1_factory=_StageOneFactory(slow_first=True),
+    )
+    try:
+        results = [pipeline.next_ordered() for _ in range(12)]
+        assert [result.index for result in results] == list(range(12))
+        assert [result.value for result in results] == [index + 10 for index in range(12)]
+        assert all(result.stage2_worker == -1 for result in results)
+        assert all(result.stage2_service_ms == 0.0 for result in results)
+        assert 1 < pipeline.reorder_highwater <= 6
+    finally:
+        pipeline.close()
+
+
+def test_pipeline_rejects_inconsistent_second_stage_configuration() -> None:
+    with pytest.raises(ValueError, match="stage2_factory must be None"):
+        _pipeline(stage2_factory=None, stage2_workers=1)
+    with pytest.raises(ValueError, match="stage2_factory must be None"):
+        _pipeline(stage2_factory=_StageTwoFactory(), stage2_workers=0)

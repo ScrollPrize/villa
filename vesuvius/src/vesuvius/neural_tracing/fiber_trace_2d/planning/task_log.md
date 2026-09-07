@@ -112,3 +112,7 @@ Loader-worker follow-up:
 - Added previous-footprint reuse, shared compact dependency resolution,
   single-pinned-chunk gathering and a worker-local pointer cache. Exact
   reference/optimized C++ tests and focused Python plumbing tests pass.
+- Added a raw-only mode to the same bounded pipeline and measured 128 persistent
+  loaders with no augmentation: 93.76 samples/s end-to-end over 2,048 S1a
+  samples, all workers used, 116.1 mean CPU cores. Coordinate-map generation is
+  now the dominant scaling bottleneck.

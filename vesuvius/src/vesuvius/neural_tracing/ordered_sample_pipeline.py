@@ -31,6 +31,8 @@ class OrderedPipelineResult:
     reorder_wait_ms: float
     stage1_worker: int
     stage2_worker: int
+    stage1_started_ns: int
+    stage1_finished_ns: int
     stage2_finished_ns: int
     delivered_ns: int
 
@@ -42,6 +44,7 @@ class _RawItem:
     stage1_service_ms: float
     stage1_cpu_ms: float
     stage1_worker: int
+    stage1_started_ns: int
     stage1_finished_ns: int
 
 
@@ -57,6 +60,8 @@ class _CompletedItem:
     stage2_worker: int
     stage2_finished_ns: int
     stage1_worker: int
+    stage1_started_ns: int
+    stage1_finished_ns: int
 
 
 def _set_native_thread_limits() -> None:
@@ -128,6 +133,7 @@ def _stage1_main(
                 credits.release()
                 break
             started = time.perf_counter()
+            started_ns = time.perf_counter_ns()
             cpu_started = time.process_time()
             value = operation(index)
             cpu_ms = (time.process_time() - cpu_started) * 1000.0
@@ -139,6 +145,7 @@ def _stage1_main(
                 stage1_service_ms=service_ms,
                 stage1_cpu_ms=cpu_ms,
                 stage1_worker=int(worker_id),
+                stage1_started_ns=started_ns,
                 stage1_finished_ns=finished_ns,
             )
             _put_bounded(raw_queue, item, stop_event)
@@ -205,6 +212,8 @@ def _stage2_main(
                 stage2_worker=int(worker_id),
                 stage2_finished_ns=finished_ns,
                 stage1_worker=int(raw.stage1_worker),
+                stage1_started_ns=int(raw.stage1_started_ns),
+                stage1_finished_ns=int(raw.stage1_finished_ns),
             )
             _put_bounded(result_queue, completed, stop_event)
     except BaseException as exc:
@@ -229,13 +238,18 @@ def _stage2_main(
 
 
 class OrderedTwoStageSamplePipeline:
-    """Two process stages with bounded lookahead and ordered final delivery."""
+    """One or two process stages with bounded lookahead and ordered delivery.
+
+    Setting ``stage2_workers=0`` and ``stage2_factory=None`` exposes completed
+    stage-one values directly.  This is used to measure the real raw-sample
+    queue without adding an identity/augmentation process stage.
+    """
 
     def __init__(
         self,
         *,
         stage1_factory: Callable[[], Callable[[int], Any]],
-        stage2_factory: Callable[[], Callable[[Any], Any]],
+        stage2_factory: Callable[[], Callable[[Any], Any]] | None,
         start_index: int,
         item_count: int,
         stage1_workers: int,
@@ -250,13 +264,17 @@ class OrderedTwoStageSamplePipeline:
         for name, value in (
             ("item_count", item_count),
             ("stage1_workers", stage1_workers),
-            ("stage2_workers", stage2_workers),
             ("raw_queue_capacity", raw_queue_capacity),
             ("result_queue_capacity", result_queue_capacity),
             ("max_in_flight", max_in_flight),
         ):
             if int(value) <= 0:
                 raise ValueError(f"{name} must be > 0")
+        if int(stage2_workers) < 0:
+            raise ValueError("stage2_workers must be >= 0")
+        if (int(stage2_workers) == 0) != (stage2_factory is None):
+            raise ValueError("stage2_factory must be None exactly when stage2_workers is 0")
+        self.has_stage2 = int(stage2_workers) > 0
         if multiprocessing_context == "fork":
             raise ValueError("fork is not supported for the torch sample pipeline")
         self.start_index = int(start_index)
@@ -307,6 +325,7 @@ class OrderedTwoStageSamplePipeline:
                 self.processes.append(process)
                 self.controls.append(parent)
             for worker_id in range(int(stage2_workers)):
+                assert stage2_factory is not None
                 parent, child = self.context.Pipe(duplex=False)
                 process = self.context.Process(
                     target=_stage2_main,
@@ -401,7 +420,9 @@ class OrderedTwoStageSamplePipeline:
                     f"received={self.received} reorder={len(self.reorder)}"
                 )
             try:
-                completed = self.result_queue.get(timeout=min(0.1, remaining))
+                completed = (
+                    self.result_queue if self.has_stage2 else self.raw_queue
+                ).get(timeout=min(0.1, remaining))
             except queue.Empty:
                 continue
             received_ns = time.perf_counter_ns()
@@ -417,21 +438,46 @@ class OrderedTwoStageSamplePipeline:
         completed = self.reorder.pop(self.next_expected)
         received_ns = self.received_ns.pop(self.next_expected)
         delivered_ns = time.perf_counter_ns()
-        result = OrderedPipelineResult(
-            index=int(completed.index),
-            value=completed.value,
-            stage1_service_ms=float(completed.stage1_service_ms),
-            stage1_cpu_ms=float(completed.stage1_cpu_ms),
-            raw_queue_ms=float(completed.raw_queue_ms),
-            stage2_service_ms=float(completed.stage2_service_ms),
-            stage2_cpu_ms=float(completed.stage2_cpu_ms),
-            result_queue_ms=max(0.0, (received_ns - int(completed.stage2_finished_ns)) / 1.0e6),
-            stage1_worker=int(completed.stage1_worker),
-            stage2_worker=int(completed.stage2_worker),
-            reorder_wait_ms=max(0.0, (delivered_ns - received_ns) / 1.0e6),
-            stage2_finished_ns=int(completed.stage2_finished_ns),
-            delivered_ns=int(delivered_ns),
-        )
+        if self.has_stage2:
+            result = OrderedPipelineResult(
+                index=int(completed.index),
+                value=completed.value,
+                stage1_service_ms=float(completed.stage1_service_ms),
+                stage1_cpu_ms=float(completed.stage1_cpu_ms),
+                raw_queue_ms=float(completed.raw_queue_ms),
+                stage2_service_ms=float(completed.stage2_service_ms),
+                stage2_cpu_ms=float(completed.stage2_cpu_ms),
+                result_queue_ms=max(
+                    0.0, (received_ns - int(completed.stage2_finished_ns)) / 1.0e6
+                ),
+                stage1_worker=int(completed.stage1_worker),
+                stage2_worker=int(completed.stage2_worker),
+                stage1_started_ns=int(completed.stage1_started_ns),
+                stage1_finished_ns=int(completed.stage1_finished_ns),
+                reorder_wait_ms=max(0.0, (delivered_ns - received_ns) / 1.0e6),
+                stage2_finished_ns=int(completed.stage2_finished_ns),
+                delivered_ns=int(delivered_ns),
+            )
+        else:
+            result = OrderedPipelineResult(
+                index=int(completed.index),
+                value=completed.value,
+                stage1_service_ms=float(completed.stage1_service_ms),
+                stage1_cpu_ms=float(completed.stage1_cpu_ms),
+                raw_queue_ms=max(
+                    0.0, (received_ns - int(completed.stage1_finished_ns)) / 1.0e6
+                ),
+                stage2_service_ms=0.0,
+                stage2_cpu_ms=0.0,
+                result_queue_ms=0.0,
+                stage1_worker=int(completed.stage1_worker),
+                stage2_worker=-1,
+                stage1_started_ns=int(completed.stage1_started_ns),
+                stage1_finished_ns=int(completed.stage1_finished_ns),
+                reorder_wait_ms=max(0.0, (delivered_ns - received_ns) / 1.0e6),
+                stage2_finished_ns=int(completed.stage1_finished_ns),
+                delivered_ns=int(delivered_ns),
+            )
         self.next_expected += 1
         self.delivered += 1
         self.credits.release()

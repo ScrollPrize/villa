@@ -144,3 +144,31 @@ transforms, non-power-of-two chunks, boundary coordinates and non-finite
 coordinates are covered by the C++ reference-versus-optimized tests. The
 ordinary training default enables the fast path but not its diagnostic
 counters; the benchmark can disable either independently.
+
+## 128-process raw-loading capacity
+
+The benchmark's `--raw-only` mode uses the same stage-one workers, global
+credits, control pipes and ordered coordinator but launches no augmentation
+processes. It materializes and transfers each complete `FiberTrace3DRawSample`
+through the bounded output queue, then discards it. Thus queue/shared-memory IPC
+is included, while value augmentation and batch stacking are excluded.
+
+Production-mode command arguments were 2,048 measured samples after 256 warmup,
+128 load workers, output queue 128, global in-flight limit 256, source/decode/
+sampling limits 1, warm cache, and locality diagnostics disabled. GPUs were
+hidden. The result is
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_125817_240977/result.json`.
+
+- End-to-end throughput: 93.76 raw samples/s.
+- Completion-span throughput: 95.21 samples/s.
+- All 128 workers produced measured samples; mean measured CPU utilization was
+  116.1 cores and startup took 11.73 s.
+- Raw service: mean 1,205 ms, p50 971 ms, p95 2,484 ms.
+- Output queue/IPC: mean 36.8 ms, p50 27.0 ms, p95 91.4 ms.
+- Reorder high-water: 236 of the 256 globally bounded in-flight samples.
+
+The result is well below the 221 samples/s training target. Adding processes is
+not sufficient: coordinate-map generation alone consumed 1,468 summed worker
+seconds and slowed to 1.40 samples/service-second under host-wide contention.
+It accounts for about 59% of total raw worker service in this run and is the
+next loading optimization target.

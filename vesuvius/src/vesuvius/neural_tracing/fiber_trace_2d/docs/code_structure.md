@@ -2608,3 +2608,8 @@ The VC3D sampler exposes `chunk_locality_fast_path` and
 and the pipeline benchmark. The optimized native path reuses exact adjacent
 dependency footprints and performs direct single-pinned-chunk trilinear
 gathers; the reference path remains selectable for matched measurements.
+
+`pipeline_benchmark --raw-only` runs the same bounded stage-one worker and
+coordinator machinery without creating augmentation workers. Complete raw
+samples still cross the output queue, so the mode measures materialization and
+IPC but excludes value augmentation and batch stacking.
