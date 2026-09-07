@@ -330,6 +330,24 @@ class Volume:
                     f"Warning: Could not find config file at expected locations: {possible_paths}. Will try default: {self.configs}")
                 # Error will be raised in get_url_from_yaml if file truly doesn't exist
 
+            # --- Infer the scroll for a segment given without one ---
+            # Volume(type="segment", segment_id=...) is the documented form, but
+            # energy/resolution are keyed by scroll, so without this the lookup
+            # fails on scroll_id=None.
+            if self.type == "segment" and self.scroll_id is None:
+                inferred = self._infer_scroll_from_segment()
+                if inferred is None:
+                    raise ValueError(
+                        f"Segment {self.segment_id} was not found in {self.configs}. "
+                        f"Pass scroll_id explicitly if it lives elsewhere.")
+                self.scroll_id, inferred_energy, inferred_resolution = inferred
+                if energy is None:
+                    energy = inferred_energy
+                if resolution is None:
+                    resolution = inferred_resolution
+                if self.verbose:
+                    print(f"Inferred scroll_id={self.scroll_id} for segment {self.segment_id}")
+
             # --- Energy & Resolution ---
             self.energy = energy if energy is not None else self.grab_canonical_energy()
             self.resolution = resolution if resolution is not None else self.grab_canonical_resolution()
@@ -540,6 +558,34 @@ class Volume:
                     stack.append((list(value.items()), path + [key]))
 
         return None, None, None, None
+
+    def _infer_scroll_from_segment(self) -> Optional[Tuple[str, int, float]]:
+        """Find which scroll a segment belongs to by scanning the config.
+
+        Returns (scroll_id, energy, resolution) for the first entry whose
+        ``segments`` map contains ``self.segment_id``, or None if absent.
+        """
+        if not self.configs or not os.path.exists(self.configs):
+            return None
+        try:
+            with open(self.configs, 'r') as file:
+                config_data: Dict = yaml.safe_load(file) or {}
+        except Exception:
+            return None
+
+        target = str(self.segment_id)
+        for scroll_id, energies in config_data.items():
+            if not isinstance(energies, dict):
+                continue
+            for energy, resolutions in energies.items():
+                if not isinstance(resolutions, dict):
+                    continue
+                for resolution, entry in resolutions.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    if target in (entry.get("segments") or {}):
+                        return str(scroll_id), int(energy), float(resolution)
+        return None
 
     def get_url_from_yaml(self) -> str:
         """Retrieves the data URL/path from the YAML config file."""
