@@ -335,6 +335,13 @@ class Volume:
             # energy/resolution are keyed by scroll, so without this the lookup
             # fails on scroll_id=None.
             if self.type == "segment" and self.scroll_id is None:
+                if not self.configs or not os.path.exists(self.configs):
+                    # Distinguish "no config to look in" from "segment not listed",
+                    # and keep the error type the same as get_url_from_yaml's.
+                    raise FileNotFoundError(
+                        f"Configuration file not found at {self.configs}. It is needed to "
+                        f"determine which scroll segment {self.segment_id} belongs to. "
+                        f"Pass scroll_id explicitly to skip this lookup.")
                 inferred = self._infer_scroll_from_segment()
                 if inferred is None:
                     raise ValueError(
@@ -563,15 +570,15 @@ class Volume:
         """Find which scroll a segment belongs to by scanning the config.
 
         Returns (scroll_id, energy, resolution) for the first entry whose
-        ``segments`` map contains ``self.segment_id``, or None if absent.
+        ``segments`` map contains ``self.segment_id``. Returns None if the
+        config does not exist, or if it exists but does not list the segment.
+        A config that exists but cannot be read or parsed raises, rather than
+        being reported later as a missing segment.
         """
         if not self.configs or not os.path.exists(self.configs):
             return None
-        try:
-            with open(self.configs, 'r') as file:
-                config_data: Dict = yaml.safe_load(file) or {}
-        except Exception:
-            return None
+        with open(self.configs, 'r') as file:
+            config_data: Dict = yaml.safe_load(file) or {}
 
         target = str(self.segment_id)
         for scroll_id, energies in config_data.items():

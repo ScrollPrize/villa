@@ -62,6 +62,18 @@ def test_returns_none_for_unknown_segment(config_file):
 
 
 @pytest.mark.unit
+def test_malformed_config_raises_rather_than_reporting_a_missing_segment(tmp_path):
+    """A config that exists but will not parse is a config problem, not a
+    missing segment, and must not be flattened into the latter."""
+    import yaml
+
+    path = tmp_path / "scrolls.yaml"
+    path.write_text('"1":\n  "54":\n   bad: [unclosed\n')
+    with pytest.raises(yaml.YAMLError):
+        _probe(20230827161847, path)._infer_scroll_from_segment()
+
+
+@pytest.mark.unit
 def test_returns_none_when_config_missing(tmp_path):
     probe = _probe(20230827161847, tmp_path / "does_not_exist.yaml")
     assert probe._infer_scroll_from_segment() is None
