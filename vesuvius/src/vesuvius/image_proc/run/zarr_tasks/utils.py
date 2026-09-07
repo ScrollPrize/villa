@@ -17,6 +17,8 @@ from typing import List, Tuple
 
 import numpy as np
 import zarr
+
+from vesuvius.data.utils import open_zarr
 from numcodecs import Blosc
 from tqdm import tqdm
 
@@ -112,14 +114,22 @@ def create_level_dataset(
     if overwrite and level_path.exists():
         shutil.rmtree(level_path)
 
-    store = zarr.NestedDirectoryStore(str(level_path))
-    return zarr.open(
-        store=store,
+    # zarr 3 removed NestedDirectoryStore (and DirectoryStore). Its only purpose here was
+    # nested chunk directories, which both zarr 2 and zarr 3 express as
+    # dimension_separator="/". The store therefore goes and the separator replaces it.
+    #
+    # open_zarr is this package's own wrapper and already defaults zarr_format=2, passing
+    # the argument only on zarr 3 (zarr 2 has none and warns when given one). That is
+    # exactly what a numcodecs `compressor=` requires, and its docstring gives the same
+    # reason. Using it here keeps one copy of that rule in the codebase instead of two.
+    return open_zarr(
+        path=str(level_path),
+        mode="w",
         shape=shape,
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
-        mode="w",
+        dimension_separator="/",
         write_empty_chunks=False,
         fill_value=0,
     )
