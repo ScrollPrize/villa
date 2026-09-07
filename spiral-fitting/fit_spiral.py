@@ -1217,6 +1217,51 @@ class FitContext:
             if pcl_input_enabled(config, spec.role, spec.path)
         ]
 
+        # An input that is present on disk but switched off is almost always a
+        # surprise: the dataset ships the file, so the operator expects it to
+        # be used. Patches already announce their own absence below; nothing
+        # else did, which is what let a fit run with no evidence at all and
+        # still look normal. Only files that exist are reported, because
+        # conventional_input_paths() invents a path for every catalogued input
+        # whether or not it is there.
+        discarded = [
+            (name, flag)
+            for name, declared, resolved, flag in (
+                ('tracks_dbm', paths.tracks_dbm, self.tracks_dbm_path,
+                 'input_use_tracks'),
+                ('normal_x', paths.normal_x, self.normal_nx_zarr_path,
+                 'input_use_normals'),
+                ('fibers', paths.fibers, self.fibers_path,
+                 'input_use_fibers'),
+                ('fiber_directions', paths.fiber_directions,
+                 self.fiber_directions_path, 'input_use_fiber_directions'),
+                ('verified_patches', paths.verified_patches,
+                 self.verified_patches_path, 'input_use_verified_patches'),
+                ('unverified_patches', paths.unverified_patches,
+                 self.unverified_patches_path, 'input_use_unverified_patches'),
+                ('outer_shell', paths.outer_shell, self.shell_path,
+                 'input_use_outer_shell'),
+                ('gradient_magnitude', paths.gradient_magnitude,
+                 self.grad_mag_zarr_path, 'input_use_gradient_magnitude'),
+            )
+            if declared and resolved is None and os.path.exists(declared)
+        ]
+        for name, flag in discarded:
+            print(f'WARNING: {name} exists in this dataset but is discarded '
+                  f'because {flag} is false; it will not constrain the fit')
+
+        # Normals give the sheet's orientation, not which winding a point is
+        # on: two adjacent windings have parallel normals. Only tracks and
+        # patches place a point on a winding. Saying so is worth one line: a
+        # run with neither still converges and writes a normal-looking
+        # checkpoint.
+        if not self.tracks_dbm_path and not self.verified_patches_path \
+                and not self.unverified_patches_path:
+            print('WARNING: no winding-placing input is active (tracks and '
+                  'patches are all off or absent). Normals and fibers supply '
+                  'orientation only, so the winding assignment will rest on '
+                  'the umbilicus and the regularisers alone.')
+
         # Deployment/presentation values.
         self.cache_path = cache_dir if cache_dir is not None else (paths.cache_directory or None)
         self.lasagna_storage_backend = storage_backend
