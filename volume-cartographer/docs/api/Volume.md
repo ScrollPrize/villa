@@ -183,6 +183,12 @@ does not construct full-resolution meshgrid or displacement intermediates, and
 releases the GIL. The Fiber3D loader selects it through `geometry_backend`
 (`auto`, `native`, or the reference `eager` implementation).
 
+`vc.volume.anisotropic_blur_3d(volume, axis_zyx, sigma_along, sigma_across)`
+provides the corresponding single-threaded Fiber3D CPU augmentation primitive.
+It returns a new contiguous float32 ZYX array, releases the GIL, and applies
+three sequential constant-stencil passes without constructing coordinate
+grids. The input is not modified.
+
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
 mirror: metadata and fetched storage objects keep their source-relative paths
 and exact encoded bytes. Sharded arrays cache one complete outer shard and fan

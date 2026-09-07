@@ -341,6 +341,81 @@ pipeline benchmark.
 
 Record the native fused coordinate generator and measured throughput gain.
 
+## Native anisotropic value augmentation
+
+- Extend the existing opt-in per-sample timing dictionary with separate
+  normalization, contrast, brightness, gamma, noise, isotropic blur,
+  anisotropic blur, and final-mask timings. Timers must not change random draws,
+  values, or normal unprofiled behavior. Capture a CPU-only baseline with the
+  stable full-pipeline launcher before replacing the implementation.
+- Add one standalone native function to the existing VC Python extension. It
+  accepts a contiguous float32 ZYX volume, the float32 ZYX principal axis, and
+  along/across sigmas, and returns a new contiguous float32 ZYX volume. It owns
+  no global pool, releases the GIL, and uses exactly one calling thread so the
+  existing process pool remains the sole augmentation parallelism.
+- Reproduce the current operation as three sequential passes: principal axis,
+  first perpendicular, second perpendicular. Construct the same stable
+  right-handed basis, Gaussian radius `ceil(3*sigma)`, normalized weights, and
+  replicate-border behavior. Precompute each pass's constant trilinear stencil
+  from its tap offsets, merge identical integer offsets, and traverse the
+  volume once per pass using two reusable output buffers. Do not materialize
+  coordinate grids or dispatch one operation per tap. Merge only within a pass;
+  retain all three passes so repeated border clamping is unchanged. Preserve
+  principal/directional normalization and the strict `abs(dot)>0.9` reference
+  selection branch.
+- Add `value_augmentation_backend = auto|native|torch`. `auto` uses native on
+  eligible CPU tensors and falls back to the Torch reference when an older
+  binding is installed. Explicit `native` fails clearly when unavailable or
+  ineligible; `torch` remains the comparison/debug implementation. Auto
+  fallback is restricted to a missing binding or explicitly unsupported tensor
+  contract, never native validation/runtime errors. Define handling for
+  noncontiguous, non-float32, and gradient-tracking tensors. Profiling records
+  the resolved anisotropic backend and disabled-blur cases.
+- Compare native and Torch outputs on deterministic interior, border, axial,
+  oblique, singleton-axis, zero-sigma, degenerate-axis, and no-anisotropic-blur
+  fixtures. Current Torch generation performs a float32 voxel-to-normalized-to-
+  voxel coordinate round trip whose rounding can vary with position and shape;
+  a constant stencil intentionally approximates that behavior in addition to
+  reassociating weights. Test full 128-cubed and non-power-of-two volumes with
+  impulses, ramps, high-contrast random values, realistic normalized values,
+  and both sides of the strict basis-selection threshold. Report
+  maximum/mean absolute error. The initial full-size random comparison measured
+  max `6.18e-5` and mean `1.64e-6`, so require max <= `1e-4 * max(1,
+  max_abs_input)` and mean <= `3e-6 * max(1, max_abs_input)` for the
+  oriented-blur output. Verify identical shapes, dtype, contiguity,
+  determinism, input immutability, and unchanged masks/other augmentation
+  semantics. Reject invalid dimensions, sigmas, axes, and allocation overflow;
+  never relax a failed tolerance silently.
+- Rerun the same full S1a benchmark command and topology. Report total
+  samples/s, augmentation mean/p50/p95, each new substage, summed CPU cores,
+  queue waits, and before/after artifact paths. The user target is 1-2
+  augmented samples/s per worker; derive it from augmentation service time or
+  an isolated saturated augmentation run, not global throughput divided by
+  workers. Include allocation/binding cost and matched sample identities. Keep
+  GPUs hidden and native thread limits fixed throughout.
+
+### Spec update
+
+Document backend selection, the native three-pass stencil contract, one-thread
+ownership, numerical tolerance, and retained Torch fallback.
+
+### Docs updates
+
+Add the measured substage baseline, implementation structure, exact benchmark
+command, numerical comparison, before/after performance, and portability note
+to the sample-pipeline benchmark document.
+
+### Testing
+
+Add focused binding validation and native-versus-Torch output tests plus loader
+backend selection/fallback tests. Build the Release VC binding, reinstall only
+that explicitly authorized editable package, run focused CPU Python tests, the
+stable full-pipeline benchmark, and `git diff --check`.
+
+### Changelog update
+
+Record the native anisotropic augmentation and measured speedup once validated.
+
 ## Two-GPU measurement implementation (authorized continuation)
 - Add opt-in per-rank JSONL iteration/stage wall timers and bounded CPU/CUDA
   profiler traces to the real trainer. Record enqueue scopes accurately; do not

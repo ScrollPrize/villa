@@ -881,6 +881,197 @@ nb::tuple generateFiber3DCoords(
     return nb::make_tuple(coordsArray, validArray);
 }
 
+struct BlurStencilEntry {
+    int z;
+    int y;
+    int x;
+    float weight;
+};
+
+std::array<float, 3> normalizeVector(const std::array<float, 3>& value,
+                                     const char* name)
+{
+    const float norm = std::sqrt(
+        value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+    if (!std::isfinite(norm) || norm <= 0.0f)
+        throw nb::value_error(
+            (std::string(name) + " must have positive finite norm").c_str());
+    return {value[0] / norm, value[1] / norm, value[2] / norm};
+}
+
+std::array<float, 3> crossVector(const std::array<float, 3>& a,
+                                 const std::array<float, 3>& b)
+{
+    return {
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+std::vector<BlurStencilEntry> makeBlurStencil(const std::array<float, 3>& axis,
+                                              float sigma)
+{
+    if (sigma <= 0.0f)
+        return {{0, 0, 0, 1.0f}};
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+    std::vector<float> kernel(static_cast<size_t>(2 * radius + 1));
+    float kernelSum = 0.0f;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const float scaled = static_cast<float>(offset) / sigma;
+        const float weight = std::exp(-0.5f * scaled * scaled);
+        kernel[static_cast<size_t>(offset + radius)] = weight;
+        kernelSum += weight;
+    }
+    for (float& weight : kernel)
+        weight /= kernelSum;
+
+    std::vector<BlurStencilEntry> stencil;
+    stencil.reserve(kernel.size() * 8);
+    for (int tap = -radius; tap <= radius; ++tap) {
+        const std::array<float, 3> delta{
+            static_cast<float>(tap) * axis[0],
+            static_cast<float>(tap) * axis[1],
+            static_cast<float>(tap) * axis[2],
+        };
+        const std::array<int, 3> low{
+            static_cast<int>(std::floor(delta[0])),
+            static_cast<int>(std::floor(delta[1])),
+            static_cast<int>(std::floor(delta[2])),
+        };
+        const std::array<float, 3> fraction{
+            delta[0] - static_cast<float>(low[0]),
+            delta[1] - static_cast<float>(low[1]),
+            delta[2] - static_cast<float>(low[2]),
+        };
+        const float tapWeight = kernel[static_cast<size_t>(tap + radius)];
+        for (int cornerZ = 0; cornerZ < 2; ++cornerZ) {
+            const float weightZ = cornerZ != 0 ? fraction[0] : 1.0f - fraction[0];
+            for (int cornerY = 0; cornerY < 2; ++cornerY) {
+                const float weightY = cornerY != 0 ? fraction[1] : 1.0f - fraction[1];
+                for (int cornerX = 0; cornerX < 2; ++cornerX) {
+                    const float weightX = cornerX != 0 ? fraction[2] : 1.0f - fraction[2];
+                    const BlurStencilEntry candidate{
+                        low[0] + cornerZ,
+                        low[1] + cornerY,
+                        low[2] + cornerX,
+                        tapWeight * weightZ * weightY * weightX,
+                    };
+                    if (candidate.weight == 0.0f)
+                        continue;
+                    auto existing = std::find_if(
+                        stencil.begin(), stencil.end(), [&](const BlurStencilEntry& entry) {
+                            return entry.z == candidate.z && entry.y == candidate.y &&
+                                   entry.x == candidate.x;
+                        });
+                    if (existing == stencil.end())
+                        stencil.push_back(candidate);
+                    else
+                        existing->weight += candidate.weight;
+                }
+            }
+        }
+    }
+    return stencil;
+}
+
+void applyBlurStencil(const float* source,
+                      float* destination,
+                      const std::array<size_t, 3>& shape,
+                      const std::vector<BlurStencilEntry>& stencil)
+{
+    const int depth = static_cast<int>(shape[0]);
+    const int height = static_cast<int>(shape[1]);
+    const int width = static_cast<int>(shape[2]);
+    const size_t plane = shape[1] * shape[2];
+    for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float value = 0.0f;
+                for (const auto& entry : stencil) {
+                    const int sourceZ = std::clamp(z + entry.z, 0, depth - 1);
+                    const int sourceY = std::clamp(y + entry.y, 0, height - 1);
+                    const int sourceX = std::clamp(x + entry.x, 0, width - 1);
+                    const size_t index = static_cast<size_t>(sourceZ) * plane +
+                                         static_cast<size_t>(sourceY) * shape[2] +
+                                         static_cast<size_t>(sourceX);
+                    value += source[index] * entry.weight;
+                }
+                destination[static_cast<size_t>(z) * plane +
+                            static_cast<size_t>(y) * shape[2] +
+                            static_cast<size_t>(x)] = value;
+            }
+        }
+    }
+}
+
+nb::ndarray<float, nb::numpy, nb::c_contig> anisotropicBlur3D(
+    const FloatCoords& volume,
+    const FloatCoords& axisZyx,
+    float sigmaAlong,
+    float sigmaAcross)
+{
+    if (volume.ndim() != 3)
+        throw nb::value_error("volume must have shape (Z,Y,X)");
+    requireFloatShape(axisZyx, {3}, "axis_zyx");
+    requireFinite(axisZyx, "axis_zyx");
+    if (!std::isfinite(sigmaAlong) || sigmaAlong < 0.0f ||
+        !std::isfinite(sigmaAcross) || sigmaAcross < 0.0f) {
+        throw nb::value_error("blur sigmas must be finite and nonnegative");
+    }
+    std::array<size_t, 3> shape{};
+    size_t pointCount = 1;
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        shape[dimension] = volume.shape(dimension);
+        if (shape[dimension] == 0)
+            throw nb::value_error("volume dimensions must be positive");
+        if (shape[dimension] > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw nb::value_error("volume dimensions exceed native index range");
+        if (pointCount > std::numeric_limits<size_t>::max() / shape[dimension])
+            throw nb::value_error("volume allocation overflows size_t");
+        pointCount *= shape[dimension];
+    }
+    if (pointCount > std::numeric_limits<size_t>::max() / sizeof(float))
+        throw nb::value_error("volume allocation overflows size_t");
+
+    const float* rawAxis = axisZyx.data();
+    const auto along = normalizeVector(
+        {rawAxis[0], rawAxis[1], rawAxis[2]}, "axis_zyx");
+    const std::array<float, 3> reference =
+        std::abs(along[0]) > 0.9f
+            ? std::array<float, 3>{0.0f, 1.0f, 0.0f}
+            : std::array<float, 3>{1.0f, 0.0f, 0.0f};
+    const auto acrossA = normalizeVector(
+        crossVector(along, reference), "perpendicular axis");
+    const auto acrossB = normalizeVector(
+        crossVector(along, acrossA), "perpendicular axis");
+    const std::array<std::array<float, 3>, 3> axes{along, acrossA, acrossB};
+    const std::array<float, 3> sigmas{sigmaAlong, sigmaAcross, sigmaAcross};
+
+    std::vector<float> first(pointCount);
+    std::vector<float> second(pointCount);
+    const float* source = volume.data();
+    float* destination = first.data();
+    size_t completedPasses = 0;
+    {
+        nb::gil_scoped_release release;
+        for (size_t pass = 0; pass < axes.size(); ++pass) {
+            if (sigmas[pass] <= 0.0f)
+                continue;
+            const auto stencil = makeBlurStencil(axes[pass], sigmas[pass]);
+            applyBlurStencil(source, destination, shape, stencil);
+            source = destination;
+            destination = destination == first.data() ? second.data() : first.data();
+            ++completedPasses;
+        }
+        if (completedPasses == 0)
+            std::copy(volume.data(), volume.data() + pointCount, first.data());
+        else if (source != first.data())
+            first.swap(second);
+    }
+    return makeNumpyArray<float>(std::move(first), shape);
+}
+
 void validatePlaneVectors(const FloatCoords& values,
                           size_t planeCount,
                           const char* name)
@@ -1240,6 +1431,13 @@ NB_MODULE(volume, m)
           "volume_spacing_base"_a,
           "base_shape_zyx"_a,
           "Generate Fiber3D base coordinates and validity in one native pass.");
+    m.def("anisotropic_blur_3d",
+          &anisotropicBlur3D,
+          "volume"_a,
+          "axis_zyx"_a,
+          "sigma_along"_a,
+          "sigma_across"_a,
+          "Apply the Fiber3D three-pass oriented Gaussian blur on one CPU thread.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",

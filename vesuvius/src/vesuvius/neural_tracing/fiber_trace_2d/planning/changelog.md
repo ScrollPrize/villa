@@ -439,3 +439,9 @@
   `auto|native|eager` loader selection. On the CPU-only S1a benchmark it raised
   128-loader raw throughput from 116.53 to 227.33 samples/s while remaining
   within 3.82e-6 base voxels of the eager reference.
+
+## 2026-09-07 — Native Fiber3D anisotropic augmentation
+
+- Replaced repeated CPU `grid_sample` oriented blur with a single-threaded,
+  GIL-free three-pass native stencil. Full augmentation improved from 1.165s to
+  0.494s/sample and the matched pipeline from 22.65 to 58.81 samples/s.

@@ -86,6 +86,7 @@ class FiberTrace3DConfig:
     round_source_to_chunk_boundaries: bool = True
     geometry_tile_depth: int = 0
     geometry_backend: str = "auto"
+    value_augmentation_backend: str = "auto"
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
@@ -452,6 +453,9 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
         geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
+        value_augmentation_backend=str(
+            raw.get("value_augmentation_backend", "auto")
+        ).lower(),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),
@@ -1055,26 +1059,43 @@ def apply_value_augmentation_3d(
     volume: torch.Tensor,
     valid_mask: torch.Tensor,
     params: _Augment3DParams,
+    *,
+    profile_timings_ms: dict[str, float] | None = None,
 ) -> torch.Tensor:
     """Apply the shared value transform used by synchronous and queued loading."""
+    def record(name: str, started: float) -> None:
+        if profile_timings_ms is not None:
+            profile_timings_ms[name] = (time.perf_counter() - started) * 1000.0
+
+    started = time.perf_counter()
     out = _normalize_image(volume, valid_mask, config.image_normalization)
+    record("value_normalize_ms", started)
     if not config.augment_enabled:
         return out
+    started = time.perf_counter()
     if params.contrast != 1.0:
         center = out[valid_mask].mean() if bool(valid_mask.any()) else out.mean()
         out = (out - center) * float(params.contrast) + center
+    record("value_contrast_ms", started)
+    started = time.perf_counter()
     if params.brightness != 0.0:
         out = out + float(params.brightness)
+    record("value_brightness_ms", started)
+    started = time.perf_counter()
     if params.gamma != 1.0:
         valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
         lo = valid_values.min()
         hi = valid_values.max()
         scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
         out = torch.pow(scaled, float(params.gamma)) * (hi - lo) + lo
+    record("value_gamma_ms", started)
+    started = time.perf_counter()
     if params.noise_std > 0.0:
         gen = torch.Generator(device=out.device)
         gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
         out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
+    record("value_noise_ms", started)
+    started = time.perf_counter()
     if params.blur_sigma > 0.0:
         sigma = float(params.blur_sigma)
         radius = max(1, int(math.ceil(3.0 * sigma)))
@@ -1091,20 +1112,69 @@ def apply_value_augmentation_3d(
             padding[(2 - axis) * 2 + 1] = radius
             data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
         out = data[0, 0]
-    if (
+    record("value_isotropic_blur_ms", started)
+    anisotropic_used = (
         params.anisotropic_blur_axis_zyx is not None
         and (
             params.anisotropic_blur_sigma_along > 0.0
             or params.anisotropic_blur_sigma_across > 0.0
         )
-    ):
-        out = _anisotropic_blur_3d(
-            out,
-            axis_zyx=params.anisotropic_blur_axis_zyx,
-            sigma_along=float(params.anisotropic_blur_sigma_along),
-            sigma_across=float(params.anisotropic_blur_sigma_across),
+    )
+    started = time.perf_counter()
+    anisotropic_native_used = False
+    if anisotropic_used:
+        backend = str(config.value_augmentation_backend)
+        native_eligible = (
+            out.device.type == "cpu"
+            and out.dtype == torch.float32
+            and out.is_contiguous()
+            and not out.requires_grad
         )
-    return torch.where(valid_mask, out, torch.zeros_like(out))
+        native_function = None
+        if native_eligible and backend in {"auto", "native"}:
+            try:
+                from vc.volume import anisotropic_blur_3d
+
+                native_function = anisotropic_blur_3d
+            except ImportError as exc:
+                if backend == "native":
+                    raise RuntimeError(
+                        "value_augmentation_backend='native' requires a rebuilt "
+                        "volume-cartographer binding with anisotropic_blur_3d"
+                    ) from exc
+        elif backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires a contiguous, "
+                "gradient-free float32 CPU tensor"
+            )
+        if native_function is not None:
+            native_result = native_function(
+                out.detach().numpy(),
+                np.ascontiguousarray(
+                    params.anisotropic_blur_axis_zyx, dtype=np.float32
+                ),
+                float(params.anisotropic_blur_sigma_along),
+                float(params.anisotropic_blur_sigma_across),
+            )
+            out = torch.from_numpy(np.asarray(native_result, dtype=np.float32))
+            anisotropic_native_used = True
+        else:
+            out = _anisotropic_blur_3d(
+                out,
+                axis_zyx=params.anisotropic_blur_axis_zyx,
+                sigma_along=float(params.anisotropic_blur_sigma_along),
+                sigma_across=float(params.anisotropic_blur_sigma_across),
+            )
+    record("value_anisotropic_blur_ms", started)
+    if profile_timings_ms is not None:
+        profile_timings_ms["value_anisotropic_blur_used"] = float(anisotropic_used)
+        profile_timings_ms["value_anisotropic_native_used"] = float(
+            anisotropic_native_used
+        )
+    started = time.perf_counter()
+    result = torch.where(valid_mask, out, torch.zeros_like(out))
+    record("value_final_mask_ms", started)
+    return result
 
 
 def augment_fiber_trace_3d_raw_sample(
@@ -1117,17 +1187,18 @@ def augment_fiber_trace_3d_raw_sample(
     started = time.perf_counter()
     cpu_started = time.process_time()
     sample = raw.sample
+    timings = dict(sample.profile_timings_ms or {}) if profile else None
     volume = apply_value_augmentation_3d(
         config,
         sample.volume[0],
         sample.valid_mask[0],
         raw.augmentation,
+        profile_timings_ms=timings,
     ).view_as(sample.volume)
     augment_ms = (time.perf_counter() - started) * 1000.0
     augment_cpu_ms = (time.process_time() - cpu_started) * 1000.0
-    timings = None
     if profile:
-        timings = dict(sample.profile_timings_ms or {})
+        assert timings is not None
         timings["value_augmentation_ms"] = augment_ms
         timings["value_augmentation_cpu_ms"] = augment_cpu_ms
         timings["sample_total_ms"] = float(raw.load_wall_ms) + augment_ms
@@ -1182,6 +1253,14 @@ class FiberTrace3DLoader:
             raise ValueError("geometry_tile_depth must be >= 0")
         if str(config.geometry_backend) not in {"auto", "native", "eager"}:
             raise ValueError("geometry_backend must be auto, native, or eager")
+        if str(config.value_augmentation_backend) not in {
+            "auto",
+            "native",
+            "torch",
+        }:
+            raise ValueError(
+                "value_augmentation_backend must be auto, native, or torch"
+            )
         if not (0.0 <= config.augment_smooth_displacement_probability <= 1.0):
             raise ValueError("augment_smooth_displacement_probability must be in [0,1]")
         if not (0.0 <= config.augment_anisotropic_blur_probability <= 1.0):
@@ -2832,6 +2911,9 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
         geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
+        value_augmentation_backend=str(
+            raw.get("value_augmentation_backend", "auto")
+        ).lower(),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),

@@ -2824,3 +2824,24 @@
   patches, mismatched valid voxels must be at most `1e-4` and maximum uint8
   difference at most one. No fast-math flags are permitted, and scalar portable
   behavior remains available on supported Ubuntu/macOS amd64/arm64 builds.
+
+# Native Fiber3D anisotropic augmentation
+
+- `value_augmentation_backend = auto|native|torch` controls oriented blur.
+  `auto` uses the native implementation for contiguous gradient-free float32
+  CPU tensors and falls back only when the binding is absent or the tensor
+  contract is unsupported. Explicit `native` fails clearly; native validation
+  or runtime errors are never hidden by fallback. `torch` is the reference.
+- Native oriented blur is a standalone, GIL-free, one-calling-thread primitive.
+  It preserves the three sequential principal/perpendicular/perpendicular
+  passes, strict stable-basis branch, Gaussian radius and normalized kernels,
+  and replicate-border semantics. Each pass precomputes and merges its constant
+  trilinear stencil and uses two reusable float32 buffers. It must not create
+  full coordinate grids, internally parallelize, mutate its input, or merge
+  across passes.
+- Native/reference comparison uses full 128-cubed, non-power-of-two, border,
+  singleton, impulse, ramp, high-contrast random, and basis-threshold fixtures.
+  Maximum error must be no more than `1e-4 * max(1,max_abs_input)` and mean
+  error no more than `3e-6 * max(1,max_abs_input)`. Shape, float32 dtype,
+  contiguity, determinism, masking, parameter draws and other value transforms
+  remain unchanged.

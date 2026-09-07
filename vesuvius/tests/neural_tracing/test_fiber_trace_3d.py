@@ -2059,6 +2059,147 @@ def test_anisotropic_blur_spreads_along_configured_axis() -> None:
     assert blurred[4, 4, 3] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("shape", "axis"),
+    (
+        ((17, 19, 23), np.asarray([0.31, 0.83, -0.46], dtype=np.float32)),
+        ((1, 13, 11), np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        ((11, 13, 17), np.asarray([0.8999, 0.436096, 0.0], dtype=np.float32)),
+        ((11, 13, 17), np.asarray([0.9001, 0.435683, 0.0], dtype=np.float32)),
+    ),
+)
+def test_native_anisotropic_blur_matches_torch_reference(
+    shape: tuple[int, int, int], axis: np.ndarray
+) -> None:
+    native_module = pytest.importorskip("vc.volume")
+    blur = getattr(native_module, "anisotropic_blur_3d", None)
+    if blur is None:
+        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    source = torch.randn(shape, generator=torch.Generator().manual_seed(23))
+    source_before = source.clone()
+    expected = _anisotropic_blur_3d(
+        source,
+        axis_zyx=axis,
+        sigma_along=1.5,
+        sigma_across=0.25,
+    )
+    actual_array = blur(source.numpy(), axis, 1.5, 0.25)
+    actual = torch.from_numpy(actual_array)
+    scale = max(1.0, float(torch.max(torch.abs(source))))
+    error = torch.abs(actual - expected)
+    assert float(error.max()) <= 1.0e-4 * scale
+    assert float(error.mean()) <= 3.0e-6 * scale
+    assert actual.shape == source.shape
+    assert actual.dtype == torch.float32
+    assert actual_array.flags.c_contiguous
+    assert torch.equal(source, source_before)
+
+
+def test_native_anisotropic_blur_matches_full_training_cube() -> None:
+    native_module = pytest.importorskip("vc.volume")
+    blur = getattr(native_module, "anisotropic_blur_3d", None)
+    if blur is None:
+        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    source = torch.randn((128, 128, 128), generator=torch.Generator().manual_seed(41))
+    axis = np.asarray([0.31, 0.83, -0.46], dtype=np.float32)
+    expected = _anisotropic_blur_3d(
+        source,
+        axis_zyx=axis,
+        sigma_along=1.5,
+        sigma_across=0.25,
+    )
+    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
+    scale = max(1.0, float(torch.max(torch.abs(source))))
+    error = torch.abs(actual - expected)
+    assert float(error.max()) <= 1.0e-4 * scale
+    assert float(error.mean()) <= 3.0e-6 * scale
+
+
+@pytest.mark.parametrize("kind", ("ramp", "impulse", "high_contrast"))
+def test_native_anisotropic_blur_structured_inputs(kind: str) -> None:
+    native_module = pytest.importorskip("vc.volume")
+    blur = getattr(native_module, "anisotropic_blur_3d", None)
+    if blur is None:
+        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    shape = (17, 19, 23)
+    if kind == "ramp":
+        z, y, x = torch.meshgrid(
+            *(torch.linspace(-2.0, 2.0, length) for length in shape),
+            indexing="ij",
+        )
+        source = (z + 0.3 * y - 0.7 * x).contiguous()
+    elif kind == "impulse":
+        source = torch.zeros(shape, dtype=torch.float32)
+        source[8, 9, 11] = 10.0
+    else:
+        source = 100.0 * torch.randn(
+            shape, generator=torch.Generator().manual_seed(47)
+        )
+    axis = np.asarray([-0.52, 0.17, 0.84], dtype=np.float32)
+    expected = _anisotropic_blur_3d(
+        source,
+        axis_zyx=axis,
+        sigma_along=1.5,
+        sigma_across=0.25,
+    )
+    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
+    scale = max(1.0, float(torch.max(torch.abs(source))))
+    error = torch.abs(actual - expected)
+    assert float(error.max()) <= 1.0e-4 * scale
+    assert float(error.mean()) <= 3.0e-6 * scale
+
+
+def test_native_anisotropic_blur_validates_input_and_zero_sigma() -> None:
+    native_module = pytest.importorskip("vc.volume")
+    blur = getattr(native_module, "anisotropic_blur_3d", None)
+    if blur is None:
+        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    source = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
+    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    assert np.array_equal(blur(source, axis, 0.0, 0.0), source)
+    with pytest.raises(ValueError, match="positive finite norm"):
+        blur(source, np.zeros((3,), dtype=np.float32), 1.0, 0.0)
+    with pytest.raises(ValueError, match="nonnegative"):
+        blur(source, axis, -1.0, 0.0)
+    reversed_source = source[:, :, ::-1]
+    assert np.array_equal(blur(reversed_source, axis, 0.0, 0.0), reversed_source)
+
+
+def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vc.volume
+
+    if not hasattr(vc.volume, "anisotropic_blur_3d"):
+        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    common = {
+        "patch_shape_zyx": [17, 15, 13],
+        "augment_anisotropic_blur_probability": 1.0,
+        "augment_anisotropic_blur_sigma_along": 1.5,
+        "augment_anisotropic_blur_sigma_across": 0.25,
+    }
+    native_loader = _loader_with_mapping(
+        {**common, "value_augmentation_backend": "native"}
+    )
+    raw = native_loader.load_raw_sample(2, profile=True)
+    native_sample = native_loader.augment_raw_sample(raw, profile=True)
+    native_unprofiled = native_loader.augment_raw_sample(raw, profile=False)
+    assert native_sample.profile_timings_ms is not None
+    assert native_sample.profile_timings_ms["value_anisotropic_native_used"] == 1.0
+    assert torch.equal(native_sample.volume, native_unprofiled.volume)
+
+    monkeypatch.delattr(vc.volume, "anisotropic_blur_3d")
+    auto_loader = _loader_with_mapping(
+        {**common, "value_augmentation_backend": "auto"}
+    )
+    auto_sample = auto_loader.augment_raw_sample(raw, profile=True)
+    assert auto_sample.profile_timings_ms is not None
+    assert auto_sample.profile_timings_ms["value_anisotropic_native_used"] == 0.0
+    explicit_loader = _loader_with_mapping(
+        {**common, "value_augmentation_backend": "native"}
+    )
+    with pytest.raises(RuntimeError, match="requires a rebuilt volume-cartographer"):
+        explicit_loader.augment_raw_sample(raw, profile=True)
+
+
 def test_nonzero_unsupported_3d_shear_and_ringing_raise(tmp_path) -> None:
     config_path = tmp_path / "bad.json"
     raw = {

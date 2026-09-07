@@ -267,3 +267,77 @@ Low-resolution 3D precomposition was considered but not added. Direct lookup
 of the already-small controls is simpler and the measured end-to-end loader
 capacity now exceeds the target. Precomposition should be reconsidered only if
 a future profile shows smooth-control evaluation dominating a new workload.
+
+## Full value-augmentation pipeline after native generation
+
+The stable CPU-only launcher was run without `--raw-only` using 256 measured
+samples after 32 warmup samples, 16 load workers, 32 value-augmentation
+workers, queue capacities 64, global in-flight limit 128, and one native I/O,
+decode, and sampling thread per loader:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_pipeline_benchmark
+```
+
+It sustained 24.02 samples/s over the measured production span and 22.49
+samples/s end to end. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_143832_106216/result.json`.
+
+| Stage | Mean | p50 | p95 | Worker count |
+|---|---:|---:|---:|---:|
+| raw loading | 230.30 ms | 247.54 ms | 281.99 ms | 16 |
+| value augmentation | 1,102.59 ms | 344.28 ms | 2,205.08 ms | 32 |
+| raw inter-stage queue wait | 1,705.34 ms | 1,813.98 ms | 2,871.93 ms | — |
+| batch stack | 49.33 ms/batch | 49.33 ms | 62.45 ms | coordinator |
+
+The raw queue wait proves that augmentation backpressures loading in this
+topology. Augmentation alone consumes 1.105 CPU-seconds/sample on average, so
+221 samples/s would require about 244 fully utilized CPU cores before loading,
+IPC, ordering, and batching. Subsequent operation-resolved timing confirmed the
+50%-probability anisotropic blur as the source of the bimodal latency.
+
+## Native anisotropic value augmentation
+
+The instrumented Torch reference run used the same launcher and 16-loader /
+32-augmentation-worker topology. Oriented blur was enabled for 48.4% of the
+deterministic samples and consumed about 1.82 seconds whenever enabled. Its
+884ms all-sample contribution dwarfed isotropic blur (94ms), gamma (64ms),
+normalization (57ms), contrast (50ms), and noise (11ms). The measured pipeline
+rate was 22.65 samples/s. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_145403_816239/result.json`.
+
+The replacement `vc.volume.anisotropic_blur_3d` is a GIL-free scalar C++
+kernel. It preserves the principal/perpendicular/perpendicular pass order,
+Gaussian kernels, stable basis and replicated borders. For each pass it
+precomputes the constant trilinear stencil represented by all Gaussian taps,
+merges duplicate offsets, and traverses the volume once. Two 128-cubed float32
+buffers replace the Torch implementation's repeated full coordinate grids and
+17 `grid_sample` calls. It uses the calling thread only; parallelism remains in
+the process-level augmentation pool. `value_augmentation_backend=auto|native|torch`
+controls selection, with `auto` defaulting to native for eligible CPU tensors
+and narrowly falling back for an absent binding or unsupported tensor contract.
+
+The matched native run reached **58.81 samples/s** production and 52.07
+samples/s end to end. Full value augmentation fell from 1,164.97ms to 494.43ms
+mean, 358.62ms to 373.88ms median, and 2,243.86ms to 747.30ms p95. Enabled
+native oriented blur averaged about 339ms, a 5.4x improvement, and complete
+augmentation sustains **2.02 samples/service-second per worker**. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_150249_214899/result.json`.
+
+The constant stencil intentionally omits Torch's position-dependent float32
+voxel-to-normalized-to-voxel coordinate round trip. On a full 128-cubed random
+fixture, maximum error was `6.18e-5` and mean error `1.64e-6`; ramp error was at
+most `3.10e-6`. Tests use scale-relative bounds and cover full-size random,
+non-power-of-two, impulse, ramp, high-contrast, singleton, basis-threshold and
+border cases.
+
+A host-scale run with 64 loaders and 128 augmentation workers used 2,048
+measured samples after 256 warmup samples. It reached 76.80 samples/s while
+augmentation retained 1.44 samples/service-second under contention. All 192
+workers participated, but the single coordinator became the next bottleneck:
+batch stacking averaged 66.39ms per eight samples, result-queue wait averaged
+2.10s, and only 78.5 CPU cores were effectively busy. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_150407_151591/result.json`.
+This does not indicate an augmentation scaling failure; it establishes that
+coordinator delivery/batch construction must be addressed separately before
+the global pipeline can approach 221 samples/s.

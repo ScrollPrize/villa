@@ -335,6 +335,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override Fiber3D coordinate generation backend",
     )
+    parser.add_argument(
+        "--value-augmentation-backend",
+        choices=("auto", "native", "torch"),
+        default=None,
+        help="override Fiber3D value augmentation backend",
+    )
     parser.add_argument("--multiprocessing-context", choices=("spawn", "forkserver"), default="forkserver")
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--no-progress-timeout-seconds", type=float, default=300.0)
@@ -388,6 +394,10 @@ def main(argv: list[str] | None = None) -> int:
         config_payload["geometry_tile_depth"] = int(args.geometry_tile_depth)
     if args.geometry_backend is not None:
         config_payload["geometry_backend"] = str(args.geometry_backend)
+    if args.value_augmentation_backend is not None:
+        config_payload["value_augmentation_backend"] = str(
+            args.value_augmentation_backend
+        )
     batch_size = int(config_payload.get("batch_size", 1))
     if batch_size <= 0:
         raise ValueError("config batch_size must be > 0")

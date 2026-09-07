@@ -63,3 +63,11 @@ transform as full-resolution PyTorch layers. Approximate coordinate agreement
 with the existing generator is acceptable. Consider precomposing the smooth
 transforms on a low-resolution 3D lattice when it is measurably faster overall.
 Keep all work CPU-only while GPUs remain allocated elsewhere.
+
+Authorized next optimization: measure each value-augmentation operation, then
+replace the current arbitrary-axis anisotropic blur's repeated full-volume
+PyTorch `grid_sample` calls with a portable, single-threaded, GIL-free native
+stencil. Preserve the three sequential directional passes, Gaussian kernels,
+replicated borders, deterministic parameters, and approximate output values.
+Target 1-2 fully augmented 128-cubed samples/s per CPU core and scalable
+process-level execution. Do not use GPUs.

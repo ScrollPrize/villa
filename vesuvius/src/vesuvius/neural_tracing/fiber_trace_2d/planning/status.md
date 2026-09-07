@@ -31,3 +31,8 @@
 - [x] Implement and test the portable native binding and loader backend.
 - [x] Benchmark native generation with 1 and 128 processes.
 - [x] Decide from measurements whether low-resolution 3D precomposition helps (defer: direct generation already exceeds the global target).
+- [x] Measure the full value-augmentation pipeline and identify its bottleneck.
+- [x] Add operation-resolved value-augmentation timings and capture a matched Torch baseline.
+- [x] Independently review the native anisotropic-blur plan; incorporate coordinate-roundtrip and full-volume validation findings.
+- [x] Implement and test the native one-thread three-pass stencil.
+- [x] Benchmark the native full augmentation pipeline and report per-core capacity.
