@@ -10,11 +10,11 @@ from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Patch, Segment
 
 
-_CACHE_VERSION = "v6"
+_CACHE_VERSION = "v7"
 
 
 def patch_finding_cache_token(config: InkDataConfig) -> str:
-    """Return the v6 token including every patch-semantic input."""
+    """Return the v7 token including split-isolated discovery semantics."""
     finding = config.patch_finding
     patch_y = config.patch_size[1]
     default_stride = int(patch_y * finding.overlap)
@@ -24,6 +24,7 @@ def patch_finding_cache_token(config: InkDataConfig) -> str:
         return (
             f"{config.discovery_mode}-subtiling-{_CACHE_VERSION}"
             f"-ts-{tile_size}_st-{stride}_fe-{int(finding.filter_empty_tile)}"
+            f"-mlc-{finding.min_labeled_coverage}"
         )
     scan_scale = "" if finding.scan_scale is None else finding.scan_scale
     if config.discovery_mode == "unlabeled":
@@ -99,6 +100,9 @@ def load_patch_cache(
         records = json.load(stream)
     if not isinstance(records, list):
         raise ValueError(f"patch cache {path} must contain a JSON array")
+    if not records:
+        # Empty legacy lists have no record carrying the semantic version.
+        return None
     segments_by_key = {segment.cache_key: segment for segment in segments}
     expected_token = patch_finding_cache_token(config)
     patches: list[Patch] = []
