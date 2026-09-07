@@ -170,15 +170,19 @@ TEST_CASE("get_grid with a real (committed) GridStore file is read back")
         gs.add({cv::Point(0, 0), cv::Point(5, 5), cv::Point(10, 10)});
         gs.save((d / "xy" / "000000.grid").string());
     }
-    NormalGridVolume v(d.string());
-    auto g = v.get_grid(0, 0);
-    REQUIRE(g != nullptr);
-    CHECK(g->numSegments() >= 1);
-    // A second lookup hits the cache.
-    auto stats_before = v.cacheStats();
-    auto g2 = v.get_grid(0, 0);
-    CHECK(g2 != nullptr);
-    auto stats_after = v.cacheStats();
-    CHECK(stats_after.gridHits > stats_before.gridHits);
+    // Nested scope: the mmap-backed store must be destroyed before the directory
+    // can be deleted. Windows refuses to remove a file that is still mapped.
+    {
+        NormalGridVolume v(d.string());
+        auto g = v.get_grid(0, 0);
+        REQUIRE(g != nullptr);
+        CHECK(g->numSegments() >= 1);
+        // A second lookup hits the cache.
+        auto stats_before = v.cacheStats();
+        auto g2 = v.get_grid(0, 0);
+        CHECK(g2 != nullptr);
+        auto stats_after = v.cacheStats();
+        CHECK(stats_after.gridHits > stats_before.gridHits);
+    }
     fs::remove_all(d);
 }

@@ -297,6 +297,11 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
     CHECK(hit->surface == lazy);
     CHECK_FALSE(lazy->isLoaded());
 
+    // Release the disk-backed surface before deleting its directory: Windows
+    // refuses to remove files that are still mapped.
+    index = SurfacePatchIndex{};
+    lazy.reset();
+
     fs::remove_all(root);
 }
 
