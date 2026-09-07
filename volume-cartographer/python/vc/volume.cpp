@@ -888,6 +888,128 @@ struct BlurStencilEntry {
     float weight;
 };
 
+nb::ndarray<float, nb::numpy, nb::c_contig> fiber3DValueTransform(
+    const FloatCoords& volume,
+    const BoolMask& validMask,
+    const std::string& normalization,
+    float contrast,
+    float brightness,
+    float gamma)
+{
+    if (volume.ndim() != 3 || validMask.ndim() != 3)
+        throw nb::value_error("volume and valid_mask must have shape (Z,Y,X)");
+    std::array<size_t, 3> shape{};
+    size_t pointCount = 1;
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        shape[dimension] = volume.shape(dimension);
+        if (shape[dimension] == 0)
+            throw nb::value_error("volume dimensions must be positive");
+        if (validMask.shape(dimension) != shape[dimension])
+            throw nb::value_error("valid_mask shape must match volume");
+        if (pointCount > std::numeric_limits<size_t>::max() / shape[dimension])
+            throw nb::value_error("volume allocation overflows size_t");
+        pointCount *= shape[dimension];
+    }
+    if (pointCount > std::numeric_limits<size_t>::max() / sizeof(float))
+        throw nb::value_error("volume allocation overflows size_t");
+    if (normalization != "none" && normalization != "raw" &&
+        normalization != "identity" && normalization != "zscore" &&
+        normalization != "minmax") {
+        throw nb::value_error("unsupported image normalization");
+    }
+    if (!std::isfinite(contrast) || contrast <= 0.0f ||
+        !std::isfinite(brightness) ||
+        !std::isfinite(gamma) || gamma <= 0.0f) {
+        throw nb::value_error(
+            "contrast and gamma must be positive and all parameters finite");
+    }
+
+    std::vector<float> output(pointCount);
+    const float* source = volume.data();
+    const bool* mask = validMask.data();
+    {
+        nb::gil_scoped_release release;
+        size_t validCount = 0;
+        double sum = 0.0;
+        float sourceMin = std::numeric_limits<float>::infinity();
+        float sourceMax = -std::numeric_limits<float>::infinity();
+        for (size_t index = 0; index < pointCount; ++index) {
+            if (!mask[index])
+                continue;
+            const float value = source[index];
+            sum += static_cast<double>(value);
+            sourceMin = std::min(sourceMin, value);
+            sourceMax = std::max(sourceMax, value);
+            ++validCount;
+        }
+        const bool anyValid = validCount != 0;
+        if (!anyValid) {
+            for (size_t index = 0; index < pointCount; ++index) {
+                const float value = source[index];
+                sum += static_cast<double>(value);
+                sourceMin = std::min(sourceMin, value);
+                sourceMax = std::max(sourceMax, value);
+            }
+            validCount = pointCount;
+        }
+
+        const float sourceMean = static_cast<float>(
+            sum / static_cast<double>(validCount));
+        float normalizeDivisor = 1.0f;
+        const bool useZscore = anyValid && normalization == "zscore";
+        const bool useMinmax = anyValid && normalization == "minmax";
+        if (useZscore) {
+            double squared = 0.0;
+            size_t varianceCount = 0;
+            for (size_t index = 0; index < pointCount; ++index) {
+                if (mask[index]) {
+                    const double delta = static_cast<double>(source[index]) -
+                                         static_cast<double>(sourceMean);
+                    squared += delta * delta;
+                    ++varianceCount;
+                }
+            }
+            const float standardDeviation = std::max(
+                1.0e-6f,
+                static_cast<float>(std::sqrt(
+                    squared / static_cast<double>(varianceCount))));
+            normalizeDivisor = standardDeviation;
+        } else if (useMinmax) {
+            normalizeDivisor = std::max(1.0e-6f, sourceMax - sourceMin);
+        }
+
+        const auto normalizeValue = [&](float value) {
+            if (useZscore)
+                return (value - sourceMean) / normalizeDivisor;
+            if (useMinmax)
+                return (value - sourceMin) / normalizeDivisor;
+            return value;
+        };
+        const float normalizedMean = normalizeValue(sourceMean);
+        const auto transformValue = [&](float value) {
+            const float normalized = normalizeValue(value);
+            return (normalized - normalizedMean) * contrast +
+                   normalizedMean + brightness;
+        };
+        const float transformedMin = transformValue(sourceMin);
+        const float transformedMax = transformValue(sourceMax);
+        const float transformedRange = std::max(
+            1.0e-6f, transformedMax - transformedMin);
+        for (size_t index = 0; index < pointCount; ++index) {
+            float value = transformValue(source[index]);
+            if (gamma != 1.0f) {
+                const float unit = std::clamp(
+                    (value - transformedMin) / transformedRange, 0.0f, 1.0f);
+                value = std::pow(unit, gamma) *
+                            (transformedMax - transformedMin) +
+                        transformedMin;
+            }
+            output[index] = value;
+        }
+    }
+    return makeNumpyArray<float>(std::move(output), shape);
+}
+
 std::array<float, 3> normalizeVector(const std::array<float, 3>& value,
                                      const char* name)
 {
@@ -975,6 +1097,75 @@ std::vector<BlurStencilEntry> makeBlurStencil(const std::array<float, 3>& axis,
     return stencil;
 }
 
+std::optional<size_t> axisAlignedDimension(const std::array<float, 3>& axis)
+{
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        const size_t a = (dimension + 1) % 3;
+        const size_t b = (dimension + 2) % 3;
+        if (std::abs(std::abs(axis[dimension]) - 1.0f) <= 1.0e-6f &&
+            std::abs(axis[a]) <= 1.0e-6f && std::abs(axis[b]) <= 1.0e-6f) {
+            return dimension;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<float> makeGaussianKernel(float sigma)
+{
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+    std::vector<float> kernel(static_cast<size_t>(2 * radius + 1));
+    float sum = 0.0f;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const float scaled = static_cast<float>(offset) / sigma;
+        const float weight = std::exp(-0.5f * scaled * scaled);
+        kernel[static_cast<size_t>(offset + radius)] = weight;
+        sum += weight;
+    }
+    for (float& weight : kernel)
+        weight /= sum;
+    return kernel;
+}
+
+void applyAxisAlignedBlur(const float* source,
+                          float* destination,
+                          const std::array<size_t, 3>& shape,
+                          size_t dimension,
+                          float sigma)
+{
+    const auto kernel = makeGaussianKernel(sigma);
+    const int radius = static_cast<int>((kernel.size() - 1) / 2);
+    const int depth = static_cast<int>(shape[0]);
+    const int height = static_cast<int>(shape[1]);
+    const int width = static_cast<int>(shape[2]);
+    const size_t plane = shape[1] * shape[2];
+    for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float value = 0.0f;
+                for (int offset = -radius; offset <= radius; ++offset) {
+                    int sourceZ = z;
+                    int sourceY = y;
+                    int sourceX = x;
+                    if (dimension == 0)
+                        sourceZ = std::clamp(z + offset, 0, depth - 1);
+                    else if (dimension == 1)
+                        sourceY = std::clamp(y + offset, 0, height - 1);
+                    else
+                        sourceX = std::clamp(x + offset, 0, width - 1);
+                    const size_t index = static_cast<size_t>(sourceZ) * plane +
+                                         static_cast<size_t>(sourceY) * shape[2] +
+                                         static_cast<size_t>(sourceX);
+                    value += source[index] *
+                             kernel[static_cast<size_t>(offset + radius)];
+                }
+                destination[static_cast<size_t>(z) * plane +
+                            static_cast<size_t>(y) * shape[2] +
+                            static_cast<size_t>(x)] = value;
+            }
+        }
+    }
+}
+
 void applyBlurStencil(const float* source,
                       float* destination,
                       const std::array<size_t, 3>& shape,
@@ -1058,8 +1249,14 @@ nb::ndarray<float, nb::numpy, nb::c_contig> anisotropicBlur3D(
         for (size_t pass = 0; pass < axes.size(); ++pass) {
             if (sigmas[pass] <= 0.0f)
                 continue;
-            const auto stencil = makeBlurStencil(axes[pass], sigmas[pass]);
-            applyBlurStencil(source, destination, shape, stencil);
+            const auto alignedDimension = axisAlignedDimension(axes[pass]);
+            if (alignedDimension) {
+                applyAxisAlignedBlur(
+                    source, destination, shape, *alignedDimension, sigmas[pass]);
+            } else {
+                const auto stencil = makeBlurStencil(axes[pass], sigmas[pass]);
+                applyBlurStencil(source, destination, shape, stencil);
+            }
             source = destination;
             destination = destination == first.data() ? second.data() : first.data();
             ++completedPasses;
@@ -1438,6 +1635,15 @@ NB_MODULE(volume, m)
           "sigma_along"_a,
           "sigma_across"_a,
           "Apply the Fiber3D three-pass oriented Gaussian blur on one CPU thread.");
+    m.def("fiber3d_value_transform",
+          &fiber3DValueTransform,
+          "volume"_a,
+          "valid_mask"_a,
+          "normalization"_a,
+          "contrast"_a,
+          "brightness"_a,
+          "gamma"_a,
+          "Apply Fiber3D normalization, contrast, brightness, and gamma in one CPU pass.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",

@@ -341,3 +341,20 @@ batch stacking averaged 66.39ms per eight samples, result-queue wait averaged
 This does not indicate an augmentation scaling failure; it establishes that
 coordinator delivery/batch construction must be addressed separately before
 the global pipeline can approach 221 samples/s.
+
+## 128-worker continuation
+
+Using exactly 32 loading and 96 augmentation workers, the committed native
+oriented-blur baseline delivered 81.54 ordered samples/s. Reusing that kernel
+for axis-aligned isotropic blur reached 85.75/s. Fusing valid-only z-score,
+contrast, brightness and gamma into one native reduction/output traversal then
+reached 131.01 ordered samples/s (123.52/s worker production); value
+augmentation fell to 322.6ms/sample. The native fused transform differs from
+the Torch sequence by at most `2.15e-6` in tested random/partial/empty/constant
+mask cases and retains the exact seeded Torch noise draw.
+
+A 56/72 split and a benchmark-only 128-worker fused pool were both slower. The
+fused pool's completed samples waited 1.02s on average to be received, proving
+that large tensor queue transport and ordered materialization now suppress
+worker utilization. The target remains unmet; bounded reusable shared tensor
+slots are the next measured optimization rather than larger queues.

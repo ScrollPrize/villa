@@ -71,3 +71,10 @@ stencil. Preserve the three sequential directional passes, Gaussian kernels,
 replicated borders, deterministic parameters, and approximate output values.
 Target 1-2 fully augmented 128-cubed samples/s per CPU core and scalable
 process-level execution. Do not use GPUs.
+
+Authorized continuation: reach at least 221 fully loaded and augmented
+128-cubed samples/s using at most 128 host worker processes/CPU threads. Measure
+the committed native-blur implementation at that exact resource budget first,
+then remove the next measured bottlenecks. Preserve deterministic sample order,
+bounded memory, augmentation probabilities and parameter generation. Record
+every benchmark iteration and any unmet target in the task log. Do not use GPUs.

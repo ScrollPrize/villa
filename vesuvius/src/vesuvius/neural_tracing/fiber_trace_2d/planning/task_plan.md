@@ -218,6 +218,70 @@ benchmark.
 Record the exact requested-level dependency and pinned-gather acceleration once
 validated.
 
+## 128-worker end-to-end throughput continuation
+
+- Establish a committed-code baseline with exactly 128 worker processes split
+  between loading and augmentation. Account separately for queue feeders,
+  coordinator CPU and any native I/O/decode/cache helper threads; report actual
+  process/thread topology and CPU use rather than calling 128 processes a
+  128-thread result. Report completed-sample production and ordered
+  batch-delivery rates separately so coordinator overhead cannot be mistaken
+  for worker capacity.
+- Use the existing operation-resolved profile to choose changes. First reduce
+  the remaining full-volume PyTorch passes in value augmentation, especially
+  isotropic blur and pointwise normalization/gamma/masking. Extract shared
+  native helpers rather than adding a benchmark-only implementation.
+- Preserve deterministic augmentation parameter draws, probabilities, sample
+  identities and ordered delivery. Approximate floating output is allowed only
+  where explicitly measured against the current Torch implementation with
+  documented scale-relative error. No GPU work is permitted.
+- Keep every native compute operation single-threaded and GIL-free. Do not
+  exceed 128 load-plus-augmentation worker processes in acceptance runs. Keep
+  the global credit bound over claimed, executing, queued and reordered work;
+  report peak process/shared-memory use and decoder-cache residency.
+- Profile coordinator receive/reorder and batch materialization from the first
+  baseline, while deferring transport changes until measurements justify them.
+  If transport remains limiting, replace
+  large object queue payloads with bounded reusable shared-memory slots and
+  descriptor messages. Slots require explicit ownership/generation validation,
+  release only after consumption, crash-safe cleanup and an independent error
+  channel; workers may not allocate unbounded shared tensors.
+- Iterate worker splits using the same warm PHercParis4 S1a workload and enough
+  samples to pass startup transients. Record exact topology, mean/p50/p95 stage
+  times, active CPU cores, queue waits and output artifact for every material
+  result, including failed or aborted runs and their reasons. Acceptance means
+  sustained fully augmented ordered delivery including batch materialization,
+  using explicit warmup/sample counts and repeated-run distributions—not worker
+  completion timestamps or summed service capacity. Stop only at 221 samples/s
+  or with the remaining measured blocker explicitly documented.
+
+### Spec update
+
+Document the selected native value operations and, if needed, the bounded slot
+transport contract. Preserve valid-only normalization, empty/constant-mask
+behavior, augmentation order, exact noise draws, final masking, deterministic
+ordering, `spawn`/`forkserver`, and supported-platform fallback behavior.
+
+### Docs updates
+
+Extend the benchmark document with the exact 128-worker baseline, each accepted
+optimization, numerical comparisons, and the final achieved/unmet throughput.
+
+### Testing
+
+Add focused reference comparisons with concrete per-operation scale-relative
+error thresholds and boundary/invalid-input tests for native kernels. Confirm
+split and synchronous loading agree for each selected backend. Synthetic tests
+for any transport change cover slow-first-sample, full queues, worker exits,
+early cancellation, slot generations and cleanup without assuming Linux fork.
+Run the focused Fiber3D loader suite, release-build the binding, and run the
+real CPU-only benchmark.
+
+### Changelog update
+
+Record each production-default optimization once validated; benchmark-only
+instrumentation may share the current acceleration entry.
+
 ## Cache-local fused coordinate generation
 
 Superseded for the current implementation by **Native fused coordinate

@@ -445,3 +445,5 @@
 - Replaced repeated CPU `grid_sample` oriented blur with a single-threaded,
   GIL-free three-pass native stencil. Full augmentation improved from 1.165s to
   0.494s/sample and the matched pipeline from 22.65 to 58.81 samples/s.
+- Extended the native path to isotropic blur and fused deterministic point
+  transforms, reaching 131.01 ordered samples/s with exactly 128 workers.

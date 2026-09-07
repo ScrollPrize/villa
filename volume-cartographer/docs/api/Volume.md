@@ -189,6 +189,11 @@ It returns a new contiguous float32 ZYX array, releases the GIL, and applies
 three sequential constant-stencil passes without constructing coordinate
 grids. The input is not modified.
 
+`vc.volume.fiber3d_value_transform(...)` fuses valid-only image normalization,
+contrast, brightness, and gamma into one single-threaded, GIL-free native
+operation. The loader retains its seeded Torch noise draw and applies blurs in
+the original order.
+
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
 mirror: metadata and fetched storage objects keep their source-relative paths
 and exact encoded bytes. Sharded arrays cache one complete outer shard and fan

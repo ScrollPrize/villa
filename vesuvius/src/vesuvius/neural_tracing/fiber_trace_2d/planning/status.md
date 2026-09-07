@@ -36,3 +36,11 @@
 - [x] Independently review the native anisotropic-blur plan; incorporate coordinate-roundtrip and full-volume validation findings.
 - [x] Implement and test the native one-thread three-pass stencil.
 - [x] Benchmark the native full augmentation pipeline and report per-core capacity.
+- [x] Commit the native oriented-blur increment (`19af65a07`).
+- [x] Plan and independently review the exact 128-worker continuation.
+- [x] Capture the exact 32-load/96-augment committed baseline.
+- [x] Fuse isotropic blur and deterministic point-value transforms natively.
+- [x] Measure fixed-split rebalance and fused-pool upper-bound probes.
+- [x] Identify bounded large-tensor transport as the next limiter.
+- [ ] Replace raw/result tensor queue copies with generation-checked bounded shared slots.
+- [ ] Sustain at least 221 fully augmented ordered samples/s at the 128-worker budget.

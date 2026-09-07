@@ -1054,6 +1054,96 @@ def _anisotropic_blur_3d(
     return out
 
 
+def _native_value_blur(
+    volume: torch.Tensor,
+    *,
+    axis_zyx: np.ndarray,
+    sigma_along: float,
+    sigma_across: float,
+    backend: str,
+) -> tuple[torch.Tensor | None, bool]:
+    """Run the shared native directional blur when selected and eligible."""
+    eligible = (
+        volume.device.type == "cpu"
+        and volume.dtype == torch.float32
+        and volume.is_contiguous()
+        and not volume.requires_grad
+    )
+    if not eligible:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires a contiguous, "
+                "gradient-free float32 CPU tensor"
+            )
+        return None, False
+    if backend not in {"auto", "native"}:
+        return None, False
+    try:
+        from vc.volume import anisotropic_blur_3d
+    except ImportError as exc:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires a rebuilt "
+                "volume-cartographer binding with anisotropic_blur_3d"
+            ) from exc
+        return None, False
+    native_result = anisotropic_blur_3d(
+        volume.detach().numpy(),
+        np.ascontiguousarray(axis_zyx, dtype=np.float32),
+        float(sigma_along),
+        float(sigma_across),
+    )
+    return torch.from_numpy(np.asarray(native_result, dtype=np.float32)), True
+
+
+def _native_value_transform(
+    volume: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    normalization: str,
+    contrast: float,
+    brightness: float,
+    gamma: float,
+    backend: str,
+) -> tuple[torch.Tensor | None, bool]:
+    eligible = (
+        volume.device.type == "cpu"
+        and volume.dtype == torch.float32
+        and volume.is_contiguous()
+        and valid_mask.device.type == "cpu"
+        and valid_mask.dtype == torch.bool
+        and valid_mask.is_contiguous()
+        and not volume.requires_grad
+    )
+    if not eligible:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires contiguous, "
+                "gradient-free float32 CPU values and a contiguous bool CPU mask"
+            )
+        return None, False
+    if backend not in {"auto", "native"}:
+        return None, False
+    try:
+        from vc.volume import fiber3d_value_transform
+    except ImportError as exc:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires a rebuilt "
+                "volume-cartographer binding with fiber3d_value_transform"
+            ) from exc
+        return None, False
+    native_result = fiber3d_value_transform(
+        volume.detach().numpy(),
+        valid_mask.detach().numpy(),
+        str(normalization),
+        float(contrast),
+        float(brightness),
+        float(gamma),
+    )
+    return torch.from_numpy(np.asarray(native_result, dtype=np.float32)), True
+
+
 def apply_value_augmentation_3d(
     config: FiberTrace3DConfig,
     volume: torch.Tensor,
@@ -1067,28 +1157,49 @@ def apply_value_augmentation_3d(
         if profile_timings_ms is not None:
             profile_timings_ms[name] = (time.perf_counter() - started) * 1000.0
 
+    backend = str(config.value_augmentation_backend)
+    contrast = float(params.contrast) if config.augment_enabled else 1.0
+    brightness = float(params.brightness) if config.augment_enabled else 0.0
+    gamma = float(params.gamma) if config.augment_enabled else 1.0
     started = time.perf_counter()
-    out = _normalize_image(volume, valid_mask, config.image_normalization)
-    record("value_normalize_ms", started)
+    native_out, value_transform_native_used = _native_value_transform(
+        volume,
+        valid_mask,
+        normalization=config.image_normalization,
+        contrast=contrast,
+        brightness=brightness,
+        gamma=gamma,
+        backend=backend,
+    )
+    if native_out is not None:
+        out = native_out
+        record("value_native_transform_ms", started)
+    else:
+        out = _normalize_image(volume, valid_mask, config.image_normalization)
+        record("value_normalize_ms", started)
+        started = time.perf_counter()
+        if contrast != 1.0:
+            center = out[valid_mask].mean() if bool(valid_mask.any()) else out.mean()
+            out = (out - center) * contrast + center
+        record("value_contrast_ms", started)
+        started = time.perf_counter()
+        if brightness != 0.0:
+            out = out + brightness
+        record("value_brightness_ms", started)
+        started = time.perf_counter()
+        if gamma != 1.0:
+            valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
+            lo = valid_values.min()
+            hi = valid_values.max()
+            scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
+            out = torch.pow(scaled, gamma) * (hi - lo) + lo
+        record("value_gamma_ms", started)
+    if profile_timings_ms is not None:
+        profile_timings_ms["value_native_transform_used"] = float(
+            value_transform_native_used
+        )
     if not config.augment_enabled:
         return out
-    started = time.perf_counter()
-    if params.contrast != 1.0:
-        center = out[valid_mask].mean() if bool(valid_mask.any()) else out.mean()
-        out = (out - center) * float(params.contrast) + center
-    record("value_contrast_ms", started)
-    started = time.perf_counter()
-    if params.brightness != 0.0:
-        out = out + float(params.brightness)
-    record("value_brightness_ms", started)
-    started = time.perf_counter()
-    if params.gamma != 1.0:
-        valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
-        lo = valid_values.min()
-        hi = valid_values.max()
-        scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-        out = torch.pow(scaled, float(params.gamma)) * (hi - lo) + lo
-    record("value_gamma_ms", started)
     started = time.perf_counter()
     if params.noise_std > 0.0:
         gen = torch.Generator(device=out.device)
@@ -1096,23 +1207,38 @@ def apply_value_augmentation_3d(
         out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
     record("value_noise_ms", started)
     started = time.perf_counter()
+    isotropic_native_used = False
     if params.blur_sigma > 0.0:
         sigma = float(params.blur_sigma)
-        radius = max(1, int(math.ceil(3.0 * sigma)))
-        coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=out.device)
-        kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
-        kernel = kernel / kernel.sum().clamp_min(1.0e-12)
-        data = out.view(1, 1, *out.shape)
-        for axis in range(3):
-            shape = [1, 1, 1, 1, 1]
-            shape[2 + axis] = int(kernel.numel())
-            weight = kernel.view(*shape)
-            padding = [0, 0, 0, 0, 0, 0]
-            padding[(2 - axis) * 2] = radius
-            padding[(2 - axis) * 2 + 1] = radius
-            data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
-        out = data[0, 0]
+        native_out, isotropic_native_used = _native_value_blur(
+            out,
+            axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            sigma_along=sigma,
+            sigma_across=sigma,
+            backend=backend,
+        )
+        if native_out is not None:
+            out = native_out
+        else:
+            radius = max(1, int(math.ceil(3.0 * sigma)))
+            coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=out.device)
+            kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+            kernel = kernel / kernel.sum().clamp_min(1.0e-12)
+            data = out.view(1, 1, *out.shape)
+            for axis in range(3):
+                shape = [1, 1, 1, 1, 1]
+                shape[2 + axis] = int(kernel.numel())
+                weight = kernel.view(*shape)
+                padding = [0, 0, 0, 0, 0, 0]
+                padding[(2 - axis) * 2] = radius
+                padding[(2 - axis) * 2 + 1] = radius
+                data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
+            out = data[0, 0]
     record("value_isotropic_blur_ms", started)
+    if profile_timings_ms is not None:
+        profile_timings_ms["value_isotropic_native_used"] = float(
+            isotropic_native_used
+        )
     anisotropic_used = (
         params.anisotropic_blur_axis_zyx is not None
         and (
@@ -1123,41 +1249,15 @@ def apply_value_augmentation_3d(
     started = time.perf_counter()
     anisotropic_native_used = False
     if anisotropic_used:
-        backend = str(config.value_augmentation_backend)
-        native_eligible = (
-            out.device.type == "cpu"
-            and out.dtype == torch.float32
-            and out.is_contiguous()
-            and not out.requires_grad
+        native_out, anisotropic_native_used = _native_value_blur(
+            out,
+            axis_zyx=params.anisotropic_blur_axis_zyx,
+            sigma_along=float(params.anisotropic_blur_sigma_along),
+            sigma_across=float(params.anisotropic_blur_sigma_across),
+            backend=backend,
         )
-        native_function = None
-        if native_eligible and backend in {"auto", "native"}:
-            try:
-                from vc.volume import anisotropic_blur_3d
-
-                native_function = anisotropic_blur_3d
-            except ImportError as exc:
-                if backend == "native":
-                    raise RuntimeError(
-                        "value_augmentation_backend='native' requires a rebuilt "
-                        "volume-cartographer binding with anisotropic_blur_3d"
-                    ) from exc
-        elif backend == "native":
-            raise RuntimeError(
-                "value_augmentation_backend='native' requires a contiguous, "
-                "gradient-free float32 CPU tensor"
-            )
-        if native_function is not None:
-            native_result = native_function(
-                out.detach().numpy(),
-                np.ascontiguousarray(
-                    params.anisotropic_blur_axis_zyx, dtype=np.float32
-                ),
-                float(params.anisotropic_blur_sigma_along),
-                float(params.anisotropic_blur_sigma_across),
-            )
-            out = torch.from_numpy(np.asarray(native_result, dtype=np.float32))
-            anisotropic_native_used = True
+        if native_out is not None:
+            out = native_out
         else:
             out = _anisotropic_blur_3d(
                 out,
@@ -1172,7 +1272,9 @@ def apply_value_augmentation_3d(
             anisotropic_native_used
         )
     started = time.perf_counter()
-    result = torch.where(valid_mask, out, torch.zeros_like(out))
+    result = out if bool(valid_mask.all()) else torch.where(
+        valid_mask, out, torch.zeros_like(out)
+    )
     record("value_final_mask_ms", started)
     return result
 

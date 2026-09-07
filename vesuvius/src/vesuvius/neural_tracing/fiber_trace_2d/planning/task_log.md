@@ -34,6 +34,29 @@
 - 2026-09-07: Release binding build and focused augmentation/pipeline test
   selections passed (11 tests in the final selection; an earlier 12-test
   selection also passed).
-  passed. A full `test_fiber_trace_3d.py` run progressed beyond its initial
+- 2026-09-07: Committed that native augmentation increment as `19af65a07`.
+  The exact 128-worker 32-load/96-augment baseline produced 78.66 samples/s,
+  81.54 ordered samples/s and used 76.5 aggregate worker cores
+  (`sample_pipeline_20260907_152553_942459`).
+- 2026-09-07: Reusing the native directional kernel for isotropic blur reached
+  89.61 produced / 85.75 ordered samples/s and reduced that operation from
+  173.1 to 86.7ms/sample (`sample_pipeline_20260907_152959_126973`).
+- 2026-09-07: Fusing valid-only normalization, contrast, brightness and gamma
+  reached 123.52 produced / 131.01 ordered samples/s; augmentation fell to
+  322.6ms/sample (`sample_pipeline_20260907_153756_733494`).
+- 2026-09-07: A 56-load/72-augment rebalance regressed to 109.31 produced /
+  108.40 ordered samples/s with reorder high-water 188
+  (`sample_pipeline_20260907_153849_887277`).
+- 2026-09-07: A benchmark-only fused 128-worker probe reached 106.45 produced /
+  107.94 ordered samples/s and showed 1.02s/sample output receive lag
+  (`sample_pipeline_20260907_154220_816263`), confirming tensor transport as a
+  limiter. A following run aborted because `_LoadFactory` accidentally lost its
+  return during this probe; it was restored before further measurement.
+- 2026-09-07: Axis-specialized blur reduced isotropic blur to 50.2ms/sample.
+  The matched run reached 109.52 produced / 99.73 ordered samples/s amid high
+  transport/host variability (`sample_pipeline_20260907_154721_325067`).
+- 2026-09-07: Seventeen focused native/reference/backend tests pass after the
+  fused transform and axis-aligned blur work. A full `test_fiber_trace_3d.py`
+  run from the previous increment progressed beyond its initial
   test groups without a reported failure but then stopped producing output and
   was interrupted; it is not counted as a passing full-suite validation.

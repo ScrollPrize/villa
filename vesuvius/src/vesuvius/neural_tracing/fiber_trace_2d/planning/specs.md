@@ -2845,3 +2845,9 @@
   error no more than `3e-6 * max(1,max_abs_input)`. Shape, float32 dtype,
   contiguity, determinism, masking, parameter draws and other value transforms
   remain unchanged.
+- The same backend may use the directional primitive for axis-aligned
+  isotropic blur and a fused native normalization/contrast/brightness/gamma
+  transform. Statistics remain valid-mask-only; empty and constant masks retain
+  reference behavior. Seeded noise remains in Torch. Native fused-transform
+  error is bounded by `1e-6 * max(1,max_abs_reference)` maximum and
+  `1e-7 * max(1,max_abs_reference)` mean on reference fixtures.

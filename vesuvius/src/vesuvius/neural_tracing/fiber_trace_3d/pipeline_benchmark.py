@@ -71,6 +71,41 @@ class _LoadFactory:
 
 
 @dataclass(frozen=True)
+class _FusedLoadOperation:
+    loader: FiberTrace3DLoader
+    sample_index_limit: int | None
+    sample_mode: str
+
+    def __call__(self, index: int) -> FiberTrace3DSample:
+        return self.loader.load_sample(
+            index,
+            sample_index_limit=self.sample_index_limit,
+            sample_mode=self.sample_mode,
+            device="cpu",
+            profile=True,
+        )
+
+
+@dataclass(frozen=True)
+class _FusedLoadFactory:
+    config_path: str
+    sample_index_limit: int | None
+    sample_mode: str
+
+    def __call__(self) -> _FusedLoadOperation:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"skipping NML fiber component with branch node:.*",
+            category=RuntimeWarning,
+        )
+        return _FusedLoadOperation(
+            FiberTrace3DLoader(load_config(self.config_path)),
+            self.sample_index_limit,
+            self.sample_mode,
+        )
+
+
+@dataclass(frozen=True)
 class _AugmentOperation:
     config: Any
 
@@ -289,6 +324,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stop after raw sample loading; launch no augmentation workers",
     )
+    parser.add_argument(
+        "--fused",
+        action="store_true",
+        help="benchmark complete load+augmentation in one free-worker pool",
+    )
     parser.add_argument("--raw-queue-capacity", type=int, default=64)
     parser.add_argument("--result-queue-capacity", type=int, default=64)
     parser.add_argument("--max-in-flight", type=int, default=128)
@@ -350,6 +390,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if bool(args.raw_only) and bool(args.fused):
+        raise ValueError("--raw-only and --fused are mutually exclusive")
     for name in (
         "samples",
         "load_workers",
@@ -359,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be > 0")
-    if not bool(args.raw_only) and int(args.augment_workers) <= 0:
+    if not bool(args.raw_only) and not bool(args.fused) and int(args.augment_workers) <= 0:
         raise ValueError("--augment-workers must be > 0 unless --raw-only is used")
     if int(args.warmup_samples) < 0 or int(args.verify_samples) < 0:
         raise ValueError("warmup/verify sample counts must be >= 0")
@@ -430,13 +472,24 @@ def main(argv: list[str] | None = None) -> int:
     total_items = int(args.warmup_samples) + int(args.samples)
     sample_limit = None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
     startup_started = time.perf_counter()
+    stage1_factory = (
+        _FusedLoadFactory(str(config_path), sample_limit, str(args.sample_mode))
+        if bool(args.fused)
+        else _LoadFactory(str(config_path), sample_limit, str(args.sample_mode))
+    )
     pipeline = OrderedTwoStageSamplePipeline(
-        stage1_factory=_LoadFactory(str(config_path), sample_limit, str(args.sample_mode)),
-        stage2_factory=None if bool(args.raw_only) else _AugmentFactory(str(config_path)),
+        stage1_factory=stage1_factory,
+        stage2_factory=(
+            None
+            if bool(args.raw_only) or bool(args.fused)
+            else _AugmentFactory(str(config_path))
+        ),
         start_index=int(args.start_index),
         item_count=total_items,
         stage1_workers=int(args.load_workers),
-        stage2_workers=0 if bool(args.raw_only) else int(args.augment_workers),
+        stage2_workers=(
+            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
+        ),
         raw_queue_capacity=int(args.raw_queue_capacity),
         result_queue_capacity=int(args.result_queue_capacity),
         max_in_flight=int(args.max_in_flight),
@@ -448,8 +501,9 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "sample_pipeline: "
         f"load_workers={args.load_workers} "
-        f"augment_workers={0 if args.raw_only else args.augment_workers} "
+        f"augment_workers={0 if args.raw_only or args.fused else args.augment_workers} "
         f"raw_only={bool(args.raw_only)} "
+        f"fused={bool(args.fused)} "
         f"raw_queue={args.raw_queue_capacity} result_queue={args.result_queue_capacity} "
         f"in_flight={args.max_in_flight} batch={batch_size} "
         f"warmup={args.warmup_samples} measure={args.samples} native_threads=1",
@@ -569,18 +623,25 @@ def main(argv: list[str] | None = None) -> int:
         "topology": (
             "one-host-global-cpu-raw-loader"
             if bool(args.raw_only)
-            else "one-host-global-cpu-pipeline"
+            else (
+                "one-host-global-cpu-fused-pipeline"
+                if bool(args.fused)
+                else "one-host-global-cpu-pipeline"
+            )
         ),
         "raw_only": bool(args.raw_only),
+        "fused": bool(args.fused),
         "cache_state_label": str(args.cache_state),
         "start_index": int(args.start_index),
         "warmup_samples": int(args.warmup_samples),
         "measured_samples": int(args.samples),
         "batch_size": batch_size,
         "load_workers": int(args.load_workers),
-        "augment_workers": 0 if bool(args.raw_only) else int(args.augment_workers),
+        "augment_workers": (
+            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
+        ),
         "worker_processes": int(args.load_workers) + (
-            0 if bool(args.raw_only) else int(args.augment_workers)
+            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
         ),
         "raw_queue_capacity": int(args.raw_queue_capacity),
         "result_queue_capacity": int(args.result_queue_capacity),
@@ -618,19 +679,19 @@ def main(argv: list[str] | None = None) -> int:
         "stage1_service_ms": distribution(item["stage1_service_ms"] for item in measured),
         "stage1_cpu_ms": distribution(item["stage1_cpu_ms"] for item in measured),
         "raw_queue_ms": None
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else distribution(item["raw_queue_ms"] for item in measured),
         "output_queue_ms": distribution(item["raw_queue_ms"] for item in measured)
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else None,
         "stage2_service_ms": None
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else distribution(item["stage2_service_ms"] for item in measured),
         "stage2_cpu_ms": None
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else distribution(item["stage2_cpu_ms"] for item in measured),
         "result_queue_ms": None
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else distribution(item["result_queue_ms"] for item in measured),
         "reorder_wait_ms": distribution(item["reorder_wait_ms"] for item in measured),
         "batch_delivery_wait_ms": distribution(batch_wait_ms),
@@ -642,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "stage1_workers_used": len({item["stage1_worker"] for item in measured}),
         "stage2_workers_used": 0
-        if bool(args.raw_only)
+        if bool(args.raw_only) or bool(args.fused)
         else len({item["stage2_worker"] for item in measured}),
         "summed_worker_cpu_cores": (
             sum(item["stage1_cpu_ms"] + item["stage2_cpu_ms"] for item in measured)
