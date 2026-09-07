@@ -301,7 +301,7 @@ If you are new to the project, this is a great place to start.
 
 **Best Submission of the Month: <span className="vc-money">\$20,000</span>, guaranteed every month, to the single best submission — selected by the Vesuvius Challenge team.**
 
-Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span> or <span className="vc-money">\$500</span>.
+Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span>, <span className="vc-money">\$500</span> or <span className="vc-money">\$250</span>.
 
 We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
