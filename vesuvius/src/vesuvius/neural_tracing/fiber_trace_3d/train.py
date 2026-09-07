@@ -22,6 +22,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
+from vesuvius.neural_tracing.fiber_trace_3d.training_profile import (
+    TrainingProfile, compile_training_model, loader_profile_enabled,
+)
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
@@ -493,6 +496,9 @@ def _distributed_should_use_sync_batchnorm(config: _DistributedConfig) -> bool:
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    # torch.compile wraps the DDP module; callers still need its raw semantics.
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
     if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)):
         return model.module
     return model
@@ -2155,6 +2161,9 @@ def run_training(
     raw_config = _load_raw_config(config_path)
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
+    profile_loader = loader_profile_enabled(training)
+    if profile_loader and _loader_worker_count(raw_config) <= 0:
+        raise ValueError("profile_loader requires loader_workers > 0")
     (
         test_hang_diagnostics_config,
         test_hang_diagnostics_cli,
@@ -2188,6 +2197,8 @@ def run_training(
         else None
     )
 
+    if "initialization_seed" in training:
+        torch.manual_seed(int(training["initialization_seed"]))
     raw_model = build_fiber_trace_3d_model(raw_config)
     if _distributed_should_use_sync_batchnorm(distributed):
         raw_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(raw_model)
@@ -2215,7 +2226,10 @@ def run_training(
             map_location=device,
         )
 
-    train_model = _wrap_distributed_model(raw_model, distributed)
+    train_model = compile_training_model(
+        _wrap_distributed_model(raw_model, distributed),
+        str(training.get("compile_mode", "off")),
+    )
     run_datestr = str(
         training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")
     )
@@ -2594,12 +2608,15 @@ def run_training(
         batch_count=remaining_steps,
         sample_index_limit=sample_index_limit,
         sample_mode="random",
+        profile=profile_loader,
     )
     train_iterator = iter(train_dataloader) if train_dataloader is not None else None
+    profile = TrainingProfile(training, run_dir, distributed.rank, device)
     try:
         step = int(start_step)
         while max_steps is None or step < max_steps:
             step += 1
+            profile.begin(step)
             sample_index = _distributed_training_sample_index(
                 step,
                 batch_size=loader.config.batch_size,
@@ -2615,7 +2632,7 @@ def run_training(
             )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
-            with _autocast_context(mixed_precision):
+            with profile.stage("forward_loss"), _autocast_context(mixed_precision):
                 loss_tensors = _forward_loss_tensors(
                     train_model,
                     batch,
@@ -2626,14 +2643,19 @@ def run_training(
                 )
             if _grad_scaler_enabled(grad_scaler):
                 assert grad_scaler is not None
-                grad_scaler.scale(loss_tensors["total"]).backward()
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+                with profile.stage("backward"):
+                    grad_scaler.scale(loss_tensors["total"]).backward()
+                with profile.stage("optimizer"):
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
             else:
-                loss_tensors["total"].backward()
-                optimizer.step()
-            reduced_loss_tensors = _distributed_mean_loss_tensors(loss_tensors, distributed)
-            losses = _losses_to_float_dict(reduced_loss_tensors)
+                with profile.stage("backward"):
+                    loss_tensors["total"].backward()
+                with profile.stage("optimizer"):
+                    optimizer.step()
+            with profile.stage("scalar_reduce_sync"):
+                reduced_loss_tensors = _distributed_mean_loss_tensors(loss_tensors, distributed)
+                losses = _losses_to_float_dict(reduced_loss_tensors)
             step_ms = (time.perf_counter() - fw_start) * 1000.0
 
             if distributed.is_main and (step <= 100 or step % scalar_interval == 0):
@@ -2731,18 +2753,25 @@ def run_training(
                         grad_scaler=grad_scaler,
                     )
                 _distributed_barrier(distributed)
+            profile.end(load_ms=load_ms, wait_ms=wait_ms, to_device_ms=to_device_ms,
+                        target_ms=target_ms, fw_bw_step_ms=step_ms,
+                        loss_total=losses["total"],
+                        loader_profile=batch.profile_timings_ms if profile_loader else None)
     finally:
-        if test_dataloader is not None:
-            test_dataloader = None
-        if train_dataloader is not None:
-            train_iterator = None
-            train_dataloader = None
-        if writer is not None:
-            writer.flush()
-            writer.close()
-        if diagnostics is not None:
-            diagnostics.close()
-        _distributed_cleanup(distributed)
+        try:
+            profile.close()
+        finally:
+            if test_dataloader is not None:
+                test_dataloader = None
+            if train_dataloader is not None:
+                train_iterator = None
+                train_dataloader = None
+            if writer is not None:
+                writer.flush()
+                writer.close()
+            if diagnostics is not None:
+                diagnostics.close()
+            _distributed_cleanup(distributed)
 
 
 def _image_to_u8(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -4021,6 +4050,9 @@ class _FiberTrace3DBatchDataset(Dataset):
             timings["worker_item_end_ns"] = float(time.time_ns())
             timings["worker_item_cpu_ms"] = (time.process_time() - item_cpu_start) * 1000.0
             timings["worker_item_index"] = float(index)
+            worker_info = torch.utils.data.get_worker_info()
+            timings["worker_id"] = float(worker_info.id if worker_info else -1)
+            timings["worker_sample_index"] = float(sample_index)
             batch = replace(batch, profile_timings_ms=timings)
         if worker_device.type == "cuda":
             torch.cuda.synchronize(worker_device)
@@ -4149,7 +4181,14 @@ def _next_training_batch(
         target_ms = (time.perf_counter() - target_start) * 1000.0
         return batch, wait_ms + target_ms, wait_ms, 0.0, target_ms
 
+    wait_start_ns = time.time_ns()
     batch = next(iterator)
+    if batch.profile_timings_ms is not None:
+        batch = replace(batch, profile_timings_ms={
+            **batch.profile_timings_ms,
+            "coordinator_wait_start_ns": float(wait_start_ns),
+            "coordinator_received_ns": float(time.time_ns()),
+        })
     wait_ms = (time.perf_counter() - wait_start) * 1000.0
     to_device_start = time.perf_counter()
     batch = batch.to(device)

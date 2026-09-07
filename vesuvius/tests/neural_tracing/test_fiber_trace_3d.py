@@ -702,6 +702,35 @@ def _loader(*, augment_enabled: bool = False) -> FiberTrace3DLoader:
     return FiberTrace3DLoader(config)
 
 
+def test_split_raw_and_value_augmentation_matches_composed_sample() -> None:
+    loader = _loader(augment_enabled=True)
+    combined = loader.load_sample(5, profile=False)
+    staged = loader.augment_raw_sample(loader.load_raw_sample(5, profile=False), profile=False)
+
+    for name in (
+        "stream_index",
+        "data_index",
+        "record_index",
+        "fiber_path",
+        "control_point_index",
+        "target_mode",
+    ):
+        assert getattr(staged, name) == getattr(combined, name)
+    for name in (
+        "volume",
+        "valid_mask",
+        "cp_local_zyx",
+        "crop_origin_zyx",
+        "target_segment_starts_zyx",
+        "target_segment_ends_zyx",
+        "target_segment_bbox_lo_zyx",
+        "target_segment_bbox_hi_zyx",
+        "target_tangent_zyx",
+    ):
+        assert torch.equal(getattr(staged, name), getattr(combined, name)), name
+    assert staged.profile_timings_ms is None
+
+
 def _native_trace_record(
     volume: np.ndarray,
     *,
@@ -837,6 +866,73 @@ def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
 
     assert config.volume_cache_memory_mib == 128.0
     assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
+
+
+def test_3d_config_preserves_volume_io_decode_and_sample_threads() -> None:
+    config = config_from_mapping(
+        {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "volume_io_threads": 2,
+            "volume_decode_threads": 3,
+            "volume_sample_threads": 1,
+            "_array_records": [
+                {
+                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+    )
+
+    assert config.volume_io_threads == 2
+    assert config.volume_decode_threads == 3
+    assert config.volume_sample_threads == 1
+
+
+def test_pipeline_stage_profile_rates_use_service_time_and_native_units() -> None:
+    from vesuvius.neural_tracing.fiber_trace_3d.pipeline_benchmark import (
+        _stage_profile_rates,
+    )
+
+    measured = [
+        {
+            "sample_coordinate_points": 2_097_152.0,
+            "sample_valid_coordinate_points": 1_000_000.0,
+            "sample_geometry_ms": 500.0,
+            "sample_vc_sample_seconds": 0.25,
+            "sample_vc_decode_seconds": 0.125,
+            "sample_vc_decoded_chunks": 4.0,
+            "sample_vc_decode_input_bytes": float(2 * 1024 * 1024),
+            "sample_vc_decoded_chunk_bytes": float(4 * 1024 * 1024),
+        }
+    ]
+    rates = _stage_profile_rates(
+        measured,
+        measured_samples=1,
+        production_seconds=0.25,
+    )
+
+    assert rates["coordinate_generation"]["mega_points_per_service_second"] == pytest.approx(
+        4.194304
+    )
+    assert rates["coordinate_generation"]["equivalent_samples_per_service_second"] == 2.0
+    assert rates["coordinate_sampling"]["mega_points_per_service_second"] == 4.0
+    assert rates["chunk_decoding"]["chunks_per_service_second"] == 32.0
+    assert rates["chunk_decoding"]["input_mib_per_service_second"] == 16.0
+    assert rates["chunk_decoding"]["output_mib_per_service_second"] == 32.0
+    assert rates["chunk_decoding"]["equivalent_samples_per_service_second"] == 8.0
+
+
+def test_pipeline_stage_profile_rates_report_missing_decode_as_na() -> None:
+    from vesuvius.neural_tracing.fiber_trace_3d.pipeline_benchmark import (
+        _stage_profile_rates,
+    )
+
+    rates = _stage_profile_rates([], measured_samples=0, production_seconds=1.0)
+    assert rates["chunk_decoding"]["chunks_per_service_second"] is None
+    assert rates["chunk_decoding"]["equivalent_samples_per_service_second"] is None
 
 
 def test_3d_dataset_manifest_is_optional_at_scale_zero() -> None:
@@ -1210,6 +1306,30 @@ def test_3d_batch_dataset_strides_batch_indices_for_distributed_ranks() -> None:
 
     assert torch.equal(first.stream_indices, torch.tensor([2, 3], dtype=torch.long))
     assert torch.equal(second.stream_indices, torch.tensor([8, 9], dtype=torch.long))
+
+
+def test_worker_profiling_preserves_batch_and_receive_metadata(monkeypatch) -> None:
+    from vesuvius.neural_tracing.fiber_trace_3d.train import _next_training_batch
+    loader = _loader(augment_enabled=True)
+    options = dict(start_batch_index=1, batch_index_stride=2, batch_count=1,
+                   sample_mode="random", worker_device="cpu")
+    plain = _FiberTrace3DBatchDataset(loader.config, **options)
+    profiled = _FiberTrace3DBatchDataset(loader.config, profile=True, **options)
+    monkeypatch.setattr(plain, "_get_loader", lambda: loader)
+    monkeypatch.setattr(profiled, "_get_loader", lambda: loader)
+    expected, actual = plain[0], profiled[0]
+    assert expected.profile_timings_ms is None
+    assert torch.equal(expected.volume, actual.volume)
+    assert torch.equal(expected.stream_indices, actual.stream_indices)
+    assert torch.equal(expected.target_segment_starts_zyx, actual.target_segment_starts_zyx)
+    assert actual.profile_timings_ms["worker_id"] == -1
+    assert actual.profile_timings_ms["worker_sample_index"] == int(actual.stream_indices[0])
+    result, *_ = _next_training_batch(iterator=iter([actual]), loader=loader,
+                                      sample_index=0, sample_mode="random", device=torch.device("cpu"))
+    timings = result.profile_timings_ms
+    assert timings["coordinator_received_ns"] >= timings["coordinator_wait_start_ns"]
+    assert timings["coordinator_received_ns"] >= timings["worker_item_end_ns"]
+    assert "value_augmentation_ms" in timings
 
 
 def test_3d_batch_dataset_applies_non_aligned_sample_offset_before_stride() -> None:
@@ -2530,6 +2650,50 @@ def test_vc3d_coordinate_sampler_direct_block_read_uses_binding() -> None:
     assert result.valid_mask.shape == (4, 5, 6)
     assert result.valid_mask.all()
     assert result.stats["sample_block_zyx"] == 1
+
+
+def test_vc3d_coordinate_sampler_forwards_worker_limit_and_stats() -> None:
+    class _FakeVolume:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def sample_coords(self, *args: object):
+            self.calls.append(args)
+            coords = np.asarray(args[0])
+            shape = coords.shape[:2]
+            return (
+                np.zeros((*shape, 1), dtype=np.uint8),
+                np.ones((*shape, 1), dtype=np.uint8),
+                {
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "sample_workers": 1,
+                    "sample_seconds": 0.25,
+                    "decoded_chunks": 2,
+                },
+            )
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+    sampler.sample_threads = 1
+    sampler.chunk_locality_fast_path = True
+    sampler.collect_locality_stats = True
+
+    coords = np.zeros((4, 5, 3), dtype=np.float32)
+    valid = np.ones((4, 5), dtype=bool)
+    result = sampler.sample_coords(coords, valid)
+
+    assert fake.calls[0][6] == 1
+    assert fake.calls[0][7] is True
+    assert fake.calls[0][8] is True
+    assert result.stats["sample_workers"] == 1
+    assert result.stats["sample_seconds"] == 0.25
+    assert result.stats["decoded_chunks"] == 2
+    assert result.stats["requested_level_only"] is True
 
 
 def test_numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds() -> None:

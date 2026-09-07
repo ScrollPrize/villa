@@ -1,3 +1,11 @@
+# 2026-09-07
+
+- Added opt-in normal Fiber training profiling and explicit torch.compile
+  experiments, retaining eager defaults and raw checkpoint/evaluation models.
+
+- Added read-only Fiber training event analysis and documented the S1a 8x8
+  historical baseline for the one-hour held-out-loss target.
+
 # 2026-08-07
 
 - Simplified manager S3 staging to marker-only resumable rclone transfer and
@@ -408,3 +416,19 @@
   and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
 - Made live progress cadence independent of TTY detection and report unique
   remote-missing chunks per listed Z plane.
+
+## 2026-09-07 — Fiber3D per-sample pipeline benchmark
+
+- Added a reusable bounded two-process-stage ordered sample pipeline, split the
+  3D loader at its existing value-augmentation boundary, and measured the real
+  warm S1a path without changing normal training.
+## 2026-09-07
+
+- Added explicit VC3D coordinate-sampler concurrency and stage-resolved Fiber3D
+  loader benchmark metrics without changing normal sampling defaults.
+
+## 2026-09-07 — Requested-level sampling locality
+
+- Reused adjacent dependency footprints and pinned chunk pointers in the exact
+  VC3D scalar path, reducing isolated dependency/interpolation service from
+  617ms to 98ms per S1a training sample without changing sampled bytes.

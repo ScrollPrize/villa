@@ -1,13 +1,26 @@
-# Status: rolling live OME-Zarr input cache for shared 3D inference
-
-- [x] Capture the approved live-cache behavior in `task.md`.
-- [x] Inspect current bulk download, automatic download, shared tile scheduling,
-  TensorStore read-ahead, manager launch, and source-support behavior.
-- [x] Write implementation, testing, spec, docs, and changelog plan.
-- [x] Obtain and incorporate independent review against task/spec/plan.
-- [x] Extract/reuse shared selected-level download/cache primitives.
-- [x] Implement bounded live tile materialization and authoritative source support.
-- [x] Implement conservative whole-Z-plane eviction and accounting.
-- [x] Integrate Fiber, Lasagna, manager, progress, and provenance.
-- [x] Add regression tests and update specs/docs/changelog/task log.
-- [x] Run focused validation and report limitations/performance evidence.
+# Status
+- [x] Read workflow and relevant 3D specs; locate reference data.
+- [x] Write task and measurement plan.
+- [x] Independent plan review; incorporate provenance and elapsed-origin caveats.
+- [x] Implement and test event analysis (3 tests passed).
+- [x] Record historical measurements and saved reference configuration.
+- [ ] Collect uncontended current eight-GPU training profile.
+- [x] Implement optional two-GPU normal-training profiling and compile controls.
+- [x] Run eager two-GPU baseline, export both traces and verify tests.
+- [x] Complete both compile comparisons and report timings/numerical drift.
+- [x] Profile normal loader workers on two GPUs; verify unchanged batches and report stage/ordering costs.
+- [ ] Split value-augmentation hotspot into substage measurements before tuning.
+- [x] Plan central bounded per-sample load/augmentation benchmark pipeline.
+- [x] Independently review the two-stage pipeline plan; incorporate bounded-credit and liveness findings.
+- [x] Implement and test the central pipeline and split loader boundary.
+- [x] Run and report the real S1a queue benchmark.
+- [x] Plan explicit single-thread coordinate sampling and stage-resolved metrics.
+- [x] Independently review the single-thread stage-profile plan; incorporate metric-scope and cold-observation findings.
+- [x] Implement and test sampler control and decoder/sampler instrumentation.
+- [x] Run and report controlled warm and fresh-process S1a benchmarks.
+- [x] Plan requested-level dependency and pinned-sampling optimization.
+- [x] Independently review the dependency/pinned-sampling plan; incorporate matched instrumentation and independent-reference checks.
+- [x] Capture isolated dependency/sampling baseline diagnostics.
+- [x] Implement shared footprint reuse and pinned single-chunk fast paths.
+- [x] Verify exact outputs and run the CPU-only S1a before/after benchmark.
+- [ ] Evaluate optimizations against quality per hour.

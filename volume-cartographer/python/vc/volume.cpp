@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -704,6 +705,20 @@ nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats)
     out["missing_chunks"] = stats.missingChunks;
     out["fallback_levels"] = stats.fallbackLevels;
     out["requested_level_only"] = stats.requestedLevelOnly;
+    out["sample_workers"] = stats.sampleWorkers;
+    out["dependency_seconds"] = stats.dependencySeconds;
+    out["chunk_resolve_seconds"] = stats.chunkResolveSeconds;
+    out["sample_seconds"] = stats.sampleSeconds;
+    out["dependency_points"] = stats.dependencyPoints;
+    out["dependency_footprint_reuses"] = stats.dependencyFootprintReuses;
+    out["dependency_footprint_changes"] = stats.dependencyFootprintChanges;
+    out["dependency_key_lookups"] = stats.dependencyKeyLookups;
+    out["dependency_hash_probes"] = stats.dependencyHashProbes;
+    out["dependency_chunk_run_reuses"] = stats.dependencyChunkRunReuses;
+    out["sample_direct_gather_points"] = stats.sampleDirectGatherPoints;
+    out["sample_boundary_points"] = stats.sampleBoundaryPoints;
+    out["sample_pinned_map_lookups"] = stats.samplePinnedMapLookups;
+    out["sample_chunk_run_reuses"] = stats.sampleChunkRunReuses;
     return out;
 }
 
@@ -713,16 +728,29 @@ nb::tuple sampleCoords(Volume& volume,
                        int level,
                        const std::string& sampling,
                        int tileSize,
-                       bool blocking)
+                       bool blocking,
+                       int samplerThreads,
+                       bool chunkLocalityFastPath,
+                       bool collectLocalityStats)
 {
+    if (samplerThreads < 0)
+        throw nb::value_error("sampler_threads must be non-negative");
     auto coords = coordsArrayToMat(coordsXyz);
     auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
     cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
     vc::render::ChunkedPlaneSampler::Stats stats;
+    auto* chunkCache = dynamic_cast<vc::render::ChunkCache*>(volume.chunkedCache());
+    std::optional<vc::render::ChunkCache::Stats> cacheBefore;
+    std::optional<vc::render::ChunkCache::Stats> cacheAfter;
     {
         nb::gil_scoped_release release;
-        const vc::render::ChunkedPlaneSampler::Options options(
+        vc::render::ChunkedPlaneSampler::Options options(
             parseSampling(sampling), tileSize);
+        options.parallelThreads = samplerThreads;
+        options.chunkLocalityFastPath = chunkLocalityFastPath;
+        options.collectLocalityStats = collectLocalityStats;
+        if (chunkCache)
+            cacheBefore = chunkCache->stats();
         if (blocking) {
             stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
                 *volume.chunkedCache(),
@@ -740,6 +768,8 @@ nb::tuple sampleCoords(Volume& volume,
                 coverage,
                 options);
         }
+        if (chunkCache)
+            cacheAfter = chunkCache->stats();
     }
 
     std::vector<uint8_t> image(static_cast<size_t>(coords.rows) * static_cast<size_t>(coords.cols));
@@ -761,6 +791,15 @@ nb::tuple sampleCoords(Volume& volume,
         static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
     nb::dict statsDict = statsToDict(stats);
     statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
+    statsDict["sampler_threads"] = samplerThreads;
+    if (cacheBefore && cacheAfter) {
+        statsDict["decode_attempts"] = cacheAfter->decodeAttempts - cacheBefore->decodeAttempts;
+        statsDict["decoded_chunks"] = cacheAfter->decodedChunks - cacheBefore->decodedChunks;
+        statsDict["decode_input_bytes"] = cacheAfter->decodeInputBytes - cacheBefore->decodeInputBytes;
+        statsDict["decoded_chunk_bytes"] = cacheAfter->decodedChunkBytes - cacheBefore->decodedChunkBytes;
+        statsDict["decode_seconds"] = static_cast<double>(
+            cacheAfter->decodeNanoseconds - cacheBefore->decodeNanoseconds) / 1.0e9;
+    }
     return nb::make_tuple(imageArr, validArr, statsDict);
 }
 
@@ -948,6 +987,15 @@ NB_MODULE(volume, m)
           },
           "count"_a,
           "Set fixed process-wide regular chunk source-read concurrency.");
+    m.def("set_chunk_cache_decode_threads",
+          [](std::size_t count) {
+              if (count == 0)
+                  throw std::invalid_argument("count must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureDecodeConcurrency(count);
+          },
+          "count"_a,
+          "Set fixed process-wide regular chunk decode concurrency.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",
@@ -1015,7 +1063,10 @@ NB_MODULE(volume, m)
             "level"_a = 0,
             "sampling"_a = "trilinear",
             "tile_size"_a = 32,
-            "blocking"_a = true)
+            "blocking"_a = true,
+            "sampler_threads"_a = 0,
+            "chunk_locality_fast_path"_a = true,
+            "collect_locality_stats"_a = false)
         .def("sample_planes", &samplePlanes,
             "origins_xyz"_a,
             "x_steps_xyz"_a,

@@ -1,0 +1,574 @@
+"""Benchmark the bounded per-sample load -> value-augmentation pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import sys
+import time
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from vesuvius.neural_tracing.fiber_trace_3d.analyze_training import distribution
+from vesuvius.neural_tracing.fiber_trace_3d.loader import (
+    FiberTrace3DLoader,
+    FiberTrace3DRawSample,
+    FiberTrace3DSample,
+    augment_fiber_trace_3d_raw_sample,
+    load_config,
+)
+from vesuvius.neural_tracing.ordered_sample_pipeline import (
+    OrderedPipelineResult,
+    OrderedTwoStageSamplePipeline,
+)
+import vesuvius.neural_tracing.ordered_sample_pipeline as ordered_pipeline_module
+import vesuvius.neural_tracing.fiber_trace_3d.loader as loader_module
+
+
+@dataclass(frozen=True)
+class _LoadOperation:
+    loader: FiberTrace3DLoader
+    sample_index_limit: int | None
+    sample_mode: str
+
+    def __call__(self, index: int) -> FiberTrace3DRawSample:
+        return self.loader.load_raw_sample(
+            index,
+            sample_index_limit=self.sample_index_limit,
+            sample_mode=self.sample_mode,
+            device="cpu",
+            profile=True,
+        )
+
+
+@dataclass(frozen=True)
+class _LoadFactory:
+    config_path: str
+    sample_index_limit: int | None
+    sample_mode: str
+
+    def __call__(self) -> _LoadOperation:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"skipping NML fiber component with branch node:.*",
+            category=RuntimeWarning,
+        )
+        return _LoadOperation(
+            FiberTrace3DLoader(load_config(self.config_path)),
+            self.sample_index_limit,
+            self.sample_mode,
+        )
+
+
+@dataclass(frozen=True)
+class _AugmentOperation:
+    config: Any
+
+    def __call__(self, raw: FiberTrace3DRawSample) -> FiberTrace3DSample:
+        return augment_fiber_trace_3d_raw_sample(self.config, raw, profile=True)
+
+
+@dataclass(frozen=True)
+class _AugmentFactory:
+    config_path: str
+
+    def __call__(self) -> _AugmentOperation:
+        return _AugmentOperation(load_config(self.config_path))
+
+
+def _assert_samples_equal(actual: FiberTrace3DSample, expected: FiberTrace3DSample) -> None:
+    scalar_fields = (
+        "stream_index",
+        "data_index",
+        "record_index",
+        "fiber_path",
+        "control_point_index",
+        "target_mode",
+    )
+    tensor_fields = (
+        "volume",
+        "valid_mask",
+        "cp_local_zyx",
+        "crop_origin_zyx",
+        "target_segment_starts_zyx",
+        "target_segment_ends_zyx",
+        "target_segment_bbox_lo_zyx",
+        "target_segment_bbox_hi_zyx",
+        "target_tangent_zyx",
+    )
+    for name in scalar_fields:
+        if getattr(actual, name) != getattr(expected, name):
+            raise AssertionError(f"pipeline sample field differs: {name}")
+    for name in tensor_fields:
+        if not torch.equal(getattr(actual, name), getattr(expected, name)):
+            raise AssertionError(f"pipeline sample tensor differs: {name}")
+
+
+def _resolved_config(reference: Path) -> tuple[dict[str, Any], str]:
+    payload = json.loads(reference.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError("config/reference JSON root must be an object")
+    if "datasets" in payload:
+        return payload, "direct-config"
+    nested = payload.get("config")
+    if isinstance(nested, dict) and "datasets" in nested:
+        return dict(nested), "saved-reference-config"
+    raise ValueError("JSON must be a FiberTrace3D config or contain a config object")
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _set_parent_thread_limits() -> None:
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def _stage_profile_rates(
+    measured: list[dict[str, float]],
+    *,
+    measured_samples: int,
+    production_seconds: float,
+) -> dict[str, Any]:
+    def total(key: str) -> float:
+        return sum(float(item.get(key, 0.0)) for item in measured)
+
+    def rate(numerator: float, seconds: float) -> float | None:
+        return None if seconds <= 0.0 else numerator / seconds
+
+    generated_points = total("sample_coordinate_points")
+    valid_points = total("sample_valid_coordinate_points")
+    geometry_seconds = total("sample_geometry_ms") / 1000.0
+    sampling_seconds = total("sample_vc_sample_seconds")
+    dependency_seconds = total("sample_vc_dependency_seconds")
+    resolve_seconds = total("sample_vc_chunk_resolve_seconds")
+    requested_chunks = total("sample_vc_requested_chunks")
+    decode_seconds = total("sample_vc_decode_seconds")
+    decoded_chunks = total("sample_vc_decoded_chunks")
+    decode_input_bytes = total("sample_vc_decode_input_bytes")
+    decoded_bytes = total("sample_vc_decoded_chunk_bytes")
+    dependency_points = total("sample_vc_dependency_points")
+    footprint_reuses = total("sample_vc_dependency_footprint_reuses")
+    footprint_changes = total("sample_vc_dependency_footprint_changes")
+    dependency_key_lookups = total("sample_vc_dependency_key_lookups")
+    dependency_hash_probes = total("sample_vc_dependency_hash_probes")
+    direct_gathers = total("sample_vc_sample_direct_gather_points")
+    boundary_points = total("sample_vc_sample_boundary_points")
+    pinned_map_lookups = total("sample_vc_sample_pinned_map_lookups")
+    mib = 1024.0 * 1024.0
+    return {
+        "coordinate_generation": {
+            "points": int(generated_points),
+            "service_seconds_sum": geometry_seconds,
+            "mega_points_per_service_second": rate(generated_points / 1.0e6, geometry_seconds),
+            "equivalent_samples_per_service_second": rate(float(measured_samples), geometry_seconds),
+            "effective_host_concurrency": rate(geometry_seconds, production_seconds),
+        },
+        "coordinate_sampling": {
+            "valid_points": int(valid_points),
+            "service_seconds_sum": sampling_seconds,
+            "mega_points_per_service_second": rate(valid_points / 1.0e6, sampling_seconds),
+            "equivalent_samples_per_service_second": rate(float(measured_samples), sampling_seconds),
+            "effective_host_concurrency": rate(sampling_seconds, production_seconds),
+        },
+        "dependency_discovery": {
+            "valid_points": int(valid_points),
+            "service_seconds_sum": dependency_seconds,
+            "mega_points_per_service_second": rate(valid_points / 1.0e6, dependency_seconds),
+            "equivalent_samples_per_service_second": rate(float(measured_samples), dependency_seconds),
+            "effective_host_concurrency": rate(dependency_seconds, production_seconds),
+            "points_visited": int(dependency_points),
+            "same_footprint_reuses": int(footprint_reuses),
+            "footprint_changes": int(footprint_changes),
+            "key_lookups": int(dependency_key_lookups),
+            "hash_probes": int(dependency_hash_probes),
+            "same_footprint_reuse_fraction": rate(footprint_reuses, dependency_points),
+        },
+        "sampling_locality": {
+            "direct_gather_points": int(direct_gathers),
+            "boundary_points": int(boundary_points),
+            "pinned_map_lookups": int(pinned_map_lookups),
+            "direct_gather_fraction": rate(direct_gathers, valid_points),
+        },
+        "chunk_resolution": {
+            "requested_chunks": int(requested_chunks),
+            "service_seconds_sum": resolve_seconds,
+            "chunks_per_service_second": rate(requested_chunks, resolve_seconds),
+            "equivalent_samples_per_service_second": rate(float(measured_samples), resolve_seconds),
+            "effective_host_concurrency": rate(resolve_seconds, production_seconds),
+        },
+        "chunk_decoding": {
+            "chunks": int(decoded_chunks),
+            "input_bytes": int(decode_input_bytes),
+            "output_bytes": int(decoded_bytes),
+            "service_seconds_sum": decode_seconds,
+            "chunks_per_service_second": rate(decoded_chunks, decode_seconds),
+            "input_mib_per_service_second": rate(decode_input_bytes / mib, decode_seconds),
+            "output_mib_per_service_second": rate(decoded_bytes / mib, decode_seconds),
+            "equivalent_samples_per_service_second": rate(float(measured_samples), decode_seconds),
+            "effective_host_concurrency": rate(decode_seconds, production_seconds),
+        },
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("reference", type=Path)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--samples", type=int, default=256)
+    parser.add_argument("--warmup-samples", type=int, default=32)
+    parser.add_argument("--verify-samples", type=int, default=2)
+    parser.add_argument("--load-workers", type=int, default=16)
+    parser.add_argument("--augment-workers", type=int, default=32)
+    parser.add_argument("--raw-queue-capacity", type=int, default=64)
+    parser.add_argument("--result-queue-capacity", type=int, default=64)
+    parser.add_argument("--max-in-flight", type=int, default=128)
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--sample-index-limit", type=int, default=0)
+    parser.add_argument("--sample-mode", choices=("random", "sequential"), default="random")
+    parser.add_argument(
+        "--volume-io-threads",
+        type=int,
+        default=0,
+        help="override VC3D source-read concurrency; 0 preserves the config",
+    )
+    parser.add_argument(
+        "--volume-decode-threads",
+        type=int,
+        default=0,
+        help="override VC3D chunk-decode concurrency; 0 preserves the config",
+    )
+    parser.add_argument(
+        "--volume-sample-threads",
+        type=int,
+        default=0,
+        help="override VC3D coordinate-interpolation workers; 0 preserves the config/default",
+    )
+    parser.add_argument(
+        "--disable-chunk-locality-fast-path",
+        action="store_true",
+        help="run the instrumented scalar reference dependency/sampling path",
+    )
+    parser.add_argument(
+        "--disable-locality-stats",
+        action="store_true",
+        help="measure production locality path without per-point diagnostic counters",
+    )
+    parser.add_argument("--multiprocessing-context", choices=("spawn", "forkserver"), default="forkserver")
+    parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
+    parser.add_argument("--no-progress-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--cache-state", choices=("unknown", "cold", "warm"), default="unknown")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    for name in (
+        "samples",
+        "load_workers",
+        "augment_workers",
+        "raw_queue_capacity",
+        "result_queue_capacity",
+        "max_in_flight",
+    ):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0")
+    if int(args.warmup_samples) < 0 or int(args.verify_samples) < 0:
+        raise ValueError("warmup/verify sample counts must be >= 0")
+    if any(
+        int(value) < 0
+        for value in (
+            args.volume_io_threads,
+            args.volume_decode_threads,
+            args.volume_sample_threads,
+        )
+    ):
+        raise ValueError("volume I/O/decode/sample thread overrides must be >= 0")
+    if int(args.verify_samples) > int(args.warmup_samples) + int(args.samples):
+        raise ValueError("--verify-samples cannot exceed total warmup + measured samples")
+    _set_parent_thread_limits()
+
+    config_payload, reference_kind = _resolved_config(args.reference.resolve())
+    if int(args.volume_io_threads) > 0:
+        config_payload["volume_io_threads"] = int(args.volume_io_threads)
+    if int(args.volume_decode_threads) > 0:
+        config_payload["volume_decode_threads"] = int(args.volume_decode_threads)
+    if int(args.volume_sample_threads) > 0:
+        config_payload["volume_sample_threads"] = int(args.volume_sample_threads)
+    config_payload["volume_chunk_locality_fast_path"] = not bool(
+        args.disable_chunk_locality_fast_path
+    )
+    config_payload["volume_collect_locality_stats"] = not bool(
+        args.disable_locality_stats
+    )
+    batch_size = int(config_payload.get("batch_size", 1))
+    if batch_size <= 0:
+        raise ValueError("config batch_size must be > 0")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = args.output_root.resolve() / f"sample_pipeline_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    config_path = run_dir / "config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2) + "\n")
+
+    verify_expected: dict[int, FiberTrace3DSample] = {}
+    verify_started = time.perf_counter()
+    if int(args.verify_samples) > 0:
+        verifier = FiberTrace3DLoader(load_config(config_path))
+        for offset in range(int(args.verify_samples)):
+            index = int(args.start_index) + offset
+            verify_expected[index] = verifier.load_sample(
+                index,
+                sample_index_limit=(
+                    None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
+                ),
+                sample_mode=str(args.sample_mode),
+                device="cpu",
+                profile=False,
+            )
+    verify_seconds = time.perf_counter() - verify_started
+
+    total_items = int(args.warmup_samples) + int(args.samples)
+    sample_limit = None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
+    startup_started = time.perf_counter()
+    pipeline = OrderedTwoStageSamplePipeline(
+        stage1_factory=_LoadFactory(str(config_path), sample_limit, str(args.sample_mode)),
+        stage2_factory=_AugmentFactory(str(config_path)),
+        start_index=int(args.start_index),
+        item_count=total_items,
+        stage1_workers=int(args.load_workers),
+        stage2_workers=int(args.augment_workers),
+        raw_queue_capacity=int(args.raw_queue_capacity),
+        result_queue_capacity=int(args.result_queue_capacity),
+        max_in_flight=int(args.max_in_flight),
+        multiprocessing_context=str(args.multiprocessing_context),
+        startup_timeout_seconds=float(args.startup_timeout_seconds),
+        no_progress_timeout_seconds=float(args.no_progress_timeout_seconds),
+    )
+    startup_seconds = time.perf_counter() - startup_started
+    print(
+        "sample_pipeline: "
+        f"load_workers={args.load_workers} augment_workers={args.augment_workers} "
+        f"raw_queue={args.raw_queue_capacity} result_queue={args.result_queue_capacity} "
+        f"in_flight={args.max_in_flight} batch={batch_size} "
+        f"warmup={args.warmup_samples} measure={args.samples} native_threads=1",
+        flush=True,
+    )
+
+    measured: list[dict[str, float]] = []
+    all_completion_ns: list[int] = []
+    batch_wait_ms: list[float] = []
+    batch_stack_ms: list[float] = []
+    measurement_started: float | None = None
+    batch: list[OrderedPipelineResult] = []
+    batch_started: float | None = None
+    last_report = time.monotonic()
+    measurement_finished: float | None = None
+    try:
+        for ordinal in range(total_items):
+            if ordinal == int(args.warmup_samples):
+                measurement_started = time.perf_counter()
+            if ordinal >= int(args.warmup_samples) and not batch:
+                batch_started = time.perf_counter()
+            result = pipeline.next_ordered()
+            all_completion_ns.append(int(result.stage2_finished_ns))
+            expected = verify_expected.get(int(result.index))
+            if expected is not None:
+                _assert_samples_equal(result.value, expected)
+                del verify_expected[int(result.index)]
+            if ordinal >= int(args.warmup_samples):
+                timings = result.value.profile_timings_ms or {}
+                measured.append(
+                    {
+                        "stage1_service_ms": result.stage1_service_ms,
+                        "stage1_cpu_ms": result.stage1_cpu_ms,
+                        "raw_queue_ms": result.raw_queue_ms,
+                        "stage2_service_ms": result.stage2_service_ms,
+                        "stage2_cpu_ms": result.stage2_cpu_ms,
+                        "result_queue_ms": result.result_queue_ms,
+                        "reorder_wait_ms": result.reorder_wait_ms,
+                        "stage1_worker": float(result.stage1_worker),
+                        "stage2_worker": float(result.stage2_worker),
+                        "stage2_finished_ns": float(result.stage2_finished_ns),
+                        "delivered_ns": float(result.delivered_ns),
+                        **{
+                            f"sample_{key}": float(value)
+                            for key, value in timings.items()
+                            if isinstance(value, (int, float))
+                        },
+                    }
+                )
+                batch.append(result)
+                if len(batch) == batch_size or ordinal + 1 == total_items:
+                    stack_started = time.perf_counter()
+                    volumes = torch.stack([item.value.volume for item in batch], dim=0)
+                    masks = torch.stack([item.value.valid_mask for item in batch], dim=0)
+                    del volumes, masks
+                    batch_stack_ms.append((time.perf_counter() - stack_started) * 1000.0)
+                    assert batch_started is not None
+                    batch_wait_ms.append((stack_started - batch_started) * 1000.0)
+                    batch.clear()
+                    batch_started = None
+            now = time.monotonic()
+            if now - last_report >= 10.0 or ordinal + 1 == total_items:
+                print(
+                    f"sample_pipeline progress={ordinal + 1}/{total_items} "
+                    f"reorder={len(pipeline.reorder)} highwater={pipeline.reorder_highwater}",
+                    flush=True,
+                )
+                last_report = now
+        measurement_finished = time.perf_counter()
+    finally:
+        pipeline.close()
+    if verify_expected:
+        raise RuntimeError(f"verification samples were not delivered: {sorted(verify_expected)}")
+    if measurement_started is None or measurement_finished is None:
+        raise RuntimeError("measurement interval was not recorded")
+    measurement_seconds = measurement_finished - measurement_started
+    pipeline_seconds = max(
+        1.0e-9,
+        (measurement_finished * 1.0e9 - float(pipeline.started_ns)) / 1.0e9,
+    )
+    production_ns = sorted(all_completion_ns)[int(args.warmup_samples):]
+    delivery_ns = sorted(int(item["delivered_ns"]) for item in measured)
+    production_seconds = max(1.0e-9, (production_ns[-1] - production_ns[0]) / 1.0e9)
+    delivery_seconds = max(1.0e-9, (delivery_ns[-1] - delivery_ns[0]) / 1.0e9)
+    production_rate = max(0, len(production_ns) - 1) / production_seconds
+    ordered_delivery_rate = max(0, len(measured) - 1) / delivery_seconds
+
+    voxel_count = math.prod(int(value) for value in config_payload["patch_shape_zyx"])
+    raw_sample_bytes = voxel_count * (4 + 1)
+    conservative_bytes_per_credit = raw_sample_bytes * 2
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "command": [sys.executable, "-m", __spec__.name if __spec__ else __name__, *(argv or sys.argv[1:])],
+        "reference": str(args.reference.resolve()),
+        "reference_kind": reference_kind,
+        "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+        "run_dir": str(run_dir),
+        "topology": "one-host-global-cpu-pipeline",
+        "cache_state_label": str(args.cache_state),
+        "start_index": int(args.start_index),
+        "warmup_samples": int(args.warmup_samples),
+        "measured_samples": int(args.samples),
+        "batch_size": batch_size,
+        "load_workers": int(args.load_workers),
+        "augment_workers": int(args.augment_workers),
+        "worker_processes": int(args.load_workers) + int(args.augment_workers),
+        "raw_queue_capacity": int(args.raw_queue_capacity),
+        "result_queue_capacity": int(args.result_queue_capacity),
+        "max_in_flight": int(args.max_in_flight),
+        "native_threads_per_worker": 1,
+        "volume_io_threads_per_load_worker": config_payload.get("volume_io_threads"),
+        "volume_decode_threads_per_load_worker": config_payload.get(
+            "volume_decode_threads"
+        ),
+        "volume_sample_threads_per_load_worker": config_payload.get(
+            "volume_sample_threads"
+        ),
+        "volume_chunk_locality_fast_path": config_payload.get(
+            "volume_chunk_locality_fast_path", True
+        ),
+        "raw_sample_bytes_estimate": raw_sample_bytes,
+        "conservative_peak_tensor_bytes_estimate": (
+            conservative_bytes_per_credit * int(args.max_in_flight)
+        ),
+        "startup_seconds": startup_seconds,
+        "synchronous_verification_samples": int(args.verify_samples),
+        "synchronous_verification_seconds": verify_seconds,
+        "measurement_delivery_window_seconds": measurement_seconds,
+        "pipeline_cold_seconds": pipeline_seconds,
+        "pipeline_cold_samples_per_second": total_items / pipeline_seconds,
+        "production_span_seconds": production_seconds,
+        "samples_per_second": production_rate,
+        "ordered_delivery_samples_per_second": ordered_delivery_rate,
+        "batches_per_second": production_rate / batch_size,
+        "stage1_service_ms": distribution(item["stage1_service_ms"] for item in measured),
+        "stage1_cpu_ms": distribution(item["stage1_cpu_ms"] for item in measured),
+        "raw_queue_ms": distribution(item["raw_queue_ms"] for item in measured),
+        "stage2_service_ms": distribution(item["stage2_service_ms"] for item in measured),
+        "stage2_cpu_ms": distribution(item["stage2_cpu_ms"] for item in measured),
+        "result_queue_ms": distribution(item["result_queue_ms"] for item in measured),
+        "reorder_wait_ms": distribution(item["reorder_wait_ms"] for item in measured),
+        "batch_delivery_wait_ms": distribution(batch_wait_ms),
+        "batch_stack_ms": distribution(batch_stack_ms),
+        "reorder_highwater": int(pipeline.reorder_highwater),
+        "sample_stage_ms": {
+            key.removeprefix("sample_"): distribution(item[key] for item in measured if key in item)
+            for key in sorted({key for item in measured for key in item if key.startswith("sample_")})
+        },
+        "stage1_workers_used": len({item["stage1_worker"] for item in measured}),
+        "stage2_workers_used": len({item["stage2_worker"] for item in measured}),
+        "summed_worker_cpu_cores": (
+            sum(item["stage1_cpu_ms"] + item["stage2_cpu_ms"] for item in measured)
+            / max(production_seconds * 1000.0, 1.0e-9)
+        ),
+        "stage_profile_rates": _stage_profile_rates(
+            measured,
+            measured_samples=len(measured),
+            production_seconds=production_seconds,
+        ),
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+        },
+        "source_sha256": {
+            "pipeline_benchmark.py": _sha256_path(Path(__file__)),
+            "ordered_sample_pipeline.py": _sha256_path(Path(ordered_pipeline_module.__file__)),
+            "loader.py": _sha256_path(Path(loader_module.__file__)),
+        },
+    }
+    (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(
+        f"sample_pipeline result samples_per_second={result['samples_per_second']:.2f} "
+        f"production_seconds={production_seconds:.2f} cpu_cores={result['summed_worker_cpu_cores']:.1f} "
+        f"reorder_highwater={pipeline.reorder_highwater} result={run_dir / 'result.json'}",
+        flush=True,
+    )
+    rates = result["stage_profile_rates"]
+    generation = rates["coordinate_generation"]
+    sampling = rates["coordinate_sampling"]
+    decoding = rates["chunk_decoding"]
+    resolution = rates["chunk_resolution"]
+    format_rate = lambda value: "N/A" if value is None else f"{float(value):.3f}"
+    print(
+        "sample_pipeline stages "
+        f"coord_gen={format_rate(generation['mega_points_per_service_second'])}MP/s "
+        f"({format_rate(generation['equivalent_samples_per_service_second'])} samples/s) "
+        f"sampling={format_rate(sampling['mega_points_per_service_second'])}MP/s "
+        f"({format_rate(sampling['equivalent_samples_per_service_second'])} samples/s) "
+        f"decode={format_rate(decoding['chunks_per_service_second'])}chunks/s "
+        f"input={format_rate(decoding['input_mib_per_service_second'])}MiB/s "
+        f"output={format_rate(decoding['output_mib_per_service_second'])}MiB/s "
+        f"({format_rate(decoding['equivalent_samples_per_service_second'])} samples/s) "
+        f"resolve={format_rate(resolution['chunks_per_service_second'])}chunks/s "
+        f"({format_rate(resolution['equivalent_samples_per_service_second'])} samples/s)",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

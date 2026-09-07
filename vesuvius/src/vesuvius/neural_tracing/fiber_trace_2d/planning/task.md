@@ -1,29 +1,56 @@
-# Task: rolling live OME-Zarr input cache for shared 3D inference
+# Fiber 3D training acceleration
 
-Add an explicitly enabled live-fetch mode to the shared Fiber/Lasagna 3D tiled
-inference path. Live mode must fetch selected-input OME-Zarr chunks ahead of
-the canonical inference traversal and conservatively remove cached chunks
-behind that traversal so full-volume inference can run without materializing
-the complete selected scale.
+Reference: s1a_128_1_single_8x8_20260729_075013. S1a NML at input OME
+level 1, 8 GPUs, 8 patches per GPU.
 
-Requirements:
+Goal: test/loss_total < 1.0 within one hour from fresh training startup,
+including testing, visualization and checkpointing. Record cache preparation
+separately. Preserve the held-out data, preprocessing, loss and aggregation.
+Track direction/presence loss and angular error too. No resumed initialization
+may count as from-scratch acceleration.
 
-- The implementation is shared by Fiber 3D and regular Lasagna predict3d.
-- Live mode is opt-in and applies only to full, non-cropped inference of one
-  numeric OME-Zarr scale with valid `_download` source metadata.
-- The selected scale is the only mutable/deletable cache content. Other scales,
-  OME metadata, `.dl_cache`, and unrelated files must never be deleted.
-- The live disk-cache target defaults to 10 TiB. It is conservative: exceeding
-  the target is acceptable whenever no complete safe Z plane can be removed.
-- Fetch lookahead defaults to 10,000 canonical inference tiles and remains
-  bounded/lazy; no full Cartesian tile-job list may be created.
-- Eviction is only by complete input Zarr Z-chunk planes. When the cache exceeds
-  its target, remove the oldest eligible plane strictly behind the current
-  relevant input Z band, recheck the projected size, and repeat until under the
-  target or no eligible plane remains. Never evict ahead of inference, from the
-  live/read-ahead band, or by Y/X/LRU selection.
-- Existing bulk prefetch, cropped auto-download, output resume, TensorStore
-  reads, multi-GPU scheduling, and numerical output must retain their behavior
-  when live mode is disabled.
-- The manager must be able to launch live-fetch inference without first doing a
-  complete scale prefetch.
+Options (not yet approved changes):
+1. Pipeline utilization: loading, targets, transfers, forward/backward,
+   optimizer, DDP, evaluation, visualization and snapshots.
+2. Verify AMP; benchmark compilation/convolution settings.
+3. Informative sampling: hard positives/negatives and annotation coverage.
+4. Learning rate, warmup/schedule and effective batch size together.
+5. Loss gradient balance and incomplete-label treatment.
+6. U-Net width/depth/block allocation.
+7. Difficulty/context curriculum.
+
+Current work: measurement first. Recover the exact saved reference settings;
+do not substitute mutable configs. The one-hour target is not a promised result.
+
+Authorized next experiment: two-GPU tooling/iteration/compile comparison on
+physical GPUs 0,1, using /home/hendrik/.venv_las and writing all run artifacts
+under /ephemeral/hendrik/fiber3d_train2. Keep batch 8 per rank (global 16),
+so this is not the eight-GPU convergence baseline.
+
+Next: profile loader workers to explain stalls, reusing existing stage timers.
+Keep current task-log updates minimal. Loader and normalization improvement
+remain the optimization priorities; current change is measurement only.
+
+Authorized implementation: introduce a central, reusable two-stage per-sample
+pipeline and benchmark it before connecting it to training. Stage one loads raw
+samples; stage two performs value augmentation. Both queues are bounded, work
+is claimed by the next free worker, final delivery remains deterministic, and
+the benchmark reports throughput, queue pressure and stalls. Target loader
+capacity is greater than 221 samples/s globally on the intended eight-GPU host.
+
+Current measurement refinement: make VC3D coordinate interpolation concurrency
+an explicit loader/benchmark setting, run with source read, chunk decode, and
+coordinate sampling each limited to one worker, and profile coordinate-map
+generation, actual chunk decoding, and coordinate interpolation separately.
+Report decoder chunks/s and MiB/s plus coordinate MP/s; normalize every stage
+to equivalent 128^3 training samples/s. Preserve the existing transformed
+per-coordinate trilinear sampling algorithm and its outputs.
+
+Authorized optimization: profile requested-level coordinate dependency
+discovery independently on the real S1a 128^3 workload, then eliminate its
+redundant per-corner hash probes with a previous-coordinate chunk-footprint
+fast path. Restore equivalent cheap locality in pinned chunk resolution and
+inspect the existing render sampler for other exact, portable fast paths.
+Target coordinate generation and requested-level sampling capacity is at least
+20 samples/s each so their serial composition can sustain 10 samples/s. Do not
+use GPUs while they remain allocated to other work.

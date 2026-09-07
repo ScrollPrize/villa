@@ -156,9 +156,23 @@ that service directly before or during use:
 | `configureFetchConcurrency(count, adaptive)` | Change global source-read admission in place |
 
 Python exposes the equivalent module-level functions
-`vc.set_chunk_cache_budget(bytes)` and
-`vc.set_chunk_cache_io_threads(count)`. The latter selects fixed admission.
+`vc.set_chunk_cache_budget(bytes)`,
+`vc.set_chunk_cache_io_threads(count)`, and
+`vc.set_chunk_cache_decode_threads(count)`. The thread controls select fixed
+source-read and decode admission respectively; the process service retains its
+fixed physical worker pools.
 Cache policy is deliberately not configured through a `Volume` instance.
+
+Python `Volume.sample_coords(..., sampler_threads=0,
+chunk_locality_fast_path=True, collect_locality_stats=False)` also accepts a
+per-call coordinate-interpolation worker cap. Zero preserves automatic
+behavior, one uses the calling thread only, and positive values are bounded by
+the existing render-sampler pool. The exact locality fast path reuses adjacent
+dependency footprints and pinned chunk pointers; it can be disabled for a
+matched reference measurement. Locality counters are opt-in because collecting
+them adds inner-loop bookkeeping. These controls do not alter cache I/O or
+decode admission. Returned stats include dependency, chunk-resolution and
+interpolation durations plus per-cache codec counter deltas for profiling.
 
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
 mirror: metadata and fetched storage objects keep their source-relative paths

@@ -1,92 +1,114 @@
-# Task log: rolling live OME-Zarr input cache for shared 3D inference
+# Training measurement log
 
-## Planning findings
+2026-09-07:
+- main checkout was clean.
+- Reference saved LR is 0.01, current mutable sd1 config LR is 0.001.
+- Reference already enabled BF16; AMP is not an untapped optimization.
+- Existing benchmark uses eval/no_grad and rejects DDP.
+- Existing training compute timer includes optimizer/scalar collective; target
+  timer without profiling measures enqueue time rather than complete GPU work.
+- GPUs 2-7 occupied; 0-1 free. Eight-GPU baseline pending availability; no
+  existing jobs stopped and no competing training launched.
+- Reference events lack test_total_seconds. Train/test timestamp gaps are
+  approximate test intervals, not isolated device timings.
+- Workflow names spec.md; actual normative file is specs.md. Relevant 3D
+  training sections read. No inference behavior changes.
+- Independent reviewer confirmed plan/spec compatibility. Added metric-component,
+  historical-startup, provenance and throughput-versus-convergence clarifications.
+- Added analyze_training.py and three synthetic regression tests; all passed.
+  Ran on the actual reference event file and saved summary/config in docs/.
+- Best historical loss 1.017569 at 13.97h, last 1.153580 at 15.39h;
+  best within first hour 1.886512. No observed threshold crossing.
+- Sampled compute median 502ms versus p95 10.03s; paired test gaps sum 3.10h.
+  These identify investigation targets, not a proven bottleneck attribution.
+- Deferred explicitly: live all-rank profiler instrumentation and current 8-GPU
+  measurement await GPU availability. No optimization or convergence claim made.
 
-- Bulk auto-download currently completes before inference. TensorStore's
-  existing bounded read-ahead only reads already-local chunks and is not a
-  remote materialization cache.
-- The shared runner currently uses transient local chunk existence both to
-  skip model tiles and to classify supported output chunks. Live caching must
-  make these checks authoritative against remote inventory or an initially
-  empty/evicted cache can incorrectly suppress valid inference.
-- Canonical traversal is Z-major with lazily materialized axis lattices. The
-  live window can therefore remain bounded at 10,000 events and a safe eviction
-  frontier can advance only after a complete canonical model Z row commits.
-- At the current 512/96/32 defaults, PHercParis4 scale 0 has 6,241 tiles per
-  model Z row. A 10,000-tile window spans at most three model Z positions and
-  approximately 7--12 128-voxel input Zarr planes. The configured 10 TiB cache
-  target is much larger than the immediate forward working set.
-- A conservative target requires no ahead/LRU deletion: when over target,
-  delete oldest whole planes strictly behind the safe boundary; if none are
-  available, report and temporarily remain over target.
-- `preprocess_cos_omezarr.py` still contains a duplicated automatic-download
-  wrapper even though Fiber imports the shared runner helper. This task will
-  remove that divergence rather than add another backend-specific cache path.
-- Independent review required remote inventory to remain active-plane bounded,
-  clarified sparse-plane eviction, preserved `.noremote` as advisory only,
-  separated the 10,000 descriptor/materialization window from the much smaller
-  TensorStore tile-array window, and strengthened local accounting, metadata
-  validation, shared/exclusive locking, and fatal transport-error behavior.
-- Current uncommitted downloader retry/progress/scanner-failure changes are the
-  baseline for this task and must be preserved rather than rewritten away.
+Two-GPU continuation (same task, user-authorized):
+- Using only GPUs 0,1 and /home/hendrik/.venv_las; all experiment output under
+  /ephemeral/hendrik/fiber3d_train2. Existing input/cache paths reused.
+- Added opt-in normal-loop per-rank wall timers and bounded CPU/CUDA traces;
+  default training does not create artifacts. Evaluation/vis/snapshot costs are
+  included in iteration totals but not yet individually scoped by this tracer.
+- Added explicit compile modes off/default/reduce-overhead and optional model
+  initialization seed. Raw models remain the checkpoint/evaluation source.
+- Independent review caught cleanup on profiler export error and launcher
+  batch/resume validation; fixed both. Summary excludes steps <=30, trace and
+  test steps; importantly it retains loader stalls.
+- Unit tests: 5 profiler/summary/compile tests pass; 13 existing DDP/snapshot/
+  precision tests pass. Existing suite needs PYTHONPATH=/home/hendrik/villa/vesuvius
+  to import its tests.zarr_utils helper; initial collection without that failed.
+- Eager 120-step run completed successfully in 264.8s. Rank0 steady iteration
+  mean 1595ms, median 483ms, p95 8554ms; compute median 449ms. Rank0 loader
+  wait mean 1114ms; rank1 waits inside forward/DDP instead. Peak tensor memory
+  about 13.83GiB/rank. Five-step CPU/CUDA traces exported successfully.
+- Default compile first training compute took 44.69s; Dynamo warns its default
+  recompilation limit of8 was reached for a reused conv frame. This is partial
+  compilation with library eager fallback, not evidence of full-graph compile.
+  Our code does not suppress compiler exceptions. No default compile adoption.
+- All three 120-step experiments completed: eager264.8s, default295.0s,
+  reduce-overhead284.6s. Rank0 steady medians483.3/531.2/536.0ms;
+  mean iteration times1595.3/1560.1/1596.8ms including loader stalls.
+- Both ranks exported traces in all modes. Raw eager kernel sums: BN1197.89ms,
+  NCCL31.10ms, other872.77ms over five steps. Do not sum parent operator
+  device totals together with kernel rows (that double-counts).
+- Initial test loss identical. First train loss differs by0.000181675 under
+  compilation; step100 test differences recorded in docs, not treated as a
+  convergence ranking. Historical and eager model714 keys/shapes match;
+  eager/compiled snapshots preserve714 raw keys without wrapper prefixes.
+- Final verification:21 focused tests pass (193 unrelated deselected), including
+  the13 existing DDP/snapshot/precision tests. No default compile activation.
+- Complete report, commands and artifacts: docs/training_profile_2gpu.md and
+  docs/training_profile_2gpu_20260907.json. Remaining worker-internal/stage
+  profiling, unprofiled repeats, eight-GPU and one-hour convergence runs are
+  explicitly follow-ups, not claimed complete.
 
-## Deviations
-
-- Live fetching initially manages only the primary selected input scale.
-  Lasagna `pred_dt` is an independent post-inference external source; live mode
-  rejects a separately remote `pred_dt` rather than silently materializing a
-  second unbounded cache. Already-local `pred_dt` behavior remains unchanged.
-- S3 list responses are consumed as keys, not object-size projections. Progress
-  therefore reports exact completed resident/downloaded bytes, current transfer
-  rate, and in-flight chunk count, but does not invent a projected-byte total.
-  Actual completed bytes remain the sole eviction trigger as required.
-
-## Implementation
-
-- Added `lasagna/live_omezarr_cache.py` with selected-level metadata validation,
-  authoritative lazy per-Z remote inventory, atomic retrying raw-chunk transfer,
-  aggregate local accounting, shared/exclusive advisory locking, and
-  conservative whole-plane eviction.
-- Kept canonical event generation lazy while separating the 10,000-item live
-  materialization window from the existing bounded TensorStore/full-tile read
-  window. Durable completed outputs are skipped before fetch. Serial and
-  multi-device paths call the same shared scheduler.
-- Changed live source-support checks to use authoritative remote inventory,
-  never transient local cache contents or `.noremote` state.
-- Removed the duplicate Lasagna downloader implementation and routed Fiber and
-  Lasagna through the shared automatic-download helper. Bulk download takes the
-  same exclusive selected-level lock used by live mutation; ordinary tiled
-  readers take a shared lock.
-- Added Fiber, Lasagna, and manager CLI flags, manager completion, source-link
-  initialization without bulk prefetch, portable provenance, and final manager
-  cache statistics. Normal non-live prefetch and no-prefetch behavior remains
-  unchanged.
-- Made progress refresh once per second through both terminals and manager
-  pipes, with newline history checkpoints at most once per minute while work
-  advances. Remote-missing accounting now counts each absent chunk once when
-  its Z-plane inventory is first listed instead of counting overlapping tile
-  requests repeatedly.
-- Updated shared inference specs, code-structure documentation, Lasagna README,
-  manager documentation, and changelog.
-
-## Validation
-
-- `python -m py_compile` passed for the new cache, shared runner, downloader,
-  both inference entry points, and manager modules.
-- `pytest lasagna/tests/test_live_omezarr_cache.py
-  lasagna/tests/test_live_tiled_predict3d.py
-  lasagna/tests/test_download_omezarr.py lasagna/tests/test_manager.py -q`:
-  **77 passed**.
-- Two focused legacy shared-runner tests covering normal Python-Zarr/TensorStore
-  serial equivalence and lazy canonical events: **2 passed**.
-- Fiber CLI/signature tests including live options and invalid combinations:
-  **7 passed, 199 deselected**.
-- Fiber, Lasagna, and manager `--help` smoke checks expose all three live flags.
-- `git diff --check` passed.
-- Focused progress/missing-accounting regression validation: **11 passed**.
-- No real S3/full-volume performance run was made, so no throughput or peak-cache
-  claim is reported. The focused synthetic tests verify window ordering,
-  pre-fetch resume rejection, selected-scale isolation, exact accounting, and
-  safe-plane deletion. A broader local suite attempt encountered an existing
-  Zarr 3/Python 3.14 synchronous `open_group` stall in an unrelated atomic-output
-  test; the focused normal-runner tests complete successfully.
+Loader-worker follow-up:
+- Reuse existing load_batch(profile=True) timers in normal two-GPU training;
+  add worker identity/receive timestamps to separate service from queue delay.
+- Same eager S1a 2x8 setup, .venv_las, logs under fiber3d_train2. No tuning yet.
+- Profiling metadata/value-preservation tests passed (19 focused tests). Launched
+  120 eager steps with --trace-steps 0 --profile-loader on free GPUs 0,1.
+- Completed (251.4s): augmentation ~64% of worker service; 8 workers/rank
+  overlap, with computed-ahead batches blocked by ordered delivery. Test losses
+  match eager baseline. Details: docs/training_loader_profile_2gpu.md.
+- No tuning yet; augmentation substage profiling and BN optimization remain next.
+- Throughput budget: historical 22.21 samples/s global including tests and
+  27.85 between tests; current loader ~9.6 global on 2 GPUs versus a measured
+  ready-batch ceiling of 33.9--36.3. A controlled repeated-batch run is pending.
+- Started bounded two-process-stage, per-sample queue benchmark; training path
+  remains unchanged until queue behavior and throughput are measured.
+- Independent review required one global delivery-credit bound, non-blocking
+  completion draining and separate failure control; incorporated before coding.
+- Implemented the shared two-stage process pipeline and exact split loader;
+  focused pipeline/profile tests pass.
+- Warm S1a benchmark: 22.67 samples/s with 16 load + 32 augmentation workers;
+  queue residence was small and stage kernels remain the limiting work.
+- Added separate VC3D read/decode admission controls and a stable approved
+  benchmark launcher; read=1/decode=1 was throughput-neutral across 3 repeats.
+- Source inspection found `sample_coords` independently dispatches large patches
+  to up to 8 native render-sampler workers. Planning a per-call serial control
+  and separate coordinate-generation, codec-decode, and interpolation metrics;
+  the previous aggregate timing did not justify attributing extra CPU to probes.
+- Added per-call coordinate-sampler limits and per-cache codec plus blocking-
+  sampler stage counters. Native/Python focused tests pass; editable VC binding
+  rebuilt with GCC 13 after the machine-default GCC 11 failed on existing C++23.
+- Controlled 1/1/1 fresh run: 16.00 samples/s, raw CPU/wall 927.6/963.3ms;
+  coord generation 10.40MP/s, interpolation 5.83MP/s, resolution 682 chunks/s.
+  Uncompressed codec calls are near-no-op and not an I/O bottleneck.
+- User authorized exact dependency-discovery and pinned-sampling locality
+  optimization with 20 samples/s per-stage targets. Planned CPU-only profiling,
+  shared footprint logic, previous-footprint reuse, and pinned direct gathering.
+- Independent review required matched instrumented reference/optimized modes,
+  worker-local counters, explicit coordinate/edge contracts, independent scalar
+  reference coverage, and separate target reporting; incorporated before code.
+- Review also identified existing reusable corner-visitor locality machinery
+  and differing visitor/scalar edge and missing policies. Plan now requires a
+  mechanical shared-primitives extraction before optimization, with explicit
+  caller policies and separate pre-change oracles.
+- Matched one-worker CPU profiles: dependency discovery improved 240.32ms to
+  45.01ms (4.16 to 22.22 samples/s); pinned interpolation improved 377.04ms to
+  53.26ms (2.65 to 18.78 samples/s). Combined capacity is 10.18 samples/s.
+- Added previous-footprint reuse, shared compact dependency resolution,
+  single-pinned-chunk gathering and a worker-local pointer cache. Exact
+  reference/optimized C++ tests and focused Python plumbing tests pass.

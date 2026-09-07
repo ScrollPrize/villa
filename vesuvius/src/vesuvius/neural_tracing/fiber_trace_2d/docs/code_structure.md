@@ -748,6 +748,11 @@ Ownership changed as follows:
 - For 3D loading, omitted or `null` `volume_cache_memory_mib` resolves in
   Python to a 512 MiB VC3D decoded/hot-cache cap per loader/worker. Explicit
   positive values override this default.
+- `volume_io_threads` and `volume_decode_threads` optionally set positive
+  process-local VC3D source-read and chunk-decode admission limits. Persistent-
+  cache probing remains on its separate fixed pool. `volume_sample_threads`
+  independently caps the native per-call coordinate interpolation dispatch;
+  one makes that computation serial. Omission preserves normal defaults.
 - Worker batches are returned on CPU. The main process transfers the complete
   batch to the configured training device before model execution. Console
   `load_ms` includes DataLoader wait plus this main-process transfer;
@@ -2518,3 +2523,88 @@ threads.
   with `python -m pip install -e volume-cartographer --no-deps --break-system-packages`.
 - Production remote sampling should use the VC3D blocking sampler, not the
   fallback NumPy sampler.
+# Two-GPU training experiments
+
+Add --profile-loader --trace-steps 0 to profile_experiment for CPU-worker stage
+timing in the real two-rank training loop, without a CUDA trace. This sets
+training.profile_loader=true (requires profile_enabled=true and positive
+loader_workers). timings_rankN.jsonl carries nested loader_profile copied from
+the existing loader's profile_timings_ms, plus worker ID/sample index and
+coordinator epoch wait-start/received timestamps. Receipt is recorded before
+H2D/target creation. Fields ending _ns are epoch timestamps, not durations;
+CPU/wall durations and summed stage times have separate meanings. Sampling and
+worker scheduling are unchanged. Worker construction belongs to startup.
+
+fiber_trace_3d.training_profile provides optional stage wall timers and bounded
+CPU/CUDA traces inside the normal train.py loop. training.profile_enabled is
+false by default; profile_trace_start=21 and profile_trace_steps=5 select the
+window (zero trace steps retains wall timing only). Trace export occurs outside
+the iteration timer. Wall scopes include asynchronous submission and waits;
+use the Chrome trace for actual GPU operators/collectives.
+
+training.compile_mode is off/default/reduce-overhead. Compilation wraps the
+DDP training model; evaluation and snapshots use the raw model. An optional
+training.initialization_seed gives paired experiments the same initialization.
+No training sampling, loss, precision, or checkpoint policy is changed.
+
+fiber_trace_3d.profile_experiment launches an isolated normal two-rank torchrun
+using its current Python interpreter. Required --reference is the saved audit
+JSON containing config, and --output is a new experiments root. It pins physical
+GPUs 0,1, batch 8/rank, BF16 and saved LR, sets scalar logging every step, and
+records generated config, launch metadata, run.log and per-rank artifacts.
+Defaults: --steps 120, --compile-mode off, --trace-steps 5. Native thread pools
+are limited before launching processes. Shared input cache remains unchanged
+in config; logs/output/compiler caches live under --output. These are batch-16
+tooling experiments, not batch-64 convergence comparisons.
+
+## Bounded per-sample load/augmentation benchmark
+
+`vesuvius.neural_tracing.ordered_sample_pipeline` is a reusable two-process-
+stage scheduler. Load workers claim monotonically assigned sample indices;
+augmentation workers take whichever raw sample is ready. Two bounded data
+queues connect the stages. A single bounded credit pool covers work in workers,
+both queues, and the coordinator's reorder map, and is released only after
+deterministic ordered delivery. The coordinator continuously drains later
+completions while waiting for an earlier sample. Separate one-way control pipes
+carry startup, failure, and lifecycle messages, so a full data queue cannot
+hide an exception.
+
+`FiberTrace3DLoader.load_raw_sample` stops immediately before value
+augmentation and carries the already sampled deterministic augmentation
+parameters. `augment_raw_sample` completes the sample, while `load_sample`
+composes those same two operations. This keeps the normal synchronous loader
+and benchmark on one implementation.
+
+Run the real S1a benchmark with:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_pipeline_benchmark
+```
+
+The launcher fixes the current reference, venv, CPU-only environment and
+output root. Benchmark arguments live one-per-line in
+`vesuvius/scripts/fiber3d_pipeline_benchmark.args`; changing that file does not
+change the executable command, so one approval covers subsequent benchmark
+configurations. Override machine paths with `FIBER3D_BENCH_REFERENCE`,
+`FIBER3D_BENCH_PYTHON`, or `FIBER3D_BENCH_OUTPUT` when invoking manually.
+
+The command creates a unique `sample_pipeline_*` directory with the resolved
+config and `result.json`. `samples_per_second` is measured from completion
+events after discarding the configured number of completion events as warmup;
+ordered-delivery throughput is reported separately. Queue residence and reorder
+wait are not worker service time. The benchmark is host-global and is not yet
+wired into DDP training. See `docs/training_sample_pipeline_benchmark.md` for
+the initial result and interpretation.
+
+With profiling enabled, `stage_profile_rates` separates `_build_geometry_maps`
+coordinate generation, native dependency discovery, chunk resolution/pinning,
+actual cache codec calls, and native trilinear interpolation. Counts divided by
+summed worker service time are per-service rates; effective host concurrency is
+reported independently. Direct uncompressed chunks have a near-no-op codec, so
+chunk-resolution time—not codec time—captures their filesystem/cache cost.
+
+The VC3D sampler exposes `chunk_locality_fast_path` and
+`collect_locality_stats` through `make_coordinate_sampler`, the Fiber3D loader,
+and the pipeline benchmark. The optimized native path reuses exact adjacent
+dependency footprints and performs direct single-pinned-chunk trilinear
+gathers; the reference path remains selectable for matched measurements.

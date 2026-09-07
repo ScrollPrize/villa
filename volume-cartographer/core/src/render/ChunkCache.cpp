@@ -705,6 +705,7 @@ struct ChunkCacheService::Impl {
     std::shared_ptr<ChunkRequestScheduler> decodeScheduler =
         std::make_shared<ChunkRequestScheduler>(
             kDecodeWorkers, 7, schedulerSelectionGate);
+    std::size_t activeDecodeWorkers = kDecodeWorkers;
     std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
     std::size_t activeFetchWorkers = 0;
     bool activeFetchAdaptive = false;
@@ -993,12 +994,26 @@ void ChunkCacheService::configureDecodedByteCapacity(
     impl_->decodedByteBudget->setMaximumBytes(decodedByteCapacity);
 }
 
+void ChunkCacheService::configureDecodeConcurrency(
+    std::size_t maxConcurrentDecodes)
+{
+    std::lock_guard lock(impl_->mutex);
+    impl_->decodeScheduler->configureConcurrency(maxConcurrentDecodes);
+    impl_->activeDecodeWorkers = maxConcurrentDecodes;
+}
+
 ChunkCacheService::FetchConcurrency ChunkCacheService::fetchConcurrency() const
 {
     std::lock_guard lock(impl_->mutex);
     return {impl_->fetchScheduler->workerCapacity(),
             impl_->activeFetchWorkers,
             impl_->activeFetchAdaptive};
+}
+
+std::size_t ChunkCacheService::decodeConcurrency() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return impl_->activeDecodeWorkers;
 }
 
 PersistentCacheEncoding
@@ -2098,6 +2113,11 @@ ChunkCache::Stats ChunkCache::stats() const
         }
         if (auto scheduler = state->decodeScheduler_.lock())
             result.pendingDecodeTasks = scheduler->pending();
+        result.decodeAttempts = state->decodeAttempts_.load(std::memory_order_relaxed);
+        result.decodedChunks = state->decodedChunks_.load(std::memory_order_relaxed);
+        result.decodeInputBytes = state->decodeInputBytes_.load(std::memory_order_relaxed);
+        result.decodedChunkBytes = state->decodedChunkBytes_.load(std::memory_order_relaxed);
+        result.decodeNanoseconds = state->decodeNanoseconds_.load(std::memory_order_relaxed);
         result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
         for (const auto& [key, parked] : state->blockingReadersByKey_) {
             (void)key;
@@ -4015,6 +4035,8 @@ void ChunkCache::queueStorageObjectDecode(
                 if (!state)
                     return;
                 ChunkFetchResult decoded;
+                const auto decodeInputBytes = objectBytes->size();
+                const auto decodeStarted = std::chrono::steady_clock::now();
                 try {
                     decoded = consumer.fetcher->decodeStorageObject(
                         fetcherKey(key), std::span<const std::byte>(
@@ -4022,7 +4044,13 @@ void ChunkCache::queueStorageObjectDecode(
                 } catch (const std::exception& error) {
                     decoded.status = ChunkFetchStatus::DecodeError;
                     decoded.message = error.what();
+                } catch (...) {
+                    recordDecodeMeasurement(
+                        state, decodeStarted, decodeInputBytes, decoded);
+                    throw;
                 }
+                recordDecodeMeasurement(
+                    state, decodeStarted, decodeInputBytes, decoded);
                 FetchContext context{
                     consumer.generation, consumer.fetcherGeneration,
                     consumer.fetchSerial, consumer.schedulerEpoch,
@@ -4060,11 +4088,15 @@ void ChunkCache::decodePersistentAndStore(
                 decoded.status = ChunkFetchStatus::Found;
                 decoded.bytes = std::move(cached->bytes);
             } else {
+                const auto decodeInputBytes = cached->bytes.size();
+                const auto decodeStarted = std::chrono::steady_clock::now();
                 decoded = cached->sourcePayload
                     ? context.fetcher->decodeSourcePayload(
                           fetcherKey(key), std::move(cached->bytes))
                     : context.fetcher->decodePersistentBytes(
                           fetcherKey(key), std::move(cached->bytes));
+                recordDecodeMeasurement(
+                    state, decodeStarted, decodeInputBytes, decoded);
             }
             resolved = decoded.status == ChunkFetchStatus::Found &&
                        decoded.bytes.size() == expectedChunkBytes(*state, key);
@@ -4102,6 +4134,8 @@ void ChunkCache::decodeFetchedAndStore(
 
     ChunkFetchResult decoded;
     const bool persistentWriteHandled = fetched->persistentWriteHandled;
+    const auto decodeInputBytes = fetched->bytes.size();
+    const auto decodeStarted = std::chrono::steady_clock::now();
     try {
         decoded = context.fetcher->decodeFetched(
             fetcherKey(key), std::move(*fetched));
@@ -4112,6 +4146,7 @@ void ChunkCache::decodeFetchedAndStore(
         decoded.status = ChunkFetchStatus::DecodeError;
         decoded.message = "unknown chunk decode exception";
     }
+    recordDecodeMeasurement(state, decodeStarted, decodeInputBytes, decoded);
     decoded.persistentWriteHandled = persistentWriteHandled;
     if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
         // Delta3D persistence always starts from the decoded logical chunk;
@@ -4123,6 +4158,30 @@ void ChunkCache::decodeFetchedAndStore(
             std::move(persistence));
     } else {
         finishAndStore(state, key, context, std::move(decoded), false);
+    }
+}
+
+void ChunkCache::recordDecodeMeasurement(
+    const std::shared_ptr<State>& state,
+    std::chrono::steady_clock::time_point started,
+    std::size_t inputBytes,
+    const ChunkFetchResult& result) noexcept
+{
+    if (!state)
+        return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    state->decodeAttempts_.fetch_add(1, std::memory_order_relaxed);
+    state->decodeInputBytes_.fetch_add(
+        static_cast<std::uint64_t>(inputBytes), std::memory_order_relaxed);
+    state->decodeNanoseconds_.fetch_add(
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, elapsed)),
+        std::memory_order_relaxed);
+    if (result.status == ChunkFetchStatus::Found) {
+        state->decodedChunks_.fetch_add(1, std::memory_order_relaxed);
+        state->decodedChunkBytes_.fetch_add(
+            static_cast<std::uint64_t>(result.bytes.size()),
+            std::memory_order_relaxed);
     }
 }
 

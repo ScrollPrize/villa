@@ -134,10 +134,14 @@ public:
     // work is neither cancelled nor restarted.
     void configureFetchConcurrency(std::size_t maxConcurrentReads,
                                    bool adaptive);
+    // Changes decoded-chunk work admission on the existing fixed worker pool.
+    // Running and queued work is retained.
+    void configureDecodeConcurrency(std::size_t maxConcurrentDecodes);
     // Changes the global decoded RAM ceiling in place. Sources and queued or
     // running work are preserved; reductions evict only decoded LRU entries.
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
+    std::size_t decodeConcurrency() const;
     PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
@@ -198,6 +202,13 @@ public:
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
         std::size_t pendingDecodeTasks = 0;
+        // Cumulative actual codec work. Cache hits containing already-decoded
+        // bytes do not increment these counters.
+        std::uint64_t decodeAttempts = 0;
+        std::uint64_t decodedChunks = 0;
+        std::uint64_t decodeInputBytes = 0;
+        std::uint64_t decodedChunkBytes = 0;
+        std::uint64_t decodeNanoseconds = 0;
         // Unresolved chunk requests (queued or executing), indexed by pyramid
         // level. Persistent-cache probes count while the requested chunk is
         // still unavailable to rendering.
@@ -548,6 +559,11 @@ private:
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
+        std::atomic<std::uint64_t> decodeAttempts_{0};
+        std::atomic<std::uint64_t> decodedChunks_{0};
+        std::atomic<std::uint64_t> decodeInputBytes_{0};
+        std::atomic<std::uint64_t> decodedChunkBytes_{0};
+        std::atomic<std::uint64_t> decodeNanoseconds_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
         std::shared_ptr<void> persistentLease_;
         std::string persistentCacheWarning_;
@@ -597,6 +613,11 @@ private:
         FetchContext context,
         std::shared_ptr<ChunkFetchResult> fetched,
         std::shared_ptr<PersistenceOperation> persistence = {});
+    static void recordDecodeMeasurement(
+        const std::shared_ptr<State>& state,
+        std::chrono::steady_clock::time_point started,
+        std::size_t inputBytes,
+        const ChunkFetchResult& result) noexcept;
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);

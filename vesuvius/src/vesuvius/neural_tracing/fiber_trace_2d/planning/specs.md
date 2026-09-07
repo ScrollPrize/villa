@@ -336,6 +336,26 @@
 
 ## 3D CP-Centered Fiber Model Variant
 
+- Normal 3D training optionally accepts training.profile_enabled (default false).
+  Enabled runs write per-rank iteration/stage wall timings and a bounded CPU/CUDA
+  trace beginning at profile_trace_start (default 21) for profile_trace_steps
+  iterations (default 5; zero disables tracing). Wall scopes do not synchronize
+  CUDA, and must not be described as GPU execution times. Default runs create
+  no profiler artifacts. Existing evaluation/checkpoint policies remain intact.
+- training.compile_mode defaults to off; default and reduce-overhead explicitly
+  compile the DDP-wrapped training model. Evaluation and checkpoint serialization
+  retain the original uncompiled model. Compiler failures propagate. Numerical
+  and throughput differences must be measured before adopting compilation.
+- training.initialization_seed optionally seeds model initialization for paired
+  experiments; omission preserves the historical initialization behavior.
+- training.profile_loader defaults false and requires profile_enabled=true
+  and loader_workers>0. It enables the existing loader stage timers in normal
+  training; sampled tensors, targets and batch order are unchanged. Per-rank
+  timing rows include nested loader_profile with worker ID/PID, sample/item
+  indices and same-clock epoch timestamps bracketing coordinator receipt before
+  H2D. Worker-end-to-receive is combined transport/order/prefetch residence, not
+  an isolated IPC timer. Later batches computed early do not prove queue delivery.
+
 - The 3D CP model lives in a sibling package,
   `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
   `fiber_trace_2d` configs, strip geometry, Trace2CP tooling, or 2D training.
@@ -630,11 +650,51 @@
   `FiberTrace3DBatch` objects; the main training process transfers the whole
   batch to `training.device` immediately before forward/backward. The old
   thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- The standalone 3D sample-pipeline benchmark uses the shared
+  `OrderedTwoStageSamplePipeline`: free load processes claim deterministic
+  sample indices one at a time, a bounded raw queue feeds free value-
+  augmentation processes, and a bounded result queue feeds ordered batch
+  assembly. The normal training loader is unchanged until this benchmarked
+  path is explicitly integrated.
+- One global credit window bounds all claimed, executing, queued, and
+  coordinator-reordered samples. Credits are released only at ordered
+  delivery. The coordinator must drain later completions while waiting for an
+  earlier index, so deterministic delivery cannot fill the result queue and
+  deadlock worker progress.
+- Sample-pipeline control and failure reporting must not depend on capacity in
+  either data queue. Worker exceptions and every premature process exit,
+  including exit code zero, are errors. The pipeline uses `spawn` or
+  `forkserver`, limits ordinary native thread pools per process, and owns
+  cleanup of its workers, control pipes, and queue feeder resources.
+- `FiberTrace3DLoader.load_sample` is the composition of the same raw-load and
+  value-augmentation functions used by the benchmark. A split sample must be
+  tensor-for-tensor identical to the synchronous profile-disabled result and
+  retain its deterministic value-augmentation parameters across the queue.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.pipeline_benchmark`
+  benchmarks the real loader without training. Its JSON records exact command,
+  source/config identity, worker topology, queue/credit capacities, cache-state
+  label, startup and warmup, throughput, stage/queue/reorder/batch-stall
+  distributions, worker CPU use, and a conservative in-flight tensor-memory
+  estimate.
 - In 3D configs, omitted or `null` `volume_cache_memory_mib` means a
   Python-side default of 512 MiB per VC3D sampler/loader/worker, not VC3D's
   internal 8 GiB default. Explicit positive values override this cap. The
   generated 2D Trace2CP geometry loader used by 3D evaluation receives the same
   default when the 3D raw config leaves the key unset or `null`.
+- Positive `volume_io_threads` and `volume_decode_threads` independently limit
+  the process-local VC3D source-read and decoded-chunk work admission. They do
+  not change the separate persistent-cache probe pool.
+- Optional `volume_sample_threads` controls only native VC3D coordinate-
+  interpolation dispatch for each call: omission/zero preserves the automatic
+  pool limit, one executes interpolation serially, and a positive value caps
+  workers without resizing the process pool or changing dependency/decode
+  admission. Sampling values and strict requested-level behavior are unchanged.
+- The standalone sample-pipeline profile distinguishes Python coordinate-map
+  generation, native dependency discovery, blocking chunk resolution, actual
+  codec calls, and native coordinate interpolation. Native-unit rates divide
+  counts/bytes by summed service time; host effective concurrency is reported
+  separately. Equivalent sample rates use exactly 128^3 output coordinates for
+  this reference and codec rates are N/A when no codec work occurs.
 - 3D DataLoader workers must not materialize full dense direction/presence
   target tensors. Worker batches carry image/valid tensors plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata plus
@@ -2721,3 +2781,22 @@
 - `flush_workers=0` is the synchronous baseline and uses immediate ring release;
   both inference CLIs default to the available CPU count capped at 64 process
   workers.
+
+# Requested-level coordinate-sampling locality
+
+- VC3D blocking dependency discovery and pinned scalar sampling share compact
+  chunk-run and dependency-resolution primitives with the renderer's corner
+  visitor. Normal callers enable exact locality fast paths by default;
+  diagnostic counters are opt-in and benchmark-only.
+- Dependency discovery may reuse only the immediately preceding point's exact
+  compact chunk footprint. Chunk coordinates use exact integer division for
+  arbitrary positive chunk shapes; power-of-two assumptions and approximate
+  scale conversions are forbidden.
+- Interior trilinear cells whose eight samples belong to one present pinned
+  chunk use direct contiguous gathers. Boundary, out-of-bounds and missing-data
+  cases retain the pre-optimization scalar policy and ordered `std::fma`
+  interpolation. Pointer caches are worker-local and cache immutable pinned-map
+  results only.
+- Reference and optimized modes must return identical dependency sets, bytes,
+  coverage and missing/error counts for transformed levels, non-power-of-two
+  chunks, boundary and non-finite coordinates.

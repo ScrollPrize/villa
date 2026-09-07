@@ -89,6 +89,10 @@ class FiberTrace3DConfig:
     volume_cache_dir: str | None = None
     volume_cache_memory_mib: float | None = DEFAULT_VOLUME_CACHE_MEMORY_MIB
     volume_io_threads: int | None = None
+    volume_decode_threads: int | None = None
+    volume_sample_threads: int | None = None
+    volume_chunk_locality_fast_path: bool = True
+    volume_collect_locality_stats: bool = False
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
     config_dir: Path | None = None
@@ -184,6 +188,16 @@ class FiberTrace3DSample:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     profile_timings_ms: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class FiberTrace3DRawSample:
+    """Value-unaugmented sample plus deterministic parameters for stage two."""
+
+    sample: FiberTrace3DSample
+    augmentation: _Augment3DParams
+    load_wall_ms: float
+    load_cpu_ms: float
 
 
 @dataclass(frozen=True)
@@ -442,6 +456,22 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         volume_io_threads=(
             None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
         ),
+        volume_decode_threads=(
+            None
+            if raw.get("volume_decode_threads") is None
+            else int(raw.get("volume_decode_threads"))
+        ),
+        volume_sample_threads=(
+            None
+            if raw.get("volume_sample_threads") is None
+            else int(raw.get("volume_sample_threads"))
+        ),
+        volume_chunk_locality_fast_path=bool(
+            raw.get("volume_chunk_locality_fast_path", True)
+        ),
+        volume_collect_locality_stats=bool(
+            raw.get("volume_collect_locality_stats", False)
+        ),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
         config_dir=config_path.parent,
@@ -453,6 +483,10 @@ def _common_zarr_config(config: FiberTrace3DConfig) -> dict[str, Any]:
         "volume_cache_dir": config.volume_cache_dir,
         "volume_cache_memory_mib": config.volume_cache_memory_mib,
         "volume_io_threads": config.volume_io_threads,
+        "volume_decode_threads": config.volume_decode_threads,
+        "volume_sample_threads": config.volume_sample_threads,
+        "volume_chunk_locality_fast_path": config.volume_chunk_locality_fast_path,
+        "volume_collect_locality_stats": config.volume_collect_locality_stats,
         "volume_cache_offline": config.volume_cache_offline,
         "volume_cache_retry_seconds": config.volume_cache_retry_seconds,
         "_config_dir": str(config.config_dir) if config.config_dir is not None else None,
@@ -1010,6 +1044,91 @@ def _anisotropic_blur_3d(
     return out
 
 
+def apply_value_augmentation_3d(
+    config: FiberTrace3DConfig,
+    volume: torch.Tensor,
+    valid_mask: torch.Tensor,
+    params: _Augment3DParams,
+) -> torch.Tensor:
+    """Apply the shared value transform used by synchronous and queued loading."""
+    out = _normalize_image(volume, valid_mask, config.image_normalization)
+    if not config.augment_enabled:
+        return out
+    if params.contrast != 1.0:
+        center = out[valid_mask].mean() if bool(valid_mask.any()) else out.mean()
+        out = (out - center) * float(params.contrast) + center
+    if params.brightness != 0.0:
+        out = out + float(params.brightness)
+    if params.gamma != 1.0:
+        valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
+        lo = valid_values.min()
+        hi = valid_values.max()
+        scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
+        out = torch.pow(scaled, float(params.gamma)) * (hi - lo) + lo
+    if params.noise_std > 0.0:
+        gen = torch.Generator(device=out.device)
+        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
+        out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
+    if params.blur_sigma > 0.0:
+        sigma = float(params.blur_sigma)
+        radius = max(1, int(math.ceil(3.0 * sigma)))
+        coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=out.device)
+        kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel = kernel / kernel.sum().clamp_min(1.0e-12)
+        data = out.view(1, 1, *out.shape)
+        for axis in range(3):
+            shape = [1, 1, 1, 1, 1]
+            shape[2 + axis] = int(kernel.numel())
+            weight = kernel.view(*shape)
+            padding = [0, 0, 0, 0, 0, 0]
+            padding[(2 - axis) * 2] = radius
+            padding[(2 - axis) * 2 + 1] = radius
+            data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
+        out = data[0, 0]
+    if (
+        params.anisotropic_blur_axis_zyx is not None
+        and (
+            params.anisotropic_blur_sigma_along > 0.0
+            or params.anisotropic_blur_sigma_across > 0.0
+        )
+    ):
+        out = _anisotropic_blur_3d(
+            out,
+            axis_zyx=params.anisotropic_blur_axis_zyx,
+            sigma_along=float(params.anisotropic_blur_sigma_along),
+            sigma_across=float(params.anisotropic_blur_sigma_across),
+        )
+    return torch.where(valid_mask, out, torch.zeros_like(out))
+
+
+def augment_fiber_trace_3d_raw_sample(
+    config: FiberTrace3DConfig,
+    raw: FiberTrace3DRawSample,
+    *,
+    profile: bool = False,
+) -> FiberTrace3DSample:
+    """Finish a raw sample using the same stage-two path in every caller."""
+    started = time.perf_counter()
+    cpu_started = time.process_time()
+    sample = raw.sample
+    volume = apply_value_augmentation_3d(
+        config,
+        sample.volume[0],
+        sample.valid_mask[0],
+        raw.augmentation,
+    ).view_as(sample.volume)
+    augment_ms = (time.perf_counter() - started) * 1000.0
+    augment_cpu_ms = (time.process_time() - cpu_started) * 1000.0
+    timings = None
+    if profile:
+        timings = dict(sample.profile_timings_ms or {})
+        timings["value_augmentation_ms"] = augment_ms
+        timings["value_augmentation_cpu_ms"] = augment_cpu_ms
+        timings["sample_total_ms"] = float(raw.load_wall_ms) + augment_ms
+        timings["sample_cpu_ms"] = float(raw.load_cpu_ms) + augment_cpu_ms
+    return replace(sample, volume=volume, profile_timings_ms=timings)
+
+
 def _format_seconds(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     if seconds < 60.0:
@@ -1130,6 +1249,10 @@ class FiberTrace3DLoader:
                 cache_root=self.config.volume_cache_dir,
                 cache_budget_bytes=self.config.volume_cache_memory_bytes,
                 io_threads=self.config.volume_io_threads,
+                decode_threads=self.config.volume_decode_threads,
+                sample_threads=self.config.volume_sample_threads,
+                chunk_locality_fast_path=self.config.volume_chunk_locality_fast_path,
+                collect_locality_stats=self.config.volume_collect_locality_stats,
             )
             base_shape_zyx = _validate_dataset_manifest(
                 dataset_config,
@@ -1625,6 +1748,11 @@ class FiberTrace3DLoader:
         result = record.sampler.sample_coord_batch(coords_base, np.ascontiguousarray(valid))
         if profile_timings_ms is not None:
             profile_timings_ms["volume_sample_ms"] = (time.perf_counter() - start) * 1000.0
+            profile_timings_ms["coordinate_points"] = float(coords_base.size // 3)
+            profile_timings_ms["valid_coordinate_points"] = float(np.count_nonzero(valid))
+            for key, value in result.stats.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    profile_timings_ms[f"vc_{key}"] = float(value)
         start = time.perf_counter()
         sampled_np = np.asarray(result.image, dtype=np.float32)
         sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
@@ -1641,58 +1769,7 @@ class FiberTrace3DLoader:
         valid_mask: torch.Tensor,
         params: _Augment3DParams,
     ) -> torch.Tensor:
-        out = _normalize_image(volume, valid_mask, self.config.image_normalization)
-        if not self.config.augment_enabled:
-            return out
-        if params.contrast != 1.0:
-            if bool(valid_mask.any()):
-                center = out[valid_mask].mean()
-            else:
-                center = out.mean()
-            out = (out - center) * float(params.contrast) + center
-        if params.brightness != 0.0:
-            out = out + float(params.brightness)
-        if params.gamma != 1.0:
-            valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
-            lo = valid_values.min()
-            hi = valid_values.max()
-            scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-            out = torch.pow(scaled, float(params.gamma)) * (hi - lo) + lo
-        if params.noise_std > 0.0:
-            gen = torch.Generator(device=out.device)
-            gen.manual_seed(_stable_seed(self.config.seed, "value_noise", params.stream_index) % (2**63 - 1))
-            out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
-        if params.blur_sigma > 0.0:
-            # Conservative separable 3D blur. Kept simple for the first 3D path.
-            sigma = float(params.blur_sigma)
-            radius = max(1, int(math.ceil(3.0 * sigma)))
-            coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=out.device)
-            kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
-            kernel = kernel / kernel.sum().clamp_min(1.0e-12)
-            data = out.view(1, 1, *out.shape)
-            for axis in range(3):
-                shape = [1, 1, 1, 1, 1]
-                shape[2 + axis] = int(kernel.numel())
-                weight = kernel.view(*shape)
-                padding = [0, 0, 0, 0, 0, 0]
-                padding[(2 - axis) * 2] = radius
-                padding[(2 - axis) * 2 + 1] = radius
-                data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
-            out = data[0, 0]
-        if (
-            params.anisotropic_blur_axis_zyx is not None
-            and (
-                params.anisotropic_blur_sigma_along > 0.0
-                or params.anisotropic_blur_sigma_across > 0.0
-            )
-        ):
-            out = _anisotropic_blur_3d(
-                out,
-                axis_zyx=params.anisotropic_blur_axis_zyx,
-                sigma_along=float(params.anisotropic_blur_sigma_along),
-                sigma_across=float(params.anisotropic_blur_sigma_across),
-            )
-        return torch.where(valid_mask, out, torch.zeros_like(out))
+        return apply_value_augmentation_3d(self.config, volume, valid_mask, params)
 
     def _line_window_for_labels(
         self,
@@ -1893,7 +1970,7 @@ class FiberTrace3DLoader:
             self._target_tangent_output_zyx(record, cp_index, params),
         )
 
-    def load_sample(
+    def load_raw_sample(
         self,
         sample_index: int,
         *,
@@ -1901,7 +1978,7 @@ class FiberTrace3DLoader:
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
         profile: bool = False,
-    ) -> FiberTrace3DSample:
+    ) -> FiberTrace3DRawSample:
         stream_index = int(sample_index)
         total_start = time.perf_counter()
         cpu_total_start = time.process_time()
@@ -1936,10 +2013,6 @@ class FiberTrace3DLoader:
         if timings is not None:
             timings["sample_volume_total_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        volume = self._apply_value_augmentation(volume, valid, params)
-        if timings is not None:
-            timings["value_augmentation_ms"] = (time.perf_counter() - start) * 1000.0
-        start = time.perf_counter()
         (
             target_mode,
             segment_starts,
@@ -1955,9 +2028,12 @@ class FiberTrace3DLoader:
         )
         if timings is not None:
             timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
-            timings["sample_total_ms"] = (time.perf_counter() - total_start) * 1000.0
-            timings["sample_cpu_ms"] = (time.process_time() - cpu_total_start) * 1000.0
-        return FiberTrace3DSample(
+        load_wall_ms = (time.perf_counter() - total_start) * 1000.0
+        load_cpu_ms = (time.process_time() - cpu_total_start) * 1000.0
+        if timings is not None:
+            timings["raw_sample_total_ms"] = load_wall_ms
+            timings["raw_sample_cpu_ms"] = load_cpu_ms
+        sample = FiberTrace3DSample(
             stream_index=stream_index,
             data_index=int(data_index),
             record_index=int(record_index),
@@ -1997,6 +2073,38 @@ class FiberTrace3DLoader:
             ),
             profile_timings_ms=timings,
         )
+        return FiberTrace3DRawSample(
+            sample=sample,
+            augmentation=params,
+            load_wall_ms=load_wall_ms,
+            load_cpu_ms=load_cpu_ms,
+        )
+
+    def augment_raw_sample(
+        self,
+        raw: FiberTrace3DRawSample,
+        *,
+        profile: bool = False,
+    ) -> FiberTrace3DSample:
+        return augment_fiber_trace_3d_raw_sample(self.config, raw, profile=profile)
+
+    def load_sample(
+        self,
+        sample_index: int,
+        *,
+        sample_index_limit: int | None = None,
+        sample_mode: str = "random",
+        device: torch.device | str = "cpu",
+        profile: bool = False,
+    ) -> FiberTrace3DSample:
+        raw = self.load_raw_sample(
+            sample_index,
+            sample_index_limit=sample_index_limit,
+            sample_mode=sample_mode,
+            device=device,
+            profile=profile,
+        )
+        return self.augment_raw_sample(raw, profile=profile)
 
     def load_batch(
         self,
@@ -2562,6 +2670,22 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         volume_cache_memory_mib=_parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib")),
         volume_io_threads=(
             None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
+        ),
+        volume_decode_threads=(
+            None
+            if raw.get("volume_decode_threads") is None
+            else int(raw.get("volume_decode_threads"))
+        ),
+        volume_sample_threads=(
+            None
+            if raw.get("volume_sample_threads") is None
+            else int(raw.get("volume_sample_threads"))
+        ),
+        volume_chunk_locality_fast_path=bool(
+            raw.get("volume_chunk_locality_fast_path", True)
+        ),
+        volume_collect_locality_stats=bool(
+            raw.get("volume_collect_locality_stats", False)
         ),
         config_dir=config_dir,
     )

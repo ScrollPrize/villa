@@ -226,8 +226,10 @@ all resident data. Decreasing capacity evicts globally oldest decoded entries,
 but queued and running probe/read/decode work drains normally; a completion is
 accounted and then subjected to the new ceiling. C++ callers configure the
 process service directly. Python callers use
-`vc.set_chunk_cache_budget(bytes)` and
-`vc.set_chunk_cache_io_threads(count)`; no per-volume cache-policy API exists.
+`vc.set_chunk_cache_budget(bytes)`, `vc.set_chunk_cache_io_threads(count)`, and
+`vc.set_chunk_cache_decode_threads(count)`; no per-volume cache-policy API
+exists. The two thread controls independently limit source-read and decoded-
+chunk work admission. Persistent-cache probing retains its separate pool.
 
 Changing the current volume drops viewer references but keeps the `Volume`'s
 lightweight source handle and service state, so switching A -> B -> A neither
