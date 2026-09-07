@@ -1255,8 +1255,16 @@ class FitContext:
         # patches place a point on a winding. Saying so is worth one line: a
         # run with neither still converges and writes a normal-looking
         # checkpoint.
-        if not self.tracks_dbm_path and not self.verified_patches_path \
-                and not self.unverified_patches_path:
+        # Existence again, not just the resolved string: with the toggle on,
+        # verified_patches_path is set to the conventional directory whether or
+        # not that directory is there, so testing the path alone would make
+        # this branch unreachable.
+        placing_inputs = [
+            path for path in (self.tracks_dbm_path,
+                              self.verified_patches_path,
+                              self.unverified_patches_path)
+            if path and os.path.exists(path)]
+        if not placing_inputs:
             print('WARNING: no winding-placing input is active (tracks and '
                   'patches are all off or absent). Normals and fibers supply '
                   'orientation only, so the winding assignment will rest on '
