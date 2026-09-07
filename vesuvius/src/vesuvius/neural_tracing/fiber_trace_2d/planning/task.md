@@ -54,3 +54,10 @@ inspect the existing render sampler for other exact, portable fast paths.
 Target coordinate generation and requested-level sampling capacity is at least
 20 samples/s each so their serial composition can sustain 10 samples/s. Do not
 use GPUs while they remain allocated to other work.
+
+Authorized next optimization: replace eager full-volume coordinate-map
+intermediates with cache-local fused generation from the affine augmentation
+metadata and low-resolution smooth-displacement controls. Preserve the exact
+coordinate, validity, dependency and sampling contracts; retain the current
+path as a matched oracle until equivalence is demonstrated. Profile the current
+generator's individual operations first and keep all work CPU-only.

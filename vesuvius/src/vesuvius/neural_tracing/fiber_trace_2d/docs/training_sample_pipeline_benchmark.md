@@ -172,3 +172,39 @@ not sufficient: coordinate-map generation alone consumed 1,468 summed worker
 seconds and slowed to 1.40 samples/service-second under host-wide contention.
 It accounts for about 59% of total raw worker service in this run and is the
 next loading optimization target.
+
+## Coordinate-generation substage profile
+
+A one-worker raw-only run profiled 128 measured S1a samples after 32 warmup
+with all native limits at one and GPUs hidden. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_132508_129751/result.json`.
+The eager generator sustained 6.17 coordinate maps/service-second and the full
+raw loader sustained 2.88 samples/s. Smooth displacement is selected for 50%
+of this stream, producing a bimodal geometry distribution: geometry p50 was
+36.6ms while p95 was 320.0ms. Smooth interpolation cost 136.0ms/sample on
+average; the later full-map validity scan cost another 44.3ms/sample.
+
+An exact cache-local candidate split the Z dimension into 16 eight-slice tiles
+while retaining the same Torch operations and final coordinate map. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_133140_083423/result.json`.
+It was bitwise-identical to eager generation in tests for smooth modes
+none/1d/2d/3d and tile depths 1/3/8. Geometry capacity improved from 6.17 to
+8.23 maps/s, and full raw loading from 2.88 to 3.23 samples/s (+12.0%). This is
+a safe intermediate result, not yet the planned implicit native fusion.
+
+The matched 128-loader depth-eight run reached 111.71 samples/s end-to-end,
+versus 93.76 samples/s eager (+19.1%). Mean geometry time fell from 716.7ms to
+541.9ms and mean complete raw service from 1,205.4ms to 1,050.5ms. All 128
+workers participated. Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_133508_256805/result.json`.
+The remaining 221-samples/s target requires deeper fusion; tiling alone does
+not remove the final coordinate map, scale pass or validity scan.
+
+Fusing the unchanged NumPy selected-to-base multiplication and validity checks
+into each hot eight-slice tile reached 116.53 samples/s (+4.3% over tiling,
++24.3% over eager). It eliminated the later full-map conversion/validity
+passes; validity service fell from 126.3ms to 84.8ms under 128-way contention.
+Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260907_133912_525705/result.json`.
+The final base-coordinate map is still materialized for the current sampler;
+removing that map requires the planned shared implicit coordinate provider.

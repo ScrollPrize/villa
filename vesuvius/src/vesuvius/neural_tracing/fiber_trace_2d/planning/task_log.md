@@ -116,3 +116,16 @@ Loader-worker follow-up:
   loaders with no augmentation: 93.76 samples/s end-to-end over 2,048 S1a
   samples, all workers used, 116.1 mean CPU cores. Coordinate-map generation is
   now the dominant scaling bottleneck.
+- User authorized cache-local fusion of affine coordinate generation and
+  low-resolution smooth-control interpolation. Planning retains the eager path
+  as an exact oracle and avoids materializing full coordinate intermediates.
+- Eager one-worker profile: geometry 6.17 maps/s, raw loading 2.88 samples/s;
+  smooth interpolation averages 136ms and the separate validity scan 44ms.
+  Eight-slice cache-local generation is bitwise-identical in focused tests and
+  improves geometry to 8.23 maps/s and raw loading to 3.23 samples/s.
+- At 128 loaders the same depth-eight candidate improves end-to-end raw
+  throughput 93.76 to 111.71 samples/s (+19.1%) and mean geometry 716.7 to
+  541.9ms, but remains below the 221-samples/s target.
+- Fusing exact scale/validity work into the hot coordinate tiles reaches 116.53
+  samples/s (+24.3% over eager); the remaining final coordinate map requires
+  the shared implicit-provider sampler change.

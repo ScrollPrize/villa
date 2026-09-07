@@ -323,6 +323,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="measure production locality path without per-point diagnostic counters",
     )
+    parser.add_argument(
+        "--geometry-tile-depth",
+        type=int,
+        default=0,
+        help="override cache-local coordinate-generation Z depth; 0 preserves the config",
+    )
     parser.add_argument("--multiprocessing-context", choices=("spawn", "forkserver"), default="forkserver")
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--no-progress-timeout-seconds", type=float, default=300.0)
@@ -351,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             args.volume_io_threads,
             args.volume_decode_threads,
             args.volume_sample_threads,
+            args.geometry_tile_depth,
         )
     ):
         raise ValueError("volume I/O/decode/sample thread overrides must be >= 0")
@@ -371,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
     config_payload["volume_collect_locality_stats"] = not bool(
         args.disable_locality_stats
     )
+    if int(args.geometry_tile_depth) > 0:
+        config_payload["geometry_tile_depth"] = int(args.geometry_tile_depth)
     batch_size = int(config_payload.get("batch_size", 1))
     if batch_size <= 0:
         raise ValueError("config batch_size must be > 0")

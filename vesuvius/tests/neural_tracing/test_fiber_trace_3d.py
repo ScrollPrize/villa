@@ -1816,6 +1816,73 @@ def test_smooth_displacement_modes_are_deterministic_and_finite() -> None:
         assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
 
 
+@pytest.mark.parametrize("mode", ("none", "1d", "2d", "3d"))
+@pytest.mark.parametrize("tile_depth", (1, 3, 8))
+def test_tiled_geometry_is_bitwise_identical_to_eager_geometry(
+    mode: str, tile_depth: int
+) -> None:
+    common = {
+        "augment_smooth_displacement_mode": mode,
+        "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
+        "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
+        "augment_smooth_displacement_probability": 1.0,
+    }
+    eager = _loader_with_mapping(common)
+    tiled = _loader_with_mapping({**common, "geometry_tile_depth": tile_depth})
+    record, _record_index, cp_index = eager.descriptor_for_sample_index(2)
+    params = eager._sample_augment_params(record, cp_index, 2)
+
+    eager_geometry = eager._build_geometry_maps(params, device=torch.device("cpu"))
+    tiled_geometry = tiled._build_geometry_maps(params, device=torch.device("cpu"))
+
+    assert torch.equal(
+        tiled_geometry.backward_source_zyx,
+        eager_geometry.backward_source_zyx,
+    )
+
+    fused_geometry = tiled._build_geometry_maps(
+        params,
+        device=torch.device("cpu"),
+        volume_spacing_base=float(record.volume_spacing_base),
+        base_shape_zyx=record.base_shape_zyx,
+    )
+    assert eager_geometry.backward_source_zyx is not None
+    expected_base = np.ascontiguousarray(
+        eager_geometry.backward_source_zyx.numpy() * float(record.volume_spacing_base)
+    )
+    base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
+    expected_valid = np.isfinite(expected_base).all(axis=-1)
+    for axis in range(3):
+        expected_valid &= (expected_base[..., axis] >= 0.0) & (
+            expected_base[..., axis] <= float(base_shape[axis] - 1.0)
+        )
+    assert fused_geometry.backward_source_zyx is None
+    assert np.array_equal(fused_geometry.backward_source_base_zyx, expected_base)
+    assert np.array_equal(fused_geometry.valid_base, expected_valid)
+
+
+def test_tiled_geometry_is_bitwise_identical_for_training_patch_shape() -> None:
+    common = {
+        "patch_shape_zyx": [128, 128, 128],
+        "augment_smooth_displacement_mode": "3d",
+        "augment_smooth_displacement_amplitude_zyx": [2.0, 2.0, 2.0],
+        "augment_smooth_displacement_control_spacing_zyx": [16.0, 16.0, 16.0],
+        "augment_smooth_displacement_probability": 1.0,
+    }
+    eager = _loader_with_mapping(common)
+    tiled = _loader_with_mapping({**common, "geometry_tile_depth": 8})
+    record, _record_index, cp_index = eager.descriptor_for_sample_index(2)
+    params = eager._sample_augment_params(record, cp_index, 2)
+
+    eager_geometry = eager._build_geometry_maps(params, device=torch.device("cpu"))
+    tiled_geometry = tiled._build_geometry_maps(params, device=torch.device("cpu"))
+
+    assert torch.equal(
+        tiled_geometry.backward_source_zyx,
+        eager_geometry.backward_source_zyx,
+    )
+
+
 def test_anisotropic_blur_spreads_along_configured_axis() -> None:
     volume = torch.zeros((9, 9, 9), dtype=torch.float32)
     volume[4, 4, 4] = 1.0

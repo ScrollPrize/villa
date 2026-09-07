@@ -84,6 +84,7 @@ class FiberTrace3DConfig:
     augment_anisotropic_blur_orientation: str = "fiber"
     augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
+    geometry_tile_depth: int = 0
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
@@ -146,8 +147,10 @@ class _Augment3DParams:
 
 @dataclass(frozen=True)
 class _GeometryMaps3D:
-    backward_source_zyx: torch.Tensor
+    backward_source_zyx: torch.Tensor | None
     params: _Augment3DParams
+    backward_source_base_zyx: np.ndarray | None = None
+    valid_base: np.ndarray | None = None
 
 
 @dataclass
@@ -446,6 +449,7 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
             raw.get("augment_anisotropic_blur_roll_degrees", 0.0)
         ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
+        geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),
@@ -1172,6 +1176,8 @@ class FiberTrace3DLoader:
             raise ValueError("augment_smooth_displacement_amplitude_zyx values must be >= 0")
         if any(v <= 0.0 for v in config.augment_smooth_displacement_control_spacing_zyx):
             raise ValueError("augment_smooth_displacement_control_spacing_zyx values must be > 0")
+        if int(config.geometry_tile_depth) < 0:
+            raise ValueError("geometry_tile_depth must be >= 0")
         if not (0.0 <= config.augment_smooth_displacement_probability <= 1.0):
             raise ValueError("augment_smooth_displacement_probability must be in [0,1]")
         if not (0.0 <= config.augment_anisotropic_blur_probability <= 1.0):
@@ -1670,21 +1676,104 @@ class FiberTrace3DLoader:
         device: torch.device,
         forward_start_zyx: np.ndarray | None = None,
         forward_end_zyx: np.ndarray | None = None,
+        profile_timings_ms: dict[str, float] | None = None,
+        volume_spacing_base: float | None = None,
+        base_shape_zyx: tuple[int, int, int] | None = None,
     ) -> _GeometryMaps3D:
         del forward_start_zyx, forward_end_zyx
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
-        local = _zyx_grid(patch_shape, device=device)
+
+        def record(name: str, started: float) -> None:
+            if profile_timings_ms is not None:
+                profile_timings_ms[name] = profile_timings_ms.get(name, 0.0) + (
+                    time.perf_counter() - started
+                ) * 1000.0
+
+        start = time.perf_counter()
         cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
         cp_volume = torch.as_tensor(params.cp_volume_zyx, dtype=torch.float32, device=device)
         inv_matrix = torch.as_tensor(params.output_to_source_zyx, dtype=torch.float32, device=device)
-        rel_output = local - cp_local.view(1, 1, 1, 3)
-        rel_aug = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
+        record("geometry_metadata_ms", start)
+        start = time.perf_counter()
         controls = _smooth_control_tensors(params.smooth, device=device)
-        rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth, controls)
-        backward_source = cp_volume.view(1, 1, 1, 3) + rel_source
+        record("geometry_controls_ms", start)
+
+        requested_depth = int(self.config.geometry_tile_depth)
+        tile_depth = patch_shape[0] if requested_depth <= 0 else min(
+            requested_depth, patch_shape[0]
+        )
+        tiled = tile_depth < patch_shape[0]
+        fuse_sampling_maps = tiled and volume_spacing_base is not None and base_shape_zyx is not None
+        backward_source = (
+            torch.empty((*patch_shape, 3), dtype=torch.float32, device=device)
+            if tiled and not fuse_sampling_maps
+            else None
+        )
+        coords_base = (
+            np.empty((*patch_shape, 3), dtype=np.float32) if fuse_sampling_maps else None
+        )
+        valid_base = np.empty(patch_shape, dtype=np.bool_) if fuse_sampling_maps else None
+        base_shape = (
+            np.asarray(base_shape_zyx, dtype=np.float32) if fuse_sampling_maps else None
+        )
+        for z0 in range(0, patch_shape[0], tile_depth):
+            z1 = min(z0 + tile_depth, patch_shape[0])
+            tile_shape = (z1 - z0, patch_shape[1], patch_shape[2])
+            start = time.perf_counter()
+            local = _zyx_grid(tile_shape, device=device)
+            if z0:
+                local[..., 0].add_(float(z0))
+            record("geometry_grid_ms", start)
+            start = time.perf_counter()
+            rel_output = local - cp_local.view(1, 1, 1, 3)
+            record("geometry_center_ms", start)
+            start = time.perf_counter()
+            rel_aug = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
+            record("geometry_affine_ms", start)
+            start = time.perf_counter()
+            rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth, controls)
+            record("geometry_smooth_ms", start)
+            start = time.perf_counter()
+            translated = cp_volume.view(1, 1, 1, 3) + rel_source
+            record("geometry_translate_ms", start)
+            if fuse_sampling_maps:
+                assert coords_base is not None and valid_base is not None and base_shape is not None
+                start_fused = time.perf_counter()
+                tile_base = coords_base[z0:z1]
+                np.multiply(
+                    translated.detach().cpu().numpy(),
+                    float(volume_spacing_base),
+                    out=tile_base,
+                )
+                record("geometry_scale_ms", start_fused)
+                start_fused = time.perf_counter()
+                tile_valid = np.isfinite(tile_base).all(axis=-1)
+                tile_valid &= (tile_base[..., 0] >= 0.0) & (
+                    tile_base[..., 0] <= float(base_shape[0] - 1.0)
+                )
+                tile_valid &= (tile_base[..., 1] >= 0.0) & (
+                    tile_base[..., 1] <= float(base_shape[1] - 1.0)
+                )
+                tile_valid &= (tile_base[..., 2] >= 0.0) & (
+                    tile_base[..., 2] <= float(base_shape[2] - 1.0)
+                )
+                valid_base[z0:z1] = tile_valid
+                record("geometry_valid_ms", start_fused)
+            elif tiled:
+                assert backward_source is not None
+                backward_source[z0:z1].copy_(translated)
+            else:
+                backward_source = translated
+        assert backward_source is not None or coords_base is not None
+        if profile_timings_ms is not None:
+            profile_timings_ms["geometry_tiles"] = float(
+                math.ceil(patch_shape[0] / tile_depth)
+            )
         return _GeometryMaps3D(
             backward_source_zyx=backward_source,
             params=params,
+            backward_source_base_zyx=coords_base,
+            valid_base=valid_base,
         )
 
     def _source_points_to_output_np(
@@ -1730,18 +1819,29 @@ class FiberTrace3DLoader:
         profile_timings_ms: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         start = time.perf_counter()
-        coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(np.float32)
-        coords_base = np.ascontiguousarray(coords_selected * float(record.volume_spacing_base))
+        if geometry.backward_source_base_zyx is not None:
+            coords_base = geometry.backward_source_base_zyx
+        else:
+            assert geometry.backward_source_zyx is not None
+            coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(
+                np.float32, copy=False
+            )
+            coords_base = np.ascontiguousarray(
+                coords_selected * float(record.volume_spacing_base)
+            )
         if profile_timings_ms is not None:
             profile_timings_ms["coord_to_numpy_ms"] = (
                 time.perf_counter() - start
             ) * 1000.0
         start = time.perf_counter()
-        base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
-        valid = np.isfinite(coords_base).all(axis=-1)
-        valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
-        valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
-        valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
+        if geometry.valid_base is not None:
+            valid = geometry.valid_base
+        else:
+            base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
+            valid = np.isfinite(coords_base).all(axis=-1)
+            valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
+            valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
+            valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
         if profile_timings_ms is not None:
             profile_timings_ms["coord_valid_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
@@ -2000,6 +2100,9 @@ class FiberTrace3DLoader:
         geometry = self._build_geometry_maps(
             params,
             device=resolved_device,
+            profile_timings_ms=timings,
+            volume_spacing_base=float(record.volume_spacing_base),
+            base_shape_zyx=record.base_shape_zyx,
         )
         if timings is not None:
             timings["geometry_ms"] = (time.perf_counter() - start) * 1000.0
@@ -2661,6 +2764,7 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         ),
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
+        geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),

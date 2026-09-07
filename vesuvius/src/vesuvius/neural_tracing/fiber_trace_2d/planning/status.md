@@ -24,3 +24,6 @@
 - [x] Implement shared footprint reuse and pinned single-chunk fast paths.
 - [x] Verify exact outputs and run the CPU-only S1a before/after benchmark.
 - [ ] Evaluate optimizations against quality per hour.
+- [x] Profile eager coordinate-generation operations independently.
+- [ ] Implement shared cache-local implicit coordinate evaluation.
+- [ ] Verify exact eager/fused equivalence and benchmark 1/128 workers.

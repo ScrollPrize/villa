@@ -218,6 +218,55 @@ benchmark.
 Record the exact requested-level dependency and pinned-gather acceleration once
 validated.
 
+## Cache-local fused coordinate generation
+
+- Profile `_build_geometry_maps` independently on deterministic S1a samples,
+  separating grid creation, metadata conversion, centering, affine mapping,
+  smooth-control interpolation, final translation, NumPy conversion/scaling,
+  and validity generation. Report allocations/bytes where available and
+  mean/p50/p95 service times with one native worker and no GPU.
+- Add one reusable native implicit-grid descriptor containing output shape,
+  float32 centers and inverse affine, selected-to-base scale/base shape, and
+  smooth mode/control arrays/origin/spacing. Both requested-level dependency
+  discovery and pinned sampling must consume one shared coordinate evaluator;
+  do not copy Fiber augmentation math into independent implementations.
+- Evaluate coordinates directly in traversal order. The initial implementation
+  may recompute each coordinate in the dependency and sampling passes rather
+  than storing a full 128^3x3 map. Smooth controls are small and remain
+  cache-resident; only final sampled values and coverage are materialized.
+- Preserve the current sequential inverse-smooth component order for 3D,
+  float32 casts and operation order, affine convention, selected/base scaling,
+  finite/bounds checks, missing behavior, deterministic partitions and target
+  metadata. Do not algebraically combine selected-to-base scaling with the
+  renderer transform. Keep the eager path as an explicit runtime
+  reference/fallback.
+- Treat Torch `einsum` reduction/contraction and division rounding as explicit
+  exactness risks. Compare generated coordinate bits before sampling as well as
+  final bytes. Keep Fiber-specific smooth math in its coordinate provider and
+  parameterize the existing shared dependency/pinned traversal rather than
+  creating another sampler implementation.
+- Default-enable only after reference/optimized comparisons establish identical
+  sampled bytes, coverage, dependency sets and metadata across smooth modes
+  none/1d/2d/3d, nontrivial affine/scale, borders, missing chunks and
+  non-power-of-two chunk shapes, singleton control axes, origin/last-voxel and
+  NaN/Inf cases. Do not use fast math or GPU resources. Unverified compiler/
+  architecture combinations retain the eager default rather than silently
+  changing numerics.
+- Measure cheaper stages independently before implicit recomputation: remove
+  the redundant float32 CPU `astype` copy, then fuse selected-to-base scaling,
+  validity and coordinate-layout conversion around the existing final Torch
+  map. Compare that retained-map approach and bounded coordinate tiles against
+  evaluating smooth coordinates twice.
+- Benchmark one worker and the same 128-process raw-only workload. Attribute
+  the change to coordinate work, queue/IPC and total raw throughput; record
+  mean/p50/p95 and memory/residency limitations.
+
+### Spec and documentation updates
+
+Document the implicit-coordinate contract, reference fallback, exactness tests,
+commands, artifacts and before/after results. Record any unmet 221-samples/s
+global target explicitly.
+
 ## Two-GPU measurement implementation (authorized continuation)
 - Add opt-in per-rank JSONL iteration/stage wall timers and bounded CPU/CUDA
   profiler traces to the real trainer. Record enqueue scopes accurately; do not
