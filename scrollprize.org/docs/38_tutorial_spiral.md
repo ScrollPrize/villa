@@ -121,6 +121,14 @@ re-running rclone resumes interrupted downloads. The dataset contains verified a
 Configuration is straightforward: the input paths and fitting region are plain variables at the top of `fit_spiral.py`. Edit them to point at your download:
 
 - `dataset_path` — the root of the dataset; the per-input paths below it (`verified_patches_path`, `unverified_patches_path`, `pcl_json_paths`, `fibers_path`, `shell_path`, `tracks_dbm_path`, the normals/grad-mag zarr paths, …) default to locations inside it. Set any of them to `None` to fit without that input.
+- **`input_use_*` — whether an input that is present is actually used.** Each optional input has a toggle in `default_config`, independent of whether its file is there. `input_use_tracks` has defaulted to `false` since [#1651](https://github.com/ScrollPrize/villa/pull/1651), so a dataset that ships a tracks DBM will not use it unless you say so:
+
+  ```
+  FIT_SPIRAL_CONFIG_OVERRIDES='{"input_use_tracks": true, ...}'
+  ```
+
+  This matters most on scrolls whose only published supervision is tracks, which is the case for most of the Grand-Prize-eligible ones: with tracks off and no verified patches, nothing left in the fit places a point on a winding — normals give orientation, and two adjacent windings have parallel normals. The fit still converges and writes a normal-looking checkpoint. See [#1716](https://github.com/ScrollPrize/villa/issues/1716).
+
 - `z_begin, z_end` — the slice range (in full-resolution voxels) to fit. **Consider starting with a small range**: the whole written region of Scroll 1 is roughly z 4,000–17,000, and fitting all of it needs a lot of GPU memory (around 60 GB). A ~1,000-slice range is a good first run on a smaller GPU. Per-step sample counts are scaled automatically to the size of the z-range, so hyperparameters don't need retuning when you change it.
 
 Everything else — loss weights, resolutions, step counts — lives in the `default_config` dict just below, with one entry per knob. You can override any of them without editing the file via a JSON environment variable, and a few other environment variables control the run:
