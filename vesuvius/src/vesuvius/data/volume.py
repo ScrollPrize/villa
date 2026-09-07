@@ -579,7 +579,11 @@ class Volume:
         if not self.configs or not os.path.exists(self.configs):
             return None
         with open(self.configs, 'r') as file:
-            config_data: Dict = yaml.safe_load(file) or {}
+            config_data: Dict = yaml.safe_load(file)
+        if not config_data:
+            # Same complaint get_url_from_yaml already makes, raised here so an
+            # empty config is not reported as a missing segment.
+            raise ValueError(f"Config file {self.configs} is empty or invalid YAML.")
 
         target = str(self.segment_id)
         for scroll_id, energies in config_data.items():

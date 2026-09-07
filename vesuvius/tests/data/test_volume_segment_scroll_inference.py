@@ -140,3 +140,13 @@ def test_explicit_scroll_id_is_not_overridden_by_inference(monkeypatch):
                  normalization_scheme="none")
 
     assert vol.scroll_id == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", ["", "\n", "null\n"])
+def test_empty_config_is_reported_as_a_config_problem(tmp_path, body):
+    """An empty config is a config problem, not a missing segment."""
+    path = tmp_path / "scrolls.yaml"
+    path.write_text(body)
+    with pytest.raises(ValueError, match="empty or invalid YAML"):
+        _probe(20230827161847, path)._infer_scroll_from_segment()
