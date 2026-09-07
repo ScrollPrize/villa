@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import socket
+import tempfile
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -4401,7 +4402,10 @@ def run_prefetch(
     summaries: dict[str, Any] = {"train": summary}
     if raw_config.get("test_datasets") and (prefetch_steps == 0 or prefetch_steps is None):
         test_raw = _make_test_loader_raw_config(raw_config, training)
-        tmp_path = Path("/tmp") / f"fiber_trace_3d_prefetch_test_{int(time.time() * 1000)}.json"
+        tmp_path = (
+            Path(tempfile.gettempdir())
+            / f"fiber_trace_3d_prefetch_test_{int(time.time() * 1000)}.json"
+        )
         tmp_path.write_text(json.dumps(_json_safe(test_raw)), encoding="utf-8")
         try:
             test_loader = FiberTrace3DLoader(load_config(tmp_path))

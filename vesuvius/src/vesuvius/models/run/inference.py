@@ -11,6 +11,7 @@ except ImportError:  # pragma: no cover - Windows has no fcntl
 import hashlib
 import multiprocessing
 import subprocess
+import tempfile
 import threading
 import fsspec
 import numcodecs
@@ -240,7 +241,10 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
         return self._collapse(self.network(*args, **kwargs))
 
 
-DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
+DEFAULT_MODEL_CACHE_DIR = os.environ.get(
+    'VESUVIUS_MODEL_CACHE_DIR',
+    os.path.join(tempfile.gettempdir(), 'vesuvius-models'),
+)
 
 
 def _lock_file_exclusive(fh):
