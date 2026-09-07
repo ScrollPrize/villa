@@ -125,15 +125,11 @@ bool cancelled(const std::atomic<bool>* cancelFlag)
     return cancelFlag && cancelFlag->load(std::memory_order_acquire);
 }
 
-std::filesystem::path markerDirectoryForLayout(
-    const std::filesystem::path& cacheDir,
-    vc::render::PersistentCacheLayout layout)
+std::filesystem::path markerDirectoryForCache(
+    const std::filesystem::path& cacheDir)
 {
-    if (layout == vc::render::PersistentCacheLayout::ZarrMirror) {
-        return cacheDir.parent_path() / ".vc_cache_bookkeeping" /
-               cacheDir.filename();
-    }
-    return cacheDir;
+    return cacheDir.parent_path() / ".vc_cache_bookkeeping" /
+           cacheDir.filename();
 }
 
 } // namespace
@@ -300,20 +296,7 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
             return result;
         }
 
-        std::vector<vc::render::ChunkKey> requests;
-        if (cache->persistentCacheLayout() ==
-            vc::render::PersistentCacheLayout::ZarrMirror) {
-            requests = cache->storageObjectRepresentatives(level);
-        } else {
-            const auto grid = volume->chunkGridShape(level);
-            requests.reserve(chunkCountForGrid(grid));
-            for (int iz = 0; iz < grid[0]; ++iz) {
-                for (int iy = 0; iy < grid[1]; ++iy) {
-                    for (int ix = 0; ix < grid[2]; ++ix)
-                        requests.push_back({level, iz, iy, ix});
-                }
-            }
-        }
+        auto requests = cache->storageObjectRepresentatives(level);
         result.totalChunks = requests.size();
         if (result.totalChunks == 0) {
             result.status = OpenDataVolumePrefillResult::Status::Skipped;
@@ -323,8 +306,7 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
 
         auto markerInfo = markerInfoForVolume(*volume, level);
         markerInfo.totalChunks = result.totalChunks;
-        const auto markerDir = markerDirectoryForLayout(
-            result.cacheDir, cache->persistentCacheLayout());
+        const auto markerDir = markerDirectoryForCache(result.cacheDir);
         if (openDataVolumePrefillMarkerMatches(markerDir, markerInfo)) {
             result.status = OpenDataVolumePrefillResult::Status::Skipped;
             result.resolvedChunks = result.totalChunks;
@@ -332,11 +314,8 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
             return result;
         }
 
-        // Keep several chunks in different pipeline stages at once: remote
-        // fetch, source decode, Delta3D compression, and the single ordered
-        // writer. The cap bounds retained payload memory while still allowing
-        // the cache service and its two compression workers to make progress in
-        // parallel.
+        // Keep several source-object downloads in flight while bounding
+        // retained payload memory.
         const auto fetchConcurrency =
             vc::render::processChunkCacheService()->fetchConcurrency();
         const std::size_t workerCount = std::min<std::size_t>(
@@ -397,7 +376,6 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
         for (auto& future : workers)
             future.get();
 
-        cache->waitForPersistentWrites();
         if (cancelled(cancelFlag) &&
             result.resolvedChunks < result.totalChunks) {
             result.status = OpenDataVolumePrefillResult::Status::Cancelled;

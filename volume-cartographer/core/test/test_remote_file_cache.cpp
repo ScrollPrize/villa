@@ -190,6 +190,12 @@ TEST_CASE("remote file cache mirrors readable source paths")
     CHECK(vc::core::util::remoteFileCacheSource(
               "s3://bucket/run/file.json?token=secret#fragment") ==
           "s3://bucket/run/file.json");
+    CHECK(vc::core::util::remoteZarrMirrorPath(
+              "https://example.test/volumes/scan.zarr?token=secret") ==
+          fs::path("mirror/https/example.test/volumes/scan.zarr"));
+    CHECK(vc::core::util::remoteZarrMirrorPath(
+              "s3://bucket/volumes/scan.zarr#vc-base-scale=2") ==
+          fs::path("mirror/s3/bucket/volumes/scan.zarr"));
     CHECK_THROWS_AS(
         vc::core::util::remoteFileCachePath(
             "https://example.test/run/../file.json"),

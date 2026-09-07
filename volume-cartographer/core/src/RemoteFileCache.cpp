@@ -317,7 +317,9 @@ std::string remoteFileCacheSource(std::string_view sourceLocation)
     return source;
 }
 
-std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
+static std::filesystem::path remoteSourcePath(
+    std::string_view sourceLocation,
+    std::string_view namespaceDirectory)
 {
     const auto source = remoteFileCacheSource(sourceLocation);
     const auto schemeEnd = source.find("://");
@@ -347,7 +349,7 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
     if (!validComponent(authority))
         throw std::invalid_argument("remote file cache source has an invalid authority");
 
-    std::filesystem::path result = "remote_sources";
+    std::filesystem::path result{namespaceDirectory};
     result /= scheme;
     result /= authority;
     if (pathStart == std::string::npos || pathStart + 1 == source.size())
@@ -365,6 +367,16 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
         remaining.remove_prefix(slash + 1);
     }
     return result;
+}
+
+std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
+{
+    return remoteSourcePath(sourceLocation, "remote_sources");
+}
+
+std::filesystem::path remoteZarrMirrorPath(std::string_view sourceLocation)
+{
+    return remoteSourcePath(sourceLocation, "mirror");
 }
 
 RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options)

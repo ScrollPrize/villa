@@ -13,8 +13,6 @@
 
 namespace vc::render {
 
-inline constexpr std::string_view kPersistentSourcePayloadExtension = ".source";
-
 // Zarr store keys are relative slash-separated object names. Reject platform
 // roots, empty components, and traversal before joining them to a cache root.
 inline bool isSafeZarrStoreKey(std::string_view key) noexcept
@@ -78,8 +76,6 @@ enum class ChunkFetchStatus {
 struct ChunkFetchResult {
     ChunkFetchStatus status = ChunkFetchStatus::Missing;
     std::vector<std::byte> bytes;
-    std::vector<std::byte> persistentBytes;
-    bool hasPersistentBytes = false;
     // An independent exact-source write owns persistence for this fetch.
     bool persistentWriteHandled = false;
     int httpStatus = 0;
@@ -144,18 +140,12 @@ public:
         return fetched;
     }
 
-    virtual std::string persistentCacheExtension(const ChunkKey&) const
-    {
-        return ".bin";
-    }
-
     virtual std::optional<std::string> sourceChunkKey(const ChunkKey&) const
     {
         return std::nullopt;
     }
 
-    // Exact physical-object access used by native Zarr mirror caches. Generic
-    // fetchers remain on the legacy logical-chunk persistence path.
+    // Exact physical-object access used by native Zarr mirror caches.
     virtual std::optional<ChunkStorageObject>
     storageObject(const ChunkKey&) const
     {
@@ -170,11 +160,13 @@ public:
     }
 
     virtual ChunkFetchResult decodeStorageObject(
-        const ChunkKey& key,
+        const ChunkKey&,
         std::span<const std::byte> objectBytes) const
     {
-        return decodeSourcePayload(
-            key, std::vector<std::byte>(objectBytes.begin(), objectBytes.end()));
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes.assign(objectBytes.begin(), objectBytes.end());
+        return result;
     }
 
     virtual std::optional<ChunkKey> logicalRepresentativeForStorageKey(
@@ -184,38 +176,6 @@ public:
         return std::nullopt;
     }
 
-    virtual bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const
-    {
-        return false;
-    }
-
-    // Persistence maintenance stores the exact source payload without
-    // decoding. Fetchers opt in only when decodeSourcePayload() can reconstruct
-    // the decoded chunk from those bytes later.
-    virtual bool supportsSourcePayloadPersistence(const ChunkKey&) const
-    {
-        return false;
-    }
-
-    virtual ChunkFetchResult decodeSourcePayload(
-        const ChunkKey& key,
-        std::vector<std::byte> bytes) const
-    {
-        ChunkFetchResult fetched;
-        fetched.status = ChunkFetchStatus::Found;
-        fetched.bytes = std::move(bytes);
-        return decodeFetched(key, std::move(fetched));
-    }
-
-    virtual ChunkFetchResult decodePersistentBytes(
-        const ChunkKey&,
-        std::vector<std::byte> bytes) const
-    {
-        ChunkFetchResult result;
-        result.status = ChunkFetchStatus::Found;
-        result.bytes = std::move(bytes);
-        return result;
-    }
 };
 
 } // namespace vc::render

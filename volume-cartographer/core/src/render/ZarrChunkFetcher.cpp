@@ -1,6 +1,5 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/VcDataset.hpp"
-#include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -241,13 +240,6 @@ public:
     {
         if (!array_)
             throw std::invalid_argument("streaming zarr fetcher requires an array");
-        // Source encodings already compact enough to persist verbatim,
-        // avoiding a decode+re-encode round trip on the cache writer.
-        if (array_->stores_chunks_with_codec("c3d"))
-            persistEncodedExtension_ = ".c3d";
-        else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
-                 array_->stores_chunks_with_codec(vc::kVcz1CodecName))
-            persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
     ChunkFetchResult fetch(const ChunkKey& key) override
@@ -322,20 +314,11 @@ public:
             result.status = ChunkFetchStatus::Found;
             result.bytes = array_->decode_chunk_payload(
                 std::span<const std::byte>(encoded.data(), encoded.size()));
-            if (!persistEncodedExtension_.empty()) {
-                result.persistentBytes = std::move(encoded);
-                result.hasPersistentBytes = true;
-            }
         } catch (const std::exception& e) {
             result.status = ChunkFetchStatus::DecodeError;
             result.message = e.what();
         }
         return result;
-    }
-
-    std::string persistentCacheExtension(const ChunkKey&) const override
-    {
-        return persistEncodedExtension_.empty() ? ".bin" : persistEncodedExtension_;
     }
 
     std::optional<std::string> sourceChunkKey(const ChunkKey& key) const override
@@ -445,58 +428,8 @@ public:
             static_cast<int>((*indices)[2])};
     }
 
-    bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const override
-    {
-        return persistEncodedExtension_.empty() && array_->direct_chunk_payload_is_decoded_bytes();
-    }
-
-    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
-    {
-        return true;
-    }
-
-    ChunkFetchResult decodeSourcePayload(
-        const ChunkKey&,
-        std::vector<std::byte> bytes) const override
-    {
-        ChunkFetchResult result;
-        try {
-            result.status = ChunkFetchStatus::Found;
-            result.bytes = array_->decode_chunk_payload(
-                std::span<const std::byte>(bytes.data(), bytes.size()));
-        } catch (const std::exception& e) {
-            result.status = ChunkFetchStatus::DecodeError;
-            result.message = e.what();
-        }
-        return result;
-    }
-
-    ChunkFetchResult decodePersistentBytes(
-        const ChunkKey&,
-        std::vector<std::byte> bytes) const override
-    {
-        ChunkFetchResult result;
-        try {
-            result.status = ChunkFetchStatus::Found;
-            if (!persistEncodedExtension_.empty()) {
-                result.hasPersistentBytes = true;
-                result.persistentBytes = std::move(bytes);
-                result.bytes = array_->decode_chunk_payload(
-                    std::span<const std::byte>(result.persistentBytes.data(),
-                                               result.persistentBytes.size()));
-            } else {
-                result.bytes = std::move(bytes);
-            }
-        } catch (const std::exception& e) {
-            result.status = ChunkFetchStatus::DecodeError;
-            result.message = e.what();
-        }
-        return result;
-    }
-
 private:
     std::shared_ptr<utils::ZarrArray> array_;
-    std::string persistEncodedExtension_;
     bool remoteHttp_ = false;
 };
 

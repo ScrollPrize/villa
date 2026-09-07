@@ -880,11 +880,6 @@ nb::list chunkDependenciesToPython(
             : std::string{};
         item["cache_path"] = dependency.persistentPath.string();
         item["empty_path"] = dependency.persistentEmptyPath.string();
-        item["persistent_extension"] = dependency.persistentExtension;
-        item["cache_payload_format"] = dependency.sourcePayloadMatchesPersistentCache
-            ? std::string{"source_bytes"}
-            : std::string{"unsupported"};
-        item["source_payload_matches_cache"] = dependency.sourcePayloadMatchesPersistentCache;
         out.append(std::move(item));
     }
     return out;

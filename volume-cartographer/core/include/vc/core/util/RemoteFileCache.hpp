@@ -51,6 +51,9 @@ struct RemoteFileCacheResult {
 // Mirror a remote source below remote_sources/<scheme>/<authority>/<path>.
 // Components that are unsafe or non-portable as filesystem names are rejected.
 [[nodiscard]] std::filesystem::path remoteFileCachePath(std::string_view sourceLocation);
+// Mirror a remote Zarr below mirror/<scheme>/<authority>/<path>.
+// Query credentials and client-side fragments are excluded from the path.
+[[nodiscard]] std::filesystem::path remoteZarrMirrorPath(std::string_view sourceLocation);
 
 [[nodiscard]] RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options);
 

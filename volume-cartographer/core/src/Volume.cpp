@@ -1548,7 +1548,8 @@ std::filesystem::path Volume::remotePersistentCachePath() const
 {
     if (!isRemote_ || remoteCacheRoot_.empty())
         return {};
-    return remoteCacheRoot_ / id();
+    return remoteCacheRoot_ /
+           vc::core::util::remoteZarrMirrorPath(remoteUrl_);
 }
 
 int Volume::sliceWidth() const noexcept { return _width; }

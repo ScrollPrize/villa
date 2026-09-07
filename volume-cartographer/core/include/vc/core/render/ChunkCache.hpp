@@ -34,19 +34,6 @@ struct ChunkCacheLevelInfo {
     IChunkedArray::LevelTransform transform{};
 };
 
-enum class PersistentCacheLayout {
-    Auto,
-    Legacy,
-    ZarrMirror,
-    // A regular, unsharded Zarr store with VC-Delta3D as its chunk codec.
-    Delta3d,
-};
-
-enum class PersistentCacheEncoding {
-    SourceMirror,
-    Delta3dLossless,
-};
-
 struct PersistentCacheMetadataObject {
     std::string key;
     std::vector<std::byte> bytes;
@@ -59,17 +46,7 @@ struct ChunkCacheOptions {
     std::optional<std::filesystem::path> persistentCachePath;
     // Optional root registered with PersistentZarrCacheBudget.
     std::optional<std::filesystem::path> persistentCacheBudgetRoot;
-    // Auto selects an existing legacy footprint, otherwise an exact Zarr
-    // mirror when metadata and physical-object fetchers are available.
-    // Delta3d is selected only by ChunkCacheService and preserves the source
-    // Zarr hierarchy and logical chunk keys while replacing its codec.
-    PersistentCacheLayout persistentCacheLayout = PersistentCacheLayout::Auto;
     std::vector<PersistentCacheMetadataObject> zarrMirrorMetadata;
-    // Deprecated compatibility fields. Readers accept legacy compressed
-    // entries, but production writes never create recompressed cache data.
-    bool compressPersistentCache = false;
-    // Near-lossless persistent-cache quantization width; one is lossless.
-    int cacheQuantBinWidth = 1;
     // When the shared decoded-byte budget must evict, sources flagged here
     // are preferred victims: they may not displace other participants'
     // decoded data unless no flagged participant has anything left to give.
@@ -106,10 +83,6 @@ public:
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
         std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
-        // Startup-only selection for remote-volume persistent caches. Sources
-        // acquired from this service cannot change representation in place.
-        PersistentCacheEncoding persistentCacheEncoding =
-            PersistentCacheEncoding::SourceMirror;
     };
 
     ChunkCacheService();
@@ -138,7 +111,6 @@ public:
     // running work are preserved; reductions evict only decoded LRU entries.
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
-    PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
 
@@ -213,9 +185,6 @@ public:
         std::optional<std::string> sourceChunkKey;
         std::filesystem::path persistentPath;
         std::filesystem::path persistentEmptyPath;
-        std::string persistentExtension;
-        bool sourcePayloadMatchesPersistentCache = false;
-        PersistentCacheLayout layout = PersistentCacheLayout::Legacy;
     };
 
     ChunkCache(std::vector<LevelInfo> levels,
@@ -274,13 +243,11 @@ public:
     std::vector<ChunkKey> activeRemoteFetches() const;
 
     PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
-    PersistentCacheLayout persistentCacheLayout() const noexcept;
     std::vector<ChunkKey> persistedStorageObjectRepresentatives() const;
     std::vector<ChunkKey> storageObjectRepresentatives(int level) const;
 
     Stats stats() const;
     void invalidate();
-    void waitForPersistentWrites() const;
     // Uses the service's shared source scheduler and keyed transfer registry.
     // This request never decodes or populates decoded RAM by itself.
     PersistentRequestResult persistChunkBlocking(
@@ -289,16 +256,6 @@ public:
         int iy,
         int ix,
         PersistentRequestMode mode = PersistentRequestMode::Ensure);
-
-    // Deprecated no-op compatibility API. Legacy compressed entries remain
-    // readable; new writes are never recompressed.
-    static void setPersistentCompressionDefault(bool enabled);
-    static bool persistentCompressionDefault();
-
-    // Process-wide default for Options::cacheQuantBinWidth (same pattern as
-    // the compression default above; the larger of the two values wins).
-    static void setPersistentQuantizationDefault(int binWidth);
-    static int persistentQuantizationDefault();
 
     // Optional process-wide default aggregate budget. Applications install
     // this once; explicitly supplied budgets (for example the overlay pool)
@@ -326,31 +283,11 @@ private:
         std::optional<float> distanceSquared;
     };
 
-    struct PersistentProbeResult {
-        bool sourceData = false;
-        bool compressedData = false;
-        bool primaryData = false;
-        bool empty = false;
-
-        bool hasData() const noexcept
-        {
-            return sourceData || compressedData || primaryData;
-        }
-    };
-
-    struct PersistentReadResult {
-        std::vector<std::byte> bytes;
-        bool sourcePayload = false;
-        bool decodedPayload = false;
-    };
-
     struct Entry {
         EntryStatus status = EntryStatus::InFlight;
         std::shared_ptr<const std::vector<std::byte>> bytes;
         std::string error;
         std::size_t decodedBytes = 0;
-        bool persisted = false;
-        bool persistentWriteQueued = false;
         bool unresolvedCounted = false;
         bool inLru = false;
         int basePriority = 0;
@@ -382,10 +319,6 @@ private:
         std::atomic_bool writeQueued{false};
         std::uint64_t probeTaskId = 0;
         std::uint64_t sourceTaskId = 0;
-        // Foreground misses arriving while a maintenance Delta3D operation is
-        // decoding or publishing wait here, then re-probe the completed cache
-        // entry instead of issuing a duplicate source request.
-        std::vector<FetchContext> foregroundWaiters;
     };
 
     struct SourceTransfer {
@@ -396,7 +329,6 @@ private:
         std::uint64_t schedulerEpoch = 0;
         std::shared_ptr<IChunkFetcher> fetcher;
         bool decodeRequested = false;
-        std::weak_ptr<PersistenceOperation> persistence;
     };
 
     struct StorageObjectKey {
@@ -467,25 +399,14 @@ private:
             , sourceIdentity_(std::move(sourceIdentity))
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
         {
-            persistentLayout_ = options_.persistentCacheLayout;
             unresolvedFetchesByLevel_.resize(levels_.size(), 0);
-            persistentExtensions_.resize(fetchers_.size());
-            for (std::size_t level = 0; level < fetchers_.size(); ++level) {
-                if (fetchers_[level]) {
-                    persistentExtensions_[level] =
-                        fetchers_[level]->persistentCacheExtension(
-                            ChunkKey{static_cast<int>(level), 0, 0, 0});
-                }
-            }
         }
 
         std::vector<LevelInfo> levels_;
         std::vector<std::shared_ptr<IChunkFetcher>> fetchers_;
-        std::vector<std::string> persistentExtensions_;
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
-        PersistentCacheLayout persistentLayout_ = PersistentCacheLayout::Legacy;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget_;
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;
@@ -547,7 +468,6 @@ private:
         std::size_t remoteFetchesInFlight_ = 0;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
-        std::atomic_size_t persistentWritesInFlight_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
         std::shared_ptr<void> persistentLease_;
         std::string persistentCacheWarning_;
@@ -584,19 +504,11 @@ private:
         const ChunkKey& key,
         std::uint64_t generation,
         int priorityOffset);
-    static void probePersistentAndDispatch(const std::shared_ptr<State>& state,
-                                           ChunkKey key,
-                                           FetchContext context);
-    static void decodePersistentAndStore(const std::shared_ptr<State>& state,
-                                         ChunkKey key,
-                                         FetchContext context,
-                                         PersistentProbeResult probe);
     static void decodeFetchedAndStore(
         const std::shared_ptr<State>& state,
         ChunkKey key,
         FetchContext context,
-        std::shared_ptr<ChunkFetchResult> fetched,
-        std::shared_ptr<PersistenceOperation> persistence = {});
+        std::shared_ptr<ChunkFetchResult> fetched);
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
@@ -604,8 +516,7 @@ private:
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
         FetchContext context,
-        bool decodeRequested,
-        const std::shared_ptr<PersistenceOperation>& persistence);
+        bool decodeRequested);
     static void runSourceTransfer(const std::shared_ptr<State>& state,
                                   ChunkKey key,
                                   std::uint64_t transferSerial);
@@ -641,97 +552,24 @@ private:
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
         StorageConsumer consumer,
-        std::shared_ptr<const std::vector<std::byte>> objectBytes,
-        bool loadedFromPersistentCache);
-    static void probePersistenceAndDispatch(
-        const std::shared_ptr<State>& state,
-        ChunkKey key,
-        std::shared_ptr<PersistenceOperation> operation);
+        std::shared_ptr<const std::vector<std::byte>> objectBytes);
     static void completePersistenceOperation(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
         const std::shared_ptr<PersistenceOperation>& operation,
         PersistentRequestResult result);
-    static void queuePersistentDecode(const std::shared_ptr<State>& state,
-                                      const ChunkKey& key,
-                                      FetchContext context,
-                                      PersistentProbeResult probe);
     static void queueFetchedDecode(const std::shared_ptr<State>& state,
                                    const ChunkKey& key,
                                    FetchContext context,
-                                   ChunkFetchResult fetched,
-                                   std::shared_ptr<PersistenceOperation> persistence = {});
+                                   ChunkFetchResult fetched);
     static void finishAndStore(const std::shared_ptr<State>& state,
                                const ChunkKey& key,
                                FetchContext context,
-                               ChunkFetchResult fetch,
-                               bool loadedFromPersistentCache);
-    static void finishDelta3dAndStore(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        FetchContext context,
-        ChunkFetchResult fetch,
-        std::shared_ptr<PersistenceOperation> persistence);
-    static PersistentProbeResult probePersistent(const State& state,
-                                                  const ChunkKey& key);
-    static std::optional<PersistentReadResult> readPersistent(
-        const State& state,
-        const ChunkKey& key,
-        const PersistentProbeResult& probe);
+                               ChunkFetchResult fetch);
     static void storeFetchResultLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
-        ChunkFetchResult fetch,
-        bool loadedFromPersistentCache);
-    [[nodiscard]] static bool storeDelta3dFetchResultLocked(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        ChunkFetchResult fetch,
-        const std::shared_ptr<PersistenceOperation>& persistence);
-    static bool queuePersistentWrite(const std::shared_ptr<State>& state,
-                                     const ChunkKey& key,
-                                     std::shared_ptr<const std::vector<std::byte>> bytes);
-    static bool queueDelta3dWrite(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        std::shared_ptr<const std::vector<std::byte>> bytes,
-        std::shared_ptr<PersistenceOperation> operation = {},
-        bool stateAlreadyLocked = false);
-    static void queueDelta3dMaintenanceDecode(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        FetchContext context,
-        ChunkFetchResult fetched,
-        std::shared_ptr<PersistenceOperation> operation);
-    static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
-                                          const ChunkKey& key);
-    static bool queuePersistentSourceWrite(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        std::shared_ptr<const std::vector<std::byte>> bytes,
-        std::shared_ptr<PersistenceOperation> operation);
-    static bool queuePersistentSourceEmptyWrite(
-        const std::shared_ptr<State>& state,
-        const ChunkKey& key,
-        std::shared_ptr<PersistenceOperation> operation);
-    static bool writePersistentSource(
-        State& state,
-        const ChunkKey& key,
-        const std::vector<std::byte>& bytes);
-    static bool writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
-    static bool writeDelta3dPersistent(
-        State& state,
-        const ChunkKey& key,
-        const std::vector<std::byte>& bytes);
-    static bool writePersistentEmpty(State& state, const ChunkKey& key);
-    static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
-    static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
-    static std::filesystem::path persistentDelta3dPath(const State& state, const ChunkKey& key);
-    static std::filesystem::path persistentDelta3dEmptyPath(
-        const State& state,
-        const ChunkKey& key);
-    static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
-    static std::filesystem::path persistentSourcePath(const State& state, const ChunkKey& key);
+        ChunkFetchResult fetch);
     static std::filesystem::path mirrorObjectPath(
         const State& state, const ChunkStorageObject& object);
     static std::filesystem::path mirrorEmptyPath(
@@ -742,12 +580,10 @@ private:
         std::span<const std::byte> bytes);
     static bool writeMirrorEmpty(
         State& state, const ChunkStorageObject& object);
-    static PersistentCacheLayout resolvePersistentCacheLayout(
+    static void validatePersistentMirror(
         const Options& options,
         const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers);
     static void publishMirrorMetadata(const std::shared_ptr<State>& state);
-    static void publishDelta3dMetadata(const std::shared_ptr<State>& state);
-    static bool persistentEntryIsRaw(const State& state, const ChunkKey& key);
     static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
     static std::size_t persistentCacheBytes(
         const std::filesystem::path& path,

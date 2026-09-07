@@ -194,7 +194,10 @@ Maintenance-only work never decodes or enters the RAM LRU. Refresh replaces an
 object only after a successful source result; transport errors leave its prior
 disk entry intact.
 
-New remote-volume cache directories are incomplete byte-for-byte Zarr mirrors.
+New remote-volume cache directories are incomplete byte-for-byte Zarr mirrors
+at `<remote-cache-root>/mirror/<scheme>/<authority>/<remote-path>`. This
+URL-derived identity lets Open Data and direct attachments of the same source
+share one mirror; query credentials and client-side selectors are excluded.
 Required root, group, and array metadata is copied to its original relative
 path. Each downloaded data object is written at its exact source key without a
 private extension or payload transformation, so the directory remains readable
@@ -212,12 +215,12 @@ outer shard creates one shard-level `.empty`; a missing index entry inside a
 present shard does not create a sidecar. Prefill and redownload enumerate outer
 objects, so one shard is transferred at most once.
 
-Existing caches with a complete `level_N/z/y/x.<ext>` footprint remain in the
-legacy layout and are never mixed or automatically migrated. Legacy `.source`,
-`.zst`, `.bin`, `.c3d`, and `.empty` precedence and mixed-entry decoding remain
-supported. Production no longer recompresses decoded remote-cache chunks or
-offers recompression settings; a selected legacy cache continues writing its
-compatible legacy representation.
+Private cache layouts such as `level_N/z/y/x.<ext>`, `.source`, `.bin`, `.zst`,
+`.c3d`, and the former generated Delta3D stores are unsupported. Existing files
+in those layouts are left untouched but are never probed, decoded, written, or
+included in cache-budget accounting. Every remote attachment supplies
+authoritative source Zarr metadata; the cache publishes that metadata and adds
+only exact source-relative storage objects plus adjacent `.empty` markers.
 
 Decoded RAM capacity is also mutable service policy.
 `configureDecodedByteCapacity()` updates the existing aggregate budget without

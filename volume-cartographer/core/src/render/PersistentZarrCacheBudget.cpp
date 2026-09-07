@@ -1,7 +1,5 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
-#include "vc/core/render/ChunkFetch.hpp"
-
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
@@ -67,32 +65,6 @@ bool isUnsignedNumber(const std::string& value)
            std::all_of(value.begin(), value.end(), [](unsigned char c) {
                return c >= '0' && c <= '9';
            });
-}
-
-bool isVolumeChunk(const fs::path& path, const fs::path& root)
-{
-    const auto ext = path.extension().string();
-    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" &&
-        ext != kPersistentSourcePayloadExtension && ext != ".empty")
-        return false;
-    auto y = path.parent_path();
-    auto z = y.parent_path();
-    auto level = z.parent_path();
-    const auto relative = path.lexically_relative(root);
-    if (relative.empty() ||
-        (relative.begin() != relative.end() && *relative.begin() == ".."))
-        return false;
-    for (const auto& component : relative) {
-        const auto value = component.string();
-        if (value == "segments" || value == "normal_grids" ||
-            value == "normal-grid" || value == "projects")
-            return false;
-    }
-    const auto levelName = level.filename().string();
-    return isUnsignedNumber(y.filename().string()) &&
-           isUnsignedNumber(z.filename().string()) &&
-           levelName.rfind("level_", 0) == 0 &&
-           isUnsignedNumber(levelName.substr(6));
 }
 
 bool isZarrMetadataFile(const fs::path& path)
@@ -409,8 +381,7 @@ void PersistentZarrCacheBudget::startScan()
             std::uint64_t total = 0;
             const auto genericPayloads = managedGenericPayloads(files);
             for (const auto& path : files) {
-                if (!isVolumeChunk(path, self->impl_->root) &&
-                    !isLasagnaData(path, artifacts) &&
+                if (!isLasagnaData(path, artifacts) &&
                     !isNativeZarrPayload(path, zarrArrays) &&
                     !genericPayloads.contains(path.string()))
                     continue;

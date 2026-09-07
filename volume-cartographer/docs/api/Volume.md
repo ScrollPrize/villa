@@ -161,12 +161,15 @@ Python exposes the equivalent module-level functions
 Cache policy is deliberately not configured through a `Volume` instance.
 
 For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
-mirror: metadata and fetched storage objects keep their source-relative paths
-and exact encoded bytes. Sharded arrays cache one complete outer shard and fan
-out requested inner-chunk decodes from that shared payload. Adjacent `.empty`
-markers represent missing whole objects. Existing legacy
-`level_N/z/y/x.<ext>` caches are detected automatically and remain readable and
-writable without migration; no new decoded-cache recompression is performed.
+mirror below `mirror/<scheme>/<authority>/<remote-path>`. Metadata and fetched
+storage objects keep their source-relative paths and exact encoded bytes.
+Query credentials and client-side selectors are excluded from the directory
+identity. Sharded arrays cache one complete outer shard and fan out requested
+inner-chunk decodes from that shared payload. Adjacent `.empty` markers
+represent missing whole objects. Private `level_N/z/y/x.<ext>` cache entries
+and generated cache representations are ignored and never modified. Remote
+attachments must provide authoritative source Zarr metadata; local cache
+contents are not used as a metadata fallback.
 
 | Method | Returns | Description |
 |--------|---------|-------------|

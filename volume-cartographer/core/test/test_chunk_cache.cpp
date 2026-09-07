@@ -72,6 +72,8 @@ private:
 
 class BlockingFetcher : public IChunkFetcher {
 public:
+    bool measuresRemoteTransfer() const noexcept override { return true; }
+
     ChunkFetchResult fetch(const ChunkKey&) override
     {
         ++fetchCalls;
@@ -227,248 +229,12 @@ private:
     bool released_ = false;
 };
 
-class PersistentSourceFetcher : public IChunkFetcher {
-public:
-    ChunkFetchResult fetch(const ChunkKey& key) override
-    {
-        return decodeFetched(key, fetchEncoded(key));
-    }
-
-    ChunkFetchResult fetchEncoded(const ChunkKey&) override
-    {
-        ++fetchCalls;
-        {
-            std::unique_lock lock(mutex_);
-            ++started_;
-            cv_.notify_all();
-            cv_.wait(lock, [&] { return !blocking_ || released_; });
-            return encoded_;
-        }
-    }
-
-    ChunkFetchResult decodeFetched(
-        const ChunkKey&, ChunkFetchResult fetched) const override
-    {
-        ++decodeCalls;
-        if (fetched.status != ChunkFetchStatus::Found)
-            return fetched;
-        ChunkFetchResult decoded;
-        decoded.status = ChunkFetchStatus::Found;
-        decoded.bytes = makeDecoded(fetched.bytes);
-        return decoded;
-    }
-
-    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
-    {
-        return true;
-    }
-
-    ChunkFetchResult decodeSourcePayload(
-        const ChunkKey&, std::vector<std::byte> bytes) const override
-    {
-        ++sourceDecodeCalls;
-        ChunkFetchResult decoded;
-        decoded.status = ChunkFetchStatus::Found;
-        decoded.bytes = makeDecoded(bytes);
-        return decoded;
-    }
-
-    void setEncoded(ChunkFetchResult result)
-    {
-        std::lock_guard lock(mutex_);
-        encoded_ = std::move(result);
-    }
-
-    void block()
-    {
-        std::lock_guard lock(mutex_);
-        blocking_ = true;
-        released_ = false;
-    }
-
-    bool waitForStarted(int count, std::chrono::milliseconds timeout)
-    {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout, [&] { return started_ >= count; });
-    }
-
-    void release()
-    {
-        {
-            std::lock_guard lock(mutex_);
-            released_ = true;
-        }
-        cv_.notify_all();
-    }
-
-    std::atomic<int> fetchCalls{0};
-    mutable std::atomic<int> decodeCalls{0};
-    mutable std::atomic<int> sourceDecodeCalls{0};
-
-private:
-    static std::vector<std::byte> makeDecoded(
-        const std::vector<std::byte>& encoded)
-    {
-        const auto value = encoded.empty() ? std::byte{0} : encoded.front();
-        return std::vector<std::byte>(64, value);
-    }
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    ChunkFetchResult encoded_{
-        ChunkFetchStatus::Found, {std::byte{71}}};
-    int started_ = 0;
-    bool blocking_ = false;
-    bool released_ = false;
-};
-
 class ThrowingFetcher : public IChunkFetcher {
 public:
     ChunkFetchResult fetch(const ChunkKey&) override
     {
         throw std::runtime_error("synthetic fetch failure");
     }
-};
-
-class SplitStageFetcher : public IChunkFetcher {
-public:
-    ~SplitStageFetcher() override { releasePersistentDecodes(); }
-
-    ChunkFetchResult fetch(const ChunkKey& key) override
-    {
-        return decodeFetched(key, fetchEncoded(key));
-    }
-
-    ChunkFetchResult fetchEncoded(const ChunkKey&) override
-    {
-        {
-            std::lock_guard lock(mutex_);
-            remoteThread_ = std::this_thread::get_id();
-            ++remoteCalls_;
-        }
-        cv_.notify_all();
-        ChunkFetchResult result;
-        result.status = ChunkFetchStatus::Found;
-        result.bytes = {std::byte{77}};
-        return result;
-    }
-
-    ChunkFetchResult decodeFetched(
-        const ChunkKey&,
-        ChunkFetchResult fetched) const override
-    {
-        {
-            std::lock_guard lock(mutex_);
-            remoteDecodeThread_ = std::this_thread::get_id();
-            ++remoteDecodeCalls_;
-        }
-        cv_.notify_all();
-        ChunkFetchResult result;
-        if (fetched.status != ChunkFetchStatus::Found ||
-            fetched.bytes != std::vector<std::byte>{std::byte{77}}) {
-            result.status = ChunkFetchStatus::DecodeError;
-            return result;
-        }
-        result.status = ChunkFetchStatus::Found;
-        result.bytes = std::vector<std::byte>(64, std::byte{91});
-        return result;
-    }
-
-    std::string persistentCacheExtension(const ChunkKey&) const override
-    {
-        return ".encoded";
-    }
-
-    ChunkFetchResult decodePersistentBytes(
-        const ChunkKey& key,
-        std::vector<std::byte>) const override
-    {
-        {
-            std::unique_lock lock(mutex_);
-            persistentDecodeOrder_.push_back(key);
-            cv_.notify_all();
-            cv_.wait(lock, [&] {
-                return releaseAllPersistent_ || persistentDecodePermits_ > 0;
-            });
-            if (!releaseAllPersistent_)
-                --persistentDecodePermits_;
-        }
-        ChunkFetchResult result;
-        result.status = ChunkFetchStatus::Found;
-        result.bytes = std::vector<std::byte>(64, std::byte{42});
-        return result;
-    }
-
-    bool waitForRemote(std::chrono::milliseconds timeout) const
-    {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout, [&] { return remoteCalls_ > 0; });
-    }
-
-    bool waitForRemoteDecode(std::chrono::milliseconds timeout) const
-    {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout, [&] { return remoteDecodeCalls_ > 0; });
-    }
-
-    void releasePersistentDecodes() const
-    {
-        {
-            std::lock_guard lock(mutex_);
-            releaseAllPersistent_ = true;
-        }
-        cv_.notify_all();
-    }
-
-    void releasePersistentDecodes(int count) const
-    {
-        {
-            std::lock_guard lock(mutex_);
-            persistentDecodePermits_ += count;
-        }
-        cv_.notify_all();
-    }
-
-    bool waitForPersistentDecodes(
-        std::size_t count,
-        std::chrono::milliseconds timeout) const
-    {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout, [&] {
-            return persistentDecodeOrder_.size() >= count;
-        });
-    }
-
-    std::vector<ChunkKey> persistentDecodeOrder() const
-    {
-        std::lock_guard lock(mutex_);
-        return persistentDecodeOrder_;
-    }
-
-    int remoteCalls() const
-    {
-        std::lock_guard lock(mutex_);
-        return remoteCalls_;
-    }
-
-    bool remoteAndDecodeUsedDifferentThreads() const
-    {
-        std::lock_guard lock(mutex_);
-        return remoteThread_ != std::thread::id{} &&
-               remoteDecodeThread_ != std::thread::id{} &&
-               remoteThread_ != remoteDecodeThread_;
-    }
-
-private:
-    mutable std::mutex mutex_;
-    mutable std::condition_variable cv_;
-    mutable bool releaseAllPersistent_ = false;
-    mutable int persistentDecodePermits_ = 0;
-    mutable std::vector<ChunkKey> persistentDecodeOrder_;
-    mutable int remoteCalls_ = 0;
-    mutable int remoteDecodeCalls_ = 0;
-    mutable std::thread::id remoteThread_;
-    mutable std::thread::id remoteDecodeThread_;
 };
 
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
@@ -564,24 +330,6 @@ std::shared_ptr<ChunkCache> makeServiceCache(
         0.0, ChunkDtype::UInt8, std::move(options));
 }
 
-std::shared_ptr<ChunkCache> makePersistentServiceCache(
-    const std::shared_ptr<ChunkCacheService>& service,
-    std::string identity,
-    const std::shared_ptr<IChunkFetcher>& fetcher,
-    const fs::path& persistentPath)
-{
-    std::vector<ChunkCache::LevelInfo> levels = {
-        {{8, 8, 8}, {4, 4, 4}, {}},
-    };
-    ChunkCache::Options options;
-    options.detectAllFillChunks = false;
-    options.persistentCachePath = persistentPath;
-    return service->acquireSource(
-        std::move(identity), std::move(levels),
-        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, std::move(options));
-}
-
 ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
                             std::chrono::milliseconds timeout = std::chrono::seconds{2})
 {
@@ -614,22 +362,6 @@ TEST_CASE("ChunkCacheService interns source identity into a numeric hot key")
     CHECK(service->sourceCount() == 2);
     CHECK(ChunkKey{0, 0, 0, 0, first->sourceId()} !=
           ChunkKey{0, 0, 0, 0, other->sourceId()});
-}
-
-TEST_CASE("Delta3D cache mode permits sources without persistent caching")
-{
-    auto options = serviceOptions();
-    options.persistentCacheEncoding =
-        vc::render::PersistentCacheEncoding::Delta3dLossless;
-    auto service = std::make_shared<ChunkCacheService>(std::move(options));
-    auto fetcher = std::make_shared<CountingFetcher>();
-
-    auto cache = makeServiceCache(
-        service, "local-with-delta3d-process-mode", fetcher);
-
-    REQUIRE(cache);
-    CHECK(cache->persistentCacheLayout() ==
-          vc::render::PersistentCacheLayout::Legacy);
 }
 
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
@@ -1062,7 +794,6 @@ TEST_CASE("ChunkCache reports source-qualified remote fetch start and stop")
     };
     ChunkCache::Options options;
     options.detectAllFillChunks = false;
-    options.persistentCachePath = dir;
     auto cache = service->acquireSource(
         "remote-activity", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
@@ -1096,7 +827,6 @@ TEST_CASE("ChunkCache reports source-qualified remote fetch start and stop")
             ChunkKey{0, 0, 0, 1, cache->sourceId()}, false});
     }
     CHECK(cache->activeRemoteFetches().empty());
-    cache->waitForPersistentWrites();
     fs::remove_all(dir);
 }
 
@@ -1114,7 +844,6 @@ TEST_CASE("ChunkCache clears remote activity after fetch exceptions and listener
     };
     ChunkCache::Options options;
     options.detectAllFillChunks = false;
-    options.persistentCachePath = dir;
     auto cache = service->acquireSource(
         "remote-activity-error", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
@@ -1144,7 +873,6 @@ TEST_CASE("ChunkCache invalidation ends remote activity exactly once")
     };
     ChunkCache::Options options;
     options.detectAllFillChunks = false;
-    options.persistentCachePath = dir;
     auto cache = service->acquireSource(
         "remote-activity-invalidate", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
@@ -1197,7 +925,6 @@ TEST_CASE("ChunkCache invalidation stop events survive a throwing listener")
     };
     ChunkCache::Options options;
     options.detectAllFillChunks = false;
-    options.persistentCachePath = dir;
     auto cache = service->acquireSource(
         "remote-activity-throwing-listener", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
@@ -1721,254 +1448,6 @@ TEST_CASE("ChunkCache: addChunkReadyListener/removeChunkReadyListener fires on r
     c->removeChunkReadyListener(id);
     // Removing again is a no-op (just shouldn't crash).
     c->removeChunkReadyListener(id);
-}
-
-TEST_CASE("ChunkCache: persistent cache path round-trip")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    auto persistDir = fs::temp_directory_path() /
-        ("vc_chunk_cache_persist_" + std::to_string(rng()));
-    fs::create_directories(persistDir);
-
-    auto f = std::make_shared<CountingFetcher>();
-    ChunkFetchResult fr;
-    fr.status = ChunkFetchStatus::Found;
-    fr.bytes = makeBytes(64, std::byte{33});
-    f->setCanned({0, 0, 0, 0}, fr);
-
-    {
-        std::vector<ChunkCache::LevelInfo> levels = {{{8,8,8}, {4,4,4}, {}}};
-        ChunkCache::Options opts;
-        opts.persistentCachePath = persistDir;
-        ChunkCache c(std::move(levels),
-                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-                     0.0, ChunkDtype::UInt8, opts);
-        auto r = waitForResolved(c, 0, 0, 0, 0);
-        CHECK(r.status == ChunkStatus::Data);
-    }
-
-    // New cache: should be able to read from persistent storage without
-    // re-fetching. The fetcher could still be called once for the in-flight
-    // path; just check we don't crash.
-    {
-        std::vector<ChunkCache::LevelInfo> levels = {{{8,8,8}, {4,4,4}, {}}};
-        ChunkCache::Options opts;
-        opts.persistentCachePath = persistDir;
-        ChunkCache c(std::move(levels),
-                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-                     0.0, ChunkDtype::UInt8, opts);
-        auto r = waitForResolved(c, 0, 0, 0, 0);
-        CHECK(r.status == ChunkStatus::Data);
-    }
-
-    fs::remove_all(persistDir);
-}
-
-TEST_CASE("ChunkCache maintenance persists exact source without decoding")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_source_persist_" + std::to_string(rng()));
-    fs::create_directories(dir);
-    auto service = makeService();
-    auto fetcher = std::make_shared<PersistentSourceFetcher>();
-    auto cache = makePersistentServiceCache(
-        service, "source-persist", fetcher, dir);
-
-    const auto result = cache->persistChunkBlocking(
-        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Ensure);
-    CHECK(result.status == ChunkCache::PersistentRequestStatus::Data);
-    CHECK(fetcher->fetchCalls.load() == 1);
-    CHECK(fetcher->decodeCalls.load() == 0);
-    CHECK(fetcher->sourceDecodeCalls.load() == 0);
-    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
-
-    const auto sourcePath = dir / "level_0" / "0" / "0" / "0.source";
-    CHECK(readTestBytes(sourcePath) ==
-          std::vector<std::byte>{std::byte{71}});
-
-    const auto decoded = cache->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(decoded.status == ChunkStatus::Data);
-    REQUIRE(decoded.bytes);
-    CHECK(decoded.bytes->front() == std::byte{71});
-    CHECK(fetcher->fetchCalls.load() == 1);
-    CHECK(fetcher->decodeCalls.load() == 0);
-    CHECK(fetcher->sourceDecodeCalls.load() == 1);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache source refresh replaces only after a successful outcome")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_source_refresh_" + std::to_string(rng()));
-    const auto sourcePath = dir / "level_0" / "0" / "0" / "0.source";
-    const auto emptyPath = dir / "level_0" / "0" / "0" / "0.empty";
-    writeTestBytes(sourcePath, std::vector<std::byte>{std::byte{11}});
-
-    auto service = makeService();
-    auto fetcher = std::make_shared<PersistentSourceFetcher>();
-    auto cache = makePersistentServiceCache(
-        service, "source-refresh", fetcher, dir);
-
-    ChunkFetchResult failed;
-    failed.status = ChunkFetchStatus::HttpError;
-    failed.httpStatus = 503;
-    fetcher->setEncoded(failed);
-    auto result = cache->persistChunkBlocking(
-        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    CHECK(result.status == ChunkCache::PersistentRequestStatus::Error);
-    CHECK(readTestBytes(sourcePath) ==
-          std::vector<std::byte>{std::byte{11}});
-
-    ChunkFetchResult missing;
-    missing.status = ChunkFetchStatus::Missing;
-    fetcher->setEncoded(missing);
-    result = cache->persistChunkBlocking(
-        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    CHECK(result.status == ChunkCache::PersistentRequestStatus::Missing);
-    CHECK_FALSE(fs::exists(sourcePath));
-    CHECK(fs::exists(emptyPath));
-
-    ChunkFetchResult found;
-    found.status = ChunkFetchStatus::Found;
-    found.bytes = {std::byte{29}};
-    fetcher->setEncoded(found);
-    result = cache->persistChunkBlocking(
-        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    CHECK(result.status == ChunkCache::PersistentRequestStatus::Data);
-    CHECK(readTestBytes(sourcePath) ==
-          std::vector<std::byte>{std::byte{29}});
-    CHECK_FALSE(fs::exists(emptyPath));
-    CHECK(fetcher->decodeCalls.load() == 0);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache maintenance and decoded demand share one source transfer")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_source_join_" + std::to_string(rng()));
-    fs::create_directories(dir);
-    auto service = makeService(1024 * 1024, 2);
-    auto fetcher = std::make_shared<PersistentSourceFetcher>();
-    fetcher->block();
-    auto cache = makePersistentServiceCache(
-        service, "source-join", fetcher, dir);
-
-    auto persistence = std::async(std::launch::async, [&] {
-        return cache->persistChunkBlocking(
-            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    });
-    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
-    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
-    std::this_thread::sleep_for(std::chrono::milliseconds{20});
-    fetcher->release();
-
-    CHECK(persistence.get().status ==
-          ChunkCache::PersistentRequestStatus::Data);
-    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(fetcher->fetchCalls.load() == 1);
-    CHECK(fetcher->decodeCalls.load() == 1);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache maintenance survives replacement of joined view demand")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_source_view_clear_" + std::to_string(rng()));
-    fs::create_directories(dir);
-    auto service = makeService(1024 * 1024, 1);
-    auto fetcher = std::make_shared<PersistentSourceFetcher>();
-    fetcher->block();
-    auto cache = makePersistentServiceCache(
-        service, "source-view-clear", fetcher, dir);
-
-    auto persistence = std::async(std::launch::async, [&] {
-        return cache->persistChunkBlocking(
-            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    });
-    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
-    cache->replaceViewDemand({41, 1}, {0.0f, 0.0f}, {
-        {{0, 0, 0, 0}, {0.0f, 0.0f}},
-    });
-    cache->replaceViewDemand({41, 2}, {0.0f, 0.0f}, {});
-    fetcher->release();
-
-    CHECK(persistence.get().status ==
-          ChunkCache::PersistentRequestStatus::Data);
-    CHECK(fetcher->fetchCalls.load() == 1);
-    CHECK(fetcher->decodeCalls.load() == 0);
-    CHECK(fs::exists(dir / "level_0" / "0" / "0" / "0.source"));
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache maintenance joins a source transfer started by decoding")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_decode_join_" + std::to_string(rng()));
-    fs::create_directories(dir);
-    auto service = makeService(1024 * 1024, 2);
-    auto fetcher = std::make_shared<PersistentSourceFetcher>();
-    fetcher->block();
-    auto cache = makePersistentServiceCache(
-        service, "decode-join", fetcher, dir);
-
-    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
-    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
-    auto persistence = std::async(std::launch::async, [&] {
-        return cache->persistChunkBlocking(
-            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds{20});
-    fetcher->release();
-
-    CHECK(persistence.get().status ==
-          ChunkCache::PersistentRequestStatus::Data);
-    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(fetcher->fetchCalls.load() == 1);
-    CHECK(fetcher->decodeCalls.load() == 1);
-    CHECK(fs::exists(dir / "level_0" / "0" / "0" / "0.source"));
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache maintenance restarts on source fetcher refresh")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-        ("vc_chunk_maintenance_refresh_" + std::to_string(rng()));
-    fs::create_directories(dir);
-    auto service = makeService(1024 * 1024, 2);
-    auto expired = std::make_shared<PersistentSourceFetcher>();
-    expired->block();
-    auto first = makePersistentServiceCache(
-        service, "maintenance-refresh", expired, dir);
-
-    auto persistence = std::async(std::launch::async, [&] {
-        return first->persistChunkBlocking(
-            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
-    });
-    REQUIRE(expired->waitForStarted(1, std::chrono::seconds{2}));
-
-    auto refreshed = std::make_shared<PersistentSourceFetcher>();
-    ChunkFetchResult replacement;
-    replacement.status = ChunkFetchStatus::Found;
-    replacement.bytes = {std::byte{88}};
-    refreshed->setEncoded(replacement);
-    auto second = makePersistentServiceCache(
-        service, "maintenance-refresh", refreshed, dir);
-    (void)second;
-
-    REQUIRE(refreshed->waitForStarted(1, std::chrono::seconds{2}));
-    CHECK(persistence.get().status ==
-          ChunkCache::PersistentRequestStatus::Data);
-    CHECK(readTestBytes(
-              dir / "level_0" / "0" / "0" / "0.source") ==
-          std::vector<std::byte>{std::byte{88}});
-    expired->release();
-    fs::remove_all(dir);
 }
 
 TEST_CASE("ChunkCache: ctor without options uses defaults")
@@ -3615,197 +3094,4 @@ TEST_CASE("ChunkCache rejects stale asynchronous GUI misses")
     CHECK(fetcher->order() == std::vector<ChunkKey>{
         {0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}});
     CHECK(cache->getChunkIfCached(0, 0, 0, 3).status == ChunkStatus::MissQueued);
-}
-
-TEST_CASE("ChunkCache: disk-cached chunks resolve without touching the fetcher pool")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-                     ("vc_chunk_probe_" + std::to_string(rng()));
-    fs::create_directories(dir);
-
-    ChunkFetchResult fr;
-    fr.status = ChunkFetchStatus::Found;
-    fr.bytes = makeBytes(64, std::byte{123});
-
-    {
-        // Warm the persistent cache.
-        auto f = std::make_shared<CountingFetcher>();
-        f->setCanned({0, 0, 0, 0}, fr);
-        std::vector<ChunkCache::LevelInfo> levels = {{{4, 4, 4}, {4, 4, 4}, {}}};
-        ChunkCache::Options opts;
-        opts.persistentCachePath = dir;
-        ChunkCache c(std::move(levels),
-                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-                     0.0, ChunkDtype::UInt8, opts);
-        CHECK(waitForResolved(c, 0, 0, 0, 0).status == ChunkStatus::Data);
-        c.waitForPersistentWrites();
-    }
-
-    {
-        // A fetcher that would only produce errors: the chunk must come
-        // from the disk probe, never from the remote pool.
-        auto f = std::make_shared<CountingFetcher>();
-        ChunkFetchResult err;
-        err.status = ChunkFetchStatus::HttpError;
-        err.httpStatus = 500;
-        f->setCanned({0, 0, 0, 0}, err);
-        std::vector<ChunkCache::LevelInfo> levels = {{{4, 4, 4}, {4, 4, 4}, {}}};
-        ChunkCache::Options opts;
-        opts.persistentCachePath = dir;
-        ChunkCache c(std::move(levels),
-                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-                     0.0, ChunkDtype::UInt8, opts);
-        auto r = waitForResolved(c, 0, 0, 0, 0);
-        CHECK(r.status == ChunkStatus::Data);
-        CHECK(f->fetchCalls.load() == 0);
-    }
-
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache classifies persistent misses while cached decodes are blocked")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-                     ("vc_chunk_split_stages_" + std::to_string(rng()));
-    fs::create_directories(dir);
-
-    const auto encoded = std::vector<std::byte>{std::byte{11}};
-    for (int ix = 0; ix < 16; ++ix) {
-        writeTestBytes(
-            dir / "level_0" / "0" / "0" /
-                (std::to_string(ix) + ".encoded"),
-            encoded);
-    }
-
-    auto fetcher = std::make_shared<SplitStageFetcher>();
-    {
-        std::vector<ChunkCache::LevelInfo> levels = {
-            {{4, 4, 68}, {4, 4, 4}, {}},
-        };
-        ChunkCache::Options options;
-        options.persistentCachePath = dir;
-        options.detectAllFillChunks = false;
-        ChunkCache cache(
-            std::move(levels),
-            std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-            0.0, ChunkDtype::UInt8, options,
-            serviceOptions(1024 * 1024, 1));
-
-        for (int ix = 0; ix < 16; ++ix)
-            (void)cache.tryGetChunk(0, 0, 0, ix);
-        (void)cache.tryGetChunk(0, 0, 0, 16);
-
-        // The old combined probe/decode pool blocked before classifying this
-        // miss. The split 32-worker stat stage must admit its remote GET while
-        // every CPU decode worker is occupied by cached data.
-        const bool remoteStarted = fetcher->waitForRemote(std::chrono::seconds{2});
-        fetcher->releasePersistentDecodes();
-        CHECK(remoteStarted);
-        CHECK(fetcher->remoteCalls() == 1);
-        CHECK(waitForResolved(cache, 0, 0, 0, 16).status == ChunkStatus::Data);
-        CHECK(fetcher->waitForRemoteDecode(std::chrono::seconds{2}));
-        CHECK(fetcher->remoteAndDecodeUsedDifferentThreads());
-    }
-
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache reprioritizes pending decode work by view-relative level")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-                     ("vc_chunk_decode_priority_" + std::to_string(rng()));
-    const auto encoded = std::vector<std::byte>{std::byte{11}};
-    for (int ix = 0; ix < 9; ++ix) {
-        writeTestBytes(
-            dir / "level_0" / "0" / "0" /
-                (std::to_string(ix) + ".encoded"),
-            encoded);
-    }
-    writeTestBytes(dir / "level_2" / "0" / "0" / "0.encoded", encoded);
-
-    auto fetcher = std::make_shared<SplitStageFetcher>();
-    {
-        std::vector<ChunkCache::LevelInfo> levels(3);
-        for (auto& level : levels) {
-            level.shape = {4, 4, 36};
-            level.chunkShape = {4, 4, 4};
-        }
-        ChunkCache::Options options;
-        options.persistentCachePath = dir;
-        options.detectAllFillChunks = false;
-        ChunkCache cache(
-            std::move(levels),
-            std::vector<std::shared_ptr<IChunkFetcher>>(3, fetcher),
-            0.0, ChunkDtype::UInt8, options,
-            serviceOptions(1024 * 1024, 1));
-
-        for (int ix = 0; ix < 8; ++ix)
-            (void)cache.tryGetChunk(0, 0, 0, ix);
-        REQUIRE(fetcher->waitForPersistentDecodes(8, std::chrono::seconds{2}));
-
-        cache.markViewActive(91);
-        cache.replaceViewDemand({91, 1}, {0.0f, 0.0f}, {
-            {{0, 0, 0, 8}, {0.0f, 0.0f}, 0},
-            {{2, 0, 0, 0}, {0.0f, 0.0f}, 2},
-        });
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds{2};
-        while (cache.stats().pendingDecodeTasks < 2 &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
-        REQUIRE(cache.stats().pendingDecodeTasks >= 2);
-        fetcher->releasePersistentDecodes(1);
-        REQUIRE(fetcher->waitForPersistentDecodes(9, std::chrono::seconds{2}));
-        const auto order = fetcher->persistentDecodeOrder();
-        REQUIRE(order.size() >= 9);
-        CHECK(order[8] == ChunkKey{2, 0, 0, 0});
-        fetcher->releasePersistentDecodes();
-    }
-
-    fs::remove_all(dir);
-}
-
-TEST_CASE("ChunkCache invalidation cancels pending decode work")
-{
-    std::mt19937_64 rng(std::random_device{}());
-    const auto dir = fs::temp_directory_path() /
-                     ("vc_chunk_decode_invalidate_" + std::to_string(rng()));
-    const auto encoded = std::vector<std::byte>{std::byte{11}};
-    for (int ix = 0; ix < 9; ++ix) {
-        writeTestBytes(
-            dir / "level_0" / "0" / "0" /
-                (std::to_string(ix) + ".encoded"),
-            encoded);
-    }
-
-    auto fetcher = std::make_shared<SplitStageFetcher>();
-    {
-        std::vector<ChunkCache::LevelInfo> levels = {
-            {{4, 4, 36}, {4, 4, 4}, {}},
-        };
-        ChunkCache::Options options;
-        options.persistentCachePath = dir;
-        options.detectAllFillChunks = false;
-        ChunkCache cache(
-            std::move(levels),
-            std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-            0.0, ChunkDtype::UInt8, options,
-            serviceOptions(1024 * 1024, 1));
-
-        for (int ix = 0; ix < 8; ++ix)
-            (void)cache.tryGetChunk(0, 0, 0, ix);
-        REQUIRE(fetcher->waitForPersistentDecodes(8, std::chrono::seconds{2}));
-        (void)cache.tryGetChunk(0, 0, 0, 8);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        cache.invalidate();
-        fetcher->releasePersistentDecodes();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        CHECK(fetcher->persistentDecodeOrder().size() == 8);
-    }
-
-    fs::remove_all(dir);
 }

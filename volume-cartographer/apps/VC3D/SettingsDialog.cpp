@@ -122,11 +122,6 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
                 spinIOThreads->setEnabled(!automatic);
             });
 
-    setupCacheActionControls();
-    _remoteCacheDelta3dCheckBox->setChecked(settings.value(
-        perf::REMOTE_CACHE_DELTA3D,
-        perf::REMOTE_CACHE_DELTA3D_DEFAULT).toBool());
-
     connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
         QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
             edtRemoteCachePath->text());
@@ -140,21 +135,6 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
     connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
-}
-
-void SettingsDialog::setupCacheActionControls()
-{
-    _remoteCacheDelta3dCheckBox = new QCheckBox(
-        tr("Compress remote volume disk cache with VC-Delta3D (lossless)."),
-        groupBox_5);
-    _remoteCacheDelta3dCheckBox->setObjectName(
-        QStringLiteral("chkRemoteCacheDelta3d"));
-    _remoteCacheDelta3dCheckBox->setToolTip(tr(
-        "Requires restart. On the next use of each remote volume, VC3D replaces "
-        "incompatible disposable cache contents with the selected lossless format."));
-
-    if (gridLayout_5)
-        gridLayout_5->addWidget(_remoteCacheDelta3dCheckBox, 2, 0, 1, 3);
 }
 
 void SettingsDialog::setupOutputSegmentsControl()
@@ -266,9 +246,6 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text().trimmed());
-    settings.setValue(
-        perf::REMOTE_CACHE_DELTA3D,
-        _remoteCacheDelta3dCheckBox->isChecked());
     const bool automaticDownloads = chkAutoDownloadParallelism->isChecked();
     const int downloadParallelism = spinIOThreads->value();
     settings.setValue(

@@ -95,11 +95,6 @@ public:
         return result;
     }
 
-    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
-    {
-        return true;
-    }
-
     std::atomic<std::size_t> sourceFetches{0};
 
 private:
@@ -214,17 +209,13 @@ int main()
             persistentPath, remote);
         const auto populateStart = Clock::now();
         cache->prefetchChunks(keys, true);
-        cache->waitForPersistentWrites();
         populateTimes.push_back(elapsedMs(populateStart));
         if (remote->sourceFetches.load() != keys.size()) {
             throw std::runtime_error("cold population did not fetch every object");
         }
-        if (cache->persistentCacheLayout() !=
-                vc::render::PersistentCacheLayout::ZarrMirror ||
-            !fs::is_regular_file(persistentPath / "0" / "0.0.0") ||
-            fs::exists(persistentPath / ".vc_delta3d_cache")) {
+        if (!fs::is_regular_file(persistentPath / "0" / "0.0.0")) {
             throw std::runtime_error(
-                "benchmark did not exercise the uncompressed SourceMirror layout");
+                "benchmark did not exercise the native Zarr mirror layout");
         }
         cache.reset();
 

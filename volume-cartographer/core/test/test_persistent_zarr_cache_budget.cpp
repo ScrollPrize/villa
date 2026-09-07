@@ -32,10 +32,19 @@ void writeBytes(const fs::path& path, std::size_t size, char value = 'x')
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
+void writeNativeMetadata(const fs::path& volume)
+{
+    writeBytes(volume / ".zgroup", 0);
+    fs::create_directories(volume / "0");
+    std::ofstream metadata(volume / "0" / ".zarray");
+    metadata << R"({"zarr_format":2,"shape":[8,8,8],"chunks":[2,2,2],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null})";
+}
+
 fs::path volumeChunk(const fs::path& root, int x)
 {
-    return root / "volume-hash" / "level_0" / "0" / "0" /
-           (std::to_string(x) + ".bin");
+    writeNativeMetadata(root / "volume-hash");
+    return root / "volume-hash" / "0" /
+           ("0.0." + std::to_string(x));
 }
 
 Budget::SpaceProvider spaceWith(std::shared_ptr<std::atomic<std::uint64_t>> free)
@@ -61,6 +70,7 @@ bool publish(Budget& budget, const fs::path& path, std::size_t size)
 TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
 {
     const auto root = tempRoot("discover");
+    writeNativeMetadata(root / "volume-hash");
     writeBytes(volumeChunk(root, 0), 11);
     writeBytes(root / "volume-hash" / "manifest.json", 19);
     writeBytes(root / "segments" / "level_0" / "0" / "0" / "0.bin", 23);
@@ -79,7 +89,7 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     fs::remove_all(root);
 }
 
-TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
+TEST_CASE("budget startup scan discovers native Zarr chunks")
 {
     const auto root = tempRoot("delta3d_discover");
     const auto volume = root / "volume-hash";
@@ -89,7 +99,6 @@ TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
         metadata << R"({"zarr_format":2,"shape":[8,8,8],"chunks":[2,2,2],"dtype":"|u1","compressor":{"id":"vc-delta3d","quant":1},"fill_value":0,"order":"C","filters":null})";
     }
     writeBytes(volume / "0" / "0.0.0", 23);
-    writeBytes(root / "volume-hash" / ".vc_delta3d_cache", 5);
 
     auto budget = Budget::configure(root, {}, spaceWith(
         std::make_shared<std::atomic<std::uint64_t>>(900)));
@@ -101,9 +110,10 @@ TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
 TEST_CASE("budget discovers open-data volume chunks grouped by sample")
 {
     const auto root = tempRoot("open_data_volume");
-    writeBytes(root / "open_data" / "volumes" / "PHerc0139" /
-                   "volume-hash" / "level_0" / "0" / "0" / "0.bin",
-               29);
+    const auto volume = root / "open_data" / "volumes" / "PHerc0139" /
+                        "volume-hash";
+    writeNativeMetadata(volume);
+    writeBytes(volume / "0" / "0.0.0", 29);
 
     auto budget = Budget::configure(root, {}, spaceWith(
         std::make_shared<std::atomic<std::uint64_t>>(900)));
@@ -116,10 +126,10 @@ TEST_CASE("budget-coordinated cache migration preserves accounting")
 {
     const auto root = tempRoot("move_subtree");
     const auto legacyVolume = root / "volume-hash";
-    const auto legacyChunk =
-        legacyVolume / "level_0" / "0" / "0" / "0.bin";
+    const auto legacyChunk = legacyVolume / "0" / "0.0.0";
     const auto groupedVolume =
         root / "open_data" / "volumes" / "PHerc0139" / "volume-hash";
+    writeNativeMetadata(legacyVolume);
     writeBytes(legacyChunk, 37);
 
     auto budget = Budget::configure(root, {}, spaceWith(
@@ -132,13 +142,13 @@ TEST_CASE("budget-coordinated cache migration preserves accounting")
     CHECK_FALSE(ec);
     CHECK_FALSE(fs::exists(legacyVolume));
     CHECK(fs::is_regular_file(
-        groupedVolume / "level_0" / "0" / "0" / "0.bin"));
+        groupedVolume / "0" / "0.0.0"));
     CHECK(budget->stats().managedBytes == 37);
     budget->waitForIdle();
     CHECK(budget->stats().managedBytes == 37);
 
     auto pin = budget->pinRead(
-        groupedVolume / "level_0" / "0" / "0" / "0.bin");
+        groupedVolume / "0" / "0.0.0");
     pin.complete(false);
     fs::remove_all(root);
 }
@@ -147,7 +157,8 @@ TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting
 {
     const auto root = tempRoot("replace_subtree");
     const auto oldVolume = root / "old-volume";
-    const auto oldChunk = oldVolume / "level_0" / "0" / "0" / "0.bin";
+    const auto oldChunk = oldVolume / "0" / "0.0.0";
+    writeNativeMetadata(oldVolume);
     writeBytes(oldChunk, 100);
     auto budget = Budget::configure(root, {100, 0}, spaceWith(
         std::make_shared<std::atomic<std::uint64_t>>(900)));
@@ -239,6 +250,7 @@ TEST_CASE("volume chunk exclusions are relative to the managed root")
 {
     const auto base = tempRoot("relative");
     const auto root = base / "projects" / "user-cache";
+    writeNativeMetadata(root / "volume-hash");
     writeBytes(volumeChunk(root, 0), 17);
     auto budget = Budget::configure(root, {}, spaceWith(
         std::make_shared<std::atomic<std::uint64_t>>(900)));

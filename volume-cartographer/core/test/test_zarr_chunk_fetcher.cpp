@@ -408,6 +408,12 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     auto source = tmpDir("mirror_sharded_source");
     auto mirror = tmpDir("mirror_sharded_cache");
     auto array = makeShardedArray(source);
+    const auto legacyEntry = mirror / "level_0" / "0" / "0" / "0.bin";
+    fs::create_directories(legacyEntry.parent_path());
+    {
+        std::ofstream output(legacyEntry, std::ios::binary);
+        output.put('\0');
+    }
 
     vc::render::ChunkCache::Options options;
     options.persistentCachePath = mirror;
@@ -435,6 +441,7 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     CHECK(readBytes(mirror / "zarr.json") == readBytes(source / "zarr.json"));
     CHECK(readBytes(mirror / "0" / "zarr.json") ==
           readBytes(source / "0" / "zarr.json"));
+    CHECK(fs::is_regular_file(legacyEntry));
     CHECK(cache->storageObjectRepresentatives(0).size() == 1);
 
     fs::remove(sourceShard);
@@ -448,108 +455,6 @@ TEST_CASE("native mirror stores a complete shard and serves sibling inner chunks
     vc::render::processChunkCacheService()->invalidateSource(identity);
     fs::remove_all(source);
     fs::remove_all(mirror);
-}
-
-TEST_CASE("Delta3D cache is a regular unsharded Zarr with the source layout")
-{
-    auto source = tmpDir("delta3d_zarr_source");
-    auto cacheDir = tmpDir("delta3d_zarr_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
-        options.shapeZYX = {32, 32, 32};
-        options.chunkShapeZYX = {32, 32, 32};
-        options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
-        return options;
-    }());
-    REQUIRE(volume);
-    Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
-    volume.reset();
-
-    auto store = std::make_shared<utils::FileSystemStore>(source);
-    auto array = std::make_shared<utils::ZarrArray>(
-        utils::ZarrArray::open(store, "0"));
-    const auto object = array->storage_object_location(
-        std::array<std::size_t, 3>{0, 0, 0});
-    const auto sourceChunk = source / object.key;
-    REQUIRE(fs::is_regular_file(sourceChunk));
-
-    vc::render::ChunkCache::Options options;
-    options.persistentCachePath = cacheDir;
-    for (const auto& key : {".zgroup", ".zattrs", "0/.zarray", "0/.zattrs"}) {
-        if (fs::is_regular_file(source / key))
-            options.zarrMirrorMetadata.push_back({key, readBytes(source / key)});
-    }
-    vc::render::ChunkCacheService::Options serviceOptions;
-    serviceOptions.fetchConcurrency.workerCapacity = 4;
-    serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
-    serviceOptions.persistentCacheEncoding =
-        vc::render::PersistentCacheEncoding::Delta3dLossless;
-    auto cache = createChunkCache(array, options, serviceOptions);
-    REQUIRE(cache->persistentCacheLayout() ==
-            vc::render::PersistentCacheLayout::Delta3d);
-
-    const auto first = cache->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(first.status == vc::render::ChunkStatus::Data);
-    REQUIRE(first.bytes);
-    CHECK(first.bytes->front() == std::byte{173});
-    cache->waitForPersistentWrites();
-    const auto cachedChunk = cacheDir / object.key;
-    REQUIRE(fs::is_regular_file(cachedChunk));
-    CHECK_FALSE(fs::exists(cacheDir / "level_0"));
-
-    const auto cacheMetadata = readBytes(cacheDir / "0" / ".zarray");
-    const std::string cacheMetadataText(
-        reinterpret_cast<const char*>(cacheMetadata.data()),
-        cacheMetadata.size());
-    CHECK(cacheMetadataText.find("vc-delta3d") != std::string::npos);
-    auto regularZarr = utils::ZarrArray::open(
-        cacheDir / "0", vc::buildZarrCodecRegistry(1));
-    const auto regularRead = regularZarr.read_chunk(
-        std::array<std::size_t, 3>{0, 0, 0});
-    REQUIRE(regularRead);
-    CHECK(*regularRead == *first.bytes);
-    cache.reset();
-
-    fs::remove(sourceChunk);
-    auto reopened = createChunkCache(array, options, serviceOptions);
-    const auto cached = reopened->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(cached.status == vc::render::ChunkStatus::Data);
-    REQUIRE(cached.bytes);
-    CHECK(*cached.bytes == *first.bytes);
-    reopened.reset();
-    fs::remove_all(source);
-    fs::remove_all(cacheDir);
-}
-
-TEST_CASE("Delta3D persistence is disabled for sharded source arrays")
-{
-    auto source = tmpDir("delta3d_sharded_source");
-    auto cacheDir = tmpDir("delta3d_sharded_cache");
-    auto array = makeShardedArray(source);
-    vc::render::ChunkCache::Options options;
-    options.persistentCachePath = cacheDir;
-    options.zarrMirrorMetadata = {
-        {"zarr.json", readBytes(source / "zarr.json")},
-        {"0/zarr.json", readBytes(source / "0" / "zarr.json")},
-    };
-    vc::render::ChunkCacheService::Options serviceOptions;
-    serviceOptions.persistentCacheEncoding =
-        vc::render::PersistentCacheEncoding::Delta3dLossless;
-    auto cache = createChunkCache(array, options, serviceOptions);
-    REQUIRE(cache);
-    const auto stats = cache->stats();
-    CHECK_FALSE(stats.persistentCacheEnabled);
-    CHECK(stats.persistentCacheWarning.find("sharded") != std::string::npos);
-    const auto chunk = cache->getChunkBlocking(0, 0, 0, 0);
-    REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
-    REQUIRE(chunk.bytes);
-    CHECK(chunk.bytes->front() == std::byte{1});
-    CHECK_FALSE(fs::exists(cacheDir / ".vc_delta3d_cache"));
-    fs::remove_all(source);
-    fs::remove_all(cacheDir);
 }
 
 TEST_CASE("native mirror coalesces inner requests into one full shard transfer")
@@ -687,64 +592,6 @@ TEST_CASE("missing whole shard creates one physical empty marker")
     vc::render::processChunkCacheService()->invalidateSource(identity);
     fs::remove_all(source);
     fs::remove_all(mirror);
-}
-
-TEST_CASE("existing legacy cache footprint remains legacy")
-{
-    auto source = tmpDir("legacy_layout_source");
-    auto cacheRoot = tmpDir("legacy_layout_cache");
-    auto array = makeShardedArray(source);
-    fs::create_directories(cacheRoot / "level_0" / "0" / "0");
-    {
-        std::ofstream legacy(cacheRoot / "level_0" / "0" / "0" / "0.bin",
-                             std::ios::binary);
-        legacy.put('\0');
-    }
-
-    vc::render::ChunkCache::Options options;
-    options.persistentCachePath = cacheRoot;
-    options.zarrMirrorMetadata = {
-        {"zarr.json", readBytes(source / "zarr.json")},
-        {"0/zarr.json", readBytes(source / "0" / "zarr.json")},
-    };
-    const auto identity = "test:legacy-layout:" + source.string();
-    auto cache = vc::render::acquireProcessChunkCache(
-        identity, array, std::move(options));
-    REQUIRE(cache);
-    CHECK(cache->persistentCacheLayout() ==
-          vc::render::PersistentCacheLayout::Legacy);
-
-    cache.reset();
-    vc::render::processChunkCacheService()->invalidateSource(identity);
-    fs::remove_all(source);
-    fs::remove_all(cacheRoot);
-}
-
-TEST_CASE("incidental legacy-looking paths do not select legacy layout")
-{
-    auto source = tmpDir("incidental_layout_source");
-    auto cacheRoot = tmpDir("incidental_layout_cache");
-    auto array = makeShardedArray(source);
-    fs::create_directories(cacheRoot / "level_0");
-    {
-        std::ofstream incidental(cacheRoot / "level_0" / "note.empty");
-    }
-
-    vc::render::ChunkCache::Options options;
-    options.persistentCachePath = cacheRoot;
-    options.zarrMirrorMetadata = {
-        {"zarr.json", readBytes(source / "zarr.json")},
-        {"0/zarr.json", readBytes(source / "0" / "zarr.json")},
-    };
-    CHECK_THROWS_WITH_AS(
-        vc::render::acquireProcessChunkCache(
-            "test:incidental-layout:" + source.string(),
-            array, std::move(options)),
-        doctest::Contains("neither a legacy cache nor a Zarr mirror"),
-        std::runtime_error);
-
-    fs::remove_all(source);
-    fs::remove_all(cacheRoot);
 }
 
 TEST_CASE("native mirror stores exact unsharded bytes and reopens without source data")
