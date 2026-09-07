@@ -135,6 +135,15 @@ python pack_resident_pools.py /path/to/lasagna_inputs \
     --ct /path/to/<scroll>_ds2.zarr --ct-group 2 --verify 2000
 ```
 
+**Which sidecars the defaults actually load.** `dense_spacing_mode` defaults to
+`winding_model`, so `_grad_mag_required()` is false and the gradient-magnitude
+sidecar is never read; `input_use_surf_sdt` defaults to false, so
+`_phase_bundle_enabled()` is false and the surf-SDT sidecar is never read
+either. A default fit therefore needs only the normals sidecar. On the published
+`spiral_datasets/PHercParis4` that is 11 GB of a 47.5 GB `lasagna_inputs/`
+directory — the 33 GB `surf_sdt` and 4.8 GB `grad_mag` pools are only needed if
+you switch `dense_spacing_mode` to `phase` or `grad_mag`.
+
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
 scroll) so those bricks drop out of the pool and sample as no-data. The
 fitter loads the sidecars restricted to the configured z-ROI in one
