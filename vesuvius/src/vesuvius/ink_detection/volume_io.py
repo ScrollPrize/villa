@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -13,10 +15,49 @@ import numpy as np
 import zarr
 
 from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
+from vesuvius.data.volume import _is_transient_read_error
 
+
+LOGGER = logging.getLogger(__name__)
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+READ_ATTEMPTS = 4
+
+
+if ZARR_V3:
+
+    class RetryingFsspecStore(zarr.storage.FsspecStore):
+        """Retry transient remote reads instead of losing the whole run.
+
+        Object stores drop connections routinely: truncated payloads, SSL
+        record errors, 5xx. An absent chunk is not one of those, because the
+        base store already returns None for it, so an error raised here is
+        worth another attempt rather than discarding a job that has been
+        streaming for minutes.
+        """
+
+        async def get(self, key, prototype, byte_range=None):
+            delay = 0.5
+            for attempt in range(READ_ATTEMPTS):
+                try:
+                    return await super().get(key, prototype, byte_range)
+                except Exception as error:
+                    if attempt == READ_ATTEMPTS - 1 or not _is_transient_read_error(
+                        error
+                    ):
+                        raise
+                    LOGGER.warning(
+                        "Transient read error on %s (%s), retry %d/%d in %.1fs: %s",
+                        key,
+                        type(error).__name__,
+                        attempt + 1,
+                        READ_ATTEMPTS - 1,
+                        delay,
+                        error,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
 
 
 def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
@@ -128,7 +169,7 @@ def open_volume_root(
         if is_remote:
             remote_options = dict(storage_options)
             remote_options["skip_instance_cache"] = True
-            source_store = zarr.storage.FsspecStore.from_url(
+            source_store = RetryingFsspecStore.from_url(
                 path_text,
                 storage_options=remote_options,
                 read_only=True,
@@ -144,7 +185,7 @@ def open_volume_root(
 
     if is_remote and ZARR_V3:
         storage_options["skip_instance_cache"] = True
-        store = zarr.storage.FsspecStore.from_url(
+        store = RetryingFsspecStore.from_url(
             path_text,
             storage_options=storage_options,
             read_only=True,
