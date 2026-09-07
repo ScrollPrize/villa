@@ -32,6 +32,21 @@ CONFIG = textwrap.dedent(
 )
 
 
+class _FakeArray:
+    """Minimal stand-in for the zarr array Volume expects from load_data."""
+
+    import numpy as _np
+
+    shape = (65, 16, 16)
+    ndim = 3
+    dtype = _np.dtype("uint8")
+
+    def __getitem__(self, idx):
+        import numpy as np
+
+        return np.zeros((1, 1, 1), dtype="uint8")
+
+
 def _probe(segment_id, config_path):
     """A Volume shell carrying only what the helper reads."""
     vol = Volume.__new__(Volume)
@@ -90,3 +105,38 @@ def test_shipped_config_covers_the_documented_example():
     if not os.path.exists(shipped):
         pytest.skip("shipped scrolls.yaml not present in this install")
     assert _probe(20230827161847, shipped)._infer_scroll_from_segment() is not None
+
+
+@pytest.mark.unit
+def test_documented_segment_call_initializes_without_scroll_id(monkeypatch):
+    """The documented one-argument form must actually construct a Volume.
+
+    The inference runs inside ``Volume.__init__``, so the helper tests above do
+    not on their own show that ``Volume(type="segment", segment_id=...)`` works.
+    Network-dependent steps are stubbed; everything before them is the real
+    code path, including reading the shipped config.
+    """
+    import numpy as np
+
+    monkeypatch.setattr(Volume, "load_ome_metadata", lambda self: {})
+    monkeypatch.setattr(Volume, "load_data", lambda self: _FakeArray())
+    monkeypatch.setattr(Volume, "download_inklabel", lambda self, save_path=None: None)
+
+    vol = Volume(type="segment", segment_id=20230827161847, normalization_scheme="none")
+
+    assert vol.scroll_id == "1"
+    assert vol.energy == 54
+    assert vol.resolution == 7.91
+    assert vol.url.endswith("20230827161847.zarr/")
+
+
+@pytest.mark.unit
+def test_explicit_scroll_id_is_not_overridden_by_inference(monkeypatch):
+    monkeypatch.setattr(Volume, "load_ome_metadata", lambda self: {})
+    monkeypatch.setattr(Volume, "load_data", lambda self: _FakeArray())
+    monkeypatch.setattr(Volume, "download_inklabel", lambda self, save_path=None: None)
+
+    vol = Volume(type="segment", segment_id=20230827161847, scroll_id=1,
+                 normalization_scheme="none")
+
+    assert vol.scroll_id == 1

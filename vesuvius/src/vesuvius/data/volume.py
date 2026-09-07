@@ -340,8 +340,9 @@ class Volume:
                     # and keep the error type the same as get_url_from_yaml's.
                     raise FileNotFoundError(
                         f"Configuration file not found at {self.configs}. It is needed to "
-                        f"determine which scroll segment {self.segment_id} belongs to. "
-                        f"Pass scroll_id explicitly to skip this lookup.")
+                        f"determine which scroll segment {self.segment_id} belongs to, and "
+                        f"again to resolve the segment's URL. Restore scrolls.yaml, or open "
+                        f"the data directly with Volume(type='zarr', path=...).")
                 inferred = self._infer_scroll_from_segment()
                 if inferred is None:
                     raise ValueError(
