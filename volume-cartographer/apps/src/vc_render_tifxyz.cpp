@@ -1680,15 +1680,26 @@ int main(int argc, char *argv[])
                 return p;
             };
 
-            // Skip if all exist
+            // Skip if all exist and open as TIFFs. A render killed mid-way
+            // (OOM, --timeout) leaves every slice with a header but no
+            // directory -- TiffWriter writes the IFD in close() -- and a bare
+            // exists() check would treat those torn files as done and skip
+            // them on every rerun (#1404).
             bool tifSkip = false;
             if (numParts <= 1) {
-                bool all = true;
-                for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
-                if (all) {
+                int missing = 0, torn = 0;
+                for (int z = 0; z < tifSlices; z++) {
+                    const auto p = makePartPath(z);
+                    if (!std::filesystem::exists(p)) missing++;
+                    else if (!isReadableTiff(p)) torn++;
+                }
+                if (missing == 0 && torn == 0) {
                     if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return true; }
                     logPrintf(stdout, "[tif] all slices exist, skipping tif output.\n");
                     tifSkip = true;
+                } else if (torn > 0) {
+                    logPrintf(stdout, "[tif] %d of %d existing slices are not readable TIFFs (interrupted render?), re-rendering all slices.\n",
+                              torn, tifSlices - missing);
                 }
             }
             if (!tifSkip) {
