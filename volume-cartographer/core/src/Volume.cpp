@@ -1574,7 +1574,11 @@ size_t Volume::chunkCount(int level) const
 std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
-    return metadata_["voxelsize"].get_double();
+    // 0 means unknown. A document may state the key as null, as text, or not
+    // at all, and a physical measurement must degrade to "unavailable" rather
+    // than throw from deep inside whatever asked for it.
+    const double value = vc::json::number_or(metadata_, "voxelsize", 0.0);
+    return std::isfinite(value) && value > 0.0 ? value : 0.0;
 }
 
 size_t Volume::dtypeSize() const noexcept
