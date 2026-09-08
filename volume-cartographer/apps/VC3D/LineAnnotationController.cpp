@@ -10876,6 +10876,7 @@ void LineAnnotationController::startFiberModeOptimization(
                         "trace_model_prefetch_rejected={} "
                         "trace_score_ms={:.0f} report_ceres_ms={:.0f} "
                         "report_prefetch_ms={:.0f} report_chunk_dependencies={} "
+                        "span_remote_kib={} reinit_remote_kib={} tail_remote_kib={} "
                         "process_remote_delta=[{}]",
                         retraceAll, dirtyEngaged, dirtyCount, controlCount, points.size(),
                         elapsedMsSince(workerStart), optimizerMs, optimized.spanTraceMs,
@@ -10899,6 +10900,9 @@ void LineAnnotationController::startFiberModeOptimization(
                         task.result.report.normalChunkPrefetchMs +
                             task.result.report.normalMaterializeMs,
                         task.result.report.normalPrefetchChunksRead,
+                        optimized.spanRemoteBytes / 1024,
+                        optimized.reinitRemoteBytes / 1024,
+                        optimized.tailRemoteBytes / 1024,
                         remoteStoreDeltaString(storeBefore, storeAfter));
                 }
             } catch (const std::exception& ex) {

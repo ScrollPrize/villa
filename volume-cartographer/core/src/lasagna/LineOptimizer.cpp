@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <ceres/ceres.h>
 #include <opencv2/core.hpp>
@@ -1610,6 +1611,26 @@ using Clock = std::chrono::steady_clock;
 
 using NormalPrefetchFuture = std::future<NormalPrefetchReport>;
 
+std::optional<ModelPrefetchWindow> normalModelWindow(const NormalSampler& sampler) noexcept
+{
+    if (!modelPrefetchEnabled())
+        return std::nullopt;
+    try {
+        // Only Lasagna exposes remote caches; custom/local samplers retain the
+        // existing sampling contract. Never catch required sampling failures.
+        if (const auto* lasagna = dynamic_cast<const LasagnaNormalSampler*>(&sampler)) {
+            ModelPrefetchWindowOptions options;
+            options.lookahead = 512.0;
+            options.refreshDistance = 128.0;
+            options.corridor.radius = 32.0;
+            return ModelPrefetchWindow(lasagna->prefetchSources(), options);
+        }
+    } catch (...) {
+        // Optional source discovery/allocation may not fail an optimization.
+    }
+    return std::nullopt;
+}
+
 void enqueueNormalPrefetch(
     const NormalSampler& sampler,
     std::vector<cv::Vec3d> predictedPoints,
@@ -1652,6 +1673,7 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
         constexpr int kPrefetchLookaheadSteps = 12;
         constexpr int kPrefetchRefreshSteps = 8;
         std::vector<NormalPrefetchFuture> pendingPrefetches;
+        auto modelWindow = normalModelWindow(sampler);
         cv::Vec3d point = seedPoint;
         cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
         NormalSample previousSample = sampler.sampleNormal(point);
@@ -1660,6 +1682,10 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
             previousNormal = {0.0, 0.0, 0.0};
         }
         for (int i = 0; i < config.segmentsPerSide; ++i) {
+            throwIfCancelled(config);
+            if (modelWindow)
+                (void)modelWindow->advance(point, direction,
+                    config.segmentLength * (config.segmentsPerSide - i), config.cancelFlag);
             if (i % kPrefetchRefreshSteps == 0) {
                 const int lookahead = std::min(
                     kPrefetchLookaheadSteps, config.segmentsPerSide - i);
@@ -2062,6 +2088,7 @@ void growNormalConstructedExtension(
     constexpr int kPrefetchLookaheadSteps = 12;
     constexpr int kPrefetchRefreshSteps = 8;
     std::vector<NormalPrefetchFuture> pendingPrefetches;
+    auto modelWindow = normalModelWindow(sampler);
     cv::Vec3d point = startPoint;
     direction = normalizedOrZero(direction);
     if (length(direction) <= kEpsilon) {
@@ -2074,6 +2101,10 @@ void growNormalConstructedExtension(
     }
     out.reserve(static_cast<size_t>(config.segmentsPerSide));
     for (int i = 0; i < config.segmentsPerSide; ++i) {
+        throwIfCancelled(config);
+        if (modelWindow)
+            (void)modelWindow->advance(point, direction,
+                config.segmentLength * (config.segmentsPerSide - i), config.cancelFlag);
         if (i % kPrefetchRefreshSteps == 0) {
             const int lookahead = std::min(
                 kPrefetchLookaheadSteps, config.segmentsPerSide - i);
@@ -4618,7 +4649,8 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     }
 
     std::vector<cv::Vec3d> leftOpenExtension;
-    {
+    auto growLeft = [&]() {
+        throwIfCancelled(config);
         std::vector<std::array<double, 3>> grown;
         const int firstControlIndex = internalControlIndices.front();
         const cv::Vec3d outward = stitchedInternal[static_cast<size_t>(firstControlIndex)] -
@@ -4643,10 +4675,11 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         for (auto it = grown.rbegin(); it != grown.rend(); ++it) {
             leftOpenExtension.push_back(toVec3d(*it));
         }
-    }
+    };
 
     std::vector<cv::Vec3d> rightOpenExtension;
-    {
+    auto growRight = [&]() {
+        throwIfCancelled(config);
         std::vector<std::array<double, 3>> grown;
         const int lastControlIndex = internalControlIndices.back();
         const cv::Vec3d outward = stitchedInternal[static_cast<size_t>(lastControlIndex)] -
@@ -4671,7 +4704,31 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         for (const auto& point : grown) {
             rightOpenExtension.push_back(toVec3d(point));
         }
+    };
+
+    // The two tails only read the completed internal spans and write disjoint
+    // vectors. Preserve each tail's scalar math and the later stitch/solve
+    // order, while overlapping remote waits (as seed construction already does).
+    if (modelPrefetchEnabled() && normalSampler_.supportsConcurrentSampling()) {
+        std::optional<std::future<void>> leftFuture;
+        try {
+            leftFuture.emplace(std::async(std::launch::async, growLeft));
+        } catch (...) {
+            // Thread/allocation admission is optional. Exceptions from the
+            // grow operations themselves remain outside this catch boundary.
+        }
+        if (leftFuture) {
+            growRight();
+            leftFuture->get();
+        } else {
+            growLeft();
+            growRight();
+        }
+    } else {
+        growLeft();
+        growRight();
     }
+    throwIfCancelled(config);
 
     std::vector<cv::Vec3d> stitched;
     stitched.reserve(leftOpenExtension.size() + stitchedInternal.size() + rightOpenExtension.size());

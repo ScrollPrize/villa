@@ -42,6 +42,8 @@ struct CliOptions {
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     int inferenceScaledownPower = 2;
     int prefetchWarmupMs = 0;
+    int settlePrefetchMs = 0;
+    std::optional<int> guiDirtySpan;
     std::optional<int> modelReaders;
     bool quiet = false;
     bool guiReoptimize = false;
@@ -66,6 +68,8 @@ void printUsage(const char* argv0)
         << "  --model-readers N              fixed shared model read concurrency [default adaptive; 1..64]\n"
         << "  --trace-output PATH            write exact trace/decision JSON to a new file (double bit patterns)\n"
         << "  --gui-reoptimize                run the actual GUI fiber optimizer, including 1200-base-voxel tails\n"
+        << "  --gui-dirty-span N              re-solve one zero-based saved CP span; requires --gui-reoptimize\n"
+        << "  --settle-prefetch-ms N          bounded post-timing drain for complete model counters [0; max 60000]\n"
         << "  --normal-manifest-identity ID   stable normal-model provenance in GUI output [manifest location]\n"
         << "  --fiber-manifest-identity ID    stable prediction-model provenance in GUI output [manifest location]\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
@@ -196,6 +200,14 @@ CliOptions parseArgs(int argc, char** argv)
                 failOption("--trace-output must name a new file");
         } else if (arg == "--gui-reoptimize") {
             options.guiReoptimize = true;
+        } else if (arg == "--gui-dirty-span") {
+            options.guiDirtySpan = parseInt(requireValue(i, argc, argv, "gui-dirty-span"), "gui-dirty-span");
+            if (*options.guiDirtySpan < 0)
+                failOption("--gui-dirty-span must be nonnegative");
+        } else if (arg == "--settle-prefetch-ms") {
+            options.settlePrefetchMs = parseInt(requireValue(i, argc, argv, "settle-prefetch-ms"), "settle-prefetch-ms");
+            if (options.settlePrefetchMs < 0 || options.settlePrefetchMs > 60000)
+                failOption("--settle-prefetch-ms must be between 0 and 60000");
         } else if (arg == "--normal-manifest-identity") {
             options.normalManifestIdentity = requireValue(i, argc, argv, "normal-manifest-identity");
         } else if (arg == "--fiber-manifest-identity") {
@@ -333,6 +345,8 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--error-threshold-base-voxels must be non-negative");
     if (options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30)
         failOption("--inference-scaledown-power must be in [0, 30]");
+    if (options.guiDirtySpan && !options.guiReoptimize)
+        failOption("--gui-dirty-span requires --gui-reoptimize");
     if (options.normalManifest.empty()) {
         failOption(
             "--normal-manifest is required; pass the Lasagna normal manifest used for "
@@ -555,7 +569,12 @@ vc3d::line_annotation::FiberModeOptimizationRequest makeGuiRequest(
     request.fiberManifestLocation = options.fiberManifestIdentity.empty()
         ? options.fiberManifest : options.fiberManifestIdentity;
     request.globalMode = annotation::fiberOptimizationModeFromString(parsed.optimizationMode);
-    request.retraceAll = true;
+    request.retraceAll = !options.guiDirtySpan.has_value();
+    if (options.guiDirtySpan) {
+        if (static_cast<size_t>(*options.guiDirtySpan) + 1 >= fiber.controlPointsXyzBase.size())
+            failOption("--gui-dirty-span is outside the saved fiber's control spans");
+        request.dirtySegments = std::vector<size_t>{static_cast<size_t>(*options.guiDirtySpan)};
+    }
     request.extrapolationDistanceBaseVoxels = annotation::kDefaultExtrapolationDistanceBaseVoxels;
     annotation::configureFiberModeLasagnaDefaults(
         request.lasagnaConfig, annotation::kDefaultExtrapolationDistanceBaseVoxels);
@@ -644,6 +663,7 @@ int main(int argc, char** argv)
         }
         std::cout << "native_trace2cp_readers adaptive=" << !options.modelReaders.has_value()
                   << " configured_max=" << options.modelReaders.value_or(64) << '\n';
+        const auto remoteBefore = vc::lasagna::remoteStoreStats();
 
         vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;
         datasetOptions.remoteCacheRoot = options.remoteCacheDir;
@@ -725,6 +745,7 @@ int main(int argc, char** argv)
                           workingToBaseScale, options.prefetchWarmupMs);
 
         using Clock = std::chrono::steady_clock;
+        const auto solveRemoteBefore = vc::lasagna::remoteStoreStats();
         const auto wallStart = Clock::now();
         const std::clock_t cpuStart = std::clock();
         auto lastProgress = Clock::now();
@@ -807,7 +828,14 @@ int main(int argc, char** argv)
             std::cout << "native_trace2cp_gui_stages span_trace_ms=" << std::fixed << std::setprecision(3)
                       << guiResult->spanTraceMs << " reinit_ms=" << guiResult->reinitMs
                       << " tail_trace_ms=" << guiResult->tailTraceMs
-                      << " tail_normal_pass_ms=" << guiResult->tailNormalPassMs << '\n';
+                      << " tail_normal_pass_ms=" << guiResult->tailNormalPassMs
+                      << " report_prefetch_ms=" << guiResult->optimization.report.normalChunkPrefetchMs +
+                                                    guiResult->optimization.report.normalMaterializeMs
+                      << " report_ceres_ms=" << guiResult->optimization.report.ceresSolveMs
+                      << " span_remote_bytes=" << guiResult->spanRemoteBytes
+                      << " reinit_remote_bytes=" << guiResult->reinitRemoteBytes
+                      << " tail_remote_bytes=" << guiResult->tailRemoteBytes
+                      << " dirty_span=" << options.guiDirtySpan.value_or(-1) << '\n';
         } else {
             writeTraceOutput(options.traceOutput, result, workingToBaseScale);
             std::cout << "native_trace2cp_fiber err/kvx=" << std::fixed
@@ -950,6 +978,23 @@ int main(int argc, char** argv)
                   << " model_prefetch_ms=" << profile.modelPrefetchMs
                   << " model_prefetch_submitted=" << profile.modelPrefetchSubmitted
                   << " model_prefetch_rejected=" << profile.modelPrefetchRejected
+                  << '\n';
+        // Separate from optimizer timing. A benchmark can wait for optional
+        // reads to finish before snapshotting process-wide model-store counters.
+        const auto settleStart = Clock::now();
+        const auto settleDeadline = settleStart + std::chrono::milliseconds(options.settlePrefetchMs);
+        while (vc::render::ChunkCache::speculativePrefetchStats().pendingRequests != 0 &&
+               Clock::now() < settleDeadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const auto remoteAfter = vc::lasagna::remoteStoreStats();
+        std::cout << "native_trace2cp_remote remote_owned=" << remoteAfter.objectsOwned - remoteBefore.objectsOwned
+                  << " remote_bytes=" << remoteAfter.bytesOwned - remoteBefore.bytesOwned
+                  << " remote_disk_hits=" << remoteAfter.objectsFromDisk - remoteBefore.objectsFromDisk
+                  << " remote_failures=" << remoteAfter.failures - remoteBefore.failures
+                  << " remote_owner_ms_sum=" << (remoteAfter.ownerNanoseconds - remoteBefore.ownerNanoseconds) / 1e6
+                  << " solve_and_drain_remote_bytes=" << remoteAfter.bytesOwned - solveRemoteBefore.bytesOwned
+                  << " pending_requests=" << vc::render::ChunkCache::speculativePrefetchStats().pendingRequests
+                  << " settle_ms=" << std::chrono::duration<double, std::milli>(Clock::now() - settleStart).count()
                   << '\n';
         return 0;
     } catch (const std::exception& exc) {

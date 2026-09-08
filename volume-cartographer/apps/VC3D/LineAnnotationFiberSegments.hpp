@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <atomic>
 #include <functional>
 #include <limits>
@@ -289,6 +290,11 @@ struct FiberModeOptimizationResult {
     double reinitMs = 0.0;          // reinitializeAndOptimizeExistingLine calls, summed
     double tailTraceMs = 0.0;       // replaceOpenTailsWithNative incl. its normal pass
     double tailNormalPassMs = 0.0;  // the per-point sampleNormal loop inside it
+    // Process-wide completed-read deltas during each phase, including overlap
+    // from speculation/other consumers. Not exclusive request attribution.
+    std::uint64_t spanRemoteBytes = 0;
+    std::uint64_t reinitRemoteBytes = 0;
+    std::uint64_t tailRemoteBytes = 0;
 };
 
 [[nodiscard]] FiberModeOptimizationResult optimizeFiberWithNativeFallback(

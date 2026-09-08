@@ -67,4 +67,29 @@ private:
     ModelPrefetchReport report_;
 };
 
+// All distances, including source spacing, are in the caller's coordinates.
+// The native tracer uses trace voxels; the line optimizer uses base voxels.
+struct ModelPrefetchWindowOptions {
+    double lookahead = 256.0;
+    double refreshDistance = 64.0;
+    ModelPrefetchOptions corridor{16.0, 128, 4096, 16ULL * 1024ULL * 1024ULL};
+};
+
+// Shared queue-only moving ray. Required reads and direction calculations stay
+// with the caller. An optional planning/admission failure disables this window.
+class ModelPrefetchWindow {
+public:
+    explicit ModelPrefetchWindow(std::vector<ModelPrefetchSource> sources,
+                                 ModelPrefetchWindowOptions options = {});
+    // Returns this call's scheduling counters; planningMs includes admission.
+    ModelPrefetchReport advance(const cv::Vec3d& origin, const cv::Vec3d& direction,
+                                double remainingDistance,
+                                const std::atomic<bool>* cancelled = nullptr) noexcept;
+private:
+    std::vector<ModelPrefetchSource> sources_;
+    ModelPrefetchWindowOptions options_;
+    std::unique_ptr<ModelPrefetchPlan> plan_;
+    cv::Vec3d plannedOrigin_{};
+};
+
 } // namespace vc::lasagna

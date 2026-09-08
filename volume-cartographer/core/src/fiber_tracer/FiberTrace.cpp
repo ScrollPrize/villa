@@ -2177,60 +2177,38 @@ public:
     {
         if (!vc::lasagna::modelPrefetchEnabled())
             return;
-        if (const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions))
-            sources_ = field->prefetchSources();
-        if (const auto* sampler = dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normals)) {
-            auto normalSources = sampler->prefetchSources();
-            sources_.insert(sources_.end(), normalSources.begin(), normalSources.end());
+        try {
+            std::vector<vc::lasagna::ModelPrefetchSource> sources;
+            if (const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions))
+                sources = field->prefetchSources();
+            if (const auto* sampler = dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normals)) {
+                auto normalSources = sampler->prefetchSources();
+                sources.insert(sources.end(), normalSources.begin(), normalSources.end());
+            }
+            window_.emplace(std::move(sources));
+        } catch (...) {
+            // Optional source discovery/allocation must not change fallback.
         }
-        std::erase_if(sources_, [](const auto& source) { return !source.remote; });
     }
 
     void advance(const BeamState& beam) noexcept
     {
-        if (sources_.empty())
+        if (!window_)
             return;
-        const auto started = TraceClock::now();
-        try {
-            const cv::Vec3d origin = toVec3d(beamEndpoint(beam));
-            if (!plan_ || cv::norm(origin - plannedOrigin_) >= 64.0) {
-                vc::lasagna::ModelPrefetchOptions options;
-                options.radius = 16.0;
-                options.maxRequests = 128;
-                options.maxPlanningSteps = 4096;
-                options.maxPlannedBytes = 16ULL * 1024ULL * 1024ULL;
-                // Do not download a full ray beyond a nearby segment endpoint
-                // or the remaining tail budget. The corridor already supplies
-                // the interpolation/beam margin. This only limits speculation.
-                const double remaining = lengthLimit_
-                    ? *lengthLimit_ - static_cast<double>(beam.tracedLength)
-                    : cv::norm(target_ - origin);
-                const double ahead = std::clamp(remaining, 0.0, 256.0);
-                plan_ = std::make_unique<vc::lasagna::ModelPrefetchPlan>(
-                    sources_, std::vector<cv::Vec3d>{
-                        origin, origin + toVec3d(beam.previousStepDirection) * ahead}, options);
-                plannedOrigin_ = origin;
-            }
-            const auto before = plan_->report();
-            (void)plan_->pump();
-            if (profile_) {
-                profile_->modelPrefetchSubmitted += plan_->report().submitted - before.submitted;
-                profile_->modelPrefetchRejected += plan_->report().rejected - before.rejected;
-            }
-        } catch (...) {
-            // A speculative planner/admission failure must not select a
-            // different trace/fallback. Required reads still report errors.
-            sources_.clear();
-            plan_.reset();
+        const cv::Vec3d origin = toVec3d(beamEndpoint(beam));
+        const double remaining = lengthLimit_
+            ? *lengthLimit_ - static_cast<double>(beam.tracedLength)
+            : cv::norm(target_ - origin);
+        const auto delta = window_->advance(origin, toVec3d(beam.previousStepDirection), remaining);
+        if (profile_) {
+            profile_->modelPrefetchSubmitted += delta.submitted;
+            profile_->modelPrefetchRejected += delta.rejected;
+            profile_->modelPrefetchMs += delta.planningMs;
         }
-        if (profile_)
-            profile_->modelPrefetchMs += elapsedSeconds(started) * 1000.0;
     }
 
 private:
-    std::vector<vc::lasagna::ModelPrefetchSource> sources_;
-    std::unique_ptr<vc::lasagna::ModelPrefetchPlan> plan_;
-    cv::Vec3d plannedOrigin_{};
+    std::optional<vc::lasagna::ModelPrefetchWindow> window_;
     cv::Vec3d target_{};
     std::optional<double> lengthLimit_;
     FiberTraceProfile* profile_ = nullptr;

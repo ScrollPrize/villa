@@ -89,6 +89,43 @@ TEST_CASE("model prefetch uses each channel's own coordinate scale")
     CHECK(both.report().plannedBytes == 16 * 64);
 }
 
+TEST_CASE("moving window is bounded and cancellation or local data submits nothing")
+{
+    Source source;
+    ModelPrefetchWindowOptions options;
+    options.lookahead = 8;
+    options.refreshDistance = 4;
+    options.corridor.radius = 0;
+    options.corridor.maxRequests = 3;
+    ModelPrefetchWindow local({source.source(1, false)}, options);
+    CHECK(local.advance({8, 8, 8}, {1, 0, 0}, 100).submitted == 0);
+    std::atomic<bool> cancelled{true};
+    ModelPrefetchWindow window({source.source()}, options);
+    CHECK(window.advance({8, 8, 8}, {1, 0, 0}, 100, &cancelled).submitted == 0);
+    const auto first = window.advance({8, 8, 8}, {1, 0, 0}, 100);
+    CHECK(first.submitted <= 3);
+    REQUIRE(first.submitted > 0);
+    CHECK(window.advance({8, 8, 8}, {1, 0, 0}, 100).submitted == 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ChunkCache::speculativePrefetchStats().pendingRequests != 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(ChunkCache::speculativePrefetchStats().pendingRequests == 0);
+    const auto moved = window.advance({32, 8, 8}, {1, 0, 0}, 0);
+    CHECK(moved.submitted <= 3);
+    CHECK(moved.submitted > 0);
+}
+
+TEST_CASE("moving window ignores invalid options")
+{
+    Source source;
+    ModelPrefetchWindowOptions options;
+    options.lookahead = std::numeric_limits<double>::quiet_NaN();
+    ModelPrefetchWindow invalid({source.source()}, options);
+    CHECK(invalid.advance({8, 8, 8}, {1, 0, 0}, 100).submitted == 0);
+    CHECK_NOTHROW(invalid.advance({8, 8, 8}, {1, 0, 0}, 100));
+}
+
 TEST_CASE("model prefetch bounds planning and bytes independently")
 {
     Source source;

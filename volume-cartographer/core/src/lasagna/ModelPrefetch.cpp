@@ -9,6 +9,47 @@
 #include <unordered_set>
 
 namespace vc::lasagna {
+
+ModelPrefetchWindow::ModelPrefetchWindow(std::vector<ModelPrefetchSource> sources,
+                                       ModelPrefetchWindowOptions options)
+    : sources_(std::move(sources)), options_(options)
+{
+    std::erase_if(sources_, [](const auto& source) { return !source.remote; });
+    if (!modelPrefetchEnabled() || !std::isfinite(options_.lookahead) ||
+        options_.lookahead <= 0 || !std::isfinite(options_.refreshDistance) ||
+        options_.refreshDistance <= 0)
+        sources_.clear();
+}
+
+ModelPrefetchReport ModelPrefetchWindow::advance(
+    const cv::Vec3d& origin, const cv::Vec3d& direction, double remainingDistance,
+    const std::atomic<bool>* cancelled) noexcept
+{
+    ModelPrefetchReport delta;
+    if (sources_.empty() || (cancelled && cancelled->load(std::memory_order_relaxed)))
+        return delta;
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        if (!plan_ || cv::norm(origin - plannedOrigin_) >= options_.refreshDistance) {
+            const double ahead = std::clamp(remainingDistance, 0.0, options_.lookahead);
+            plan_ = std::make_unique<ModelPrefetchPlan>(sources_,
+                std::vector<cv::Vec3d>{origin, origin + direction * ahead}, options_.corridor);
+            plannedOrigin_ = origin;
+        }
+        const auto before = plan_->report();
+        (void)plan_->pump(cancelled);
+        delta.submitted = plan_->report().submitted - before.submitted;
+        delta.rejected = plan_->report().rejected - before.rejected;
+        delta.alreadyResolved = plan_->report().alreadyResolved - before.alreadyResolved;
+    } catch (...) {
+        sources_.clear();
+        plan_.reset();
+    }
+    delta.planningMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    return delta;
+}
+
 namespace {
 
 using vc::render::ChunkKey;

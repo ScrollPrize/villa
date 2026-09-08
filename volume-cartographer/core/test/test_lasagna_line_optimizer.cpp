@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -523,6 +524,78 @@ TEST_CASE("LineOptimizer cancellation throws at solve entry points")
     // Unset flag: entry points proceed (no throw).
     cancel.store(false);
     CHECK_NOTHROW(optimizer.optimizeExistingLine(linePoints, {0, 10}, 5, config));
+}
+
+TEST_CASE("normal construction observes cancellation during growth and propagates required failures")
+{
+    class CancellingSampler final : public vc::lasagna::NormalSampler {
+    public:
+        mutable std::atomic<bool> cancel{false};
+        mutable int calls = 0;
+        bool fail = false;
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+        {
+            ++calls;
+            if (fail && calls == 6)
+                throw std::runtime_error("required normal failed");
+            if (!fail && calls == 5)
+                cancel.store(true);
+            return {{0, 0, 1}, true, {}};
+        }
+    } sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 100;
+    config.cancelFlag = &sampler.cancel;
+    config.printSolverProgress = false;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    CHECK_THROWS_AS(optimizer.optimizeFromSeed({0, 0, 0}, config),
+                    vc::lasagna::LineOptimizationCancelled);
+    CHECK(sampler.calls < 20);
+    sampler.cancel.store(false);
+    sampler.calls = 0;
+    sampler.fail = true;
+    CHECK_THROWS_WITH_AS(optimizer.optimizeFromSeed({0, 0, 0}, config),
+                         doctest::Contains("required normal failed"), std::runtime_error);
+    CHECK(sampler.calls == 6);
+}
+
+TEST_CASE("concurrent reinit tails propagate cancellation and required sampling errors")
+{
+    class TailSampler final : public vc::lasagna::NormalSampler {
+    public:
+        mutable std::atomic<bool> cancel{false};
+        mutable std::atomic<bool> leftRanInWorker{false};
+        std::thread::id caller = std::this_thread::get_id();
+        bool fail = false;
+        bool supportsConcurrentSampling() const noexcept override { return true; }
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& point) const override
+        {
+            if (point[0] < 0) {
+                leftRanInWorker.store(std::this_thread::get_id() != caller);
+                if (fail)
+                    throw std::runtime_error("required left tail normal failed");
+                cancel.store(true);
+            }
+            return {{0, 0, 1}, true, {}};
+        }
+    } sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.cancelFlag = &sampler.cancel;
+    config.printSolverProgress = false;
+    config.segmentsPerSide = 100;
+    std::vector<cv::Vec3d> points{{0, 0, 0}, {5, 0, 0}, {10, 0, 0}};
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, points.front(), true, 0}, {2.0, points.back(), false, 2}};
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    CHECK_THROWS_AS(optimizer.reinitializeAndOptimizeExistingLine(
+        points, controls, {0, 2}, 1, config, {{0, 1}}), vc::lasagna::LineOptimizationCancelled);
+    if (vc::lasagna::modelPrefetchEnabled())
+        CHECK(sampler.leftRanInWorker.load());
+    sampler.cancel.store(false);
+    sampler.fail = true;
+    CHECK_THROWS_WITH_AS(optimizer.reinitializeAndOptimizeExistingLine(
+        points, controls, {0, 2}, 1, config, {{0, 1}}),
+        doctest::Contains("required left tail normal failed"), std::runtime_error);
 }
 
 TEST_CASE("LineOptimizer local update range covers three neighboring control spans")

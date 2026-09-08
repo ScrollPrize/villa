@@ -2,6 +2,7 @@
 #include "LineAnnotationOptimizationDefaults.hpp"
 
 #include "vc/lasagna/NormalAlignment.hpp"
+#include "vc/lasagna/Dataset.hpp"
 
 #include "vc/lasagna/LineSpline.hpp"
 
@@ -785,12 +786,14 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                     "fiber prediction or trace-normal sampler is unavailable");
             }
             const auto traceStart = std::chrono::steady_clock::now();
+            const auto remoteStart = vc::lasagna::remoteStoreStats();
             traced = vc::fiber_tracer::traceFiberSegment(
                 *request.predictions,
                 traceRequest,
                 request.traceNormalSampler);
             output.spanTraceMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - traceStart).count();
+            output.spanRemoteBytes += vc::lasagna::remoteStoreStats().bytesOwned - remoteStart.bytesOwned;
         } catch (const std::exception& ex) {
             traceException = ex.what();
             traced.reset();
@@ -958,6 +961,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             }
         }
         const auto reinitStart = std::chrono::steady_clock::now();
+        const auto reinitRemoteStart = vc::lasagna::remoteStoreStats();
         reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
             std::move(stitched), optimizerControlPoints(request.controlPoints),
             controlIndices, controlIndices[controlIndices.size() / 2],
@@ -965,6 +969,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             std::move(hardDirections));
         output.reinitMs += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - reinitStart).count();
+        output.reinitRemoteBytes += vc::lasagna::remoteStoreStats().bytesOwned - reinitRemoteStart.bytesOwned;
         if (!reinitialized.failed)
             break;
         // A cancelled solve reports failure through the candidate machinery;
@@ -1031,10 +1036,12 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     }
     if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
         const auto tailStart = std::chrono::steady_clock::now();
+        const auto tailRemoteStart = vc::lasagna::remoteStoreStats();
         const int shift = replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
         output.tailTraceMs += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tailStart).count();
+        output.tailRemoteBytes += vc::lasagna::remoteStoreStats().bytesOwned - tailRemoteStart.bytesOwned;
         for (auto& control : request.controlPoints) {
             control.optimizedIndex += shift;
             control.linePosition += static_cast<double>(shift);

@@ -60,6 +60,21 @@ def configured_readers_match(extra_args, metrics):
     requested = str(int(extra_args[index+1]))
     return metrics.get('configured_max') == requested and metrics.get('adaptive') == '0'
 
+def parse_metric_output(stdout):
+    """Shared CLI protocol for loopback and real-remote benchmark runners."""
+    profile, metrics, warmup = {}, {}, {}
+    for line in stdout.splitlines():
+        if not line.startswith('native_trace2cp_'):
+            continue
+        fields = dict(item.split('=', 1) for item in line.split()[1:] if '=' in item)
+        if line.startswith('native_trace2cp_profile'):
+            profile = {key:float(value) for key, value in fields.items()}
+        elif line.startswith('native_trace2cp_warmup'):
+            warmup = {key:float(value) for key, value in fields.items()}
+        else:
+            metrics.update(fields)
+    return metrics, profile, warmup
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
@@ -241,18 +256,7 @@ def main():
                 requests_drained, requests = drain_trial_requests(
                     server, start_row, timeout=args.drain_timeout_s)
                 write_json(stem.with_suffix('.requests.json'), requests)
-                profile = {}
-                metrics = {}
-                warmup = {}
-                for line in completed.stdout.splitlines():
-                    if line.startswith('native_trace2cp_'):
-                        fields = dict(item.split('=',1) for item in line.split()[1:] if '=' in item)
-                        if line.startswith('native_trace2cp_profile'):
-                            profile = {k: float(v) for k,v in fields.items()}
-                        elif line.startswith('native_trace2cp_warmup'):
-                            warmup = {k: float(v) for k,v in fields.items()}
-                        else:
-                            metrics.update(fields)
+                metrics, profile, warmup = parse_metric_output(completed.stdout)
                 row = {'mode':mode, 'trial':trial, 'command':command, 'process_wall_s':elapsed,
                        'returncode':completed.returncode, 'request_count':len(requests),
                        'requests_drained':requests_drained,
