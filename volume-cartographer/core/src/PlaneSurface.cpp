@@ -3,6 +3,7 @@
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/mat.hpp>
 #include "utils/Json.hpp"
 
 #include <cmath>
@@ -22,7 +23,8 @@ static cv::Vec3f internal_loc(const cv::Vec3f &nominal, const cv::Vec3f &interna
     return internal + cv::Vec3f(nominal[0]*scale[0], nominal[1]*scale[1], nominal[2]);
 }
 
-//given origin and normal, return the normalized vector v which describes a point : origin + v which lies in the plane and maximizes v.x at the cost of v.y,v.z
+// given origin and normal, return the normalized vector v which describes a point : origin + v
+// which lies in the plane and maximizes v.x at the cost of v.y,v.z
 static cv::Vec3f vx_from_orig_norm(const cv::Vec3f &o, const cv::Vec3f &n)
 {
     //impossible
@@ -210,6 +212,10 @@ void PlaneSurface::update()
 
     _M = transf({0,0,3,3});
     _T = transf({3,0,1,3});
+}
+
+cv::Matx33d PlaneSurface::frame() {
+    return _M;
 }
 
 cv::Vec3f PlaneSurface::project(cv::Vec3f wp, float render_scale, float coord_scale)

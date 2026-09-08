@@ -6,16 +6,26 @@
 2. Merge `origin/main` without rewriting the branch's published history.
 3. Resolve conflicts by preserving the Fiberlet branch behavior while
    incorporating upstream fixes and current interfaces.
-4. Review the resulting diff for unresolved markers, accidental deletions,
-   and incompatible build/test registrations.
-5. Commit the completed merge.
+4. Audit every path changed on both sides, with focused semantic review of
+   FiberTrace, ChunkCache, Lasagna sampling/optimization, CMake registrations,
+   tests, Python entry points, and durable planning/specification files.
+5. Compare the merge result against both `origin/main` and the pre-merge branch
+   for overlapping files, then check unmerged entries, conflict markers,
+   whitespace errors, accidental deletions, and unrelated-file inclusion.
+6. Preserve durable spec/changelog additions from both histories without
+   importing unrelated upstream active task/status records into this task.
+7. Commit the completed merge.
 
 ## Tests
 
-1. Build the directly affected Volume Cartographer targets in the existing
-   Release build.
-2. Run focused FiberTrace/Fiberlet tests selected from the actual merged diff.
-3. Report any unrelated or pre-existing failures without relaxing them.
+1. Regenerate the existing Release CMake build and build `vc_fiber_trace_chunk`,
+   `vc_fiberlets`, and the directly affected test targets.
+2. Run `test_fiber_trace3d`, `test_chunk_cache`, Lasagna normal/line-optimizer
+   tests, `test_fiberlet_paths`, `test_fiberlet_storage`,
+   `test_fiberlet_crop_trace`, and available reference-replay tests.
+3. Run an existing deterministic Fiberlet smoke fixture covering selection,
+   cost, and termination behavior if one is available in the built tests.
+4. Report any unrelated or pre-existing failures without relaxing them.
 
 ## Spec update
 

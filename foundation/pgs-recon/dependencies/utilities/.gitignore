@@ -1,0 +1,54 @@
+*.iconset/
+bin/
+flycheck*
+*.o
+*.so
+*.a
+*.gch
+
+# Emacs
+*~
+
+# Intellij
+.idea/
+*.iml
+*.iws
+
+# Mac
+.DS_Store
+._*
+Brewfile.lock.json
+
+# Maven
+log/
+target/
+
+# CMake
+*CMakeCache.txt
+*CMakeFiles
+*Makefile
+*cmake_install.cmake
+*install_manifest.txt
+*build*/
+deps/
+.cache/
+
+# Vim
+tags
+.ycm_extra_conf.py
+.ycm_extra_conf.pyc
+
+# Python
+__pycache__
+.ropeproject
+venv/*
+
+# Doxygen
+docs/latex/
+docs/html/
+
+# CLion
+cmake-build*/
+
+# VS Code
+.vscode/

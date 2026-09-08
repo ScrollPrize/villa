@@ -1377,7 +1377,10 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
         session = _attach_fake_session(self.state, self.output, self.root)
-        live = Config().as_dict()
+        # Pin every input toggle to its historical value so the legacy
+        # backfill sub-case below stays a pure absence-vs-backfill check even
+        # though input_use_surf_sdt now defaults off.
+        live = Config(dict(BACKFILLABLE_CONFIG_DEFAULTS)).as_dict()
         session.applied_config = dict(live)
 
         # A checkpoint differing only in allowlisted model configuration is a

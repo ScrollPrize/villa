@@ -25,6 +25,7 @@ public:
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
 
     float pointDist(cv::Vec3f wp);
+    cv::Matx33d frame();
     cv::Vec3f project(cv::Vec3f wp, float render_scale = 1.0, float coord_scale = 1.0);
     void setNormal(cv::Vec3f normal);
     void setOrigin(cv::Vec3f origin);

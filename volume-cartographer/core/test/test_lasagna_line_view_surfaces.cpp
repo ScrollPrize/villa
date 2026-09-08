@@ -118,9 +118,10 @@ TEST_CASE("LineViewBuilder uses a fixed seven-row cross strip")
     checkVec(sideSlicePoints(3, 0), {0.0, 0.0, 0.0});
     checkVec(sideSlicePoints(4, 0), {0.0, 0.0, 32.0});
     checkVec(sideSlicePoints(6, 0), {0.0, 0.0, 96.0});
-    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 32.0));
+    // Along-line density follows the 8 vx sampling target; cross rows stay 32 vx.
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 8.0));
     CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 32.0));
-    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 32.0));
+    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 8.0));
     CHECK(views.lineSideSlice->scale()[1] == doctest::Approx(1.0 / 32.0));
     CHECK(views.lineSurface->strictQuadRenderValidity());
     CHECK(views.lineSideSlice->strictQuadRenderValidity());
@@ -450,6 +451,7 @@ TEST_CASE("LineViewBuilder resamples by arc length only between annotation contr
     }
 
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 32.0;
     config.controlPointLinePositions = {0.0, 1.0, 3.0};
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
@@ -475,6 +477,36 @@ TEST_CASE("LineViewBuilder resamples by arc length only between annotation contr
     }
 }
 
+TEST_CASE("LineViewBuilder default along target is 8 vx while cross rows stay 32 vx")
+{
+    // A 16 vx control span is two columns at the default target (it was one
+    // column at the previous 32 vx target); the 4 vx span stays one column.
+    vc::lasagna::LineModel line;
+    for (const double x : {0.0, 4.0, 20.0}) {
+        line.points.push_back({{x, 0.0, 0.0}, normal({0.0, 0.0, 1.0}), true});
+    }
+    vc::lasagna::LineViewConfig config;
+    config.controlPointLinePositions = {0.0, 1.0, 2.0};
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.rows == 7);
+    REQUIRE(points.cols == 4);
+    CHECK(vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels == doctest::Approx(8.0));
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(8.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 8.0));
+    CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 32.0));
+    checkVec(points(points.rows / 2, 0), {0.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {4.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 2), {12.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 3), {20.0, 0.0, 0.0});
+    checkVec(points(0, 0), {0.0, -96.0, 0.0});
+    checkVec(points(6, 0), {0.0, 96.0, 0.0});
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(1.0));
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(2.0) ==
+          doctest::Approx(3.0));
+}
+
 TEST_CASE("LineViewBuilder follows optimized bends between control supports")
 {
     vc::lasagna::LineModel line;
@@ -487,6 +519,7 @@ TEST_CASE("LineViewBuilder follows optimized bends between control supports")
     }
 
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 32.0;
     config.controlPointLinePositions = {0.0, 2.0, 3.0};
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
@@ -510,6 +543,7 @@ TEST_CASE("LineViewBuilder keeps fractional control positions as exact supports"
     }
 
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 32.0;
     config.controlPointLinePositions = {0.5, 2.0};
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();

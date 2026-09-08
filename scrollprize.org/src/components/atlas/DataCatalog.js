@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { neuroglancerUrl } from "./dataAccess";
 
 // DataCatalog — the "Data & access" panel for a scroll detail page.
@@ -35,6 +35,61 @@ function PathRow({ label, value }) {
   );
 }
 
+// "CT in Neuroglancer" picker for scrolls with several raw-CT OME-Zarr
+// volumes: a dbtn that opens a menu of per-volume Neuroglancer links, each
+// labeled with the volume id + resolution/energy. Click-away closes it.
+function CtVolumeDropdown({ volumes, display }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  return (
+    <span className="dbtn-dd" ref={ref}>
+      <button
+        type="button"
+        className="dbtn"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        CT in Neuroglancer ({volumes.length}) ▾
+      </button>
+      {open ? (
+        <div className="dbtn-menu" role="menu">
+          {volumes.map((v) => {
+            const detail = [
+              v.px != null ? `${v.px} µm` : null,
+              v.energy != null ? `${v.energy} keV` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <a
+                key={v.id}
+                role="menuitem"
+                href={neuroglancerUrl(v.zarr, `${display} ${v.id}`)}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setOpen(false)}
+              >
+                {v.id}
+                {detail ? <span className="ddmeta"> {detail}</span> : null} ↗
+              </a>
+            );
+          })}
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
 export default function DataCatalog({ scroll }) {
   if (!scroll) return null;
 
@@ -49,11 +104,13 @@ export default function DataCatalog({ scroll }) {
     "s3://vesuvius-challenge-open-data/",
   );
 
-  // Optional Neuroglancer deep-link for the item's OME-Zarr volume (see
-  // ./dataAccess.js).
-  const ctUrl = scroll.volumeZarr
-    ? neuroglancerUrl(scroll.volumeZarr, `${scroll.display} CT`)
-    : null;
+  // Raw-CT OME-Zarr volumes → Neuroglancer. One volume keeps the plain button;
+  // several get a picker (CtVolumeDropdown).
+  const ctVolumes = (scroll.ctVolumes || []).filter((v) => v.zarr);
+  const ctUrl =
+    ctVolumes.length === 1
+      ? neuroglancerUrl(ctVolumes[0].zarr, `${scroll.display} CT`)
+      : null;
   const licenses = scroll.licenses || [];
   // Optional per-license scope annotations curated in atlasOverlay.json
   // (license name -> which of this scroll's data it covers).
@@ -86,7 +143,11 @@ export default function DataCatalog({ scroll }) {
       </a>,
     );
   }
-  if (ctUrl) {
+  if (ctVolumes.length > 1) {
+    links.push(
+      <CtVolumeDropdown key="ngct" volumes={ctVolumes} display={scroll.display} />,
+    );
+  } else if (ctUrl) {
     links.push(
       <a
         key="ngct"

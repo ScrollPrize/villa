@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from dtypes import numpy_float_hi
 
 import numpy as np
 import torch
@@ -157,8 +158,8 @@ class FlattenSlimTest(unittest.TestCase):
 		self.assertLessEqual(s1.final_residual, s0.final_residual * 1.05)
 
 	def test_bilinear_quad_inversion_accepts_inside_and_rejects_outside(self) -> None:
-		points = np.asarray([[0.25, 0.75], [1.5, 0.5]], dtype=np.float64)
-		quad = np.asarray([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]], dtype=np.float64)
+		points = np.asarray([[0.25, 0.75], [1.5, 0.5]], dtype=numpy_float_hi)
+		quad = np.asarray([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]], dtype=numpy_float_hi)
 		quads = np.repeat(quad[None, :, :, :], 2, axis=0)
 
 		s, t, residual2 = flatten_slim.bilinear_inverse_points(points, quads)

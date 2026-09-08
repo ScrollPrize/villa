@@ -66,3 +66,4 @@ dist/
 # Claude Code runtime (local settings/state are not shared; skills are)
 .claude/*
 !.claude/skills/
+Testing/

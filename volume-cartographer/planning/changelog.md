@@ -50,6 +50,14 @@
   of crop-trace pieces into H/V, even/odd, and broken states, with five OBJ
   class views and explicit objective diagnostics.
 
+## 2026-08-31
+
+- Added optional base-XYZ focus bounds that dim plane and annotation-strip views and roughly constrain new or reoptimized fiber geometry.
+
+## 2026-08-27
+
+- Added anonymous-first S3 access for public remote Lasagna manifests and Zarr objects, with authenticated fallback for private data.
+
 ## 2026-08-17
 
 - Anchored multi-control collapse through the ordinary local span update before

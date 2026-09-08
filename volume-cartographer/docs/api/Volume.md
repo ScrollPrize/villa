@@ -407,9 +407,8 @@ volume->updateMetadata(patch);
   using power-of-two level indices, with limited per-level padding tolerance.
 - Local zarr arrays may be stored as scale directories (`0`, `1`, `2`, ...)
   or as a root array for level 0.
-- Remote `s3://` URLs are resolved to HTTPS. AWS SigV4 credentials are used
-  when available, with anonymous fallback for public buckets if stale
-  credentials are rejected.
+- Remote `s3://` URLs are resolved to HTTPS and opened anonymously first. AWS
+  SigV4 credentials are used when anonymous access is denied.
 - `processChunkCacheService()` retains regular source state for the process.
   Capacity and concurrency changes preserve source identity and all
   queued/running work. A capacity reduction evicts globally oldest decoded

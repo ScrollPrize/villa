@@ -1,11 +1,17 @@
 import math
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
-from dt_targets import patch_dt_target_in_sample_frame
+from dt_targets import (
+    compute_patch_dt_target_cache,
+    patch_dt_target_in_sample_frame,
+    strip_dt_target_in_sample_frame,
+)
+from fit_spiral import FitContext
 from losses import _patch_radius_and_dt_losses
 from sample_spiral import radius_from_unwrapped_shifted, unwrap_shifted_radii
 from satisfaction_metrics import get_patch_satisfied_areas, metrics_config
@@ -42,6 +48,78 @@ def _patch_with_quad_centers(centers):
 
 
 class ThetaCrossingLossTests(unittest.TestCase):
+    def test_patch_target_cache_uses_theta_potential_winding_units(self):
+        dr = torch.tensor(10.0)
+        patch_row = SimpleNamespace(
+            _dt_target_ijs=np.array([[0.25, 0.25], [0.75, 0.75]]),
+            _dt_target_block_rc=np.array([[0, 0], [0, 1]], dtype=np.int32),
+            _dt_target_block_shape=(1, 2),
+        )
+
+        class Atlas:
+            def theta_node_ids(self, patch_indices, ijs):
+                return np.array([4, 5], dtype=np.int64)
+
+            def lookup(self, patch_indices, ijs):
+                return torch.stack([
+                    _spiral_point(0.0, 3, float(dr)),
+                    _spiral_point(0.0, 3, float(dr)),
+                ])
+
+        crossing_map = SimpleNamespace(
+            winding_potentials=lambda node_ids, theta: torch.tensor([2, 2]))
+        cache = compute_patch_dt_target_cache(
+            _IdentityTransform(), dr, [patch_row], Atlas(), crossing_map,
+            floating_threshold=0.25)
+
+        self.assertEqual(cache['frame'], 'theta_potential')
+        # Radius 3 plus theta potential 2 targets winding 5. The selector
+        # already returns winding units even though dr is non-unit.
+        torch.testing.assert_close(
+            cache['target_relative'].to(torch.int64), torch.tensor([5]))
+        target = patch_dt_target_in_sample_frame(
+            torch.tensor([[51.0]]), torch.zeros((1, 1, 2)),
+            torch.zeros((1, 1)), torch.zeros((1, 1)), dr, cache,
+            torch.tensor([0]))
+        torch.testing.assert_close(target, torch.tensor([[50.0]]))
+
+    def test_patch_target_cache_uses_only_largest_connected_component(self):
+        dr = torch.tensor(10.0)
+        patch_row = SimpleNamespace(
+            _dt_target_ijs=np.array([
+                [0.25, 0.25], [0.25, 1.25], [2.25, 0.25],
+                [2.25, 2.25], [4.25, 4.25],
+            ]),
+            _dt_target_block_rc=np.array(
+                [[0, 0], [0, 1], [2, 0], [2, 2], [4, 4]],
+                dtype=np.int32),
+            _dt_target_block_shape=(5, 5),
+        )
+
+        class Atlas:
+            def theta_node_ids(self, patch_indices, ijs):
+                return np.array([4, 5, 6, 7, 8], dtype=np.int64)
+
+            def lookup(self, patch_indices, ijs):
+                return torch.stack([
+                    _spiral_point(0.0, 3, float(dr)),
+                    _spiral_point(0.0, 3, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                    _spiral_point(0.0, 9, float(dr)),
+                ])
+
+        crossing_map = SimpleNamespace(
+            winding_potentials=lambda node_ids, theta: torch.zeros(5))
+        cache = compute_patch_dt_target_cache(
+            _IdentityTransform(), dr, [patch_row], Atlas(), crossing_map,
+            floating_threshold=0.25)
+
+        # The three detached winding-9 singletons collectively outnumber the
+        # winding-3 main island, but their unrelated frames must not affect it.
+        torch.testing.assert_close(
+            cache['target_relative'].to(torch.int64), torch.tensor([3]))
+
     def test_patch_losses_ignore_padded_samples_in_both_radius_modes(self):
         dr = torch.tensor(10.0)
         theta = torch.tensor([[0.2, 1.1, 2.0, 4.0]])
@@ -81,6 +159,23 @@ class ThetaCrossingLossTests(unittest.TestCase):
         }
         target = patch_dt_target_in_sample_frame(
             torch.tensor([[30.0, -20.0, -20.0]]), sample_ijs, zeros, zeros,
+            dr, cache, torch.tensor([0]), sample_mask=sample_mask)
+        torch.testing.assert_close(target, torch.tensor([[30.0]]))
+
+    def test_strip_dt_median_fallback_ignores_padded_points(self):
+        dr = torch.tensor(10.0)
+        sample_mask = torch.tensor([[True, False, False]])
+        zeros = torch.zeros((1, 3))
+        cache = {
+            'frame': 'strip_endpoints',
+            'anchor_theta': torch.zeros((1, 2)),
+            'anchor_adjustment': torch.tensor([[0, 5]]),
+            'target_relative': torch.tensor([3.0]),
+            'valid': torch.tensor([True]),
+        }
+        target = strip_dt_target_in_sample_frame(
+            torch.tensor([[30.0, -20.0, -20.0]]),
+            torch.tensor([[4, 10, 10]]), zeros, zeros,
             dr, cache, torch.tensor([0]), sample_mask=sample_mask)
         torch.testing.assert_close(target, torch.tensor([[30.0]]))
 
@@ -185,6 +280,66 @@ class ThetaCrossingSatisfactionTests(unittest.TestCase):
         self.assertFalse(bool(strict[0]))
         self.assertTrue(bool(loose[0]))
         self.assertEqual(metrics_config, original)
+
+
+class ThetaCrossingCacheCadenceTests(unittest.TestCase):
+    @staticmethod
+    def _context():
+        context = FitContext.__new__(FitContext)
+        context.config = {
+            'theta_crossing_map_update_interval': 100,
+            'dt_target_update_interval': 100,
+            'track_max_tortuosity': 0,
+            'track_exclusion_radius': 0,
+        }
+        context.shell_map = None
+        context.shell_outer_winding_idx = None
+        context.shell_valid_zyxs_gpu = None
+        context.tracks = []
+        context.prepared_main_tracks = None
+        context.verified_patches_list = []
+        context.unverified_patches = None
+        context.unverified_patches_list = []
+        context.unverified_patch_sampling_probabilities = None
+        context.unverified_patch_atlas = None
+        context.dt_target_cache_manager = SimpleNamespace(
+            update_interval=100, reset=Mock())
+        context.theta_crossing_map = SimpleNamespace(
+            invalidate=Mock(), refresh_if_due=Mock(return_value=True))
+        context._enforce_theta_liftability = Mock()
+        return context
+
+    def test_live_change_through_either_alias_updates_both(self):
+        for key in ('theta_crossing_map_update_interval',
+                    'dt_target_update_interval'):
+            context = self._context()
+            context.apply_config({key: 37}, current_iteration=0)
+            self.assertEqual(
+                context.config['theta_crossing_map_update_interval'], 37)
+            self.assertEqual(context.config['dt_target_update_interval'], 37)
+            self.assertEqual(context.dt_target_cache_manager.update_interval, 37)
+            context.theta_crossing_map.invalidate.assert_called_once_with()
+            self.assertGreaterEqual(
+                context.dt_target_cache_manager.reset.call_count, 1)
+
+    def test_conflicting_alias_update_rolls_back_both_values(self):
+        context = self._context()
+        with self.assertRaisesRegex(ValueError, 'one shared cadence'):
+            context.apply_config({
+                'theta_crossing_map_update_interval': 10,
+                'dt_target_update_interval': 11,
+            }, current_iteration=0)
+        self.assertEqual(
+            context.config['theta_crossing_map_update_interval'], 100)
+        self.assertEqual(context.config['dt_target_update_interval'], 100)
+
+    def test_theta_refresh_invalidates_dt_targets(self):
+        context = self._context()
+        refreshed = context._refresh_theta_crossing_map_for_step(
+            23, object())
+        self.assertTrue(refreshed)
+        context._enforce_theta_liftability.assert_called_once_with()
+        context.dt_target_cache_manager.reset.assert_called_once_with()
 
 
 if __name__ == '__main__':

@@ -90,15 +90,28 @@ void DecodedChunkCacheBudget::enforce()
                 snapshot.emplace_back(id, participant);
         }
 
+        // Victim selection prefers participants that volunteered to be
+        // evicted first (bulk background consumers such as lasagna channel
+        // sampling): while any of them still holds decoded data, the
+        // interactive viewers' tiles are left alone. Within either class the
+        // global LRU decides.
         std::uint64_t victimId = 0;
         std::uint64_t oldestTouch = std::numeric_limits<std::uint64_t>::max();
+        bool victimEvictFirst = false;
         for (const auto& [id, participant] : snapshot) {
             if (!participant.oldestDecodedTouch)
                 continue;
             const auto touch = participant.oldestDecodedTouch();
-            if (touch && *touch < oldestTouch) {
+            if (!touch)
+                continue;
+            const bool preferOverCurrent =
+                participant.evictFirst != victimEvictFirst
+                    ? participant.evictFirst
+                    : *touch < oldestTouch;
+            if (victimId == 0 || preferOverCurrent) {
                 oldestTouch = *touch;
                 victimId = id;
+                victimEvictFirst = participant.evictFirst;
             }
         }
         if (victimId == 0)

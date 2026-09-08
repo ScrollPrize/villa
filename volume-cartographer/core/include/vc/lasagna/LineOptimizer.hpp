@@ -3,10 +3,23 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace vc::lasagna {
+
+// Thrown from solve entry points when LineOptimizationConfig::cancelFlag is
+// set: the caller superseded (or is tearing down) the solve, so no result is
+// wanted. Deliberately a distinct type so coordinators can tell cancellation
+// from a genuine failure and skip failure handling (fallback demotion,
+// rollback, error dialogs).
+struct LineOptimizationCancelled : std::runtime_error {
+    LineOptimizationCancelled()
+        : std::runtime_error("line optimization cancelled")
+    {
+    }
+};
 
 struct LineOptimizationLossReport {
     std::string name;
@@ -152,6 +165,15 @@ struct LineControlPointUpdateResult {
     int changedControlIndex = -1;
     int activeStart = -1;
     int activeEnd = -1;
+    // Half-open range [replacedStart, replacedStart + replacedCount) of
+    // linePoints this update rebuilt; every point outside it is carried over
+    // from the input line unchanged (the suffix shifted by the size delta).
+    // -1/0 when the whole line must be treated as new (single control, or an
+    // update that regrew a tail). Lets callers resample derived per-point
+    // data only where geometry actually changed. Set by the geometric
+    // overload; the solving overload leaves it unset.
+    int replacedStart = -1;
+    int replacedCount = 0;
 };
 
 [[nodiscard]] LineControlPointUpdateResult updateExistingLineControlPoint(

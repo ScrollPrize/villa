@@ -3,8 +3,10 @@
 - [x] Inspect worktree and divergence
 - [x] Fetch current `origin/main`
 - [x] Replace active planning files
-- [ ] Independently review the integration plan
-- [ ] Merge `origin/main`
-- [ ] Resolve and review conflicts
-- [ ] Build and run focused tests
-- [ ] Commit the merge
+- [x] Independently review the integration plan
+- [x] Merge `origin/main`
+- [x] Resolve textual conflicts
+- [x] Audit overlapping semantic changes
+- [x] Review conflicts and merge delta
+- [x] Build and run focused tests
+- [x] Commit the merge
