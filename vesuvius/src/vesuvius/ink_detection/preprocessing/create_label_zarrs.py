@@ -109,6 +109,23 @@ def _normalize_to_2d(image: np.ndarray, source_path: Path) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def _decoded_block_to_2d(decoded: np.ndarray, source_path: Path) -> np.ndarray:
+    """Return a decoded tile or strip as 2D without losing a length-1 row axis.
+
+    ``page.decode`` returns ``(depth, rows, columns, samples)`` for a strip
+    exactly as it does for a tile. ``_normalize_to_2d`` squeezes, which is
+    right for a whole image but drops the row axis of a one-row strip --
+    ``(1, 1, width, 1)`` becomes ``(width,)`` -- so index the axes explicitly.
+    One-row strips arise when ``rowsperstrip == 1``, or when
+    ``height % rowsperstrip == 1`` leaves a single row in the final strip.
+    Tiles cannot hit this: TIFF tile heights are multiples of 16.
+    """
+    block = np.asarray(decoded)
+    if block.ndim == 4:
+        return np.ascontiguousarray(block[0, :, :, 0])
+    return _normalize_to_2d(block, source_path)
+
+
 def _normalized_2d_shape(
     shape: Sequence[int], source_path: Path
 ) -> tuple[int, int]:
@@ -276,30 +293,29 @@ def _get_streamable_tiff_metadata(
     if path.suffix.lower() not in {".tif", ".tiff"}:
         return None
     with tifffile.TiffFile(path) as tif:
-        if len(tif.pages) != 1:
-            # Multi-page TIFFs are out of scope for this change. The rest of
-            # this module -- _normalize_to_2d, _normalized_2d_shape,
-            # _create_ome_zarr_datasets(image_shape: tuple[int, int]) -- is
-            # built for a single flat 2D label image; a genuine multi-page
-            # file (verified separately) already produces silently wrong
-            # output on the non-streaming path today, independent of this
-            # change (tifffile.imread stacks all pages, then the channel-
-            # squeeze logic mistakes the page axis for height and keeps only
-            # column 0 of the real width). That is a real, separate bug, but
-            # this PR does not touch it: returning None here for any
-            # multi-page input, tiled or striped, keeps this PR's behavior
-            # change scoped to exactly the reported gap -- single-page
-            # striped TIFFs that previously fell through to the (also
-            # single-page-only) in-memory path unnecessarily.
-            return None
         page = tif.pages[0]
+        if page.is_tiled:
+            # Tiled input streamed before this change, unconditionally. Leave
+            # that exactly as it was: every extra condition here is a tiled
+            # file that regresses to the in-memory path it was exempt from.
+            return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
+
+        # Striped input is what this change adds. The two conditions below
+        # apply only to it.
+        if len(tif.pages) != 1:
+            # The rest of this module -- _normalize_to_2d,
+            # _normalized_2d_shape, _create_ome_zarr_datasets(image_shape:
+            # tuple[int, int]) -- is built for a single flat 2D label image.
+            # A genuine multi-page file already produces silently wrong output
+            # on the in-memory path today, independent of this change; that is
+            # a separate bug and this PR does not touch it.
+            return None
         if page.compression not in _STREAMABLE_COMPRESSIONS:
             # Some codecs (notably old-style JPEG, compression 6) need
-            # cross-block state tifffile does not expose per-block, so a
-            # block cannot be decoded in isolation. Neither tiled nor striped
-            # input using one of these can stream; fall through to the
-            # in-memory path exactly as before rather than risk decoding
-            # blocks independently for a codec that does not support it.
+            # cross-block state tifffile does not expose per-block, so a block
+            # cannot be decoded in isolation. Fall through to the in-memory
+            # path rather than decode blocks independently for a codec that
+            # does not support it.
             return None
         return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
 
@@ -322,7 +338,7 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
     """
     with tifffile.TiffFile(input_path) as tif:
         page = tif.pages[0]
-        if page.compression not in _STREAMABLE_COMPRESSIONS:
+        if not page.is_tiled and page.compression not in _STREAMABLE_COMPRESSIONS:
             raise ValueError(
                 f"Expected a streamable TIFF (tiled or striped, compression in "
                 f"{sorted(_STREAMABLE_COMPRESSIONS)}) for the streaming path: "
@@ -353,7 +369,7 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                     )
                     if decoded is None:
                         continue
-                    tile_YX = _normalize_to_2d(decoded, input_path)
+                    tile_YX = _decoded_block_to_2d(decoded, input_path)
                     tile_y, tile_x = position[2], position[3]
                     overlap_y0 = max(block_y, tile_y)
                     overlap_y1 = min(block_y + block_height, tile_y + tile_YX.shape[0])

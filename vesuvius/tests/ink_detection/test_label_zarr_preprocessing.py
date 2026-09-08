@@ -11,6 +11,7 @@ import zarr
 
 from vesuvius.ink_detection.preprocessing.create_label_zarrs import (
     DEFAULT_LABEL_SLICE,
+    _STREAMABLE_COMPRESSIONS,
     build_pyramid_with_mode,
     convert_image,
     find_target_images,
@@ -221,6 +222,102 @@ def test_multipage_tiff_is_left_to_the_existing_path_unchanged(tmp_path):
 
     result = convert_image(label_path, levels=1)
     assert result["streamed_tiled_tiff"] == "false"
+
+
+def test_one_row_strip_streams_correctly(tmp_path):
+    """A strip containing exactly one row must not lose its row axis.
+
+    ``page.decode`` returns ``(depth, rows, columns, samples)``; when
+    ``rows == 1`` that is ``(1, 1, width, 1)``, and squeezing it drops the row
+    axis to give ``(width,)`` -- which the 2D guard then rejects with
+    ``ValueError``. This arises whenever ``height % rowsperstrip == 1`` (only
+    the final strip is affected) or ``rowsperstrip == 1`` (every strip is).
+    Tiles cannot hit it, because TIFF tile heights are multiples of 16, which
+    is why the old ``is_tiled`` gate hid it.
+
+    These files converted before this PR, slowly, through the in-memory path,
+    so a crash here would be a regression.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    # 65 rows at 32 per strip -> strips of 32, 32, 1. The last strip is the
+    # one that decodes as (1, 1, width, 1).
+    image_YX = np.arange(65 * 48, dtype=np.uint16).reshape(65, 48)
+    tifffile.imwrite(label_path, image_YX, rowsperstrip=32)
+
+    with tifffile.TiffFile(label_path) as tif:
+        page = tif.pages[0]
+        assert not page.is_tiled, "fixture must actually be striped"
+        assert page.chunked[0] == 3, "fixture must have a one-row final strip"
+
+    result = convert_image(label_path, levels=2)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
+    )
+
+
+def test_every_strip_one_row_streams_correctly(tmp_path):
+    """``rowsperstrip=1`` makes every strip a one-row strip, not just the last.
+
+    Separate from the case above because it exercises the same decode shape on
+    every block rather than only the remainder, and because a writer that
+    produces it does so for every image it writes, not by accident of height.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    image_YX = np.arange(24 * 40, dtype=np.uint16).reshape(24, 40)
+    tifffile.imwrite(label_path, image_YX, rowsperstrip=1)
+
+    with tifffile.TiffFile(label_path) as tif:
+        assert tif.pages[0].chunked[0] == 24, "fixture must be one row per strip"
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+def test_tiled_input_streams_regardless_of_page_count_and_codec(tmp_path):
+    """Tiled input streamed unconditionally before this PR; it still must.
+
+    The first version of this change gated *both* tiled and striped input on a
+    single-page check and a codec whitelist. That silently sent tiled
+    multi-page files, and tiled files using a codec outside the whitelist,
+    back to the in-memory path they had always been exempt from -- which is
+    the allocation #1231 reports. Both are regressions rather than new
+    behaviour, so they are asserted here explicitly.
+    """
+    multipage_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(2).integers(
+        0, 2, size=(5, 32, 48), dtype=np.uint8
+    )
+    tifffile.imwrite(multipage_path, volume_ZYX, tile=(16, 16))
+    with tifffile.TiffFile(multipage_path) as tif:
+        assert len(tif.pages) == 5, "fixture must actually be multi-page"
+        assert tif.pages[0].is_tiled, "fixture must actually be tiled"
+
+    result = convert_image(multipage_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(multipage_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(
+        group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0]
+    )
+
+    zstd_path = tmp_path / "segment-b_supervision_mask.tif"
+    image_YX = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+    tifffile.imwrite(zstd_path, image_YX, tile=(16, 16), compression="zstd")
+    with tifffile.TiffFile(zstd_path) as tif:
+        page = tif.pages[0]
+        assert page.is_tiled, "fixture must actually be tiled"
+        assert page.compression not in _STREAMABLE_COMPRESSIONS, (
+            "fixture must use a codec outside the striped whitelist"
+        )
+
+    result = convert_image(zstd_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(zstd_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
 def test_label_command_reports_failure_and_cli_module_help(tmp_path, capsys):
