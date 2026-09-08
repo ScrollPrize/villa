@@ -148,23 +148,26 @@ fs::path settingsFilePath()
 
 fs::path remoteCachePath()
 {
-    if (auto configured = configuredRemoteCachePath(settingsFilePath());
-        !configured.empty()) {
-        return ensureDirectory(std::move(configured));
-    }
-
-    for (const fs::path root : {fs::path("/volpkgs"), fs::path("/ephemeral")}) {
-        std::error_code ec;
-        if (!fs::exists(root, ec) || ec)
-            continue;
-        if (!fs::is_directory(root, ec) || ec) {
-            throw std::runtime_error(
-                "Remote cache root '" + root.string() + "' is not a directory");
+    static const fs::path active = [] {
+        if (auto configured = configuredRemoteCachePath(settingsFilePath());
+            !configured.empty()) {
+            return ensureDirectory(std::move(configured));
         }
-        return ensureDirectory(root / "remote_cache");
-    }
 
-    return ensureDirectory(homeDirectory() / ".VC3D" / "remote_cache");
+        for (const fs::path root : {fs::path("/volpkgs"), fs::path("/ephemeral")}) {
+            std::error_code ec;
+            if (!fs::exists(root, ec) || ec)
+                continue;
+            if (!fs::is_directory(root, ec) || ec) {
+                throw std::runtime_error(
+                    "Remote cache root '" + root.string() + "' is not a directory");
+            }
+            return ensureDirectory(root / "remote_cache");
+        }
+
+        return ensureDirectory(homeDirectory() / ".VC3D" / "remote_cache");
+    }();
+    return active;
 }
 
 } // namespace vc::settings

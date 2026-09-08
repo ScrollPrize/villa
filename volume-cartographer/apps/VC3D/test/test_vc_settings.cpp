@@ -10,7 +10,7 @@ class VCSettingsTest : public QObject
     Q_OBJECT
 
 private slots:
-    void storedRemoteCacheDirectoryIsGlobal()
+    void storedRemoteCacheDirectoryIsGlobalAndRestartOnly()
     {
         QTemporaryDir configDir;
         QTemporaryDir cacheParent;
@@ -18,7 +18,8 @@ private slots:
         QVERIFY(cacheParent.isValid());
         qputenv("VC3D_CONFIG_DIR", configDir.path().toUtf8());
 
-        const QString first = cacheParent.filePath(QStringLiteral("first"));
+        const QString first = cacheParent.filePath(
+            QString::fromUtf8("f\xC3\xADrst-\xE6\xBC\xA2\xE5\xAD\x97"));
         const QString second = cacheParent.filePath(QStringLiteral("second cache"));
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, first);
@@ -29,8 +30,8 @@ private slots:
 
         settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, second);
         settings.sync();
-        QCOMPARE(QDir::cleanPath(vc3d::remoteCachePath()), QDir::cleanPath(second));
-        QVERIFY(QDir(second).exists());
+        QCOMPARE(QDir::cleanPath(vc3d::remoteCachePath()), QDir::cleanPath(first));
+        QVERIFY(!QDir(second).exists());
     }
 };
 

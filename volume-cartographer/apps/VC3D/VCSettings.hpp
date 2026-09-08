@@ -26,7 +26,8 @@ inline QString settingsFilePath()
     return pathToQString(vc::settings::settingsFilePath());
 }
 
-// Single source of truth for where downloaded remote-volume chunks land.
+// Process-active root for downloaded remote-volume chunks. The value is fixed
+// on first use; settings changes take effect after VC3D restarts.
 //
 // Priority — first match wins:
 //   1. viewer/remote_cache_dir from the process-wide VC3D settings
