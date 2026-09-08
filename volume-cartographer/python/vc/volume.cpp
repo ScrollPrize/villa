@@ -1175,22 +1175,74 @@ void applyBlurStencil(const float* source,
     const int height = static_cast<int>(shape[1]);
     const int width = static_cast<int>(shape[2]);
     const size_t plane = shape[1] * shape[2];
+    int minZ = 0;
+    int minY = 0;
+    int minX = 0;
+    int maxZ = 0;
+    int maxY = 0;
+    int maxX = 0;
+    std::vector<std::ptrdiff_t> linearOffsets;
+    linearOffsets.reserve(stencil.size());
+    for (const auto& entry : stencil) {
+        minZ = std::min(minZ, entry.z);
+        minY = std::min(minY, entry.y);
+        minX = std::min(minX, entry.x);
+        maxZ = std::max(maxZ, entry.z);
+        maxY = std::max(maxY, entry.y);
+        maxX = std::max(maxX, entry.x);
+        linearOffsets.push_back(
+            static_cast<std::ptrdiff_t>(entry.z) *
+                static_cast<std::ptrdiff_t>(plane) +
+            static_cast<std::ptrdiff_t>(entry.y) *
+                static_cast<std::ptrdiff_t>(shape[2]) +
+            static_cast<std::ptrdiff_t>(entry.x));
+    }
+    const int interiorZ0 = std::min(depth, std::max(0, -minZ));
+    const int interiorY0 = std::min(height, std::max(0, -minY));
+    const int interiorX0 = std::min(width, std::max(0, -minX));
+    const int interiorZ1 = std::max(interiorZ0, std::min(depth, depth - maxZ));
+    const int interiorY1 = std::max(interiorY0, std::min(height, height - maxY));
+    const int interiorX1 = std::max(interiorX0, std::min(width, width - maxX));
+    const auto writeBoundary = [&](int z, int y, int x) {
+        float value = 0.0f;
+        for (const auto& entry : stencil) {
+            const int sourceZ = std::clamp(z + entry.z, 0, depth - 1);
+            const int sourceY = std::clamp(y + entry.y, 0, height - 1);
+            const int sourceX = std::clamp(x + entry.x, 0, width - 1);
+            const size_t index = static_cast<size_t>(sourceZ) * plane +
+                                 static_cast<size_t>(sourceY) * shape[2] +
+                                 static_cast<size_t>(sourceX);
+            value += source[index] * entry.weight;
+        }
+        destination[static_cast<size_t>(z) * plane +
+                    static_cast<size_t>(y) * shape[2] +
+                    static_cast<size_t>(x)] = value;
+    };
     for (int z = 0; z < depth; ++z) {
         for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                float value = 0.0f;
-                for (const auto& entry : stencil) {
-                    const int sourceZ = std::clamp(z + entry.z, 0, depth - 1);
-                    const int sourceY = std::clamp(y + entry.y, 0, height - 1);
-                    const int sourceX = std::clamp(x + entry.x, 0, width - 1);
-                    const size_t index = static_cast<size_t>(sourceZ) * plane +
-                                         static_cast<size_t>(sourceY) * shape[2] +
-                                         static_cast<size_t>(sourceX);
-                    value += source[index] * entry.weight;
-                }
-                destination[static_cast<size_t>(z) * plane +
-                            static_cast<size_t>(y) * shape[2] +
-                            static_cast<size_t>(x)] = value;
+            if (z < interiorZ0 || z >= interiorZ1 ||
+                y < interiorY0 || y >= interiorY1 ||
+                interiorX0 >= interiorX1) {
+                for (int x = 0; x < width; ++x)
+                    writeBoundary(z, y, x);
+                continue;
+            }
+            for (int x = 0; x < interiorX0; ++x)
+                writeBoundary(z, y, x);
+            for (int x = interiorX1; x < width; ++x)
+                writeBoundary(z, y, x);
+
+            float* destinationRow = destination + static_cast<size_t>(z) * plane +
+                                    static_cast<size_t>(y) * shape[2];
+            std::fill(destinationRow + interiorX0, destinationRow + interiorX1, 0.0f);
+            for (size_t tap = 0; tap < stencil.size(); ++tap) {
+                const float* sourceRow = source +
+                    static_cast<std::ptrdiff_t>(static_cast<size_t>(z) * plane +
+                                                static_cast<size_t>(y) * shape[2]) +
+                    linearOffsets[tap];
+                const float weight = stencil[tap].weight;
+                for (int x = interiorX0; x < interiorX1; ++x)
+                    destinationRow[x] += sourceRow[x] * weight;
             }
         }
     }
