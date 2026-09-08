@@ -155,6 +155,7 @@ _INPUT_TOGGLE_KEYS = {
     "unverified_patches": "input_use_unverified_patches",
     "tracks_dbm": "input_use_tracks",
     "fibers": "input_use_fibers",
+    "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
     "surf_sdt": "input_use_surf_sdt",
     "gradient_magnitude": "input_use_gradient_magnitude",
@@ -280,6 +281,11 @@ def _normals_required(config: Mapping[str, Any]) -> bool:
     )
 
 
+def _fiber_directions_enabled(config: Mapping[str, Any]) -> bool:
+    return (input_source_enabled(config, "fiber_directions")
+            and float(config.get("loss_weight_fiber_directions", 0.0)) > 0)
+
+
 def _grad_mag_required(config: Mapping[str, Any]) -> bool:
     return (input_source_enabled(config, "gradient_magnitude")
             and _dense_spacing_mode(config) == "grad_mag"
@@ -349,6 +355,10 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  enabled=_unverified_patches_enabled),
     FitInputSpec("fibers", "directory", conventional_relative="fibers",
                  enabled=_fibers_enabled),
+    FitInputSpec("fiber_directions", "file",
+                 conventional_relative="fiber_directions.npz",
+                 enabled=_fiber_directions_enabled,
+                 required=_fiber_directions_enabled),
     FitInputSpec("outer_shell", "directory",
                  conventional_relative="outer_shell",
                  enabled=lambda config: input_source_enabled(config, "outer_shell"),
@@ -426,6 +436,7 @@ class SpiralInputPaths:
     umbilicus: str = ""
     pcls: tuple[PclInputSpec, ...] = ()
     fibers: str = ""
+    fiber_directions: str = ""
     tracks_dbm: str = ""
     verified_patches: str = ""
     unverified_patches: str = ""
@@ -746,6 +757,7 @@ def conventional_input_paths(
         umbilicus=resolve("umbilicus"),
         pcls=pcls,
         fibers=resolve("fibers"),
+        fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
         verified_patches=resolve("verified_patches"),
         unverified_patches=spec.path_override("unverified_patches"),

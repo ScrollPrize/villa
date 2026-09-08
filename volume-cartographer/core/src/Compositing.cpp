@@ -96,69 +96,7 @@ float compositeLayerStack(
             return CompositeMethod::alpha(stack, params);
         case utils::CompositingMethod::beer_lambert:
             return CompositeMethod::beerLambert(stack, params);
-        case utils::CompositingMethod::dvr:
-            return utils::composite_dvr(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                params.dvrAmbient);
-        case utils::CompositingMethod::first_hit_iso:
-            return utils::composite_first_hit_iso(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                float(params.isoCutoff));
-        case utils::CompositingMethod::dev_from_mean:
-            return utils::composite_dev_from_mean(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                float(params.isoCutoff));
-        case utils::CompositingMethod::emission_dvr:
-            return utils::composite_emission_dvr(
-                std::span<const float>(stack.values.data(), stack.validCount));
-        case utils::CompositingMethod::max_above_iso:
-            return utils::composite_max_above_iso(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                float(params.isoCutoff));
-        case utils::CompositingMethod::gamma_weighted:
-            return utils::composite_gamma_weighted(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                float(params.isoCutoff));
-        case utils::CompositingMethod::gradient_mag:
-            return utils::composite_gradient_mag(
-                std::span<const float>(stack.values.data(), stack.validCount));
-        case utils::CompositingMethod::pbr_iso:
-            return utils::composite_first_hit_iso(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                float(params.isoCutoff));
-        case utils::CompositingMethod::shaded_dvr:
-            return utils::composite_dvr(
-                std::span<const float>(stack.values.data(), stack.validCount),
-                params.dvrAmbient);
     }
 
     return CompositeMethod::mean(stack);
-}
-
-bool methodRequiresLayerStorage(const std::string& method) noexcept
-{
-    return utils::method_requires_storage(utils::parse_compositing_method(method));
-}
-
-float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params) noexcept
-{
-    if (!params.lightingEnabled) {
-        return 1.0f;
-    }
-
-    // Normalize the surface normal
-    float normalLen = std::sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
-    if (normalLen < 0.0001f) {
-        return params.lightAmbient;
-    }
-
-    float invLen = 1.0f / normalLen;
-    float nDotL = (normal[0] * invLen) * params.lightDirX
-                + (normal[1] * invLen) * params.lightDirY
-                + (normal[2] * invLen) * params.lightDirZ;
-    if (nDotL < 0.0f) nDotL = 0.0f;
-
-    // Combine: ambient + diffuse
-    float lighting = params.lightAmbient + params.lightDiffuse * nDotL;
-    return std::min(1.0f, std::max(0.0f, lighting));
 }

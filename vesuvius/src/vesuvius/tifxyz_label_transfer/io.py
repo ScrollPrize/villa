@@ -26,6 +26,54 @@ def _read_tiff(path: Path) -> NDArray:
         return tifffile.imread(path)
 
 
+def load_tifxyz_mask(
+    path: Path | str,
+    xyz_shape: Sequence[int],
+) -> NDArray[np.bool_]:
+    """Load a TIFXYZ mask using the canonical stored-grid semantics."""
+    mask_path = Path(path)
+    target_shape = int(xyz_shape[0]), int(xyz_shape[1])
+    mask = np.asarray(_read_tiff(mask_path))
+
+    # mask.tif may be multipage; the first page is the validity mask.
+    if (
+        mask.ndim > 2
+        and mask.shape[-2] % target_shape[0] == 0
+        and mask.shape[-1] % target_shape[1] == 0
+    ):
+        mask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))[0]
+    elif (
+        mask.ndim > 2
+        and mask.shape[0] % target_shape[0] == 0
+        and mask.shape[1] % target_shape[1] == 0
+    ):
+        mask = mask.reshape((mask.shape[0], mask.shape[1], -1))[:, :, 0]
+
+    if mask.shape == target_shape:
+        return np.asarray(mask >= 255)
+    if (
+        mask.ndim == 2
+        and mask.shape[0] % target_shape[0] == 0
+        and mask.shape[1] % target_shape[1] == 0
+    ):
+        # QuadSurface accepts a higher-resolution mask when each dimension is
+        # an integer multiple of the XYZ grid. A stored-grid point is retained
+        # only when its complete mask block is valid.
+        factor_y = mask.shape[0] // target_shape[0]
+        factor_x = mask.shape[1] // target_shape[1]
+        return np.all(
+            mask.reshape(
+                target_shape[0], factor_y, target_shape[1], factor_x
+            )
+            >= 255,
+            axis=(1, 3),
+        )
+    raise ValueError(
+        f"mask shape {mask.shape} is incompatible with XYZ shape "
+        f"{target_shape}"
+    )
+
+
 def _open_zarr_label(path: Path):
     import zarr
 
@@ -122,45 +170,13 @@ def load_surface(path: Path | str, use_mask: bool = True) -> Surface:
     valid = None
     mask_path = surface_path / "mask.tif"
     if use_mask and mask_path.is_file():
-        mask = np.asarray(_read_tiff(mask_path))
-        # mask.tif may be multipage; the first page is the validity mask.
-        if (
-            mask.ndim > 2
-            and mask.shape[-2] % x.shape[0] == 0
-            and mask.shape[-1] % x.shape[1] == 0
-        ):
-            mask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))[0]
-        elif (
-            mask.ndim > 2
-            and mask.shape[0] % x.shape[0] == 0
-            and mask.shape[1] % x.shape[1] == 0
-        ):
-            mask = mask.reshape((mask.shape[0], mask.shape[1], -1))[:, :, 0]
-        if mask.shape == x.shape:
-            valid = mask >= 255
-        elif (
-            mask.ndim == 2
-            and mask.shape[0] % x.shape[0] == 0
-            and mask.shape[1] % x.shape[1] == 0
-        ):
-            # QuadSurface accepts a higher-resolution mask when each dimension
-            # is an integer multiple of the XYZ grid. A stored-grid point is
-            # retained only when its complete mask block is valid.
-            factor_y = mask.shape[0] // x.shape[0]
-            factor_x = mask.shape[1] // x.shape[1]
-            valid = np.all(
-                mask.reshape(
-                    x.shape[0], factor_y, x.shape[1], factor_x
-                )
-                >= 255,
-                axis=(1, 3),
-            )
-        else:
+        try:
+            valid = load_tifxyz_mask(mask_path, x.shape)
+        except ValueError as exc:
             raise ValueError(
-                f"mask shape {mask.shape} is incompatible with XYZ shape "
-                f"{x.shape}; pass --ignore-tifxyz-mask only if this mask "
-                "should intentionally be ignored"
-            )
+                f"{exc}; pass --ignore-tifxyz-mask only if this mask should "
+                "intentionally be ignored"
+            ) from exc
     return Surface(
         x=x,
         y=y,

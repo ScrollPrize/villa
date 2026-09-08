@@ -12,10 +12,16 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -55,6 +61,42 @@ public:
 
     explicit Mapping(const fs::path& path)
     {
+#ifdef _WIN32
+        file_ = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                              nullptr);
+        if (file_ == INVALID_HANDLE_VALUE)
+            throw std::system_error(
+                static_cast<int>(::GetLastError()), std::system_category(),
+                "cannot open " + path.string());
+        LARGE_INTEGER file_size{};
+        if (!::GetFileSizeEx(file_, &file_size)) {
+            const int error = static_cast<int>(::GetLastError());
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            throw std::system_error(
+                error, std::system_category(), "cannot stat " + path.string());
+        }
+        size_ = static_cast<size_t>(file_size.QuadPart);
+        if (size_ != 0) {
+            mapping_ = ::CreateFileMappingW(file_, nullptr, PAGE_READONLY,
+                                            0, 0, nullptr);
+            if (mapping_ != nullptr)
+                data_ = ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+            if (data_ == nullptr) {
+                const int error = static_cast<int>(::GetLastError());
+                if (mapping_ != nullptr)
+                    ::CloseHandle(mapping_);
+                mapping_ = nullptr;
+                ::CloseHandle(file_);
+                file_ = INVALID_HANDLE_VALUE;
+                throw std::system_error(
+                    error, std::system_category(),
+                    "cannot map " + path.string());
+            }
+        }
+#else
         descriptor_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (descriptor_ < 0)
             throw std::system_error(
@@ -82,11 +124,31 @@ public:
             ::madvise(data_, size_, MADV_SEQUENTIAL);
 #endif
         }
+#endif
     }
 
     Mapping(const Mapping&) = delete;
     Mapping& operator=(const Mapping&) = delete;
 
+#ifdef _WIN32
+    Mapping(Mapping&& other) noexcept
+        : file_(std::exchange(other.file_, INVALID_HANDLE_VALUE)),
+          mapping_(std::exchange(other.mapping_, nullptr)),
+          data_(std::exchange(other.data_, nullptr)),
+          size_(std::exchange(other.size_, 0))
+    {
+    }
+
+    ~Mapping()
+    {
+        if (data_ != nullptr)
+            ::UnmapViewOfFile(data_);
+        if (mapping_ != nullptr)
+            ::CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE)
+            ::CloseHandle(file_);
+    }
+#else
     Mapping(Mapping&& other) noexcept
         : descriptor_(std::exchange(other.descriptor_, -1)),
           data_(std::exchange(other.data_, nullptr)),
@@ -101,6 +163,7 @@ public:
         if (descriptor_ >= 0)
             ::close(descriptor_);
     }
+#endif
 
     const void* data() const { return data_; }
     size_t size() const { return size_; }
@@ -118,7 +181,12 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+#else
     int descriptor_ = -1;
+#endif
     void* data_ = nullptr;
     size_t size_ = 0;
 };

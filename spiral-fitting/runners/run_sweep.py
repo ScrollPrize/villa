@@ -24,7 +24,7 @@ from config import Config  # noqa: E402
 
 
 _STEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_LIVE_OUTPUT_RE = re.compile(r"(?:PROGRESS |step \d+: loss = )")
+_LIVE_OUTPUT_RE = re.compile(r"(?:PROGRESS |RESUME fit |step \d+: loss = )")
 DEFAULT_NUM_THREADS = 6
 
 

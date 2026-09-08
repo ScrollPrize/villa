@@ -74,6 +74,19 @@ constexpr double kReinitSeedMaxNormalAlignmentAbs = 0.17364817766693033; // sin(
     return deterministicTangentFromNormalVector(sample.normal);
 }
 
+[[nodiscard]] bool cancellationRequested(const LineOptimizationConfig& config)
+{
+    return config.cancelFlag &&
+           config.cancelFlag->load(std::memory_order_relaxed);
+}
+
+void throwIfCancelled(const LineOptimizationConfig& config)
+{
+    if (cancellationRequested(config)) {
+        throw LineOptimizationCancelled();
+    }
+}
+
 [[nodiscard]] LineOptimizationConfig sanitizedConfig(LineOptimizationConfig config)
 {
     config.segmentsPerSide = std::max(1, config.segmentsPerSide);
@@ -2288,6 +2301,10 @@ void optimizeControlSpanInitialization(
     }
 
     for (size_t controlIndex = 0; controlIndex + 1 < controls.size(); ++controlIndex) {
+        // Each span initialization can run its own Ceres solve (plus normal
+        // sampling); without a check here a cancelled solve would still pay
+        // for every remaining span before the iteration callback could act.
+        throwIfCancelled(config);
         if (!shouldOptimizeControlSpanInitialization(controls, config, controlIndex)) {
             continue;
         }
@@ -2630,6 +2647,12 @@ public:
 
     ceres::CallbackReturnType operator()(const ceres::IterationSummary& /*summary*/) override
     {
+        // Cooperative cancellation: a superseded solve stops within one
+        // iteration instead of running out its iteration budget. The aborted
+        // summary reports the solution unusable; callers discard it.
+        if (cancellationRequested(config_)) {
+            return ceres::SOLVER_ABORT;
+        }
         fillPrefetchedNormalSamples(points_,
                                     sampler_,
                                     config_,
@@ -2722,6 +2745,11 @@ private:
     const double normalMsBeforeSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
     const auto solveStart = Clock::now();
     ceres::Solve(options, &problem, &summary);
+    // The iteration callback's SOLVER_ABORT only stops Ceres; without this
+    // check a cancelled solve would keep going through result assembly and
+    // its caller's normal resampling before anything noticed, and a direct
+    // caller could mistake the aborted partial state for a real solution.
+    throwIfCancelled(config);
     const auto solveEnd = Clock::now();
     const double normalMsAfterSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
     const double normalCallbackMs = std::max(0.0, normalMsAfterSolve - normalMsBeforeSolve);
@@ -2874,6 +2902,7 @@ void applyHardSpanDirections(
     std::optional<cv::Vec3d> hardLeftDirection = std::nullopt,
     std::optional<cv::Vec3d> hardRightDirection = std::nullopt)
 {
+    throwIfCancelled(config);
     if (length(rightPoint - leftPoint) <= kEpsilon) {
         throw std::invalid_argument("Adjacent reinitialization control points are coincident");
     }
@@ -3460,6 +3489,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         unchanged.changedControlIndex = changedSortedIndex;
         unchanged.activeStart = 0;
         unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        unchanged.replacedStart = 0;
+        unchanged.replacedCount = 0;
         return unchanged;
     }
 
@@ -3520,6 +3551,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     result.linePoints = std::move(updatedLine);
     result.controlPoints = std::move(controlPoints);
     result.changedControlIndex = changedSortedIndex;
+    result.replacedStart = eraseStart;
+    result.replacedCount = static_cast<int>(replacement.size());
     const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
                                                           result.changedControlIndex,
                                                           static_cast<int>(result.linePoints.size()),
@@ -3582,6 +3615,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         unchanged.changedControlIndex = changedSortedIndex;
         unchanged.activeStart = 0;
         unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        unchanged.replacedStart = 0;
+        unchanged.replacedCount = 0;
         return unchanged;
     }
 
@@ -3785,6 +3820,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     const LineOptimizationConfig& rawConfig) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     (void)normalSampler_.prefetchNormalSamples({seedPoint}, false);
     const NormalSample seedNormal = normalSampler_.sampleNormal(seedPoint);
     const cv::Vec3d tangent = initialTangentFromConfig(seedNormal, config);
@@ -3793,6 +3829,9 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 
     const auto directNormalStart = Clock::now();
     auto directNormalInit = directNormalConstructedPoints(seedPoint, tangent, normalSampler_, config);
+    // The seed construction walk above samples normals step by step and can
+    // dominate a cancelled teardown; stop before the solves below.
+    throwIfCancelled(config);
     auto spacingConstraints = fixedStepConstraints(directNormalInit.size() - 1);
     if (!config.runGlobalOptimization) {
         int finalValidSamples = 0;
@@ -3950,6 +3989,7 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     std::vector<std::pair<int, int>> protectedPointRanges) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     if (linePoints.size() < 2) {
         throw std::invalid_argument("Existing line optimization requires at least two samples");
     }
@@ -4131,6 +4171,7 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     if (linePoints.size() < 2) {
         throw std::invalid_argument("Existing line reinitialization requires at least two samples");
     }

@@ -334,6 +334,16 @@ int main(int argc, char *argv[])
     auto volume = remote_volume
         ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
         : Volume::New(vol_path);
+    if (!volume->hasScaleLevel(0)) {
+        // The tracer reads scale group 0 only; on a sparse pyramid those reads
+        // would silently come back as fill value instead of failing.
+        std::cerr << "ERROR: volume has no full-resolution level 0, which the tracer reads;"
+                  << " present levels:";
+        for (int level : volume->presentScaleLevels())
+            std::cerr << " " << level;
+        std::cerr << std::endl;
+        return EXIT_FAILURE;
+    }
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();

@@ -156,6 +156,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -2611,7 +2612,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2620,8 +2621,28 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 for (uint64_t fiberId : fiberIds) {
                     _fiberIntersectionCache.pruneFiber(fiberId);
                 }
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
+    _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
+    _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
+    const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        tabBar->setTabButton(fiberMapIndex, QTabBar::RightSide, nullptr);
+    }
+    connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberAtControlPointRequested,
+            this, [this](uint64_t fiberId, int controlPointIndex) {
+                if (_fiberWidget) {
+                    _fiberWidget->selectFiber(fiberId);
+                }
+                if (_fiberSliceWidget) {
+                    _fiberSliceWidget->selectFiber(fiberId);
+                }
+                if (_lineAnnotationController) {
+                    _lineAnnotationController->openFiberAtControlPoint(fiberId,
+                                                                      controlPointIndex);
+                }
+            });
+
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
@@ -3852,6 +3873,21 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         viewer->setProperty("vc_wrap_annotation_bound", true);
     }
 
+    const std::string& surfName = viewer->surfName();
+    if ((surfName == "xy plane" || surfName == "seg xz" || surfName == "seg yz") &&
+        !viewer->property("vc_volcam_bound").toBool()) {
+        // Slice views fold their volumetric-camera azimuth into the slice
+        // plane itself (so sampling, intersections, focus and handles all
+        // agree); reconfigure the planes whenever the per-view camera (or
+        // anything that implicitly zeroes it) changes.
+        viewer->setVolumetricAzimuthInSurface(true);
+        connect(viewer, &CChunkedVolumeViewer::compositeCameraChanged, this, [this]() {
+            if (_axisAlignedSliceController) {
+                _axisAlignedSliceController->syncVolumetricAzimuths();
+            }
+        });
+        viewer->setProperty("vc_volcam_bound", true);
+    }
     // Axis-aligned rotation/tilt wiring is attached per viewer by
     // AxisAlignedSliceController via ViewerManager::baseViewerCreated.
 }
@@ -5080,6 +5116,18 @@ void CWindow::updateAtlasFiberDocks()
 
     tree->collapseAll();
     updateOptimizeEnabled();
+}
+
+void CWindow::scheduleAtlasSearchDockRefresh()
+{
+    if (_atlasSearchDockRefreshQueued) {
+        return;
+    }
+    _atlasSearchDockRefreshQueued = true;
+    QTimer::singleShot(50, this, [this]() {
+        _atlasSearchDockRefreshQueued = false;
+        updateAtlasSearchDocks();
+    });
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -7975,6 +8023,7 @@ void CWindow::CreateWidgets(void)
         .planeCompositeYZ = ui.chkPlaneCompositeYZ,
         .planeLayersFront = ui.spinPlaneLayersFront,
         .planeLayersBehind = ui.spinPlaneLayersBehind,
+        .planeReverseDirection = ui.chkPlaneReverseDirection,
     };
     _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
     _viewerCompositePanel->setViewerManagers(
@@ -8187,12 +8236,43 @@ void CWindow::CreateWidgets(void)
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
+    const QRegularExpression coordinateTriple(
+        "^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$");
+    ui.focusBBoxMin->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMin));
+    ui.focusBBoxMax->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMax));
+    connect(ui.focusBBoxMin, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.focusBBoxMax, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.chkFocusBBox, &QCheckBox::toggled,
+            this, &CWindow::onFocusBoundsToggled);
+    connect(_state, &CState::focusBoundsChanged,
+            this, &CWindow::refreshFocusBoundsUi);
+    connect(_state, &CState::volumeChanged, this,
+            [this](std::shared_ptr<Volume>, const std::string&) {
+                refreshFocusBoundsUi();
+            });
+    refreshFocusBoundsUi();
+
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         bool showOverlays = settings.value(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS,
                                            vc3d::settings::viewer::SHOW_AXIS_OVERLAYS_DEFAULT).toBool();
         QSignalBlocker blocker(chkAxisOverlays);
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
+    }
+    // Deliberately not persisted: the coordinate frame gizmo is on by default
+    // every session, matching the checkbox's designer state.
+    if (auto* chkCoordinateFrames = ui.chkCoordinateFrames) {
+        connect(chkCoordinateFrames, &QCheckBox::toggled, this, [](bool show) {
+            for (auto* manager : ViewerManager::allManagers()) {
+                if (manager) {
+                    manager->setShowCoordinateFrames(show);
+                }
+            }
+        });
     }
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
@@ -10162,6 +10242,104 @@ void CWindow::onManualLocationChanged()
     }
 }
 
+void CWindow::refreshFocusBoundsUi()
+{
+    if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
+        return;
+    }
+
+    std::optional<Rect3D> bounds = _state ? _state->focusBounds() : std::nullopt;
+    if (!bounds && _state && _state->currentVolume()) {
+        const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+        bounds = Rect3D{{0.0f, 0.0f, 0.0f},
+                        {static_cast<float>(std::max(0, width - 1)),
+                         static_cast<float>(std::max(0, height - 1)),
+                         static_cast<float>(std::max(0, depth - 1))}};
+    }
+
+    const QSignalBlocker checkBlocker(ui.chkFocusBBox);
+    const QSignalBlocker minBlocker(ui.focusBBoxMin);
+    const QSignalBlocker maxBlocker(ui.focusBBoxMax);
+    ui.chkFocusBBox->setChecked(_state && _state->focusBoundsEnabled());
+    const bool haveVolume = _state && _state->currentVolume();
+    ui.chkFocusBBox->setEnabled(haveVolume);
+    ui.focusBBoxMin->setEnabled(haveVolume);
+    ui.focusBBoxMax->setEnabled(haveVolume);
+    if (!bounds) {
+        ui.focusBBoxMin->clear();
+        ui.focusBBoxMax->clear();
+        return;
+    }
+    const auto formatPoint = [](const cv::Vec3f& point) {
+        return QStringLiteral("%1, %2, %3")
+            .arg(static_cast<int>(std::lround(point[0])))
+            .arg(static_cast<int>(std::lround(point[1])))
+            .arg(static_cast<int>(std::lround(point[2])));
+    };
+    ui.focusBBoxMin->setText(formatPoint(bounds->low));
+    ui.focusBBoxMax->setText(formatPoint(bounds->high));
+}
+
+void CWindow::onFocusBoundsEdited()
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto parsePoint = [](const QString& text) -> std::optional<cv::Vec3f> {
+        const QStringList parts = text.trimmed().split(',');
+        if (parts.size() != 3) {
+            return std::nullopt;
+        }
+        cv::Vec3f point;
+        for (int axis = 0; axis < 3; ++axis) {
+            bool ok = false;
+            const int value = parts[axis].trimmed().toInt(&ok);
+            if (!ok) {
+                return std::nullopt;
+            }
+            point[axis] = static_cast<float>(value);
+        }
+        return point;
+    };
+
+    auto low = parsePoint(ui.focusBBoxMin->text());
+    auto high = parsePoint(ui.focusBBoxMax->text());
+    if (!low || !high) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f volumeHigh{
+        static_cast<float>(std::max(0, width - 1)),
+        static_cast<float>(std::max(0, height - 1)),
+        static_cast<float>(std::max(0, depth - 1))};
+    for (int axis = 0; axis < 3; ++axis) {
+        (*low)[axis] = std::clamp((*low)[axis], 0.0f, volumeHigh[axis]);
+        (*high)[axis] = std::clamp((*high)[axis], 0.0f, volumeHigh[axis]);
+    }
+    _state->setFocusBounds(Rect3D{*low, *high});
+    refreshFocusBoundsUi();
+}
+
+void CWindow::onFocusBoundsToggled(bool enabled)
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+    if (enabled && !_state->focusBounds()) {
+        onFocusBoundsEdited();
+        if (!_state->focusBounds()) {
+            refreshFocusBoundsUi();
+            return;
+        }
+    }
+    _state->setFocusBoundsEnabled(enabled);
+}
+
 void CWindow::onZoomIn()
 {
     if (auto* viewer = activeBaseViewer()) {
@@ -10825,16 +11003,24 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         planeShared->setNormal(normal);
         planeShared->setInPlaneRotation(0.0f);
 
+        // Keep the volumetric-camera azimuth folded into the plane (see
+        // AxisAlignedSliceController::applyOrientation).
+        float inPlaneRot = AxisAlignedSliceController::azimuthInPlaneRotation(
+            *planeShared,
+            _axisAlignedSliceController
+                ? _axisAlignedSliceController->volumetricAzimuthDeg(planeName)
+                : 0.0f);
+
         // Adjust in-plane rotation so Z projects "up"
         const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
         const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, normal);
         const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
         if (cv::norm(desiredUp) > kEpsilon) {
             const cv::Vec3f currentUp = planeShared->basisY();
-            const float delta = signedAngleBetween(currentUp, desiredUp, normal);
-            if (std::abs(delta) > kEpsilon) {
-                planeShared->setInPlaneRotation(delta);
-            }
+            inPlaneRot += signedAngleBetween(currentUp, desiredUp, normal);
+        }
+        if (std::abs(inPlaneRot) > kEpsilon) {
+            planeShared->setInPlaneRotation(inPlaneRot);
         }
 
         _state->setSurface(planeName, planeShared);

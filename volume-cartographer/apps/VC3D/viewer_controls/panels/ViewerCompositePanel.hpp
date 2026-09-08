@@ -8,9 +8,12 @@
 
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QLabel;
 class QScrollArea;
+class QSlider;
 class QSpinBox;
+class QVBoxLayout;
 class ViewerManager;
 class VolumeViewerBase;
 
@@ -43,6 +46,7 @@ public:
         QCheckBox* planeCompositeYZ{nullptr};
         QSpinBox* planeLayersFront{nullptr};
         QSpinBox* planeLayersBehind{nullptr};
+        QCheckBox* planeReverseDirection{nullptr};
     };
 
     explicit ViewerCompositePanel(const UiRefs& uiRefs,
@@ -55,6 +59,8 @@ public:
 
 private:
     void setupControls();
+    void setupVolumetricControls(QVBoxLayout* layout);
+    void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
     void syncUiFromManager();
     void updateCompositeParamsVisibility();
@@ -65,4 +71,12 @@ private:
     UiRefs _uiRefs;
     std::vector<ViewerManager*> _viewerManagers;
     std::vector<QMetaObject::Connection> _managerConnections;
+
+    // Volumetric-mode controls (built programmatically; the .ui file only
+    // carries the shared composite rows).
+    QWidget* _volumetricGroup{nullptr};
+    QWidget* _volumetricFlattenedGroup{nullptr};
+    QDoubleSpinBox* _volumetricGamma{nullptr};
+    QSlider* _volumetricLighting{nullptr};
+    QDoubleSpinBox* _volumetricWScale{nullptr};
 };

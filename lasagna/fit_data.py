@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from dtypes import numpy_float_hi
 import torch
 import torch.nn.functional as F
 import zarr
@@ -828,15 +829,15 @@ def _load_umbilicus_lookup(
 			raise ValueError(f"umbilicus control point {i} has non-finite coordinates")
 		rows.append((x, y, z))
 
-	pts_np = np.asarray(rows, dtype=np.float64)
+	pts_np = np.asarray(rows, dtype=numpy_float_hi)
 	order = np.argsort(pts_np[:, 2], kind="mergesort")
 	pts_np = pts_np[order]
 
 	z_vals = pts_np[:, 2]
 	uniq_z, inv = np.unique(z_vals, return_inverse=True)
 	if uniq_z.shape[0] != z_vals.shape[0]:
-		xy_sum = np.zeros((uniq_z.shape[0], 2), dtype=np.float64)
-		count = np.zeros((uniq_z.shape[0], 1), dtype=np.float64)
+		xy_sum = np.zeros((uniq_z.shape[0], 2), dtype=numpy_float_hi)
+		count = np.zeros((uniq_z.shape[0], 1), dtype=numpy_float_hi)
 		np.add.at(xy_sum, inv, pts_np[:, :2])
 		np.add.at(count, inv, 1.0)
 		xy_vals = xy_sum / np.maximum(count, 1.0)
@@ -848,7 +849,7 @@ def _load_umbilicus_lookup(
 	z0 = math.floor(float(z_vals[0]) / z_step) * z_step
 	z1 = math.ceil(float(z_vals[-1]) / z_step) * z_step
 	count = max(1, int(round((z1 - z0) / z_step)) + 1)
-	z_lookup = z0 + np.arange(count, dtype=np.float64) * z_step
+	z_lookup = z0 + np.arange(count, dtype=numpy_float_hi) * z_step
 	x_lookup = np.interp(z_lookup, z_vals, pts_np[:, 0])
 	y_lookup = np.interp(z_lookup, z_vals, pts_np[:, 1])
 	lookup_np = np.stack([x_lookup, y_lookup], axis=1).astype(np.float32)
