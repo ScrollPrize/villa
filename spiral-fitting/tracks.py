@@ -11,6 +11,7 @@ import shutil
 import struct
 from pathlib import Path
 import tempfile
+import zipfile
 
 import kornia
 import numpy as np
@@ -1824,7 +1825,11 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
                     'partner_local', 'positions', 'clearances')
             }
         _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    # A truncated or partially downloaded sidecar is not a zip archive at all
+    # (zipfile.BadZipFile / EOFError, neither an OSError nor a ValueError);
+    # treat it like any other invalid cache instead of aborting the fit.
+    except (OSError, EOFError, zipfile.BadZipFile, KeyError, TypeError,
+            ValueError, json.JSONDecodeError) as error:
         if warn:
             print(f'WARNING: ignoring invalid track crossing cache '
                   f'{cache_path}: {error}')
