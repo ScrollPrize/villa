@@ -1171,6 +1171,10 @@ int main(int argc, char *argv[])
     }
 
     // --- Log path setup ---
+    // Join the flush thread and preserve buffered diagnostics on every return.
+    struct LogFlusherGuard {
+        ~LogFlusherGuard() { stopLogFlusher(); }
+    } logFlusherGuard;
     if (parsed.count("log-path")) {
         const auto& logPath = parsed["log-path"].as<std::string>();
         g_logFile = std::fopen(logPath.c_str(), "a");
@@ -1850,6 +1854,5 @@ int main(int argc, char *argv[])
     if (!process_one(seg_path))
         return EXIT_FAILURE;
 
-    stopLogFlusher();
     return EXIT_SUCCESS;
 }
