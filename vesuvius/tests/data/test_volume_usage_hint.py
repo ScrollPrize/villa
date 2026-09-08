@@ -14,7 +14,12 @@ import pytest
 from vesuvius.data.volume import Volume
 
 
-def test_failure_hint_segment_example_carries_scroll_id(capsys):
+def test_failure_hint_segment_example_carries_scroll_id(capsys, monkeypatch):
+    # Volume.__init__ probes the EC2 metadata endpoint before it validates
+    # arguments; keep the test off the network.
+    import vesuvius.data.volume as volume_module
+
+    monkeypatch.setattr(volume_module, "is_aws_ec2_instance", lambda: False)
     with pytest.raises(Exception):
         Volume(type="segment", segment_id=20230827161847)  # the documented-but-broken call
     out = capsys.readouterr().out
