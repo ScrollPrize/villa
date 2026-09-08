@@ -1,19 +1,29 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
+#include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationOptimizationDefaults.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
+#include "vc/lasagna/ModelPrefetch.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -24,11 +34,17 @@ struct CliOptions {
     std::filesystem::path fiberJson;
     std::string normalManifest;
     std::filesystem::path remoteCacheDir;
+    std::filesystem::path traceOutput;
+    std::string normalManifestIdentity;
+    std::string fiberManifestIdentity;
     std::optional<double> voxelSizeUm;
     double errorThresholdBaseVoxels = 20.0;
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     int inferenceScaledownPower = 2;
+    int prefetchWarmupMs = 0;
+    std::optional<int> modelReaders;
     bool quiet = false;
+    bool guiReoptimize = false;
     FiberTraceConfig trace;
 };
 
@@ -46,6 +62,12 @@ void printUsage(const char* argv0)
         << "Options:\n"
         << "  --normal-manifest PATH          required Lasagna normal manifest for tangent/normal smoothness\n"
         << "  --remote-cache-dir PATH         required for remote HTTP/S3 Lasagna manifests\n"
+        << "  --prefetch-warmup-ms N          optional model corridor warmup, separately timed [0; max 10000]\n"
+        << "  --model-readers N              fixed shared model read concurrency [default adaptive; 1..64]\n"
+        << "  --trace-output PATH            write exact trace/decision JSON to a new file (double bit patterns)\n"
+        << "  --gui-reoptimize                run the actual GUI fiber optimizer, including 1200-base-voxel tails\n"
+        << "  --normal-manifest-identity ID   stable normal-model provenance in GUI output [manifest location]\n"
+        << "  --fiber-manifest-identity ID    stable prediction-model provenance in GUI output [manifest location]\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
         << "  --inference-scaledown-power N   prediction output scaledown relative to trace voxels, as 2^N [2]\n"
         << "  --step-voxels N                 trace step in manifest trace voxels [4]\n"
@@ -158,6 +180,26 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (arg == "--remote-cache-dir") {
             options.remoteCacheDir =
                 requireValue(i, argc, argv, "remote-cache-dir");
+        } else if (arg == "--prefetch-warmup-ms") {
+            options.prefetchWarmupMs = parseInt(
+                requireValue(i, argc, argv, "prefetch-warmup-ms"), "prefetch-warmup-ms");
+            if (options.prefetchWarmupMs < 0 || options.prefetchWarmupMs > 10000)
+                failOption("--prefetch-warmup-ms must be between 0 and 10000");
+        } else if (arg == "--model-readers") {
+            options.modelReaders = parseInt(
+                requireValue(i, argc, argv, "model-readers"), "model-readers");
+            if (*options.modelReaders < 1 || *options.modelReaders > 64)
+                failOption("--model-readers must be between 1 and 64");
+        } else if (arg == "--trace-output") {
+            options.traceOutput = requireValue(i, argc, argv, "trace-output");
+            if (options.traceOutput.empty() || std::filesystem::exists(options.traceOutput))
+                failOption("--trace-output must name a new file");
+        } else if (arg == "--gui-reoptimize") {
+            options.guiReoptimize = true;
+        } else if (arg == "--normal-manifest-identity") {
+            options.normalManifestIdentity = requireValue(i, argc, argv, "normal-manifest-identity");
+        } else if (arg == "--fiber-manifest-identity") {
+            options.fiberManifestIdentity = requireValue(i, argc, argv, "fiber-manifest-identity");
         } else if (arg == "--voxel-size-um") {
             options.voxelSizeUm =
                 parseDouble(requireValue(i, argc, argv, "voxel-size-um"),
@@ -331,12 +373,277 @@ void clearProgressLine()
     std::cout << "\r" << std::string(180, ' ') << "\r";
 }
 
+void warmModelCorridor(
+    const vc::fiber_tracer::FiberPredictionField& predictions,
+    const vc::lasagna::LasagnaNormalSampler& normals,
+    const vc::fiber_tracer::FiberInput& fiber,
+    double traceToBaseScale, int budgetMs)
+{
+    if (budgetMs == 0)
+        return;
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    const auto before = vc::lasagna::remoteStoreStats();
+    vc::lasagna::ModelPrefetchReport report;
+    bool done = false;
+    bool failed = false;
+    const bool enabled = vc::lasagna::modelPrefetchEnabled();
+    if (enabled) {
+        try {
+            auto sources = predictions.prefetchSources();
+            auto normalSources = normals.prefetchSources();
+            sources.insert(sources.end(), normalSources.begin(), normalSources.end());
+            for (auto& source : sources)
+                source.spacing *= traceToBaseScale;
+            std::erase_if(sources, [](const auto& source) { return !source.remote; });
+            if (!sources.empty()) {
+                vc::lasagna::ModelPrefetchPlan plan(std::move(sources), fiber.linePointsXyzBase);
+                const auto deadline = start + std::chrono::milliseconds(budgetMs);
+                while (Clock::now() < deadline) {
+                    if (!done)
+                        done = plan.pump();
+                    // This standalone CLI has no other speculative producer
+                    // before tracing. Settling is bounded by the same deadline;
+                    // submitted downloads may continue into the trace phase.
+                    if (done && vc::render::ChunkCache::speculativePrefetchStats().pendingRequests == 0)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                report = plan.report();
+            } else {
+                done = true;
+            }
+        } catch (const std::exception& error) {
+            failed = true;
+            std::cerr << "model corridor warmup skipped after error: " << error.what() << '\n';
+        }
+    }
+    const auto after = vc::lasagna::remoteStoreStats();
+    const double elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    std::cout << "native_trace2cp_warmup enabled=" << enabled
+              << " budget_ms=" << budgetMs << " warmup_ms=" << std::fixed << std::setprecision(3) << elapsed
+              << " planning_ms=" << report.planningMs << " planned=" << report.planned
+              << " submitted=" << report.submitted << " rejected=" << report.rejected
+              << " planned_bytes=" << report.plannedBytes << " truncated=" << report.truncated
+              << " submission_done=" << done << " failed=" << failed
+              << " pending_requests=" << vc::render::ChunkCache::speculativePrefetchStats().pendingRequests
+              << " remote_owned=" << after.objectsOwned - before.objectsOwned
+              << " remote_bytes=" << after.bytesOwned - before.bytesOwned
+              << " remote_disk_hits=" << after.objectsFromDisk - before.objectsFromDisk << '\n';
+}
+
+// Exact bit payloads preserve signed zero, infinities, and NaN payloads as well
+// as ordinary coordinates. Timings, cache state, and input paths are excluded
+// so equal solver outputs compare byte-for-byte across storage conditions.
+std::string doubleBits(double value)
+{
+    static_assert(sizeof(double) == sizeof(std::uint64_t));
+    static_assert(std::numeric_limits<double>::is_iec559);
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16)
+        << std::bit_cast<std::uint64_t>(value);
+    return out.str();
+}
+
+nlohmann::json exactPoint(const cv::Vec3d& point)
+{
+    return {doubleBits(point[0]), doubleBits(point[1]), doubleBits(point[2])};
+}
+
+nlohmann::json exactPoints(const std::vector<cv::Vec3d>& points)
+{
+    auto out = nlohmann::json::array();
+    for (const auto& point : points)
+        out.push_back(exactPoint(point));
+    return out;
+}
+
+nlohmann::json optionalDoubleBits(const std::optional<double>& value)
+{
+    return value ? nlohmann::json(doubleBits(*value)) : nlohmann::json(nullptr);
+}
+
+nlohmann::json exactJsonDoubles(nlohmann::json value)
+{
+    if (value.is_number_float())
+        return doubleBits(value.get<double>());
+    if (value.is_structured()) {
+        for (auto& child : value)
+            child = exactJsonDoubles(std::move(child));
+    }
+    return value;
+}
+
+void writeExactOutput(const std::filesystem::path& path, const nlohmann::json& output)
+{
+    if (std::filesystem::exists(path))
+        throw std::runtime_error("trace output already exists: " + path.string());
+    std::ofstream stream(path, std::ios::out | std::ios::noreplace);
+    stream.exceptions(std::ios::badbit | std::ios::failbit);
+    stream << output.dump(2) << '\n';
+}
+
+void writeTraceOutput(const std::filesystem::path& path,
+                      const vc::fiber_tracer::FiberTraceWholeFiberResult& result,
+                      double traceToBaseScale)
+{
+    if (path.empty())
+        return;
+    auto segments = nlohmann::json::array();
+    for (const auto& segment : result.segments) {
+        const auto& trace = segment.trace;
+        auto crossings = nlohmann::json::array();
+        for (const auto& crossing : trace.targetPlaneCrossings) {
+            crossings.push_back({{"name", crossing.name}, {"point", exactPoint(crossing.point)},
+                                 {"in_plane_error_voxels", doubleBits(crossing.inPlaneErrorVoxels)}});
+        }
+        segments.push_back({
+            {"start_control_point", segment.startControlPointIndex},
+            {"target_control_point", segment.targetControlPointIndex},
+            {"success", segment.success}, {"restart", segment.restart}, {"reason", segment.reason},
+            {"in_plane_error_trace_voxels", doubleBits(segment.inPlaneErrorTraceVoxels)},
+            {"in_plane_error_base_voxels", doubleBits(segment.inPlaneErrorBaseVoxels)},
+            {"reference_arc_distance_voxels", doubleBits(segment.referenceArcDistanceVoxels)},
+            {"trace", {{"points", exactPoints(trace.points)},
+                       {"reached_target_plane", trace.reachedTargetPlane},
+                       {"reached_trace_length", trace.reachedTraceLength},
+                       {"reason", trace.reason}, {"steps", trace.steps},
+                       {"target_plane_crossings", std::move(crossings)},
+                       {"selected_target_plane_name", trace.selectedTargetPlaneName},
+                       {"selected_target_plane_crossing", trace.selectedTargetPlaneCrossing
+                           ? exactPoint(*trace.selectedTargetPlaneCrossing) : nlohmann::json(nullptr)},
+                       {"selected_target_plane_error_voxels", doubleBits(trace.selectedTargetPlaneErrorVoxels)}}}});
+    }
+    const nlohmann::json output = {
+        {"format", "vc_fiber_trace_metric_exact_v1"},
+        {"double_encoding", "IEEE-754 binary64 bits as 16 hexadecimal digits"},
+        {"point_coordinate_space", "trace_voxels"},
+        {"trace_to_base_scale", doubleBits(traceToBaseScale)},
+        {"segments", std::move(segments)}, {"stitched_trace", exactPoints(result.stitchedTrace)},
+        {"restart_count", result.restartCount}, {"lookahead_retry_count", result.lookaheadRetryCount},
+        {"lookahead_retry_recovered_count", result.lookaheadRetryRecoveredCount},
+        {"segment_count", result.segmentCount}, {"restarts_per_kvx", doubleBits(result.restartsPerKvx)},
+        {"reference_length_voxels", doubleBits(result.referenceLengthVoxels)},
+        {"reference_length_meters", optionalDoubleBits(result.referenceLengthMeters)},
+        {"restarts_per_meter", optionalDoubleBits(result.restartsPerMeter)}};
+    writeExactOutput(path, output);
+}
+
+vc3d::line_annotation::FiberModeOptimizationRequest makeGuiRequest(
+    const CliOptions& options, const vc::fiber_tracer::FiberInput& fiber,
+    const vc::fiber_tracer::FiberPredictionField& predictions,
+    const vc::lasagna::LasagnaNormalSampler& traceNormals,
+    const vc::lasagna::LasagnaNormalSampler& baseNormals,
+    double traceToBaseScale, vc::fiber_tracer::FiberTraceProfile& profile)
+{
+    namespace annotation = vc3d::line_annotation;
+    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(
+        nlohmann::json::parse(std::ifstream(options.fiberJson)), options.fiberJson.string());
+    annotation::FiberModeOptimizationRequest request;
+    request.linePointsBase = fiber.linePointsXyzBase;
+    request.predictions = &predictions;
+    request.baseNormalSampler = &baseNormals;
+    request.traceNormalSampler = &traceNormals;
+    request.traceToBaseScale = traceToBaseScale;
+    request.traceConfig = options.trace;
+    request.traceConfig.traceToBaseScale = traceToBaseScale;
+    request.traceConfig.baseVoxelSizeUm = options.voxelSizeUm;
+    request.traceConfig.profile = &profile;
+    request.traceConfig.endpointAcceptThresholdBaseVoxels = options.errorThresholdBaseVoxels;
+    request.normalManifestLocation = options.normalManifestIdentity.empty()
+        ? options.normalManifest : options.normalManifestIdentity;
+    request.fiberManifestLocation = options.fiberManifestIdentity.empty()
+        ? options.fiberManifest : options.fiberManifestIdentity;
+    request.globalMode = annotation::fiberOptimizationModeFromString(parsed.optimizationMode);
+    request.retraceAll = true;
+    request.extrapolationDistanceBaseVoxels = annotation::kDefaultExtrapolationDistanceBaseVoxels;
+    annotation::configureFiberModeLasagnaDefaults(
+        request.lasagnaConfig, annotation::kDefaultExtrapolationDistanceBaseVoxels);
+    const double center = static_cast<double>(fiber.linePointsXyzBase.size() - 1) * 0.5;
+    size_t seedControl = 0;
+    double seedDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < fiber.controlPointsXyzBase.size(); ++i) {
+        const size_t lineIndex = fiber.controlPointLineIndices[i];
+        annotation::LineControlPoint control{
+            static_cast<double>(lineIndex), fiber.controlPointsXyzBase[i], false,
+            static_cast<int>(lineIndex)};
+        if (i < parsed.segmentMetadata.size() && !parsed.segmentMetadata[i].is_null())
+            control.segmentToNext = annotation::fiberTraceSegmentMetadataFromJson(parsed.segmentMetadata[i]);
+        request.controlPoints.push_back(std::move(control));
+        const double distance = std::abs(static_cast<double>(lineIndex) - center);
+        if (distance < seedDistance) {
+            seedDistance = distance;
+            seedControl = i;
+        }
+    }
+    request.controlPoints[seedControl].isSeed = true;
+    return request;
+}
+
+void writeGuiTraceOutput(const std::filesystem::path& path,
+                         const vc3d::line_annotation::FiberModeOptimizationResult& result)
+{
+    if (path.empty())
+        return;
+    auto controls = nlohmann::json::array();
+    for (const auto& control : result.controlPoints) {
+        controls.push_back({{"point", exactPoint(control.volumePoint)},
+                            {"line_position", doubleBits(control.linePosition)},
+                            {"optimized_index", control.optimizedIndex}, {"is_seed", control.isSeed},
+                            {"accepted_native", vc3d::line_annotation::isAcceptedNativeTrace(control.segmentToNext)},
+                            {"segment_to_next", control.segmentToNext
+                                ? exactJsonDoubles(vc3d::line_annotation::fiberTraceSegmentMetadataToJson(*control.segmentToNext))
+                                : nlohmann::json(nullptr)}});
+    }
+    const auto normalJson = [](const vc::lasagna::NormalSample& sample) {
+        return nlohmann::json{{"normal", exactPoint(sample.normal)},
+                               {"valid", sample.valid}, {"reason", sample.reason}};
+    };
+    auto points = nlohmann::json::array();
+    for (const auto& point : result.optimization.line.points) {
+        points.push_back({{"position", exactPoint(point.position)},
+                          {"sampled_normal", normalJson(point.sampledNormal)}, {"valid", point.valid}});
+    }
+    auto segmentSamples = nlohmann::json::array();
+    for (const auto& segment : result.optimization.line.segmentSamples) {
+        auto samples = nlohmann::json::array();
+        for (const auto& sample : segment.samples) {
+            samples.push_back({{"t", doubleBits(sample.t)}, {"position", exactPoint(sample.position)},
+                               {"sampled_normal", normalJson(sample.sampledNormal)}});
+        }
+        segmentSamples.push_back(std::move(samples));
+    }
+    const auto& report = result.optimization.report;
+    writeExactOutput(path, {
+        {"format", "vc_gui_fiber_reoptimization_exact_v1"},
+        {"double_encoding", "IEEE-754 binary64 bits as 16 hexadecimal digits"},
+        {"point_coordinate_space", "base_voxels"},
+        {"control_points", std::move(controls)}, {"points", std::move(points)},
+        {"segment_samples", std::move(segmentSamples)},
+        {"display_frame_anchor_index", result.optimization.line.displayFrameAnchorIndex},
+        {"native_segments", result.nativeSegments}, {"lasagna_fallback_segments", result.lasagnaFallbackSegments},
+        {"cspline_fallback_segments", result.csplineFallbackSegments},
+        {"native_extrapolations", result.nativeExtrapolations},
+        {"lasagna_fallback_extrapolations", result.lasagnaFallbackExtrapolations},
+        {"optimization", {{"initial_cost", doubleBits(report.initialCost)}, {"final_cost", doubleBits(report.finalCost)},
+                           {"initial_rms", doubleBits(report.initialRms)}, {"final_rms", doubleBits(report.finalRms)},
+                           {"residuals", report.residuals}, {"iterations", report.iterations},
+                           {"valid_normal_samples", report.validNormalSamples}, {"invalid_normal_samples", report.invalidNormalSamples},
+                           {"converged", report.converged}, {"message", report.message}}}});
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     try {
         const CliOptions options = parseArgs(argc, argv);
+        if (options.modelReaders) {
+            vc::render::processChunkCacheService()->configureFetchConcurrency(
+                static_cast<std::size_t>(*options.modelReaders), false);
+        }
+        std::cout << "native_trace2cp_readers adaptive=" << !options.modelReaders.has_value()
+                  << " configured_max=" << options.modelReaders.value_or(64) << '\n';
 
         vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;
         datasetOptions.remoteCacheRoot = options.remoteCacheDir;
@@ -369,6 +676,16 @@ int main(int argc, char** argv)
             vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
         const vc::lasagna::NormalSampler* normalSamplerPtr = &*normalSampler;
 
+        std::optional<vc::lasagna::LasagnaDataset> baseNormalDataset;
+        std::optional<vc::lasagna::LasagnaNormalSampler> baseNormalSampler;
+        if (options.guiReoptimize) {
+            auto manifest = normalDataset->manifest();
+            manifest.workingToBaseScale = 1.0;
+            baseNormalDataset.emplace(std::move(manifest));
+            baseNormalSampler.emplace(
+                *baseNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+        }
+
         const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
         if (!options.quiet) {
             std::cout
@@ -398,6 +715,14 @@ int main(int argc, char** argv)
         request.config = options.trace;
         vc::fiber_tracer::FiberTraceProfile profile;
         request.config.profile = &profile;
+        std::optional<vc3d::line_annotation::FiberModeOptimizationRequest> guiRequest;
+        if (options.guiReoptimize) {
+            guiRequest.emplace(makeGuiRequest(options, fiber, predictions, *normalSampler,
+                                              *baseNormalSampler, workingToBaseScale, profile));
+        }
+
+        warmModelCorridor(predictions, *normalSampler, fiber,
+                          workingToBaseScale, options.prefetchWarmupMs);
 
         using Clock = std::chrono::steady_clock;
         const auto wallStart = Clock::now();
@@ -454,11 +779,15 @@ int main(int argc, char** argv)
                 std::cout << '\n';
         };
 
-        const auto result = vc::fiber_tracer::traceWholeFiberMetric(
-            predictions,
-            request,
-            normalSamplerPtr,
-            progress);
+        vc::fiber_tracer::FiberTraceWholeFiberResult result;
+        std::optional<vc3d::line_annotation::FiberModeOptimizationResult> guiResult;
+        if (guiRequest) {
+            guiResult.emplace(vc3d::line_annotation::optimizeFiberWithNativeFallback(
+                std::move(*guiRequest)));
+        } else {
+            result = vc::fiber_tracer::traceWholeFiberMetric(
+                predictions, request, normalSamplerPtr, progress);
+        }
         const auto wallEnd = Clock::now();
         const std::clock_t cpuEnd = std::clock();
         const double wallSeconds =
@@ -466,7 +795,22 @@ int main(int argc, char** argv)
         const double cpuSeconds =
             static_cast<double>(cpuEnd - cpuStart) / static_cast<double>(CLOCKS_PER_SEC);
 
-        std::cout << "native_trace2cp_fiber err/kvx=" << std::fixed
+        if (guiResult) {
+            writeGuiTraceOutput(options.traceOutput, *guiResult);
+            std::cout << "native_trace2cp_gui segments=" << guiResult->controlPoints.size() - 1
+                      << " points=" << guiResult->optimization.line.points.size()
+                      << " native_segments=" << guiResult->nativeSegments
+                      << " lasagna_fallback_segments=" << guiResult->lasagnaFallbackSegments
+                      << " cspline_fallback_segments=" << guiResult->csplineFallbackSegments
+                      << " native_tails=" << guiResult->nativeExtrapolations
+                      << " lasagna_tails=" << guiResult->lasagnaFallbackExtrapolations << '\n';
+            std::cout << "native_trace2cp_gui_stages span_trace_ms=" << std::fixed << std::setprecision(3)
+                      << guiResult->spanTraceMs << " reinit_ms=" << guiResult->reinitMs
+                      << " tail_trace_ms=" << guiResult->tailTraceMs
+                      << " tail_normal_pass_ms=" << guiResult->tailNormalPassMs << '\n';
+        } else {
+            writeTraceOutput(options.traceOutput, result, workingToBaseScale);
+            std::cout << "native_trace2cp_fiber err/kvx=" << std::fixed
                   << std::setprecision(1) << result.restartsPerKvx
                   << " restarts=" << result.restartCount
                   << " lookahead_retries=" << result.lookaheadRetryCount
@@ -481,6 +825,7 @@ int main(int argc, char** argv)
                           << (*result.referenceLengthMeters * 1000.0) << "mm)";
             }
             std::cout << '\n';
+        }
         }
         std::cout << "native_trace2cp_timing trace_wall_s=" << std::fixed
                   << std::setprecision(3) << wallSeconds
@@ -602,6 +947,9 @@ int main(int argc, char** argv)
                   << profile.lookaheadFrontierAllocatedSlots
                   << " lookahead_frontier_evaluated_slots="
                   << profile.lookaheadFrontierEvaluatedSlots
+                  << " model_prefetch_ms=" << profile.modelPrefetchMs
+                  << " model_prefetch_submitted=" << profile.modelPrefetchSubmitted
+                  << " model_prefetch_rejected=" << profile.modelPrefetchRejected
                   << '\n';
         return 0;
     } catch (const std::exception& exc) {

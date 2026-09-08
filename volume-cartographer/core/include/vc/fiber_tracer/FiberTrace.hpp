@@ -3,6 +3,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
+#include "vc/lasagna/ModelPrefetch.hpp"
 
 #include <array>
 #include <cstddef>
@@ -79,6 +80,9 @@ struct FiberTraceProfile {
     double lookaheadFrontierStorageSeconds = 0.0;
     size_t lookaheadFrontierAllocatedSlots = 0;
     size_t lookaheadFrontierEvaluatedSlots = 0;
+    double modelPrefetchMs = 0.0;
+    size_t modelPrefetchSubmitted = 0;
+    size_t modelPrefetchRejected = 0;
 };
 
 struct FiberTraceConfig {
@@ -325,6 +329,7 @@ public:
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
     [[nodiscard]] size_t optionCount() const noexcept;
+    [[nodiscard]] std::vector<vc::lasagna::ModelPrefetchSource> prefetchSources() const;
 
 private:
     class Impl;

@@ -63,6 +63,7 @@ public:
         std::vector<FloatNormalSample>& samples) const;
     [[nodiscard]] std::array<const LasagnaChannelCornerSampler*, 3>
     groupedCornerSamplers() const noexcept;
+    [[nodiscard]] std::vector<ModelPrefetchSource> prefetchSources() const;
     void materializeGroupedCorners(
         const std::vector<std::vector<LasagnaCornerSample>>& corners,
         size_t firstVolume,

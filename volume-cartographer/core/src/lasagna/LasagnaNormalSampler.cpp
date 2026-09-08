@@ -769,6 +769,16 @@ LasagnaNormalSampler::LasagnaNormalSampler(
 
 LasagnaNormalSampler::~LasagnaNormalSampler() = default;
 
+std::vector<ModelPrefetchSource> LasagnaNormalSampler::prefetchSources() const
+{
+    std::vector<ModelPrefetchSource> result;
+    for (const auto* sampler : groupedCornerSamplers()) {
+        if (sampler)
+            result.push_back(sampler->prefetchSource());
+    }
+    return result;
+}
+
 LasagnaNormalSampler::LasagnaNormalSampler(LasagnaNormalSampler&&) noexcept = default;
 
 LasagnaNormalSampler& LasagnaNormalSampler::operator=(LasagnaNormalSampler&&) noexcept = default;

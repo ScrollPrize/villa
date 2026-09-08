@@ -154,6 +154,7 @@ target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_lasagna
     src/lasagna/ChannelSampler.cpp
+    src/lasagna/ModelPrefetch.cpp
     src/lasagna/Dataset.cpp
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp

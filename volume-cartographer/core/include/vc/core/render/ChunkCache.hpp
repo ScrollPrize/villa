@@ -181,6 +181,31 @@ public:
         std::string error;
     };
 
+    enum class SpeculativePrefetchStatus {
+        Submitted,
+        AlreadyQueued,
+        AlreadyResolved,
+        // Unsupported/invalid, already failed, or too large for this plan.
+        Skipped,
+        // Temporary shared admission pressure; a later pump may retry.
+        Rejected,
+    };
+
+    struct SpeculativePrefetchStats {
+        std::uint64_t submitted = 0;
+        std::uint64_t alreadyQueued = 0;
+        std::uint64_t alreadyResolved = 0;
+        std::uint64_t skipped = 0;
+        std::uint64_t rejected = 0;
+        std::uint64_t completed = 0;
+        std::uint64_t errors = 0;
+        std::uint64_t cancelled = 0;
+        std::uint64_t joinedByDemand = 0;
+        std::uint64_t retriedAfterError = 0;
+        std::size_t pendingRequests = 0;
+        std::size_t pendingBytes = 0;
+    };
+
     struct Stats {
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
@@ -254,6 +279,38 @@ public:
                         bool wait,
                         int priorityOffset,
                         const ChunkRequestContext& request) override;
+    // Queue-only optional warmup through this source's normal fetch/decode
+    // pipeline. Globally limited to 16 operations / 32 MiB of estimated full
+    // decoded chunk bytes, further limited to half this service's configured
+    // maximum read concurrency (at least one) and half its decoded capacity.
+    // This bounds queued plus executing work, not the current adaptive read
+    // admission: the shared scheduler still limits execution and prioritizes
+    // required reads, while a bounded backlog permits adaptive measurement.
+    // Existing requests are skipped without changing their priority or budget.
+    // Required reads promote speculative work and retry its failure once as
+    // a normal request. Invalidation cannot release the budget of a source
+    // read or decode which is still running. No thread waits for this work.
+    // Outer persistent-cache paths and Delta3D are unsupported and return
+    // Skipped; an embedded read-through source store remains supported.
+    SpeculativePrefetchStatus prefetchSpeculativeChunk(const ChunkKey& key);
+    // Process-wide snapshots; completed/errors/cancelled partition operations
+    // whose actual task chain has ended. Bytes are estimates, not downloads.
+    static SpeculativePrefetchStats speculativePrefetchStats();
+    // True only within a speculative fetcher's source-read call on this
+    // thread, including nested source reads. Embedded stores use it to avoid
+    // forwarding optional owner errors to ordinary in-flight followers.
+    static bool isSpeculativeSourceRead() noexcept;
+    // Mark optional metadata reads on the calling thread too. Nested scopes
+    // preserve an enclosing marker; destruction restores it on every exit.
+    class SpeculativeSourceReadScope final {
+    public:
+        explicit SpeculativeSourceReadScope(bool enabled = true) noexcept;
+        ~SpeculativeSourceReadScope();
+        SpeculativeSourceReadScope(const SpeculativeSourceReadScope&) = delete;
+        SpeculativeSourceReadScope& operator=(const SpeculativeSourceReadScope&) = delete;
+    private:
+        bool previous_;
+    };
     void replaceViewDemand(const ChunkRequestContext& request,
                            const std::array<float, 2>& focus,
                            std::vector<ChunkViewportSample> samples) override;
@@ -310,6 +367,7 @@ public:
 private:
     friend class ChunkCacheService;
     struct State;
+    struct SpeculativeLease;
     ChunkCache(std::shared_ptr<ChunkCacheService> service,
                std::shared_ptr<State> state);
     enum class EntryStatus {
@@ -360,6 +418,10 @@ private:
         std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
         bool backgroundDemand = false;
+        // Origin survives required demand joining this fetch cycle so a
+        // transient speculative failure cannot poison that required read.
+        bool speculativeOrigin = false;
+        std::shared_ptr<SpeculativeLease> speculativeLease;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -371,6 +433,7 @@ private:
         std::uint64_t schedulerEpoch = 0;
         std::shared_ptr<IChunkFetcher> fetcher;
         std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
+        std::shared_ptr<SpeculativeLease> speculativeLease;
     };
 
     struct PersistenceOperation {
@@ -397,6 +460,7 @@ private:
         std::shared_ptr<IChunkFetcher> fetcher;
         bool decodeRequested = false;
         std::weak_ptr<PersistenceOperation> persistence;
+        std::shared_ptr<SpeculativeLease> speculativeLease;
     };
 
     struct StorageObjectKey {
@@ -572,6 +636,11 @@ private:
                                        Entry& entry,
                                        const ChunkRequestContext& request);
     static bool hasDemandLocked(const Entry& entry);
+    static void retrySpeculativeErrorLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        Entry& entry,
+        int priorityOffset);
     static bool hasParkedBlockingReaderLocked(const State& state,
                                               const ChunkKey& key);
     static bool cancelUndemandedEntryLocked(State& state,

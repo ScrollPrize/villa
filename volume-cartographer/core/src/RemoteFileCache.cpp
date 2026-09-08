@@ -1,5 +1,6 @@
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include "utils/http_fetch.hpp"
 
@@ -26,12 +27,19 @@ constexpr std::string_view kSidecarSuffix = ".vc-remote-file.json";
 struct InFlight {
     std::condition_variable finished;
     bool done = false;
+    bool speculativeOrigin = false;
     std::exception_ptr error;
 };
 
 std::mutex gInFlightMutex;
 std::unordered_map<std::string, std::shared_ptr<InFlight>> gInFlight;
 std::atomic<std::uint64_t> gTemporarySerial{0};
+std::atomic<std::size_t> gCurrentFollowers{0};
+
+struct FollowerRegistration {
+    FollowerRegistration() { gCurrentFollowers.fetch_add(1, std::memory_order_relaxed); }
+    ~FollowerRegistration() { gCurrentFollowers.fetch_sub(1, std::memory_order_relaxed); }
+};
 
 std::filesystem::path sidecarPath(const std::filesystem::path& payload)
 {
@@ -367,7 +375,12 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
     return result;
 }
 
-RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options)
+namespace {
+
+RemoteFileCacheResult cacheRemoteFileWithDemandRetry(
+    const std::string& sourceLocation,
+    const RemoteFileCacheOptions& options,
+    bool allowSpeculativeRetry)
 {
     const auto payload = checkedDestination(options);
     const auto normalized = normalizeRemoteFileLocation(sourceLocation);
@@ -387,12 +400,27 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
         auto [it, inserted] = gInFlight.try_emplace(flightKey, std::make_shared<InFlight>());
         flight = it->second;
         owner = inserted;
+        if (owner)
+            flight->speculativeOrigin = vc::render::ChunkCache::isSpeculativeSourceRead();
     }
     if (!owner) {
         std::unique_lock lock(gInFlightMutex);
-        flight->finished.wait(lock, [&] { return flight->done; });
-        if (flight->error)
-            std::rethrow_exception(flight->error);
+        {
+            FollowerRegistration follower;
+            flight->finished.wait(lock, [&] { return flight->done; });
+        }
+        const auto error = flight->error;
+        const bool retryAsDemand = allowSpeculativeRetry && error && flight->speculativeOrigin &&
+            !vc::render::ChunkCache::isSpeculativeSourceRead();
+        lock.unlock();
+        // Optional metadata may fail before a required opener would have
+        // issued its own request. Give that follower one ordinary attempt,
+        // outside the registry lock. A newly racing speculative owner cannot
+        // cause further recursion because the retry disables this allowance.
+        if (retryAsDemand)
+            return cacheRemoteFileWithDemandRetry(sourceLocation, options, false);
+        if (error)
+            std::rethrow_exception(error);
         if (!validCacheHit(payload, source, options.accounting))
             throw std::runtime_error("remote file cache publication did not produce a valid entry");
         return makeResult(payload, normalized, true, options.accounting);
@@ -475,6 +503,18 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
     if (error)
         std::rethrow_exception(error);
     return makeResult(payload, normalized, false, options.accounting);
+}
+
+} // namespace
+
+RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options)
+{
+    return cacheRemoteFileWithDemandRetry(sourceLocation, options, true);
+}
+
+std::size_t remoteFileCacheCurrentFollowers() noexcept
+{
+    return gCurrentFollowers.load(std::memory_order_relaxed);
 }
 
 void invalidateRemoteFileCacheEntry(const RemoteFileCacheOptions& options)

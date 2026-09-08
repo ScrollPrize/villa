@@ -1,6 +1,7 @@
 #include "vc/lasagna/Dataset.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
@@ -296,6 +297,12 @@ public:
 
     std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override
     {
+        return getWithDemandRetry(key, true);
+    }
+
+    std::optional<std::vector<std::byte>> getWithDemandRetry(
+        const std::string& key, bool allowSpeculativeRetry) const
+    {
         const auto relative = checkedRelativePath(key);
         const auto path = cachePath(relative);
         if (auto bytes = readIfExists(path, !isMetadataPath(relative))) {
@@ -327,6 +334,8 @@ public:
                 request = it->second;
             } else {
                 request = std::make_shared<InFlightRequest>();
+                request->speculativeOrigin =
+                    vc::render::ChunkCache::isSpeculativeSourceRead();
                 inFlight_.emplace(requestKey, request);
                 ownsRequest = true;
                 announceStreaming = announcedArtifacts_.insert(artifactKey).second;
@@ -339,15 +348,24 @@ public:
         }
 
         if (!ownsRequest) {
+            remoteStoreCounters().joined.fetch_add(1, std::memory_order_relaxed);
             std::unique_lock<std::mutex> lock(inFlightMutex_);
             request->finished.wait(lock, [&]() { return request->done; });
             const auto error = request->error;
             const bool found = request->found;
+            const bool retryAsDemand = allowSpeculativeRetry && error && request->speculativeOrigin &&
+                !vc::render::ChunkCache::isSpeculativeSourceRead();
             auto sharedBytes = request->bytes;
             lock.unlock();
+            // Scalar/legacy and corner sampling share this physical store.
+            // A required scalar read joining speculative corner I/O must get
+            // its own ordinary attempt if that earlier optional read failed.
+            // Permit only one retry even if a second speculative owner races
+            // this caller to the newly free key.
+            if (retryAsDemand)
+                return getWithDemandRetry(key, false);
             if (error)
                 std::rethrow_exception(error);
-            remoteStoreCounters().joined.fetch_add(1, std::memory_order_relaxed);
             return found ? std::move(sharedBytes) : std::nullopt;
         }
 
@@ -444,6 +462,7 @@ private:
         std::condition_variable finished;
         bool done = false;
         bool found = false;
+        bool speculativeOrigin = false;
         std::optional<std::vector<std::byte>> bytes;
         std::exception_ptr error;
     };

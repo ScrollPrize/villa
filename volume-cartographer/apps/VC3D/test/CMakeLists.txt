@@ -9,6 +9,14 @@
 # in, keeping the test fast and self-contained.
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
 
+add_executable(test_line_model_warmup_queue test_line_model_warmup_queue.cpp)
+target_include_directories(test_line_model_warmup_queue PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_line_model_warmup_queue PRIVATE Threads::Threads)
+add_test(NAME line_model_warmup_queue COMMAND test_line_model_warmup_queue)
+vc_register_test_target(test_line_model_warmup_queue)
+vc_register_ctest(line_model_warmup_queue test_line_model_warmup_queue)
+
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp

@@ -554,9 +554,14 @@ public:
         cacheOptions.decodedEvictionPreferSelf = true;
         cache_ = vc::render::acquireProcessChunkCache(
             "lasagna-channel|" + sourcePath.lexically_normal().string() +
-                "|channel=" + std::to_string(binding.channelIndex),
+            "|channel=" + std::to_string(binding.channelIndex),
             binding.array,
-            std::move(cacheOptions));
+            std::move(cacheOptions), binding.group && binding.group->isRemote());
+        // A remote sharded store may fetch an entire physical shard for one
+        // logical chunk; leave it to required reads until admission can bound
+        // that physical object size as well as decoded bytes.
+        prefetchRemote_ = binding.group && binding.group->isRemote() &&
+                          !binding.array->metadata().shard_config;
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(
@@ -638,11 +643,16 @@ public:
     [[nodiscard]] float spacing() const noexcept { return spacing_; }
     [[nodiscard]] const std::array<int, 3>& shapeZYX() const noexcept { return shapeZYX_; }
     [[nodiscard]] vc::render::IChunkedArray* cache() const noexcept { return cache_.get(); }
+    [[nodiscard]] ModelPrefetchSource prefetchSource() const
+    {
+        return {cache_, static_cast<double>(spacing_), prefetchRemote_};
+    }
 
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
     std::shared_ptr<vc::render::ChunkCache> cache_;
+    bool prefetchRemote_ = false;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
@@ -656,6 +666,11 @@ LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
     LasagnaChannelCornerSampler&&) noexcept = default;
 LasagnaChannelCornerSampler& LasagnaChannelCornerSampler::operator=(
     LasagnaChannelCornerSampler&&) noexcept = default;
+
+ModelPrefetchSource LasagnaChannelCornerSampler::prefetchSource() const
+{
+    return impl_->prefetchSource();
+}
 
 NormalPrefetchReport LasagnaChannelCornerSampler::sampleBatch(
     const std::vector<cv::Vec3f>& volumePoints,

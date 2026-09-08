@@ -3809,3 +3809,609 @@ TEST_CASE("ChunkCache invalidation cancels pending decode work")
 
     fs::remove_all(dir);
 }
+
+namespace {
+
+using SpeculativeStatus = ChunkCache::SpeculativePrefetchStatus;
+
+class SpeculativeGateFetcher final : public IChunkFetcher {
+public:
+    explicit SpeculativeGateFetcher(int failures = 0, std::size_t bytes = 64)
+        : failures_(failures), bytes_(bytes)
+    {
+    }
+
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        std::unique_lock lock(mutex_);
+        order_.push_back(key);
+        speculative_.push_back(ChunkCache::isSpeculativeSourceRead());
+        const bool fail = static_cast<int>(order_.size()) <= failures_;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_ || permits_ != 0; });
+        if (!released_)
+            --permits_;
+        lock.unlock();
+        ChunkFetchResult result;
+        result.status = fail ? ChunkFetchStatus::HttpError : ChunkFetchStatus::Found;
+        if (fail) {
+            result.httpStatus = 503;
+            result.message = "temporary speculative test failure";
+        } else {
+            result.bytes.assign(bytes_, std::byte{37});
+        }
+        return result;
+    }
+
+    bool waitStarted(std::size_t count)
+    {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds{2},
+                            [&] { return order_.size() >= count; });
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    std::vector<ChunkKey> order() const
+    {
+        std::lock_guard lock(mutex_);
+        return order_;
+    }
+
+    std::vector<bool> speculativeFlags() const
+    {
+        std::lock_guard lock(mutex_);
+        return speculative_;
+    }
+
+    void releaseOne()
+    {
+        std::lock_guard lock(mutex_);
+        ++permits_;
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool released_ = false;
+    std::size_t permits_ = 0;
+    int failures_;
+    std::size_t bytes_;
+    std::vector<ChunkKey> order_;
+    std::vector<bool> speculative_;
+};
+
+struct SpeculativeReleaseGuard {
+    std::shared_ptr<SpeculativeGateFetcher> fetcher;
+    ~SpeculativeReleaseGuard() { fetcher->release(); }
+};
+
+template <typename Predicate>
+bool waitSpeculativeTest(Predicate predicate)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return true;
+}
+
+bool waitSpeculativeIdle()
+{
+    return waitSpeculativeTest([] {
+        return ChunkCache::speculativePrefetchStats().pendingRequests == 0;
+    });
+}
+
+std::shared_ptr<ChunkCache> makeSpeculativeCache(
+    const std::shared_ptr<ChunkCacheService>& service,
+    const std::shared_ptr<IChunkFetcher>& fetcher,
+    const std::string& identity,
+    std::array<int, 3> shape = {4, 4, 256},
+    std::array<int, 3> chunks = {4, 4, 4})
+{
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    return service->acquireSource(
+        identity, {{shape, chunks, {}}}, {fetcher}, 0.0,
+        ChunkDtype::UInt8, options);
+}
+
+} // namespace
+
+TEST_CASE("ChunkCache speculative prefetch deduplicates and preserves exact bytes")
+{
+    REQUIRE(waitSpeculativeIdle());
+    const auto before = ChunkCache::speculativePrefetchStats();
+    auto service = makeService(1024 * 1024, 4);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-exact");
+    SpeculativeReleaseGuard release{fetcher};
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(fetcher->waitStarted(1));
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::AlreadyQueued);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 1);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 64);
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::AlreadyResolved);
+    const auto result = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(*result.bytes == std::vector<std::byte>(64, std::byte{37}));
+    CHECK(fetcher->order().size() == 1);
+    CHECK(fetcher->speculativeFlags() == std::vector<bool>{true});
+    CHECK_FALSE(ChunkCache::isSpeculativeSourceRead());
+    const auto after = ChunkCache::speculativePrefetchStats();
+    CHECK(after.submitted - before.submitted == 1);
+    CHECK(after.completed - before.completed == 1);
+    CHECK(after.errors == before.errors);
+    CHECK(after.pendingBytes == 0);
+}
+
+TEST_CASE("ChunkCache optional source scope restores nested and exceptional state")
+{
+    CHECK_FALSE(ChunkCache::isSpeculativeSourceRead());
+    {
+        ChunkCache::SpeculativeSourceReadScope disabled(false);
+        CHECK_FALSE(ChunkCache::isSpeculativeSourceRead());
+        {
+            ChunkCache::SpeculativeSourceReadScope optional;
+            CHECK(ChunkCache::isSpeculativeSourceRead());
+            {
+                ChunkCache::SpeculativeSourceReadScope nestedDisabled(false);
+                CHECK(ChunkCache::isSpeculativeSourceRead());
+            }
+            CHECK(ChunkCache::isSpeculativeSourceRead());
+        }
+        CHECK_FALSE(ChunkCache::isSpeculativeSourceRead());
+    }
+    CHECK_THROWS_AS([] {
+        ChunkCache::SpeculativeSourceReadScope optional;
+        throw std::runtime_error("optional metadata failed");
+    }(), std::runtime_error);
+    CHECK_FALSE(ChunkCache::isSpeculativeSourceRead());
+}
+
+TEST_CASE("ChunkCache speculative limits are shared across sources and services")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 32);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto first = makeSpeculativeCache(service, fetcher, "speculative-cap-first");
+    auto second = makeSpeculativeCache(service, fetcher, "speculative-cap-second");
+    SpeculativeReleaseGuard release{fetcher};
+    for (int index = 0; index < 16; ++index) {
+        auto& cache = index % 2 == 0 ? first : second;
+        REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, index}) ==
+                SpeculativeStatus::Submitted);
+    }
+    CHECK(first->prefetchSpeculativeChunk({0, 0, 0, 32}) == SpeculativeStatus::Rejected);
+    CHECK(second->prefetchSpeculativeChunk({0, 0, 0, 32}) == SpeculativeStatus::Rejected);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 16);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 16 * 64);
+    first->invalidate();
+    second->invalidate();
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+
+    auto lowConcurrency = makeService(1024 * 1024, 2);
+    auto otherService = makeService(1024 * 1024, 2);
+    auto blocked = std::make_shared<SpeculativeGateFetcher>();
+    auto low = makeSpeculativeCache(lowConcurrency, blocked, "speculative-service-first");
+    auto other = makeSpeculativeCache(otherService, blocked, "speculative-service-second");
+    SpeculativeReleaseGuard releaseBlocked{blocked};
+    REQUIRE(low->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    CHECK(other->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Rejected);
+    blocked->release();
+    REQUIRE(waitSpeculativeIdle());
+}
+
+TEST_CASE("ChunkCache adaptive reads retain a bounded optional backlog and required priority")
+{
+    REQUIRE(waitSpeculativeIdle());
+    ChunkCacheService::Options options;
+    options.decodedByteCapacity = 1024 * 1024;
+    options.fetchConcurrency.workerCapacity = 8;
+    options.fetchConcurrency.maxConcurrentReads = 8;
+    options.fetchConcurrency.adaptive = true;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    REQUIRE(service->adaptiveDownloadState().has_value());
+    CHECK(service->adaptiveDownloadState()->settledAdmissionLimit == 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-adaptive-backlog");
+    SpeculativeReleaseGuard release{fetcher};
+    for (int index = 0; index < 4; ++index)
+        REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, index}) ==
+                SpeculativeStatus::Submitted);
+    REQUIRE(fetcher->waitStarted(2));
+    CHECK(fetcher->order().size() == 2);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 4);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 4 * 64);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 4}) == SpeculativeStatus::Rejected);
+
+    int requiredIndex = 4;
+    SUBCASE("new required work passes older optional backlog") {}
+    SUBCASE("required join promotes a queued optional request") { requiredIndex = 3; }
+    cache->prefetchChunks({{0, 0, 0, requiredIndex}}, false);
+    // One completion admits exactly one further read at the unchanged initial
+    // adaptive limit. Its queue priority must beat older optional requests.
+    fetcher->releaseOne();
+    REQUIRE(fetcher->waitStarted(3));
+    const auto order = fetcher->order();
+    REQUIRE(order.size() == 3);
+    CHECK(order[2] == ChunkKey{0, 0, 0, requiredIndex});
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    const auto required = cache->getChunkBlocking(0, 0, 0, requiredIndex);
+    REQUIRE(required.status == ChunkStatus::Data);
+    REQUIRE(required.bytes);
+    CHECK(*required.bytes == std::vector<std::byte>(64, std::byte{37}));
+}
+
+TEST_CASE("ChunkCache speculative byte admission respects global and decoded budgets")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(128ULL * 1024ULL * 1024ULL, 16);
+    constexpr std::size_t chunkBytes = 16ULL * 1024ULL * 1024ULL;
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>(0, chunkBytes);
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-bytes",
+                                      {256, 256, 1024}, {256, 256, 256});
+    SpeculativeReleaseGuard release{fetcher};
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Submitted);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 2}) == SpeculativeStatus::Rejected);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 2 * chunkBytes);
+    cache->invalidate();
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+
+    auto smallService = makeService(128, 8);
+    auto smallFetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto small = makeSpeculativeCache(smallService, smallFetcher, "speculative-small");
+    SpeculativeReleaseGuard releaseSmall{smallFetcher};
+    REQUIRE(small->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    CHECK(small->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Rejected);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 64);
+    small->invalidate();
+    smallFetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+
+    auto oversized = makeSpeculativeCache(service, fetcher, "speculative-oversized",
+        {1024, 1024, 1024}, {1024, 1024, 1024});
+    CHECK(oversized->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Skipped);
+    CHECK(oversized->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 0);
+}
+
+TEST_CASE("ChunkCache speculative errors retry once when required demand arrives")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>(1);
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-retry-after");
+    SpeculativeReleaseGuard release{fetcher};
+    const auto before = ChunkCache::speculativePrefetchStats();
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    REQUIRE(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Error);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Skipped);
+
+    SUBCASE("blocking demand") {
+        REQUIRE(cache->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    }
+    SUBCASE("nonblocking demand") {
+        CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+        REQUIRE(waitSpeculativeTest([&] {
+            return cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data;
+        }));
+    }
+    SUBCASE("required prefetch") {
+        cache->prefetchChunks({{0, 0, 0, 0}}, true);
+        REQUIRE(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    }
+    const auto result = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(result.bytes);
+    CHECK(*result.bytes == std::vector<std::byte>(64, std::byte{37}));
+    CHECK(fetcher->speculativeFlags() == std::vector<bool>{true, false});
+    const auto after = ChunkCache::speculativePrefetchStats();
+    CHECK(after.errors - before.errors == 1);
+    CHECK(after.retriedAfterError - before.retriedAfterError == 1);
+}
+
+TEST_CASE("ChunkCache required demand joining speculation retries its failure")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>(1);
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-retry-joined");
+    std::future<ChunkResult> reader;
+    SpeculativeReleaseGuard release{fetcher};
+    const auto before = ChunkCache::speculativePrefetchStats();
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(fetcher->waitStarted(1));
+    SUBCASE("blocking demand") {
+        reader = std::async(std::launch::async, [&] {
+            return cache->getChunkBlocking(0, 0, 0, 0);
+        });
+        REQUIRE(waitSpeculativeTest([&] { return cache->stats().blockingReaders == 1; }));
+    }
+    SUBCASE("nonblocking demand") {
+        CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    }
+    SUBCASE("required prefetch") {
+        cache->prefetchChunks({{0, 0, 0, 0}}, false);
+    }
+    fetcher->release();
+    if (reader.valid()) {
+        REQUIRE(reader.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+        CHECK(reader.get().status == ChunkStatus::Data);
+    }
+    REQUIRE(waitSpeculativeTest([&] {
+        return cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data;
+    }));
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(fetcher->speculativeFlags() == std::vector<bool>{true, false});
+    const auto after = ChunkCache::speculativePrefetchStats();
+    CHECK(after.joinedByDemand - before.joinedByDemand == 1);
+    CHECK(after.retriedAfterError - before.retriedAfterError == 1);
+}
+
+TEST_CASE("ChunkCache normal failures and failed speculative retries remain terminal")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>(100);
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-terminal-errors");
+    SpeculativeReleaseGuard release{fetcher};
+    fetcher->release();
+    SUBCASE("original required failure is unchanged") {
+        CHECK(cache->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Error);
+        CHECK(cache->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Error);
+        cache->prefetchChunks({{0, 0, 0, 0}}, true);
+        CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Error);
+        CHECK(fetcher->speculativeFlags() == std::vector<bool>{false});
+    }
+    SUBCASE("speculative failure gets exactly one required retry") {
+        REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+        REQUIRE(waitSpeculativeIdle());
+        CHECK(cache->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Error);
+        CHECK(cache->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Error);
+        cache->prefetchChunks({{0, 0, 0, 0}}, true);
+        CHECK(fetcher->speculativeFlags() == std::vector<bool>{true, false});
+    }
+}
+
+TEST_CASE("ChunkCache invalidation retains admission while speculative source read runs")
+{
+    REQUIRE(waitSpeculativeIdle());
+    const auto before = ChunkCache::speculativePrefetchStats();
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-invalidated");
+    SpeculativeReleaseGuard release{fetcher};
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(fetcher->waitStarted(1));
+    cache->invalidate();
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 1);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingBytes == 64);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Rejected);
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(ChunkCache::speculativePrefetchStats().cancelled - before.cancelled == 1);
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Submitted);
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(cache->getChunkBlocking(0, 0, 0, 1).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCache required demand promotes queued speculative priority")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto blocker = std::make_shared<SpeculativeGateFetcher>();
+    auto blockingCache = makeSpeculativeCache(service, blocker, "speculative-priority-blocker");
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-priority");
+    std::future<ChunkResult> reader;
+    SpeculativeReleaseGuard releaseBlocker{blocker};
+    SpeculativeReleaseGuard release{fetcher};
+    // Occupy both read workers with required reads before publishing work.
+    blockingCache->prefetchChunks({{0, 0, 0, 0}, {0, 0, 0, 1}}, false);
+    REQUIRE(blocker->waitStarted(2));
+    fetcher->release();
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    bool promoted = false;
+    SUBCASE("unpromoted speculation follows required queued reads") {
+        cache->prefetchChunks({{0, 0, 0, 1}}, false);
+    }
+    SUBCASE("tryGetChunk promotes speculative FIFO position") {
+        promoted = true;
+        CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+        cache->prefetchChunks({{0, 0, 0, 1}}, false);
+    }
+    SUBCASE("required prefetch promotes speculative FIFO position") {
+        promoted = true;
+        cache->prefetchChunks({{0, 0, 0, 0}, {0, 0, 0, 1}}, false);
+    }
+    SUBCASE("blocking demand promotes ahead of an earlier required read") {
+        promoted = true;
+        cache->prefetchChunks({{0, 0, 0, 1}}, false);
+        reader = std::async(std::launch::async, [&] {
+            return cache->getChunkBlocking(0, 0, 0, 0);
+        });
+        REQUIRE(waitSpeculativeTest([&] { return cache->stats().blockingReaders == 1; }));
+    }
+    // Reducing admission before releasing workers makes observed fetch order
+    // deterministic without exposing or modifying the scheduler itself.
+    service->configureFetchConcurrency(1, false);
+    blocker->release();
+    if (reader.valid()) {
+        REQUIRE(reader.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+        CHECK(reader.get().status == ChunkStatus::Data);
+    }
+    REQUIRE(waitSpeculativeTest([&] {
+        return cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data &&
+               cache->getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data;
+    }));
+    REQUIRE(waitSpeculativeIdle());
+    const auto order = fetcher->order();
+    REQUIRE(order.size() == 2);
+    if (promoted) {
+        CHECK(order == std::vector<ChunkKey>{{0, 0, 0, 0}, {0, 0, 0, 1}});
+    } else {
+        CHECK(order == std::vector<ChunkKey>{{0, 0, 0, 1}, {0, 0, 0, 0}});
+    }
+}
+
+TEST_CASE("ChunkCache speculative admission rejects invalid and unsupported sources")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-invalid-keys");
+    CHECK(cache->prefetchSpeculativeChunk({-1, 0, 0, 0}) == SpeculativeStatus::Skipped);
+    CHECK(cache->prefetchSpeculativeChunk({1, 0, 0, 0}) == SpeculativeStatus::Skipped);
+    CHECK(cache->prefetchSpeculativeChunk({0, -1, 0, 0}) == SpeculativeStatus::Skipped);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 64}) == SpeculativeStatus::Skipped);
+    CHECK(fetcher->fetchCalls.load() == 0);
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 0);
+
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_speculative_unsupported_" + std::to_string(rng()));
+    {
+        ChunkCache::Options options;
+        options.persistentCachePath = dir;
+        ChunkCache persistent({{{4, 4, 4}, {4, 4, 4}, {}}}, {fetcher},
+                              0.0, ChunkDtype::UInt8, options,
+                              serviceOptions(1024 * 1024, 2));
+        CHECK(persistent.prefetchSpeculativeChunk({0, 0, 0, 0}) ==
+              SpeculativeStatus::Skipped);
+        CHECK(fetcher->fetchCalls.load() == 0);
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache refresh drops optional work while preserving its active lease")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto oldFetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, oldFetcher, "speculative-refresh");
+    SpeculativeReleaseGuard release{oldFetcher};
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(oldFetcher->waitStarted(1));
+    auto newFetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult found;
+    found.status = ChunkFetchStatus::Found;
+    found.bytes.assign(64, std::byte{51});
+    newFetcher->setCanned({0, 0, 0, 0}, found);
+    auto refreshed = makeSpeculativeCache(service, newFetcher, "speculative-refresh");
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 1);
+    CHECK(refreshed->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Rejected);
+    CHECK(newFetcher->fetchCalls.load() == 0);
+    const auto result = refreshed->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(*result.bytes == std::vector<std::byte>(64, std::byte{51}));
+    oldFetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(newFetcher->fetchCalls.load() == 1);
+}
+
+TEST_CASE("ChunkCache invalidation releases queued speculative admission without fetching")
+{
+    REQUIRE(waitSpeculativeIdle());
+    const auto before = ChunkCache::speculativePrefetchStats();
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-queued-invalidation");
+    SpeculativeReleaseGuard release{fetcher};
+    cache->prefetchChunks({{0, 0, 0, 0}, {0, 0, 0, 1}}, false);
+    REQUIRE(fetcher->waitStarted(2));
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 2}) == SpeculativeStatus::Submitted);
+    cache->invalidate();
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(ChunkCache::speculativePrefetchStats().cancelled - before.cancelled == 1);
+    fetcher->release();
+    CHECK(fetcher->order().size() == 2);
+}
+
+namespace {
+
+class SpeculativeDecodeGateFetcher final : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey&) override
+    {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = {std::byte{19}};
+        return result;
+    }
+
+    ChunkFetchResult decodeFetched(const ChunkKey&, ChunkFetchResult) const override
+    {
+        std::unique_lock lock(mutex_);
+        started_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_; });
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes.assign(64, std::byte{19});
+        return result;
+    }
+
+    bool waitStarted()
+    {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds{2}, [&] { return started_; });
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    mutable bool started_ = false;
+    bool released_ = false;
+};
+
+struct SpeculativeDecodeReleaseGuard {
+    std::shared_ptr<SpeculativeDecodeGateFetcher> fetcher;
+    ~SpeculativeDecodeReleaseGuard() { fetcher->release(); }
+};
+
+} // namespace
+
+TEST_CASE("ChunkCache invalidation retains admission while speculative decode runs")
+{
+    REQUIRE(waitSpeculativeIdle());
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<SpeculativeDecodeGateFetcher>();
+    auto cache = makeSpeculativeCache(service, fetcher, "speculative-decode-invalidation");
+    SpeculativeDecodeReleaseGuard release{fetcher};
+    REQUIRE(cache->prefetchSpeculativeChunk({0, 0, 0, 0}) == SpeculativeStatus::Submitted);
+    REQUIRE(fetcher->waitStarted());
+    cache->invalidate();
+    CHECK(ChunkCache::speculativePrefetchStats().pendingRequests == 1);
+    CHECK(cache->prefetchSpeculativeChunk({0, 0, 0, 1}) == SpeculativeStatus::Rejected);
+    fetcher->release();
+    REQUIRE(waitSpeculativeIdle());
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}

@@ -4,6 +4,7 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -53,6 +54,10 @@ struct RemoteFileCacheResult {
 [[nodiscard]] std::filesystem::path remoteFileCachePath(std::string_view sourceLocation);
 
 [[nodiscard]] RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options);
+
+// Process-wide current callers waiting for another fetch of the same cached
+// file. Useful for diagnosing shared manifest/metadata waits; not a total.
+[[nodiscard]] std::size_t remoteFileCacheCurrentFollowers() noexcept;
 
 void invalidateRemoteFileCacheEntry(const RemoteFileCacheOptions& options);
 

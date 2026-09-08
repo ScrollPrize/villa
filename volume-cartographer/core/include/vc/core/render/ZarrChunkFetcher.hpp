@@ -103,13 +103,17 @@ std::unique_ptr<ChunkCache> createChunkCache(
 std::unique_ptr<ChunkCache> createChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options,
-    ChunkCacheService::Options serviceOptions);
+    ChunkCacheService::Options serviceOptions,
+    bool remoteHttp = false);
 
 // Acquire an already-open scalar array from the process-wide cache service.
 // Equal source identities share decoded chunks, scheduling, and persistence.
+// Set remoteHttp for an embedded HTTP-backed store to observe actual payload
+// bytes with the existing download observer; local disk hits add no bytes.
 std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     std::string sourceIdentity,
     std::shared_ptr<utils::ZarrArray> array,
-    ChunkCache::Options options = {});
+    ChunkCache::Options options = {},
+    bool remoteHttp = false);
 
 } // namespace vc::render

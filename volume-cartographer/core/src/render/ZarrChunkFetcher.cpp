@@ -1195,7 +1195,8 @@ std::unique_ptr<ChunkCache> createChunkCache(
 std::unique_ptr<ChunkCache> createChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options,
-    ChunkCacheService::Options serviceOptions)
+    ChunkCacheService::Options serviceOptions,
+    bool remoteHttp)
 {
     if (!array)
         throw std::invalid_argument("cannot create a chunk cache for a null Zarr array");
@@ -1217,7 +1218,7 @@ std::unique_ptr<ChunkCache> createChunkCache(
          toArray3(chunkShape, "chunk shape"),
          IChunkedArray::LevelTransform{}}};
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
-    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array), remoteHttp));
     return std::make_unique<ChunkCache>(
         std::move(levels),
         std::move(fetchers),
@@ -1229,7 +1230,8 @@ std::unique_ptr<ChunkCache> createChunkCache(
 std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     std::string sourceIdentity,
     std::shared_ptr<utils::ZarrArray> array,
-    ChunkCache::Options options)
+    ChunkCache::Options options,
+    bool remoteHttp)
 {
     if (sourceIdentity.empty())
         throw std::invalid_argument("process chunk-cache source identity is empty");
@@ -1253,7 +1255,7 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
          toArray3(chunkShape, "chunk shape"),
          IChunkedArray::LevelTransform{}}};
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
-    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array), remoteHttp));
     return processChunkCacheService()->acquireSource(
         std::move(sourceIdentity), std::move(levels), std::move(fetchers),
         meta.fill_value.value_or(0.0), dtype, std::move(options));

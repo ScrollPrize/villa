@@ -10,6 +10,8 @@
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
+#include "LineAnnotationOptimizationDefaults.hpp"
+#include "LineModelWarmupQueue.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
@@ -30,6 +32,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
+#include "vc/lasagna/ModelPrefetch.hpp"
 
 #include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
@@ -107,6 +110,8 @@
 namespace fs = std::filesystem;
 
 struct LineAnnotationController::LineAnnotationSession {
+    ~LineAnnotationSession() { modelWarmup->cancel(); }
+
     enum class TaskState {
         Idle,
         Running,
@@ -164,6 +169,8 @@ struct LineAnnotationController::LineAnnotationSession {
     // Edits never set it: the solve runs to completion and its result is
     // span-merged at landing (render-job model).
     std::shared_ptr<std::atomic<bool>> runningSolveCancel;
+    std::shared_ptr<vc3d::line_annotation::LineModelWarmupQueue> modelWarmup =
+        std::make_shared<vc3d::line_annotation::LineModelWarmupQueue>();
     // Solve lifecycle: single-flight, epoch-refused publication after a
     // session mutation, coalesced pending dirty spans. Pure decision object;
     // the controller drives it at edit, launch, and finish.
@@ -386,7 +393,6 @@ void copyCoordinateIdentityToJson(
 }
 
 constexpr double kEpsilon = 1.0e-12;
-constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.
 constexpr int kSolveDispatchDebounceMs = 150;
@@ -421,6 +427,53 @@ double elapsedMsSince(std::chrono::steady_clock::time_point start)
         std::chrono::steady_clock::now() - start).count();
 }
 
+// These helpers accept immutable, already resolved inputs. Both the ordinary
+// session initialization and background warmup use the same opening/scaling
+// path; constructing samplers retains their dataset owner alongside them.
+vc::lasagna::LasagnaDataset openLineModelDataset(
+    const std::string& location, const fs::path& cacheRoot,
+    double workingToBaseScale = 1.0)
+{
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = cacheRoot;
+    options.workingToBaseScale = workingToBaseScale;
+    return vc::lasagna::LasagnaDataset::openLocation(location, options);
+}
+
+struct LineNormalResources {
+    std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+};
+
+LineNormalResources openLineNormalResources(
+    const std::string& location, const fs::path& cacheRoot,
+    double workingToBaseScale)
+{
+    auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+        openLineModelDataset(location, cacheRoot, workingToBaseScale));
+    auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+    return {std::move(dataset), std::move(sampler)};
+}
+
+struct LinePredictionResources {
+    std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
+    std::shared_ptr<vc::fiber_tracer::FiberPredictionField> field;
+    double traceToBaseScale = 1.0;
+};
+
+LinePredictionResources openLinePredictionResources(
+    const std::string& location, const fs::path& cacheRoot)
+{
+    const auto opened = openLineModelDataset(location, cacheRoot);
+    const auto scales = vc::fiber_tracer::resolveFiberPredictionTraceScales(
+        opened.manifest());
+    auto manifest = opened.manifest();
+    manifest.workingToBaseScale = scales.traceToBaseScale;
+    auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(std::move(manifest));
+    auto field = std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
+    return {std::move(dataset), std::move(field), scales.traceToBaseScale};
+}
+
 // Formats the delta of two remote-store snapshots for a log line. The
 // counters are process-wide, so concurrent work (metrics, other panes,
 // prefetch) is included; treat the numbers as an upper bound for one solve.
@@ -441,18 +494,7 @@ std::string remoteStoreDeltaString(const vc::lasagna::RemoteStoreStats& before,
 }
 using Clock = std::chrono::steady_clock;
 
-struct InitialLineDiscretization {
-    int segmentsPerSide = 1;
-    double segmentLength = kLineSegmentLength;
-};
-
-InitialLineDiscretization initialLineDiscretization(int totalLengthVx)
-{
-    const double halfLength = std::max(1, totalLengthVx) * 0.5;
-    const int segmentsPerSide = std::max(
-        1, static_cast<int>(std::ceil(halfLength / kLineSegmentLength)));
-    return {segmentsPerSide, halfLength / static_cast<double>(segmentsPerSide)};
-}
+using vc3d::line_annotation::initialLineDiscretization;
 
 void closeLineAnnotationDialogAfterFinalization(LineAnnotationDialog* dialog)
 {
@@ -2098,6 +2140,10 @@ LineAnnotationController::LineAnnotationController(CState* state,
 
 LineAnnotationController::~LineAnnotationController()
 {
+    for (auto& pane : _panes) {
+        if (pane.session)
+            pane.session->modelWarmup->cancel();
+    }
     flushAllPendingSessionAutoSaves();
     waitForFiberSaves();
     // Bounded teardown of in-flight line solves: request cooperative
@@ -3089,12 +3135,14 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                   static_cast<float>(origin[1]),
                   static_cast<float>(origin[2])},
         cv::Vec3f{0.0f, 0.0f, 1.0f});
-    (void)launchSession(SourceKind::Plane,
+    if (launchSession(SourceKind::Plane,
                         nextSurfaceName(),
                         sourcePlane,
                         camera,
                         {0.0, 0.0, 1.0},
-                        std::move(session));
+                        session)) {
+        scheduleModelWarmup(*session);
+    }
 }
 
 void LineAnnotationController::deleteFiber(uint64_t fiberId)
@@ -4330,6 +4378,10 @@ void LineAnnotationController::cleanupIntersectionInspectionSurfaces()
     }
     const std::string sourceSession = _intersectionInspection->sourceSessionSurfaceName;
     const std::string targetSession = _intersectionInspection->targetSessionSurfaceName;
+    for (const auto& pane : _panes) {
+        if (pane.session && (pane.surfaceName == sourceSession || pane.surfaceName == targetSession))
+            pane.session->modelWarmup->cancel();
+    }
     _panes.erase(std::remove_if(_panes.begin(),
                                 _panes.end(),
                                 [&sourceSession, &targetSession](const PaneRecord& pane) {
@@ -5550,6 +5602,8 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
 void LineAnnotationController::saveOpenFibersCore()
 {
     for (const auto& pane : _panes) {
+        if (pane.session)
+            pane.session->modelWarmup->cancel();
         if (!pane.session || pane.session->suppressFiberSave) {
             continue;
         }
@@ -7166,6 +7220,8 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // over _panes may be live when they do.
     panes.swap(_panes);
     for (auto& pane : panes) {
+        if (pane.session)
+            pane.session->modelWarmup->cancel();
         if (pane.dialog) {
             // Defensive net only: the project-open flows call
             // prepareForPackageSwitch() first, which closes these through the
@@ -7611,6 +7667,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         }
     }
     session.solveQueue.addPending(prepared.dirtySegmentIndices, false);
+    scheduleModelWarmup(session);
     if (autoReoptimize) {
         scheduleSolveDispatch(session);
     } else if (!session.suppressGeneratedViews &&
@@ -9341,6 +9398,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         ? focus->linePosition
         : linePosition;
     session.focusedControlPoint = focus->volumePoint;
+    scheduleModelWarmup(session);
 
     writeLineDebugJson("control_delete",
                        session.controlPoints,
@@ -9417,13 +9475,11 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             return false;
         }
     }
-    auto openSelectedDataset = [&](const std::string& location) {
-        vc::lasagna::LasagnaDatasetOpenOptions options;
-        options.workingToBaseScale = workingToBaseScale;
-        options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+    auto openSelectedResources = [&](const std::string& location) {
         const std::string resolved =
             vc::project::isLocationRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
-        return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
+        return openLineNormalResources(
+            resolved, vpkg->remoteCacheRootOrEmpty(), workingToBaseScale);
     };
 
     if (selected.empty()) {
@@ -9443,12 +9499,10 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         selected = *picked;
         selectedIdentity = selected;
         try {
-            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                openSelectedDataset(selected));
-            manifestPath = dataset->manifest().manifestPath;
-            auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
-            session.dataset = std::move(dataset);
-            session.normalSampler = std::move(sampler);
+            auto resources = openSelectedResources(selected);
+            manifestPath = resources.dataset->manifest().manifestPath;
+            session.dataset = std::move(resources.dataset);
+            session.normalSampler = std::move(resources.sampler);
         } catch (const std::exception& ex) {
             showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())),
                       headless);
@@ -9459,12 +9513,11 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         if (!session.normalSampler || session.selectedDatasetLocation != selected ||
             session.workingToBaseScale != workingToBaseScale) {
             try {
-                auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                    openSelectedDataset(selected));
-                manifestPath = dataset->manifest().manifestPath;
-                auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
-                session.dataset = std::move(dataset);
-                session.normalSampler = std::move(sampler);
+                session.modelWarmup->cancel();
+                auto resources = openSelectedResources(selected);
+                manifestPath = resources.dataset->manifest().manifestPath;
+                session.dataset = std::move(resources.dataset);
+                session.normalSampler = std::move(resources.sampler);
             } catch (const std::exception& ex) {
                 showError(tr("Invalid selected Lasagna dataset: %1")
                               .arg(QString::fromStdString(ex.what())),
@@ -9541,6 +9594,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
             continue;
         }
         auto& session = *pane.session;
+        session.modelWarmup->cancel();
         session.dataset.reset();
         session.normalSampler.reset();
         session.traceNormalDataset.reset();
@@ -9580,6 +9634,7 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
             continue;
         }
         auto& session = *pane.session;
+        session.modelWarmup->cancel();
         session.fiberInferenceDataset.reset();
         session.fiberPredictionField.reset();
         session.selectedFiberInferenceDatasetLocation.clear();
@@ -9639,14 +9694,12 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         if (!vc::project::isLocationRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
-            vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
             const std::string resolved = vc::project::isLocationRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
-            const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
-                resolved, options);
+            const auto cacheRoot = vpkg->remoteCacheRootOrEmpty();
+            const auto openedDataset = openLineModelDataset(resolved, cacheRoot);
             (void)vc::fiber_tracer::resolveFiberPredictionTraceScales(
                 openedDataset.manifest());
             std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
@@ -9657,7 +9710,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     std::move(prepared.volume)});
             }
             const auto result = vpkg->attachPreparedLasagnaDataset(
-                selected, {}, true, volumes, options.remoteCacheRoot);
+                selected, {}, true, volumes, cacheRoot);
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
                 showError(
                     tr("A Lasagna volume conflicts with an existing volume id."),
@@ -9675,26 +9728,18 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     if (!session.fiberPredictionField ||
         session.selectedFiberInferenceDatasetLocation != selected) {
         try {
-            vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
             const std::string resolved = vc::project::isLocationRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
                       selected, vpkg->path().parent_path()).string();
-            auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
-                resolved, options);
-            manifestPath = openedDataset.manifest().manifestPath;
-            const auto traceScales =
-                vc::fiber_tracer::resolveFiberPredictionTraceScales(
-                    openedDataset.manifest());
-            auto predictionManifest = openedDataset.manifest();
-            predictionManifest.workingToBaseScale = traceScales.traceToBaseScale;
-            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                std::move(predictionManifest));
-            auto field = std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
-            session.fiberInferenceDataset = std::move(dataset);
-            session.fiberPredictionField = std::move(field);
-            session.fiberTraceToBaseScale = traceScales.traceToBaseScale;
+            if (session.fiberPredictionField)
+                session.modelWarmup->cancel();
+            auto resources = openLinePredictionResources(
+                resolved, vpkg->remoteCacheRootOrEmpty());
+            manifestPath = resources.dataset->manifest().manifestPath;
+            session.fiberInferenceDataset = std::move(resources.dataset);
+            session.fiberPredictionField = std::move(resources.field);
+            session.fiberTraceToBaseScale = resources.traceToBaseScale;
         } catch (const std::exception& ex) {
             showError(tr("Invalid selected fiber inference dataset: %1")
                           .arg(QString::fromStdString(ex.what())),
@@ -9709,21 +9754,17 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             session.traceNormalDataset->manifest().workingToBaseScale,
             session.fiberTraceToBaseScale)) {
         try {
-            vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.workingToBaseScale = session.fiberTraceToBaseScale;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
             const std::string normalLocation =
                 vc::project::isLocationRemote(session.selectedDatasetLocation)
                     ? session.selectedDatasetLocation
                     : vc::project::resolveLocalPath(
                           session.selectedDatasetLocation,
                           vpkg->path().parent_path()).string();
-            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::openLocation(normalLocation, options));
-            auto sampler =
-                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
-            session.traceNormalDataset = std::move(dataset);
-            session.traceNormalSampler = std::move(sampler);
+            auto resources = openLineNormalResources(
+                normalLocation, vpkg->remoteCacheRootOrEmpty(),
+                session.fiberTraceToBaseScale);
+            session.traceNormalDataset = std::move(resources.dataset);
+            session.traceNormalSampler = std::move(resources.sampler);
             session.traceNormalDatasetLocation = session.selectedDatasetLocation;
         } catch (const std::exception& ex) {
             showError(tr("Invalid trace-scale Lasagna normal dataset: %1")
@@ -9741,6 +9782,150 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     return true;
 }
 
+void LineAnnotationController::scheduleModelWarmup(LineAnnotationSession& session)
+{
+    if (!vc::lasagna::modelPrefetchEnabled())
+        return;
+    if (!_state || !_state->vpkg() || session.optimizedLine.points.size() < 2) {
+        session.modelWarmup->cancel();
+        return;
+    }
+
+    auto sources = session.normalSampler
+        ? session.normalSampler->prefetchSources()
+        : std::vector<vc::lasagna::ModelPrefetchSource>{};
+    const auto vpkg = _state->vpkg();
+    std::string selected = vpkg->selectedFiberInferenceDataset();
+    const auto entries = vpkg->fiberInferenceDatasetEntries();
+    // The same unambiguous default as ensureFiberInferenceDatasetForSession,
+    // without its picker, project mutation, or metadata opening on the GUI.
+    if (selected.empty() && entries.size() == 1)
+        selected = entries.front().location;
+    std::string identity = selected;
+    const auto selectedEntry = std::find_if(entries.begin(), entries.end(),
+        [&](const auto& entry) { return entry.location == selected; });
+    if (selectedEntry != entries.end())
+        identity = vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+
+    std::string predictionLocation;
+    if (session.fiberPredictionField &&
+        session.selectedFiberInferenceDatasetLocation == selected) {
+        auto predictionSources = session.fiberPredictionField->prefetchSources();
+        for (auto& source : predictionSources)
+            source.spacing *= session.fiberTraceToBaseScale;
+        sources.insert(sources.end(), predictionSources.begin(), predictionSources.end());
+    } else if (vc::project::isLocationRemote(identity) ||
+               vc::project::isLocationRemote(selected)) {
+        predictionLocation = vc::project::isLocationRemote(selected)
+            ? selected
+            : vc::project::resolveLocalPath(selected, vpkg->path().parent_path()).string();
+    }
+    std::erase_if(sources, [](const auto& source) { return !source.remote; });
+    if (sources.empty() && predictionLocation.empty()) {
+        session.modelWarmup->cancel();
+        return; // Local-only model files incur no background work or extra I/O.
+    }
+
+    std::vector<cv::Vec3d> points;
+    points.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points)
+        points.push_back(point.position);
+    // CP edits have already spliced the new CP and its adjacent spans into this
+    // actual curve, including when a previous solve is still running.
+    const double focusedPosition = session.focusedLinePosition;
+    const auto cacheRoot = vpkg->remoteCacheRootOrEmpty();
+    const std::string fiberName = session.fiberFileName;
+    const auto warmup = session.modelWarmup;
+    const bool startWorker = warmup->replace(
+        [sources = std::move(sources), points = std::move(points),
+         predictionLocation = std::move(predictionLocation), cacheRoot,
+         focusedPosition, fiberName](const auto& cancelled) mutable {
+            using WarmupClock = std::chrono::steady_clock;
+            // A short quiet window coalesces rapid clicks before opening any
+            // metadata. Cancellation never joins another consumer's request.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (cancelled->load(std::memory_order_relaxed))
+                return;
+            const auto started = WarmupClock::now();
+            const bool perfLog = lineAnnotationPerfLogEnabled();
+            const auto before = perfLog ? vc::lasagna::remoteStoreStats()
+                                       : vc::lasagna::RemoteStoreStats{};
+            LinePredictionResources predictionResources;
+            if (!predictionLocation.empty()) {
+                try {
+                    vc::render::ChunkCache::SpeculativeSourceReadScope optionalMetadata;
+                    predictionResources = openLinePredictionResources(
+                        predictionLocation, cacheRoot);
+                    if (cancelled->load(std::memory_order_relaxed))
+                        return;
+                    auto predicted = predictionResources.field->prefetchSources();
+                    for (auto& source : predicted) {
+                        source.spacing *= predictionResources.traceToBaseScale;
+                        if (source.remote)
+                            sources.push_back(std::move(source));
+                    }
+                } catch (const std::exception& ex) {
+                    if (perfLog)
+                        Logger()->info("Line annotation model warmup: fiber={} metadata_error={}",
+                                       fiberName, ex.what());
+                }
+            }
+            if (cancelled->load(std::memory_order_relaxed) || sources.empty())
+                return;
+
+            // Start both directions at the edited/focused point, retaining the
+            // original curve rather than filling a box around distant controls.
+            const size_t focus = std::isfinite(focusedPosition)
+                ? static_cast<size_t>(std::clamp(focusedPosition, 0.0,
+                      static_cast<double>(points.size() - 1)))
+                : points.size() / 2;
+            const std::vector<cv::Vec3d> forward(points.begin() + focus, points.end());
+            const std::vector<cv::Vec3d> backward(
+                points.rbegin() + (points.size() - 1 - focus), points.rend());
+            vc::lasagna::ModelPrefetchOptions options;
+            options.maxRequests /= 2;
+            options.maxPlannedBytes /= 2;
+            vc::lasagna::ModelPrefetchPlan ahead(sources, forward, options);
+            vc::lasagna::ModelPrefetchPlan behind(std::move(sources), backward, options);
+            bool aheadDone = false;
+            bool behindDone = false;
+            const auto deadline = started + std::chrono::seconds(5);
+            while (!cancelled->load(std::memory_order_relaxed) &&
+                   WarmupClock::now() < deadline && (!aheadDone || !behindDone)) {
+                if (!aheadDone)
+                    aheadDone = ahead.pump(cancelled.get());
+                if (!behindDone)
+                    behindDone = behind.pump(cancelled.get());
+                if (!aheadDone || !behindDone)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (perfLog) {
+                const auto& a = ahead.report();
+                const auto& b = behind.report();
+                Logger()->info(
+                    "Line annotation model warmup perf: fiber={} points={} "
+                    "worker_ms={:.0f} planning_ms={:.1f} planned={} submitted={} "
+                    "already_queued={} already_resolved={} skipped={} admission_rejections={} "
+                    "planned_kib={:.0f} truncated={} cancelled={} submission_done={} "
+                    "process_remote_delta=[{}]",
+                    fiberName, points.size(), elapsedMsSince(started),
+                    a.planningMs + b.planningMs, a.planned + b.planned,
+                    a.submitted + b.submitted, a.alreadyQueued + b.alreadyQueued,
+                    a.alreadyResolved + b.alreadyResolved, a.skipped + b.skipped,
+                    a.rejected + b.rejected,
+                    static_cast<double>(a.plannedBytes + b.plannedBytes) / 1024.0,
+                    a.truncated || b.truncated,
+                    cancelled->load(std::memory_order_relaxed), aheadDone && behindDone,
+                    remoteStoreDeltaString(before, vc::lasagna::remoteStoreStats()));
+            }
+        });
+    if (startWorker) {
+        // Global low-priority worker owns only the coalesced immutable jobs;
+        // closing a pane does not wait on this pool or on speculative transfers.
+        QThreadPool::globalInstance()->start([warmup] { warmup->run(); }, -1);
+    }
+}
+
 void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
     const std::string& surfaceName,
     size_t firstControlPointIndex,
@@ -9751,6 +9936,7 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
     if (!pane || !pane->session)
         return;
     auto& session = *pane->session;
+    session.modelWarmup->cancel();
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."),
                   session.suppressErrorDialogs);
@@ -10183,6 +10369,7 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
     }
 
     auto& session = *pane->session;
+    session.modelWarmup->cancel();
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."),
                   session.suppressErrorDialogs);
@@ -10413,16 +10600,8 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
                 diagnostic.tracePointCount,
                 diagnostic.fromException ? "exception" : "trace_result");
         };
-    const auto discretization = initialLineDiscretization(
-        std::max(2, extrapolationDistanceVx * 2));
-    request.lasagnaConfig.segmentsPerSide = discretization.segmentsPerSide;
-    request.lasagnaConfig.segmentLength = discretization.segmentLength;
-    request.lasagnaConfig.straightnessWeight = 0.1;
-    request.lasagnaConfig.tangentStraightnessWeight = 5.0;
-    request.lasagnaConfig.samplesPerSegment = 1;
-    request.lasagnaConfig.maxIterations = 1000;
-    request.lasagnaConfig.differentiableNormalSampling = true;
-    request.lasagnaConfig.printSolverProgress = false;
+    vc3d::line_annotation::configureFiberModeLasagnaDefaults(
+        request.lasagnaConfig, extrapolationDistanceVx);
     return request;
 }
 
@@ -10540,6 +10719,7 @@ void LineAnnotationController::startFiberModeOptimization(
          !session.traceNormalSampler || !session.fiberPredictionField)) {
         return;
     }
+    scheduleModelWarmup(session);
     if (!session.controlPointCollapseRollback && session.fiberId != 0 &&
         session.fiberMetricsMatchStoredFiber) {
         session.fiberMetricsMatchStoredFiber = false;
@@ -10689,8 +10869,14 @@ void LineAnnotationController::startFiberModeOptimization(
                         "final_normal_pass_ms={:.0f} native_segments={} lasagna_fallback={} "
                         "native_tails={} lasagna_tails={} trace_calls={} "
                         "trace_pred_prefetch_ms={:.0f} trace_normal_prefetch_ms={:.0f} "
+                        "trace_pred_materialize_ms={:.0f} trace_normal_materialize_ms={:.0f} "
+                        "trace_corner_prepare_ms={:.0f} trace_corner_layout_ms={:.0f} "
+                        "trace_corner_pin_inclusive_ms={:.0f} trace_corner_gather_score_ms={:.0f} "
+                        "trace_model_prefetch_ms={:.1f} trace_model_prefetch_submitted={} "
+                        "trace_model_prefetch_rejected={} "
                         "trace_score_ms={:.0f} report_ceres_ms={:.0f} "
-                        "report_prefetch_ms={:.0f} report_chunks_read={} {}",
+                        "report_prefetch_ms={:.0f} report_chunk_dependencies={} "
+                        "process_remote_delta=[{}]",
                         retraceAll, dirtyEngaged, dirtyCount, controlCount, points.size(),
                         elapsedMsSince(workerStart), optimizerMs, optimized.spanTraceMs,
                         optimized.reinitMs, optimized.tailTraceMs, optimized.tailNormalPassMs,
@@ -10699,6 +10885,15 @@ void LineAnnotationController::startFiberModeOptimization(
                         optimized.lasagnaFallbackExtrapolations, traceProfile.oneWayCalls,
                         traceProfile.predictionPrefetchSeconds * 1000.0,
                         traceProfile.normalPrefetchSeconds * 1000.0,
+                        traceProfile.predictionMaterializeSeconds * 1000.0,
+                        traceProfile.normalMaterializeSeconds * 1000.0,
+                        traceProfile.predictionCornerPrepareSeconds * 1000.0,
+                        traceProfile.predictionCornerLayoutSeconds * 1000.0,
+                        traceProfile.predictionCornerPinSeconds * 1000.0,
+                        traceProfile.predictionCornerGatherSeconds * 1000.0,
+                        traceProfile.modelPrefetchMs,
+                        traceProfile.modelPrefetchSubmitted,
+                        traceProfile.modelPrefetchRejected,
                         traceProfile.candidateScoreSeconds * 1000.0,
                         task.result.report.ceresSolveMs,
                         task.result.report.normalChunkPrefetchMs +
@@ -12320,6 +12515,7 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
             pane.session->solveQueue.shutdown();
         }
         if (pane.surfaceName == surfaceName && pane.session) {
+            pane.session->modelWarmup->cancel();
             generatedSurfaceNames = pane.session->generatedSurfaceNames;
             // Session-cache entries are keyed by fiberId and validated by
             // (lineRevision, epoch), both of which restart when the fiber is

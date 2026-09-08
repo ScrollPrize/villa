@@ -2164,6 +2164,78 @@ template <typename LossAt>
     return result;
 }
 
+// Scheduling only: all candidate generation, scoring and normal interpolation
+// below retain their existing order and exact required-read paths.
+class TraceModelPrefetch {
+public:
+    TraceModelPrefetch(const FiberPredictionSource& predictions,
+                       const vc::lasagna::NormalSampler* normals,
+                       FiberTraceProfile* profile,
+                       const cv::Vec3d& target,
+                       std::optional<double> lengthLimit)
+        : target_(target), lengthLimit_(lengthLimit), profile_(profile)
+    {
+        if (!vc::lasagna::modelPrefetchEnabled())
+            return;
+        if (const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions))
+            sources_ = field->prefetchSources();
+        if (const auto* sampler = dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normals)) {
+            auto normalSources = sampler->prefetchSources();
+            sources_.insert(sources_.end(), normalSources.begin(), normalSources.end());
+        }
+        std::erase_if(sources_, [](const auto& source) { return !source.remote; });
+    }
+
+    void advance(const BeamState& beam) noexcept
+    {
+        if (sources_.empty())
+            return;
+        const auto started = TraceClock::now();
+        try {
+            const cv::Vec3d origin = toVec3d(beamEndpoint(beam));
+            if (!plan_ || cv::norm(origin - plannedOrigin_) >= 64.0) {
+                vc::lasagna::ModelPrefetchOptions options;
+                options.radius = 16.0;
+                options.maxRequests = 128;
+                options.maxPlanningSteps = 4096;
+                options.maxPlannedBytes = 16ULL * 1024ULL * 1024ULL;
+                // Do not download a full ray beyond a nearby segment endpoint
+                // or the remaining tail budget. The corridor already supplies
+                // the interpolation/beam margin. This only limits speculation.
+                const double remaining = lengthLimit_
+                    ? *lengthLimit_ - static_cast<double>(beam.tracedLength)
+                    : cv::norm(target_ - origin);
+                const double ahead = std::clamp(remaining, 0.0, 256.0);
+                plan_ = std::make_unique<vc::lasagna::ModelPrefetchPlan>(
+                    sources_, std::vector<cv::Vec3d>{
+                        origin, origin + toVec3d(beam.previousStepDirection) * ahead}, options);
+                plannedOrigin_ = origin;
+            }
+            const auto before = plan_->report();
+            (void)plan_->pump();
+            if (profile_) {
+                profile_->modelPrefetchSubmitted += plan_->report().submitted - before.submitted;
+                profile_->modelPrefetchRejected += plan_->report().rejected - before.rejected;
+            }
+        } catch (...) {
+            // A speculative planner/admission failure must not select a
+            // different trace/fallback. Required reads still report errors.
+            sources_.clear();
+            plan_.reset();
+        }
+        if (profile_)
+            profile_->modelPrefetchMs += elapsedSeconds(started) * 1000.0;
+    }
+
+private:
+    std::vector<vc::lasagna::ModelPrefetchSource> sources_;
+    std::unique_ptr<vc::lasagna::ModelPrefetchPlan> plan_;
+    cv::Vec3d plannedOrigin_{};
+    cv::Vec3d target_{};
+    std::optional<double> lengthLimit_;
+    FiberTraceProfile* profile_ = nullptr;
+};
+
 [[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
     const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request,
@@ -2216,6 +2288,8 @@ template <typename LossAt>
             "fiber trace start point has no valid prediction direction");
     }
     const TraceVec startDirection = startPrediction.direction;
+    TraceModelPrefetch modelPrefetch(predictions, normalSampler, profile,
+                                     request.targetPoint, traceLengthLimitVoxels);
 
     const float distance = traceLengthLimitVoxels.has_value()
         ? static_cast<float>(*traceLengthLimitVoxels)
@@ -2283,6 +2357,8 @@ template <typename LossAt>
               request.config.coneGridSize);
     int stepIndex = 0;
     while (stepIndex < maxSteps) {
+        if (!beams.empty())
+            modelPrefetch.advance(beams.front());
         std::vector<BeamState> expanded = beams;
         int advanced = 0;
         bool prunedFinalFrontier = false;
@@ -3529,6 +3605,19 @@ public:
         return cache_->prefetchInterleaved(requests);
     }
 
+    [[nodiscard]] std::vector<vc::lasagna::ModelPrefetchSource> prefetchSources() const
+    {
+        std::vector<vc::lasagna::ModelPrefetchSource> result;
+        for (const auto& option : options_) {
+            for (const auto* sampler : {option.presenceCorners.get(),
+                                        option.nxCorners.get(), option.nyCorners.get()}) {
+                if (sampler)
+                    result.push_back(sampler->prefetchSource());
+            }
+        }
+        return result;
+    }
+
     void materializeGroupedPredictionCorners(
         const std::vector<std::vector<vc::lasagna::LasagnaCornerSample>>& corners,
         size_t firstVolume,
@@ -4523,6 +4612,11 @@ FiberPredictionSample FiberPredictionField::sample(
 size_t FiberPredictionField::optionCount() const noexcept
 {
     return impl_->optionCount();
+}
+
+std::vector<vc::lasagna::ModelPrefetchSource> FiberPredictionField::prefetchSources() const
+{
+    return impl_->prefetchSources();
 }
 
 FiberInput loadFiberJson(const std::filesystem::path& path)

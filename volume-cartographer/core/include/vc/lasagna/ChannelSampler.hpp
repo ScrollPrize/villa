@@ -2,6 +2,7 @@
 
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
+#include "vc/lasagna/ModelPrefetch.hpp"
 
 #include <array>
 #include <cstddef>
@@ -196,6 +197,8 @@ public:
     [[nodiscard]] NormalPrefetchReport sampleBatch(
         const std::vector<cv::Vec3f>& volumePoints,
         std::vector<LasagnaCornerSample>& samples) const;
+
+    [[nodiscard]] ModelPrefetchSource prefetchSource() const;
 
 private:
     friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(

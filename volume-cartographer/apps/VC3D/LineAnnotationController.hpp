@@ -687,6 +687,7 @@ private:
             const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
+    void scheduleModelWarmup(LineAnnotationSession& session);
     void refreshLineAnnotationDatasetMenus() const;
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
     void handleLasagnaDatasetSelectionChanged(const std::string& location);

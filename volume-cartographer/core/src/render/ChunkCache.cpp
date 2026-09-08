@@ -45,6 +45,30 @@ constexpr std::string_view kDelta3dCacheMarkerName = ".vc_delta3d_cache";
 constexpr std::string_view kDelta3dCacheMarkerContents = "D3D1\n";
 std::atomic_size_t g_persistentWriteBacklogBytes{0};
 
+constexpr std::size_t kSpeculativeMaxRequests = 16;
+constexpr std::size_t kSpeculativeMaxBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr int kSpeculativePriorityOffset = 1024;
+thread_local bool g_speculativeSourceRead = false;
+
+struct SpeculativeAdmission {
+    std::mutex mutex;
+    ChunkCache::SpeculativePrefetchStats stats;
+};
+
+SpeculativeAdmission& speculativeAdmission()
+{
+    // Queued cache work can outlive other function-local static objects.
+    static auto* admission = new SpeculativeAdmission;
+    return *admission;
+}
+
+void countSpeculative(std::uint64_t ChunkCache::SpeculativePrefetchStats::* counter)
+{
+    auto& admission = speculativeAdmission();
+    std::lock_guard lock(admission.mutex);
+    ++(admission.stats.*counter);
+}
+
 bool atomicWriteBytes(const std::filesystem::path& path,
                       std::span<const std::byte> bytes);
 std::optional<std::vector<std::byte>>
@@ -638,6 +662,28 @@ std::optional<std::vector<std::byte>>
 readFileBytes(const std::filesystem::path& path);
 
 } // namespace
+
+struct ChunkCache::SpeculativeLease {
+    enum class Outcome { Cancelled, Completed, Error };
+    std::size_t bytes = 0;
+    bool admitted = false;
+    std::atomic<Outcome> outcome{Outcome::Cancelled};
+
+    ~SpeculativeLease()
+    {
+        if (!admitted)
+            return;
+        auto& admission = speculativeAdmission();
+        std::lock_guard lock(admission.mutex);
+        --admission.stats.pendingRequests;
+        admission.stats.pendingBytes -= bytes;
+        switch (outcome.load(std::memory_order_relaxed)) {
+        case Outcome::Completed: ++admission.stats.completed; break;
+        case Outcome::Error: ++admission.stats.errors; break;
+        case Outcome::Cancelled: ++admission.stats.cancelled; break;
+        }
+    }
+};
 
 struct ChunkCacheService::Impl {
     explicit Impl(Options options)
@@ -1293,6 +1339,21 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
     retry.reserve(state->entries_.size());
     for (auto it = state->entries_.begin(); it != state->entries_.end();) {
         Entry& entry = it->second;
+        if (entry.speculativeOrigin) {
+            // Refresh can leave the previous source call running. Optional
+            // work must not start a second operation on its admission lease.
+            // Drop undemanded warmup; demanded work restarts normally below.
+            if (!entry.backgroundDemand && entry.viewDemands.empty()) {
+                const ChunkKey key = it->first;
+                if (entry.inLru)
+                    state->lru_.erase(entry.lruIt);
+                ++it;
+                eraseUnresolvedEntryLocked(*state, key);
+                continue;
+            }
+            entry.speculativeOrigin = false;
+            entry.speculativeLease.reset();
+        }
         if (entry.status == EntryStatus::InFlight && !hasDemandLocked(entry)) {
             if (entry.unresolvedCounted && it->first.level >= 0 &&
                 it->first.level < static_cast<int>(
@@ -1630,9 +1691,17 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
 
     auto it = state->entries_.find(key);
     if (it != state->entries_.end()) {
-        if (it->second.status == EntryStatus::InFlight) {
-            if (addRequestDemandLocked(*state, key, it->second, request))
+        if (it->second.status == EntryStatus::InFlight ||
+            (it->second.status == EntryStatus::Error && it->second.speculativeOrigin)) {
+            if (addRequestDemandLocked(*state, key, it->second, request)) {
+                if (it->second.status == EntryStatus::Error) {
+                    retrySpeculativeErrorLocked(state, key, it->second, 0);
+                } else if (it->second.speculativeOrigin) {
+                    it->second.basePriority = std::min(
+                        it->second.basePriority, fetchBasePriority(*state, key, 0));
+                }
                 reprioritizeEntryLocked(*state, key, it->second);
+            }
             return ChunkResult{
                 ChunkStatus::MissQueued, state->dtype_,
                 state->levels_[level].chunkShape, {}, {}};
@@ -1751,7 +1820,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     try {
         for (int attempt = 0;; ++attempt) {
             auto [it, inserted] = state->entries_.emplace(key, Entry{});
-            it->second.backgroundDemand = true;
+            (void)addRequestDemandLocked(*state, key, it->second, {});
             bool notifyRemoteStart = false;
             if (inserted) {
                 try {
@@ -1766,6 +1835,10 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
                     eraseUnresolvedEntryLocked(*state, key);
                     throw;
                 }
+            } else if (it->second.status == EntryStatus::Error &&
+                       it->second.speculativeOrigin) {
+                retrySpeculativeErrorLocked(
+                    state, key, it->second, kBlockingFetchPriorityOffset);
             } else if (it->second.status == EntryStatus::InFlight) {
                 const int boosted =
                     fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
@@ -1828,6 +1901,115 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
     prefetchChunks(keys, wait, priorityOffset, {});
 }
 
+ChunkCache::SpeculativePrefetchStats ChunkCache::speculativePrefetchStats()
+{
+    auto& admission = speculativeAdmission();
+    std::lock_guard lock(admission.mutex);
+    return admission.stats;
+}
+
+bool ChunkCache::isSpeculativeSourceRead() noexcept
+{
+    return g_speculativeSourceRead;
+}
+
+ChunkCache::SpeculativeSourceReadScope::SpeculativeSourceReadScope(bool enabled) noexcept
+    : previous_(g_speculativeSourceRead)
+{
+    g_speculativeSourceRead = previous_ || enabled;
+}
+
+ChunkCache::SpeculativeSourceReadScope::~SpeculativeSourceReadScope()
+{
+    g_speculativeSourceRead = previous_;
+}
+
+ChunkCache::SpeculativePrefetchStatus ChunkCache::prefetchSpeculativeChunk(
+    const ChunkKey& requestedKey)
+{
+    // Service source acquisition locks service before source state. Take this
+    // snapshot first to preserve that lock order; configured concurrency bounds
+    // the optional backlog independently of the adaptive execution limit.
+    const auto fetchConcurrency = service_->fetchConcurrency();
+    auto state = state_;
+    std::lock_guard lock(state->mutex_);
+    const ChunkKey key = sourceKey(*state, requestedKey);
+    const auto skip = [] {
+        countSpeculative(&SpeculativePrefetchStats::skipped);
+        return SpeculativePrefetchStatus::Skipped;
+    };
+    // The model-channel cache uses a fetcher with its own read-through store.
+    // Keep the distinct outer persistence/storage-object pipeline out of this
+    // optional API until its operation ownership is represented here as well.
+    if (state->options_.persistentCachePath ||
+        state->persistentLayout_ == PersistentCacheLayout::Delta3d ||
+        !isValidKey(*state, key))
+        return skip();
+    if (const auto found = state->entries_.find(key); found != state->entries_.end()) {
+        if (found->second.status == EntryStatus::InFlight) {
+            countSpeculative(&SpeculativePrefetchStats::alreadyQueued);
+            return SpeculativePrefetchStatus::AlreadyQueued;
+        }
+        if (found->second.status == EntryStatus::Error)
+            return skip();
+        countSpeculative(&SpeculativePrefetchStats::alreadyResolved);
+        return SpeculativePrefetchStatus::AlreadyResolved;
+    }
+    if (state->sourceTransfers_.contains(key)) {
+        countSpeculative(&SpeculativePrefetchStats::alreadyQueued);
+        return SpeculativePrefetchStatus::AlreadyQueued;
+    }
+    const auto scheduler = state->fetchScheduler_.lock();
+    if (!scheduler || state->decodeScheduler_.expired())
+        return skip();
+    const auto requestLimit = std::min(
+        kSpeculativeMaxRequests,
+        std::max<std::size_t>(1, fetchConcurrency.maxConcurrentReads / 2));
+    const auto byteLimit = std::min(
+        kSpeculativeMaxBytes, state->decodedByteBudget_->maximumBytes() / 2);
+    std::size_t bytes = dtypeSize(state->dtype_);
+    for (const int extent : state->levels_[static_cast<std::size_t>(key.level)].chunkShape) {
+        if (extent <= 0 || bytes > byteLimit / static_cast<std::size_t>(extent))
+            return skip();
+        bytes *= static_cast<std::size_t>(extent);
+    }
+    auto lease = std::make_shared<SpeculativeLease>();
+    lease->bytes = bytes;
+    {
+        auto& admission = speculativeAdmission();
+        std::lock_guard admissionLock(admission.mutex);
+        if (admission.stats.pendingRequests >= requestLimit ||
+            admission.stats.pendingBytes > byteLimit - bytes) {
+            ++admission.stats.rejected;
+            return SpeculativePrefetchStatus::Rejected;
+        }
+        ++admission.stats.submitted;
+        ++admission.stats.pendingRequests;
+        admission.stats.pendingBytes += bytes;
+        lease->admitted = true;
+    }
+    try {
+        auto [entry, inserted] = state->entries_.emplace(key, Entry{});
+        (void)inserted;
+        entry->second.speculativeOrigin = true;
+        entry->second.speculativeLease = lease;
+        (void)queueFetchLocked(state, key, state->generation_, kSpeculativePriorityOffset);
+    } catch (...) {
+        // Queue allocation/setup failures must not leave an unresolved entry
+        // with no task behind it. Any running task still owns its own lease.
+        if (auto transfer = state->sourceTransfers_.find(key);
+            transfer != state->sourceTransfers_.end()) {
+            scheduler->cancel(transfer->second.taskId);
+            state->sourceTransfers_.erase(transfer);
+        }
+        eraseUnresolvedEntryLocked(*state, key);
+        lease->outcome.store(SpeculativeLease::Outcome::Error, std::memory_order_relaxed);
+        state->cv_.notify_all();
+        return skip();
+    }
+    return SpeculativePrefetchStatus::Submitted;
+}
+
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
                                 bool wait,
                                 int priorityOffset,
@@ -1850,8 +2032,11 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
             } else {
                 state->entries_.erase(it);
             }
-        } else if (it->second.status == EntryStatus::InFlight) {
+        } else if (it->second.status == EntryStatus::InFlight ||
+                   (it->second.status == EntryStatus::Error && it->second.speculativeOrigin)) {
             if (addRequestDemandLocked(*state, key, it->second, request)) {
+                if (it->second.status == EntryStatus::Error)
+                    retrySpeculativeErrorLocked(state, key, it->second, priorityOffset);
                 it->second.basePriority = std::min(
                     it->second.basePriority,
                     fetchBasePriority(*state, key, priorityOffset));
@@ -2841,6 +3026,8 @@ bool ChunkCache::addRequestDemandLocked(State& state,
                                         const ChunkRequestContext& request)
 {
     if (!request.interactive()) {
+        if (entry.speculativeOrigin && !entry.backgroundDemand && entry.viewDemands.empty())
+            countSpeculative(&SpeculativePrefetchStats::joinedByDemand);
         entry.backgroundDemand = true;
         return true;
     }
@@ -2851,6 +3038,8 @@ bool ChunkCache::addRequestDemandLocked(State& state,
             return false;
         }
     }
+    if (entry.speculativeOrigin && !entry.backgroundDemand && entry.viewDemands.empty())
+        countSpeculative(&SpeculativePrefetchStats::joinedByDemand);
     auto& slot = entry.viewDemands[request.viewId];
     if (request.viewVersion > slot.version) {
         slot.version = request.viewVersion;
@@ -2867,7 +3056,33 @@ bool ChunkCache::addRequestDemandLocked(State& state,
 
 bool ChunkCache::hasDemandLocked(const Entry& entry)
 {
-    return entry.backgroundDemand || !entry.viewDemands.empty();
+    return entry.backgroundDemand || !entry.viewDemands.empty() ||
+           static_cast<bool>(entry.speculativeLease);
+}
+
+void ChunkCache::retrySpeculativeErrorLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    Entry& entry,
+    int priorityOffset)
+{
+    if (entry.status != EntryStatus::Error || !entry.speculativeOrigin)
+        return;
+    entry.speculativeOrigin = false;
+    entry.speculativeLease.reset();
+    if (entry.inLru) {
+        state->lru_.erase(entry.lruIt);
+        entry.inLru = false;
+    }
+    entry.error.clear();
+    countSpeculative(&SpeculativePrefetchStats::retriedAfterError);
+    try {
+        (void)queueFetchLocked(state, key, state->generation_, priorityOffset);
+    } catch (...) {
+        eraseUnresolvedEntryLocked(*state, key);
+        state->cv_.notify_all();
+        throw;
+    }
 }
 
 bool ChunkCache::hasParkedBlockingReaderLocked(const State& state,
@@ -3042,7 +3257,8 @@ bool ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         fetchSerial,
         schedulerEpoch,
         state->fetchers_.at(static_cast<std::size_t>(key.level)),
-        {}};
+        {},
+        entry.speculativeLease};
     if (!context.fetcher)
         return false;
     std::weak_ptr<State> weakState = state;
@@ -3216,6 +3432,7 @@ void ChunkCache::joinSourceTransferLocked(
     transfer.fetcher = std::move(context.fetcher);
     transfer.decodeRequested = decodeRequested;
     transfer.persistence = persistence;
+    transfer.speculativeLease = context.speculativeLease;
 
     ChunkWorkPriority priority;
     if (decodeRequested) {
@@ -3238,7 +3455,10 @@ void ChunkCache::joinSourceTransferLocked(
     std::weak_ptr<State> weakState = state;
     scheduler->submit(
         taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
-        [weakState, key, serial] {
+        [weakState, key, serial, lease = context.speculativeLease] {
+            // Keep admission reserved even if invalidation removes the entry
+            // and transfer registry while this source task is executing.
+            (void)lease;
             if (auto state = weakState.lock())
                 runSourceTransfer(state, key, serial);
         });
@@ -3369,8 +3589,12 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
             notifyRemoteFetchListeners(state, key, true,
                                        /*isolateCallbackExceptions=*/true);
         }
-        fetch = sourceTransfer.fetcher->fetchEncoded(
-            fetcherKey(key), observeProgress);
+        {
+            SpeculativeSourceReadScope speculativeScope(
+                static_cast<bool>(sourceTransfer.speculativeLease));
+            fetch = sourceTransfer.fetcher->fetchEncoded(
+                fetcherKey(key), observeProgress);
+        }
     } catch (const std::exception& e) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = e.what();
@@ -3444,6 +3668,7 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
         sourceTransfer.schedulerEpoch,
         sourceTransfer.fetcher,
         scheduler,
+        sourceTransfer.speculativeLease,
     };
 
     const bool persistenceSupported = persistence &&
@@ -4144,8 +4369,36 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
         it->second.probeTaskId = 0;
         it->second.fetchTaskId = 0;
         it->second.decodeTaskId = 0;
+        if (context.speculativeLease) {
+            const bool error =
+                (fetch.status != ChunkFetchStatus::Found &&
+                 fetch.status != ChunkFetchStatus::Missing) ||
+                (fetch.status == ChunkFetchStatus::Found &&
+                 fetch.bytes.size() != expectedChunkBytes(*state, key));
+            context.speculativeLease->outcome.store(
+                error ? SpeculativeLease::Outcome::Error : SpeculativeLease::Outcome::Completed,
+                std::memory_order_relaxed);
+            it->second.speculativeLease.reset();
+            if (!error)
+                it->second.speculativeOrigin = false;
+        }
         storeFetchResultLocked(
             state, key, std::move(fetch), loadedFromPersistentCache);
+        // A required reader can join before a speculative request fails.
+        // Retry that cycle before publishing its terminal result, including
+        // for asynchronous required reads which do not call getChunkBlocking.
+        it = state->entries_.find(key);
+        if (it != state->entries_.end() && it->second.speculativeOrigin &&
+            (it->second.backgroundDemand || !it->second.viewDemands.empty())) {
+            const int priorityOffset = it->second.basePriority -
+                fetchBasePriority(*state, key, 0);
+            try {
+                retrySpeculativeErrorLocked(state, key, it->second, priorityOffset);
+            } catch (...) {
+                // The helper erased the unqueueable entry. Notify readers
+                // below so they can refetch instead of remaining parked.
+            }
+        }
     }
     enforceSharedBudget(state);
     state->cv_.notify_all();

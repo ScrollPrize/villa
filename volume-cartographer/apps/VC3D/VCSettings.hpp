@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LineAnnotationOptimizationDefaults.hpp"
+
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -324,7 +326,8 @@ namespace line_annotation {
     constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
     constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
     constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
-    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
+    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT =
+        vc3d::line_annotation::kDefaultExtrapolationDistanceBaseVoxels;
     // Maximum base-voxel polyline arclength for control-point extrapolation.
     // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";

@@ -1,4 +1,5 @@
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationOptimizationDefaults.hpp"
 
 #include "vc/lasagna/NormalAlignment.hpp"
 
@@ -17,6 +18,21 @@
 
 namespace vc3d::line_annotation
 {
+
+void configureFiberModeLasagnaDefaults(vc::lasagna::LineOptimizationConfig& config,
+                                      int extrapolationDistanceBaseVoxels)
+{
+    const auto discretization = initialLineDiscretization(
+        std::max(2, extrapolationDistanceBaseVoxels * 2));
+    config.segmentsPerSide = discretization.segmentsPerSide;
+    config.segmentLength = discretization.segmentLength;
+    config.straightnessWeight = 0.1;
+    config.tangentStraightnessWeight = 5.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 1000;
+    config.differentiableNormalSampling = true;
+    config.printSolverProgress = false;
+}
 
 bool shouldRunNativeSeedTrace(
     FiberOptimizationMode mode,
