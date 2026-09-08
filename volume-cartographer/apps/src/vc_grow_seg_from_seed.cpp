@@ -395,6 +395,25 @@ int main(int argc, char *argv[])
     std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
+    // min_area_cm is a physical threshold, so it cannot be evaluated without a
+    // voxel size. Refuse here rather than after tracing: with voxelsize 0 every
+    // area_cm2 is 0, so the check below would discard every surface however
+    // large it really is, and the run would still look like a success.
+    // gen_neighbor is exempt: it returns before that check and never consults
+    // min_area_cm, so refusing it here would block a mode the threshold does
+    // not apply to.
+    if (mode != "gen_neighbor" && min_area_cm > 0.0f &&
+        !(std::isfinite(voxelsize) && voxelsize > 0.0f)) {
+        std::cerr << "ERROR: volume reports no usable voxel size (" << voxelsize
+                  << " um/voxel), so min_area_cm " << min_area_cm
+                  << " cannot be evaluated." << std::endl
+                  << "       Set \"voxelsize\" (um per voxel) in "
+                  << params_path.string()
+                  << ", or set \"min_area_cm\" to 0 to grow without an area threshold."
+                  << std::endl;
+        return EXIT_FAILURE;
+    }
+
     auto direction_fields = load_direction_fields(params, cache_root);
 
     std::unordered_map<std::string,QuadSurface*> surfs;
@@ -1447,21 +1466,25 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    double area_cm2 = surf->meta["area_cm2"].get_double();
-    if (area_cm2 < min_area_cm) {
-        std::cout << "discarding generated surface because area_cm2 " << area_cm2
-                  << " is below min_area_cm " << min_area_cm << std::endl;
-        if (std::filesystem::exists(seg_dir)) {
-            std::filesystem::remove_all(seg_dir);
-        }
+    if (min_area_cm > 0.0f) {
+        // area_cm2 is guaranteed present here: the startup check rejects an
+        // unusable voxel size, and storeAreaMeta() omits the key only then.
+        const double area_cm2 = surf->meta["area_cm2"].get_double();
+        if (area_cm2 < min_area_cm) {
+            std::cout << "discarding generated surface because area_cm2 " << area_cm2
+                      << " is below min_area_cm " << min_area_cm << std::endl;
+            if (std::filesystem::exists(seg_dir)) {
+                std::filesystem::remove_all(seg_dir);
+            }
 #if defined(_WIN32)
-        // See end of main(): skip CRT teardown, worker threads deadlock it.
-        std::cout.flush();
-        std::cerr.flush();
-        std::_Exit(EXIT_SUCCESS);
+            // See end of main(): skip CRT teardown, worker threads deadlock it.
+            std::cout.flush();
+            std::cerr.flush();
+            std::_Exit(EXIT_SUCCESS);
 #else
-        return EXIT_SUCCESS;
+            return EXIT_SUCCESS;
 #endif
+        }
     }
 
     std::cout << "saving " << seg_dir.string() << std::endl;
