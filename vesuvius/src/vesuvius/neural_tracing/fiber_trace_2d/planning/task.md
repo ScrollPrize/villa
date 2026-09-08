@@ -1,10 +1,13 @@
-# Task: explain the native quarter-resolution end-to-end throughput gap
+# Task: overlap Fiber3D batch preparation with training
 
-Profile why Fiber3D native stride-4 GroupNorm training improves replay/model-only
-throughput by about 73%, but improves the full loading and augmentation pipeline
-by only about 18%. Use the S1a 128-cube two-GPU reference on physical GPUs 0 and
-1, `/home/hendrik/.venv_las`, and `/ephemeral/hendrik/fiber3d_train2`.
+The native quarter-resolution Fiber3D model reaches 95.7 global samples/s when
+replaying a GPU-resident batch, but the shared real-sample trainer reaches only
+83.8 samples/s even though its CPU sample pipeline sustains over 220 samples/s.
 
-Attribute time and stalls precisely enough to select and implement the next
-highest-impact optimization. Keep the overarching target of at least 221
-samples/s for the eventual 8-GPU training run.
+Move ordered batch collation/staging off the training critical path and keep two
+future batches prepared. Use pinned host staging and a dedicated CUDA stream so
+H2D transfer and GPU target materialization for batch N+2 overlap computation of
+batch N. Preserve deterministic samples, bounded memory, and existing behavior
+when the optimization is disabled or CUDA is unavailable. Measure against both
+the 83.8 samples/s real-pipeline result and 95.7 samples/s replay ceiling on GPUs
+0 and 1.

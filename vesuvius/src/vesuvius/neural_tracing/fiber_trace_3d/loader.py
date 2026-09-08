@@ -381,50 +381,108 @@ class FiberTrace3DBatch:
     presence_mask: torch.Tensor | None = None
     profile_timings_ms: dict[str, float] | None = None
 
-    def to(self, device: torch.device | str) -> "FiberTrace3DBatch":
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
-            volume=self.volume.to(device),
-            valid_mask=self.valid_mask.to(device),
-            cp_local_zyx=self.cp_local_zyx.to(device),
-            crop_origin_zyx=self.crop_origin_zyx.to(device),
-            stream_indices=self.stream_indices.to(device),
-            data_indices=self.data_indices.to(device),
-            record_indices=self.record_indices.to(device),
-            control_point_indices=self.control_point_indices.to(device),
+            volume=self.volume.to(device, non_blocking=non_blocking),
+            valid_mask=self.valid_mask.to(device, non_blocking=non_blocking),
+            cp_local_zyx=self.cp_local_zyx.to(device, non_blocking=non_blocking),
+            crop_origin_zyx=self.crop_origin_zyx.to(device, non_blocking=non_blocking),
+            stream_indices=self.stream_indices.to(device, non_blocking=non_blocking),
+            data_indices=self.data_indices.to(device, non_blocking=non_blocking),
+            record_indices=self.record_indices.to(device, non_blocking=non_blocking),
+            control_point_indices=self.control_point_indices.to(
+                device, non_blocking=non_blocking
+            ),
             fiber_paths=self.fiber_paths,
             target_modes=self.target_modes,
             target_segment_offsets=self.target_segment_offsets,
             target_segment_counts=self.target_segment_counts,
-            target_segment_starts_zyx=self.target_segment_starts_zyx.to(device),
-            target_segment_ends_zyx=self.target_segment_ends_zyx.to(device),
+            target_segment_starts_zyx=self.target_segment_starts_zyx.to(
+                device, non_blocking=non_blocking
+            ),
+            target_segment_ends_zyx=self.target_segment_ends_zyx.to(
+                device, non_blocking=non_blocking
+            ),
             target_segment_bbox_lo_zyx=self.target_segment_bbox_lo_zyx,
             target_segment_bbox_hi_zyx=self.target_segment_bbox_hi_zyx,
-            target_tangent_zyx=self.target_tangent_zyx.to(device),
+            target_tangent_zyx=self.target_tangent_zyx.to(
+                device, non_blocking=non_blocking
+            ),
             direction_target=None
             if self.direction_target is None
-            else self.direction_target.to(device),
+            else self.direction_target.to(device, non_blocking=non_blocking),
             direction_weight=None
             if self.direction_weight is None
-            else self.direction_weight.to(device),
-            direction_mask=None if self.direction_mask is None else self.direction_mask.to(device),
+            else self.direction_weight.to(device, non_blocking=non_blocking),
+            direction_mask=None
+            if self.direction_mask is None
+            else self.direction_mask.to(device, non_blocking=non_blocking),
             direction_indices_bzyx=None
             if self.direction_indices_bzyx is None
-            else self.direction_indices_bzyx.to(device),
+            else self.direction_indices_bzyx.to(device, non_blocking=non_blocking),
             direction_target_sparse=None
             if self.direction_target_sparse is None
-            else self.direction_target_sparse.to(device),
+            else self.direction_target_sparse.to(device, non_blocking=non_blocking),
             direction_weight_sparse=None
             if self.direction_weight_sparse is None
-            else self.direction_weight_sparse.to(device),
+            else self.direction_weight_sparse.to(device, non_blocking=non_blocking),
             direction_tangent_sparse_zyx=None
             if self.direction_tangent_sparse_zyx is None
-            else self.direction_tangent_sparse_zyx.to(device),
+            else self.direction_tangent_sparse_zyx.to(
+                device, non_blocking=non_blocking
+            ),
             presence_target=None
             if self.presence_target is None
-            else self.presence_target.to(device),
-            presence_mask=None if self.presence_mask is None else self.presence_mask.to(device),
+            else self.presence_target.to(device, non_blocking=non_blocking),
+            presence_mask=None
+            if self.presence_mask is None
+            else self.presence_mask.to(device, non_blocking=non_blocking),
             profile_timings_ms=self.profile_timings_ms,
         )
+
+    def pin_memory(self) -> "FiberTrace3DBatch":
+        """Copy CUDA-bound CPU tensors into allocator-managed pinned storage."""
+
+        def pin(value: torch.Tensor | None) -> torch.Tensor | None:
+            if value is None or value.device.type != "cpu":
+                return value
+            return value.pin_memory()
+
+        return replace(
+            self,
+            volume=pin(self.volume),
+            valid_mask=pin(self.valid_mask),
+            cp_local_zyx=pin(self.cp_local_zyx),
+            crop_origin_zyx=pin(self.crop_origin_zyx),
+            stream_indices=pin(self.stream_indices),
+            data_indices=pin(self.data_indices),
+            record_indices=pin(self.record_indices),
+            control_point_indices=pin(self.control_point_indices),
+            target_segment_starts_zyx=pin(self.target_segment_starts_zyx),
+            target_segment_ends_zyx=pin(self.target_segment_ends_zyx),
+            target_tangent_zyx=pin(self.target_tangent_zyx),
+            direction_target=pin(self.direction_target),
+            direction_weight=pin(self.direction_weight),
+            direction_mask=pin(self.direction_mask),
+            direction_indices_bzyx=pin(self.direction_indices_bzyx),
+            direction_target_sparse=pin(self.direction_target_sparse),
+            direction_weight_sparse=pin(self.direction_weight_sparse),
+            direction_tangent_sparse_zyx=pin(self.direction_tangent_sparse_zyx),
+            presence_target=pin(self.presence_target),
+            presence_mask=pin(self.presence_mask),
+        )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Keep allocator-owned CUDA tensors alive through work on ``stream``."""
+
+        for value in vars(self).values():
+            if isinstance(value, torch.Tensor) and value.device.type == "cuda":
+                value.record_stream(stream)
 
 
 def collate_fiber_trace_3d_samples(

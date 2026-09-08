@@ -1,5 +1,8 @@
 # 2026-09-08
 
+- Added bounded two-batch-ahead pinned staging, asynchronous H2D, and CUDA
+  target preparation to the shared Fiber3D training pipeline. Two-GPU native
+  stride-4 throughput increased from 83.812 to 91.719 samples/s.
 - Added configurable GroupNorm and native lower-resolution Fiber3D heads.
   Native stride-4 GroupNorm raised the matched two-H100 replay ceiling from
   55.30 to 95.71 samples/s and the real-sample path from 50.23 to 59.15

@@ -39,6 +39,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
     DistributedSampleIndex,
+    FiberTrace3DCudaBatchPipeline,
     FiberTrace3DTrainingBatchPipeline,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
@@ -2332,6 +2333,14 @@ def run_training(
         raise ValueError(
             "profile_replay_batch and profile_replay_cpu_batch are mutually exclusive"
         )
+    cuda_batch_depth = _training_cuda_batch_pipeline_depth(training)
+    if cuda_batch_depth > 0:
+        if profile_replay_batch or profile_replay_cpu_batch:
+            raise ValueError("CUDA batch preparation is incompatible with replay modes")
+        if _training_sample_pipeline_workers(training) <= 0:
+            raise ValueError(
+                "CUDA batch preparation requires training.sample_pipeline_workers > 0"
+            )
     if (
         profile_loader
         and _loader_worker_count(raw_config) <= 0
@@ -2352,6 +2361,8 @@ def run_training(
     distributed = _distributed_config_from_env(base_device)
     _distributed_init(distributed)
     device = distributed.device
+    if cuda_batch_depth > 0 and device.type != "cuda":
+        raise ValueError("CUDA batch preparation requires a CUDA training device")
     writer = None
     diagnostics: _TrainingHangDiagnostics | None = None
     train_dataloader = None
@@ -2873,6 +2884,20 @@ def run_training(
             profile=profile_loader,
         )
         train_iterator = iter(train_dataloader) if train_dataloader is not None else None
+    cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
+    if cuda_batch_depth > 0:
+        if not isinstance(train_iterator, FiberTrace3DTrainingBatchPipeline):
+            raise RuntimeError("CUDA batch preparation requires the shared sample pipeline")
+        cuda_batch_pipeline = FiberTrace3DCudaBatchPipeline(
+            train_iterator,
+            config=loader.config,
+            device=device,
+            output_stride=_model_output_stride(raw_model),
+            depth=cuda_batch_depth,
+        )
+        train_iterator = cuda_batch_pipeline
+        train_dataloader = cuda_batch_pipeline
+
     replayed_batch: FiberTrace3DBatch | None = None
     replayed_cpu_batch: FiberTrace3DBatch | None = None
     replayed_batch_sha256: str | None = None
@@ -3047,7 +3072,10 @@ def run_training(
 
             test_metric = None
             test_metric_name = None
-            if test_interval > 0 and step % test_interval == 0:
+            test_due = test_interval > 0 and step % test_interval == 0
+            if test_due:
+                if cuda_batch_pipeline is not None:
+                    cuda_batch_pipeline.pause()
                 test_metric, test_metric_name = run_configured_tests(step)
                 test_metric = _distributed_broadcast_object(test_metric, distributed)
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
@@ -3096,6 +3124,8 @@ def run_training(
                         grad_scaler=grad_scaler,
                     )
                 _distributed_barrier(distributed)
+            if test_due and cuda_batch_pipeline is not None:
+                cuda_batch_pipeline.resume()
             profile.end(load_ms=load_ms, wait_ms=wait_ms, to_device_ms=to_device_ms,
                         target_ms=target_ms, fw_bw_step_ms=step_ms,
                         loss_total=losses["total"],
@@ -3124,6 +3154,7 @@ def run_training(
                     "replay_batch": profile_replay_batch,
                     "replay_cpu_batch": profile_replay_cpu_batch,
                     "sample_pipeline_workers": sample_pipeline_workers,
+                    "cuda_batch_pipeline_depth": cuda_batch_depth,
                     "replay_batch_sha256": replayed_batch_sha256,
                     "replay_source_batch_sha256": replayed_source_batch_sha256,
                     "normalization_module_counts": normalization_module_counts,
@@ -3139,6 +3170,14 @@ def run_training(
                     "peak_allocated_bytes": (
                         int(torch.cuda.max_memory_allocated(device))
                         if device.type == "cuda" else 0
+                    ),
+                    "peak_reserved_bytes": (
+                        int(torch.cuda.max_memory_reserved(device))
+                        if device.type == "cuda" else 0
+                    ),
+                    "maximum_live_pinned_bytes": (
+                        int(cuda_batch_pipeline.max_pinned_bytes)
+                        if cuda_batch_pipeline is not None else 0
                     ),
                 }
                 (run_dir / f"throughput_rank{distributed.rank}.json").write_text(
@@ -4496,6 +4535,15 @@ def _training_sample_pipeline_workers(training: dict[str, Any]) -> int:
     return workers
 
 
+def _training_cuda_batch_pipeline_depth(training: dict[str, Any]) -> int:
+    depth = int(training.get("sample_pipeline_cuda_prefetch_depth", 0))
+    if depth < 0:
+        raise ValueError(
+            "training.sample_pipeline_cuda_prefetch_depth must be nonnegative"
+        )
+    return depth
+
+
 def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:
     training = dict(raw_config.get("training", {}))
     raw_factor = training.get("loader_prefetch_factor", raw_config.get("loader_prefetch_factor", 2))
@@ -4623,6 +4671,18 @@ def _next_training_batch(
             "coordinator_received_ns": float(time.time_ns()),
         })
     wait_ms = (time.perf_counter() - wait_start) * 1000.0
+    if isinstance(iterator, FiberTrace3DCudaBatchPipeline):
+        timings = batch.profile_timings_ms or {}
+        exposed_wait_ms = float(
+            timings.get("cuda_pipeline_exposed_queue_wait_ms", 0.0)
+        ) + float(timings.get("cuda_pipeline_exposed_event_wait_ms", 0.0))
+        return (
+            batch,
+            exposed_wait_ms,
+            exposed_wait_ms,
+            float(timings.get("cuda_pipeline_transfer_ms", 0.0)),
+            float(timings.get("cuda_pipeline_target_ms", 0.0)),
+        )
     to_device_start = time.perf_counter()
     try:
         batch = batch.to(device)

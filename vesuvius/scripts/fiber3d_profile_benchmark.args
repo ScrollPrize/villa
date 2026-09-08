@@ -7,5 +7,6 @@ group
 4
 --throughput-only
 --sample-pipeline
+--async-batch-preparation
 --trace-steps
 0

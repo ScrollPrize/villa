@@ -2922,3 +2922,15 @@
 - Shared batch slots remain leased until the rank's H2D copy has synchronized.
   Training closes the pipeline explicitly on normal or exceptional exit. A
   zero worker count retains the legacy whole-batch DataLoader path.
+- Training may additionally set `training.sample_pipeline_cuda_prefetch_depth`
+  when the shared sample pipeline and CUDA are active. Zero is the compatibility
+  default; the profiled setting is two future batches. One coordinator thread
+  performs ordered collation, allocator-owned pinned staging, nonblocking H2D,
+  and target materialization on a dedicated CUDA stream.
+- The current batch plus admitted future batches bound live host and device
+  staging to `depth + 1` batches per rank. Device tensors are not explicitly
+  reused and are recorded on the consuming training stream. Shared sample slots
+  are released after their contents enter pinned staging. The consumer waits
+  only for its selected preparation event and receives preparation failures in
+  order. Evaluation pauses and synchronizes preparation before starting.
+  Replay modes and non-CUDA training reject asynchronous preparation.

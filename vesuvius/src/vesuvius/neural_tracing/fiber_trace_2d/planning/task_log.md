@@ -1,13 +1,27 @@
-# Task log: profile the stride-4 full-pipeline gap
+# Task log: overlap Fiber3D batch preparation
 
-- Native stride-4 GroupNorm implementation committed as `66f3134b7` after 269 Fiber3D/profile tests and two directly affected shared Lasagna tests passed.
-- Existing paired result: replay throughput increased from 55.301 to 95.714 samples/s, while real-pipeline throughput increased from 50.231 to 59.154 samples/s. This task will measure rather than assume the cause of that gap.
-- Experiments are restricted to physical GPUs 0 and 1 and artifacts below `/ephemeral/hendrik/fiber3d_train2`.
-- Independent review found that stride-4-only reruns could locate a bottleneck but not explain the relative speedup. The plan now requires contemporaneous stride-1 controls, uninstrumented versus instrumented controls, and an intermediate raw-batch replay retaining preparation/H2D/target work.
-- Fresh stride-4 results were 95.708 samples/s for prepared-GPU replay, 88.224 for augmented-CPU replay, and 60.115 for the legacy real pipeline. Loader instrumentation reduced the legacy result to 58.455 samples/s (2.8% overhead).
-- The legacy trainer assigns whole batches to eight workers per rank. Profiled batch service averaged about 2.08s and produced an eight-step starvation wave; one rank waited for input while the other waited at DDP synchronization.
-- Extracted the benchmark operations into a shared module and connected the existing ordered shared process pool to training. One global 128-worker/512-slot budget is partitioned across ranks; logical indices map to the canonical DDP sample stream and shared slots remain leased until synchronized H2D completion.
-- Integrated throughput was 84.028 and 83.595 samples/s uninstrumented (83.812 mean), while an instrumented control reached 84.853. This recovers 79.5% of the replay-to-real loss and reaches 95.0% of the CPU-replay ceiling.
-- The first integration trial completed numerical work at 84.028 samples/s but did not explicitly close its pipeline during trainer teardown. The launcher was interrupted after output; explicit close was added and the next run exited normally.
-- Post-extraction standalone shared-pool validation sustained 222.09 production samples/s and 218.41 samples/s including process startup/drain over 4,096 measured samples. Artifact: `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_162725_479470/result.json`.
-- Validation: 289 focused Fiber3D, profiling, and ordered-pipeline tests passed.
+- Baselines: GPU replay 95.708 global samples/s; shared real pipeline trials
+  84.028 and 83.595 samples/s (83.812 mean); standalone CPU pipeline 222.09
+  production samples/s.
+- Integrated profile attributes the remaining approximately 24ms/step gap to
+  13.6ms synchronous H2D, 4.0ms target construction, 3.7ms mean ordered batch
+  wait/assembly, and residual host/synchronization jitter.
+- Planned implementation keeps deterministic sample production shared and adds
+  a bounded asynchronous preparation stage rather than another loader.
+- Independent review rejected explicitly reusable device slots without consumed
+  events. The implementation will instead keep three allocator-owned live
+  batches (current plus two future), use `record_stream`, report allocated and
+  reserved memory, and quiesce before evaluation.
+- Implemented a depth-two coordinator around the existing shared sample
+  pipeline. It pins and releases ordered CPU batches off-thread, submits H2D and
+  target construction on a dedicated CUDA stream, and exposes failures/events
+  in order. The synchronous path remains the default.
+- Two matched runs reached 91.792 and 91.646 global samples/s (91.719 mean), up
+  9.4% from 83.812 and reaching 95.8% of the 95.708 replay ceiling. Exposed
+  wait was below 0.7ms at p95. Peak allocated/reserved device memory was
+  14.99/20.31GiB per rank; bounded pinned storage was 240.0MiB per rank.
+- Steps 98--100 matched the synchronous run's losses and metrics exactly across
+  many queue wraps. The remaining gap is GPU-side copy/target contention rather
+  than input starvation.
+- Validation: 290 focused Fiber3D, profiling, and ordered-pipeline tests passed;
+  Python compilation and `git diff --check` also passed.

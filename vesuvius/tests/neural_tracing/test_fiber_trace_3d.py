@@ -326,10 +326,22 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
+    _training_cuda_batch_pipeline_depth,
     _test_batch_take,
     _validate_snapshot_intervals,
     _write_3d_sample_sheet,
 )
+
+
+def test_training_cuda_batch_pipeline_depth_defaults_off_and_validates() -> None:
+    assert _training_cuda_batch_pipeline_depth({}) == 0
+    assert _training_cuda_batch_pipeline_depth(
+        {"sample_pipeline_cuda_prefetch_depth": 2}
+    ) == 2
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        _training_cuda_batch_pipeline_depth(
+            {"sample_pipeline_cuda_prefetch_depth": -1}
+        )
 
 
 def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):

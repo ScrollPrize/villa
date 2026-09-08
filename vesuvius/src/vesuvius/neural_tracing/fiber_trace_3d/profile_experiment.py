@@ -57,6 +57,11 @@ def main():
         help="use the bounded shared per-sample CPU pipeline in training",
     )
     parser.add_argument(
+        "--async-batch-preparation",
+        action="store_true",
+        help="prepare two future pinned/CUDA batches outside the training thread",
+    )
+    parser.add_argument(
         "--replay-batch",
         action="store_true",
         help="capture one prepared GPU batch per rank, stop loaders, and replay it",
@@ -74,6 +79,10 @@ def main():
     args = parser.parse_args()
     if args.replay_batch and args.replay_cpu_batch:
         parser.error("--replay-batch and --replay-cpu-batch are mutually exclusive")
+    if args.async_batch_preparation and not args.sample_pipeline:
+        parser.error("--async-batch-preparation requires --sample-pipeline")
+    if args.async_batch_preparation and (args.replay_batch or args.replay_cpu_batch):
+        parser.error("--async-batch-preparation is incompatible with replay modes")
     if args.steps < 30 or args.trace_steps < 0:
         parser.error("steps must be >=30 and trace-steps nonnegative")
     if args.output_stride <= 0:
@@ -98,6 +107,8 @@ def main():
     suffix += f"_os{args.output_stride}"
     if args.sample_pipeline:
         suffix += "_sample_pipeline"
+    if args.async_batch_preparation:
+        suffix += "_async_batch"
     experiment = args.output.resolve() / f"profile_2gpu_{args.compile_mode}{suffix}_{stamp}"
     experiment.mkdir(parents=True, exist_ok=False)
     training = config["training"]
@@ -121,6 +132,8 @@ def main():
             sample_pipeline_slots=512,
             sample_pipeline_initial_in_flight=16,
         )
+    if args.async_batch_preparation:
+        training["sample_pipeline_cuda_prefetch_depth"] = 2
     throughput_only = bool(
         args.throughput_only or args.replay_batch or args.replay_cpu_batch
     )
@@ -156,6 +169,7 @@ def main():
                 "output_stride": int(args.output_stride),
                 "profile_loader": args.profile_loader,
                 "sample_pipeline": args.sample_pipeline,
+                "async_batch_preparation": args.async_batch_preparation,
                 "replay_batch": args.replay_batch,
                 "replay_cpu_batch": args.replay_cpu_batch,
                 "throughput_only": throughput_only}

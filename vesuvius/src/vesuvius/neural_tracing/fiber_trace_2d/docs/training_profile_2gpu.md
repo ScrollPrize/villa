@@ -282,3 +282,47 @@ Artifacts:
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_cpu_replay_group_os4_20260908_160615_494193`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_20260908_162049_091414`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_loader_group_os4_sample_pipeline_20260908_162210_991101`
+
+## Asynchronous batch preparation, 2026-09-08
+
+The shared trainer can keep two future batches prepared using
+`training.sample_pipeline_cuda_prefetch_depth: 2`. Ordered collation and pinned
+host staging run on one background coordinator; nonblocking H2D and native
+quarter-resolution target construction run on a dedicated CUDA stream. Taking
+batch N admits N+2. Current plus two future batches bound live staging to three
+batches per rank, and evaluation pauses and drains preparation.
+
+Two fresh uninstrumented trials used the same two H100s, GroupNorm, native
+output stride 4, global batch 16, BF16 eager training, 30 warmup steps, and 90
+measured steps:
+
+| Path | Global samples/s | Iteration mean / median / p95 (rank 0) |
+| --- | ---: | ---: |
+| synchronous shared pipeline, mean of 2 | 83.812 | 191.14 / 187.40 / 211.49 ms (representative trial) |
+| asynchronous preparation, trial 1 | 91.792 | 173.99 / 173.41 / 178.11 ms |
+| asynchronous preparation, trial 2 | 91.646 | 174.26 / 173.23 / 181.60 ms |
+| prepared GPU replay | 95.708 | 166.98 / 166.98 / 167.36 ms |
+
+The asynchronous mean is 91.719 samples/s: 9.4% above the synchronous shared
+pipeline and 95.8% of the GPU replay ceiling. Exposed preparation wait was
+0.17/0.035/0.61ms mean/median/p95 in trial 1 and 0.32/0.32/0.61ms in trial 2.
+Peak allocated memory was 14.99GiB per rank, peak reserved memory 20.31GiB, and
+the calculated maximum live pinned-host storage was 240.0MiB per rank. Steps
+98--100 produced exactly the same reported losses and metrics as the
+synchronous deterministic run.
+
+The remaining approximately 4% versus replay is not CPU sample starvation:
+replay omits transfer and target work. Concurrent preparation slightly raises
+the forward/backward/step region from roughly 166--167ms to roughly 170ms
+because its copy and target kernels still consume GPU resources.
+
+Command:
+
+```bash
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_165937_591417`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_170107_746537`

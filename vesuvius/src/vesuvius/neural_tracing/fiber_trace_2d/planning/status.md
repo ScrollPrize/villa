@@ -1,13 +1,10 @@
-# Status: profile the stride-4 full-pipeline gap
+# Status: overlap Fiber3D batch preparation
 
-- [x] Record task and detailed plan
-- [x] Independent plan review and corrections
-- [x] Run matched stride 1/4 by replay/real throughput matrix
-- [x] Add and run CPU-batch preparation replay
-- [x] Run repeated stride-4 replay baseline
-- [x] Run repeated stride-4 full pipeline with loader profiling
-- [x] Attribute critical-path time and rank skew
-- [x] Validate the identified bottleneck
-- [x] Implement the shared per-sample trainer pipeline
-- [x] Update tests, specs, profiling docs, task log, and changelog
-- [x] Run final focused tests and diff checks
+- [x] Record the task
+- [x] Draft the implementation and measurement plan
+- [x] Independent plan review
+- [x] Implement bounded pinned/CUDA preparation
+- [x] Add and run focused tests
+- [x] Run matched two-GPU benchmarks
+- [x] Update specs, docs, changelog, and task log
+- [x] Final review and commit
