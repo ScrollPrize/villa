@@ -1552,15 +1552,31 @@ class FitContext:
         # Patch loading and ROI filtering
         # ==========================================================================
 
-        filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
+        # The conventional outer-shell path is set whether or not the dataset
+        # has one (the headless CLI does no existence probing), and the
+        # 2025-2026 scroll datasets ship tracks without an outer shell. The
+        # shell is optional unless shell losses or winding-model supervision
+        # need it, so only filter tracks by it when it actually exists.
+        shell_available = bool(self.shell_path) and os.path.isfile(
+            os.path.join(self.shell_path, 'meta.json'))
+        filter_tracks_by_shell = bool(self.tracks_dbm_path) and shell_available
         shell_patch = None
         if self.outer_shell_required() or filter_tracks_by_shell:
             if not self.shell_path:
                 raise RuntimeError(
                     'the outer shell is required by shell losses or winding-model '
                     'supervision, but no outer shell path is set')
+            if not shell_available:
+                raise RuntimeError(
+                    'the outer shell is required by shell losses or winding-model '
+                    f'supervision, but no tifxyz was found at {self.shell_path} '
+                    '(set loss_weight_shell_outer and loss_weight_shell_patch_radius '
+                    'to 0, or input_use_outer_shell to false, to fit without one)')
             progress.begin('loading', 'Loading outer shell')
             shell_patch = load_tifxyz(self.shell_path)
+        elif self.tracks_dbm_path and self.shell_path:
+            print(f'no outer shell at {self.shell_path}; tracks will not be '
+                  'filtered to the outer shell')
 
         use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
         use_unverified_patches = bool(self.unverified_patches_path) and not self.config['input_disable_patches']
