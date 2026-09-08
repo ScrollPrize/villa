@@ -1,5 +1,8 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
@@ -125,6 +128,40 @@ fs::path ensureDirectory(fs::path path)
             "Cannot create remote cache directory '" + pathToUtf8(path) + "': " +
             (ec ? ec.message() : "path is not a directory"));
     }
+
+    return path;
+}
+
+fs::path ensureWritableDirectory(fs::path path)
+{
+    path = ensureDirectory(std::move(path));
+
+    static std::atomic<std::uint64_t> probeSequence{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path probe = path / (
+        ".vc3d-write-probe-" + std::to_string(stamp) + "-" +
+        std::to_string(probeSequence.fetch_add(1, std::memory_order_relaxed)));
+
+    {
+        std::ofstream output(probe, std::ios::binary | std::ios::trunc);
+        output.put('\0');
+        output.close();
+        if (!output) {
+            std::error_code cleanupEc;
+            fs::remove(probe, cleanupEc);
+            throw std::runtime_error(
+                "Remote cache directory '" + pathToUtf8(path) +
+                "' is not writable by this user");
+        }
+    }
+
+    std::error_code ec;
+    fs::remove(probe, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "Cannot remove write probe from remote cache directory '" +
+            pathToUtf8(path) + "': " + ec.message());
+    }
     return path;
 }
 
@@ -151,7 +188,7 @@ fs::path remoteCachePath()
     static const fs::path active = [] {
         if (auto configured = configuredRemoteCachePath(settingsFilePath());
             !configured.empty()) {
-            return ensureDirectory(std::move(configured));
+            return ensureWritableDirectory(std::move(configured));
         }
 
         for (const fs::path root : {fs::path("/volpkgs"), fs::path("/ephemeral")}) {
@@ -162,10 +199,10 @@ fs::path remoteCachePath()
                 throw std::runtime_error(
                     "Remote cache root '" + root.string() + "' is not a directory");
             }
-            return ensureDirectory(root / "remote_cache");
+            return ensureWritableDirectory(root / "remote_cache");
         }
 
-        return ensureDirectory(homeDirectory() / ".VC3D" / "remote_cache");
+        return ensureWritableDirectory(homeDirectory() / ".VC3D" / "remote_cache");
     }();
     return active;
 }
