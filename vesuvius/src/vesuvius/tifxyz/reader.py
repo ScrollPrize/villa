@@ -63,6 +63,33 @@ class TifxyzInfo:
         return read_tifxyz(self.path, **kwargs)
 
 
+def _bbox_carries_missing_marker(bbox: Tuple[float, ...]) -> bool:
+    """True if any bbox component is exactly the tifxyz missing-point marker."""
+    return any(float(v) == -1.0 for v in bbox)
+
+
+def _bbox_from_arrays(
+    x: np.ndarray, y: np.ndarray, z: np.ndarray, valid: np.ndarray
+) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """(x_min, y_min, z_min, x_max, y_max, z_max) over the valid points, or None if there are none."""
+    if not np.any(valid):
+        return None
+    return (
+        float(x[valid].min()), float(y[valid].min()), float(z[valid].min()),
+        float(x[valid].max()), float(y[valid].max()), float(z[valid].max()),
+    )
+
+
+def _bbox_from_valid_points(
+    reader: "TifxyzReader",
+) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Read the three grids and take the extent of points that are not the -1 marker."""
+    x = reader.read_coordinate("x")
+    y = reader.read_coordinate("y")
+    z = reader.read_coordinate("z")
+    return _bbox_from_arrays(x, y, z, (x != -1) & (y != -1) & (z != -1))
+
+
 def list_tifxyz(
     folder: Union[str, Path],
     *,
@@ -118,11 +145,25 @@ def list_tifxyz(
         try:
             reader = TifxyzReader(segment_dir)
             meta = reader.read_metadata()
-
+            bbox = meta["bbox"]
+            if bbox is not None and _bbox_carries_missing_marker(bbox):
+                # The stored bbox was computed over the raw grid and inherited the
+                # tifxyz missing-point marker (-1) as a minimum. 28 published
+                # PHercParis4 surfaces ship this way (villa issue #1618). Taken at
+                # face value it makes z_min = -1, so the surface passes every z_range
+                # filter whose upper bound is above -1, whatever its real extent.
+                # Recompute from the valid points instead; for the published
+                # uncompressed float32 grids this is a memmap scan, ~0.1 s, no disk.
+                bbox = _bbox_from_valid_points(reader)
+                logger.warning(
+                    "%s: meta.json bbox contains the -1 missing-point marker; "
+                    "using the extent of the valid coordinates instead",
+                    segment_dir,
+                )
             info = TifxyzInfo(
                 path=segment_dir,
                 scale=meta["scale"],
-                bbox=meta["bbox"],
+                bbox=bbox,
                 uuid=meta["uuid"],
             )
 
@@ -591,13 +632,25 @@ class TifxyzReader:
             validate_shapes=discover_label_shapes,
         )
 
+        bbox = meta["bbox"]
+        if bbox is not None and _bbox_carries_missing_marker(bbox):
+            # Same defect list_tifxyz guards against (villa #1618); here the grids are
+            # already in hand, so the extent of the valid points costs nothing extra.
+            # Downstream, neural_tracing's _segment_z_bounds prefers seg.bbox when it
+            # is not None, so a -1 floor here would pass every z_range there too.
+            bbox = _bbox_from_arrays(x, y, z, mask)
+            logger.warning(
+                "%s: meta.json bbox contains the -1 missing-point marker; "
+                "using the extent of the valid coordinates instead",
+                self.path,
+            )
         return Tifxyz(
             _x=x,
             _y=y,
             _z=z,
             uuid=meta["uuid"],
             _scale=meta["scale"],
-            bbox=meta["bbox"],
+            bbox=bbox,
             area=meta["area"],
             extra=meta["extra"],
             _mask=mask,
