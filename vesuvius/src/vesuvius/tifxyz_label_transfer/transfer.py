@@ -20,7 +20,9 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 from .core import (
     AffineChoice,
+    automatic_max_distance,
     choose_affine_direction,
+    DEFAULT_MAX_SEAM_DISTANCE,
     estimate_surface_spacing,
     infer_output_shape,
     load_affine,
@@ -39,6 +41,10 @@ from .io import (
 from .native import resolve_rasterizer
 from .planar import transfer_array_planar
 
+# Preflight worst-distance-to-radius ratio above which the surface pair is
+# flagged as genuinely disagreeing (see _mapping_preflight).
+MESH_DISAGREEMENT_RATIO = 10.0
+
 
 def _distance_arg(value: str) -> Optional[float]:
     if value.lower() == "auto":
@@ -47,6 +53,15 @@ def _distance_arg(value: str) -> Optional[float]:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(
             "distance must be a positive number or 'auto'"
+        )
+    return parsed
+
+
+def _seam_distance_arg(value: str) -> float:
+    parsed = float(value)
+    if math.isnan(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "maximum seam distance must be positive, or 'inf' for unbounded"
         )
     return parsed
 
@@ -133,15 +148,35 @@ def _choose_affine(args, source, target) -> AffineChoice:
 def _resolve_max_distance(
     requested: Optional[float], source, target, affine: np.ndarray
 ) -> tuple[float, dict]:
+    """Pick the rejection radius from the target's own sampling pitch.
+
+    See :func:`core.automatic_max_distance` for why only the target's
+    spacing enters. The one direction that rule does not cover is a source
+    much coarser than its target: the point-to-triangle distance then
+    includes the coarse triangulation's chordal error, which the
+    target-keyed radius knows nothing about, so that asymmetry is flagged
+    and warned rather than silently accepted.
+    """
+
     source_spacing = estimate_surface_spacing(source, affine)
     target_spacing = estimate_surface_spacing(target)
-    automatic = max(1e-3, 0.75 * min(source_spacing, target_spacing))
+    automatic = automatic_max_distance(target)
+    source_coarser = bool(source_spacing > 1.5 * target_spacing)
+    if requested is None and source_coarser:
+        print(
+            f"WARNING: source spacing {source_spacing:.4g} is coarser than "
+            f"target spacing {target_spacing:.4g}; the automatic radius "
+            f"{automatic:.4g} does not cover the coarse source "
+            "triangulation's chordal error and may reject valid "
+            "correspondences. Consider an explicit --max-distance."
+        )
     return (
         automatic if requested is None else requested,
         {
             "source_spacing_in_target_coordinates": source_spacing,
             "target_spacing": target_spacing,
             "automatic_max_distance": automatic,
+            "source_coarser_than_target": source_coarser,
         },
     )
 
@@ -154,7 +189,6 @@ def _mapping_preflight(
     *,
     nearest_vertices: int,
     sample_limit: int,
-    vertex_index: str = "kdtree",
 ) -> dict:
     """Sample exact point-to-triangle coverage before allocating outputs."""
 
@@ -177,12 +211,15 @@ def _mapping_preflight(
             target.z.ravel()[target_indices],
         )
     )
+    # The grid index only guarantees neighbors within the matching radius,
+    # so it would hide exactly the far distances this preflight exists to
+    # measure (the mesh-disagreement signal). Always sample with the
+    # KD-tree, whatever index the transfer itself uses.
     mapper = SurfaceMapper(
         source,
         affine=affine,
         nearest_vertices=nearest_vertices,
-        vertex_index=vertex_index,
-        index_max_distance=max_distance,
+        vertex_index="kdtree",
     )
     _, _, _, distances = mapper.locate(
         target_points,
@@ -198,11 +235,34 @@ def _mapping_preflight(
         "distance_p50": None,
         "distance_p95": None,
         "distance_max": None,
+        "distance_max_over_max_distance": None,
+        "suspected_mesh_disagreement": False,
     }
     if finite.size:
         report["distance_p50"] = float(np.percentile(finite, 50))
         report["distance_p95"] = float(np.percentile(finite, 95))
         report["distance_max"] = float(finite.max())
+        # Target regions the source surface genuinely does not cover put
+        # sampled vertices tens of radii away from any source triangle; a
+        # healthy pair stays within a few radii even at its worst vertex.
+        # The ratio is scale-free, so it transfers across scrolls. On the
+        # measured corpus the one disagreeing segment scored ~71, every
+        # healthy segment at most ~3.
+        ratio = report["distance_max"] / float(max_distance)
+        report["distance_max_over_max_distance"] = float(ratio)
+        report["suspected_mesh_disagreement"] = bool(
+            ratio >= MESH_DISAGREEMENT_RATIO
+        )
+    if report["suspected_mesh_disagreement"]:
+        print(
+            "WARNING: preflight worst point-to-triangle distance "
+            f"{report['distance_max']:.4g} is "
+            f"{report['distance_max_over_max_distance']:.0f}x the matching "
+            f"radius {float(max_distance):.4g}. The target mesh likely "
+            "covers surface the source mesh does not (re-flattened or "
+            "extended segment); seam fill there fabricates annotation. "
+            "Prefer re-annotating on the current mesh."
+        )
     return report
 
 
@@ -384,7 +444,16 @@ def run_single(args, stage_name: str = "transfer") -> dict:
         if args.report_output is not None
         else sidecar_path(output_path, "report", ".json")
     )
+    fill_seams_requested = bool(getattr(args, "fill_seams", False))
+    seam_anchor_mode = getattr(args, "seam_anchor", "matched")
+    seam_anchor_path = (
+        sidecar_path(output_path, "seam_anchor", ".tif")
+        if fill_seams_requested and not planar
+        else None
+    )
     all_outputs = [output_path, valid_path, report_path]
+    if seam_anchor_path is not None:
+        all_outputs.append(seam_anchor_path)
     additional_paths = []
     for additional_source, additional_output in additional_specs:
         additional_valid = sidecar_path(additional_output, "valid", ".tif")
@@ -502,7 +571,14 @@ def run_single(args, stage_name: str = "transfer") -> dict:
         "query_batch_size": args.query_batch_size,
         "fill_value": args.fill_value,
         "planar": planar,
-        "fill_seams": bool(getattr(args, "fill_seams", False)),
+        "fill_seams": fill_seams_requested,
+        "max_seam_distance": float(
+            getattr(args, "max_seam_distance", DEFAULT_MAX_SEAM_DISTANCE)
+        ),
+        "seam_anchor": seam_anchor_mode,
+        "seam_anchor_distance_output": (
+            str(seam_anchor_path) if seam_anchor_path is not None else None
+        ),
         "workers": getattr(args, "workers", None),
         "uv_cache": uv_cache_path,
     }
@@ -528,7 +604,6 @@ def run_single(args, stage_name: str = "transfer") -> dict:
         max_distance,
         nearest_vertices=args.nearest_vertices,
         sample_limit=preflight_sample_points,
-        vertex_index=getattr(args, "vertex_index", "kdtree"),
     )
     report["preflight_mapping"] = preflight
     print(
@@ -655,6 +730,11 @@ def run_single(args, stage_name: str = "transfer") -> dict:
                 f"{mapping_report['fit_inliers']} inliers"
             )
         else:
+            seam_anchor_grid = (
+                np.zeros(target.shape, dtype=np.float32)
+                if seam_anchor_path is not None
+                else None
+            )
             _, _, _, stats = transfer_array(
                 source,
                 target,
@@ -666,7 +746,12 @@ def run_single(args, stage_name: str = "transfer") -> dict:
                 max_distance=max_distance,
                 nearest_vertices=args.nearest_vertices,
                 vertex_index=getattr(args, "vertex_index", "kdtree"),
-                fill_seams=getattr(args, "fill_seams", False),
+                fill_seams=fill_seams_requested,
+                max_seam_distance=getattr(
+                    args, "max_seam_distance", DEFAULT_MAX_SEAM_DISTANCE
+                ),
+                seam_anchor=seam_anchor_mode,
+                seam_anchor_distance_output=seam_anchor_grid,
                 workers=getattr(args, "workers", None),
                 uv_cache=uv_cache_path,
                 tile_size=args.tile_size,
@@ -717,6 +802,11 @@ def run_single(args, stage_name: str = "transfer") -> dict:
         if distance_path is not None and distance_array is not None:
             print(f"Writing mapping distances: {distance_path}")
             write_image(distance_path, distance_array)
+        if seam_anchor_path is not None:
+            # Stored-grid resolution, so re-thresholding a seam policy later
+            # is a cheap raster operation instead of a transfer re-run.
+            print(f"Writing seam anchor distances: {seam_anchor_path}")
+            write_image(seam_anchor_path, seam_anchor_grid)
 
     report["mapping"] = mapping_report
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -788,6 +878,10 @@ def _single_namespace_from_pipeline(
         nearest_vertices=args.nearest_vertices,
         vertex_index=getattr(args, "vertex_index", "kdtree"),
         fill_seams=getattr(args, "fill_seams", False),
+        max_seam_distance=getattr(
+            args, "max_seam_distance", DEFAULT_MAX_SEAM_DISTANCE
+        ),
+        seam_anchor=getattr(args, "seam_anchor", "matched"),
         workers=getattr(args, "workers", None),
         uv_cache=getattr(args, "uv_cache", None),
         tile_size=args.tile_size,
@@ -834,6 +928,13 @@ def run_pipeline(args) -> dict:
                     sidecar_path(value, "report", ".json"),
                 ]
             )
+    if getattr(args, "fill_seams", False):
+        pipeline_outputs.extend(
+            [
+                sidecar_path(intermediate, "seam_anchor", ".tif"),
+                sidecar_path(final_output, "seam_anchor", ".tif"),
+            ]
+        )
     canonical_outputs = [
         path.expanduser().resolve(strict=False) for path in pipeline_outputs
     ]
@@ -907,7 +1008,6 @@ def run_pipeline(args) -> dict:
             final_distance,
             nearest_vertices=args.nearest_vertices,
             sample_limit=getattr(args, "preflight_sample_points", 4096),
-            vertex_index=getattr(args, "vertex_index", "kdtree"),
         )
         _enforce_mapping_coverage(
             stage_name="updated-to-target",
@@ -981,6 +1081,34 @@ def _add_common_transfer_arguments(parser: argparse.ArgumentParser) -> None:
             "UV field across the gaps; filled pixels get validity 128 "
             "instead of 255 so measured and interpolated stay "
             "distinguishable"
+        ),
+    )
+    parser.add_argument(
+        "--max-seam-distance",
+        type=_seam_distance_arg,
+        default=DEFAULT_MAX_SEAM_DISTANCE,
+        help=(
+            "how far --fill-seams may continue the UV field from a measured "
+            "vertex, in target vertices (default: "
+            f"{DEFAULT_MAX_SEAM_DISTANCE:g}). Filling a gap that measured "
+            "data surrounds needs a few vertices; continuing onto surface "
+            "the source mesh does not cover runs to hundreds, and samples "
+            "the source annotation at unrelated positions. Pass 'inf' for "
+            "the unbounded fill"
+        ),
+    )
+    parser.add_argument(
+        "--seam-anchor",
+        choices=("matched", "content"),
+        default="matched",
+        help=(
+            "what --max-seam-distance measures distance from: 'matched' "
+            "(default) uses every measured vertex and caps runaway "
+            "extrapolation; 'content' uses only measured vertices that "
+            "sampled nonzero annotation, so fill may only extend "
+            "annotation near where annotation was actually measured — the "
+            "criterion that keeps fill near measured annotation and so "
+            "rejects most leakage from a disagreeing mesh"
         ),
     )
     parser.add_argument(

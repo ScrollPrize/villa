@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from .core import (
     Surface,
     SurfaceMapper,
-    estimate_surface_spacing,
+    automatic_max_distance,
     infer_output_shape,
 )
 
@@ -47,9 +47,7 @@ def fit_planar_label_transform(
         np.eye(4, dtype=np.float64) if affine is None else affine
     )
     if max_distance is None:
-        source_spacing = estimate_surface_spacing(source, effective_affine)
-        target_spacing = estimate_surface_spacing(target)
-        max_distance = max(1e-3, 0.75 * min(source_spacing, target_spacing))
+        max_distance = automatic_max_distance(target)
     if not math.isfinite(max_distance) or max_distance <= 0:
         raise ValueError(f"max_distance must be positive; got {max_distance}")
     if sample_vertices < 3:

@@ -36,6 +36,12 @@ from scipy.spatial import cKDTree
 FloatArray = NDArray[np.floating]
 BoolArray = NDArray[np.bool_]
 
+# How far --fill-seams may continue the UV field from a measured vertex,
+# in target vertices. Legitimate gap filling stays within roughly fifteen;
+# a continuation onto surface the source mesh never covered runs to
+# hundreds. Anything inside that gap behaves identically.
+DEFAULT_MAX_SEAM_DISTANCE = 25.0
+
 
 def _positive_lround(value: float) -> int:
     """Match C++ std::lround for a known-positive value."""
@@ -184,6 +190,7 @@ class MappingStats:
     target_surface_valid: int = 0
     mapped_pixels: int = 0
     seam_filled_pixels: int = 0
+    seam_blocked_pixels: int = 0
     inherited_filled_pixels: int = 0
     distance_sum: float = 0.0
     distance_min: float = math.inf
@@ -238,6 +245,7 @@ class MappingStats:
             "target_surface_valid_pixels": self.target_surface_valid,
             "mapped_pixels": self.mapped_pixels,
             "seam_filled_pixels": self.seam_filled_pixels,
+            "seam_blocked_pixels": self.seam_blocked_pixels,
             "inherited_filled_pixels": self.inherited_filled_pixels,
             "mapping_coverage": coverage,
             "distance_mean": (
@@ -531,6 +539,26 @@ def estimate_surface_spacing(
     if not distances:
         raise ValueError(f"cannot estimate spacing for surface {surface.name!r}")
     return float(np.median(np.concatenate(distances)))
+
+
+def automatic_max_distance(target: Surface) -> float:
+    """Rejection radius from the target's own sampling pitch.
+
+    ``locate`` measures point-to-triangle distance against the source's
+    triangulated quads, so what the radius has to tolerate is how far a
+    target pixel may sit from the source *surface* — dominated by the
+    target-side interpolation and by genuine mesh disagreement, not by how
+    finely the source happens to be tessellated. A denser source
+    approximates the same surface better, so the source's spacing does not
+    enter: keying the radius to whichever side is denser only punishes the
+    pair for the source's resolution (a source sampled twice as finely as
+    its target halved the radius and rejected correspondences that were
+    never in doubt). The converse — a source much coarser than its target —
+    adds chordal error from the coarse triangulation; callers should warn
+    and prefer an explicit radius there.
+    """
+
+    return max(1e-3, 0.75 * estimate_surface_spacing(target))
 
 
 def _maximum_edge_length(
@@ -1269,14 +1297,25 @@ def _fill_uv_field(
     cols: NDArray[np.float32],
     valid: BoolArray,
     smoothing_iterations: int = 64,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], BoolArray]:
+) -> Tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    BoolArray,
+    NDArray[np.float64],
+]:
     """Complete an incomplete target→source UV field across its gaps.
 
     Invalid vertices first take the value of their nearest valid vertex,
     then Jacobi relaxation on the invalid set only turns that
     piecewise-constant fill into a smooth continuation of the measured
-    field. Valid vertices are never modified. Returns float64 fields and
-    the mask of vertices that were filled.
+    field. Valid vertices are never modified. Returns float64 fields, the
+    mask of vertices that were filled, and each vertex's distance in grid
+    cells to the nearest measured vertex (zero where measured).
+
+    That distance says how far a filled value has been extrapolated from
+    anything actually observed, which is the only thing separating a small
+    interpolated gap from a continuation into surface the source mesh does
+    not cover at all. Callers bound the fill with it.
     """
 
     import scipy.ndimage
@@ -1288,10 +1327,16 @@ def _fill_uv_field(
     filled_rows = np.asarray(rows, dtype=np.float64).copy()
     filled_cols = np.asarray(cols, dtype=np.float64).copy()
     if not fill_mask.any():
-        return filled_rows, filled_cols, fill_mask
-    nearest = scipy.ndimage.distance_transform_edt(
-        fill_mask, return_distances=False, return_indices=True
+        return (
+            filled_rows,
+            filled_cols,
+            fill_mask,
+            np.zeros(valid.shape, dtype=np.float64),
+        )
+    anchor_distance, nearest = scipy.ndimage.distance_transform_edt(
+        fill_mask, return_distances=True, return_indices=True
     )
+    anchor_distance = np.asarray(anchor_distance, dtype=np.float64)
     filled_rows = filled_rows[tuple(nearest)]
     filled_cols = filled_cols[tuple(nearest)]
     for _ in range(max(0, smoothing_iterations)):
@@ -1304,7 +1349,69 @@ def _fill_uv_field(
                 + padded[1:-1, 2:]
             )
             field[fill_mask] = neighbours[fill_mask]
-    return filled_rows, filled_cols, fill_mask
+    return filled_rows, filled_cols, fill_mask, anchor_distance
+
+
+def _content_anchor_distance(
+    rows: NDArray[np.float32],
+    cols: NDArray[np.float32],
+    valid: BoolArray,
+    labels: Sequence[NDArray],
+    label_validity: Optional[BoolArray],
+    source_shape: Tuple[int, int],
+    label_shape: Tuple[int, int],
+    label_offset_yx: Tuple[float, float],
+) -> NDArray[np.float64]:
+    """Distance in grid cells to the nearest matched vertex holding annotation.
+
+    ``_fill_uv_field`` measures extrapolation from *any* measured vertex.
+    That bounds runaway continuation, but where a disagreeing target region
+    begins right beside well-matched geometry the first wrongly-continued
+    vertices sit as close to a measured anchor as legitimate gap fill does,
+    so no threshold on that distance separates them. What does separate
+    them is distance to measured annotation: leakage extends annotation far
+    from anywhere annotation was actually observed. This anchors the same
+    EDT on matched vertices whose sampled source value is nonzero instead.
+    With no annotated vertex anywhere the field is infinite and every fill
+    is blocked — there is nothing measured to extend.
+    """
+
+    import scipy.ndimage
+
+    valid = np.asarray(valid, dtype=bool)
+    source_height, source_width = source_shape
+    label_height, label_width = label_shape
+    # NaNs at invalid vertices would trip the integer cast; the mask below
+    # discards them either way.
+    safe_rows = np.where(valid, np.asarray(rows, dtype=np.float64), 0.0)
+    safe_cols = np.where(valid, np.asarray(cols, dtype=np.float64), 0.0)
+    label_rows = np.floor(
+        safe_rows * label_height / source_height - label_offset_yx[0]
+    ).astype(np.int64)
+    label_cols = np.floor(
+        safe_cols * label_width / source_width - label_offset_yx[1]
+    ).astype(np.int64)
+    in_range = (
+        valid
+        & (label_rows >= 0)
+        & (label_rows < label_height)
+        & (label_cols >= 0)
+        & (label_cols < label_width)
+    )
+    sample_rows = label_rows[in_range]
+    sample_cols = label_cols[in_range]
+    content = np.zeros(sample_rows.shape, dtype=bool)
+    for item in labels:
+        content |= np.asarray(item)[sample_rows, sample_cols] != 0
+    if label_validity is not None:
+        content &= label_validity[sample_rows, sample_cols]
+    anchor = np.zeros(valid.shape, dtype=bool)
+    anchor[in_range] = content
+    if not anchor.any():
+        return np.full(valid.shape, np.inf, dtype=np.float64)
+    return np.asarray(
+        scipy.ndimage.distance_transform_edt(~anchor), dtype=np.float64
+    )
 
 
 def transfer_array(
@@ -1326,6 +1433,9 @@ def transfer_array(
     label_offset_yx: Tuple[float, float] = (0.0, 0.0),
     vertex_index: str = "kdtree",
     fill_seams: bool = False,
+    max_seam_distance: float = DEFAULT_MAX_SEAM_DISTANCE,
+    seam_anchor: str = "matched",
+    seam_anchor_distance_output: Optional[NDArray[np.float32]] = None,
     workers: Optional[int] = None,
     uv_cache: Optional[str | Path] = None,
     additional_source_labels: Optional[Sequence[NDArray]] = None,
@@ -1372,6 +1482,25 @@ def transfer_array(
     measured UV field across the gaps. Filled pixels are written with
     validity value 128 instead of 255 so downstream consumers can always
     tell measured from interpolated.
+
+    ``max_seam_distance`` bounds that fill to pixels within the given number
+    of target vertices of an anchor. Without a bound the continued field
+    runs arbitrarily far, and where the target mesh covers surface the
+    source mesh does not, it samples the source annotation at unrelated
+    positions and paints it on. Pass ``math.inf`` to disable the bound.
+
+    ``seam_anchor`` selects what counts as an anchor. ``"matched"`` (the
+    default) anchors on every measured vertex; it caps runaway
+    extrapolation but cannot reject wrong continuation that starts right
+    beside well-matched geometry. ``"content"`` anchors only on measured
+    vertices whose sampled source value is nonzero (any label in the pass),
+    so fill may only extend annotation near where annotation was actually
+    measured — the criterion that separates seam filling from leakage.
+
+    ``seam_anchor_distance_output``, if provided, must be a float32 array
+    of the target stored-grid shape; it receives the anchor-distance field
+    the seam gate used (in grid cells), so downstream policies can be
+    re-thresholded without re-running the transfer.
 
     If ``materialize_output`` is false, no full-resolution result arrays are
     allocated. Instead, ``tile_callback`` receives each completed tile in
@@ -1470,9 +1599,7 @@ def transfer_array(
         np.eye(4, dtype=np.float64) if affine is None else affine
     )
     if max_distance is None:
-        source_spacing = estimate_surface_spacing(source, effective_affine)
-        target_spacing = estimate_surface_spacing(target)
-        max_distance = max(1e-3, 0.75 * min(source_spacing, target_spacing))
+        max_distance = automatic_max_distance(target)
     if not math.isfinite(max_distance) or max_distance <= 0:
         raise ValueError(f"max_distance must be positive; got {max_distance}")
 
@@ -1562,11 +1689,55 @@ def transfer_array(
     filled_uv_rows: Optional[NDArray[np.float64]] = None
     filled_uv_cols: Optional[NDArray[np.float64]] = None
     filled_uv_valid: Optional[BoolArray] = None
-    if fill_seams:
-        filled_uv_rows, filled_uv_cols, _ = _fill_uv_field(
-            uv_rows, uv_cols, uv_valid
+    filled_uv_anchor_distance: Optional[NDArray[np.float64]] = None
+    seam_limit = float(max_seam_distance)
+    if not seam_limit > 0.0:
+        raise ValueError(
+            f"max_seam_distance must be positive; got {max_seam_distance}"
         )
+    if seam_anchor not in ("matched", "content"):
+        raise ValueError(
+            f"seam_anchor must be 'matched' or 'content'; got {seam_anchor!r}"
+        )
+    if seam_anchor_distance_output is not None:
+        if not fill_seams:
+            raise ValueError(
+                "seam_anchor_distance_output requires fill_seams"
+            )
+        if seam_anchor_distance_output.dtype != np.float32:
+            raise ValueError(
+                "seam_anchor_distance_output must be float32; got "
+                f"{seam_anchor_distance_output.dtype}"
+            )
+        if seam_anchor_distance_output.shape != uv_valid.shape:
+            raise ValueError(
+                "seam_anchor_distance_output must match the target stored "
+                f"grid shape {uv_valid.shape}; got "
+                f"{seam_anchor_distance_output.shape}"
+            )
+    if fill_seams:
+        (
+            filled_uv_rows,
+            filled_uv_cols,
+            _,
+            anchor_distance,
+        ) = _fill_uv_field(uv_rows, uv_cols, uv_valid)
+        if seam_anchor == "content":
+            anchor_distance = _content_anchor_distance(
+                uv_rows,
+                uv_cols,
+                uv_valid,
+                all_labels,
+                propagated_validity,
+                (source_height, source_width),
+                (label_height, label_width),
+                label_offset_yx,
+            )
         filled_uv_valid = np.ones_like(uv_valid)
+        if math.isfinite(seam_limit):
+            filled_uv_anchor_distance = anchor_distance
+        if seam_anchor_distance_output is not None:
+            seam_anchor_distance_output[...] = anchor_distance
 
     from .native import NativeRasterizer, resolve_rasterizer
 
@@ -1588,6 +1759,8 @@ def transfer_array(
             max_distance=max_distance,
             filled_uv_rows=filled_uv_rows,
             filled_uv_cols=filled_uv_cols,
+            filled_uv_anchor_distance=filled_uv_anchor_distance,
+            max_seam_distance=seam_limit,
             source_validity=source_validity_values,
         )
     )
@@ -1603,6 +1776,7 @@ def transfer_array(
         int,
         int,
         NDArray[np.float64],
+        int,
         int,
         int,
         Tuple[int, int, int, int],
@@ -1661,6 +1835,7 @@ def transfer_array(
                 native.target_surface_valid,
                 native.distances[measured],
                 native.seam_filled_pixels,
+                native.seam_blocked_pixels,
                 native.inherited_filled_pixels,
                 tile,
                 tile_labels if not materialize_output else None,
@@ -1809,6 +1984,7 @@ def transfer_array(
                 ]
 
         seam_filled_count = 0
+        seam_blocked_count = 0
         if fill_seams:
             assert filled_uv_rows is not None
             assert filled_uv_cols is not None
@@ -1832,6 +2008,19 @@ def transfer_array(
                 col_end,
             )
             seam_mask = target_pixel_valid & (tile_valid == 0)
+            if filled_uv_anchor_distance is not None:
+                seam_anchor_distance, _ = bilinear_field_tile(
+                    filled_uv_anchor_distance,
+                    filled_uv_valid,
+                    resolved_shape,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                )
+                within_limit = seam_anchor_distance <= seam_limit
+                seam_blocked_count = int((seam_mask & ~within_limit).sum())
+                seam_mask &= within_limit
             seam_pixel_rows, seam_pixel_cols = np.nonzero(seam_mask)
             if seam_pixel_rows.size:
                 seam_label_rows = np.floor(
@@ -1878,6 +2067,7 @@ def transfer_array(
             int(target_pixel_valid.sum()),
             distances[accepted_rows, accepted_cols],
             seam_filled_count,
+            seam_blocked_count,
             inherited_count,
             tile,
             tile_labels if not materialize_output else None,
@@ -1893,6 +2083,7 @@ def transfer_array(
             NDArray[np.float64],
             int,
             int,
+            int,
             Tuple[int, int, int, int],
             Optional[list[NDArray]],
             Optional[NDArray[np.uint8]],
@@ -1904,6 +2095,7 @@ def transfer_array(
             target_surface_valid,
             tile_distances,
             seams,
+            blocked,
             inherited,
             tile_bounds,
             streamed_labels,
@@ -1915,6 +2107,7 @@ def transfer_array(
             distances=tile_distances,
         )
         stats.seam_filled_pixels += seams
+        stats.seam_blocked_pixels += blocked
         stats.inherited_filled_pixels += inherited
         if tile_callback is not None:
             if streamed_labels is None or streamed_validity is None:
