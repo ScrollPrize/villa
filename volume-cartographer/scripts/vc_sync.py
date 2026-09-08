@@ -26,6 +26,15 @@ prunes entries for files gone from both sides) and never hides a pending
 difference. 'reset' stamps the current state as the synced baseline, which
 discards pending differences — it asks for confirmation.
 
+Conflict resolution: a conflict whose content cannot be merged three-way is
+put to the user first ([l]ocal / [r]emote / [s]kip). Auto-merges of linked
+fibers are then planned against the decided world, so a decided root
+un-blocks its dependents in the same run and only skipped files cascade to
+the files that depend on them. A dropped link to a peer that will not exist
+after the sync (deleted on both sides, or pending local deletion) needs no
+reciprocal fix and no longer forces manual resolution. --dry-run previews
+content-merge eligibility only; link consistency is assessed in a real run.
+
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
     python s3_sync.py status <directory> [--verbose] [--sync-backups]
@@ -178,7 +187,8 @@ class SyncAction(Enum):
     DELETE_REMOTE = "delete_remote"
 
 
-PlanResult = namedtuple('PlanResult', 'pending peer_fixes manual resolved')
+PlanResult = namedtuple('PlanResult',
+                        'pending peer_fixes manual resolved stats')
 
 
 def is_backup_file(filename):
@@ -745,23 +755,28 @@ class S3SyncManager:
         {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
         to apply with _apply_pending_merges() AFTER the user confirms the
         sync (or discard with _discard_pending_merges() on cancellation).
-        Returns a preview string in dry-run mode, or None when the file is
-        not eligible, no base is available, or the merge has genuine
-        conflicts (all three versions are stashed in that case and the
-        caller falls back to the interactive prompt).
+        Returns None when the file is not eligible, no base is available,
+        or the merge has genuine conflicts (all three versions are stashed
+        in that case and the caller falls back to the interactive prompt).
+        In dry-run mode nothing is stashed and the return is a dict:
+        {'summary', 'merged_doc', 'base_doc', 'peer_files'} for a clean
+        content merge (link consistency is NOT assessed), or {'reason'}.
         """
+        def fail(reason):
+            return {'reason': reason} if dry_run else None
+
         if fiber_merge is None or not local_info or not s3_info:
-            return None
+            return fail("merge support unavailable")
         if not self._should_hash(path, local_info.get('local_size')):
-            return None
+            return fail("not an annotation-sized file")
         local_path = os.path.join(self.local_dir, path)
         try:
             with open(local_path) as f:
                 local_doc = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return None
+            return fail("local file unreadable")
         if not fiber_merge.is_fiber_doc(local_doc):
-            return None
+            return fail("not a fiber document")
 
         with self._get_db() as conn:
             row = conn.execute('SELECT * FROM files WHERE path = ?',
@@ -771,7 +786,7 @@ class S3SyncManager:
         if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
             if not dry_run:
                 print(f"  (no merge base available for {path})")
-            return None
+            return fail("no merge base")
 
         remote_doc, remote_tmp = self._fetch_remote_json(path)
         if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
@@ -780,7 +795,7 @@ class S3SyncManager:
                     os.remove(remote_tmp)
                 except OSError:
                     pass
-            return None
+            return fail("remote copy unreadable")
 
         keep_remote_tmp = False
         try:
@@ -792,10 +807,14 @@ class S3SyncManager:
                 print(f"  ⚠️  merge failed for {path} "
                       f"({ex}{_exception_location(ex)}); manual resolution")
                 _print_debug_traceback()
-                return None
+                return fail("merger error")
             summary = fiber_merge.summarize(result)
             if dry_run:
-                return f"would auto-merge ({summary})" if result['ok'] else None
+                if not result['ok']:
+                    return fail("content conflict: " + '; '.join(result['conflicts']))
+                return {'summary': summary, 'merged_doc': result['merged'],
+                        'base_doc': base_doc,
+                        'peer_files': result.get('peer_files', [])}
 
             if not result['ok']:
                 print(f"  ✗ cannot auto-merge {path}:")
@@ -1127,11 +1146,15 @@ class S3SyncManager:
         acts as a blocker from that moment — today's eager fixpoint, with
         identical membership, order and reasons.
 
-        Returns PlanResult(pending, peer_fixes, manual, resolved):
+        Returns PlanResult(pending, peer_fixes, manual, resolved, stats):
         pending [(path, plan)], peer_fixes {path: doc}, manual
         [(path, reason)] skipped decisions in prompt order (all demotions
         when resolve is None), resolved [(path, UPLOAD|DOWNLOAD)] in prompt
-        order. Every prompted path is in exactly one of manual/resolved.
+        order, stats {merged, content_conflicts, blocked_by_skip,
+        blocked_by_delete, link_state, decisions: {l, r, s}} — demotion
+        classes counted once per merge (skip wins over delete); with
+        resolve=None every manual conflict counts as 's'. Every
+        prompted path is in exactly one of manual/resolved.
         `download_paths` is not modified.
         """
         pending_merges = []
@@ -1144,6 +1167,9 @@ class S3SyncManager:
         delete_local_paths = set(delete_local_paths)
         remote_paths = set(s3_files)
         printed_notes = set()
+        stats = {'merged': 0, 'content_conflicts': 0, 'blocked_by_skip': 0,
+                 'blocked_by_delete': 0, 'link_state': 0,
+                 'decisions': {'l': 0, 'r': 0, 's': 0}}
 
         for path, reason in conflicts:
             plan = None
@@ -1154,6 +1180,7 @@ class S3SyncManager:
                 pending_merges.append((path, plan))
             else:
                 awaiting.append((path, reason))
+        stats['content_conflicts'] = len(awaiting)
 
         def peer_paths(path, plan):
             directory = os.path.dirname(path)
@@ -1194,15 +1221,19 @@ class S3SyncManager:
                 if resolve is None:
                     manual_conflicts.append((path, reason))
                     blockers.add(path)
+                    stats['decisions']['s'] += 1
                     continue
                 action = resolve(path, reason)
                 if action in (SyncAction.UPLOAD, SyncAction.DOWNLOAD):
                     resolved.append((path, action))
                     if action == SyncAction.DOWNLOAD:
                         effective_downloads.add(path)
+                    stats['decisions']['r' if action == SyncAction.DOWNLOAD
+                                       else 'l'] += 1
                 else:
                     manual_conflicts.append((path, reason))
                     blockers.add(path)
+                    stats['decisions']['s'] += 1
 
         peer_fixes = {}
         while pending_merges or awaiting:
@@ -1212,10 +1243,11 @@ class S3SyncManager:
             # awaits a decision, and the loop re-enters stage 1 after it.
             still_pending = []
             for path, plan in pending_merges:
-                blocked = sorted(os.path.basename(p)
-                                 for p in peer_paths(path, plan)
-                                 if blocks(plan, p))
+                blocking = [p for p in peer_paths(path, plan) if blocks(plan, p)]
+                blocked = sorted(os.path.basename(p) for p in blocking)
                 if blocked:
+                    stats['blocked_by_skip' if any(p in blockers for p in blocking)
+                          else 'blocked_by_delete'] += 1
                     demote(path, plan,
                            "linked fiber(s) with unresolved conflicts "
                            "or pending deletion: " + ", ".join(blocked))
@@ -1240,6 +1272,7 @@ class S3SyncManager:
             if not demoted:
                 break
             demoted_reasons = dict(demoted)
+            stats['link_state'] += len(demoted_reasons)
             still_pending = []
             for path, plan in pending_merges:
                 if path in demoted_reasons:
@@ -1248,7 +1281,9 @@ class S3SyncManager:
                     still_pending.append((path, plan))
             pending_merges = still_pending
 
-        return PlanResult(pending_merges, peer_fixes, manual_conflicts, resolved)
+        stats['merged'] = len(pending_merges)
+        return PlanResult(pending_merges, peer_fixes, manual_conflicts, resolved,
+                          stats)
 
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
@@ -2249,14 +2284,23 @@ class S3SyncManager:
                 for path, problem in invalid_uploads:
                     print(f"  {path}: {problem}")
             if conflicts and auto_merge and fiber_merge is not None:
-                print("\nMerge preview for conflicts (fetches remote copies "
-                      "to test-merge; local files are not touched):")
+                print("\nDry-run conflict preview (fetches remote copies to "
+                      "test-merge; local files are not touched; link "
+                      "consistency between fibers is only assessed in a real run):")
+                mergeable = 0
                 for path, reason in conflicts:
                     probe = self._attempt_auto_merge(path,
                                                      local_files.get(path),
                                                      s3_files.get(path),
                                                      dry_run=True)
-                    print(f"  {path}: {probe or 'manual resolution required'}")
+                    if 'summary' in probe:
+                        mergeable += 1
+                        print(f"  {path}: content merge possible ({probe['summary']})")
+                    else:
+                        print(f"  {path}: manual resolution required "
+                              f"({probe['reason']})")
+                print(f"  {mergeable} of {len(conflicts)} conflict(s) are "
+                      "content-merge candidates")
             self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
                                      "Conflicts", len(conflicts))
             print("\n--dry-run mode: No changes will be made")
@@ -2274,6 +2318,14 @@ class S3SyncManager:
             resolve=lambda path, reason: self.resolve_conflict(
                 path, reason, local_files.get(path), s3_files.get(path)))
         pending_merges, peer_fixes = plan.pending, plan.peer_fixes
+        if conflicts:
+            st, dec = plan.stats, plan.stats['decisions']
+            print(f"\nConflicts: {st['merged']} auto-merged, "
+                  f"{st['content_conflicts']} needed a decision, "
+                  f"{st['blocked_by_skip']} blocked by skipped peers, "
+                  f"{st['blocked_by_delete']} blocked by pending deletions, "
+                  f"{st['link_state']} with unresolvable link state; "
+                  f"decisions: {dec['l']} local, {dec['r']} remote, {dec['s']} skipped")
 
         # A decided root that received a reciprocal correction is written
         # and uploaded once as a peer fix: the fix doc embodies the chosen

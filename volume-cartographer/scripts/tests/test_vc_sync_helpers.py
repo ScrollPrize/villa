@@ -469,11 +469,21 @@ class TestAutoMerge:
         outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32),
                                               dry_run=True)
 
-        assert outcome and outcome.startswith('would auto-merge')
+        assert outcome and 'summary' in outcome and 'reason' not in outcome
         assert open(local_path).read() == before
         stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
         stashed = [f for _, _, fs_ in os.walk(stash_root) for f in fs_]
         assert stashed == []  # probing writes nothing
+
+    def test_dry_run_reports_reason_without_base(self, manager):
+        doc = TestLinkConsistency.fiber('n.json', TestLinkConsistency.CPS_A)
+        path = 'fibers/n.json'
+        write_local(manager, path, json.dumps(doc))
+        info = local_info(manager, path)
+        outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1'),
+                                              dry_run=True)
+        assert outcome == {'reason': 'no merge base'}
+        assert manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1')) is None
 
     def test_conflicting_merge_stashes_all_three(self, manager, monkeypatch):
         base = self.fiber([0, 0, 0, 0])
@@ -1485,6 +1495,39 @@ class TestSyncPromptThenPlan:
         after = {p: open(os.path.join(manager.local_dir, p), 'rb').read()
                  for p in ('a.json', 'r.json')}
         assert after == before
+
+
+class TestPlanStats:
+    """PlanResult.stats: demotion classes counted once per merge."""
+
+    def test_incident_stats(self, manager, monkeypatch):
+        tp = TestPromptThenPlan()
+        result, _ = tp.incident(manager, monkeypatch,
+                                {r: SyncAction.DOWNLOAD for r in tp.ROOTS})
+        assert result.stats == {
+            'merged': 8, 'content_conflicts': 3, 'blocked_by_skip': 0,
+            'blocked_by_delete': 0, 'link_state': 0,
+            'decisions': {'l': 0, 'r': 3, 's': 0}}
+        result, _ = tp.incident(manager, monkeypatch, {})
+        assert result.stats['merged'] == 0
+        assert result.stats['blocked_by_skip'] == 8
+        assert result.stats['decisions'] == {'l': 0, 'r': 0, 's': 11}
+
+    def test_skip_wins_over_delete(self, manager, monkeypatch):
+        """A merge blocked by a skipped peer AND a still-linked deleting
+        peer counts once, as blocked_by_skip."""
+        tp = TestPromptThenPlan()
+        plan = tp.plan_for(
+            manager, 'fibers/a.json', ['r.json', 'p.json'],
+            branches=[TestLinkConsistency.entry(
+                'p.json', tp.CPS, 1, TestLinkConsistency.CPS_B, 0)])
+        tp.install(manager, monkeypatch, {'fibers/a.json': plan}, ['fibers/r.json'])
+        result = manager._plan_conflict_resolutions(
+            tp.conflicts('fibers/a.json', 'fibers/r.json'), {}, {}, set(),
+            {'fibers/p.json'}, auto_merge=True)
+        assert result.stats['blocked_by_skip'] == 1
+        assert result.stats['blocked_by_delete'] == 0
+        assert result.stats['link_state'] == 0
 
 
 class TestDeleteLocalSafety:
