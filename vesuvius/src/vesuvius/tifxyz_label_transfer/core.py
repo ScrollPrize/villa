@@ -1,19 +1,17 @@
-"""Core geometry operations for TIFXYZ-to-TIFXYZ label transfer.
+"""Transfer labels between TIFXYZ surfaces using their shared 3D coordinates.
 
-The mapper works in the common 3D volume coordinate system:
+For each target pixel:
+1. Sample its XYZ position on the target surface.
+2. Find the nearest triangle on the source surface.
+3. Use triangle barycentrics to recover source canvas coordinates.
+4. Sample the source label with nearest-neighbour interpolation.
 
-1. Sample each target output pixel on the target TIFXYZ surface.
-2. Find the nearest triangle on the source TIFXYZ surface.
-3. Recover source grid coordinates with triangle barycentrics.
-4. Sample the categorical source label with nearest-neighbour interpolation.
-
-TIFXYZ arrays contain vertices, while ``vc_render_tifxyz`` samples pixel
-centres between them.  The conversion used here mirrors that convention:
+TIFXYZ arrays store vertices; the renderer samples pixel centres between
+vertices. Match that convention with:
 
     grid_coordinate = (pixel_index + 0.5) * stored_size / rendered_size
 
-No render command is required as long as the label covers the complete,
-unrotated and uncropped source canvas.
+Labels must cover the complete, unrotated, uncropped source canvas.
 """
 
 from __future__ import annotations
@@ -35,6 +33,9 @@ from scipy.spatial import cKDTree
 
 FloatArray = NDArray[np.floating]
 BoolArray = NDArray[np.bool_]
+
+# Default seam-fill distance limit, in target vertices.
+DEFAULT_MAX_SEAM_DISTANCE = 25.0
 
 
 def _positive_lround(value: float) -> int:
@@ -184,6 +185,7 @@ class MappingStats:
     target_surface_valid: int = 0
     mapped_pixels: int = 0
     seam_filled_pixels: int = 0
+    seam_blocked_pixels: int = 0
     inherited_filled_pixels: int = 0
     distance_sum: float = 0.0
     distance_min: float = math.inf
@@ -238,6 +240,7 @@ class MappingStats:
             "target_surface_valid_pixels": self.target_surface_valid,
             "mapped_pixels": self.mapped_pixels,
             "seam_filled_pixels": self.seam_filled_pixels,
+            "seam_blocked_pixels": self.seam_blocked_pixels,
             "inherited_filled_pixels": self.inherited_filled_pixels,
             "mapping_coverage": coverage,
             "distance_mean": (
@@ -452,11 +455,8 @@ def infer_output_shape(
         ),
     )
 
-    # Renders are cropped independently of the TIFXYZ canvas, so a label
-    # raster within a fraction of a percent of the source canvas is a
-    # crop/offset of it, not evidence of a different render scale. Snap the
-    # output to the target's native canvas in that case; otherwise a
-    # spurious ~0.1% scale forces every downstream consumer to resample.
+    # Treat near-native dimensions as a crop/offset to avoid introducing
+    # a small scale change that forces downstream resampling.
     native_candidates = (
         (
             max(1, _positive_lround(target_height / target_scale_y)),
@@ -531,6 +531,18 @@ def estimate_surface_spacing(
     if not distances:
         raise ValueError(f"cannot estimate spacing for surface {surface.name!r}")
     return float(np.median(np.concatenate(distances)))
+
+
+def automatic_max_distance(target: Surface) -> float:
+    """Derive the matching radius from target spacing.
+
+    Matching measures distance to source triangles, not source vertices.
+    A denser source describes the surface more accurately; using its smaller
+    spacing would shrink the radius and reject valid target matches.
+    A much coarser source may need an explicit radius for triangulation error.
+    """
+
+    return max(1e-3, 0.75 * estimate_surface_spacing(target))
 
 
 def _maximum_edge_length(
@@ -965,11 +977,7 @@ class SurfaceMapper:
         source_height, source_width = self.source.shape
         assert self.source.valid is not None
 
-        # Each neighbour vertex touches up to four stored-grid quads, and
-        # adjacent neighbours share most of them. Deduplicate the candidate
-        # quads per query and evaluate only distinct (query, quad) pairs;
-        # this replaces k * 4 * 2 full-width triangle passes with roughly
-        # one pass over the distinct quads.
+        # Neighboring vertices share quads; evaluate each (query, quad) pair once.
         neighbor_exists = neighbor_indices < self.valid_flat.size
         safe_neighbors = np.where(neighbor_exists, neighbor_indices, 0)
         flat = self.valid_flat[safe_neighbors]
@@ -1269,14 +1277,18 @@ def _fill_uv_field(
     cols: NDArray[np.float32],
     valid: BoolArray,
     smoothing_iterations: int = 64,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], BoolArray]:
-    """Complete an incomplete target→source UV field across its gaps.
+) -> Tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    BoolArray,
+    NDArray[np.float64],
+]:
+    """Fill UV gaps from nearest valid vertices, then smooth only the gaps.
 
-    Invalid vertices first take the value of their nearest valid vertex,
-    then Jacobi relaxation on the invalid set only turns that
-    piecewise-constant fill into a smooth continuation of the measured
-    field. Valid vertices are never modified. Returns float64 fields and
-    the mask of vertices that were filled.
+    Start each gap at its nearest measured value, then use Jacobi relaxation
+    to smooth the filled region while keeping measured vertices fixed.
+    Returns float64 row/column fields, the filled mask, and distances to
+    measured vertices in grid cells. Callers use distances to limit filling.
     """
 
     import scipy.ndimage
@@ -1288,10 +1300,16 @@ def _fill_uv_field(
     filled_rows = np.asarray(rows, dtype=np.float64).copy()
     filled_cols = np.asarray(cols, dtype=np.float64).copy()
     if not fill_mask.any():
-        return filled_rows, filled_cols, fill_mask
-    nearest = scipy.ndimage.distance_transform_edt(
-        fill_mask, return_distances=False, return_indices=True
+        return (
+            filled_rows,
+            filled_cols,
+            fill_mask,
+            np.zeros(valid.shape, dtype=np.float64),
+        )
+    anchor_distance, nearest = scipy.ndimage.distance_transform_edt(
+        fill_mask, return_distances=True, return_indices=True
     )
+    anchor_distance = np.asarray(anchor_distance, dtype=np.float64)
     filled_rows = filled_rows[tuple(nearest)]
     filled_cols = filled_cols[tuple(nearest)]
     for _ in range(max(0, smoothing_iterations)):
@@ -1304,7 +1322,63 @@ def _fill_uv_field(
                 + padded[1:-1, 2:]
             )
             field[fill_mask] = neighbours[fill_mask]
-    return filled_rows, filled_cols, fill_mask
+    return filled_rows, filled_cols, fill_mask, anchor_distance
+
+
+def _content_anchor_distance(
+    rows: NDArray[np.float32],
+    cols: NDArray[np.float32],
+    valid: BoolArray,
+    labels: Sequence[NDArray],
+    label_validity: Optional[BoolArray],
+    source_shape: Tuple[int, int],
+    label_shape: Tuple[int, int],
+    label_offset_yx: Tuple[float, float],
+) -> NDArray[np.float64]:
+    """Return grid-cell distances to matches with nonzero annotation.
+
+    Anchoring on annotation rather than all matches keeps filled labels near
+    observed content. Any label in the pass can supply an anchor; with none,
+    return infinity. Nearby wrong matches can still fall within the limit,
+    so this distance cannot distinguish seam gaps from mesh mismatch.
+    """
+
+    import scipy.ndimage
+
+    valid = np.asarray(valid, dtype=bool)
+    source_height, source_width = source_shape
+    label_height, label_width = label_shape
+    # NaNs at invalid vertices would trip the integer cast; the mask below
+    # discards them either way.
+    safe_rows = np.where(valid, np.asarray(rows, dtype=np.float64), 0.0)
+    safe_cols = np.where(valid, np.asarray(cols, dtype=np.float64), 0.0)
+    label_rows = np.floor(
+        safe_rows * label_height / source_height - label_offset_yx[0]
+    ).astype(np.int64)
+    label_cols = np.floor(
+        safe_cols * label_width / source_width - label_offset_yx[1]
+    ).astype(np.int64)
+    in_range = (
+        valid
+        & (label_rows >= 0)
+        & (label_rows < label_height)
+        & (label_cols >= 0)
+        & (label_cols < label_width)
+    )
+    sample_rows = label_rows[in_range]
+    sample_cols = label_cols[in_range]
+    content = np.zeros(sample_rows.shape, dtype=bool)
+    for item in labels:
+        content |= np.asarray(item)[sample_rows, sample_cols] != 0
+    if label_validity is not None:
+        content &= label_validity[sample_rows, sample_cols]
+    anchor = np.zeros(valid.shape, dtype=bool)
+    anchor[in_range] = content
+    if not anchor.any():
+        return np.full(valid.shape, np.inf, dtype=np.float64)
+    return np.asarray(
+        scipy.ndimage.distance_transform_edt(~anchor), dtype=np.float64
+    )
 
 
 def transfer_array(
@@ -1326,6 +1400,9 @@ def transfer_array(
     label_offset_yx: Tuple[float, float] = (0.0, 0.0),
     vertex_index: str = "kdtree",
     fill_seams: bool = False,
+    max_seam_distance: float = DEFAULT_MAX_SEAM_DISTANCE,
+    seam_anchor: str = "matched",
+    seam_anchor_distance_output: Optional[NDArray[np.float32]] = None,
     workers: Optional[int] = None,
     uv_cache: Optional[str | Path] = None,
     additional_source_labels: Optional[Sequence[NDArray]] = None,
@@ -1350,36 +1427,24 @@ def transfer_array(
 ]:
     """Transfer a complete 2D categorical label image between surfaces.
 
-    Optional output arrays allow callers to provide disk-backed memmaps.
+    Output arrays may be disk-backed memmaps. ``workers`` writes disjoint
+    regions; statistics accumulate in submission order for deterministic output.
+    ``uv_cache`` stores geometry mappings independently of label values, so
+    multiple labels can reuse them. Changed surfaces or parameters invalidate it.
 
-    ``workers`` threads the mapping batches and output tiles (default: all
-    cores). Workers write disjoint regions and statistics are accumulated
-    in submission order, so outputs and reports do not depend on it.
+    ``label_offset_yx`` maps label pixel ``(i, j)`` to source canvas position
+    ``(i + dy, j + dx)`` in label pixels. Out-of-bounds samples are invalid.
 
-    ``uv_cache`` names an ``.npz`` file holding the mapped UV field, which
-    depends only on the surface pair, affine, and matching parameters — not
-    on the label. A matching cache skips the mapping phase entirely (labels
-    of the same segment share it); a stale one is recomputed and rewritten.
+    ``fill_seams`` continues the mapping into gaps, marked as validity 128
+    rather than measured validity 255. ``max_seam_distance`` limits reach in
+    target vertices; ``math.inf`` disables it. ``seam_anchor`` uses all matches
+    ("matched") or matches with nonzero annotation in any label ("content").
+    Neither mode corrects mesh mismatch. ``seam_anchor_distance_output`` must
+    be float32 with the target stored-grid shape and receives grid-cell distances.
 
-    ``label_offset_yx`` declares, in label pixels, that label pixel ``(i, j)``
-    depicts source-canvas position ``(i + dy, j + dx)`` instead of ``(i, j)``.
-    This corrects a constant canvas offset between the raster the labels were
-    drawn on and the source TIFXYZ canvas. Mapped pixels whose corrected
-    label position falls outside the raster are marked invalid, not clamped.
-
-    ``fill_seams`` additionally fills target pixels whose geometry mapping
-    was rejected (fold seams, distance failures) by smoothly continuing the
-    measured UV field across the gaps. Filled pixels are written with
-    validity value 128 instead of 255 so downstream consumers can always
-    tell measured from interpolated.
-
-    If ``materialize_output`` is false, no full-resolution result arrays are
-    allocated. Instead, ``tile_callback`` receives each completed tile in
-    deterministic row-major order as ``(bounds, labels, validity)``. This is
-    used by the CLI's compressed-TIFF streaming path.
-
-    ``rasterizer`` selects the optional compiled per-pixel kernel. ``auto``
-    uses it when built and otherwise preserves the NumPy implementation.
+    With ``materialize_output=False``, ``tile_callback`` receives
+    ``(bounds, labels, validity)`` in row-major order without full output arrays.
+    ``rasterizer="auto"`` uses a compatible native kernel or falls back to NumPy.
     """
 
     label = np.asarray(source_label)
@@ -1470,9 +1535,7 @@ def transfer_array(
         np.eye(4, dtype=np.float64) if affine is None else affine
     )
     if max_distance is None:
-        source_spacing = estimate_surface_spacing(source, effective_affine)
-        target_spacing = estimate_surface_spacing(target)
-        max_distance = max(1e-3, 0.75 * min(source_spacing, target_spacing))
+        max_distance = automatic_max_distance(target)
     if not math.isfinite(max_distance) or max_distance <= 0:
         raise ValueError(f"max_distance must be positive; got {max_distance}")
 
@@ -1562,11 +1625,55 @@ def transfer_array(
     filled_uv_rows: Optional[NDArray[np.float64]] = None
     filled_uv_cols: Optional[NDArray[np.float64]] = None
     filled_uv_valid: Optional[BoolArray] = None
-    if fill_seams:
-        filled_uv_rows, filled_uv_cols, _ = _fill_uv_field(
-            uv_rows, uv_cols, uv_valid
+    filled_uv_anchor_distance: Optional[NDArray[np.float64]] = None
+    seam_limit = float(max_seam_distance)
+    if not seam_limit > 0.0:
+        raise ValueError(
+            f"max_seam_distance must be positive; got {max_seam_distance}"
         )
+    if seam_anchor not in ("matched", "content"):
+        raise ValueError(
+            f"seam_anchor must be 'matched' or 'content'; got {seam_anchor!r}"
+        )
+    if seam_anchor_distance_output is not None:
+        if not fill_seams:
+            raise ValueError(
+                "seam_anchor_distance_output requires fill_seams"
+            )
+        if seam_anchor_distance_output.dtype != np.float32:
+            raise ValueError(
+                "seam_anchor_distance_output must be float32; got "
+                f"{seam_anchor_distance_output.dtype}"
+            )
+        if seam_anchor_distance_output.shape != uv_valid.shape:
+            raise ValueError(
+                "seam_anchor_distance_output must match the target stored "
+                f"grid shape {uv_valid.shape}; got "
+                f"{seam_anchor_distance_output.shape}"
+            )
+    if fill_seams:
+        (
+            filled_uv_rows,
+            filled_uv_cols,
+            _,
+            anchor_distance,
+        ) = _fill_uv_field(uv_rows, uv_cols, uv_valid)
+        if seam_anchor == "content":
+            anchor_distance = _content_anchor_distance(
+                uv_rows,
+                uv_cols,
+                uv_valid,
+                all_labels,
+                propagated_validity,
+                (source_height, source_width),
+                (label_height, label_width),
+                label_offset_yx,
+            )
         filled_uv_valid = np.ones_like(uv_valid)
+        if math.isfinite(seam_limit):
+            filled_uv_anchor_distance = anchor_distance
+        if seam_anchor_distance_output is not None:
+            seam_anchor_distance_output[...] = anchor_distance
 
     from .native import NativeRasterizer, resolve_rasterizer
 
@@ -1588,6 +1695,8 @@ def transfer_array(
             max_distance=max_distance,
             filled_uv_rows=filled_uv_rows,
             filled_uv_cols=filled_uv_cols,
+            filled_uv_anchor_distance=filled_uv_anchor_distance,
+            max_seam_distance=seam_limit,
             source_validity=source_validity_values,
         )
     )
@@ -1603,6 +1712,7 @@ def transfer_array(
         int,
         int,
         NDArray[np.float64],
+        int,
         int,
         int,
         Tuple[int, int, int, int],
@@ -1661,6 +1771,7 @@ def transfer_array(
                 native.target_surface_valid,
                 native.distances[measured],
                 native.seam_filled_pixels,
+                native.seam_blocked_pixels,
                 native.inherited_filled_pixels,
                 tile,
                 tile_labels if not materialize_output else None,
@@ -1809,6 +1920,7 @@ def transfer_array(
                 ]
 
         seam_filled_count = 0
+        seam_blocked_count = 0
         if fill_seams:
             assert filled_uv_rows is not None
             assert filled_uv_cols is not None
@@ -1832,6 +1944,19 @@ def transfer_array(
                 col_end,
             )
             seam_mask = target_pixel_valid & (tile_valid == 0)
+            if filled_uv_anchor_distance is not None:
+                seam_anchor_distance, _ = bilinear_field_tile(
+                    filled_uv_anchor_distance,
+                    filled_uv_valid,
+                    resolved_shape,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                )
+                within_limit = seam_anchor_distance <= seam_limit
+                seam_blocked_count = int((seam_mask & ~within_limit).sum())
+                seam_mask &= within_limit
             seam_pixel_rows, seam_pixel_cols = np.nonzero(seam_mask)
             if seam_pixel_rows.size:
                 seam_label_rows = np.floor(
@@ -1878,6 +2003,7 @@ def transfer_array(
             int(target_pixel_valid.sum()),
             distances[accepted_rows, accepted_cols],
             seam_filled_count,
+            seam_blocked_count,
             inherited_count,
             tile,
             tile_labels if not materialize_output else None,
@@ -1893,6 +2019,7 @@ def transfer_array(
             NDArray[np.float64],
             int,
             int,
+            int,
             Tuple[int, int, int, int],
             Optional[list[NDArray]],
             Optional[NDArray[np.uint8]],
@@ -1904,6 +2031,7 @@ def transfer_array(
             target_surface_valid,
             tile_distances,
             seams,
+            blocked,
             inherited,
             tile_bounds,
             streamed_labels,
@@ -1915,6 +2043,7 @@ def transfer_array(
             distances=tile_distances,
         )
         stats.seam_filled_pixels += seams
+        stats.seam_blocked_pixels += blocked
         stats.inherited_filled_pixels += inherited
         if tile_callback is not None:
             if streamed_labels is None or streamed_validity is None:

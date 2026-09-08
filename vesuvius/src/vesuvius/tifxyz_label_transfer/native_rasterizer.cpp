@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr std::uint32_t kAbiVersion = 1;
+constexpr std::uint32_t kAbiVersion = 2;
 
 struct RasterRequest {
     const double* target_x;
@@ -31,6 +31,7 @@ struct RasterRequest {
     const std::uint8_t* source_valid;
     const double* filled_uv_rows;
     const double* filled_uv_cols;
+    const double* filled_uv_anchor_distance;
     const std::uint8_t* source_validity;
     std::int64_t* output_source_indices;
     std::uint8_t* output_validity;
@@ -52,7 +53,9 @@ struct RasterRequest {
     double label_offset_y;
     double label_offset_x;
     double max_distance;
+    double max_seam_distance;
     std::uint32_t fill_seams;
+    std::uint32_t has_seam_limit;
     std::uint32_t has_source_validity;
     std::uint32_t abi_version;
 };
@@ -61,6 +64,7 @@ struct RasterResult {
     std::int64_t target_surface_valid;
     std::int64_t measured_pixels;
     std::int64_t seam_filled_pixels;
+    std::int64_t seam_blocked_pixels;
     std::int64_t inherited_filled_pixels;
 };
 
@@ -294,10 +298,22 @@ VC_EXPORT int vc_tifxyz_rasterize(
     if (request.has_source_validity != 0 && request.source_validity == nullptr) {
         return 6;
     }
+    if (
+        request.has_seam_limit != 0 &&
+        (
+            request.fill_seams == 0 ||
+            request.filled_uv_anchor_distance == nullptr ||
+            !std::isfinite(request.max_seam_distance) ||
+            request.max_seam_distance <= 0.0
+        )
+    ) {
+        return 7;
+    }
 
     result->target_surface_valid = 0;
     result->measured_pixels = 0;
     result->seam_filled_pixels = 0;
+    result->seam_blocked_pixels = 0;
     result->inherited_filled_pixels = 0;
     const auto tile_width = request.col_end - request.col_start;
     const double invalid_distance = std::numeric_limits<double>::quiet_NaN();
@@ -386,6 +402,21 @@ VC_EXPORT int vc_tifxyz_rasterize(
                 request.fill_seams != 0 && target_pixel_valid &&
                 request.output_validity[local] == 0
             ) {
+                // Reject seam fill beyond the selected anchor distance limit.
+                if (request.has_seam_limit != 0) {
+                    const double anchor_distance = bilinear(
+                        request.filled_uv_anchor_distance,
+                        position,
+                        request.target_width
+                    );
+                    if (
+                        !std::isfinite(anchor_distance) ||
+                        anchor_distance > request.max_seam_distance
+                    ) {
+                        ++result->seam_blocked_pixels;
+                        continue;
+                    }
+                }
                 const double seam_row = bilinear(
                     request.filled_uv_rows, position, request.target_width
                 );
