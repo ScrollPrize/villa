@@ -321,6 +321,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-workers", type=int, default=16)
     parser.add_argument("--augment-workers", type=int, default=32)
     parser.add_argument(
+        "--shared-workers",
+        type=int,
+        default=0,
+        help="use one dependency-aware worker pool of this size for both stages",
+    )
+    parser.add_argument(
+        "--initial-in-flight",
+        type=int,
+        default=0,
+        help="initial shared-pool admission window; 0 uses shared worker count",
+    )
+    parser.add_argument(
+        "--shared-load-affinity-workers",
+        type=int,
+        default=0,
+        help="soft load affinity count in shared mode; 0 uses two thirds",
+    )
+    parser.add_argument(
         "--raw-only",
         action="store_true",
         help="stop after raw sample loading; launch no augmentation workers",
@@ -398,17 +416,33 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if bool(args.raw_only) and bool(args.fused):
         raise ValueError("--raw-only and --fused are mutually exclusive")
-    for name in (
-        "samples",
-        "load_workers",
-        "raw_queue_capacity",
-        "result_queue_capacity",
-        "max_in_flight",
-    ):
+    if int(args.shared_workers) > 0 and (bool(args.raw_only) or bool(args.fused)):
+        raise ValueError("--shared-workers requires the split two-stage pipeline")
+    for name in ("samples", "raw_queue_capacity", "result_queue_capacity", "max_in_flight"):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be > 0")
-    if not bool(args.raw_only) and not bool(args.fused) and int(args.augment_workers) <= 0:
+    if int(args.shared_workers) == 0 and int(args.load_workers) <= 0:
+        raise ValueError("--load-workers must be > 0 outside shared mode")
+    if (
+        int(args.shared_workers) == 0
+        and not bool(args.raw_only)
+        and not bool(args.fused)
+        and int(args.augment_workers) <= 0
+    ):
         raise ValueError("--augment-workers must be > 0 unless --raw-only is used")
+    if any(
+        int(value) < 0
+        for value in (
+            args.shared_workers,
+            args.initial_in_flight,
+            args.shared_load_affinity_workers,
+        )
+    ):
+        raise ValueError("shared worker/admission/affinity values must be >= 0")
+    if int(args.shared_workers) > 0 and int(args.initial_in_flight) > int(args.max_in_flight):
+        raise ValueError("--initial-in-flight cannot exceed --max-in-flight")
+    if int(args.shared_load_affinity_workers) > int(args.shared_workers):
+        raise ValueError("--shared-load-affinity-workers cannot exceed --shared-workers")
     if int(args.warmup_samples) < 0 or int(args.verify_samples) < 0:
         raise ValueError("warmup/verify sample counts must be >= 0")
     if any(
@@ -501,9 +535,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         start_index=int(args.start_index),
         item_count=total_items,
-        stage1_workers=int(args.load_workers),
+        stage1_workers=0 if int(args.shared_workers) > 0 else int(args.load_workers),
         stage2_workers=(
-            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
+            0
+            if bool(args.raw_only) or bool(args.fused) or int(args.shared_workers) > 0
+            else int(args.augment_workers)
         ),
         raw_queue_capacity=int(args.raw_queue_capacity),
         result_queue_capacity=int(args.result_queue_capacity),
@@ -512,12 +548,24 @@ def main(argv: list[str] | None = None) -> int:
         startup_timeout_seconds=float(args.startup_timeout_seconds),
         no_progress_timeout_seconds=float(args.no_progress_timeout_seconds),
         transport=transport,
+        shared_workers=int(args.shared_workers),
+        initial_in_flight=(
+            None if int(args.initial_in_flight) == 0 else int(args.initial_in_flight)
+        ),
+        shared_stage1_affinity_workers=(
+            None
+            if int(args.shared_load_affinity_workers) == 0
+            else int(args.shared_load_affinity_workers)
+        ),
     )
     startup_seconds = time.perf_counter() - startup_started
     print(
         "sample_pipeline: "
-        f"load_workers={args.load_workers} "
-        f"augment_workers={0 if args.raw_only or args.fused else args.augment_workers} "
+        f"load_workers={0 if args.shared_workers else args.load_workers} "
+        f"augment_workers={0 if args.raw_only or args.fused or args.shared_workers else args.augment_workers} "
+        f"shared_workers={args.shared_workers} initial_in_flight="
+        f"{pipeline.initial_in_flight} "
+        f"load_affinity={pipeline.shared_stage1_affinity_workers} "
         f"raw_only={bool(args.raw_only)} "
         f"fused={bool(args.fused)} "
         f"shared_slots={bool(args.shared_tensor_slots)} "
@@ -650,12 +698,16 @@ def main(argv: list[str] | None = None) -> int:
         "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
         "run_dir": str(run_dir),
         "topology": (
-            "one-host-global-cpu-raw-loader"
-            if bool(args.raw_only)
+            "one-host-global-cpu-shared-pipeline"
+            if int(args.shared_workers) > 0
             else (
-                "one-host-global-cpu-fused-pipeline"
-                if bool(args.fused)
-                else "one-host-global-cpu-pipeline"
+                "one-host-global-cpu-raw-loader"
+                if bool(args.raw_only)
+                else (
+                    "one-host-global-cpu-fused-pipeline"
+                    if bool(args.fused)
+                    else "one-host-global-cpu-pipeline"
+                )
             )
         ),
         "raw_only": bool(args.raw_only),
@@ -670,12 +722,23 @@ def main(argv: list[str] | None = None) -> int:
         "warmup_samples": int(args.warmup_samples),
         "measured_samples": int(args.samples),
         "batch_size": batch_size,
-        "load_workers": int(args.load_workers),
+        "load_workers": 0 if int(args.shared_workers) > 0 else int(args.load_workers),
         "augment_workers": (
-            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
+            0
+            if bool(args.raw_only) or bool(args.fused) or int(args.shared_workers) > 0
+            else int(args.augment_workers)
         ),
-        "worker_processes": int(args.load_workers) + (
-            0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers)
+        "shared_workers": int(args.shared_workers),
+        "initial_in_flight": int(pipeline.initial_in_flight),
+        "shared_stage1_affinity_workers": int(
+            pipeline.shared_stage1_affinity_workers
+        ),
+        "shared_stage1_target_min": int(pipeline.shared_stage1_target_min),
+        "shared_stage1_target_max": int(pipeline.shared_stage1_target_max),
+        "shared_stage1_target_final": int(pipeline.shared_stage1_target_final),
+        "worker_processes": int(args.shared_workers) or (
+            int(args.load_workers)
+            + (0 if bool(args.raw_only) or bool(args.fused) else int(args.augment_workers))
         ),
         "raw_queue_capacity": int(args.raw_queue_capacity),
         "result_queue_capacity": int(args.result_queue_capacity),
@@ -731,6 +794,9 @@ def main(argv: list[str] | None = None) -> int:
         "batch_delivery_wait_ms": distribution(batch_wait_ms),
         "batch_stack_ms": distribution(batch_stack_ms),
         "reorder_highwater": int(pipeline.reorder_highwater),
+        "admission_highwater": int(pipeline.admission_highwater),
+        "shared_stage1_tasks_by_worker": dict(pipeline.shared_stage1_counts),
+        "shared_stage2_tasks_by_worker": dict(pipeline.shared_stage2_counts),
         "sample_stage_ms": {
             key.removeprefix("sample_"): distribution(item[key] for item in measured if key in item)
             for key in sorted({key for item in measured for key in item if key.startswith("sample_")})

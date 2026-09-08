@@ -2869,3 +2869,15 @@
 - Shared transport must preserve deterministic ordered delivery, sample values,
   masks and metadata. Worker native compute remains single-threaded and
   GIL-free; transport optimization may not alter augmentation draws or math.
+- Split Fiber3D loading and value augmentation may use one shared process pool.
+  Workers claim only runnable work: load indices are monotonically admitted and
+  augmentation consumes only completed raw samples. Soft stage affinity keeps
+  loader/cache and augmentation working sets hot; a loader may augment its own
+  completed sample when the bounded raw queue is full and may help drain after
+  all loads are dispatched. No parent Python dispatcher relays sample payloads.
+- Shared-pool admission uses an explicit target frontier separate from the hard
+  credit limit. It starts at `initial_in_flight`, advances by exactly two for
+  each completed load, and is capped by the stream end. Outstanding work and
+  shared-slot ownership remain capped by `max_in_flight` until ordered delivery
+  or explicit release. A future index cannot reuse a modulo slot still owned by
+  an earlier leased sample.

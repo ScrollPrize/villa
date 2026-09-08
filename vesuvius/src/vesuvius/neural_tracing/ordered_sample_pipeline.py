@@ -1,4 +1,4 @@
-"""Bounded, ordered, two-process-stage sample pipeline.
+"""Bounded, ordered sample pipeline with fixed or shared process stages.
 
 Stage workers may complete out of order.  A single credit window bounds every
 claimed-but-not-yet-delivered item, including items held by the coordinator's
@@ -251,12 +251,183 @@ def _stage2_main(
         control.close()
 
 
+def _shared_worker_main(
+    worker_id: int,
+    stage1_factory: Callable[[], Callable[[int], Any]],
+    stage2_factory: Callable[[], Callable[[Any], Any]],
+    control: Connection,
+    start_event: Any,
+    stop_event: Any,
+    transport: Any,
+    raw_queue: Any,
+    result_queue: Any,
+    stage1_affinity_workers: int,
+    next_index: Any,
+    target_frontier: Any,
+    claim_lock: Any,
+    credits: Any,
+    end_index: int,
+    start_index: int,
+    slot_count: int,
+    slot_owners: Any,
+    outstanding: Any,
+    admission_highwater: Any,
+    stage1_counts: Any,
+    stage2_counts: Any,
+    shared_worker_count: int,
+) -> None:
+    """Claim eligible work without a coordinator round trip."""
+
+    _set_native_thread_limits()
+    stage = "startup"
+    index = -1
+    try:
+        stage1_operation = (
+            stage1_factory() if worker_id < int(stage1_affinity_workers) else None
+        )
+        stage2_operation = (
+            None if worker_id < int(stage1_affinity_workers) else stage2_factory()
+        )
+        _send_control(control, "ready", "shared", worker_id, os.getpid())
+        while not start_event.wait(timeout=0.1):
+            if stop_event.is_set():
+                return
+
+        def claim_load() -> int | None:
+            with claim_lock:
+                candidate = int(next_index.value)
+                if candidate >= int(end_index) or candidate >= int(target_frontier.value):
+                    return None
+                slot = (
+                    (candidate - int(start_index)) % int(slot_count)
+                    if int(slot_count) > 0
+                    else -1
+                )
+                if slot >= 0 and int(slot_owners[slot]) >= 0:
+                    return None
+                if not credits.acquire(block=False):
+                    return None
+                next_index.value = candidate + 1
+                outstanding.value = int(outstanding.value) + 1
+                admission_highwater.value = max(
+                    int(admission_highwater.value), int(outstanding.value)
+                )
+                if slot >= 0:
+                    slot_owners[slot] = candidate
+                return candidate
+
+        def run_augment(raw: _RawItem) -> None:
+            nonlocal stage, index, stage2_operation
+            stage = "augment"
+            index = int(raw.index)
+            if stage2_operation is None:
+                stage2_operation = stage2_factory()
+            received_ns = time.perf_counter_ns()
+            raw_value = (
+                transport.decode(index, raw.value, final=False)
+                if transport is not None
+                else raw.value
+            )
+            started = time.perf_counter()
+            cpu_started = time.process_time()
+            value = stage2_operation(raw_value)
+            if transport is not None:
+                value = transport.encode(index, value, final=True)
+            finished_ns = time.perf_counter_ns()
+            completed = _CompletedItem(
+                index=index,
+                value=value,
+                stage1_service_ms=float(raw.stage1_service_ms),
+                stage1_cpu_ms=float(raw.stage1_cpu_ms),
+                raw_queue_ms=max(
+                    0.0, (received_ns - int(raw.stage1_finished_ns)) / 1.0e6
+                ),
+                stage2_service_ms=(time.perf_counter() - started) * 1000.0,
+                stage2_cpu_ms=(time.process_time() - cpu_started) * 1000.0,
+                stage2_worker=int(worker_id),
+                stage2_finished_ns=finished_ns,
+                stage1_worker=int(raw.stage1_worker),
+                stage1_started_ns=int(raw.stage1_started_ns),
+                stage1_finished_ns=int(raw.stage1_finished_ns),
+            )
+            _put_bounded(result_queue, completed, stop_event)
+            stage2_counts[worker_id] = int(stage2_counts[worker_id]) + 1
+
+        home_load = worker_id < int(stage1_affinity_workers)
+        while not stop_event.is_set():
+            candidate = claim_load() if home_load else None
+            if candidate is not None:
+                stage = "load"
+                index = candidate
+                if stage1_operation is None:
+                    stage1_operation = stage1_factory()
+                started = time.perf_counter()
+                started_ns = time.perf_counter_ns()
+                cpu_started = time.process_time()
+                value = stage1_operation(index)
+                if transport is not None:
+                    value = transport.encode(index, value, final=False)
+                item = _RawItem(
+                    index=index,
+                    value=value,
+                    stage1_service_ms=(time.perf_counter() - started) * 1000.0,
+                    stage1_cpu_ms=(time.process_time() - cpu_started) * 1000.0,
+                    stage1_worker=int(worker_id),
+                    stage1_started_ns=started_ns,
+                    stage1_finished_ns=time.perf_counter_ns(),
+                )
+                stage1_counts[worker_id] = int(stage1_counts[worker_id]) + 1
+                with claim_lock:
+                    target_frontier.value = min(
+                        int(end_index), int(target_frontier.value) + 2
+                    )
+                try:
+                    raw_queue.put(item, timeout=0.001)
+                except queue.Full:
+                    # The worker is shared: when augmentation is persistently
+                    # behind and its bounded queue is full, consume this ready
+                    # sample directly instead of blocking a CPU on publication.
+                    run_augment(item)
+                if int(shared_worker_count) == 1 and stage != "augment":
+                    run_augment(raw_queue.get())
+            else:
+                if home_load:
+                    with claim_lock:
+                        loads_fully_dispatched = int(next_index.value) >= int(end_index)
+                    if not loads_fully_dispatched:
+                        time.sleep(0.001)
+                        continue
+                try:
+                    raw = raw_queue.get(timeout=0.01 if not home_load else 0.001)
+                except queue.Empty:
+                    continue
+                run_augment(raw)
+            stage = "idle"
+            index = -1
+    except BaseException as exc:
+        if not stop_event.is_set():
+            _send_control(
+                control,
+                "error",
+                stage,
+                worker_id,
+                os.getpid(),
+                index,
+                type(exc).__name__,
+                str(exc),
+                traceback.format_exc(),
+            )
+    finally:
+        control.close()
+
+
 class OrderedTwoStageSamplePipeline:
     """One or two process stages with bounded lookahead and ordered delivery.
 
     Setting ``stage2_workers=0`` and ``stage2_factory=None`` exposes completed
     stage-one values directly.  This is used to measure the real raw-sample
-    queue without adding an identity/augmentation process stage.
+    queue without adding an identity/augmentation process stage. Shared mode
+    uses one worker entrypoint with soft stage affinity and worker-side claims.
     """
 
     def __init__(
@@ -275,27 +446,74 @@ class OrderedTwoStageSamplePipeline:
         startup_timeout_seconds: float = 120.0,
         no_progress_timeout_seconds: float = 300.0,
         transport: Any = None,
+        shared_workers: int = 0,
+        initial_in_flight: int | None = None,
+        shared_stage1_affinity_workers: int | None = None,
     ) -> None:
         for name, value in (
             ("item_count", item_count),
-            ("stage1_workers", stage1_workers),
             ("raw_queue_capacity", raw_queue_capacity),
             ("result_queue_capacity", result_queue_capacity),
             ("max_in_flight", max_in_flight),
         ):
             if int(value) <= 0:
                 raise ValueError(f"{name} must be > 0")
-        if int(stage2_workers) < 0:
-            raise ValueError("stage2_workers must be >= 0")
-        if (int(stage2_workers) == 0) != (stage2_factory is None):
-            raise ValueError("stage2_factory must be None exactly when stage2_workers is 0")
-        self.has_stage2 = int(stage2_workers) > 0
+        for name, value in (
+            ("stage1_workers", stage1_workers),
+            ("stage2_workers", stage2_workers),
+            ("shared_workers", shared_workers),
+        ):
+            if int(value) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        self.shared_pool = int(shared_workers) > 0
+        if self.shared_pool:
+            if int(stage1_workers) != 0 or int(stage2_workers) != 0:
+                raise ValueError(
+                    "stage1_workers and stage2_workers must be 0 in shared-pool mode"
+                )
+            if stage2_factory is None:
+                raise ValueError("shared-pool mode requires stage2_factory")
+        else:
+            if int(stage1_workers) <= 0:
+                raise ValueError("stage1_workers must be > 0 outside shared-pool mode")
+            if (int(stage2_workers) == 0) != (stage2_factory is None):
+                raise ValueError(
+                    "stage2_factory must be None exactly when stage2_workers is 0"
+                )
+        self.has_stage2 = self.shared_pool or int(stage2_workers) > 0
+        initial = int(shared_workers) if initial_in_flight is None else int(initial_in_flight)
+        if self.shared_pool and not (0 < initial <= int(max_in_flight)):
+            raise ValueError("initial_in_flight must be in [1, max_in_flight]")
+        if self.shared_pool and transport is not None:
+            slot_count = getattr(transport, "slot_count", None)
+            if slot_count is None or int(slot_count) < int(max_in_flight):
+                raise ValueError(
+                    "shared-pool transport slot_count must be >= max_in_flight"
+                )
+        affinity_workers = (
+            int(round(int(shared_workers) * (2.0 / 3.0)))
+            if shared_stage1_affinity_workers is None
+            else int(shared_stage1_affinity_workers)
+        )
+        if self.shared_pool:
+            valid_affinity = (
+                affinity_workers == 1
+                if int(shared_workers) == 1
+                else 0 < affinity_workers < int(shared_workers)
+            )
+            if not valid_affinity:
+                raise ValueError(
+                    "shared_stage1_affinity_workers must leave at least one "
+                    "worker for each stage"
+                )
         if multiprocessing_context == "fork":
             raise ValueError("fork is not supported for the torch sample pipeline")
         self.start_index = int(start_index)
         self.end_index = self.start_index + int(item_count)
         self.next_expected = self.start_index
         self.item_count = int(item_count)
+        self.max_in_flight = int(max_in_flight)
+        self.raw_queue_capacity = int(raw_queue_capacity)
         self.no_progress_timeout_seconds = float(no_progress_timeout_seconds)
         self.context_name = str(multiprocessing_context)
         self.context = mp.get_context(self.context_name)
@@ -317,9 +535,78 @@ class OrderedTwoStageSamplePipeline:
         self.started_ns = 0
         self.transport = transport
         self.leased: set[int] = set()
+        self.shared_workers = int(shared_workers)
+        self.initial_in_flight = initial if self.shared_pool else 0
+        self.shared_stage1_affinity_workers = affinity_workers if self.shared_pool else 0
+        self.admission_highwater = 0
+        self.shared_stage1_counts: dict[int, int] = {}
+        self.shared_stage2_counts: dict[int, int] = {}
+        self.shared_stage1_target_min = 0
+        self.shared_stage1_target_max = 0
+        self.shared_stage1_target_final = 0
+        shared_slot_count = (
+            int(getattr(transport, "slot_count"))
+            if self.shared_pool and transport is not None
+            else 0
+        )
+        self._shared_target_frontier = self.context.Value(
+            "q", min(self.end_index, self.start_index + self.initial_in_flight)
+        )
+        self._shared_slot_owners = self.context.Array(
+            "q", [-1] * max(1, shared_slot_count), lock=False
+        )
+        self._shared_outstanding = self.context.Value("q", 0)
+        self._shared_admission_highwater = self.context.Value("q", 0)
+        self._shared_stage1_count_array = self.context.Array(
+            "q", [0] * max(1, self.shared_workers), lock=False
+        )
+        self._shared_stage2_count_array = self.context.Array(
+            "q", [0] * max(1, self.shared_workers), lock=False
+        )
+        if self.shared_pool:
+            self.shared_stage1_target_min = self.shared_stage1_affinity_workers
+            self.shared_stage1_target_max = self.shared_stage1_affinity_workers
+            self.shared_stage1_target_final = self.shared_stage1_affinity_workers
 
         try:
-            for worker_id in range(int(stage1_workers)):
+            if self.shared_pool:
+                assert stage2_factory is not None
+                for worker_id in range(self.shared_workers):
+                    parent, child = self.context.Pipe(duplex=False)
+                    process = self.context.Process(
+                        target=_shared_worker_main,
+                        args=(
+                            worker_id,
+                            stage1_factory,
+                            stage2_factory,
+                            child,
+                            self.start_event,
+                            self.stop_event,
+                            self.transport,
+                            self.raw_queue,
+                            self.result_queue,
+                            self.shared_stage1_affinity_workers,
+                            self.next_index,
+                            self._shared_target_frontier,
+                            self.claim_lock,
+                            self.credits,
+                            self.end_index,
+                            self.start_index,
+                            shared_slot_count,
+                            self._shared_slot_owners,
+                            self._shared_outstanding,
+                            self._shared_admission_highwater,
+                            self._shared_stage1_count_array,
+                            self._shared_stage2_count_array,
+                            self.shared_workers,
+                        ),
+                        name=f"ordered-sample-shared-{worker_id}",
+                    )
+                    process.start()
+                    child.close()
+                    self.processes.append(process)
+                    self.controls.append(parent)
+            for worker_id in range(0 if self.shared_pool else int(stage1_workers)):
                 parent, child = self.context.Pipe(duplex=False)
                 process = self.context.Process(
                     target=_stage1_main,
@@ -343,7 +630,7 @@ class OrderedTwoStageSamplePipeline:
                 child.close()
                 self.processes.append(process)
                 self.controls.append(parent)
-            for worker_id in range(int(stage2_workers)):
+            for worker_id in range(0 if self.shared_pool else int(stage2_workers)):
                 assert stage2_factory is not None
                 parent, child = self.context.Pipe(duplex=False)
                 process = self.context.Process(
@@ -371,6 +658,19 @@ class OrderedTwoStageSamplePipeline:
             self.close()
             raise
 
+    @staticmethod
+    def _worker_error(message: tuple[Any, ...], *, startup: bool = False) -> RuntimeError:
+        if len(message) == 8:
+            _kind, stage, worker, pid, index, exc_type, detail, trace = message
+            where = f" during startup" if startup else f" at sample {index}"
+        else:
+            _kind, stage, worker, pid, exc_type, detail, trace = message
+            where = " during startup" if startup else ""
+        return RuntimeError(
+            f"{stage} worker {worker} pid={pid} failed{where}: "
+            f"{exc_type}: {detail}\n{trace}"
+        )
+
     def _read_controls(self) -> None:
         for connection in self.controls:
             while connection.poll():
@@ -379,11 +679,7 @@ class OrderedTwoStageSamplePipeline:
                 except EOFError:
                     break
                 if message and message[0] == "error":
-                    _kind, stage, worker, pid, exc_type, detail, trace = message
-                    raise RuntimeError(
-                        f"{stage} worker {worker} pid={pid} failed: "
-                        f"{exc_type}: {detail}\n{trace}"
-                    )
+                    raise self._worker_error(message)
 
     def _await_ready(self, timeout_seconds: float) -> None:
         deadline = time.monotonic() + timeout_seconds
@@ -399,11 +695,7 @@ class OrderedTwoStageSamplePipeline:
                     if message and message[0] == "ready":
                         ready.add((str(message[1]), int(message[2])))
                     elif message and message[0] == "error":
-                        _kind, stage, worker, pid, exc_type, detail, trace = message
-                        raise RuntimeError(
-                            f"{stage} worker {worker} pid={pid} failed during startup: "
-                            f"{exc_type}: {detail}\n{trace}"
-                        )
+                        raise self._worker_error(message, startup=True)
             for process in self.processes:
                 if process.exitcode is not None:
                     raise RuntimeError(
@@ -423,6 +715,21 @@ class OrderedTwoStageSamplePipeline:
                 raise RuntimeError(
                     f"pipeline worker {process.name} exited unexpectedly with code {process.exitcode}"
                 )
+
+    def _release_shared_credit(self, index: int) -> None:
+        with self.claim_lock:
+            if self.transport is not None:
+                slot = int(self.transport._location(int(index))[0])
+                owner = int(self._shared_slot_owners[slot])
+                if owner != int(index):
+                    raise RuntimeError(
+                        f"shared slot {slot} owner mismatch: {owner} != {index}"
+                    )
+                self._shared_slot_owners[slot] = -1
+            if int(self._shared_outstanding.value) <= 0:
+                raise RuntimeError("shared-pool outstanding credit underflow")
+            self._shared_outstanding.value = int(self._shared_outstanding.value) - 1
+            self.credits.release()
 
     def next_ordered(self, *, release_credit: bool = True) -> OrderedPipelineResult:
         if self.closed:
@@ -508,7 +815,10 @@ class OrderedTwoStageSamplePipeline:
         self.next_expected += 1
         self.delivered += 1
         if release_credit:
-            self.credits.release()
+            if self.shared_pool:
+                self._release_shared_credit(int(result.index))
+            else:
+                self.credits.release()
         else:
             self.leased.add(int(result.index))
         return result
@@ -518,7 +828,10 @@ class OrderedTwoStageSamplePipeline:
         if index_i not in self.leased:
             raise RuntimeError(f"pipeline sample {index_i} is not leased")
         self.leased.remove(index_i)
-        self.credits.release()
+        if self.shared_pool:
+            self._release_shared_credit(index_i)
+        else:
+            self.credits.release()
 
     def close(self) -> None:
         if self.closed:
@@ -535,6 +848,19 @@ class OrderedTwoStageSamplePipeline:
                 process.terminate()
         for process in self.processes:
             process.join(timeout=2.0)
+        if self.shared_pool:
+            self.admission_highwater = int(self._shared_admission_highwater.value)
+            self.shared_stage1_counts = {
+                worker_id: int(self._shared_stage1_count_array[worker_id])
+                for worker_id in range(self.shared_workers)
+                if int(self._shared_stage1_count_array[worker_id]) > 0
+            }
+            self.shared_stage2_counts = {
+                worker_id: int(self._shared_stage2_count_array[worker_id])
+                for worker_id in range(self.shared_workers)
+                if int(self._shared_stage2_count_array[worker_id]) > 0
+            }
+        for process in self.processes:
             process.close()
         for connection in self.controls:
             connection.close()
@@ -542,6 +868,8 @@ class OrderedTwoStageSamplePipeline:
         self.received_ns.clear()
         self.leased.clear()
         for data_queue in (self.raw_queue, self.result_queue):
+            if data_queue is None:
+                continue
             try:
                 while True:
                     data_queue.get_nowait()

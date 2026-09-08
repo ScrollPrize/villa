@@ -38,8 +38,11 @@ class _StageOneFactory:
 @dataclass(frozen=True)
 class _StageTwo:
     fail_value: int = -1
+    hard_exit_value: int = -1
 
     def __call__(self, value: int) -> int:
+        if value == self.hard_exit_value:
+            os._exit(9)
         if value == self.fail_value:
             raise ValueError(f"rejected {value}")
         return value * 2
@@ -48,13 +51,25 @@ class _StageTwo:
 @dataclass(frozen=True)
 class _StageTwoFactory:
     fail_value: int = -1
+    hard_exit_value: int = -1
 
     def __call__(self) -> _StageTwo:
-        return _StageTwo(self.fail_value)
+        return _StageTwo(self.fail_value, self.hard_exit_value)
+
+
+@dataclass(frozen=True)
+class _FailingFactory:
+    def __call__(self) -> _StageOne:
+        raise RuntimeError("factory startup rejected")
 
 
 @dataclass(frozen=True)
 class _TupleTransport:
+    slot_count: int = 6
+
+    def _location(self, index: int) -> tuple[int, int]:
+        return index % self.slot_count, index // self.slot_count
+
     def encode(self, index: int, value: int, *, final: bool) -> tuple[int, bool, int]:
         return int(index), bool(final), int(value)
 
@@ -76,6 +91,27 @@ def _pipeline(**overrides: object) -> OrderedTwoStageSamplePipeline:
         "stage1_workers": 4,
         "stage2_workers": 3,
         "raw_queue_capacity": 1,
+        "result_queue_capacity": 1,
+        "max_in_flight": 6,
+        "multiprocessing_context": "spawn",
+        "startup_timeout_seconds": 30.0,
+        "no_progress_timeout_seconds": 5.0,
+    }
+    args.update(overrides)
+    return OrderedTwoStageSamplePipeline(**args)  # type: ignore[arg-type]
+
+
+def _shared_pipeline(**overrides: object) -> OrderedTwoStageSamplePipeline:
+    args: dict[str, object] = {
+        "stage1_factory": _StageOneFactory(),
+        "stage2_factory": _StageTwoFactory(),
+        "start_index": 0,
+        "item_count": 12,
+        "stage1_workers": 0,
+        "stage2_workers": 0,
+        "shared_workers": 4,
+        "initial_in_flight": 1,
+        "raw_queue_capacity": 2,
         "result_queue_capacity": 1,
         "max_in_flight": 6,
         "multiprocessing_context": "spawn",
@@ -198,3 +234,119 @@ def test_pipeline_transport_round_trip_and_deferred_credit_release() -> None:
         assert not pipeline.leased
     finally:
         pipeline.close()
+
+
+def test_shared_pool_gradually_admits_and_delivers_exactly_once() -> None:
+    pipeline = _shared_pipeline(stage1_factory=_StageOneFactory(slow_first=True))
+    try:
+        results = [pipeline.next_ordered() for _ in range(12)]
+        pipeline.close()
+        assert [result.index for result in results] == list(range(12))
+        assert [result.value for result in results] == [
+            (index + 10) * 2 for index in range(12)
+        ]
+        assert sum(pipeline.shared_stage1_counts.values()) == 12
+        assert sum(pipeline.shared_stage2_counts.values()) == 12
+        assert 1 < pipeline.admission_highwater <= 6
+        assert pipeline.shared_stage1_counts
+        assert pipeline.shared_stage2_counts
+    finally:
+        pipeline.close()
+
+
+def test_shared_pool_handles_short_final_growth_and_small_stream() -> None:
+    pipeline = _shared_pipeline(item_count=3, initial_in_flight=6)
+    try:
+        values = [pipeline.next_ordered().value for _ in range(3)]
+        pipeline.close()
+        assert values == [20, 22, 24]
+        assert pipeline.admission_highwater == 3
+    finally:
+        pipeline.close()
+
+
+def test_one_shared_worker_can_execute_both_runnable_stages() -> None:
+    pipeline = _shared_pipeline(
+        shared_workers=1,
+        initial_in_flight=1,
+        item_count=3,
+        raw_queue_capacity=1,
+    )
+    try:
+        values = [pipeline.next_ordered().value for _ in range(3)]
+        pipeline.close()
+        assert values == [20, 22, 24]
+        assert pipeline.shared_stage1_counts == {0: 3}
+        assert pipeline.shared_stage2_counts == {0: 3}
+    finally:
+        pipeline.close()
+
+
+def test_shared_pool_propagates_each_stage_failure_with_index() -> None:
+    for stage1_factory, stage2_factory, match in (
+        (_StageOneFactory(hard_exit_index=-1), _StageTwoFactory(fail_value=13), r"augment.*sample 3"),
+        (_StageOneFactory(hard_exit_index=3), _StageTwoFactory(), r"exited unexpectedly.*code 7"),
+        (_StageOneFactory(), _StageTwoFactory(hard_exit_value=13), r"exited unexpectedly.*code 9"),
+    ):
+        pipeline = _shared_pipeline(
+            stage1_factory=stage1_factory,
+            stage2_factory=stage2_factory,
+            item_count=8,
+        )
+        with pytest.raises(RuntimeError, match=match):
+            try:
+                while True:
+                    pipeline.next_ordered()
+            finally:
+                pipeline.close()
+
+
+def test_shared_pool_reports_factory_startup_failure() -> None:
+    with pytest.raises(RuntimeError, match=r"startup worker .*factory startup rejected"):
+        _shared_pipeline(stage1_factory=_FailingFactory())
+
+
+def test_shared_pool_deferred_release_and_saturated_close() -> None:
+    pipeline = _shared_pipeline(item_count=100, max_in_flight=2, raw_queue_capacity=1)
+    try:
+        first = pipeline.next_ordered(release_credit=False)
+        second = pipeline.next_ordered(release_credit=False)
+        assert pipeline.leased == {0, 1}
+        pipeline.release(second.index)
+        pipeline.release(first.index)
+    finally:
+        pipeline.close()
+        pipeline.close()
+
+
+def test_shared_pool_does_not_reuse_a_leased_transport_slot() -> None:
+    pipeline = _shared_pipeline(
+        item_count=4,
+        max_in_flight=2,
+        initial_in_flight=2,
+        transport=_TupleTransport(slot_count=2),
+    )
+    try:
+        first = pipeline.next_ordered(release_credit=False)
+        second = pipeline.next_ordered(release_credit=False)
+        pipeline.release(second.index)
+        time.sleep(0.05)
+        # Index 2 maps to the slot still leased by index 0, so generic credit
+        # availability alone must not permit its dispatch.
+        assert sum(int(value) for value in pipeline._shared_stage1_count_array) == 2
+        pipeline.release(first.index)
+        assert pipeline.next_ordered().value == 24
+        assert pipeline.next_ordered().value == 26
+    finally:
+        pipeline.close()
+
+
+def test_shared_pool_validates_configuration() -> None:
+    with pytest.raises(ValueError, match="must be 0 in shared-pool mode"):
+        _shared_pipeline(stage1_workers=1)
+    with pytest.raises(ValueError, match="requires stage2_factory"):
+        _shared_pipeline(stage2_factory=None)
+    with pytest.raises(ValueError, match="initial_in_flight"):
+        _shared_pipeline(initial_in_flight=7)
+    with pytest.raises(ValueError, match="slot_count"):
+        _shared_pipeline(transport=_TupleTransport(slot_count=5))

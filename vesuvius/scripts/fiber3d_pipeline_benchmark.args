@@ -6,10 +6,12 @@
 128
 --verify-samples
 0
---load-workers
+--shared-workers
+128
+--initial-in-flight
+16
+--shared-load-affinity-workers
 87
---augment-workers
-41
 --raw-queue-capacity
 128
 --result-queue-capacity

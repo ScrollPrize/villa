@@ -456,3 +456,10 @@
 - Vectorized the exact native stencil interior and balanced the fixed 128-worker
   topology, sustaining 229.75 loaded and augmented 128-cubed samples/s (223.95
   samples/s including startup and drain) on the S1a benchmark.
+
+## 2026-09-08 — Shared Fiber3D sample workers
+
+- Replaced fixed stage processes in the reusable benchmark with an autonomous
+  shared worker entrypoint, gradual bounded admission, exact slot ownership,
+  lazy stage state, and direct bounded inter-stage queues. Three 128-process
+  S1a runs averaged 225.56 loaded+augmented samples/s without GPU use.

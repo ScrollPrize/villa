@@ -397,3 +397,61 @@ Artifact:
 This establishes loader-plus-augmentation capacity; the normal trainer still
 uses its existing per-rank `DataLoader`, so connecting the reusable pipeline to
 DDP training and measuring quality-per-hour remain separate work.
+
+## Shared worker pool
+
+The split benchmark now supports `--shared-workers`. It creates one process
+population whose workers can run either stage without routing sample payloads
+through a Python scheduler. Load workers atomically claim monotonically
+admitted indices and augmentation workers consume the existing bounded raw
+queue directly. Soft stage affinity preserves loader/cache and augmentation
+working sets. A loader helps augmentation only when publishing to the raw queue
+would block, or after every load has been dispatched. Stage operations are
+initialized lazily, so augmentation-affine workers do not allocate unused VC
+loader/cache state.
+
+Admission is distinct from the hard shared-slot bound. The configured initial
+frontier is 16 samples; each completed load advances that frontier by two. The
+512 outstanding credits and generation-owned tensor slots remain the absolute
+bound, and a modulo slot cannot be reused until its exact earlier owner is
+delivered or explicitly released. Output remains reordered by deterministic
+stream index. Exceptions identify stage/index, clean exits and hard exits are
+failures, and the fixed-pool and stage-one-only modes remain available.
+
+The stable launcher now selects 128 shared workers with a soft 87-load/41-
+augmentation starting affinity:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_pipeline_benchmark
+```
+
+All measurements used the saved S1a 128-cubed reference, warm cache, Release
+GCC 13 VC bindings, one native I/O/decode/sample thread per worker, 4,096
+measured samples after 128 warmup samples, and no visible GPUs.
+
+| topology / metric | production samples/s | full start/drain samples/s |
+|---|---:|---:|
+| committed fixed reference | 229.75 | 223.95 |
+| contemporaneous fixed control | 232.20 | 226.22 |
+| shared trial 1 | 224.68 | 220.58 |
+| shared trial 2 | 227.44 | 223.03 |
+| shared trial 3 | 224.56 | 219.87 |
+| shared mean / median / approximate p95 | **225.56 / 224.68 / 227.16** | **221.16 / 220.58 / 222.79** |
+
+Final artifacts are:
+
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_102016_709985/result.json`
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_102112_977641/result.json`
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_102157_405229/result.json`
+
+After the control pipe was narrowed to its final one-way form, an exact-source
+confirmation run reached 227.18 production samples/s and 222.04 samples/s over
+the full start/drain span. Its artifact is
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_102823_682491/result.json`.
+
+The shared implementation exceeds the 221 samples/s production target and
+retains 97.1% of the contemporaneous fixed control on the three-run mean. It
+uses exactly 128 sample workers and the existing 5 GiB shared tensor bank.
+Observed production CPU demand was 124.3-125.2 logical cores. Peak RSS was not
+captured, which remains a measurement limitation. This is still benchmark-only;
+the normal DDP trainer has not yet been switched to this reusable pipeline.

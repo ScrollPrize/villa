@@ -1,47 +1,9 @@
-# Status
-- [x] Read workflow and relevant 3D specs; locate reference data.
-- [x] Write task and measurement plan.
-- [x] Independent plan review; incorporate provenance and elapsed-origin caveats.
-- [x] Implement and test event analysis (3 tests passed).
-- [x] Record historical measurements and saved reference configuration.
-- [ ] Collect uncontended current eight-GPU training profile.
-- [x] Implement optional two-GPU normal-training profiling and compile controls.
-- [x] Run eager two-GPU baseline, export both traces and verify tests.
-- [x] Complete both compile comparisons and report timings/numerical drift.
-- [x] Profile normal loader workers on two GPUs; verify unchanged batches and report stage/ordering costs.
-- [x] Split value-augmentation hotspot into substage measurements before tuning.
-- [x] Plan central bounded per-sample load/augmentation benchmark pipeline.
-- [x] Independently review the two-stage pipeline plan; incorporate bounded-credit and liveness findings.
-- [x] Implement and test the central pipeline and split loader boundary.
-- [x] Run and report the real S1a queue benchmark.
-- [x] Plan explicit single-thread coordinate sampling and stage-resolved metrics.
-- [x] Independently review the single-thread stage-profile plan; incorporate metric-scope and cold-observation findings.
-- [x] Implement and test sampler control and decoder/sampler instrumentation.
-- [x] Run and report controlled warm and fresh-process S1a benchmarks.
-- [x] Plan requested-level dependency and pinned-sampling optimization.
-- [x] Independently review the dependency/pinned-sampling plan; incorporate matched instrumentation and independent-reference checks.
-- [x] Capture isolated dependency/sampling baseline diagnostics.
-- [x] Implement shared footprint reuse and pinned single-chunk fast paths.
-- [x] Verify exact outputs and run the CPU-only S1a before/after benchmark.
-- [ ] Evaluate optimizations against quality per hour.
-- [x] Profile eager coordinate-generation operations independently.
-- [x] Implement and benchmark the intermediate cache-local Torch generator.
-- [x] Plan the custom C++ fused coordinate generator.
-- [x] Independently review the native generator plan and reconcile the superseded exact/implicit contract.
-- [x] Implement and test the portable native binding and loader backend.
-- [x] Benchmark native generation with 1 and 128 processes.
-- [x] Decide from measurements whether low-resolution 3D precomposition helps (defer: direct generation already exceeds the global target).
-- [x] Measure the full value-augmentation pipeline and identify its bottleneck.
-- [x] Add operation-resolved value-augmentation timings and capture a matched Torch baseline.
-- [x] Independently review the native anisotropic-blur plan; incorporate coordinate-roundtrip and full-volume validation findings.
-- [x] Implement and test the native one-thread three-pass stencil.
-- [x] Benchmark the native full augmentation pipeline and report per-core capacity.
-- [x] Commit the native oriented-blur increment (`19af65a07`).
-- [x] Plan and independently review the exact 128-worker continuation.
-- [x] Capture the exact 32-load/96-augment committed baseline.
-- [x] Fuse isotropic blur and deterministic point-value transforms natively.
-- [x] Measure fixed-split rebalance and fused-pool upper-bound probes.
-- [x] Identify bounded large-tensor transport as the next limiter.
-- [x] Replace raw/result tensor queue copies with generation-checked bounded shared slots.
-- [x] Sustain at least 221 fully augmented ordered samples/s at the 128-worker budget.
-- [ ] Connect the reusable central pipeline to multi-rank training and measure training throughput.
+# Shared Fiber3D sample-worker pool status
+
+- [x] Record task and implementation plan
+- [x] Independent plan review against task/specs/overarching plan
+- [x] Implement shared process pool and gradual bounded admission
+- [x] Add scheduler and transport regression tests
+- [x] Run focused test suite and static checks
+- [x] Benchmark 128-process CPU-only S1a pipeline
+- [x] Update specs, docs, task log, and changelog
