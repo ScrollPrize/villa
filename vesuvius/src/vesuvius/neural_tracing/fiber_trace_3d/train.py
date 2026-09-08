@@ -25,7 +25,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from vesuvius.neural_tracing.fiber_trace_3d.training_profile import (
     TrainingProfile, compile_training_model, loader_profile_enabled,
-    replay_batch_enabled,
+    replay_batch_enabled, replay_cpu_batch_enabled,
 )
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
@@ -36,6 +36,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     _read_raw_block,
     config_from_mapping,
     load_config,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
+    DistributedSampleIndex,
+    FiberTrace3DTrainingBatchPipeline,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
@@ -499,12 +503,39 @@ def _shutdown_dataloader_iterator(iterator: Any | None) -> None:
     shutdown = getattr(iterator, "_shutdown_workers", None)
     if callable(shutdown):
         shutdown()
+        return
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
 
 
 def _replayed_training_batch(
     batch: FiberTrace3DBatch,
 ) -> tuple[FiberTrace3DBatch, float, float, float, float]:
     return batch, 0.0, 0.0, 0.0, 0.0
+
+
+def _replayed_cpu_training_batch(
+    batch: FiberTrace3DBatch,
+    *,
+    loader: FiberTrace3DLoader,
+    device: torch.device,
+    output_stride: int,
+) -> tuple[FiberTrace3DBatch, float, float, float, float]:
+    to_device_start = time.perf_counter()
+    prepared = batch.to(device)
+    _synchronize_device(device)
+    to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
+    target_start = time.perf_counter()
+    prepared = materialize_targets(
+        prepared,
+        loader.config,
+        profile=True,
+        output_stride=output_stride,
+    )
+    _synchronize_device(device)
+    target_ms = (time.perf_counter() - target_start) * 1000.0
+    return prepared, to_device_ms + target_ms, 0.0, to_device_ms, target_ms
 
 
 def _batch_tensor_sha256(batch: FiberTrace3DBatch) -> str:
@@ -2296,8 +2327,19 @@ def run_training(
     training = dict(raw_config.get("training", {}))
     profile_loader = loader_profile_enabled(training)
     profile_replay_batch = replay_batch_enabled(training)
-    if profile_loader and _loader_worker_count(raw_config) <= 0:
-        raise ValueError("profile_loader requires loader_workers > 0")
+    profile_replay_cpu_batch = replay_cpu_batch_enabled(training)
+    if profile_replay_batch and profile_replay_cpu_batch:
+        raise ValueError(
+            "profile_replay_batch and profile_replay_cpu_batch are mutually exclusive"
+        )
+    if (
+        profile_loader
+        and _loader_worker_count(raw_config) <= 0
+        and _training_sample_pipeline_workers(training) <= 0
+    ):
+        raise ValueError(
+            "profile_loader requires loader_workers or sample_pipeline_workers > 0"
+        )
     (
         test_hang_diagnostics_config,
         test_hang_diagnostics_cli,
@@ -2341,7 +2383,7 @@ def run_training(
     if sync_batchnorm:
         raw_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(raw_model)
     normalization_module_counts = _normalization_module_counts(raw_model)
-    if profile_replay_batch:
+    if profile_replay_batch or profile_replay_cpu_batch:
         _validate_profile_normalization_modules(
             raw_config.get("model_3d", raw_config.get("model", {})).get(
                 "normalization", "batch"
@@ -2754,18 +2796,85 @@ def run_training(
     _distributed_barrier(distributed)
 
     remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
-    train_dataloader = _make_batch_dataloader(
-        config_path,
-        raw_config=raw_config,
-        start_batch_index=start_step * distributed.world_size + distributed.rank,
-        batch_index_stride=distributed.world_size,
-        batch_count=1 if profile_replay_batch else remaining_steps,
-        sample_index_limit=sample_index_limit,
-        sample_mode="random",
-        profile=profile_loader,
+    pipeline_batch_count = (
+        1 if profile_replay_batch or profile_replay_cpu_batch else remaining_steps
     )
-    train_iterator = iter(train_dataloader) if train_dataloader is not None else None
+    sample_pipeline_workers = _training_sample_pipeline_workers(training)
+    if sample_pipeline_workers > 0 and (
+        pipeline_batch_count is None or int(pipeline_batch_count) > 0
+    ):
+        if pipeline_batch_count is None:
+            raise ValueError("sample_pipeline_workers requires training.max_steps")
+        local_workers = _rank_partition(
+            sample_pipeline_workers,
+            world_size=distributed.world_size,
+            rank=distributed.rank,
+        )
+        total_affinity = int(
+            training.get("sample_pipeline_load_affinity_workers", 0)
+        ) or int(round(sample_pipeline_workers * (87.0 / 128.0)))
+        local_affinity = _rank_partition(
+            total_affinity,
+            world_size=distributed.world_size,
+            rank=distributed.rank,
+        )
+        total_slots = int(training.get("sample_pipeline_slots", 512))
+        local_slots = _rank_partition(
+            total_slots,
+            world_size=distributed.world_size,
+            rank=distributed.rank,
+        )
+        total_initial = int(training.get("sample_pipeline_initial_in_flight", 16))
+        local_initial = max(
+            loader.config.batch_size,
+            _rank_partition(
+                total_initial,
+                world_size=distributed.world_size,
+                rank=distributed.rank,
+            ),
+        )
+        if local_workers < 2 or not 0 < local_affinity < local_workers:
+            raise ValueError(
+                "sample pipeline partition must leave loading and augmentation workers per rank"
+            )
+        if local_slots < loader.config.batch_size or local_slots % loader.config.batch_size:
+            raise ValueError(
+                "sample_pipeline_slots partition must be a positive multiple of batch_size"
+            )
+        train_iterator = FiberTrace3DTrainingBatchPipeline(
+            config_path=str(Path(config_path).resolve()),
+            index_map=DistributedSampleIndex(
+                batch_size=loader.config.batch_size,
+                world_size=distributed.world_size,
+                rank=distributed.rank,
+                start_step=int(start_step),
+            ),
+            batch_size=loader.config.batch_size,
+            patch_shape_zyx=loader.config.patch_shape_zyx,
+            batch_count=int(pipeline_batch_count),
+            workers=local_workers,
+            load_affinity_workers=local_affinity,
+            slot_count=local_slots,
+            initial_in_flight=local_initial,
+            sample_index_limit=sample_index_limit,
+            sample_mode="random",
+            profile=profile_loader,
+        )
+        train_dataloader = train_iterator
+    else:
+        train_dataloader = _make_batch_dataloader(
+            config_path,
+            raw_config=raw_config,
+            start_batch_index=start_step * distributed.world_size + distributed.rank,
+            batch_index_stride=distributed.world_size,
+            batch_count=pipeline_batch_count,
+            sample_index_limit=sample_index_limit,
+            sample_mode="random",
+            profile=profile_loader,
+        )
+        train_iterator = iter(train_dataloader) if train_dataloader is not None else None
     replayed_batch: FiberTrace3DBatch | None = None
+    replayed_cpu_batch: FiberTrace3DBatch | None = None
     replayed_batch_sha256: str | None = None
     replayed_source_batch_sha256: str | None = None
     if profile_replay_batch:
@@ -2796,6 +2905,22 @@ def run_training(
                 f"source_sha256={replayed_source_batch_sha256}",
                 flush=True,
             )
+    elif profile_replay_cpu_batch:
+        if train_iterator is None:
+            raise RuntimeError("CPU replay requires a training DataLoader")
+        replayed_cpu_batch = next(train_iterator)
+        _shutdown_dataloader_iterator(train_iterator)
+        train_iterator = None
+        train_dataloader = None
+        replayed_source_batch_sha256 = _source_batch_tensor_sha256(replayed_cpu_batch)
+        _distributed_barrier(distributed)
+        if distributed.is_main:
+            print(
+                "fiber_trace_3d profile CPU replay: captured one augmented CPU batch "
+                "per rank; training loader stopped; "
+                f"source_sha256={replayed_source_batch_sha256}",
+                flush=True,
+            )
     profile = TrainingProfile(training, run_dir, distributed.rank, device)
     throughput_start_step = (
         int(training.get("profile_throughput_start_step", 31))
@@ -2822,7 +2947,20 @@ def run_training(
                 batch_size=loader.config.batch_size,
                 config=distributed,
             )
-            if replayed_batch is None:
+            if replayed_batch is not None:
+                batch, load_ms, wait_ms, to_device_ms, target_ms = (
+                    _replayed_training_batch(replayed_batch)
+                )
+            elif replayed_cpu_batch is not None:
+                batch, load_ms, wait_ms, to_device_ms, target_ms = (
+                    _replayed_cpu_training_batch(
+                        replayed_cpu_batch,
+                        loader=loader,
+                        device=device,
+                        output_stride=_model_output_stride(raw_model),
+                    )
+                )
+            else:
                 batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
                     iterator=train_iterator,
                     loader=loader,
@@ -2831,10 +2969,6 @@ def run_training(
                     sample_mode="random",
                     device=device,
                     output_stride=_model_output_stride(raw_model),
-                )
-            else:
-                batch, load_ms, wait_ms, to_device_ms, target_ms = (
-                    _replayed_training_batch(replayed_batch)
                 )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
@@ -2988,6 +3122,8 @@ def run_training(
                         throughput_steps * loader.config.batch_size / slowest_elapsed
                     ),
                     "replay_batch": profile_replay_batch,
+                    "replay_cpu_batch": profile_replay_cpu_batch,
+                    "sample_pipeline_workers": sample_pipeline_workers,
                     "replay_batch_sha256": replayed_batch_sha256,
                     "replay_source_batch_sha256": replayed_source_batch_sha256,
                     "normalization_module_counts": normalization_module_counts,
@@ -3024,6 +3160,7 @@ def run_training(
             if test_dataloader is not None:
                 test_dataloader = None
             if train_dataloader is not None:
+                _shutdown_dataloader_iterator(train_iterator)
                 train_iterator = None
                 train_dataloader = None
             if writer is not None:
@@ -4346,6 +4483,19 @@ def _loader_worker_count(raw_config: dict[str, Any]) -> int:
     return workers
 
 
+def _rank_partition(total: int, *, world_size: int, rank: int) -> int:
+    if total < 0 or world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("invalid distributed partition")
+    return total // world_size + int(rank < total % world_size)
+
+
+def _training_sample_pipeline_workers(training: dict[str, Any]) -> int:
+    workers = int(training.get("sample_pipeline_workers", 0))
+    if workers < 0:
+        raise ValueError("training.sample_pipeline_workers must be nonnegative")
+    return workers
+
+
 def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:
     training = dict(raw_config.get("training", {}))
     raw_factor = training.get("loader_prefetch_factor", raw_config.get("loader_prefetch_factor", 2))
@@ -4474,9 +4624,14 @@ def _next_training_batch(
         })
     wait_ms = (time.perf_counter() - wait_start) * 1000.0
     to_device_start = time.perf_counter()
-    batch = batch.to(device)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+    try:
+        batch = batch.to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    finally:
+        release_current = getattr(iterator, "release_current", None)
+        if callable(release_current):
+            release_current()
     to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
     target_start = time.perf_counter()
     batch = materialize_targets(

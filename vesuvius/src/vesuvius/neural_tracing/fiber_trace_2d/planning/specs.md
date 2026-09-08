@@ -2914,3 +2914,11 @@
   shared-slot ownership remain capped by `max_in_flight` until ordered delivery
   or explicit release. A future index cannot reuse a modulo slot still owned by
   an earlier leased sample.
+- Training may opt into the reusable per-sample pool with
+  `training.sample_pipeline_workers`. Worker, shared-slot, load-affinity, and
+  initial-admission settings are global host budgets partitioned
+  deterministically across DDP ranks. Each rank maps consecutive local
+  pipeline indices onto the canonical interleaved DDP sample stream.
+- Shared batch slots remain leased until the rank's H2D copy has synchronized.
+  Training closes the pipeline explicitly on normal or exceptional exit. A
+  zero worker count retains the legacy whole-batch DataLoader path.

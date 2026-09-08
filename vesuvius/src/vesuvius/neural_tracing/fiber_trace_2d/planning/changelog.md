@@ -473,3 +473,11 @@
   shared worker entrypoint, gradual bounded admission, exact slot ownership,
   lazy stage state, and direct bounded inter-stage queues. Three 128-process
   S1a runs averaged 225.56 loaded+augmented samples/s without GPU use.
+
+## 2026-09-08 — Fiber3D trainer sample-pipeline integration
+
+- Connected the bounded shared per-sample pipeline to DDP training with exact
+  rank-stream mapping and H2D-safe slot release. Two stride-4 GroupNorm runs
+  averaged 83.81 samples/s on two GPUs versus 60.12 for the old DataLoader.
+- Added CPU-batch replay profiling, measuring an 88.22 samples/s
+  transfer/target/model ceiling and isolating the old producer as the main gap.

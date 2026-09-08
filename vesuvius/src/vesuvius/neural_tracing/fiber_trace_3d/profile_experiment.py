@@ -52,9 +52,19 @@ def main():
     parser.add_argument("--trace-steps", type=int, default=5)
     parser.add_argument("--profile-loader", action="store_true")
     parser.add_argument(
+        "--sample-pipeline",
+        action="store_true",
+        help="use the bounded shared per-sample CPU pipeline in training",
+    )
+    parser.add_argument(
         "--replay-batch",
         action="store_true",
         help="capture one prepared GPU batch per rank, stop loaders, and replay it",
+    )
+    parser.add_argument(
+        "--replay-cpu-batch",
+        action="store_true",
+        help="capture one augmented CPU batch per rank and repeat normal H2D/target preparation",
     )
     parser.add_argument(
         "--throughput-only",
@@ -62,6 +72,8 @@ def main():
         help="disable evaluation, visualization, snapshots, TensorBoard, and tracing",
     )
     args = parser.parse_args()
+    if args.replay_batch and args.replay_cpu_batch:
+        parser.error("--replay-batch and --replay-cpu-batch are mutually exclusive")
     if args.steps < 30 or args.trace_steps < 0:
         parser.error("steps must be >=30 and trace-steps nonnegative")
     if args.output_stride <= 0:
@@ -73,9 +85,19 @@ def main():
         parser.error("reference experiment must start fresh, not resume")
     config.pop("_config_dir", None)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    suffix = "_replay" if args.replay_batch else ("_loader" if args.profile_loader else "")
+    suffix = (
+        "_replay"
+        if args.replay_batch
+        else "_cpu_replay"
+        if args.replay_cpu_batch
+        else "_loader"
+        if args.profile_loader
+        else ""
+    )
     suffix += f"_{args.normalization.replace('-', '_')}"
     suffix += f"_os{args.output_stride}"
+    if args.sample_pipeline:
+        suffix += "_sample_pipeline"
     experiment = args.output.resolve() / f"profile_2gpu_{args.compile_mode}{suffix}_{stamp}"
     experiment.mkdir(parents=True, exist_ok=False)
     training = config["training"]
@@ -89,9 +111,19 @@ def main():
                     initialization_seed=0, profile_enabled=True,
                     profile_loader=args.profile_loader,
                     profile_replay_batch=args.replay_batch,
+                    profile_replay_cpu_batch=args.replay_cpu_batch,
                     profile_trace_start=21, profile_trace_steps=args.trace_steps,
                     scalar_log_interval=1)
-    throughput_only = bool(args.throughput_only or args.replay_batch)
+    if args.sample_pipeline:
+        training.update(
+            sample_pipeline_workers=128,
+            sample_pipeline_load_affinity_workers=87,
+            sample_pipeline_slots=512,
+            sample_pipeline_initial_in_flight=16,
+        )
+    throughput_only = bool(
+        args.throughput_only or args.replay_batch or args.replay_cpu_batch
+    )
     if throughput_only:
         training.update(
             profile_throughput_start_step=31,
@@ -123,7 +155,9 @@ def main():
                 "normalization": args.normalization,
                 "output_stride": int(args.output_stride),
                 "profile_loader": args.profile_loader,
+                "sample_pipeline": args.sample_pipeline,
                 "replay_batch": args.replay_batch,
+                "replay_cpu_batch": args.replay_cpu_batch,
                 "throughput_only": throughput_only}
     metadata["python"] = sys.version
     metadata["packages"] = {name: importlib.metadata.version(name)

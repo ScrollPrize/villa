@@ -24,6 +24,15 @@ def replay_batch_enabled(training):
     return enabled
 
 
+def replay_cpu_batch_enabled(training):
+    enabled = training.get("profile_replay_cpu_batch", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("training.profile_replay_cpu_batch must be a JSON boolean")
+    if enabled and training.get("profile_enabled") is not True:
+        raise ValueError("training.profile_replay_cpu_batch requires profile_enabled=true")
+    return enabled
+
+
 def compile_training_model(model, mode):
     if mode == "off":
         return model

@@ -10,7 +10,6 @@ import os
 import platform
 import sys
 import time
-import warnings
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +24,12 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DRawSample,
     FiberTrace3DSample,
     FiberTrace3DSharedTensorSlots,
-    augment_fiber_trace_3d_raw_sample,
     load_config,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
+    FiberTrace3DAugmentFactory,
+    FiberTrace3DFusedLoadFactory,
+    FiberTrace3DLoadFactory,
 )
 from vesuvius.neural_tracing.ordered_sample_pipeline import (
     OrderedPipelineResult,
@@ -34,92 +37,6 @@ from vesuvius.neural_tracing.ordered_sample_pipeline import (
 )
 import vesuvius.neural_tracing.ordered_sample_pipeline as ordered_pipeline_module
 import vesuvius.neural_tracing.fiber_trace_3d.loader as loader_module
-
-
-@dataclass(frozen=True)
-class _LoadOperation:
-    loader: FiberTrace3DLoader
-    sample_index_limit: int | None
-    sample_mode: str
-
-    def __call__(self, index: int) -> FiberTrace3DRawSample:
-        return self.loader.load_raw_sample(
-            index,
-            sample_index_limit=self.sample_index_limit,
-            sample_mode=self.sample_mode,
-            device="cpu",
-            profile=True,
-        )
-
-
-@dataclass(frozen=True)
-class _LoadFactory:
-    config_path: str
-    sample_index_limit: int | None
-    sample_mode: str
-
-    def __call__(self) -> _LoadOperation:
-        warnings.filterwarnings(
-            "ignore",
-            message=r"skipping NML fiber component with branch node:.*",
-            category=RuntimeWarning,
-        )
-        return _LoadOperation(
-            FiberTrace3DLoader(load_config(self.config_path)),
-            self.sample_index_limit,
-            self.sample_mode,
-        )
-
-
-@dataclass(frozen=True)
-class _FusedLoadOperation:
-    loader: FiberTrace3DLoader
-    sample_index_limit: int | None
-    sample_mode: str
-
-    def __call__(self, index: int) -> FiberTrace3DSample:
-        return self.loader.load_sample(
-            index,
-            sample_index_limit=self.sample_index_limit,
-            sample_mode=self.sample_mode,
-            device="cpu",
-            profile=True,
-        )
-
-
-@dataclass(frozen=True)
-class _FusedLoadFactory:
-    config_path: str
-    sample_index_limit: int | None
-    sample_mode: str
-
-    def __call__(self) -> _FusedLoadOperation:
-        warnings.filterwarnings(
-            "ignore",
-            message=r"skipping NML fiber component with branch node:.*",
-            category=RuntimeWarning,
-        )
-        return _FusedLoadOperation(
-            FiberTrace3DLoader(load_config(self.config_path)),
-            self.sample_index_limit,
-            self.sample_mode,
-        )
-
-
-@dataclass(frozen=True)
-class _AugmentOperation:
-    config: Any
-
-    def __call__(self, raw: FiberTrace3DRawSample) -> FiberTrace3DSample:
-        return augment_fiber_trace_3d_raw_sample(self.config, raw, profile=True)
-
-
-@dataclass(frozen=True)
-class _AugmentFactory:
-    config_path: str
-
-    def __call__(self) -> _AugmentOperation:
-        return _AugmentOperation(load_config(self.config_path))
 
 
 def _assert_samples_equal(actual: FiberTrace3DSample, expected: FiberTrace3DSample) -> None:
@@ -522,16 +439,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     startup_started = time.perf_counter()
     stage1_factory = (
-        _FusedLoadFactory(str(config_path), sample_limit, str(args.sample_mode))
+        FiberTrace3DFusedLoadFactory(str(config_path), sample_limit, str(args.sample_mode))
         if bool(args.fused)
-        else _LoadFactory(str(config_path), sample_limit, str(args.sample_mode))
+        else FiberTrace3DLoadFactory(str(config_path), sample_limit, str(args.sample_mode))
     )
     pipeline = OrderedTwoStageSamplePipeline(
         stage1_factory=stage1_factory,
         stage2_factory=(
             None
             if bool(args.raw_only) or bool(args.fused)
-            else _AugmentFactory(str(config_path))
+            else FiberTrace3DAugmentFactory(str(config_path))
         ),
         start_index=int(args.start_index),
         item_count=total_items,

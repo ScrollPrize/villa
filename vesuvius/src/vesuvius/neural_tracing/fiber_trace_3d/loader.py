@@ -221,11 +221,13 @@ class FiberTrace3DSharedTensorSlots:
         start_index: int,
         slot_count: int,
         patch_shape_zyx: tuple[int, int, int],
+        stream_index_map: Any = None,
     ) -> None:
         if int(slot_count) <= 0:
             raise ValueError("slot_count must be positive")
         self.start_index = int(start_index)
         self.slot_count = int(slot_count)
+        self.stream_index_map = stream_index_map
         shape = (self.slot_count, 1, *(int(v) for v in patch_shape_zyx))
         self.volumes = torch.empty(shape, dtype=torch.float32).share_memory_()
         self.valid_masks = torch.empty(shape, dtype=torch.bool).share_memory_()
@@ -249,7 +251,12 @@ class FiberTrace3DSharedTensorSlots:
         del final
         sample = value.sample if isinstance(value, FiberTrace3DRawSample) else value
         slot, generation = self._location(index)
-        if int(sample.stream_index) != int(index):
+        expected_stream_index = (
+            int(index)
+            if self.stream_index_map is None
+            else int(self.stream_index_map(int(index)))
+        )
+        if int(sample.stream_index) != expected_stream_index:
             raise RuntimeError("shared-slot sample/index mismatch")
         self.volumes[slot].copy_(sample.volume)
         self.valid_masks[slot].copy_(sample.valid_mask)
@@ -418,6 +425,102 @@ class FiberTrace3DBatch:
             presence_mask=None if self.presence_mask is None else self.presence_mask.to(device),
             profile_timings_ms=self.profile_timings_ms,
         )
+
+
+def collate_fiber_trace_3d_samples(
+    samples: list[FiberTrace3DSample],
+    *,
+    volume_batch: torch.Tensor | None = None,
+    valid_mask_batch: torch.Tensor | None = None,
+    profile: bool = False,
+    total_start: float | None = None,
+    cpu_total_start: float | None = None,
+    wall_start_ns: int | None = None,
+) -> FiberTrace3DBatch:
+    """Collate ordered samples, optionally retaining zero-copy shared tensor views."""
+
+    if not samples:
+        raise ValueError("cannot collate an empty Fiber3D sample list")
+    stack_start = time.perf_counter()
+    total_start = stack_start if total_start is None else float(total_start)
+    cpu_total_start = time.process_time() if cpu_total_start is None else float(cpu_total_start)
+    wall_start_ns = time.time_ns() if wall_start_ns is None else int(wall_start_ns)
+    timings: dict[str, float] | None = None
+    if profile:
+        timings = {}
+        keys = set().union(*(set(sample.profile_timings_ms or {}) for sample in samples))
+        for key in sorted(keys):
+            timings[key] = float(
+                sum(float((sample.profile_timings_ms or {}).get(key, 0.0)) for sample in samples)
+            )
+    segment_offsets: list[int] = []
+    segment_counts: list[int] = []
+    offset = 0
+    for sample in samples:
+        count = int(sample.target_segment_starts_zyx.shape[0])
+        segment_offsets.append(offset)
+        segment_counts.append(count)
+        offset += count
+    if offset > 0:
+        segment_starts = torch.cat([sample.target_segment_starts_zyx for sample in samples])
+        segment_ends = torch.cat([sample.target_segment_ends_zyx for sample in samples])
+        segment_bbox_lo = torch.cat([sample.target_segment_bbox_lo_zyx for sample in samples])
+        segment_bbox_hi = torch.cat([sample.target_segment_bbox_hi_zyx for sample in samples])
+    else:
+        device = samples[0].volume.device
+        segment_starts = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        segment_ends = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        segment_bbox_lo = torch.zeros((0, 3), dtype=torch.long)
+        segment_bbox_hi = torch.zeros((0, 3), dtype=torch.long)
+    if (volume_batch is None) != (valid_mask_batch is None):
+        raise ValueError("volume_batch and valid_mask_batch must be supplied together")
+    if volume_batch is None:
+        volume_batch = torch.stack([sample.volume for sample in samples])
+        valid_mask_batch = torch.stack([sample.valid_mask for sample in samples])
+    assert valid_mask_batch is not None
+    if int(volume_batch.shape[0]) != len(samples) or int(valid_mask_batch.shape[0]) != len(samples):
+        raise ValueError("prebuilt batch tensors do not match sample count")
+    return FiberTrace3DBatch(
+        volume=volume_batch,
+        valid_mask=valid_mask_batch,
+        cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples]),
+        crop_origin_zyx=torch.stack([sample.crop_origin_zyx for sample in samples]),
+        stream_indices=torch.as_tensor(
+            [sample.stream_index for sample in samples],
+            dtype=torch.long,
+            device=samples[0].volume.device,
+        ),
+        data_indices=torch.as_tensor(
+            [sample.data_index for sample in samples], dtype=torch.long,
+            device=samples[0].volume.device,
+        ),
+        record_indices=torch.as_tensor(
+            [sample.record_index for sample in samples], dtype=torch.long,
+            device=samples[0].volume.device,
+        ),
+        control_point_indices=torch.as_tensor(
+            [sample.control_point_index for sample in samples], dtype=torch.long,
+            device=samples[0].volume.device,
+        ),
+        fiber_paths=tuple(sample.fiber_path for sample in samples),
+        target_modes=torch.as_tensor([sample.target_mode for sample in samples], dtype=torch.long),
+        target_segment_offsets=torch.as_tensor(segment_offsets, dtype=torch.long),
+        target_segment_counts=torch.as_tensor(segment_counts, dtype=torch.long),
+        target_segment_starts_zyx=segment_starts,
+        target_segment_ends_zyx=segment_ends,
+        target_segment_bbox_lo_zyx=segment_bbox_lo,
+        target_segment_bbox_hi_zyx=segment_bbox_hi,
+        target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples]),
+        profile_timings_ms={
+            **(timings or {}),
+            "batch_stack_ms": (time.perf_counter() - stack_start) * 1000.0,
+            "batch_total_ms": (time.perf_counter() - total_start) * 1000.0,
+            "batch_cpu_ms": (time.process_time() - cpu_total_start) * 1000.0,
+            "worker_pid": float(os.getpid()),
+            "worker_batch_start_ns": float(wall_start_ns),
+            "worker_batch_end_ns": float(time.time_ns()),
+        } if profile else None,
+    )
 
 
 def _as_zyx3(value: Any, *, key: str) -> tuple[int, int, int]:
@@ -2617,88 +2720,12 @@ class FiberTrace3DLoader:
             )
             for offset in range(int(self.config.batch_size))
         ]
-        stack_start = time.perf_counter()
-        timings: dict[str, float] | None = None
-        if profile:
-            timings = {}
-            keys = set().union(
-                *[
-                    set(sample.profile_timings_ms or {})
-                    for sample in samples
-                ]
-            )
-            for key in sorted(keys):
-                timings[key] = float(
-                    sum(float((sample.profile_timings_ms or {}).get(key, 0.0)) for sample in samples)
-                )
-        segment_offsets: list[int] = []
-        segment_counts: list[int] = []
-        offset = 0
-        for sample in samples:
-            count = int(sample.target_segment_starts_zyx.shape[0])
-            segment_offsets.append(offset)
-            segment_counts.append(count)
-            offset += count
-        if offset > 0:
-            segment_starts = torch.cat(
-                [sample.target_segment_starts_zyx for sample in samples],
-                dim=0,
-            )
-            segment_ends = torch.cat(
-                [sample.target_segment_ends_zyx for sample in samples],
-                dim=0,
-            )
-            segment_bbox_lo = torch.cat(
-                [sample.target_segment_bbox_lo_zyx for sample in samples],
-                dim=0,
-            )
-            segment_bbox_hi = torch.cat(
-                [sample.target_segment_bbox_hi_zyx for sample in samples],
-                dim=0,
-            )
-        else:
-            segment_starts = torch.zeros((0, 3), dtype=torch.float32, device=samples[0].volume.device)
-            segment_ends = torch.zeros((0, 3), dtype=torch.float32, device=samples[0].volume.device)
-            segment_bbox_lo = torch.zeros((0, 3), dtype=torch.long)
-            segment_bbox_hi = torch.zeros((0, 3), dtype=torch.long)
-        return FiberTrace3DBatch(
-            volume=torch.stack([sample.volume for sample in samples], dim=0),
-            valid_mask=torch.stack([sample.valid_mask for sample in samples], dim=0),
-            cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples], dim=0),
-            crop_origin_zyx=torch.stack([sample.crop_origin_zyx for sample in samples], dim=0),
-            stream_indices=torch.as_tensor([sample.stream_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
-            data_indices=torch.as_tensor([sample.data_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
-            record_indices=torch.as_tensor([sample.record_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
-            control_point_indices=torch.as_tensor([sample.control_point_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
-            fiber_paths=tuple(sample.fiber_path for sample in samples),
-            target_modes=torch.as_tensor(
-                [sample.target_mode for sample in samples],
-                dtype=torch.long,
-            ),
-            target_segment_offsets=torch.as_tensor(
-                segment_offsets,
-                dtype=torch.long,
-            ),
-            target_segment_counts=torch.as_tensor(
-                segment_counts,
-                dtype=torch.long,
-            ),
-            target_segment_starts_zyx=segment_starts,
-            target_segment_ends_zyx=segment_ends,
-            target_segment_bbox_lo_zyx=segment_bbox_lo,
-            target_segment_bbox_hi_zyx=segment_bbox_hi,
-            target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples], dim=0),
-            profile_timings_ms={
-                **(timings or {}),
-                "batch_stack_ms": (time.perf_counter() - stack_start) * 1000.0,
-                "batch_total_ms": (time.perf_counter() - total_start) * 1000.0,
-                "batch_cpu_ms": (time.process_time() - cpu_total_start) * 1000.0,
-                "worker_pid": float(os.getpid()),
-                "worker_batch_start_ns": float(wall_start_ns),
-                "worker_batch_end_ns": float(time.time_ns()),
-            }
-            if profile
-            else None,
+        return collate_fiber_trace_3d_samples(
+            samples,
+            profile=profile,
+            total_start=total_start,
+            cpu_total_start=cpu_total_start,
+            wall_start_ns=wall_start_ns,
         )
 
     def _chunk_requests_and_valid_voxels_for_sample_index(

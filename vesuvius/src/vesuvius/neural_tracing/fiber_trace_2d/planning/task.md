@@ -1,12 +1,10 @@
-# Native lower-resolution Fiber3D U-Net output
+# Task: explain the native quarter-resolution end-to-end throughput gap
 
-Accelerate Fiber3D training by making the shared 3D U-Net emit predictions
-directly at the lower resolution already used by Fiber inference. The initial
-experiment uses output stride 4 (quarter resolution along each axis), stops the
-decoder before its full- and half-resolution stages, and retains GroupNorm as
-the fastest measured normalization.
+Profile why Fiber3D native stride-4 GroupNorm training improves replay/model-only
+throughput by about 73%, but improves the full loading and augmentation pipeline
+by only about 18%. Use the S1a 128-cube two-GPU reference on physical GPUs 0 and
+1, `/home/hendrik/.venv_las`, and `/ephemeral/hendrik/fiber3d_train2`.
 
-Keep the existing full-resolution architecture as the compatibility default.
-Measure the native-stride architecture against the matched GroupNorm replay and
-real-sample baselines on physical GPUs 0 and 1. This phase optimizes speed; any
-effect on convergence or prediction quality will be ablated later.
+Attribute time and stalls precisely enough to select and implement the next
+highest-impact optimization. Keep the overarching target of at least 221
+samples/s for the eventual 8-GPU training run.

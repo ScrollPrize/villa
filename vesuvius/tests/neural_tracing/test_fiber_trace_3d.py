@@ -70,6 +70,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     config_from_mapping,
     load_config,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
+    DistributedSampleIndex,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     FiberTrace3DModelConfig,
     FiberTrace3DNet,
@@ -314,6 +317,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _distributed_training_sample_index,
     _mean_dense_test_rows,
     _report_test_timing,
+    _rank_partition,
     _resolve_test_hang_diagnostics_enabled,
     _resolve_test_watchdog_seconds,
     _resolve_dense_test_selection,
@@ -875,6 +879,39 @@ def test_shared_tensor_slots_expose_zero_copy_contiguous_batch() -> None:
     assert torch.equal(volumes[1], expected[1])
     with pytest.raises(RuntimeError, match="crosses or is not contiguous"):
         slots.batch_tensors([4, 6])
+
+
+def test_distributed_sample_index_maps_rank_local_batches() -> None:
+    index_map = DistributedSampleIndex(
+        batch_size=8,
+        world_size=2,
+        rank=1,
+        start_step=3,
+    )
+    assert [index_map(index) for index in (0, 7, 8, 15)] == [56, 63, 72, 79]
+
+
+def test_rank_partition_is_complete_and_balanced() -> None:
+    parts = [_rank_partition(87, world_size=8, rank=rank) for rank in range(8)]
+    assert sum(parts) == 87
+    assert max(parts) - min(parts) == 1
+
+
+def test_shared_tensor_slots_validate_mapped_stream_index() -> None:
+    loader = _loader_with_mapping({"patch_shape_zyx": [8, 8, 8]})
+    index_map = DistributedSampleIndex(batch_size=1, world_size=2, rank=1)
+    slots = FiberTrace3DSharedTensorSlots(
+        start_index=0,
+        slot_count=2,
+        patch_shape_zyx=(8, 8, 8),
+        stream_index_map=index_map,
+    )
+    raw = loader.load_raw_sample(index_map(0))
+    payload = slots.encode(0, raw, final=False)
+    restored = slots.decode(0, payload, final=False)
+    assert restored.sample.stream_index == 1
+    with pytest.raises(RuntimeError, match="sample/index mismatch"):
+        slots.encode(1, raw, final=False)
 
 
 def test_3d_config_defaults_volume_cache_to_512_mib() -> None:

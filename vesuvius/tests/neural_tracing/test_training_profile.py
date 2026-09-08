@@ -4,7 +4,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.training_profile import (
     TrainingProfile, compile_training_model, loader_profile_enabled,
-    replay_batch_enabled,
+    replay_batch_enabled, replay_cpu_batch_enabled,
 )
 
 
@@ -24,6 +24,19 @@ def test_replay_batch_requires_explicit_timing_output():
         replay_batch_enabled({"profile_replay_batch": "true", "profile_enabled": True})
     with pytest.raises(ValueError):
         replay_batch_enabled({"profile_replay_batch": True})
+
+
+def test_replay_cpu_batch_requires_explicit_timing_output():
+    assert not replay_cpu_batch_enabled({})
+    assert replay_cpu_batch_enabled(
+        {"profile_replay_cpu_batch": True, "profile_enabled": True}
+    )
+    with pytest.raises(ValueError):
+        replay_cpu_batch_enabled(
+            {"profile_replay_cpu_batch": "true", "profile_enabled": True}
+        )
+    with pytest.raises(ValueError):
+        replay_cpu_batch_enabled({"profile_replay_cpu_batch": True})
 
 
 def test_disabled_creates_nothing(tmp_path):

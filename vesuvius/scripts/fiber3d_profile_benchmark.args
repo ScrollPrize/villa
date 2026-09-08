@@ -5,6 +5,7 @@ off
 group
 --output-stride
 4
---replay-batch
+--throughput-only
+--sample-pipeline
 --trace-steps
 0

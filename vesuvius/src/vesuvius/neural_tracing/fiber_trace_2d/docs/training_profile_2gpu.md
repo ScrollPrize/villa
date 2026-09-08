@@ -241,3 +241,44 @@ Fresh paired artifacts:
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_replay_group_os1_20260908_150959_126046`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_replay_group_os4_20260908_151616_525550`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_20260908_143002_480159`
+
+## Quarter-resolution input-path attribution, 2026-09-08
+
+Fresh-process GroupNorm stride-4 runs on the same two H100s separated four
+paths. All used global batch 16, BF16 eager training, 30 warmup steps and a
+90-step slowest-rank throughput window.
+
+| Path | Global samples/s | Role |
+| --- | ---: | --- |
+| prepared GPU batch replay | 95.708 | model/DDP ceiling |
+| augmented CPU batch replay | 88.224 | repeats H2D and target construction |
+| old whole-batch DataLoader | 60.115 | original real producer |
+| shared per-sample trainer, trial 1 | 84.028 | integrated replacement |
+| shared per-sample trainer, trial 2 | 83.595 | integrated replacement |
+| shared trainer with loader timings | 84.853 | instrumentation control |
+
+The old trainer assigns a complete eight-sample batch to each of eight
+DataLoader workers per rank. A worker took about 2.08s per batch. Stalls recur
+every eight optimizer steps: one rank waits for the next producer wave while
+the other blocks at the following DDP reduction. Stride 1 hid this limitation
+because its model step was slower; the matched stride-1 real run reached 49.771
+samples/s with approximately 3.2ms median loader wait.
+
+The CPU replay retained normal transfer and target work and reached 88.224
+samples/s, showing that those stages explain only a small part of the gap. The
+integrated per-sample pipeline divides one global 128-worker, 512-slot budget
+across DDP ranks and preserves the exact canonical sample stream. Two
+uninstrumented runs averaged 83.812 samples/s, 39.4% faster than the old real
+path and 95.0% of the CPU-replay ceiling. Median producer wait is below 1ms;
+remaining work is primarily H2D/target preparation and small host scheduling
+jitter.
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_loader_group_os4_20260908_155518_542157`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_loader_group_os1_20260908_155834_757852`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_20260908_160021_141679`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_replay_group_os4_20260908_160148_611880`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_cpu_replay_group_os4_20260908_160615_494193`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_20260908_162049_091414`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_loader_group_os4_sample_pipeline_20260908_162210_991101`
