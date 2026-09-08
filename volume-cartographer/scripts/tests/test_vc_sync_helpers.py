@@ -4,6 +4,7 @@ Pure-local: a temp directory stands in for the sync dir and tracked rows are
 written straight into the SQLite DB. No S3 or network access.
 """
 import copy
+import hashlib
 import json
 import os
 import sqlite3
@@ -48,6 +49,12 @@ def track_row(manager, path, local_size, local_mtime, s3_size, s3_etag,
             '(path, local_size, local_mtime, s3_size, s3_mtime, s3_etag, local_md5) '
             'VALUES (?, ?, ?, ?, ?, ?, ?)',
             (path, local_size, local_mtime, s3_size, 0.0, s3_etag, local_md5))
+
+
+def plan3(manager, *args, **kwargs):
+    """Legacy planner call: (pending, peer_fixes, manual) by attribute."""
+    result = manager._plan_conflict_resolutions(*args, **kwargs)
+    return result.pending, result.peer_fixes, result.manual
 
 
 def local_info(manager, relpath):
@@ -1046,7 +1053,7 @@ class TestDemotionFixpoint:
                             lambda path, li, si: plans[path])
         conflicts = [('fibers/a.json', 'both changed'),
                      ('fibers/b.json', 'both changed')]
-        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+        pending, peer_fixes, manual = plan3(manager,
             conflicts, {}, {}, set(), set(), auto_merge=True)
         assert pending == []
         assert peer_fixes == {}
@@ -1068,7 +1075,7 @@ class TestDemotionFixpoint:
         write_local(manager, 'fibers/p.json', json.dumps(stale))
         monkeypatch.setattr(manager, '_attempt_auto_merge',
                             lambda path, li, si: plan)
-        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+        pending, peer_fixes, manual = plan3(manager,
             [('fibers/a.json', 'both changed')], {}, {}, set(),
             {'fibers/p.json'}, auto_merge=True)
         assert [p for p, _ in pending] == ['fibers/a.json']
@@ -1087,7 +1094,7 @@ class TestDemotionFixpoint:
             TestLinkConsistency.fiber('p.json', TestLinkConsistency.CPS_B)))
         monkeypatch.setattr(manager, '_attempt_auto_merge',
                             lambda path, li, si: plan)
-        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+        pending, peer_fixes, manual = plan3(manager,
             [('fibers/a.json', 'both changed')], {}, {}, set(),
             {'fibers/p.json'}, auto_merge=True)
         assert pending == []
@@ -1107,7 +1114,7 @@ class TestDemotionFixpoint:
         monkeypatch.setattr(manager, '_attempt_auto_merge', attempt)
         conflicts = [('fibers/a.json', 'both changed'),
                      ('fibers/b.json', 'both changed')]
-        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+        pending, peer_fixes, manual = plan3(manager,
             conflicts, {}, {}, set(), set(), auto_merge=True)
         assert pending == [] and peer_fixes == {}
         assert {p for p, _ in manual} == {'fibers/a.json', 'fibers/b.json'}
@@ -1137,6 +1144,347 @@ class TestDemotionFixpoint:
             [('fibers/a.json', plan)], set())
         assert demoted and demoted[0][0] == 'fibers/a.json'
         assert peer_fixes == {}
+
+
+class TestPromptThenPlan:
+    """_plan_conflict_resolutions with a resolve callback: content
+    conflicts are decided BEFORE link planning, so a decided root un-blocks
+    its dependents in the same run; only skipped files cascade."""
+
+    CPS = TestLinkConsistency.CPS_A
+
+    @pytest.fixture(params=['manager', 'sftp_manager'])
+    def mgr(self, request):
+        return request.getfixturevalue(request.param)
+
+    def plan_for(self, mgr, path, peers, branches=None):
+        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS,
+                                        branches=branches)
+        pending = mgr._merge_tmp_path(path, '.merged')
+        with open(pending, 'w') as f:
+            json.dump(doc, f)
+        write_local(mgr, path, json.dumps(doc))
+        return {'pending': pending, 'remote_tmp': None, 'summary': 's',
+                'merged_doc': doc,
+                'base_doc': TestLinkConsistency.fiber(os.path.basename(path),
+                                                      self.CPS),
+                'peer_files': peers}
+
+    def install(self, mgr, monkeypatch, plans, roots):
+        """plans: path -> plan (auto-mergeable); roots: content failures.
+        Returns (merge_calls, fetched) recorders."""
+        merge_calls = []
+        fetched = []
+
+        def attempt(path, li, si):
+            merge_calls.append(path)
+            return plans.get(path)
+
+        def fetch(path):
+            fetched.append(path)
+            doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS)
+            tmp = mgr._merge_tmp_path(path, '.remote')
+            with open(tmp, 'w') as f:
+                json.dump(doc, f)
+            return doc, tmp
+
+        for root in roots:
+            write_local(mgr, root, json.dumps(
+                TestLinkConsistency.fiber(os.path.basename(root), self.CPS)))
+        monkeypatch.setattr(mgr, '_attempt_auto_merge', attempt)
+        monkeypatch.setattr(mgr, '_fetch_remote_json', fetch)
+        return merge_calls, fetched
+
+    @staticmethod
+    def resolver(answers, default=SyncAction.SKIP):
+        prompts = []
+        reasons = {}
+
+        def resolve(path, reason):
+            prompts.append(path)
+            reasons[path] = reason
+            return answers.get(path, default)
+        resolve.prompts = prompts
+        resolve.reasons = reasons
+        return resolve
+
+    @staticmethod
+    def conflicts(*paths):
+        return [(p, 'Both local and S3 modified since last sync') for p in paths]
+
+    def test_resolve_none_is_legacy_fixpoint(self, mgr, monkeypatch):
+        """R manual; A->R, B->A, C->R. Today's eager stage 1 yields manual
+        order R, A, B, C (B sees A demoted within the same pass)."""
+        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json']),
+                 'fibers/b.json': self.plan_for(mgr, 'fibers/b.json', ['a.json']),
+                 'fibers/c.json': self.plan_for(mgr, 'fibers/c.json', ['r.json'])}
+        self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/a.json', 'fibers/b.json', 'fibers/c.json',
+                           'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True)
+        assert result.pending == [] and result.peer_fixes == {}
+        assert [p for p, _ in result.manual] == [
+            'fibers/r.json', 'fibers/a.json', 'fibers/b.json', 'fibers/c.json']
+        assert 'r.json' in result.manual[1][1]
+        assert 'a.json' in result.manual[2][1]
+        assert result.resolved == []
+
+    def test_download_decision_unblocks_dependents(self, mgr, monkeypatch):
+        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
+        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        resolve = self.resolver({'fibers/r.json': SyncAction.DOWNLOAD})
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/a.json', 'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
+        assert resolve.prompts == ['fibers/r.json']
+        assert [p for p, _ in result.pending] == ['fibers/a.json']
+        assert result.resolved == [('fibers/r.json', SyncAction.DOWNLOAD)]
+        assert result.manual == []
+        assert fetched == ['fibers/r.json']      # planned against remote R
+
+    def test_upload_decision_unblocks_dependents(self, mgr, monkeypatch):
+        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
+        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        resolve = self.resolver({'fibers/r.json': SyncAction.UPLOAD})
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/a.json', 'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
+        assert [p for p, _ in result.pending] == ['fibers/a.json']
+        assert result.resolved == [('fibers/r.json', SyncAction.UPLOAD)]
+        assert fetched == []                      # planned against local R
+
+    def test_skip_decision_cascades_and_prompts_dependent_once(
+            self, mgr, monkeypatch):
+        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
+        merge_calls, _ = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        resolve = self.resolver({'fibers/a.json': SyncAction.UPLOAD})  # R skipped
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/a.json', 'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
+        assert resolve.prompts == ['fibers/r.json', 'fibers/a.json']
+        assert result.pending == []
+        assert result.manual == [('fibers/r.json',
+                                  'Both local and S3 modified since last sync')]
+        assert result.resolved == [('fibers/a.json', SyncAction.UPLOAD)]
+        # the dependent's prompt names the peer that blocked it
+        assert resolve.reasons['fibers/a.json'].endswith(
+            'auto-merge failed: linked fiber(s) with unresolved conflicts '
+            'or pending deletion: r.json')
+        # content merge exactly once per conflict; no path prompted twice
+        assert sorted(merge_calls) == ['fibers/a.json', 'fibers/r.json']
+        assert len(resolve.prompts) == len(set(resolve.prompts))
+
+    def test_awaiting_peer_does_not_block(self, mgr, monkeypatch):
+        """d1 depends on skipped R (demoted, awaiting); d2 depends on d1.
+        d2 must wait for d1's DECISION, not be demoted with it."""
+        plans = {'fibers/d1.json': self.plan_for(mgr, 'fibers/d1.json', ['r.json']),
+                 'fibers/d2.json': self.plan_for(mgr, 'fibers/d2.json', ['d1.json'])}
+        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        resolve = self.resolver({'fibers/d1.json': SyncAction.DOWNLOAD})
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/d1.json', 'fibers/d2.json', 'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
+        assert resolve.prompts == ['fibers/r.json', 'fibers/d1.json']
+        assert [p for p, _ in result.pending] == ['fibers/d2.json']
+        assert fetched == ['fibers/d1.json']      # d2 planned against remote d1
+
+    def test_all_skips_terminate_with_each_path_prompted_once(
+            self, mgr, monkeypatch):
+        """Every answer SKIP (what EOF at the prompt resolves to): the loop
+        must still drain every dependent, once each."""
+        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json']),
+                 'fibers/b.json': self.plan_for(mgr, 'fibers/b.json', ['a.json'])}
+        self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
+        resolve = self.resolver({})
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts('fibers/a.json', 'fibers/b.json', 'fibers/r.json'),
+            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
+        assert resolve.prompts == ['fibers/r.json', 'fibers/a.json',
+                                   'fibers/b.json']
+        assert result.pending == [] and result.resolved == []
+        assert [p for p, _ in result.manual] == resolve.prompts
+
+    # --- the 2026-09-08 incident topology --------------------------------
+    ROOTS = ['fibers/r1.json', 'fibers/r2.json', 'fibers/r3.json']
+    GRAPH = {'fibers/d1.json': ['r1.json'], 'fibers/d2.json': ['r1.json'],
+             'fibers/d3.json': ['d2.json'],
+             'fibers/d4.json': ['d3.json', 'gone.json'],   # base-only peer
+             'fibers/d5.json': ['r2.json'],
+             'fibers/d6.json': ['d5.json'], 'fibers/d7.json': ['d5.json'],
+             'fibers/d8.json': ['r3.json']}
+
+    def incident(self, mgr, monkeypatch, answers, s3_files=None,
+                 resolve_none=False):
+        plans = {p: self.plan_for(mgr, p, peers) for p, peers in self.GRAPH.items()}
+        self.install(mgr, monkeypatch, plans, self.ROOTS)
+        resolve = None if resolve_none else self.resolver(answers)
+        result = mgr._plan_conflict_resolutions(
+            self.conflicts(*sorted(list(self.GRAPH) + self.ROOTS)),
+            {}, s3_files or {}, set(), set(), auto_merge=True, resolve=resolve)
+        return result, resolve
+
+    def test_incident_rrr_one_round(self, mgr, monkeypatch):
+        result, resolve = self.incident(
+            mgr, monkeypatch, {r: SyncAction.DOWNLOAD for r in self.ROOTS})
+        assert resolve.prompts == self.ROOTS
+        assert len(result.pending) == 8 and result.manual == []
+
+    def test_incident_all_skips(self, mgr, monkeypatch):
+        result, resolve = self.incident(mgr, monkeypatch, {})
+        assert len(resolve.prompts) == 11
+        assert len(set(resolve.prompts)) == 11
+        assert result.pending == [] and len(result.manual) == 11
+
+    def test_incident_rsl_dependent_decided_remote(self, mgr, monkeypatch):
+        result, resolve = self.incident(mgr, monkeypatch, {
+            'fibers/r1.json': SyncAction.DOWNLOAD,
+            'fibers/r3.json': SyncAction.UPLOAD,
+            'fibers/d5.json': SyncAction.DOWNLOAD})      # r2 skipped
+        assert resolve.prompts == self.ROOTS + ['fibers/d5.json']
+        assert len(result.pending) == 7
+        assert [p for p, _ in result.manual] == ['fibers/r2.json']
+
+    def test_incident_rsl_dependent_skipped(self, mgr, monkeypatch):
+        result, resolve = self.incident(mgr, monkeypatch, {
+            'fibers/r1.json': SyncAction.DOWNLOAD,
+            'fibers/r3.json': SyncAction.UPLOAD})        # r2, d5 skipped
+        assert resolve.prompts == self.ROOTS + [
+            'fibers/d5.json', 'fibers/d6.json', 'fibers/d7.json']
+        assert len(result.pending) == 5
+
+    def test_incident_legacy_all_manual(self, mgr, monkeypatch):
+        result, _ = self.incident(mgr, monkeypatch, {}, resolve_none=True)
+        assert result.pending == [] and len(result.manual) == 11
+
+    def test_incident_peer_still_on_remote_prompts_without_cascade(
+            self, mgr, monkeypatch):
+        """Run-1 inventory: gone.json still exists remotely (pending
+        DELETE_REMOTE) -> d4 is prompted once instead of auto-merged; its
+        answer does not cascade."""
+        result, resolve = self.incident(
+            mgr, monkeypatch,
+            dict({r: SyncAction.DOWNLOAD for r in self.ROOTS},
+                 **{'fibers/d4.json': SyncAction.UPLOAD}),
+            s3_files={'fibers/gone.json': s3_info(1, 'e')})
+        assert resolve.prompts == self.ROOTS + ['fibers/d4.json']
+        assert len(result.pending) == 7 and result.manual == []
+        assert result.resolved[-1] == ('fibers/d4.json', SyncAction.UPLOAD)
+
+
+class TestSyncPromptThenPlan:
+    """sync() wiring of the decided-root flow: a decided root that receives
+    a reciprocal correction is uploaded once as a peer fix (never also as a
+    resolved transfer), skip counts come from decisions, and cancelling
+    leaves every local file untouched."""
+
+    CPS_A = TestLinkConsistency.CPS_A
+    CPS_B = TestLinkConsistency.CPS_B
+
+    def arrange(self, manager, monkeypatch, answers):
+        """Local a (auto-mergeable, merged doc links r at cp1<->cp0) and r
+        (content failure: no merge base). Both are 'both modified'
+        conflicts. Transfers are recorded, not performed."""
+        fib = TestLinkConsistency.fiber
+        entry = TestLinkConsistency.entry
+        merged_a = fib('a.json', self.CPS_A,
+                       branches=[entry('r.json', self.CPS_A, 1, self.CPS_B, 0)])
+        local_a = fib('a.json', self.CPS_A, generation=2)
+        local_r = fib('r.json', self.CPS_B, generation=2)     # no reciprocal
+        remote_r = fib('r.json', self.CPS_B, generation=3)    # no reciprocal
+        write_local(manager, 'a.json', json.dumps(local_a))
+        write_local(manager, 'r.json', json.dumps(local_r))
+        remote = {'a.json': json.dumps(fib('a.json', self.CPS_A, generation=3)),
+                  'r.json': json.dumps(remote_r)}
+        s3 = {p: {'path': p, 's3_size': len(b), 's3_mtime': 0.0,
+                  's3_etag': hashlib.md5(b.encode()).hexdigest(),
+                  'is_backup': False} for p, b in remote.items()}
+        for p in ('a.json', 'r.json'):
+            track_row(manager, p, 1, 0.0, 1, 'old-etag', local_md5='0' * 32)
+
+        plan = {'pending': manager._merge_tmp_path('a.json', '.merged'),
+                'remote_tmp': None, 'summary': 's', 'merged_doc': merged_a,
+                'base_doc': fib('a.json', self.CPS_A), 'peer_files': ['r.json']}
+        with open(plan['pending'], 'w') as f:
+            json.dump(merged_a, f)
+
+        def fetch_json(path):
+            tmp = manager._merge_tmp_path(path, '.remote')
+            with open(tmp, 'w') as f:
+                f.write(remote[path])
+            return json.loads(remote[path]), tmp
+
+        def fetch_file(path, dst):
+            with open(dst, 'w') as f:
+                f.write(remote[path])
+
+        rec = {'downloads': [], 'uploads': [], 'deletes': []}
+        prompts = []
+
+        def prompt(message, choices):
+            prompts.append(choices)
+            return answers.pop(0) if answers else 's'
+
+        monkeypatch.setattr(manager, 'scan_s3_files', lambda inc=False: s3)
+        monkeypatch.setattr(manager, '_attempt_auto_merge',
+                            lambda path, li, si: plan if path == 'a.json' else None)
+        monkeypatch.setattr(manager, '_fetch_remote_json', fetch_json)
+        monkeypatch.setattr(manager, '_fetch_remote_file', fetch_file)
+        monkeypatch.setattr(manager, '_remote_md5', lambda path: 'f' * 32)
+        monkeypatch.setattr(manager, '_bucket_versioning_enabled', lambda: False)
+        monkeypatch.setattr(manager, 'perform_downloads_batch',
+                            lambda paths, s3f: rec['downloads'].extend(paths) or len(paths))
+        monkeypatch.setattr(manager, 'perform_uploads_batch',
+                            lambda paths, inc=False: rec['uploads'].extend(paths) or len(paths))
+        monkeypatch.setattr(manager, 'perform_deletes_remote_batch',
+                            lambda paths, inc=False: rec['deletes'].extend(paths) or len(paths))
+        monkeypatch.setattr(vc_sync, 'prompt_choice', prompt)
+        manager.use_rclone = True
+        rec['prompts'] = prompts
+        return rec
+
+    def test_remote_decided_root_with_fix_uploaded_once(self, manager,
+                                                        monkeypatch, capsys):
+        rec = self.arrange(manager, monkeypatch, answers=['r'])
+        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: True)
+        manager.sync()
+        out = capsys.readouterr().out
+        assert rec['prompts'] == [('l', 'r', 's')]
+        assert rec['uploads'].count('r.json') == 1
+        assert rec['uploads'].count('a.json') == 1
+        assert rec['downloads'] == []            # fix supersedes the download
+        assert 'Conflictsunresolved:0' in out.replace(' ', '')
+        assert 'your choice (S3) is applied together with a reciprocal link fix' in out
+        # on disk: r carries the reciprocal, based on the REMOTE doc (gen 3 -> 4)
+        r = json.load(open(os.path.join(manager.local_dir, 'r.json')))
+        assert r['generation'] == 4
+        assert r['branches'][0]['branch_file'] == 'a.json'
+
+    def test_local_decided_root_with_fix_uploaded_once(self, manager,
+                                                       monkeypatch, capsys):
+        rec = self.arrange(manager, monkeypatch, answers=['l'])
+        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: True)
+        manager.sync()
+        out = capsys.readouterr().out
+        assert rec['uploads'].count('r.json') == 1   # not also "Resolved conflict"
+        assert 'your choice (local) is applied together with a reciprocal link fix' in out
+        r = json.load(open(os.path.join(manager.local_dir, 'r.json')))
+        assert r['generation'] == 3                  # local (gen 2) + fix
+
+    def test_skip_cascades_and_cancel_touches_nothing(self, manager,
+                                                     monkeypatch, capsys):
+        rec = self.arrange(manager, monkeypatch, answers=['s', 's'])
+        before = {p: open(os.path.join(manager.local_dir, p), 'rb').read()
+                  for p in ('a.json', 'r.json')}
+        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: False)
+        manager.sync()
+        out = capsys.readouterr().out
+        assert len(rec['prompts']) == 2              # r skipped -> a prompted
+        assert 'Conflictsunresolved:2' in out.replace(' ', '')
+        assert rec['uploads'] == [] and rec['downloads'] == []
+        after = {p: open(os.path.join(manager.local_dir, p), 'rb').read()
+                 for p in ('a.json', 'r.json')}
+        assert after == before
 
 
 class TestDeleteLocalSafety:
