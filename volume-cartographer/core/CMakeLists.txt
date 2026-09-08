@@ -14,6 +14,7 @@ add_library(vc_core
         src/MemMap.cpp
         src/UnixSocket.cpp
         src/VolpkgConvert.cpp
+        src/VoxelSizeMetadata.cpp
         src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
