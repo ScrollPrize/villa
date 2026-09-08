@@ -1,9 +1,10 @@
-# Status: resolve Fiberlet path-cost merge
+# Status: integrate current main
 
-- [x] Inspect merge state and conflicting files
-- [x] Replace the active planning files
-- [x] Independently review the merge-resolution plan
-- [x] Resolve the todo conflict
-- [x] Review the incoming source changes
-- [x] Build and run focused tests
-- [x] Complete the merge resolution
+- [x] Inspect worktree and divergence
+- [x] Fetch current `origin/main`
+- [x] Replace active planning files
+- [ ] Independently review the integration plan
+- [ ] Merge `origin/main`
+- [ ] Resolve and review conflicts
+- [ ] Build and run focused tests
+- [ ] Commit the merge

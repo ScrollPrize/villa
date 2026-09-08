@@ -1,32 +1,33 @@
-# Plan: resolve Fiberlet path-cost merge
+# Plan: integrate current main
 
-## Resolution
+## Integration
 
-1. Preserve both independent additions in `planning/todo.md` and remove the
-   conflict markers.
-2. Review the incoming DP transition-cost retention against the current path
-   reconstruction and memory-accounting code.
-3. Confirm that exact per-transition costs reproduce the selected DP objective
-   without recomputation or numerical relaxation.
-4. Stage the resolution and complete the merge commit.
+1. Fetch and identify the current `origin/main` and branch divergence.
+2. Merge `origin/main` without rewriting the branch's published history.
+3. Resolve conflicts by preserving the Fiberlet branch behavior while
+   incorporating upstream fixes and current interfaces.
+4. Review the resulting diff for unresolved markers, accidental deletions,
+   and incompatible build/test registrations.
+5. Commit the completed merge.
 
 ## Tests
 
-1. Build the focused `test_fiberlet_paths` target in the existing optimized
-   build.
-2. Run the focused test binary and report any remaining test gaps.
+1. Build the directly affected Volume Cartographer targets in the existing
+   Release build.
+2. Run focused FiberTrace/Fiberlet tests selected from the actual merged diff.
+3. Report any unrelated or pre-existing failures without relaxing them.
 
 ## Spec update
 
-- Specify that reconstruction retains the exact five-component transition cost
-  alongside every predecessor and include that array in state-memory
-  accounting.
+- No behavior change is intended by the integration itself. Update specs only
+  if conflict resolution changes or clarifies an existing contract.
 
 ## Docs updates
 
-- Update `docs/fiberlets.md` with the retained-cost reconstruction and memory
-  contract.
+- Preserve compatible documentation from both histories. No new user-facing
+  documentation is expected unless a conflict requires reconciliation.
 
 ## Changelog update
 
-- No additional changelog entry is required beyond the merged commit history.
+- The merge history records the integration; no separate changelog entry is
+  expected unless conflict resolution introduces new behavior.

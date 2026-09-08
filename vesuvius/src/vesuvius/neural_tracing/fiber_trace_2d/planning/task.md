@@ -1,6 +1,5 @@
-# Task: resolve Fiberlet path-cost merge
+# Task: integrate current main
 
-Resolve the current merge of `a880b7c76bf5ff0140afee3425f6527389431ffb`
-(`Retain exact Fiberlet DP transition costs`). Preserve both independent todo
-sections, review the incoming path-cost changes for compatibility with the
-current branch, run the focused Fiberlet path tests, and complete the merge.
+Merge the current `origin/main` into `fiberlets-development-integration`,
+resolve any conflicts without losing the branch's Fiberlet work or upstream
+fixes, validate the affected targets, and commit the merge.
