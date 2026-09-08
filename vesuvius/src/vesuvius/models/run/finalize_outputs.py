@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
 from tqdm.auto import tqdm
@@ -223,16 +224,28 @@ def _drop_absent_chunks(chunk_infos, *, input_path, input_shape, input_chunks, o
     read). Falls back to the full list when the layout cannot be indexed, so a
     store with an unexpected key format is still processed correctly.
     """
+    import contextlib
+    import io
+
     from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
 
     try:
-        occupancy = build_chunk_occupancy(
-            str(input_path),
-            tuple(int(c) for c in input_chunks),
-            tuple(int(s) for s in input_shape),
-            verbose=verbose,
-            anon=False,
-        )
+        # use_cache=False: the occupancy cache is keyed on .zarray metadata,
+        # which chunk writes never touch, so a cached bitmap would silently
+        # hide chunks added after it was built (a late blend part, a second
+        # bbox blended into the same store). A fresh listing costs seconds
+        # against a run of minutes, and it also keeps this read step from
+        # writing a sidecar into the input store. The helper prints its
+        # progress unconditionally; keep --quiet quiet.
+        with contextlib.redirect_stdout(sys.stdout if verbose else io.StringIO()):
+            occupancy = build_chunk_occupancy(
+                str(input_path),
+                tuple(int(c) for c in input_chunks),
+                tuple(int(s) for s in input_shape),
+                verbose=verbose,
+                use_cache=False,
+                anon=False,
+            )
     except Exception as exc:  # listing failures must not break finalisation
         if verbose:
             print(f"Chunk occupancy unavailable ({exc}); processing every chunk")
@@ -530,7 +543,8 @@ def finalize_logits(
                 print(f"Error processing chunk: {e}")
                 raise e
     
-    print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_chunks/total_chunks:.2%}).")
+    empty_pct = (empty_chunks / total_chunks) if total_chunks > 0 else 0.0
+    print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_pct:.2%}).")
 
     # Only part 0 updates metadata to avoid conflicts
     if part_id == 0:

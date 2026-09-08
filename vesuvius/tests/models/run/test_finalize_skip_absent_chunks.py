@@ -87,3 +87,41 @@ def test_finalize_output_is_identical_with_and_without_skip(tmp_path, monkeypatc
     b = zarr.open(str(tmp_path / "full.zarr"), mode="r")[:]
     np.testing.assert_array_equal(a, b)
     assert a[0, 16:24, 32:48, 0:16].min() == 255 and a[0, 24:32, 32:48, 0:16].max() == 0
+
+
+def test_partition_with_no_chunks_does_not_crash(tmp_path):
+    """--num_parts N on a --bbox run leaves most Z-partitions with zero chunks;
+    part 0 must still create the shared output store and record its attrs."""
+    src = tmp_path / "merged.zarr"
+    _write_sparse_logits(src)  # data only at z 16:32 -> part 0 of 4 (z 0:16) keeps nothing
+    out_path = tmp_path / "parts.zarr"
+    finalize_logits(str(src), str(out_path), mode="binary", threshold=None,
+                    num_workers=1, verbose=False, num_parts=4, part_id=0)
+    out = zarr.open(str(out_path), mode="r")
+    assert out.attrs["total_chunks"] == 0 and out.attrs["empty_chunk_percentage"] == 0.0
+    finalize_logits(str(src), str(out_path), mode="binary", threshold=None,
+                    num_workers=1, verbose=False, num_parts=4, part_id=1)
+    assert zarr.open(str(out_path), mode="r")[0, 16:24, 32:48, 0:16].min() == 255
+
+
+def test_chunks_added_after_a_previous_run_are_not_skipped(tmp_path):
+    """The occupancy bitmap must come from a fresh listing, not a cache keyed on .zarray."""
+    src = tmp_path / "merged.zarr"
+    arr = _write_sparse_logits(src)
+    finalize_logits(str(src), str(tmp_path / "first.zarr"), mode="binary", threshold=None,
+                    num_workers=1, verbose=False)
+    block = np.zeros((2, 16, 16, 16), dtype=np.float32); block[1] = 20.0
+    arr[:, 48:64, 0:16, 48:64] = block  # a new chunk, .zarray untouched
+    finalize_logits(str(src), str(tmp_path / "second.zarr"), mode="binary", threshold=None,
+                    num_workers=1, verbose=False)
+    out = zarr.open(str(tmp_path / "second.zarr"), mode="r")
+    assert out[0, 48:64, 0:16, 48:64].min() == 255
+    assert not (src / ".chunk_occupancy.npz").exists()  # read step must not write into the input
+
+
+def test_quiet_run_prints_no_occupancy_progress(tmp_path, capsys):
+    src = tmp_path / "merged.zarr"
+    _write_sparse_logits(src)
+    finalize_logits(str(src), str(tmp_path / "q.zarr"), mode="binary", threshold=None,
+                    num_workers=1, verbose=False)
+    assert "Chunk occupancy" not in capsys.readouterr().out
