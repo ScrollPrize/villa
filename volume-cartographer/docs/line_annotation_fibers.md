@@ -294,7 +294,15 @@ equal changes converge, and different two-sided changes conflict.
 
 An ambiguous merge does not modify the fiber. The sync tool stores local,
 remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
-complete local version, keep the complete remote version, or skip. Existing
+complete local version, keep the complete remote version, or skip. Those
+questions are asked before the link-consistency planning of the other
+conflicts: a decided file ([l]ocal or [r]emote) is a known source the planner
+can plan its linked neighbours against, so their auto-merges land in the same
+run; only a skipped file blocks the neighbours that depend on it, which are
+then asked about in turn. A merge that dropped its link to a peer deleted on
+both sides (or pending local deletion) needs no reciprocal fix and is not
+treated as a dangling link. `--dry-run` reports content-merge eligibility only;
+link consistency is assessed in a real run. Existing
 base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
 only after geometry merges cleanly. Version-1 fibers retain the older merge
 behavior, including the CP-polyline `needs_reoptimization`
