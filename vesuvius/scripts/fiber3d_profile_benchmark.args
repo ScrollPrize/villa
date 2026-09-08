@@ -1,0 +1,10 @@
+# One CLI argument per line. The fixed caller parses this file without eval.
+--compile-mode
+off
+--normalization
+group
+--output-stride
+4
+--replay-batch
+--trace-steps
+0

@@ -1,3 +1,13 @@
+# 2026-09-08
+
+- Added configurable GroupNorm and native lower-resolution Fiber3D heads.
+  Native stride-4 GroupNorm raised the matched two-H100 replay ceiling from
+  55.30 to 95.71 samples/s and the real-sample path from 50.23 to 59.15
+  samples/s while preserving stride-1 checkpoint behavior.
+- Added a production-path GPU-resident batch-replay diagnostic and synchronized
+  per-rank throughput artifacts for Fiber3D training; measured the current
+  two-H100 compute ceiling and matched warm-cache real training path.
+
 # 2026-09-07
 
 - Added opt-in normal Fiber training profiling and explicit torch.compile

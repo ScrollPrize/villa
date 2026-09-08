@@ -31,6 +31,7 @@ class FiberTrace3DModelConfig:
     decoder_upsample_mode: str = "pixelshuffle"
     squeeze_excitation: bool = False
     normalization: str = "batch"
+    output_stride: int = 1
 
 
 class FiberTrace3DNet(nn.Module):
@@ -81,6 +82,7 @@ class FiberTrace3DNet(nn.Module):
             "decoder_upsample_mode": str(cfg.decoder_upsample_mode),
             "keep_inactive_deep_supervision_layers": False,
             "normalization": str(cfg.normalization),
+            "output_stride": int(cfg.output_stride),
         }
         backbone_out_channels = (
             int(cfg.conditioned_latent_channels)
@@ -93,6 +95,7 @@ class FiberTrace3DNet(nn.Module):
             {"model_config": backbone_config},
         )
         self.output_channels = int(cfg.output_channels)
+        self.output_stride = int(cfg.output_stride)
         self.direction_branch_count = int(cfg.direction_branch_count)
         self.conditioned_latent_channels = int(cfg.conditioned_latent_channels)
         self.conditioned_decoder_hidden_channels = int(
@@ -389,5 +392,6 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
             ),
             squeeze_excitation=bool(model_cfg.get("squeeze_excitation", False)),
             normalization=str(model_cfg.get("normalization", "batch")),
+            output_stride=int(model_cfg.get("output_stride", 1)),
         )
     )

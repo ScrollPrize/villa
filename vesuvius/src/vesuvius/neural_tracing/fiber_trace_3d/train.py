@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -24,6 +25,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from vesuvius.neural_tracing.fiber_trace_3d.training_profile import (
     TrainingProfile, compile_training_model, loader_profile_enabled,
+    replay_batch_enabled,
 )
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
@@ -478,6 +480,109 @@ def _distributed_barrier(config: _DistributedConfig) -> None:
         dist.barrier()
 
 
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _distributed_max_float(value: float, config: _DistributedConfig) -> float:
+    if not config.enabled:
+        return float(value)
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=config.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _shutdown_dataloader_iterator(iterator: Any | None) -> None:
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+
+
+def _replayed_training_batch(
+    batch: FiberTrace3DBatch,
+) -> tuple[FiberTrace3DBatch, float, float, float, float]:
+    return batch, 0.0, 0.0, 0.0, 0.0
+
+
+def _batch_tensor_sha256(batch: FiberTrace3DBatch) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(vars(batch).items()):
+        if not isinstance(value, torch.Tensor):
+            continue
+        tensor = value.detach().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+_MATERIALIZED_TARGET_TENSOR_FIELDS = frozenset(
+    {
+        "direction_target",
+        "direction_weight",
+        "direction_mask",
+        "direction_indices_bzyx",
+        "direction_target_sparse",
+        "direction_weight_sparse",
+        "direction_tangent_sparse_zyx",
+        "presence_target",
+        "presence_mask",
+    }
+)
+
+
+def _source_batch_tensor_sha256(batch: FiberTrace3DBatch) -> str:
+    """Hash captured source tensors independently of output-lattice targets."""
+
+    digest = hashlib.sha256()
+    for name, value in sorted(vars(batch).items()):
+        if name in _MATERIALIZED_TARGET_TENSOR_FIELDS or not isinstance(value, torch.Tensor):
+            continue
+        tensor = value.detach().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _normalization_module_counts(model: torch.nn.Module) -> dict[str, int]:
+    classes = (torch.nn.BatchNorm3d, torch.nn.SyncBatchNorm, torch.nn.GroupNorm)
+    return {
+        cls.__name__: sum(isinstance(module, cls) for module in model.modules())
+        for cls in classes
+    }
+
+
+def _validate_profile_normalization_modules(
+    requested: str,
+    *,
+    sync_batchnorm: bool,
+    counts: dict[str, int],
+) -> None:
+    requested = str(requested).lower().replace("_", "")
+    batch = int(counts.get("BatchNorm3d", 0))
+    sync = int(counts.get("SyncBatchNorm", 0))
+    group = int(counts.get("GroupNorm", 0))
+    if requested in {"batch", "batchnorm"}:
+        valid = sync > 0 and batch == 0 and group == 0 if sync_batchnorm else (
+            batch > 0 and sync == 0 and group == 0
+        )
+    elif requested in {"group", "groupnorm"}:
+        valid = group > 0 and batch == 0 and sync == 0
+    else:
+        return
+    if not valid:
+        raise RuntimeError(
+            "profile normalization modules do not match requested mode: "
+            f"requested={requested} sync_batchnorm={sync_batchnorm} counts={counts}"
+        )
+
+
 def _distributed_cleanup(config: _DistributedConfig) -> None:
     if config.enabled and dist.is_initialized():
         dist.destroy_process_group()
@@ -491,8 +596,14 @@ def _distributed_broadcast_object(value: Any, config: _DistributedConfig, *, src
     return objects[0]
 
 
-def _distributed_should_use_sync_batchnorm(config: _DistributedConfig) -> bool:
-    return bool(config.enabled and config.device.type == "cuda")
+def _distributed_should_use_sync_batchnorm(
+    config: _DistributedConfig,
+    *,
+    enabled: bool = True,
+) -> bool:
+    if not isinstance(enabled, bool):
+        raise ValueError("training.sync_batchnorm must be a JSON boolean")
+    return bool(enabled and config.enabled and config.device.type == "cuda")
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -507,7 +618,11 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 def _wrap_distributed_model(
     model: torch.nn.Module,
     config: _DistributedConfig,
+    *,
+    broadcast_buffers: bool = True,
 ) -> torch.nn.Module:
+    if not isinstance(broadcast_buffers, bool):
+        raise ValueError("training.ddp_broadcast_buffers must be a JSON boolean")
     if not config.enabled:
         return model
     if config.device.type == "cuda":
@@ -515,8 +630,9 @@ def _wrap_distributed_model(
             model,
             device_ids=[config.local_rank],
             output_device=config.local_rank,
+            broadcast_buffers=broadcast_buffers,
         )
-    return DistributedDataParallel(model)
+    return DistributedDataParallel(model, broadcast_buffers=broadcast_buffers)
 
 
 def _normalize_mixed_precision_mode(raw: Any) -> str:
@@ -884,6 +1000,13 @@ def _model_uses_conditioned_decoder(model: torch.nn.Module) -> bool:
     return bool(getattr(_unwrap_model(model), "conditioned_decoder_enabled", False))
 
 
+def _model_output_stride(model: torch.nn.Module) -> int:
+    stride = int(getattr(_unwrap_model(model), "output_stride", 1))
+    if stride <= 0:
+        raise ValueError(f"model output_stride must be > 0, got {stride}")
+    return stride
+
+
 def _conditioned_loss_options_from_training(training: dict[str, Any]) -> dict[str, float]:
     return {
         "perpendicular_jitter_degrees": float(
@@ -1032,6 +1155,12 @@ def compute_losses(
     assert batch.direction_weight_sparse is not None
     assert batch.presence_target is not None
     assert batch.presence_mask is not None
+    output_shape = tuple(int(v) for v in output.shape[-3:])
+    target_shape = tuple(int(v) for v in batch.presence_target.shape[-3:])
+    if output_shape != target_shape:
+        raise ValueError(
+            f"model output shape {output_shape} does not match target shape {target_shape}"
+        )
     pred_dirs = direction_outputs(output)
     pred_presences = presence_outputs(output)
     branch_count = int(pred_dirs.shape[1])
@@ -1888,7 +2017,11 @@ def _evaluate_dense_loss_rows(
                 consumed=consumed,
             )
         targets_started = time.monotonic()
-        batch = materialize_targets(batch, loader.config)
+        batch = materialize_targets(
+            batch,
+            loader.config,
+            output_stride=_model_output_stride(model),
+        )
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-targets-end",
@@ -2162,6 +2295,7 @@ def run_training(
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
     profile_loader = loader_profile_enabled(training)
+    profile_replay_batch = replay_batch_enabled(training)
     if profile_loader and _loader_worker_count(raw_config) <= 0:
         raise ValueError("profile_loader requires loader_workers > 0")
     (
@@ -2200,8 +2334,21 @@ def run_training(
     if "initialization_seed" in training:
         torch.manual_seed(int(training["initialization_seed"]))
     raw_model = build_fiber_trace_3d_model(raw_config)
-    if _distributed_should_use_sync_batchnorm(distributed):
+    sync_batchnorm = _distributed_should_use_sync_batchnorm(
+        distributed,
+        enabled=training.get("sync_batchnorm", True),
+    )
+    if sync_batchnorm:
         raw_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(raw_model)
+    normalization_module_counts = _normalization_module_counts(raw_model)
+    if profile_replay_batch:
+        _validate_profile_normalization_modules(
+            raw_config.get("model_3d", raw_config.get("model", {})).get(
+                "normalization", "batch"
+            ),
+            sync_batchnorm=sync_batchnorm,
+            counts=normalization_module_counts,
+        )
     raw_model = raw_model.to(device)
     mixed_precision = _mixed_precision_config_from_training(training, device)
     grad_scaler = _make_grad_scaler(mixed_precision)
@@ -2226,8 +2373,13 @@ def run_training(
             map_location=device,
         )
 
+    ddp_broadcast_buffers = training.get("ddp_broadcast_buffers", True)
     train_model = compile_training_model(
-        _wrap_distributed_model(raw_model, distributed),
+        _wrap_distributed_model(
+            raw_model,
+            distributed,
+            broadcast_buffers=ddp_broadcast_buffers,
+        ),
         str(training.get("compile_mode", "off")),
     )
     run_datestr = str(
@@ -2416,11 +2568,13 @@ def run_training(
             f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
             f"ddp_enabled={distributed.enabled} ddp_world_size={distributed.world_size} "
             f"ddp_backend={distributed.backend or 'none'} "
-            f"sync_batchnorm={_distributed_should_use_sync_batchnorm(distributed)} "
+            f"sync_batchnorm={sync_batchnorm} "
+            f"ddp_broadcast_buffers={ddp_broadcast_buffers} "
             f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
             f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
             f"loader_worker_device={loader_worker_device} "
             f"loader_multiprocessing_context={loader_context or 'default'} "
+            f"profile_replay_batch={profile_replay_batch} "
             f"test_loader_workers={loader_workers if test_loader is not None else 0} "
             f"test_global_batches={math.ceil(test_control_points / test_loader.config.batch_size) if test_loader is not None else 0} "
             f"test_batches_per_rank={len(test_batch_indices)} "
@@ -2605,31 +2759,83 @@ def run_training(
         raw_config=raw_config,
         start_batch_index=start_step * distributed.world_size + distributed.rank,
         batch_index_stride=distributed.world_size,
-        batch_count=remaining_steps,
+        batch_count=1 if profile_replay_batch else remaining_steps,
         sample_index_limit=sample_index_limit,
         sample_mode="random",
         profile=profile_loader,
     )
     train_iterator = iter(train_dataloader) if train_dataloader is not None else None
+    replayed_batch: FiberTrace3DBatch | None = None
+    replayed_batch_sha256: str | None = None
+    replayed_source_batch_sha256: str | None = None
+    if profile_replay_batch:
+        replayed_batch, _load_ms, _wait_ms, _to_device_ms, _target_ms = _next_training_batch(
+            iterator=train_iterator,
+            loader=loader,
+            sample_index=_distributed_training_sample_index(
+                int(start_step) + 1,
+                batch_size=loader.config.batch_size,
+                config=distributed,
+            ),
+            sample_index_limit=sample_index_limit,
+            sample_mode="random",
+            device=device,
+            output_stride=_model_output_stride(raw_model),
+        )
+        _shutdown_dataloader_iterator(train_iterator)
+        train_iterator = None
+        train_dataloader = None
+        replayed_batch_sha256 = _batch_tensor_sha256(replayed_batch)
+        replayed_source_batch_sha256 = _source_batch_tensor_sha256(replayed_batch)
+        _synchronize_device(device)
+        _distributed_barrier(distributed)
+        if distributed.is_main:
+            print(
+                "fiber_trace_3d profile replay: captured one GPU-resident batch per rank; "
+                f"training loader stopped; rank0_sha256={replayed_batch_sha256} "
+                f"source_sha256={replayed_source_batch_sha256}",
+                flush=True,
+            )
     profile = TrainingProfile(training, run_dir, distributed.rank, device)
+    throughput_start_step = (
+        int(training.get("profile_throughput_start_step", 31))
+        if profile.enabled
+        else None
+    )
+    if throughput_start_step is not None and throughput_start_step <= int(start_step):
+        raise ValueError("training.profile_throughput_start_step must exceed checkpoint step")
+    throughput_started: float | None = None
+    throughput_steps = 0
     try:
         step = int(start_step)
         while max_steps is None or step < max_steps:
             step += 1
+            if throughput_start_step is not None and step == throughput_start_step:
+                _distributed_barrier(distributed)
+                _synchronize_device(device)
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                throughput_started = time.perf_counter()
             profile.begin(step)
             sample_index = _distributed_training_sample_index(
                 step,
                 batch_size=loader.config.batch_size,
                 config=distributed,
             )
-            batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
-                iterator=train_iterator,
-                loader=loader,
-                sample_index=sample_index,
-                sample_index_limit=sample_index_limit,
-                sample_mode="random",
-                device=device,
-            )
+            if replayed_batch is None:
+                batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
+                    iterator=train_iterator,
+                    loader=loader,
+                    sample_index=sample_index,
+                    sample_index_limit=sample_index_limit,
+                    sample_mode="random",
+                    device=device,
+                    output_stride=_model_output_stride(raw_model),
+                )
+            else:
+                batch, load_ms, wait_ms, to_device_ms, target_ms = (
+                    _replayed_training_batch(replayed_batch)
+                )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
             with profile.stage("forward_loss"), _autocast_context(mixed_precision):
@@ -2658,7 +2864,10 @@ def run_training(
                 losses = _losses_to_float_dict(reduced_loss_tensors)
             step_ms = (time.perf_counter() - fw_start) * 1000.0
 
-            if distributed.is_main and (step <= 100 or step % scalar_interval == 0):
+            if distributed.is_main and (
+                (not profile_replay_batch and step <= 100)
+                or step % scalar_interval == 0
+            ):
                 print(
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
@@ -2757,6 +2966,57 @@ def run_training(
                         target_ms=target_ms, fw_bw_step_ms=step_ms,
                         loss_total=losses["total"],
                         loader_profile=batch.profile_timings_ms if profile_loader else None)
+            if throughput_started is not None:
+                throughput_steps += 1
+            if throughput_started is not None and max_steps is not None and step == max_steps:
+                _synchronize_device(device)
+                local_elapsed = time.perf_counter() - throughput_started
+                slowest_elapsed = _distributed_max_float(local_elapsed, distributed)
+                throughput = {
+                    "start_step": throughput_start_step,
+                    "end_step": step,
+                    "steps": throughput_steps,
+                    "elapsed_seconds_slowest_rank": slowest_elapsed,
+                    "world_size": distributed.world_size,
+                    "batch_size_per_rank": loader.config.batch_size,
+                    "global_batch_size": loader.config.batch_size * distributed.world_size,
+                    "global_samples_per_second": (
+                        throughput_steps * loader.config.batch_size * distributed.world_size
+                        / slowest_elapsed
+                    ),
+                    "samples_per_second_per_gpu": (
+                        throughput_steps * loader.config.batch_size / slowest_elapsed
+                    ),
+                    "replay_batch": profile_replay_batch,
+                    "replay_batch_sha256": replayed_batch_sha256,
+                    "replay_source_batch_sha256": replayed_source_batch_sha256,
+                    "normalization_module_counts": normalization_module_counts,
+                    "sync_batchnorm": sync_batchnorm,
+                    "ddp_broadcast_buffers": ddp_broadcast_buffers,
+                    "model_output_stride": _model_output_stride(raw_model),
+                    "model_parameter_count": sum(
+                        int(parameter.numel()) for parameter in raw_model.parameters()
+                    ),
+                    "output_shape_zyx": tuple(
+                        int(value) for value in batch.presence_target.shape[-3:]
+                    ),
+                    "peak_allocated_bytes": (
+                        int(torch.cuda.max_memory_allocated(device))
+                        if device.type == "cuda" else 0
+                    ),
+                }
+                (run_dir / f"throughput_rank{distributed.rank}.json").write_text(
+                    json.dumps(throughput, indent=2) + "\n"
+                )
+                if distributed.is_main:
+                    print(
+                        "fiber_trace_3d throughput: "
+                        f"steps={throughput_steps} elapsed={slowest_elapsed:.3f}s "
+                        f"global_samples_per_second={throughput['global_samples_per_second']:.3f} "
+                        f"samples_per_second_per_gpu={throughput['samples_per_second_per_gpu']:.3f} "
+                        f"replay_batch={profile_replay_batch}",
+                        flush=True,
+                    )
     finally:
         try:
             profile.close()
@@ -3450,6 +3710,23 @@ def _make_train_sample_3d_sheet(
     output: torch.Tensor,
 ) -> np.ndarray:
     assert batch.presence_target is not None
+    display_shape = tuple(int(value) for value in batch.volume.shape[-3:])
+    if tuple(int(value) for value in output.shape[-3:]) != display_shape:
+        output = F.interpolate(
+            output.to(dtype=torch.float32),
+            size=display_shape,
+            mode="trilinear",
+            align_corners=True,
+        )
+    if tuple(int(value) for value in batch.presence_target.shape[-3:]) != display_shape:
+        batch = replace(
+            batch,
+            presence_target=F.interpolate(
+                batch.presence_target.to(dtype=torch.float32),
+                size=display_shape,
+                mode="nearest",
+            ),
+        )
     volume = batch.volume[0, 0].detach().cpu().numpy()
     valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
     supervised_presence = F.max_pool3d(
@@ -4164,6 +4441,7 @@ def _next_training_batch(
     sample_mode: str,
     device: torch.device,
     profile_targets: bool = False,
+    output_stride: int = 1,
 ) -> tuple[FiberTrace3DBatch, float, float, float, float]:
     wait_start = time.perf_counter()
     if iterator is None:
@@ -4175,7 +4453,12 @@ def _next_training_batch(
         )
         wait_ms = (time.perf_counter() - wait_start) * 1000.0
         target_start = time.perf_counter()
-        batch = materialize_targets(batch, loader.config, profile=profile_targets)
+        batch = materialize_targets(
+            batch,
+            loader.config,
+            profile=profile_targets,
+            output_stride=output_stride,
+        )
         if profile_targets and device.type == "cuda":
             torch.cuda.synchronize(device)
         target_ms = (time.perf_counter() - target_start) * 1000.0
@@ -4196,7 +4479,12 @@ def _next_training_batch(
         torch.cuda.synchronize(device)
     to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
     target_start = time.perf_counter()
-    batch = materialize_targets(batch, loader.config, profile=profile_targets)
+    batch = materialize_targets(
+        batch,
+        loader.config,
+        profile=profile_targets,
+        output_stride=output_stride,
+    )
     if profile_targets and device.type == "cuda":
         torch.cuda.synchronize(device)
     target_ms = (time.perf_counter() - target_start) * 1000.0
@@ -4340,6 +4628,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
             sample_mode="random",
             device=device,
             profile_targets=True,
+            output_stride=_model_output_stride(model),
         )
         fw_ms = 0.0
         if not load_only:

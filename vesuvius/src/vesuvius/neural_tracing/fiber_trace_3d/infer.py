@@ -140,6 +140,7 @@ def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> d
         "output_schema": {
             key: model[key] for key in (
                 "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
+                "output_stride",
             ) if isinstance(model, dict) and key in model
         },
     }

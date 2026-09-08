@@ -1,15 +1,12 @@
-# Shared Fiber3D sample-worker pool
+# Native lower-resolution Fiber3D U-Net output
 
-Replace the reusable benchmark pipeline's fixed loading and augmentation
-process pools with one shared pool capped at 128 processes. Free workers must
-take runnable work from either stage without dependency inversion: augmentation
-is eligible only after its matching load completes, and loading must continue
-whenever no augmentation is runnable.
+Accelerate Fiber3D training by making the shared 3D U-Net emit predictions
+directly at the lower resolution already used by Fiber inference. The initial
+experiment uses output stride 4 (quarter resolution along each axis), stops the
+decoder before its full- and half-resolution stages, and retains GroupNorm as
+the fastest measured normalization.
 
-Use gradual bounded admission instead of immediately exposing the full
-lookahead. Start with a small window and, for every completed load, advance the
-admission frontier by two until the configured maximum lookahead is reached.
-Keep deterministic ordered delivery, bounded shared-memory slots, explicit
-failure handling, and unchanged sample values. Benchmark CPU-only against the
-committed 229.75 samples/s production-throughput reference, using no more than
-128 processes/CPU threads. Do not use GPUs.
+Keep the existing full-resolution architecture as the compatibility default.
+Measure the native-stride architecture against the matched GroupNorm replay and
+real-sample baselines on physical GPUs 0 and 1. This phase optimizes speed; any
+effect on convergence or prediction quality will be ablated later.

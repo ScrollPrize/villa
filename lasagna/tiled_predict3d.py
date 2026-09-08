@@ -2206,6 +2206,7 @@ def _multi_gpu_worker_main(
 	tile_size: int,
 	blend_ramp: np.ndarray,
 	product_scales: Mapping[str, int],
+	native_output_stride: int,
 	input_specs: tuple[_SharedSlotSpec, ...],
 	result_specs: tuple[_SharedSlotSpec, ...],
 	work_queue,
@@ -2229,8 +2230,16 @@ def _multi_gpu_worker_main(
 		model.eval()
 		ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
 		w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
+		w_native = (
+			_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
+			if native_output_stride > 1 else w_full
+		)
+		expected_native_shape = tuple(int(value) for value in w_native.shape)
 		weights_by_scale = {
-			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0) if sd > 1 else w_full)
+			sd: (
+				_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0)
+				if sd > native_output_stride else w_native
+			)
 			for sd in sorted(set(int(value) for value in product_scales.values()))
 		}
 		while True:
@@ -2299,6 +2308,14 @@ def _multi_gpu_worker_main(
 						cuda_events["output"][0].record()
 				stage_started = time.perf_counter()
 				tensors = model_adapter.product_tensors_from_output(raw_output)
+				for name in needed_names:
+					observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
+					if observed_shape != expected_native_shape:
+						raise ValueError(
+							f"product {name!r} native tile shape {observed_shape} does not match "
+							f"model native output stride {native_output_stride} expected shape "
+							f"{expected_native_shape}"
+						)
 				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
 				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
 				for sd in needed_scales:
@@ -2306,9 +2323,10 @@ def _multi_gpu_worker_main(
 					_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weight.detach().cpu().numpy()
 				for name in needed_names:
 					sd = int(product_scales[name])
-					weighted = tensors[name][0] * w_full
-					if sd > 1:
-						weighted = _pyrdown3d(weighted, factor=sd)
+					weighted = tensors[name][0] * w_native
+					remaining_scaledown = sd // native_output_stride
+					if remaining_scaledown > 1:
+						weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
 					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
 				if profile is not None:
 					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started
@@ -2455,6 +2473,15 @@ def run_tiled_inference_3d(
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
 	}
+	native_output_stride = int(getattr(model_adapter, "native_output_stride", 1))
+	if native_output_stride <= 0:
+		raise ValueError("model adapter native_output_stride must be > 0")
+	for product_name, sd in scales.items():
+		if int(sd) % native_output_stride:
+			raise ValueError(
+				f"product {product_name!r} inference_scaledown={sd} is not divisible by "
+				f"native model output stride {native_output_stride}"
+			)
 	if isinstance(output_scaledown_base, Mapping):
 		input_scales = set()
 		for product in products:
@@ -2509,12 +2536,17 @@ def run_tiled_inference_3d(
 
 	r = _blend_ramp(int(tile_size))
 	w_full = None
+	w_native = None
 	w_by_scale = None
 	if not parallel:
 		w_full = torch.from_numpy(r[:, None, None] * r[None, :, None] * r[None, None, :]).to(device)
+		w_native = (
+			_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
+			if native_output_stride > 1 else w_full
+		)
 		w_by_scale = {
-			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
-				 if sd > 1 else w_full.cpu().numpy())
+			sd: (_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0).cpu().numpy()
+				 if sd > native_output_stride else w_native.cpu().numpy())
 			for sd in sorted(set(scales.values()))
 		}
 	groups: dict[int, dict[str, Any]] = {}
@@ -3120,7 +3152,7 @@ def run_tiled_inference_3d(
 
 		if not parallel:
 			_start_flush_workers()
-			assert w_full is not None and w_by_scale is not None
+			assert w_full is not None and w_native is not None and w_by_scale is not None
 			serial_reader = None
 			serial_pending: deque[dict[str, Any]] = deque()
 			serial_source = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
@@ -3286,12 +3318,22 @@ def run_tiled_inference_3d(
 								f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}", flush=True,
 							)
 					tensors = model_adapter.product_tensors_from_output(raw_output)
+					expected_native_shape = tuple(int(value) for value in w_native.shape)
+					for name in needed_names:
+						observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
+						if observed_shape != expected_native_shape:
+							raise ValueError(
+								f"product {name!r} native tile shape {observed_shape} does not match "
+								f"model native output stride {native_output_stride} expected shape "
+								f"{expected_native_shape}"
+							)
 					prepared_products = {}
 					for name in needed_names:
 						sd = scales[name]
-						weighted = tensors[name][0] * w_full
-						if sd > 1:
-							weighted = _pyrdown3d(weighted, factor=sd)
+						weighted = tensors[name][0] * w_native
+						remaining_scaledown = sd // native_output_stride
+						if remaining_scaledown > 1:
+							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
 						prepared_products[name] = weighted.detach().cpu().numpy()
 					for sd, group in groups.items():
 						_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
@@ -3362,7 +3404,8 @@ def run_tiled_inference_3d(
 					target=_multi_gpu_worker_main,
 					args=(
 						index, str(worker_device), model_adapter, worker_state, tile_size, r,
-						scales, input_specs, result_specs, work_queues[index], result_queue,
+						scales, native_output_stride, input_specs, result_specs,
+						work_queues[index], result_queue,
 						bool(profile_pipeline),
 					),
 					name=f"predict3d-{worker_device}", daemon=True,

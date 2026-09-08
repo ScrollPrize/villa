@@ -289,6 +289,13 @@
   than the snapshot. Older checkpoints without embedded config may infer a
   minimal legacy free-branch model layout from
   `net.decoder.final_seg_layer.weight` when possible.
+- Fiber inference treats each product's configured inference scaledown as the
+  total requested factor relative to the selected input. The checkpoint model's
+  native output stride is recovered independently, and only the exact residual
+  factor `total / native` is applied after the model. Blend weights are first
+  built on the native output lattice. Whole-volume and native Trace2CP inference
+  reject totals that are not positive multiples of the native stride; neither
+  consumer may silently downsample native-stride output twice.
 - Lasagna 3x2 normal estimation and compact `nx/ny` byte encoding live in the
   package-safe shared `lasagna.normal_encoding` module. Lasagna predict3d,
   fiber whole-volume inference, and live fiber prediction paths must import
@@ -355,6 +362,14 @@
   indices and same-clock epoch timestamps bracketing coordinator receipt before
   H2D. Worker-end-to-receive is combined transport/order/prefetch residence, not
   an isolated IPC timer. Later batches computed early do not prove queue delivery.
+- training.profile_replay_batch defaults false and requires
+  profile_enabled=true. It captures one normal fully prepared GPU batch per
+  rank, shuts down the training DataLoader, and reuses that GPU-resident batch
+  while executing the unchanged production model/loss/backward/optimizer/loss
+  reduction path. Parameters and BatchNorm state continue to advance; the mode
+  is a compute-throughput diagnostic, not a valid learning run. Profiled runs
+  may set profile_throughput_start_step; throughput artifacts use synchronized
+  window boundaries and the slowest rank's elapsed wall time.
 
 - The 3D CP model lives in a sibling package,
   `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
@@ -499,7 +514,25 @@
   Contrastive embedding remains unsupported by default in the 3D V0 path.
 - The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
   actual BatchNorm batch because the trainer has no internal micro-batching.
-  `model_3d.normalization: "none"` remains supported for explicit ablations.
+  `model_3d.normalization` also supports `"group"` and `"none"`. Distributed
+  conversion to SyncBatchNorm is controlled by the JSON boolean
+  `training.sync_batchnorm` (default true), while DDP buffer broadcast is
+  controlled independently by `training.ddp_broadcast_buffers` (default true).
+  GroupNorm is retained in current speed experiments but is not silently
+  substituted into existing configs or checkpoints.
+- `model_3d.output_stride` selects an isotropic encoder-skip lattice for the
+  model head and defaults to 1. Output index `k` aligns to source index
+  `k * output_stride`; each output axis has ceil-divided length. A native
+  lower-resolution model constructs and executes only the decoder prefix needed
+  to reach that lattice. Stride-1 module layout and state keys remain compatible
+  with existing checkpoints.
+- Native lower-resolution targets are constructed directly on the output
+  lattice. Coarse presence is source-cell occupancy, dense-line coordinates are
+  rounded on the source lattice before stable coarse-cell deduplication, and a
+  CP-only target retains its nearest in-bounds coarse cell when its radius
+  contains no integer source sample. A coarse validity cell is valid only if all
+  in-bounds source voxels are valid; negative supervision requires the complete
+  source-cell footprint to lie inside configured edge margins.
 - `batch_size` is the actual CP-patch batch passed through the 3D model in one
   forward/backward call. The 3D trainer does not support internal
   micro-batching; any BatchNorm statistics must come from the real configured

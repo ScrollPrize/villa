@@ -1,9 +1,11 @@
-# Shared Fiber3D sample-worker pool status
+# Status: native lower-resolution Fiber3D output
 
-- [x] Record task and implementation plan
-- [x] Independent plan review against task/specs/overarching plan
-- [x] Implement shared process pool and gradual bounded admission
-- [x] Add scheduler and transport regression tests
-- [x] Run focused test suite and static checks
-- [x] Benchmark 128-process CPU-only S1a pipeline
+- [x] Record task and detailed plan
+- [x] Independent plan review against task, specs, and overarching plan
+- [x] Implement configurable truncated decoder and direct low-resolution targets
+- [x] Implement checkpoint/inference scale compatibility
+- [x] Add focused regression tests
+- [x] Run stride-1 and stride-4 GroupNorm replay benchmarks on GPUs 0 and 1
+- [x] Run matched real-sample benchmark
 - [x] Update specs, docs, task log, and changelog
+- [x] Run final focused tests and diff checks

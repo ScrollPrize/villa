@@ -42,12 +42,30 @@ def main():
                         help="Saved baseline JSON containing the authoritative config")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-mode", choices=["off", "default", "reduce-overhead"], default="off")
+    parser.add_argument(
+        "--normalization",
+        choices=["sync-batch", "batch", "group"],
+        default="group",
+    )
+    parser.add_argument("--output-stride", type=int, default=1)
     parser.add_argument("--steps", type=int, default=120)
     parser.add_argument("--trace-steps", type=int, default=5)
     parser.add_argument("--profile-loader", action="store_true")
+    parser.add_argument(
+        "--replay-batch",
+        action="store_true",
+        help="capture one prepared GPU batch per rank, stop loaders, and replay it",
+    )
+    parser.add_argument(
+        "--throughput-only",
+        action="store_true",
+        help="disable evaluation, visualization, snapshots, TensorBoard, and tracing",
+    )
     args = parser.parse_args()
     if args.steps < 30 or args.trace_steps < 0:
         parser.error("steps must be >=30 and trace-steps nonnegative")
+    if args.output_stride <= 0:
+        parser.error("output-stride must be > 0")
     config = json.loads(args.reference.read_text())["config"]
     if config.get("batch_size") != 8:
         parser.error("this reference experiment requires batch_size=8 per rank")
@@ -55,16 +73,38 @@ def main():
         parser.error("reference experiment must start fresh, not resume")
     config.pop("_config_dir", None)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    suffix = "_loader" if args.profile_loader else ""
+    suffix = "_replay" if args.replay_batch else ("_loader" if args.profile_loader else "")
+    suffix += f"_{args.normalization.replace('-', '_')}"
+    suffix += f"_os{args.output_stride}"
     experiment = args.output.resolve() / f"profile_2gpu_{args.compile_mode}{suffix}_{stamp}"
     experiment.mkdir(parents=True, exist_ok=False)
     training = config["training"]
+    model_config = config.setdefault("model_3d", {})
+    model_config["normalization"] = "group" if args.normalization == "group" else "batch"
+    model_config["output_stride"] = int(args.output_stride)
+    training["sync_batchnorm"] = args.normalization == "sync-batch"
+    training["ddp_broadcast_buffers"] = False
     training.update(run_path=str(experiment), run_name="s1a_128_sd1_2x8",
                     max_steps=args.steps, compile_mode=args.compile_mode,
                     initialization_seed=0, profile_enabled=True,
                     profile_loader=args.profile_loader,
+                    profile_replay_batch=args.replay_batch,
                     profile_trace_start=21, profile_trace_steps=args.trace_steps,
                     scalar_log_interval=1)
+    throughput_only = bool(args.throughput_only or args.replay_batch)
+    if throughput_only:
+        training.update(
+            profile_throughput_start_step=31,
+            profile_trace_steps=0,
+            scalar_log_interval=args.steps + 1,
+            tensorboard_enabled=False,
+            sample_vis_interval=0,
+            test_trace2cp_enabled=False,
+            test_interval=args.steps + 1,
+            checkpoint_interval=args.steps + 1,
+            kept_snapshot_interval=0,
+        )
+        config.pop("test_datasets", None)
     config_path = experiment / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     env = os.environ.copy()
@@ -80,7 +120,11 @@ def main():
                 "cuda_visible_devices": env["CUDA_VISIBLE_DEVICES"],
                 "reference": str(args.reference.resolve()), "global_batch": 16,
                 "compile_mode": args.compile_mode, "trace_steps": args.trace_steps,
-                "profile_loader": args.profile_loader}
+                "normalization": args.normalization,
+                "output_stride": int(args.output_stride),
+                "profile_loader": args.profile_loader,
+                "replay_batch": args.replay_batch,
+                "throughput_only": throughput_only}
     metadata["python"] = sys.version
     metadata["packages"] = {name: importlib.metadata.version(name)
                             for name in ("torch", "numpy", "tensorboard", "tensorstore")}

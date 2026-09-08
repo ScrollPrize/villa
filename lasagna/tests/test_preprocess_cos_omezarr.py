@@ -192,6 +192,22 @@ class _IdentityProductAdapter:
 		return {self._products[0].name: raw_output}
 
 
+class _NativeStrideProductAdapter(_IdentityProductAdapter):
+	def __init__(self, product: OutputProductSpec, native_output_stride: int):
+		super().__init__(product)
+		self.native_output_stride = int(native_output_stride)
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		self.calls += 1
+		_ = model, device
+		return torch.nn.functional.avg_pool3d(
+			tile,
+			kernel_size=self.native_output_stride,
+			stride=self.native_output_stride,
+			ceil_mode=True,
+		)
+
+
 class _RaisingProductAdapter(_IdentityProductAdapter):
 	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
 		self.calls += 1
@@ -416,7 +432,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		process = ctx.Process(
 			target=shared_predict3d._multi_gpu_worker_main,
 			args=(0, "cpu", SpawnIdentityAdapter(product), {"gain": torch.tensor(2.0)}, 4,
-				np.ones(4, dtype=np.float32), {"identity": 1}, input_specs,
+				np.ones(4, dtype=np.float32), {"identity": 1}, 1, input_specs,
 				result_specs, work_queue, result_queue),
 		)
 		try:
@@ -493,6 +509,56 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
 		for origin in serial_output.chunks:
 			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+
+	def test_shared_runner_composes_native_and_requested_output_stride(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = np.full((8, 8, 8), 255, dtype=np.uint8)
+		adapter = _NativeStrideProductAdapter(product, native_output_stride=4)
+		output = Output()
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True), \
+					mock.patch(f"{run_tiled_inference_3d.__module__}._accumulator_native_module", return_value=None):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), volume,
+					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 2, 2, 2)},
+					full_output_shapes_zyx={"identity": (2, 2, 2)},
+					tile_size=8, overlap=0, border=0, tmp_dir=td,
+				)
+		self.assertEqual(set(output.chunks), {(0, 0, 0)})
+		self.assertEqual(output.chunks[(0, 0, 0)].shape, (2, 2, 2))
+		self.assertTrue(np.all(output.chunks[(0, 0, 0)] > 0))
+
+		incompatible = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=2,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "native model output stride 4"):
+				run_tiled_inference_3d(
+					object(), volume,
+					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=_NativeStrideProductAdapter(incompatible, 4),
+					output_adapter=Output(), products=(incompatible,),
+					output_regions_zyx={"identity": (0, 0, 0, 8, 8, 8)},
+					full_output_shapes_zyx={"identity": (8, 8, 8)},
+					tile_size=8, overlap=0, border=0, tmp_dir=td,
+				)
 
 	def test_shared_parallel_tensorstore_pipeline_matches_python_zarr_exactly(self):
 		product = OutputProductSpec(

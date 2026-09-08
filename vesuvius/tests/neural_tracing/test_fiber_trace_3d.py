@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 import os
@@ -79,6 +80,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.model import (
     presence_outputs,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
+from vesuvius.neural_tracing.nets.output_lattice import IsotropicOutputLattice
 from vesuvius.neural_tracing.fiber_trace_3d.projection import (
     project_3d_direction_to_2d_frame,
 )
@@ -137,10 +139,12 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _TrainingHangDiagnostics,
+    _batch_tensor_sha256,
     _diagnostic_cuda_synchronize,
     _autocast_context,
     _conditioned_perpendicular_queries,
     _safe_probability_bce,
+    _source_batch_tensor_sha256,
     compute_conditioned_losses,
     compute_losses,
 )
@@ -1378,6 +1382,16 @@ def test_worker_profiling_preserves_batch_and_receive_metadata(monkeypatch) -> N
     assert "value_augmentation_ms" in timings
 
 
+def test_replayed_training_batch_reuses_prepared_object_without_stage_times() -> None:
+    from vesuvius.neural_tracing.fiber_trace_3d.train import _replayed_training_batch
+
+    batch = object()
+    replayed, load_ms, wait_ms, to_device_ms, target_ms = _replayed_training_batch(batch)
+
+    assert replayed is batch
+    assert (load_ms, wait_ms, to_device_ms, target_ms) == (0.0, 0.0, 0.0, 0.0)
+
+
 def test_3d_batch_dataset_applies_non_aligned_sample_offset_before_stride() -> None:
     config = _loader(augment_enabled=False).config
     dataset = _FiberTrace3DBatchDataset(
@@ -1559,7 +1573,15 @@ def test_3d_sync_batchnorm_is_only_automatic_for_cuda_ddp() -> None:
 
     assert not _distributed_should_use_sync_batchnorm(cpu_ddp)
     assert _distributed_should_use_sync_batchnorm(cuda_ddp)
+    assert not _distributed_should_use_sync_batchnorm(cuda_ddp, enabled=False)
     assert not _distributed_should_use_sync_batchnorm(single)
+    with pytest.raises(ValueError, match="JSON boolean"):
+        _distributed_should_use_sync_batchnorm(cuda_ddp, enabled="false")
+
+    from vesuvius.neural_tracing.fiber_trace_3d.train import _wrap_distributed_model
+
+    with pytest.raises(ValueError, match="ddp_broadcast_buffers"):
+        _wrap_distributed_model(torch.nn.Linear(1, 1), single, broadcast_buffers="false")
 
 
 def test_3d_torchrun_rejects_single_process_only_subcommands(monkeypatch) -> None:
@@ -3605,6 +3627,7 @@ def test_3d_fiber_inference_adapter_uses_checkpoint_config_for_model(
             "features_per_stage": [4, 8],
             "strides": [[1, 1, 1], [2, 2, 2]],
             "conditioned_decoder_enabled": False,
+            "output_stride": 2,
         },
         "image_normalization": "none",
     }
@@ -3640,6 +3663,8 @@ def test_3d_fiber_inference_adapter_uses_checkpoint_config_for_model(
     model = adapter.load_model(device=torch.device("cpu"))
 
     assert adapter.option_count == 2
+    assert adapter.native_output_stride == 2
+    assert model.output_stride == 2
     assert not model.conditioned_decoder_enabled
     assert model.output_channels == 14
     assert [product.name for product in adapter.output_products] == [
@@ -4106,6 +4131,164 @@ def test_3d_fiber_model_can_disable_normalization_explicitly() -> None:
         )
         for module in model.modules()
     )
+
+
+def test_3d_fiber_model_supports_group_normalization() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 16),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+            normalization="group",
+        )
+    )
+    groups = [module for module in model.modules() if isinstance(module, torch.nn.GroupNorm)]
+    assert groups
+    assert all(module.num_channels % module.num_groups == 0 for module in groups)
+    assert not any(isinstance(module, torch.nn.BatchNorm3d) for module in model.modules())
+
+
+def test_3d_fiber_model_native_output_stride_truncates_decoder() -> None:
+    common = dict(
+        input_channels=1,
+        output_channels=7,
+        features_per_stage=(4, 8, 16, 32, 32),
+        strides=((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+        decoder_upsample_mode="pixelshuffle",
+        normalization="group",
+    )
+    full = FiberTrace3DNet(FiberTrace3DModelConfig(**common, output_stride=1))
+    coarse = FiberTrace3DNet(FiberTrace3DModelConfig(**common, output_stride=4))
+
+    assert len(full.net.decoder.stages) == 4
+    assert len(coarse.net.decoder.stages) == 2
+    assert coarse.net.decoder.final_transpconv is None
+    output = coarse(torch.zeros((1, 1, 32, 32, 32)))
+    assert output.shape == (1, 7, 8, 8, 8)
+    assert sum(p.numel() for p in coarse.parameters()) < sum(p.numel() for p in full.parameters())
+
+
+def test_3d_fiber_model_explicit_stride_one_preserves_seeded_output() -> None:
+    common = dict(
+        input_channels=1,
+        output_channels=7,
+        features_per_stage=(4, 8),
+        strides=((1, 1, 1), (2, 2, 2)),
+        decoder_upsample_mode="pixelshuffle",
+        normalization="group",
+    )
+    torch.manual_seed(17)
+    implicit = FiberTrace3DNet(FiberTrace3DModelConfig(**common))
+    torch.manual_seed(17)
+    explicit = FiberTrace3DNet(FiberTrace3DModelConfig(**common, output_stride=1))
+    explicit.load_state_dict(implicit.state_dict(), strict=True)
+    sample = torch.randn((1, 1, 8, 8, 8))
+    implicit.eval()
+    explicit.eval()
+    assert torch.equal(implicit(sample), explicit(sample))
+
+
+def test_materialize_targets_uses_native_coarse_lattice_without_losing_cp() -> None:
+    loader = _loader(augment_enabled=False)
+    raw = loader.load_batch(0)
+    coarse = materialize_targets(raw, loader.config, output_stride=4)
+
+    assert coarse.presence_target is not None
+    assert coarse.presence_mask is not None
+    assert coarse.direction_indices_bzyx is not None
+    assert coarse.presence_target.shape[-3:] == (4, 4, 4)
+    assert coarse.presence_mask.shape[-3:] == (4, 4, 4)
+    assert int(coarse.direction_indices_bzyx.shape[0]) > 0
+    assert torch.all(coarse.direction_indices_bzyx[:, 1:] >= 0)
+    assert torch.all(coarse.direction_indices_bzyx[:, 1:] < 4)
+    assert float(coarse.presence_target.sum()) > 0.0
+
+
+def test_native_coarse_targets_keep_source_identity_and_support_backward() -> None:
+    loader = _loader(augment_enabled=False)
+    raw = loader.load_batch(0)
+    full = materialize_targets(raw, loader.config, output_stride=1)
+    coarse = materialize_targets(raw, loader.config, output_stride=4)
+
+    assert _source_batch_tensor_sha256(full) == _source_batch_tensor_sha256(coarse)
+    assert _batch_tensor_sha256(full) != _batch_tensor_sha256(coarse)
+
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8, 16),
+            strides=((1, 1, 1), (2, 2, 2), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+            normalization="group",
+            output_stride=4,
+        )
+    )
+    output = model(coarse.volume)
+    losses = compute_losses(output, coarse, direction_weight=1.0, presence_weight=1.0)
+    losses["total"].backward()
+    assert output.shape[-3:] == coarse.presence_target.shape[-3:]
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_native_coarse_targets_use_ceil_shape_and_conservative_validity() -> None:
+    loader = _loader(augment_enabled=False)
+    raw = loader.load_batch(0)
+    batch_size = int(raw.volume.shape[0])
+    volume = torch.zeros((batch_size, 1, 9, 10, 11), dtype=raw.volume.dtype)
+    valid = torch.ones_like(volume, dtype=torch.bool)
+    valid[0, 0, 1, 1, 1] = False
+    cp = torch.tensor(
+        [[1.2, 1.2, 1.2], [8.2, 9.2, 10.2]],
+        dtype=torch.float32,
+    )[:batch_size]
+    raw = replace(
+        raw,
+        volume=volume,
+        valid_mask=valid,
+        cp_local_zyx=cp,
+        target_modes=torch.full_like(raw.target_modes, _TARGET_MODE_CP_ONLY),
+    )
+    config = replace(loader.config, presence_negative_edge_margin_voxels=1)
+    coarse = materialize_targets(raw, config, output_stride=4)
+
+    assert coarse.presence_target.shape[-3:] == (3, 3, 3)
+    assert not bool(coarse.presence_mask[0, 0, 0, 0, 0])
+    assert bool(coarse.presence_mask[0, 0, 1, 1, 1])
+    assert not bool(coarse.presence_mask[0, 0, 2, 2, 2])
+    assert tuple(coarse.direction_indices_bzyx.shape[1:]) == (4,)
+
+
+def test_native_coarse_cp_fallback_keeps_fractional_sub_stride_radius() -> None:
+    loader = _loader(augment_enabled=False)
+    raw = loader.load_batch(0)
+    cp = torch.tensor(
+        [[2.2, 3.3, 4.4], [14.7, 15.2, 15.8]],
+        dtype=torch.float32,
+    )
+    raw = replace(
+        raw,
+        cp_local_zyx=cp,
+        target_modes=torch.full_like(raw.target_modes, _TARGET_MODE_CP_ONLY),
+    )
+    config = replace(loader.config, presence_radius_voxels=0.1)
+    coarse = materialize_targets(raw, config, output_stride=4)
+
+    indices = {tuple(int(v) for v in row) for row in coarse.direction_indices_bzyx}
+    assert (0, 0, 0, 1) in indices
+    assert (1, 3, 3, 3) in indices
+    assert float(coarse.presence_target.sum()) >= 2.0
+
+
+def test_output_lattice_total_native_residual_composition() -> None:
+    assert IsotropicOutputLattice(1).residual_to(4) == 4
+    assert IsotropicOutputLattice(4).residual_to(4) == 1
+    assert IsotropicOutputLattice(4).residual_to(8) == 2
+    assert IsotropicOutputLattice(4).shape((129, 130, 131)) == (33, 33, 33)
+    with pytest.raises(ValueError, match="positive multiple"):
+        IsotropicOutputLattice(4).residual_to(2)
 
 
 def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
@@ -6180,6 +6363,51 @@ def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
 
     assert bool(valid[0].item())
     assert float(presence[0].item()) == pytest.approx(0.4)
+
+
+def test_native_3d_trace2cp_composes_native_and_residual_scaledown() -> None:
+    class NativeStrideAdapter(_NativeTraceTestPredictionAdapter):
+        native_output_stride = 2
+
+    class NativeStrideModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            coarse = torch.nn.functional.avg_pool3d(volume, kernel_size=2, stride=2)
+            return coarse.expand(-1, 7, -1, -1, -1).contiguous()
+
+    record = _native_trace_record(np.ones((16, 16, 16), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=NativeStrideAdapter(),
+        model=NativeStrideModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=0,
+        inference_scaledown_power=2,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert cache.native_output_stride == 2
+    assert cache.residual_inference_scaledown == 2
+    assert block.output_czyx.shape == (7, 2, 2, 2)
+    assert block.valid_mask_zyx.shape == (2, 2, 2)
+
+
+def test_native_3d_trace2cp_rejects_total_stride_below_native_stride() -> None:
+    adapter = _NativeTraceTestPredictionAdapter()
+    adapter.native_output_stride = 4
+    record = _native_trace_record(np.ones((16, 16, 16), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="positive multiple"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=adapter,
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
 
 
 def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() -> None:

@@ -1,81 +1,95 @@
-# Plan: shared Fiber3D sample-worker pool
+# Plan: native lower-resolution Fiber3D U-Net output
 
-## Design and implementation
+## Architecture
 
-- Keep `OrderedTwoStageSamplePipeline` as the shared reusable implementation
-  and add a shared-pool mode rather than copying its scheduler.
-- Spawn one bounded process population. Workers claim eligible load indices
-  atomically and consume ready augmentation descriptors directly, without a
-  parent scheduling round trip. Soft load/augmentation affinities preserve hot
-  stage-local state, but every worker has the same entrypoint and lazily creates
-  the other stage when it must help: a loader augments its just-completed sample
-  instead of blocking on a full raw queue, and loaders help drain augmentation
-  once all loads have been dispatched. No future or dependency-blocked
-  augmentation is queued.
-- Keep task ownership explicit. Every admitted sample has exactly one load and,
-  when enabled, exactly one augmentation. No stage-two task may be enqueued
-  before its stage-one payload exists. Data/results continue to use bounded
-  queues and the existing shared-slot transport and generation validation.
-- Replace eager full-window admission in shared mode with explicit gradual
-  admission state: `target_frontier`, `next_load_to_dispatch`, and
-  `outstanding`. Initialize the target frontier with a positive configurable
-  window. Each accepted load completion advances it by exactly two indices,
-  capped by the stream end. Dispatch remains capped by
-  `outstanding <= max_in_flight`; ordered delivery or explicit lease release
-  retires one outstanding credit. This allows the active lookahead to grow but
-  never beyond the hard bound.
-- Ensure scheduling cannot deadlock or priority-invert: workers pull the next
-  runnable task rather than receiving permanent stage assignments; stage-two
-  work is never queued ahead of its dependency; queue publication is bounded;
-  process death, worker exceptions, duplicate completion, and no progress are
-  explicit failures.
-- Preserve the existing fixed-pool mode for compatibility and the stage-one-only
-  benchmark. Expose shared mode and initial lookahead in the benchmark CLI and
-  stable launcher, with one total worker count. Report task counts per worker,
-  pool utilization, admission high-water, and stage service distributions.
-- A shared transport slot is owned by its stream index from load encode through
-  augmentation and final consumer decode. It cannot be reused until ordered
-  delivery or explicit `release(index)`. Validate that the transport exposes at
-  least `max_in_flight` slots and preserve generation checks.
-- Attribute worker errors to stage and stream index. Detect either factory's
-  startup failure and any premature process exit, unblock dispatcher/consumer
-  waits during teardown, close pipes and queue resources, and clear leases.
+1. Add an explicit `model_3d.output_stride` setting to the shared 3D U-Net.
+   Keep stride 1 as the compatibility default and initially support isotropic
+   strides represented by an encoder skip resolution.
+   Define one shared lattice helper: output index `k` aligns to input index
+   `k * output_stride`, and output shape is ceil-divided per axis, matching the
+   padded odd-kernel strided-convolution lattice.
+2. For stride 4, construct and execute only the decoder prefix required to
+   reach the quarter-resolution encoder skip. Do not construct or run the
+   half- or full-resolution decoder stages.
+3. Attach the existing output activation/head semantics directly at that
+   decoder resolution. Preserve the exact stride-1 module structure and state
+   keys so existing checkpoints remain loadable.
+4. Retain GroupNorm in the benchmark configuration; do not change the normal
+   configuration default or silently reinterpret old checkpoints.
 
-## Validation and performance
+## Training targets and losses
 
-- Add synthetic regression tests for exact ordered output, one execution per
-  stage, gradual admission bounds (including initial window one, short streams,
-  and a partial final growth), pool-level work stealing, slow-load/no-ready-
-  augmentation progress, persistent augmentation backlog followed by resumed
-  loading, saturated queues, both-stage/startup/hard-exit failures, deferred
-  leased slots with wraparound, and clean shutdown.
-- Compare shared-pool values tensor-for-tensor with synchronous and fixed-pool
-  output for the same stream and repeat with deliberately different completion
-  timing. RNG remains keyed only by stream index, never worker identity/order.
-- Run focused pipeline/Fiber3D tests and `git diff --check`.
-- Run the approved CPU-only benchmark launcher on the saved S1a workload with
-  128 shared workers, 4096 measured samples and 128 warmup samples. Compare
-  command, input, build, process count, production/full-span throughput and
-  mean/p50/p95 stage times against commit `2e1714967` (229.75 samples/s
-  production; 223.95 samples/s full start/drain).
-- If shared initialization materially increases memory, measure and report it;
-  do not silently increase the configured 512-slot shared tensor bound.
-- Record exact cache/build/commit metadata plus peak observed process/thread/RSS
-  usage. Run repeated performance trials when practical; otherwise explicitly
-  record that the long 4096-sample comparison is a single-run limitation.
+1. Materialize presence, validity, and sparse direction targets directly on
+   the model output lattice. Coarse positives use source-voxel-cell occupancy:
+   a coarse cell is positive when it contains a positive source-grid sample.
+   CP targets always include their nearest in-bounds coarse cell if a
+   sub-voxel radius otherwise produces none. Dense lines retain source-lattice
+   rounding before deterministic coarse-cell deduplication.
+2. A coarse validity cell is valid only when all of its in-bounds source voxels
+   are valid. A negative-loss cell is eligible only when its complete source
+   footprint is inside the configured edge margins; derive lower and upper
+   bounds independently for non-divisible margins and shapes.
+3. Keep deterministic sparse-direction deduplication and existing loss math.
+   Validate model-output and target shapes explicitly with actionable errors.
+4. Apply the same output-stride handling to training, test, and visualization
+   paths through one shared target-materialization API.
+
+## Benchmark
+
+1. Extend the existing two-GPU profiling launcher with an explicit output
+   stride; do not create a second training implementation.
+2. Compare stride-1 GroupNorm with stride-4 GroupNorm using the same S1a
+   128-cubed inputs, batch 8/rank, BF16, eager execution, optimizer, seeds,
+   captured per-rank batches, 30-step warmup, and 90-step measured window.
+3. Run both replayed-batch compute and real-sample measurements on GPUs 0 and
+   1. Report global/per-GPU samples/s and iteration mean, median, and p95.
+4. Record model parameter count, output shape, and peak allocated GPU memory so
+   the source of the speedup is auditable. This phase makes no convergence or
+   quality claim.
+
+## Inference compatibility
+
+1. Store output stride in checkpoints through the existing saved config.
+2. Keep product inference scaledown as the requested total factor. Expose the
+   checkpoint's native model stride separately and define residual downscale as
+   `requested_total / native_stride`. Build blend weights on the native lattice
+   before applying residual downscaling; persisted output scale remains the
+   requested total factor.
+3. Reject incompatible combinations where native model stride and requested
+   output scale cannot be represented exactly. Keep old stride-1 checkpoints
+   and inference behavior unchanged. Apply the same composition or an explicit
+   rejection in Trace2CP/native field consumers; no consumer may silently
+   downsample twice.
+
+## Tests
+
+1. Test stride-1 state keys and output shape against the compatibility path.
+2. Test stride-4 construction, omitted decoder stages, output shape, direct
+   target materialization, loss/backward, and config validation on CPU. Target
+   cases include shifted CPs, radius below stride, short/diagonal lines,
+   non-divisible margins/shapes, invalid source regions, and duplicate coarse
+   indices.
+3. Test checkpoint config recovery and inference scale composition without a
+   full-volume run.
+4. Test total/native/residual scale composition for legacy 1/4, native 4/4,
+   native 4/8, and rejection of native 4 with requested 1 or 2. Require
+   fixed-seed stride-1 output equality and strict legacy checkpoint loading,
+   not state-key comparison alone.
+5. Run focused Fiber3D model/training/inference tests and `git diff --check`,
+   followed by the authorized two-GPU benchmarks.
 
 ## Spec update
 
-Document shared-pool scheduling, dependency eligibility, gradual admission,
-the global 128-process bound, deterministic delivery, and fixed-pool
-compatibility.
+Document the aligned ceil-shaped lattice, occupancy/validity/margin semantics,
+`model_3d.output_stride`, checkpoint behavior, and total/native/residual
+composition for whole-volume and Trace2CP inference.
 
-## Docs updates
+## Docs update
 
-Update the sample-pipeline benchmark document with the shared scheduler,
-launcher arguments, before/after results, lifecycle, and limitations.
+Add the architecture and measured stride-1/stride-4 results to the Fiber3D
+two-GPU training profile document, including the speed-only/quality caveat.
 
 ## Changelog update
 
-Add one concise entry once the shared-pool implementation and benchmark are
-complete.
+Add one concise entry for native lower-resolution Fiber3D output once the
+implementation and measurements are complete.
