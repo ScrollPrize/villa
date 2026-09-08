@@ -1,0 +1,10 @@
+{
+  "input_use_tracks": true,
+  "input_disable_patches": true,
+  "loss_weight_shell_outer": 0,
+  "loss_weight_shell_patch_radius": 0,
+  "dense_spacing_mode": "grad_mag",
+  "loss_weight_dense_spacing": 0,
+  "shell_outer_winding_idx": 90,
+  "model_gap_expander_num_windings": 90
+}

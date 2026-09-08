@@ -128,6 +128,31 @@ python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
   | PHerc0800 | 79-88 | |
   | PHerc0268 | 86-101 | |
 
+**Per-scroll presets.** `configs/scrolls/` holds one overrides file per track-ready scroll with the switches above and
+  the winding count that produced a clean fitted mesh, plus the estimated umbilicus for the scrolls that have no
+  published one (control points in full-resolution voxel coordinates, loadable by `--umbilicus` or as the dataset's
+  `umbilicus.json`). Set `z_begin`/`z_end` for the band you want and merge the rest:
+
+  ```sh
+  export FIT_SPIRAL_CONFIG_OVERRIDES="$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); d.update(z_begin=8000, z_end=9500, optimizer_num_training_steps=30000); print(json.dumps(d))' configs/scrolls/PHerc0358.json)"
+  cp configs/scrolls/PHerc0358_umbilicus_est.json <dataset>/umbilicus.json   # only when the dataset has none
+  python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
+  ```
+
+  | scroll | preset | windings | umbilicus | validated by |
+  |---|---|---|---|---|
+  | PHerc0125 | `configs/scrolls/PHerc0125.json` | 90 | published | 30k-step fit, clean continuous sheets (w089); 24+23 windings swept |
+  | PHerc0826 | `configs/scrolls/PHerc0826.json` | 70 | published | 44 windings swept over two z-bands |
+  | PHerc0211 | `configs/scrolls/PHerc0211.json` | 90 | published | 50 windings swept over two z-bands |
+  | PHerc0257 | `configs/scrolls/PHerc0257.json` | 90 | estimated (`configs/scrolls/PHerc0257_umbilicus_est.json`) | 51.7% of track points satisfied; 46 renders |
+  | PHerc0358 | `configs/scrolls/PHerc0358.json` | 100 | estimated (`configs/scrolls/PHerc0358_umbilicus_est.json`) | 50.4% of track points satisfied; 54 renders |
+  | PHerc0813 | `configs/scrolls/PHerc0813.json` | 80 | estimated (`configs/scrolls/PHerc0813_umbilicus_est.json`) | fitted and swept on Kaggle T4 (ACW); 46 renders |
+  | PHerc0191 | `configs/scrolls/PHerc0191.json` | 100 | estimated (`configs/scrolls/PHerc0191_umbilicus_est.json`) | fitted and swept on Kaggle T4 (CW); 54 renders |
+
+  PHerc0800 (median crossings 79-88), PHerc0268 (median crossings 86-101) ship an estimated umbilicus only; their winding counts have not been fitted yet, so start from
+  `shell_outer_winding_idx` a little above the median crossings and check the exported outer windings against the
+  papyrus boundary.
+
   The count is a lower bound where sheets are pressed together, so the value used should sit above the range.
 
 **What to expect.** A 1,500-slice band runs at 7-8 it/s on an RTX 3090 (about 70 minutes for 30,000 steps) and

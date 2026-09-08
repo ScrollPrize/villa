@@ -1,0 +1,60 @@
+{
+ "control_points": [
+  {
+   "x": 5468,
+   "y": 3028,
+   "z": 1944
+  },
+  {
+   "x": 5652,
+   "y": 4940,
+   "z": 4208
+  },
+  {
+   "x": 5796,
+   "y": 4532,
+   "z": 6480
+  },
+  {
+   "x": 4740,
+   "y": 4556,
+   "z": 8744
+  },
+  {
+   "x": 3892,
+   "y": 5052,
+   "z": 11016
+  },
+  {
+   "x": 4060,
+   "y": 5492,
+   "z": 13280
+  },
+  {
+   "x": 4556,
+   "y": 6652,
+   "z": 15552
+  },
+  {
+   "x": 4716,
+   "y": 5668,
+   "z": 17816
+  },
+  {
+   "x": 5580,
+   "y": 5084,
+   "z": 20088
+  },
+  {
+   "x": 3932,
+   "y": 5884,
+   "z": 22352
+  }
+ ],
+ "metadata": {
+  "source": "estimate_umbilicus.py (max distance-to-boundary of sheet mask, L3)",
+  "scroll": "PHerc0800",
+  "coordinates": "level-0 (full-resolution) voxel indices, same format as the dataset umbilicus.json; fit_spiral applies the dataset's umbilicus_coordinate_scale",
+  "origin": "gmDevi/vc-windows-tools results/umbilici"
+ }
+}
