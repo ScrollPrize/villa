@@ -7,7 +7,7 @@ import logging
 import os
 import hashlib
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -25,27 +25,55 @@ SUPPORTED_LABEL_EXTENSIONS = {".tif", ".png", ".jpg"}
 RESERVED_IMAGE_FILENAMES = {"x.tif", "y.tif", "z.tif", "mask.tif"}
 
 
+_BBOX_UNRESOLVED = object()
+
+
 @dataclass
 class TifxyzInfo:
     """Lightweight metadata for a tifxyz segment without loading coordinates.
 
     Use this for filtering/listing segments before deciding which to fully load.
+
+    ``bbox`` (and ``z_min`` / ``z_max``) are resolved lazily. For the common case the
+    stored ``meta.json`` bbox is returned untouched and no coordinate grid is read.
+    Only when the stored bbox carries the tifxyz ``-1`` missing-point marker
+    (villa #1618) is the true extent recomputed from the valid points, and only on
+    first access, so plain listing stays metadata-only (raised in review of #1731).
     """
 
     path: Path
     scale: Tuple[float, float]
-    bbox: Optional[Tuple[float, float, float, float, float, float]]
     uuid: str
+    stored_bbox: Optional[Tuple[float, float, float, float, float, float]] = None
+    _bbox: Any = field(default=_BBOX_UNRESOLVED, init=False, repr=False, compare=False)
+
+    @property
+    def bbox(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """The bounding box, recomputed from valid points only if the stored one
+        carries the ``-1`` marker. Resolved once, then cached. ``None`` means the
+        segment has no usable bbox (no stored bbox, or no valid points)."""
+        if self._bbox is _BBOX_UNRESOLVED:
+            if self.stored_bbox is not None and _bbox_carries_missing_marker(self.stored_bbox):
+                self._bbox = _bbox_from_valid_points(TifxyzReader(self.path))
+                if self._bbox is not None:
+                    logger.warning(
+                        "%s: meta.json bbox contains the -1 missing-point marker; "
+                        "using the extent of the valid coordinates instead",
+                        self.path,
+                    )
+            else:
+                self._bbox = self.stored_bbox
+        return self._bbox
 
     @property
     def z_min(self) -> Optional[float]:
-        """Return minimum z coordinate from bbox, or None if no bbox."""
-        return self.bbox[2] if self.bbox else None
+        """Minimum z from the (lazily resolved) bbox, or None if there is no bbox."""
+        return self.bbox[2] if self.bbox is not None else None
 
     @property
     def z_max(self) -> Optional[float]:
-        """Return maximum z coordinate from bbox, or None if no bbox."""
-        return self.bbox[5] if self.bbox else None
+        """Maximum z from the (lazily resolved) bbox, or None if there is no bbox."""
+        return self.bbox[5] if self.bbox is not None else None
 
     def load(self, **kwargs) -> Tifxyz:
         """Load the full Tifxyz object for this segment.
@@ -83,11 +111,22 @@ def _bbox_from_arrays(
 def _bbox_from_valid_points(
     reader: "TifxyzReader",
 ) -> Optional[Tuple[float, float, float, float, float, float]]:
-    """Read the three grids and take the extent of points that are not the -1 marker."""
+    """Extent over the valid points, using the SAME validity as ``TifxyzReader.read``:
+    ``mask.tif`` when present and shape-matching, otherwise ``z > 0`` and finite.
+
+    Reading the bbox this way keeps ``list_tifxyz`` and ``read`` consistent for the
+    same surface. The earlier version used only ``!= -1`` and so could disagree with
+    the full reader when a ``mask.tif`` was present (raised in review of #1731).
+    """
     x = reader.read_coordinate("x")
     y = reader.read_coordinate("y")
     z = reader.read_coordinate("z")
-    return _bbox_from_arrays(x, y, z, (x != -1) & (y != -1) & (z != -1))
+    mask = reader.read_mask()
+    if mask is not None and mask.shape == x.shape:
+        valid = mask
+    else:
+        valid = (z > 0) & np.isfinite(z)
+    return _bbox_from_arrays(x, y, z, valid)
 
 
 def list_tifxyz(
@@ -145,35 +184,24 @@ def list_tifxyz(
         try:
             reader = TifxyzReader(segment_dir)
             meta = reader.read_metadata()
-            bbox = meta["bbox"]
-            if bbox is not None and _bbox_carries_missing_marker(bbox):
-                # The stored bbox was computed over the raw grid and inherited the
-                # tifxyz missing-point marker (-1) as a minimum. 28 published
-                # PHercParis4 surfaces ship this way (villa issue #1618). Taken at
-                # face value it makes z_min = -1, so the surface passes every z_range
-                # filter whose upper bound is above -1, whatever its real extent.
-                # Recompute from the valid points instead; for the published
-                # uncompressed float32 grids this is a memmap scan, ~0.1 s, no disk.
-                bbox = _bbox_from_valid_points(reader)
-                logger.warning(
-                    "%s: meta.json bbox contains the -1 missing-point marker; "
-                    "using the extent of the valid coordinates instead",
-                    segment_dir,
-                )
             info = TifxyzInfo(
                 path=segment_dir,
                 scale=meta["scale"],
-                bbox=bbox,
                 uuid=meta["uuid"],
+                stored_bbox=meta["bbox"],
             )
 
-            # Filter by z_range if specified
-            if z_range is not None and info.bbox is not None:
-                bbox_z_min, bbox_z_max = info.z_min, info.z_max
-                range_z_min, range_z_max = z_range
-                # Skip if bbox doesn't overlap z_range
-                if bbox_z_min > range_z_max or bbox_z_max < range_z_min:
-                    continue
+            # Filter by z_range if specified. Reading z_min/z_max resolves the bbox
+            # lazily: for an ordinary bbox this just reads the stored value; only a
+            # bbox carrying the -1 marker (#1618) triggers a coordinate scan, and only
+            # here where it is actually needed. A segment with no usable bbox
+            # (z_min/z_max None) is not filtered out.
+            if z_range is not None:
+                z_min, z_max = info.z_min, info.z_max
+                if z_min is not None and z_max is not None:
+                    range_z_min, range_z_max = z_range
+                    if z_min > range_z_max or z_max < range_z_min:
+                        continue
 
             results.append(info)
 
