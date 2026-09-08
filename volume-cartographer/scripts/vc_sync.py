@@ -891,7 +891,20 @@ class S3SyncManager:
             f.write('\n')
         plan['merged_doc'] = doc
 
-    def _plan_link_consistency(self, pending_merges, download_paths):
+    def _absent_locally(self, path):
+        """True only when the path provably does not exist in the sync
+        dir. Unreadable/inaccessible ("cannot tell") is NOT absent: the
+        caller then reads it and demotes on failure, as before."""
+        try:
+            os.lstat(os.path.join(self.local_dir, path))
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _plan_link_consistency(self, pending_merges, download_paths,
+                               vanishing_paths=frozenset(), remote_paths=None):
         """Mirror each auto-merged fiber's link decisions into its peer
         files (fiber_merge.refresh_pair_links) so VC3D's index-exact
         cross-file reciprocity holds on the post-sync state.
@@ -899,18 +912,32 @@ class S3SyncManager:
         Pure planning over the files' FUTURE content (pending merge
         results, remote content for scheduled downloads, local content
         otherwise); nothing on disk is touched. Returns (peer_fixes,
-        demoted): peer_fixes maps non-merge peer paths to their fixed
-        docs (to write after downloads and upload), demoted lists
-        (path, reason) merges that must fall back to manual resolution.
+        demoted, notes): peer_fixes maps non-merge peer paths to their
+        fixed docs (to write after downloads and upload), demoted lists
+        (path, reason) merges that must fall back to manual resolution,
+        notes lists (path, peer_name) going-away peers that were skipped.
         Pending files of merges whose far-side fields were refreshed are
         rewritten in place (they are plan artifacts, not user files).
+
+        A peer that will not exist after this sync — pending local
+        deletion (`vanishing_paths`), or absent locally AND absent from
+        the remote inventory (`remote_paths`) AND not being downloaded —
+        has nothing to reciprocate, so a merged doc that dropped its link
+        to it is not a dangling link (it used to demote as "missing").
+        Such a peer is never read: reading a file pending deletion would
+        let refresh_pair_links strip its stale reciprocal and schedule an
+        upload of a file being deleted. A merged doc that STILL links a
+        going-away peer is dangling and demotes. Without a remote
+        inventory (`remote_paths=None`) absence cannot be established and
+        a locally missing peer demotes, as before.
         """
         if fiber_merge is None:
-            return {}, []
+            return {}, [], []
         plans = dict(pending_merges)
         future_docs = {path: plan['merged_doc'] for path, plan in pending_merges}
         changed = set()
         demoted = []
+        notes = []
 
         def future_doc(path):
             if path in future_docs:
@@ -969,9 +996,34 @@ class S3SyncManager:
                 # POSIX join: sync paths are '/'-keyed everywhere (scans,
                 # download_paths), regardless of host OS.
                 peer_path = f"{a_dir}/{peer_name}" if a_dir else peer_name
+                if peer_path not in future_docs:
+                    # Going-away peers are decided before any read. A
+                    # pending merge is served from future_docs first: the
+                    # action sets (conflict / delete-local / download) are
+                    # disjoint per path in analyze_changes, so a pending
+                    # peer can never be going away.
+                    remote_absent = (remote_paths is not None and
+                                     peer_path not in remote_paths)
+                    going_away = (peer_path in vanishing_paths or
+                                  (remote_absent and
+                                   peer_path not in download_paths and
+                                   self._absent_locally(peer_path)))
+                    if going_away:
+                        if fiber_merge.links_to(a_doc, peer_name):
+                            failure = (f"linked fiber {peer_name} is pending "
+                                       f"deletion or missing")
+                            break
+                        notes.append((path, peer_name))
+                        continue
                 b_doc = future_doc(peer_path)
                 if b_doc is None or not fiber_merge.is_fiber_doc(b_doc):
                     failure = f"linked fiber {peer_name} is missing or unreadable"
+                    if (remote_paths is not None and peer_path in remote_paths
+                            and peer_path not in download_paths
+                            and self._absent_locally(peer_path)):
+                        failure += (" (peer is absent locally but still present "
+                                    f"on {self.REMOTE_NAME}; resolve this file "
+                                    "manually)")
                     break
                 # A refresh bug on malformed input must demote this merge,
                 # never abort the whole sync mid-planning.
@@ -1009,13 +1061,13 @@ class S3SyncManager:
                 changed.add(path)
 
         if demoted:
-            return {}, demoted
+            return {}, demoted, notes
 
         for path in changed & set(plans):
             self._rewrite_pending(plans[path], future_docs[path])
         peer_fixes = {path: future_docs[path]
                       for path in changed if path not in plans}
-        return peer_fixes, demoted
+        return peer_fixes, demoted, notes
 
     def _apply_peer_fixes(self, peer_fixes):
         """Write link-consistency fixes into peer files, stashing the prior
@@ -1083,7 +1135,22 @@ class S3SyncManager:
                        f"last sync; auto-merge failed: {reason}"))
             manual_paths.add(path)
 
-        manual_paths = {p for p, _ in manual_conflicts} | set(delete_local_paths)
+        manual_paths = {p for p, _ in manual_conflicts}
+        delete_local_paths = set(delete_local_paths)
+        remote_paths = set(s3_files)
+        printed_notes = set()
+
+        def blocks(path, plan, peer_path):
+            # A manual peer always blocks. A peer pending local deletion
+            # blocks only while the merged doc still links it (a dangling
+            # link); a dropped link to a going-away peer needs no
+            # reciprocal fix, and stage 2 skips that peer without reading it.
+            if peer_path in manual_paths:
+                return True
+            return (peer_path in delete_local_paths and
+                    bool(fiber_merge.links_to(plan['merged_doc'],
+                                              os.path.basename(peer_path))))
+
         peer_fixes = {}
         while True:
             # Stage 1: cascade blocked-peer demotions to a fixpoint.
@@ -1094,7 +1161,7 @@ class S3SyncManager:
                 for path, plan in pending_merges:
                     blocked = sorted(os.path.basename(p)
                                      for p in peer_paths(path, plan)
-                                     if p in manual_paths)
+                                     if blocks(path, plan, p))
                     if blocked:
                         demote(path, plan,
                                "linked fiber(s) with unresolved conflicts "
@@ -1108,8 +1175,14 @@ class S3SyncManager:
                 break
             # Stage 2: plan the cross-file link consistency; its demotions
             # feed back into stage 1 on the next iteration.
-            peer_fixes, demoted = self._plan_link_consistency(
-                pending_merges, download_paths)
+            peer_fixes, demoted, notes = self._plan_link_consistency(
+                pending_merges, download_paths,
+                vanishing_paths=delete_local_paths, remote_paths=remote_paths)
+            for note in notes:
+                if note not in printed_notes:
+                    printed_notes.add(note)
+                    print(f"  (peer {note[1]} of {note[0]} is going away and the "
+                          "merge dropped its link; no reciprocal fix needed)")
             if not demoted:
                 break
             demoted_reasons = dict(demoted)

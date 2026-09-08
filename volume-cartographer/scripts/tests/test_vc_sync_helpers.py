@@ -701,7 +701,7 @@ class TestLinkConsistency:
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               self.fiber('a.json', self.CPS_A), ['b.json'])
 
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert demoted == []
         assert list(peer_fixes) == ['fibers/b.json']
@@ -726,7 +726,7 @@ class TestLinkConsistency:
         write_local(manager, 'fibers/b.json', json.dumps(b))
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert demoted == []
         assert peer_fixes == {}
@@ -737,11 +737,112 @@ class TestLinkConsistency:
                                             self.CPS_B, 0)])
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {}
         assert demoted and demoted[0][0] == 'fibers/a.json'
         assert 'missing' in demoted[0][1]
+
+    def _dropped_link_plan(self, manager, peers):
+        """a's merged doc links b only; base linked c too (dropped link)."""
+        a = self.fiber('a.json', self.CPS_A,
+                       branches=[self.entry('b.json', self.CPS_A, 1,
+                                            self.CPS_B, 0)])
+        base = self.fiber('a.json', self.CPS_A,
+                          branches=[self.entry('b.json', self.CPS_A, 1,
+                                               self.CPS_B, 0),
+                                    self.entry('c.json', self.CPS_A, 0,
+                                               self.CPS_B, 1)])
+        b = self.fiber('b.json', self.CPS_B,
+                       branches=[self.entry('a.json', self.CPS_B, 0,
+                                            self.CPS_A, 1)])
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+        return self.make_plan(manager, 'fibers/a.json', a, base, peers)
+
+    def test_dropped_link_to_vanished_peer_does_not_demote(self, manager):
+        """The incident: c was deleted on both sides, the merged doc has no
+        branch to it, but peer_files still lists it (base peers are kept so
+        a surviving peer's stale reciprocal can be stripped). Nothing to
+        reciprocate -> skip, not "missing"."""
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set(), remote_paths=set())
+        assert demoted == []
+        assert peer_fixes == {}
+        assert notes == [('fibers/a.json', 'c.json')]
+        assert 'fibers/c.json' not in manager._peer_doc_cache
+
+    def test_absent_peer_without_remote_inventory_still_demotes(self, manager):
+        """Legacy 2-arg call: absence cannot be established -> as before."""
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert demoted and 'missing' in demoted[0][1]
+        assert notes == []
+
+    def test_absent_peer_still_present_remotely_demotes(self, manager):
+        """Pending DELETE_REMOTE: the delete has not happened; do not
+        assume it will."""
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set(), remote_paths={'fibers/c.json'})
+        assert demoted and 'still present on S3' in demoted[0][1]
+        assert notes == []
+
+    def test_dropped_link_to_unreadable_peer_still_demotes(self, manager):
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        write_local(manager, 'fibers/c.json', 'not-json')
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set(), remote_paths=set())
+        assert demoted and 'unreadable' in demoted[0][1]
+
+    def test_dropped_link_to_downloading_peer_strips_stale_reciprocal(
+            self, manager, monkeypatch):
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        remote_c = self.fiber('c.json', self.CPS_B, generation=4,
+                              branches=[self.entry('a.json', self.CPS_B, 1,
+                                                   self.CPS_A, 0)])
+
+        def fake_fetch(path):
+            tmp = manager._merge_tmp_path(path, '.remote')
+            with open(tmp, 'w') as f:
+                json.dump(remote_c, f)
+            return remote_c, tmp
+
+        monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], {'fibers/c.json'}, remote_paths=set())
+        assert demoted == [] and notes == []
+        assert peer_fixes['fibers/c.json']['branches'] == []
+
+    def test_vanishing_peer_is_never_read_or_fixed(self, manager):
+        """c is present locally with a stale reciprocal but pending local
+        deletion: skip without reading it (a fix would be uploaded)."""
+        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
+        stale_c = self.fiber('c.json', self.CPS_B,
+                             branches=[self.entry('a.json', self.CPS_B, 1,
+                                                  self.CPS_A, 0)])
+        write_local(manager, 'fibers/c.json', json.dumps(stale_c))
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set(),
+            vanishing_paths={'fibers/c.json'}, remote_paths=set())
+        assert demoted == []
+        assert 'fibers/c.json' not in peer_fixes
+        assert 'fibers/c.json' not in manager._peer_doc_cache
+        assert notes == [('fibers/a.json', 'c.json')]
+
+    def test_live_link_to_vanishing_peer_demotes(self, manager):
+        a = self.fiber('a.json', self.CPS_A,
+                       branches=[self.entry('c.json', self.CPS_A, 1,
+                                            self.CPS_B, 0)])
+        write_local(manager, 'fibers/c.json', json.dumps(
+            self.fiber('c.json', self.CPS_B)))
+        plan = self.make_plan(manager, 'fibers/a.json', a,
+                              self.fiber('a.json', self.CPS_A), ['c.json'])
+        peer_fixes, demoted, notes = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set(),
+            vanishing_paths={'fibers/c.json'}, remote_paths=set())
+        assert demoted and 'pending deletion' in demoted[0][1]
 
     def test_peer_scheduled_for_download_uses_remote_content(self, manager,
                                                              monkeypatch):
@@ -763,7 +864,7 @@ class TestLinkConsistency:
         monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], {'fibers/b.json'})
         assert demoted == []
         fixed = peer_fixes['fibers/b.json']
@@ -781,7 +882,7 @@ class TestLinkConsistency:
         write_local(manager, 'fibers/b.json', json.dumps(b))
         plan = self.make_plan(manager, 'fibers/a.json', a,
                               copy.deepcopy(a), ['b.json'])
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert demoted == []
         assert peer_fixes == {}
@@ -806,7 +907,7 @@ class TestLinkConsistency:
                               self.fiber('a.json', self.CPS_A), ['b.json'])
 
         monkeypatch.delenv('VC_SYNC_DEBUG', raising=False)
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {} and len(demoted) == 1
         reason = demoted[0][1]
@@ -815,7 +916,7 @@ class TestLinkConsistency:
         assert 'Traceback' not in capsys.readouterr().out
 
         monkeypatch.setenv('VC_SYNC_DEBUG', '1')
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert len(demoted) == 1
         assert 'Traceback' in capsys.readouterr().out
@@ -913,8 +1014,9 @@ class TestDemotionFixpoint:
 
     CPS = TestLinkConsistency.CPS_A
 
-    def make_plan_for(self, manager, path, peers):
-        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS)
+    def make_plan_for(self, manager, path, peers, branches=None):
+        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS,
+                                        branches=branches)
         pending = manager._merge_tmp_path(path, '.merged')
         with open(pending, 'w') as f:
             json.dump(doc, f)
@@ -931,8 +1033,12 @@ class TestDemotionFixpoint:
         plans = {
             'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
                                                 ['b.json']),
-            'fibers/b.json': self.make_plan_for(manager, 'fibers/b.json',
-                                                ['c.json']),  # c missing
+            # B's merged doc still LINKS the missing c: a dangling link,
+            # not a dropped one, so it must keep demoting.
+            'fibers/b.json': self.make_plan_for(
+                manager, 'fibers/b.json', ['c.json'],
+                branches=[TestLinkConsistency.entry(
+                    'c.json', self.CPS, 1, TestLinkConsistency.CPS_B, 0)]),
         }
         write_local(manager, 'fibers/a.json', json.dumps(plans['fibers/a.json']['merged_doc']))
         write_local(manager, 'fibers/b.json', json.dumps(plans['fibers/b.json']['merged_doc']))
@@ -946,6 +1052,47 @@ class TestDemotionFixpoint:
         assert peer_fixes == {}
         assert sorted(p for p, _ in manual) == ['fibers/a.json',
                                                 'fibers/b.json']
+
+    def test_dropped_link_to_locally_deleted_peer_does_not_block(
+            self, manager, monkeypatch):
+        """A peer pending local deletion blocks stage 1 only while the
+        merged doc still links it. A dropped link needs no reciprocal fix,
+        and the going-away peer must not be read (a fix over it would be
+        uploaded while it is deleted)."""
+        plan = self.make_plan_for(manager, 'fibers/a.json', ['p.json'])
+        write_local(manager, 'fibers/a.json', json.dumps(plan['merged_doc']))
+        stale = TestLinkConsistency.fiber(
+            'p.json', TestLinkConsistency.CPS_B,
+            branches=[TestLinkConsistency.entry(
+                'a.json', TestLinkConsistency.CPS_B, 0, self.CPS, 1)])
+        write_local(manager, 'fibers/p.json', json.dumps(stale))
+        monkeypatch.setattr(manager, '_attempt_auto_merge',
+                            lambda path, li, si: plan)
+        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+            [('fibers/a.json', 'both changed')], {}, {}, set(),
+            {'fibers/p.json'}, auto_merge=True)
+        assert [p for p, _ in pending] == ['fibers/a.json']
+        assert manual == []
+        assert peer_fixes == {}
+        assert 'fibers/p.json' not in manager._peer_doc_cache
+
+    def test_live_link_to_locally_deleted_peer_blocks(self, manager,
+                                                      monkeypatch):
+        plan = self.make_plan_for(
+            manager, 'fibers/a.json', ['p.json'],
+            branches=[TestLinkConsistency.entry(
+                'p.json', self.CPS, 1, TestLinkConsistency.CPS_B, 0)])
+        write_local(manager, 'fibers/a.json', json.dumps(plan['merged_doc']))
+        write_local(manager, 'fibers/p.json', json.dumps(
+            TestLinkConsistency.fiber('p.json', TestLinkConsistency.CPS_B)))
+        monkeypatch.setattr(manager, '_attempt_auto_merge',
+                            lambda path, li, si: plan)
+        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+            [('fibers/a.json', 'both changed')], {}, {}, set(),
+            {'fibers/p.json'}, auto_merge=True)
+        assert pending == []
+        assert [p for p, _ in manual] == ['fibers/a.json']
+        assert 'pending deletion' in manual[0][1]
 
     def test_manual_peer_blocks_merge_upfront(self, manager, monkeypatch):
         plans = {'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
@@ -986,7 +1133,7 @@ class TestDemotionFixpoint:
                 'base_doc': TestLinkConsistency.fiber(
                     'a.json', TestLinkConsistency.CPS_A),
                 'peer_files': ['b.json', 'c.json']}
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert demoted and demoted[0][0] == 'fibers/a.json'
         assert peer_fixes == {}
@@ -1027,7 +1174,7 @@ class TestPlannerInputHardening:
         plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
                 'merged_doc': doc, 'base_doc': doc,
                 'peer_files': ['b\x00.json']}
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {}
         assert demoted and 'invalid linked fiber name' in demoted[0][1]
@@ -1051,7 +1198,7 @@ class TestPlannerInputHardening:
                 'base_doc': TestLinkConsistency.fiber(
                     'a.json', TestLinkConsistency.CPS_A),
                 'peer_files': ['b.json']}
-        peer_fixes, demoted = manager._plan_link_consistency(
+        peer_fixes, demoted, _notes = manager._plan_link_consistency(
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {}
         assert demoted and 'refresh against' in demoted[0][1]
