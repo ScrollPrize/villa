@@ -4,12 +4,32 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace fs = std::filesystem;
 
 namespace vc::settings {
 namespace {
+
+fs::path pathFromUtf8(std::string_view value)
+{
+    std::u8string utf8;
+    utf8.reserve(value.size());
+    for (const unsigned char byte : value)
+        utf8.push_back(static_cast<char8_t>(byte));
+    return fs::path(utf8);
+}
+
+std::string pathToUtf8(const fs::path& path)
+{
+    const auto utf8 = path.u8string();
+    std::string result;
+    result.reserve(utf8.size());
+    for (const char8_t byte : utf8)
+        result.push_back(static_cast<char>(byte));
+    return result;
+}
 
 std::string trim(std::string value)
 {
@@ -52,15 +72,15 @@ std::string decodeIniValue(std::string value)
 fs::path homeDirectory()
 {
 #ifdef _WIN32
-    if (const char* profile = std::getenv("USERPROFILE"); profile && *profile)
+    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
         return profile;
-    const char* drive = std::getenv("HOMEDRIVE");
-    const char* path = std::getenv("HOMEPATH");
+    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
+    const wchar_t* path = _wgetenv(L"HOMEPATH");
     if (drive && *drive && path && *path)
-        return std::string(drive) + path;
+        return std::wstring(drive) + path;
 #endif
     if (const char* home = std::getenv("HOME"); home && *home)
-        return home;
+        return pathFromUtf8(home);
     throw std::runtime_error("Cannot determine the user home directory for VC3D settings");
 }
 
@@ -88,7 +108,7 @@ fs::path configuredRemoteCachePath(const fs::path& settingsPath)
             continue;
         }
         const std::string configured = decodeIniValue(stripped.substr(separator + 1));
-        return configured.empty() ? fs::path{} : fs::path(configured);
+        return configured.empty() ? fs::path{} : pathFromUtf8(configured);
     }
     return {};
 }
@@ -102,7 +122,7 @@ fs::path ensureDirectory(fs::path path)
     fs::create_directories(path, ec);
     if (ec || !fs::is_directory(path)) {
         throw std::runtime_error(
-            "Cannot create remote cache directory '" + path.string() + "': " +
+            "Cannot create remote cache directory '" + pathToUtf8(path) + "': " +
             (ec ? ec.message() : "path is not a directory"));
     }
     return path;
@@ -112,10 +132,17 @@ fs::path ensureDirectory(fs::path path)
 
 fs::path settingsFilePath()
 {
-    if (const char* configured = std::getenv("VC3D_CONFIG_DIR");
+#ifdef _WIN32
+    if (const wchar_t* configured = _wgetenv(L"VC3D_CONFIG_DIR");
         configured && *configured) {
         return ensureDirectory(configured) / "VC3D.ini";
     }
+#else
+    if (const char* configured = std::getenv("VC3D_CONFIG_DIR");
+        configured && *configured) {
+        return ensureDirectory(pathFromUtf8(configured)) / "VC3D.ini";
+    }
+#endif
     return ensureDirectory(homeDirectory() / ".VC3D") / "VC3D.ini";
 }
 

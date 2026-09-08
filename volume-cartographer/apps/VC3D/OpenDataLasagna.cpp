@@ -348,7 +348,7 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const auto manualLocation = pkg.selectedLasagnaDataset();
     if (manualLocation.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = vc3d::remoteCachePath().toStdString();
+    options.remoteCacheRoot = vc3d::remoteCachePathFs();
     const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
         ? manualLocation
         : vc::project::resolveLocalPath(

@@ -81,8 +81,8 @@ bool VolumeAttachmentController::prepare(
                 *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
             return false;
         }
-        prepared.remoteCacheRoot = vc3d::remoteCachePath();
-        if (prepared.remoteCacheRoot.isEmpty()) {
+        prepared.remoteCacheRoot = vc3d::remoteCachePathFs();
+        if (prepared.remoteCacheRoot.empty()) {
             if (errorMessage && errorMessage->isEmpty()) {
                 *errorMessage = QObject::tr("Could not resolve the remote volume cache.");
             }
@@ -202,7 +202,7 @@ bool VolumeAttachmentController::start(
                         request.tags.end();
                     result.volume = Volume::NewFromUrl(
                         location,
-                        request.remoteCacheRoot.toStdString(),
+                        request.remoteCacheRoot,
                         anonymous ? vc::HttpAuth{} : request.auth,
                         vc::project::volumeMetadataFromEntryTags(request.tags),
                         !anonymous);

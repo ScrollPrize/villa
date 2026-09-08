@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QString>
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -28,7 +29,7 @@ struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
     vc::HttpAuth auth;
-    QString remoteCacheRoot;
+    std::filesystem::path remoteCacheRoot;
     VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
 };
 

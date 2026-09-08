@@ -1995,7 +1995,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         }
     }
     if (needsRemoteCache) {
-        openOptions.remoteCacheRoot = vc3d::remoteCachePath().toStdString();
+        openOptions.remoteCacheRoot = vc3d::remoteCachePathFs();
     }
 
     const auto targetPackage = _window->_state->vpkg();

@@ -342,7 +342,7 @@ auto main(int argc, char* argv[]) -> int
 
     std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
     std::cout << "creating remote volume cache at "
-              << vc3d::remoteCachePath().toStdString() << std::endl;
+              << vc3d::remoteCachePath().toUtf8().constData() << std::endl;
 
     QCommandLineParser parser;
     parser.setApplicationDescription("VC3D - Volume Cartographer 3D Viewer");
@@ -522,7 +522,7 @@ auto main(int argc, char* argv[]) -> int
         limits.minimumFreeBytes = settings.value(
             perf::REMOTE_CACHE_MIN_FREE_GIB,
             perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
-        const auto cacheRoot = vc3d::remoteCachePath().toStdString();
+        const auto cacheRoot = vc3d::remoteCachePathFs();
         vc::render::PersistentZarrCacheBudget::configure(cacheRoot, limits);
     }
     if (parser.isSet(cacheSizeOption)) {

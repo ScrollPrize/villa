@@ -2,16 +2,28 @@
 
 #include <QString>
 
+#include <filesystem>
+
 #include "vc/core/util/RemoteCacheSettings.hpp"
 
 namespace vc3d {
+
+inline QString pathToQString(const std::filesystem::path& path)
+{
+#ifdef _WIN32
+    return QString::fromStdWString(path.native());
+#else
+    const auto& native = path.native();
+    return QString::fromUtf8(native.data(), static_cast<qsizetype>(native.size()));
+#endif
+}
 
 inline constexpr auto kRemoteCacheDirectorySetting =
     vc::settings::kRemoteCacheDirectory;
 
 inline QString settingsFilePath()
 {
-    return QString::fromStdString(vc::settings::settingsFilePath().string());
+    return pathToQString(vc::settings::settingsFilePath());
 }
 
 // Single source of truth for where downloaded remote-volume chunks land.
@@ -26,7 +38,12 @@ inline QString settingsFilePath()
 // GUI and command-line project loading cannot diverge.
 inline QString remoteCachePath()
 {
-    return QString::fromStdString(vc::settings::remoteCachePath().string());
+    return pathToQString(vc::settings::remoteCachePath());
+}
+
+inline std::filesystem::path remoteCachePathFs()
+{
+    return vc::settings::remoteCachePath();
 }
 
 // =============================================================================
