@@ -573,12 +573,9 @@ namespace {
 
 enum class AccumMode : std::uint8_t { Max, Min, Mean, LayerStorage };
 
-// "median" and "minabs" are fast-path-only reducers with no entry in
-// utils::CompositingMethod, so they are named explicitly. Everything else
-// defers to the shared table, so a method added to Compositing.cpp is routed
-// here too instead of silently degrading to a mean.
+// These reducers need the individual layer values rather than a scalar accumulator.
 static bool needsLayerStorage(const std::string& m) {
-    return m == "median" || m == "minabs" || methodRequiresLayerStorage(m);
+    return m == "median" || m == "minabs" || m == "alpha" || m == "beerLambert";
 }
 
 template<typename T, SampleMode Mode>
