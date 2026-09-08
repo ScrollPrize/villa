@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <filesystem>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -158,6 +160,21 @@ std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc)
     if (!sourceLevel)
         return std::nullopt;
     return detectorVoxelSize(*sourceMetadata, *sourceLevel);
+}
+
+std::optional<double> resolveLocalStoreVoxelSize(const std::filesystem::path& storeRoot)
+{
+    for (const char* name : {"meta.json", "metadata.json"}) {
+        const auto file = storeRoot / name;
+        if (!std::filesystem::exists(file))
+            continue;
+        try {
+            return voxelSizeFromStoreMetadata(utils::Json::parse_file(file));
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace vc::metadata

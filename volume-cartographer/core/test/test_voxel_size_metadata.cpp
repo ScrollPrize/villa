@@ -9,15 +9,35 @@
 
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <string>
 
 using utils::Json;
+using vc::metadata::resolveLocalStoreVoxelSize;
 using vc::metadata::voxelSizeFromStoreMetadata;
 
 namespace
 {
 
 Json parse(const std::string& text) { return Json::parse(text); }
+
+std::filesystem::path tmpDir(const std::string& tag)
+{
+    std::mt19937_64 rng(std::random_device{}());
+    auto p = std::filesystem::temp_directory_path() /
+             ("vc_voxel_size_" + tag + "_" + std::to_string(rng()));
+    std::filesystem::create_directories(p);
+    return p;
+}
+
+void writeTextFile(const std::filesystem::path& path, const std::string& text)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out << text;
+}
 
 // A scan record without the `scan` wrapper. samplePixelSize is in mm.
 std::string scanRecord(double samplePixelSizeMm)
@@ -162,4 +182,42 @@ TEST_CASE("store metadata: a non-positive or unparseable pixel size resolves not
             R"({"scan":{"tomo":{"acquisition":{"detector":{"samplePixelSize":)") + value + "}}}}}");
         CHECK_FALSE(voxelSizeFromStoreMetadata(doc).has_value());
     }
+}
+
+TEST_CASE("resolveLocalStoreVoxelSize: a local store resolves like a Volume would")
+{
+    const auto d = tmpDir("local_store");
+
+    SUBCASE("nothing on disk resolves nothing, without throwing")
+    {
+        CHECK_FALSE(resolveLocalStoreVoxelSize(d).has_value());
+        CHECK_FALSE(resolveLocalStoreVoxelSize(d / "does_not_exist").has_value());
+    }
+
+    SUBCASE("meta.json is authoritative over metadata.json")
+    {
+        writeTextFile(d / "meta.json", R"({"type": "vol", "voxelsize": 7.91})");
+        writeTextFile(d / "metadata.json",
+                      R"({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.0024}}}}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(7.91));
+    }
+
+    SUBCASE("a published metadata.json is read when there is no meta.json")
+    {
+        writeTextFile(d / "metadata.json",
+                      R"({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.0024}}}}})");
+        const auto resolved = resolveLocalStoreVoxelSize(d);
+        REQUIRE(resolved.has_value());
+        CHECK(*resolved == doctest::Approx(2.4));
+    }
+
+    SUBCASE("a malformed document counts as absent")
+    {
+        writeTextFile(d / "meta.json", "{not json");
+        CHECK_FALSE(resolveLocalStoreVoxelSize(d).has_value());
+    }
+
+    std::filesystem::remove_all(d);
 }

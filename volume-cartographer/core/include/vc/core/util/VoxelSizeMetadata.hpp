@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <optional>
 
 #include "utils/Json.hpp"
@@ -33,5 +34,12 @@ namespace vc::metadata
 //     size wrong by an unstated power of two is worse than none.
 // `samplePixelSize` is in millimeters in all of these.
 [[nodiscard]] std::optional<double> voxelSizeFromStoreMetadata(const utils::Json& doc);
+
+// voxelSizeFromStoreMetadata() over a local volume store: its `meta.json`,
+// else its `metadata.json`. For tools that read a store without constructing a
+// Volume, so they agree with Volume::voxelSize() on what the store says. Never
+// throws; a missing or malformed document resolves nothing.
+[[nodiscard]] std::optional<double> resolveLocalStoreVoxelSize(
+    const std::filesystem::path& storeRoot);
 
 } // namespace vc::metadata
