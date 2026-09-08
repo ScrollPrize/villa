@@ -63,6 +63,7 @@ private:
     // When set, the output grid is sized to the source sampling density so the
     // flattened tifxyz keeps the input's scale instead of metric mode's 1.0.
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
+    int last_valid_count = -1;  // rasterized grid points from the last createQuadSurface()
 
 public:
     void setUVMetric(bool v) { uv_is_metric = v; }
@@ -70,6 +71,9 @@ public:
     void setUVDownsample(float f) { uv_downsample = std::max(1.0f, f); }
     void setGridCapPixels(uint64_t cap) { grid_cap_pixels = cap; }
     void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
+    int validCount() const { return last_valid_count; }
+    int gridWidth() const { return grid_size[0]; }
+    int gridHeight() const { return grid_size[1]; }
     void setSrcApproval(const cv::Mat& m) { src_approval = m; }
     bool hasApproval() const { return !src_approval.empty() && !grid_uv.empty(); }
     const cv::Mat_<cv::Vec3b>& outApproval() const { return out_approval; }
@@ -312,6 +316,7 @@ public:
         
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
+        last_valid_count = valid_count;
         
         // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
@@ -539,7 +544,7 @@ int main(int argc, char *argv[])
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, default)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
@@ -706,6 +711,19 @@ int main(int argc, char *argv[])
     QuadSurface* surf = converter.createQuadSurface(mesh_units);
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
+        return EXIT_FAILURE;
+    }
+    // A 2x2 grid is the clamped minimum: the UV range collapsed below one
+    // output pixel, so the tifxyz is degenerate no matter how many of its
+    // four corners happened to rasterize (0/4 was #1320; 1/4 slips the same
+    // way and still writes a mostly-sentinel surface).
+    const bool degenerate_grid =
+        converter.gridWidth() <= 2 && converter.gridHeight() <= 2;
+    if (converter.validCount() == 0 || degenerate_grid) {
+        std::cerr << "Error: " << (degenerate_grid ? "degenerate 2 x 2 output grid"
+                                                   : "0 grid points rasterized")
+                  << "; not writing a sentinel-filled tifxyz." << std::endl;
+        delete surf;
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
