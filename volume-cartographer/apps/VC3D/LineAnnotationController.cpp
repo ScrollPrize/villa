@@ -9367,7 +9367,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     auto openSelectedDataset = [&](const std::string& location) {
         vc::lasagna::LasagnaDatasetOpenOptions options;
         options.workingToBaseScale = workingToBaseScale;
-        options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+        options.remoteCacheRoot = vc3d::remoteCachePathFs();
         const std::string resolved =
             vc::project::isLocationRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
         return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
@@ -9587,7 +9587,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            options.remoteCacheRoot = vc3d::remoteCachePathFs();
             const std::string resolved = vc::project::isLocationRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
@@ -9604,7 +9604,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     std::move(prepared.volume)});
             }
             const auto result = vpkg->attachPreparedLasagnaDataset(
-                selected, {}, true, volumes, options.remoteCacheRoot);
+                selected, {}, true, volumes);
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
                 showError(
                     tr("A Lasagna volume conflicts with an existing volume id."),
@@ -9623,7 +9623,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         session.selectedFiberInferenceDatasetLocation != selected) {
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            options.remoteCacheRoot = vc3d::remoteCachePathFs();
             const std::string resolved = vc::project::isLocationRemote(selected)
                 ? selected
                 : vc::project::resolveLocalPath(
@@ -9658,7 +9658,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.workingToBaseScale = session.fiberTraceToBaseScale;
-            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            options.remoteCacheRoot = vc3d::remoteCachePathFs();
             const std::string normalLocation =
                 vc::project::isLocationRemote(session.selectedDatasetLocation)
                     ? session.selectedDatasetLocation

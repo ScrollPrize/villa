@@ -265,7 +265,7 @@ QString segmentsEntryLocationForPath(const QString& outputDir, const QString& vo
 std::optional<QString> openDataPatchesRootForVolume(const VolumePkg& pkg,
                                                      const QString& loadedVolumeId)
 {
-    if (loadedVolumeId.isEmpty() || !pkg.hasRemoteCacheRoot()) {
+    if (loadedVolumeId.isEmpty()) {
         return std::nullopt;
     }
 
@@ -273,9 +273,9 @@ std::optional<QString> openDataPatchesRootForVolume(const VolumePkg& pkg,
     for (const auto& tag : tags) {
         if (tag.rfind(vc3d::opendata::kOpenDataSampleIdTagPrefix, 0) == 0) {
             const auto path = vc3d::opendata::openDataPatchesRoot(
-                pkg.remoteCacheRootOrEmpty(),
+                vc3d::remoteCachePathFs(),
                 tag.substr(vc3d::opendata::kOpenDataSampleIdTagPrefix.size()));
-            return QString::fromStdString(path.string());
+            return vc3d::pathToQString(path);
         }
     }
     return std::nullopt;

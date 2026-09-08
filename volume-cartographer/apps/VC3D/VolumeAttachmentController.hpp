@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QString>
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -17,11 +18,6 @@ enum class VolumeAttachmentSelection {
     SelectAttached,
 };
 
-enum class VolumeAttachmentPresentation {
-    Silent,
-    Interactive,
-};
-
 enum class VolumeAttachmentPreparationFailure {
     None,
     NoProject,
@@ -33,7 +29,7 @@ struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
     vc::HttpAuth auth;
-    QString remoteCacheRoot;
+    std::filesystem::path remoteCacheRoot;
     VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
 };
 
@@ -54,7 +50,6 @@ public:
     bool prepare(
         const QString& location,
         std::vector<std::string> tags,
-        VolumeAttachmentPresentation presentation,
         VolumeAttachmentRequest* request,
         QString* errorMessage = nullptr,
         VolumeAttachmentPreparationFailure* failure = nullptr);
@@ -68,13 +63,8 @@ public:
         const QString& url,
         vc::HttpAuth* authOut,
         QString* errorMessage = nullptr) const;
-    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
-
 private:
     struct TaskResult;
-
-    QString configuredRemoteCacheDirectory() const;
-    QString suggestedRemoteCacheDirectory() const;
 
     CWindow* _window{nullptr};
     bool _inFlight{false};

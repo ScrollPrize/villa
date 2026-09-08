@@ -1,9 +1,6 @@
 #include "VolumeAttachmentController.hpp"
 
-#include <QDir>
 #include <QFutureWatcher>
-#include <QInputDialog>
-#include <QLineEdit>
 #include <QSettings>
 #include <QtConcurrent>
 
@@ -14,7 +11,6 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
-#include "RemoteVolumeCachePaths.hpp"
 #include "VCSettings.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -35,7 +31,6 @@ VolumeAttachmentController::VolumeAttachmentController(CWindow* window)
 bool VolumeAttachmentController::prepare(
     const QString& location,
     std::vector<std::string> tags,
-    VolumeAttachmentPresentation presentation,
     VolumeAttachmentRequest* request,
     QString* errorMessage,
     VolumeAttachmentPreparationFailure* failure)
@@ -86,10 +81,9 @@ bool VolumeAttachmentController::prepare(
                 *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
             return false;
         }
-        prepared.remoteCacheRoot = remoteCacheDirectory(presentation);
-        if (prepared.remoteCacheRoot.isEmpty()) {
-            if (errorMessage && errorMessage->isEmpty() &&
-                presentation == VolumeAttachmentPresentation::Silent) {
+        prepared.remoteCacheRoot = vc3d::remoteCachePathFs();
+        if (prepared.remoteCacheRoot.empty()) {
+            if (errorMessage && errorMessage->isEmpty()) {
                 *errorMessage = QObject::tr("Could not resolve the remote volume cache.");
             }
             if (failure)
@@ -173,7 +167,6 @@ bool VolumeAttachmentController::start(
                         task.volume,
                         request.location,
                         std::move(request.tags),
-                        request.remoteCacheRoot,
                         preferredVolumeId);
                     if (result == CWindow::VolumeAttachResult::VolumeIdConflict) {
                         outcome.error = QObject::tr(
@@ -209,7 +202,7 @@ bool VolumeAttachmentController::start(
                         request.tags.end();
                     result.volume = Volume::NewFromUrl(
                         location,
-                        request.remoteCacheRoot.toStdString(),
+                        request.remoteCacheRoot,
                         anonymous ? vc::HttpAuth{} : request.auth,
                         vc::project::volumeMetadataFromEntryTags(request.tags),
                         !anonymous);
@@ -270,60 +263,4 @@ bool VolumeAttachmentController::resolveRemoteAuth(
     if (errorMessage)
         errorMessage->clear();
     return true;
-}
-
-QString VolumeAttachmentController::suggestedRemoteCacheDirectory() const
-{
-    if (_window && _window->_state && _window->_state->vpkg()) {
-        const QString projectDir = QString::fromStdString(
-            _window->_state->vpkg()->getVolpkgDirectory());
-        if (!projectDir.isEmpty()) {
-            return vc3d::remoteCachePath(
-                QDir(projectDir).filePath("remote_cache"));
-        }
-    }
-    return vc3d::remoteCachePath();
-}
-
-QString VolumeAttachmentController::configuredRemoteCacheDirectory() const
-{
-    if (_window && _window->_state && _window->_state->vpkg()) {
-        const QString persisted = QString::fromStdString(
-            _window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
-        return vc3d::remoteCachePath(persisted);
-    }
-    return {};
-}
-
-QString VolumeAttachmentController::remoteCacheDirectory(
-    VolumeAttachmentPresentation presentation)
-{
-    QString cacheDir = configuredRemoteCacheDirectory();
-    if (cacheDir.isEmpty() &&
-        presentation == VolumeAttachmentPresentation::Interactive) {
-        bool ok = false;
-        cacheDir = QInputDialog::getText(
-            _window,
-            QObject::tr("Remote Cache Location"),
-            QObject::tr(
-                "Choose where this project should store downloaded remote "
-                "volume chunks."),
-            QLineEdit::Normal,
-            suggestedRemoteCacheDirectory(),
-            &ok).trimmed();
-        if (!ok)
-            return {};
-        cacheDir = vc3d::remoteCachePath(cacheDir);
-    }
-
-    if (cacheDir.isEmpty()) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        cacheDir = vc3d::remoteCachePath(
-            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString());
-    }
-    if (QDir::isRelativePath(cacheDir)) {
-        cacheDir =
-            QDir::cleanPath(QDir::current().absoluteFilePath(cacheDir));
-    }
-    return QDir().mkpath(cacheDir) ? cacheDir : QString{};
 }
