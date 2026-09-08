@@ -41,8 +41,7 @@ from .io import (
 from .native import resolve_rasterizer
 from .planar import transfer_array_planar
 
-# Preflight worst-distance-to-radius ratio above which the surface pair is
-# flagged as genuinely disagreeing (see _mapping_preflight).
+# Flag possible mesh mismatch at this distance-to-radius ratio or higher.
 MESH_DISAGREEMENT_RATIO = 10.0
 
 
@@ -148,15 +147,7 @@ def _choose_affine(args, source, target) -> AffineChoice:
 def _resolve_max_distance(
     requested: Optional[float], source, target, affine: np.ndarray
 ) -> tuple[float, dict]:
-    """Pick the rejection radius from the target's own sampling pitch.
-
-    See :func:`core.automatic_max_distance` for why only the target's
-    spacing enters. The one direction that rule does not cover is a source
-    much coarser than its target: the point-to-triangle distance then
-    includes the coarse triangulation's chordal error, which the
-    target-keyed radius knows nothing about, so that asymmetry is flagged
-    and warned rather than silently accepted.
-    """
+    """Use the requested radius or target-based default; warn on coarse sources."""
 
     source_spacing = estimate_surface_spacing(source, affine)
     target_spacing = estimate_surface_spacing(target)
@@ -211,10 +202,8 @@ def _mapping_preflight(
             target.z.ravel()[target_indices],
         )
     )
-    # The grid index only guarantees neighbors within the matching radius,
-    # so it would hide exactly the far distances this preflight exists to
-    # measure (the mesh-disagreement signal). Always sample with the
-    # KD-tree, whatever index the transfer itself uses.
+    # Use a KD-tree to measure distances beyond the matching radius;
+    # the grid index cannot guarantee those neighbors.
     mapper = SurfaceMapper(
         source,
         affine=affine,
@@ -242,12 +231,8 @@ def _mapping_preflight(
         report["distance_p50"] = float(np.percentile(finite, 50))
         report["distance_p95"] = float(np.percentile(finite, 95))
         report["distance_max"] = float(finite.max())
-        # Target regions the source surface genuinely does not cover put
-        # sampled vertices tens of radii away from any source triangle; a
-        # healthy pair stays within a few radii even at its worst vertex.
-        # The ratio is scale-free, so it transfers across scrolls. On the
-        # measured corpus the one disagreeing segment scored ~71, every
-        # healthy segment at most ~3.
+        # Large distances suggest target regions absent from the source mesh.
+        # Normalize by the matching radius to compare across scan scales.
         ratio = report["distance_max"] / float(max_distance)
         report["distance_max_over_max_distance"] = float(ratio)
         report["suspected_mesh_disagreement"] = bool(
@@ -803,8 +788,7 @@ def run_single(args, stage_name: str = "transfer") -> dict:
             print(f"Writing mapping distances: {distance_path}")
             write_image(distance_path, distance_array)
         if seam_anchor_path is not None:
-            # Stored-grid resolution, so re-thresholding a seam policy later
-            # is a cheap raster operation instead of a transfer re-run.
+            # Save stored-grid distances for downstream thresholding.
             print(f"Writing seam anchor distances: {seam_anchor_path}")
             write_image(seam_anchor_path, seam_anchor_grid)
 

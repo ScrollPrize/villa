@@ -402,9 +402,7 @@ VC_EXPORT int vc_tifxyz_rasterize(
                 request.fill_seams != 0 && target_pixel_valid &&
                 request.output_validity[local] == 0
             ) {
-                // How far this pixel sits from the nearest measured vertex.
-                // Beyond the limit the continued field is no longer a
-                // continuation of anything observed, so refuse to sample.
+                // Reject seam fill beyond the selected anchor distance limit.
                 if (request.has_seam_limit != 0) {
                     const double anchor_distance = bilinear(
                         request.filled_uv_anchor_distance,

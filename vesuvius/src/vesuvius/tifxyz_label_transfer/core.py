@@ -1,19 +1,17 @@
-"""Core geometry operations for TIFXYZ-to-TIFXYZ label transfer.
+"""Transfer labels between TIFXYZ surfaces using their shared 3D coordinates.
 
-The mapper works in the common 3D volume coordinate system:
+For each target pixel:
+1. Sample its XYZ position on the target surface.
+2. Find the nearest triangle on the source surface.
+3. Use triangle barycentrics to recover source canvas coordinates.
+4. Sample the source label with nearest-neighbour interpolation.
 
-1. Sample each target output pixel on the target TIFXYZ surface.
-2. Find the nearest triangle on the source TIFXYZ surface.
-3. Recover source grid coordinates with triangle barycentrics.
-4. Sample the categorical source label with nearest-neighbour interpolation.
-
-TIFXYZ arrays contain vertices, while ``vc_render_tifxyz`` samples pixel
-centres between them.  The conversion used here mirrors that convention:
+TIFXYZ arrays store vertices; the renderer samples pixel centres between
+vertices. Match that convention with:
 
     grid_coordinate = (pixel_index + 0.5) * stored_size / rendered_size
 
-No render command is required as long as the label covers the complete,
-unrotated and uncropped source canvas.
+Labels must cover the complete, unrotated, uncropped source canvas.
 """
 
 from __future__ import annotations
@@ -36,10 +34,7 @@ from scipy.spatial import cKDTree
 FloatArray = NDArray[np.floating]
 BoolArray = NDArray[np.bool_]
 
-# How far --fill-seams may continue the UV field from a measured vertex,
-# in target vertices. Legitimate gap filling stays within roughly fifteen;
-# a continuation onto surface the source mesh never covered runs to
-# hundreds. Anything inside that gap behaves identically.
+# Default seam-fill distance limit, in target vertices.
 DEFAULT_MAX_SEAM_DISTANCE = 25.0
 
 
@@ -460,11 +455,8 @@ def infer_output_shape(
         ),
     )
 
-    # Renders are cropped independently of the TIFXYZ canvas, so a label
-    # raster within a fraction of a percent of the source canvas is a
-    # crop/offset of it, not evidence of a different render scale. Snap the
-    # output to the target's native canvas in that case; otherwise a
-    # spurious ~0.1% scale forces every downstream consumer to resample.
+    # Treat near-native dimensions as a crop/offset to avoid introducing
+    # a small scale change that forces downstream resampling.
     native_candidates = (
         (
             max(1, _positive_lround(target_height / target_scale_y)),
@@ -542,20 +534,12 @@ def estimate_surface_spacing(
 
 
 def automatic_max_distance(target: Surface) -> float:
-    """Rejection radius from the target's own sampling pitch.
+    """Derive the matching radius from target spacing.
 
-    ``locate`` measures point-to-triangle distance against the source's
-    triangulated quads, so what the radius has to tolerate is how far a
-    target pixel may sit from the source *surface* — dominated by the
-    target-side interpolation and by genuine mesh disagreement, not by how
-    finely the source happens to be tessellated. A denser source
-    approximates the same surface better, so the source's spacing does not
-    enter: keying the radius to whichever side is denser only punishes the
-    pair for the source's resolution (a source sampled twice as finely as
-    its target halved the radius and rejected correspondences that were
-    never in doubt). The converse — a source much coarser than its target —
-    adds chordal error from the coarse triangulation; callers should warn
-    and prefer an explicit radius there.
+    Matching measures distance to source triangles, not source vertices.
+    A denser source describes the surface more accurately; using its smaller
+    spacing would shrink the radius and reject valid target matches.
+    A much coarser source may need an explicit radius for triangulation error.
     """
 
     return max(1e-3, 0.75 * estimate_surface_spacing(target))
@@ -993,11 +977,7 @@ class SurfaceMapper:
         source_height, source_width = self.source.shape
         assert self.source.valid is not None
 
-        # Each neighbour vertex touches up to four stored-grid quads, and
-        # adjacent neighbours share most of them. Deduplicate the candidate
-        # quads per query and evaluate only distinct (query, quad) pairs;
-        # this replaces k * 4 * 2 full-width triangle passes with roughly
-        # one pass over the distinct quads.
+        # Neighboring vertices share quads; evaluate each (query, quad) pair once.
         neighbor_exists = neighbor_indices < self.valid_flat.size
         safe_neighbors = np.where(neighbor_exists, neighbor_indices, 0)
         flat = self.valid_flat[safe_neighbors]
@@ -1303,19 +1283,12 @@ def _fill_uv_field(
     BoolArray,
     NDArray[np.float64],
 ]:
-    """Complete an incomplete target→source UV field across its gaps.
+    """Fill UV gaps from nearest valid vertices, then smooth only the gaps.
 
-    Invalid vertices first take the value of their nearest valid vertex,
-    then Jacobi relaxation on the invalid set only turns that
-    piecewise-constant fill into a smooth continuation of the measured
-    field. Valid vertices are never modified. Returns float64 fields, the
-    mask of vertices that were filled, and each vertex's distance in grid
-    cells to the nearest measured vertex (zero where measured).
-
-    That distance says how far a filled value has been extrapolated from
-    anything actually observed, which is the only thing separating a small
-    interpolated gap from a continuation into surface the source mesh does
-    not cover at all. Callers bound the fill with it.
+    Start each gap at its nearest measured value, then use Jacobi relaxation
+    to smooth the filled region while keeping measured vertices fixed.
+    Returns float64 row/column fields, the filled mask, and distances to
+    measured vertices in grid cells. Callers use distances to limit filling.
     """
 
     import scipy.ndimage
@@ -1362,18 +1335,12 @@ def _content_anchor_distance(
     label_shape: Tuple[int, int],
     label_offset_yx: Tuple[float, float],
 ) -> NDArray[np.float64]:
-    """Distance in grid cells to the nearest matched vertex holding annotation.
+    """Return grid-cell distances to matches with nonzero annotation.
 
-    ``_fill_uv_field`` measures extrapolation from *any* measured vertex.
-    That bounds runaway continuation, but where a disagreeing target region
-    begins right beside well-matched geometry the first wrongly-continued
-    vertices sit as close to a measured anchor as legitimate gap fill does,
-    so no threshold on that distance separates them. What does separate
-    them is distance to measured annotation: leakage extends annotation far
-    from anywhere annotation was actually observed. This anchors the same
-    EDT on matched vertices whose sampled source value is nonzero instead.
-    With no annotated vertex anywhere the field is infinite and every fill
-    is blocked — there is nothing measured to extend.
+    Anchoring on annotation rather than all matches keeps filled labels near
+    observed content. Any label in the pass can supply an anchor; with none,
+    return infinity. Nearby wrong matches can still fall within the limit,
+    so this distance cannot distinguish seam gaps from mesh mismatch.
     """
 
     import scipy.ndimage
@@ -1460,55 +1427,24 @@ def transfer_array(
 ]:
     """Transfer a complete 2D categorical label image between surfaces.
 
-    Optional output arrays allow callers to provide disk-backed memmaps.
+    Output arrays may be disk-backed memmaps. ``workers`` writes disjoint
+    regions; statistics accumulate in submission order for deterministic output.
+    ``uv_cache`` stores geometry mappings independently of label values, so
+    multiple labels can reuse them. Changed surfaces or parameters invalidate it.
 
-    ``workers`` threads the mapping batches and output tiles (default: all
-    cores). Workers write disjoint regions and statistics are accumulated
-    in submission order, so outputs and reports do not depend on it.
+    ``label_offset_yx`` maps label pixel ``(i, j)`` to source canvas position
+    ``(i + dy, j + dx)`` in label pixels. Out-of-bounds samples are invalid.
 
-    ``uv_cache`` names an ``.npz`` file holding the mapped UV field, which
-    depends only on the surface pair, affine, and matching parameters — not
-    on the label. A matching cache skips the mapping phase entirely (labels
-    of the same segment share it); a stale one is recomputed and rewritten.
+    ``fill_seams`` continues the mapping into gaps, marked as validity 128
+    rather than measured validity 255. ``max_seam_distance`` limits reach in
+    target vertices; ``math.inf`` disables it. ``seam_anchor`` uses all matches
+    ("matched") or matches with nonzero annotation in any label ("content").
+    Neither mode corrects mesh mismatch. ``seam_anchor_distance_output`` must
+    be float32 with the target stored-grid shape and receives grid-cell distances.
 
-    ``label_offset_yx`` declares, in label pixels, that label pixel ``(i, j)``
-    depicts source-canvas position ``(i + dy, j + dx)`` instead of ``(i, j)``.
-    This corrects a constant canvas offset between the raster the labels were
-    drawn on and the source TIFXYZ canvas. Mapped pixels whose corrected
-    label position falls outside the raster are marked invalid, not clamped.
-
-    ``fill_seams`` additionally fills target pixels whose geometry mapping
-    was rejected (fold seams, distance failures) by smoothly continuing the
-    measured UV field across the gaps. Filled pixels are written with
-    validity value 128 instead of 255 so downstream consumers can always
-    tell measured from interpolated.
-
-    ``max_seam_distance`` bounds that fill to pixels within the given number
-    of target vertices of an anchor. Without a bound the continued field
-    runs arbitrarily far, and where the target mesh covers surface the
-    source mesh does not, it samples the source annotation at unrelated
-    positions and paints it on. Pass ``math.inf`` to disable the bound.
-
-    ``seam_anchor`` selects what counts as an anchor. ``"matched"`` (the
-    default) anchors on every measured vertex; it caps runaway
-    extrapolation but cannot reject wrong continuation that starts right
-    beside well-matched geometry. ``"content"`` anchors only on measured
-    vertices whose sampled source value is nonzero (any label in the pass),
-    so fill may only extend annotation near where annotation was actually
-    measured — the criterion that separates seam filling from leakage.
-
-    ``seam_anchor_distance_output``, if provided, must be a float32 array
-    of the target stored-grid shape; it receives the anchor-distance field
-    the seam gate used (in grid cells), so downstream policies can be
-    re-thresholded without re-running the transfer.
-
-    If ``materialize_output`` is false, no full-resolution result arrays are
-    allocated. Instead, ``tile_callback`` receives each completed tile in
-    deterministic row-major order as ``(bounds, labels, validity)``. This is
-    used by the CLI's compressed-TIFF streaming path.
-
-    ``rasterizer`` selects the optional compiled per-pixel kernel. ``auto``
-    uses it when built and otherwise preserves the NumPy implementation.
+    With ``materialize_output=False``, ``tile_callback`` receives
+    ``(bounds, labels, validity)`` in row-major order without full output arrays.
+    ``rasterizer="auto"`` uses a compatible native kernel or falls back to NumPy.
     """
 
     label = np.asarray(source_label)

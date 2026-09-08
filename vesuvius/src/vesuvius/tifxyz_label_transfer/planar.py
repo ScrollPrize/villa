@@ -211,10 +211,8 @@ def transfer_array_planar(
         vertex_index=vertex_index,
         sample_vertices=sample_vertices,
     )
-    # Block-wise floor warp, matching transfer_array's floor-of-continuous
-    # label sampling. Flooring the corner-frame coordinate keeps boundary
-    # pixels stable where a rounded centre-frame coordinate would sit on a
-    # knife edge at exactly 0 or size-1.
+    # Match transfer_array's floor sampling in corner coordinates to avoid
+    # rounding instability at image boundaries.
     label_height, label_width = label.shape
     column_indices = np.arange(resolved_shape[1], dtype=np.float64)[None, :]
     block_rows = max(1, min(resolved_shape[0], 1024))
