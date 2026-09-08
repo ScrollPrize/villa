@@ -60,3 +60,62 @@
   run from the previous increment progressed beyond its initial
   test groups without a reported failure but then stopped producing output and
   was interrupted; it is not counted as a passing full-suite validation.
+## 2026-09-08 shared-slot transport continuation
+
+- Added bounded shared tensor slots to remove large tensor payloads from the
+  multiprocessing queues. Successive 32/96-worker measurements improved from
+  112.15 to 123.04 produced samples/s after small metadata was encoded as NumPy.
+- Zero-copy contiguous batch views reduced result queue lag to 0.565 ms/sample
+  and batch assembly to 0.044 ms/batch (`sample_pipeline_20260908_084414_712495`).
+- A 58/70 split with only 128 credits was head-of-line constrained at 125.69
+  samples/s (`sample_pipeline_20260908_084509_780222`). Increasing the bounded
+  credit/slot window to 256 used 2.5 GiB of shared memory and reached 146.67
+  produced samples/s, 165.92 ordered-delivery samples/s, and 129.46 cold-pipeline
+  samples/s while consuming 109.9 aggregate CPU cores
+  (`sample_pipeline_20260908_084631_245741`).
+- The latest profile leaves queue transfer and stacking negligible. Mean CPU
+  service is 347.34 ms for loading and 394.81 ms for value augmentation; the
+  largest individual cost is native oblique anisotropic blur at 257.54 ms per
+  overall sample (enabled for 48.6% of samples), followed by volume sampling at
+  242.32 ms and native coordinate generation at 82.44 ms.
+- One combined sandboxed benchmark invocation failed because `/ephemeral` was
+  read-only in that execution context; the approved standalone benchmark
+  launcher remained valid and produced the measurements above.
+- Added an exact interior fast path to the native oblique blur stencil, retaining
+  the original clamped boundary path and accumulation order. Ten focused native
+  blur/reference tests passed. The same 58/70, 256-slot benchmark then reached
+  174.16 produced, 184.90 ordered-delivery, and 148.44 cold-pipeline samples/s
+  (`sample_pipeline_20260908_085247_017059`). Mean anisotropic blur time fell
+  from 257.54 to 94.38 ms/overall sample. The resulting 319.29 ms load versus
+  209.26 ms augmentation service times identified the static worker split as
+  the next bottleneck.
+- Rebalancing the unchanged 128-worker pipeline from 58/70 to 77/51 reached
+  195.76 produced, 217.92 ordered-delivery, and 161.52 cold-pipeline samples/s
+  (`sample_pipeline_20260908_085425_903157`). Aggregate worker use rose to
+  120.5 logical cores. Contended service times were 365.08 ms loading and
+  243.99 ms augmentation, leaving roughly a 13% service-cost reduction to the
+  221 samples/s target.
+- Reordered the oblique-stencil interior loop into tap-major contiguous row
+  updates while retaining per-voxel tap order and the exact clamped boundary
+  path. Ten focused native blur/reference tests still pass. On 77/51 workers,
+  anisotropic blur fell to 37.39 ms/overall sample and augmentation to 164.77
+  ms/sample, but the now-imbalanced loading stage (355.93 ms/sample) filled the
+  256-entry reorder window; production was 178.80 samples/s despite an ordered
+  delivery span of 243.81 samples/s
+  (`sample_pipeline_20260908_085748_882853`).
+- Rebalanced again to 87 load / 41 augmentation workers and enlarged the
+  bounded shared slot/credit window to 512 (5 GiB). The 1,024-sample run reached
+  the requested sustained production target at 227.45 samples/s, with 252.68
+  ordered-delivery samples/s, 181.40 cold-pipeline samples/s, 124.9 aggregate
+  logical cores, and reorder high-water 90
+  (`sample_pipeline_20260908_085901_798884`). A longer run is required to
+  separate steady-state throughput from startup/drain overhead and confirm the
+  target robustly.
+- The 4,096-sample confirmation with the same 87/41 split and a 512-slot
+  bounded window sustained 229.75 production samples/s and 223.95 samples/s
+  from process start through final drain; ordered-completion span was 234.45
+  samples/s. Load service was 377.67/366.49/532.46 ms mean/median/p95 and
+  augmentation was 172.37/170.38/288.04 ms. Aggregate worker CPU use was
+  127.45 logical cores and reorder high-water was 88/512. Artifact:
+  `sample_pipeline_20260908_090019_097829`. This meets the requested 221
+  loaded-plus-augmented samples/s benchmark target without GPUs.

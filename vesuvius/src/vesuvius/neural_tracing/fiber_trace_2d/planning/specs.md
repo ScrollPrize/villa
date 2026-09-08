@@ -2851,3 +2851,21 @@
   reference behavior. Seeded noise remains in Torch. Native fused-transform
   error is bounded by `1e-6 * max(1,max_abs_reference)` maximum and
   `1e-7 * max(1,max_abs_reference)` mean on reference fixtures.
+
+# Bounded Fiber3D sample transport
+
+- The reusable ordered two-stage sample pipeline may transport large Fiber3D
+  tensors through a fixed shared-slot bank. Slot identity is derived from the
+  deterministic stream index and protected by a monotonically increasing
+  generation; stale or mismatched descriptors fail rather than reading
+  overwritten data.
+- Claimed-item credits bound every worker, queue, reorder-map and consumer-held
+  sample. For shared slots the coordinator must retain each credit until the
+  consumer explicitly releases the sample. Duplicate releases fail.
+- Queue payloads contain only compact metadata. Consecutive, non-wrapping slots
+  may form a zero-copy batch tensor view; noncontiguous, wrapping, or stale
+  batches fail. Slot storage size is fixed at startup from patch shape and the
+  maximum in-flight count.
+- Shared transport must preserve deterministic ordered delivery, sample values,
+  masks and metadata. Worker native compute remains single-threaded and
+  GIL-free; transport optimization may not alter augmentation draws or math.

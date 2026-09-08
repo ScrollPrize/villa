@@ -13,7 +13,7 @@ import os
 import queue
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from typing import Any, Callable
 
@@ -112,6 +112,8 @@ def _stage1_main(
     claim_lock: Any,
     credits: Any,
     end_index: int,
+    transport: Any,
+    stage1_is_final: bool,
 ) -> None:
     _set_native_thread_limits()
     try:
@@ -136,6 +138,10 @@ def _stage1_main(
             started_ns = time.perf_counter_ns()
             cpu_started = time.process_time()
             value = operation(index)
+            if transport is not None:
+                value = transport.encode(
+                    index, value, final=bool(stage1_is_final)
+                )
             cpu_ms = (time.process_time() - cpu_started) * 1000.0
             service_ms = (time.perf_counter() - started) * 1000.0
             finished_ns = time.perf_counter_ns()
@@ -181,6 +187,7 @@ def _stage2_main(
     control: Connection,
     start_event: Any,
     stop_event: Any,
+    transport: Any,
 ) -> None:
     _set_native_thread_limits()
     try:
@@ -195,9 +202,16 @@ def _stage2_main(
             except queue.Empty:
                 continue
             received_ns = time.perf_counter_ns()
+            raw_value = (
+                transport.decode(raw.index, raw.value, final=False)
+                if transport is not None
+                else raw.value
+            )
             started = time.perf_counter()
             cpu_started = time.process_time()
-            value = operation(raw.value)
+            value = operation(raw_value)
+            if transport is not None:
+                value = transport.encode(raw.index, value, final=True)
             cpu_ms = (time.process_time() - cpu_started) * 1000.0
             service_ms = (time.perf_counter() - started) * 1000.0
             finished_ns = time.perf_counter_ns()
@@ -260,6 +274,7 @@ class OrderedTwoStageSamplePipeline:
         multiprocessing_context: str = "forkserver",
         startup_timeout_seconds: float = 120.0,
         no_progress_timeout_seconds: float = 300.0,
+        transport: Any = None,
     ) -> None:
         for name, value in (
             ("item_count", item_count),
@@ -300,6 +315,8 @@ class OrderedTwoStageSamplePipeline:
         self.delivered = 0
         self.closed = False
         self.started_ns = 0
+        self.transport = transport
+        self.leased: set[int] = set()
 
         try:
             for worker_id in range(int(stage1_workers)):
@@ -317,6 +334,8 @@ class OrderedTwoStageSamplePipeline:
                         self.claim_lock,
                         self.credits,
                         self.end_index,
+                        self.transport,
+                        not self.has_stage2,
                     ),
                     name=f"ordered-sample-load-{worker_id}",
                 )
@@ -337,6 +356,7 @@ class OrderedTwoStageSamplePipeline:
                         child,
                         self.start_event,
                         self.stop_event,
+                        self.transport,
                     ),
                     name=f"ordered-sample-augment-{worker_id}",
                 )
@@ -404,7 +424,7 @@ class OrderedTwoStageSamplePipeline:
                     f"pipeline worker {process.name} exited unexpectedly with code {process.exitcode}"
                 )
 
-    def next_ordered(self) -> OrderedPipelineResult:
+    def next_ordered(self, *, release_credit: bool = True) -> OrderedPipelineResult:
         if self.closed:
             raise RuntimeError("pipeline is closed")
         if self.delivered >= self.item_count:
@@ -438,6 +458,13 @@ class OrderedTwoStageSamplePipeline:
         completed = self.reorder.pop(self.next_expected)
         received_ns = self.received_ns.pop(self.next_expected)
         delivered_ns = time.perf_counter_ns()
+        if self.transport is not None:
+            completed = replace(
+                completed,
+                value=self.transport.decode(
+                    completed.index, completed.value, final=True
+                ),
+            )
         if self.has_stage2:
             result = OrderedPipelineResult(
                 index=int(completed.index),
@@ -480,8 +507,18 @@ class OrderedTwoStageSamplePipeline:
             )
         self.next_expected += 1
         self.delivered += 1
-        self.credits.release()
+        if release_credit:
+            self.credits.release()
+        else:
+            self.leased.add(int(result.index))
         return result
+
+    def release(self, index: int) -> None:
+        index_i = int(index)
+        if index_i not in self.leased:
+            raise RuntimeError(f"pipeline sample {index_i} is not leased")
+        self.leased.remove(index_i)
+        self.credits.release()
 
     def close(self) -> None:
         if self.closed:
@@ -503,6 +540,7 @@ class OrderedTwoStageSamplePipeline:
             connection.close()
         self.reorder.clear()
         self.received_ns.clear()
+        self.leased.clear()
         for data_queue in (self.raw_queue, self.result_queue):
             try:
                 while True:

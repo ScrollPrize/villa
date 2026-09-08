@@ -356,5 +356,44 @@ mask cases and retains the exact seeded Torch noise draw.
 A 56/72 split and a benchmark-only 128-worker fused pool were both slower. The
 fused pool's completed samples waited 1.02s on average to be received, proving
 that large tensor queue transport and ordered materialization now suppress
-worker utilization. The target remains unmet; bounded reusable shared tensor
-slots are the next measured optimization rather than larger queues.
+worker utilization.
+
+The bounded transport now stores each sample's float32 volume and boolean mask
+in a generation-tagged shared slot. Queues carry only small metadata, and the
+coordinator retains the pipeline credit until the consuming batch releases its
+slot. Consecutive samples are exposed as a zero-copy batch view; a stale
+generation, wrapped batch, duplicate release, or mismatched stream index fails
+explicitly. With 256 slots (2.5 GiB), queue lag fell below 1 ms/sample and batch
+assembly below 0.05 ms/batch.
+
+Two exact native-loop improvements then removed the final augmentation
+bottleneck. Oblique stencils use a precomputed linear-offset interior path and
+tap-major contiguous row updates, while clamped border voxels retain the scalar
+reference path and every voxel retains the original tap accumulation order.
+Enabled anisotropic blur fell from about 530 ms to about 77 ms under the final
+host load; all native/Torch tolerance tests remain unchanged.
+
+The confirmed target run used 87 loading and 41 augmentation workers, one
+native thread per worker, 512 shared slots (5 GiB), 128 warmup samples, and
+4,096 measured S1a 128-cubed samples. The fixed launcher was:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_pipeline_benchmark
+```
+
+| metric | result |
+|---|---:|
+| measured production | **229.75 samples/s** |
+| full process start through drain | **223.95 samples/s** |
+| ordered completion span | 234.45 samples/s |
+| aggregate worker CPU use | 127.45 logical cores |
+| reorder high-water | 88 / 512 |
+| load service mean / median / p95 | 377.67 / 366.49 / 532.46 ms |
+| augmentation service mean / median / p95 | 172.37 / 170.38 / 288.04 ms |
+| result queue mean / batch view mean | 1.09 / 0.060 ms |
+
+Artifact:
+`/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_090019_097829/result.json`.
+This establishes loader-plus-augmentation capacity; the normal trainer still
+uses its existing per-rank `DataLoader`, so connecting the reusable pipeline to
+DDP training and measuring quality-per-hour remain separate work.

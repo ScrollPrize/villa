@@ -53,6 +53,20 @@ class _StageTwoFactory:
         return _StageTwo(self.fail_value)
 
 
+@dataclass(frozen=True)
+class _TupleTransport:
+    def encode(self, index: int, value: int, *, final: bool) -> tuple[int, bool, int]:
+        return int(index), bool(final), int(value)
+
+    def decode(
+        self, index: int, payload: tuple[int, bool, int], *, final: bool
+    ) -> int:
+        payload_index, payload_final, value = payload
+        assert payload_index == index
+        assert payload_final is final
+        return value
+
+
 def _pipeline(**overrides: object) -> OrderedTwoStageSamplePipeline:
     args: dict[str, object] = {
         "stage1_factory": _StageOneFactory(),
@@ -158,3 +172,29 @@ def test_pipeline_rejects_inconsistent_second_stage_configuration() -> None:
         _pipeline(stage2_factory=None, stage2_workers=1)
     with pytest.raises(ValueError, match="stage2_factory must be None"):
         _pipeline(stage2_factory=_StageTwoFactory(), stage2_workers=0)
+
+
+def test_pipeline_transport_round_trip_and_deferred_credit_release() -> None:
+    pipeline = _pipeline(
+        item_count=4,
+        max_in_flight=2,
+        transport=_TupleTransport(),
+    )
+    try:
+        first = pipeline.next_ordered(release_credit=False)
+        second = pipeline.next_ordered(release_credit=False)
+        assert first.value == 20
+        assert second.value == 22
+        assert pipeline.leased == {0, 1}
+        pipeline.release(first.index)
+        third = pipeline.next_ordered(release_credit=False)
+        assert third.value == 24
+        with pytest.raises(RuntimeError, match="is not leased"):
+            pipeline.release(first.index)
+        pipeline.release(second.index)
+        pipeline.release(third.index)
+        fourth = pipeline.next_ordered()
+        assert fourth.value == 26
+        assert not pipeline.leased
+    finally:
+        pipeline.close()

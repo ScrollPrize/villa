@@ -9,7 +9,7 @@
 - [x] Run eager two-GPU baseline, export both traces and verify tests.
 - [x] Complete both compile comparisons and report timings/numerical drift.
 - [x] Profile normal loader workers on two GPUs; verify unchanged batches and report stage/ordering costs.
-- [ ] Split value-augmentation hotspot into substage measurements before tuning.
+- [x] Split value-augmentation hotspot into substage measurements before tuning.
 - [x] Plan central bounded per-sample load/augmentation benchmark pipeline.
 - [x] Independently review the two-stage pipeline plan; incorporate bounded-credit and liveness findings.
 - [x] Implement and test the central pipeline and split loader boundary.
@@ -42,5 +42,6 @@
 - [x] Fuse isotropic blur and deterministic point-value transforms natively.
 - [x] Measure fixed-split rebalance and fused-pool upper-bound probes.
 - [x] Identify bounded large-tensor transport as the next limiter.
-- [ ] Replace raw/result tensor queue copies with generation-checked bounded shared slots.
-- [ ] Sustain at least 221 fully augmented ordered samples/s at the 128-worker budget.
+- [x] Replace raw/result tensor queue copies with generation-checked bounded shared slots.
+- [x] Sustain at least 221 fully augmented ordered samples/s at the 128-worker budget.
+- [ ] Connect the reusable central pipeline to multi-rank training and measure training throughput.

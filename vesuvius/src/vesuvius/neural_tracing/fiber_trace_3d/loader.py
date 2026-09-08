@@ -206,6 +206,145 @@ class FiberTrace3DRawSample:
 
 
 @dataclass(frozen=True)
+class _SharedFiberTrace3DPayload:
+    slot: int
+    generation: int
+    value: FiberTrace3DSample | FiberTrace3DRawSample
+
+
+class FiberTrace3DSharedTensorSlots:
+    """Bounded shared storage for large per-sample volume and mask tensors."""
+
+    def __init__(
+        self,
+        *,
+        start_index: int,
+        slot_count: int,
+        patch_shape_zyx: tuple[int, int, int],
+    ) -> None:
+        if int(slot_count) <= 0:
+            raise ValueError("slot_count must be positive")
+        self.start_index = int(start_index)
+        self.slot_count = int(slot_count)
+        shape = (self.slot_count, 1, *(int(v) for v in patch_shape_zyx))
+        self.volumes = torch.empty(shape, dtype=torch.float32).share_memory_()
+        self.valid_masks = torch.empty(shape, dtype=torch.bool).share_memory_()
+        self.generations = torch.full(
+            (self.slot_count,), -1, dtype=torch.int64
+        ).share_memory_()
+
+    def _location(self, index: int) -> tuple[int, int]:
+        offset = int(index) - self.start_index
+        if offset < 0:
+            raise RuntimeError(f"shared-slot index precedes start: {index}")
+        return offset % self.slot_count, offset // self.slot_count
+
+    def encode(
+        self,
+        index: int,
+        value: FiberTrace3DSample | FiberTrace3DRawSample,
+        *,
+        final: bool,
+    ) -> _SharedFiberTrace3DPayload:
+        del final
+        sample = value.sample if isinstance(value, FiberTrace3DRawSample) else value
+        slot, generation = self._location(index)
+        if int(sample.stream_index) != int(index):
+            raise RuntimeError("shared-slot sample/index mismatch")
+        self.volumes[slot].copy_(sample.volume)
+        self.valid_masks[slot].copy_(sample.valid_mask)
+        self.generations[slot] = generation
+        tensor_metadata = {
+            name: np.asarray(getattr(sample, name).detach().cpu().numpy())
+            for name in (
+                "cp_local_zyx",
+                "crop_origin_zyx",
+                "target_segment_starts_zyx",
+                "target_segment_ends_zyx",
+                "target_segment_bbox_lo_zyx",
+                "target_segment_bbox_hi_zyx",
+                "target_tangent_zyx",
+            )
+        }
+        metadata_sample = replace(
+            sample,
+            volume=None,
+            valid_mask=None,
+            **tensor_metadata,
+        )
+        metadata_value = (
+            replace(value, sample=metadata_sample)
+            if isinstance(value, FiberTrace3DRawSample)
+            else metadata_sample
+        )
+        return _SharedFiberTrace3DPayload(slot, generation, metadata_value)
+
+    def decode(
+        self,
+        index: int,
+        payload: _SharedFiberTrace3DPayload,
+        *,
+        final: bool,
+    ) -> FiberTrace3DSample | FiberTrace3DRawSample:
+        del final
+        if not isinstance(payload, _SharedFiberTrace3DPayload):
+            raise RuntimeError("shared-slot transport received an invalid descriptor")
+        slot, generation = self._location(index)
+        if payload.slot != slot or payload.generation != generation:
+            raise RuntimeError("shared-slot descriptor location mismatch")
+        observed = int(self.generations[slot].item())
+        if observed != generation:
+            raise RuntimeError(
+                f"shared-slot generation mismatch for index {index}: "
+                f"expected {generation}, observed {observed}"
+            )
+        value = payload.value
+        sample = value.sample if isinstance(value, FiberTrace3DRawSample) else value
+        tensor_metadata = {
+            name: torch.from_numpy(np.asarray(getattr(sample, name)))
+            for name in (
+                "cp_local_zyx",
+                "crop_origin_zyx",
+                "target_segment_starts_zyx",
+                "target_segment_ends_zyx",
+                "target_segment_bbox_lo_zyx",
+                "target_segment_bbox_hi_zyx",
+                "target_tangent_zyx",
+            )
+        }
+        restored = replace(
+            sample,
+            volume=self.volumes[slot],
+            valid_mask=self.valid_masks[slot],
+            **tensor_metadata,
+        )
+        return (
+            replace(value, sample=restored)
+            if isinstance(value, FiberTrace3DRawSample)
+            else restored
+        )
+
+    def batch_tensors(
+        self, indices: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not indices:
+            raise ValueError("shared-slot batch must not be empty")
+        locations = [self._location(index) for index in indices]
+        slots = [slot for slot, _generation in locations]
+        if slots != list(range(slots[0], slots[0] + len(slots))):
+            raise RuntimeError("shared-slot batch crosses or is not contiguous")
+        for index, (slot, generation) in zip(indices, locations, strict=True):
+            observed = int(self.generations[slot].item())
+            if observed != generation:
+                raise RuntimeError(
+                    f"shared-slot batch generation mismatch for index {index}: "
+                    f"expected {generation}, observed {observed}"
+                )
+        end = slots[0] + len(slots)
+        return self.volumes[slots[0] : end], self.valid_masks[slots[0] : end]
+
+
+@dataclass(frozen=True)
 class FiberTrace3DBatch:
     volume: torch.Tensor
     valid_mask: torch.Tensor

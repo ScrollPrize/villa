@@ -447,3 +447,12 @@
   0.494s/sample and the matched pipeline from 22.65 to 58.81 samples/s.
 - Extended the native path to isotropic blur and fused deterministic point
   transforms, reaching 131.01 ordered samples/s with exactly 128 workers.
+
+## 2026-09-08 — Bounded Fiber3D sample transport
+
+- Added generation-checked shared tensor slots and deferred consumer credits to
+  the reusable ordered pipeline, eliminating multiprocessing tensor transfer and
+  batch-copy stalls.
+- Vectorized the exact native stencil interior and balanced the fixed 128-worker
+  topology, sustaining 229.75 loaded and augmented 128-cubed samples/s (223.95
+  samples/s including startup and drain) on the S1a benchmark.

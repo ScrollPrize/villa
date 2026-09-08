@@ -24,6 +24,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DLoader,
     FiberTrace3DRawSample,
     FiberTrace3DSample,
+    FiberTrace3DSharedTensorSlots,
     augment_fiber_trace_3d_raw_sample,
     load_config,
 )
@@ -329,6 +330,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="benchmark complete load+augmentation in one free-worker pool",
     )
+    parser.add_argument(
+        "--shared-tensor-slots",
+        action="store_true",
+        help="transport volume/mask through bounded preallocated shared slots",
+    )
     parser.add_argument("--raw-queue-capacity", type=int, default=64)
     parser.add_argument("--result-queue-capacity", type=int, default=64)
     parser.add_argument("--max-in-flight", type=int, default=128)
@@ -471,6 +477,15 @@ def main(argv: list[str] | None = None) -> int:
 
     total_items = int(args.warmup_samples) + int(args.samples)
     sample_limit = None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
+    transport = (
+        FiberTrace3DSharedTensorSlots(
+            start_index=int(args.start_index),
+            slot_count=int(args.max_in_flight),
+            patch_shape_zyx=tuple(int(v) for v in config_payload["patch_shape_zyx"]),
+        )
+        if bool(args.shared_tensor_slots)
+        else None
+    )
     startup_started = time.perf_counter()
     stage1_factory = (
         _FusedLoadFactory(str(config_path), sample_limit, str(args.sample_mode))
@@ -496,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         multiprocessing_context=str(args.multiprocessing_context),
         startup_timeout_seconds=float(args.startup_timeout_seconds),
         no_progress_timeout_seconds=float(args.no_progress_timeout_seconds),
+        transport=transport,
     )
     startup_seconds = time.perf_counter() - startup_started
     print(
@@ -504,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         f"augment_workers={0 if args.raw_only or args.fused else args.augment_workers} "
         f"raw_only={bool(args.raw_only)} "
         f"fused={bool(args.fused)} "
+        f"shared_slots={bool(args.shared_tensor_slots)} "
         f"raw_queue={args.raw_queue_capacity} result_queue={args.result_queue_capacity} "
         f"in_flight={args.max_in_flight} batch={batch_size} "
         f"warmup={args.warmup_samples} measure={args.samples} native_threads=1",
@@ -525,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 measurement_started = time.perf_counter()
             if ordinal >= int(args.warmup_samples) and not batch:
                 batch_started = time.perf_counter()
-            result = pipeline.next_ordered()
+            result = pipeline.next_ordered(release_credit=transport is None)
             all_completion_ns.append(int(result.stage2_finished_ns))
             expected = verify_expected.get(int(result.index))
             if expected is not None:
@@ -568,14 +585,26 @@ def main(argv: list[str] | None = None) -> int:
                     len(batch) == batch_size or ordinal + 1 == total_items
                 ):
                     stack_started = time.perf_counter()
-                    volumes = torch.stack([item.value.volume for item in batch], dim=0)
-                    masks = torch.stack([item.value.valid_mask for item in batch], dim=0)
+                    if transport is not None:
+                        volumes, masks = transport.batch_tensors(
+                            [item.index for item in batch]
+                        )
+                    else:
+                        volumes = torch.stack([item.value.volume for item in batch], dim=0)
+                        masks = torch.stack([item.value.valid_mask for item in batch], dim=0)
                     del volumes, masks
                     batch_stack_ms.append((time.perf_counter() - stack_started) * 1000.0)
                     assert batch_started is not None
                     batch_wait_ms.append((stack_started - batch_started) * 1000.0)
+                    if transport is not None:
+                        for item in batch:
+                            pipeline.release(item.index)
                     batch.clear()
                     batch_started = None
+                elif bool(args.raw_only) and transport is not None:
+                    pipeline.release(result.index)
+            elif transport is not None:
+                pipeline.release(result.index)
             now = time.monotonic()
             if now - last_report >= 10.0 or ordinal + 1 == total_items:
                 print(
@@ -631,6 +660,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "raw_only": bool(args.raw_only),
         "fused": bool(args.fused),
+        "shared_tensor_slots": bool(args.shared_tensor_slots),
+        "shared_tensor_slot_count": int(args.max_in_flight) if transport is not None else 0,
+        "shared_tensor_slot_bytes": (
+            raw_sample_bytes * int(args.max_in_flight) if transport is not None else 0
+        ),
         "cache_state_label": str(args.cache_state),
         "start_index": int(args.start_index),
         "warmup_samples": int(args.warmup_samples),

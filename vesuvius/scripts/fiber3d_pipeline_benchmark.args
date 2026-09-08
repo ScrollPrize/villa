@@ -1,21 +1,21 @@
 # One command-line argument per line. The launcher command itself stays fixed
 # so a single execution approval covers subsequent benchmark configurations.
 --samples
-1024
+4096
 --warmup-samples
 128
 --verify-samples
 0
 --load-workers
-32
+87
 --augment-workers
-96
+41
 --raw-queue-capacity
 128
 --result-queue-capacity
 128
 --max-in-flight
-256
+512
 --cache-state
 warm
 --volume-io-threads
@@ -29,3 +29,4 @@ warm
 native
 --value-augmentation-backend
 native
+--shared-tensor-slots

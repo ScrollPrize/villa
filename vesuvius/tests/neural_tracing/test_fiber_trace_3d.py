@@ -60,6 +60,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
     FiberTrace3DLoader,
+    FiberTrace3DSharedTensorSlots,
     _TARGET_MODE_CP_ONLY,
     _TARGET_MODE_DENSE_LINE,
     _anisotropic_blur_3d,
@@ -827,6 +828,49 @@ def _loader_with_mapping(raw: dict) -> FiberTrace3DLoader:
     }
     base.update(raw)
     return FiberTrace3DLoader(config_from_mapping(base))
+
+
+def test_shared_tensor_slots_round_trip_and_reject_stale_generation() -> None:
+    loader = _loader_with_mapping({"patch_shape_zyx": [8, 8, 8]})
+    slots = FiberTrace3DSharedTensorSlots(
+        start_index=5,
+        slot_count=2,
+        patch_shape_zyx=(8, 8, 8),
+    )
+    raw = loader.load_raw_sample(5)
+    payload = slots.encode(5, raw, final=False)
+    restored = slots.decode(5, payload, final=False)
+    assert torch.equal(restored.sample.volume, raw.sample.volume)
+    assert torch.equal(restored.sample.valid_mask, raw.sample.valid_mask)
+    assert restored.sample.volume.data_ptr() == slots.volumes[0].data_ptr()
+    assert torch.equal(restored.sample.target_tangent_zyx, raw.sample.target_tangent_zyx)
+
+    replacement = loader.load_raw_sample(7)
+    slots.encode(7, replacement, final=False)
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        slots.decode(5, payload, final=False)
+
+
+def test_shared_tensor_slots_expose_zero_copy_contiguous_batch() -> None:
+    loader = _loader_with_mapping({"patch_shape_zyx": [8, 8, 8]})
+    slots = FiberTrace3DSharedTensorSlots(
+        start_index=3,
+        slot_count=4,
+        patch_shape_zyx=(8, 8, 8),
+    )
+    expected = []
+    for index in (3, 4):
+        raw = loader.load_raw_sample(index)
+        slots.encode(index, raw, final=False)
+        expected.append(raw.sample.volume)
+    volumes, masks = slots.batch_tensors([3, 4])
+    assert volumes.shape == (2, 1, 8, 8, 8)
+    assert masks.shape == (2, 1, 8, 8, 8)
+    assert volumes.data_ptr() == slots.volumes[0].data_ptr()
+    assert torch.equal(volumes[0], expected[0])
+    assert torch.equal(volumes[1], expected[1])
+    with pytest.raises(RuntimeError, match="crosses or is not contiguous"):
+        slots.batch_tensors([4, 6])
 
 
 def test_3d_config_defaults_volume_cache_to_512_mib() -> None:
