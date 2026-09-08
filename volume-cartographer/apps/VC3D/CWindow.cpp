@@ -2683,9 +2683,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
     auto updatePersistentCacheSpace = [this]() {
-        const std::filesystem::path root(
-            vc3d::remoteCachePath().toStdString());
-        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root);
+        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(
+            vc3d::remoteCachePathFs());
         if (!budget)
             return;
         const auto stats = budget->stats();
