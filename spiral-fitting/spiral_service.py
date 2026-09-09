@@ -1227,7 +1227,12 @@ class ServiceState:
         try:
             pcl_name = PCL_ROLE_FILES[role.value]
             shutil.copy2(source, root / pcl_name)
-            source_revision = self._file_sha256(source)
+            # Hash the snapshot, not the live source: publishing runs without
+            # the commit lock, and a write landing between the copy and the
+            # hash would advertise the newer document's revision for the
+            # older bytes, letting a client edit the stale snapshot and still
+            # pass the revision check.
+            source_revision = self._file_sha256(root / pcl_name)
             editable = self._pcl_source_editable(role, source)
             descriptor = {
                 "schema_version": 1,

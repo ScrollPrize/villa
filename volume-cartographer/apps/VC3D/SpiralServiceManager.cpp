@@ -1556,6 +1556,13 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPclArtifact[slot] = artifactId;
                 _lastPclLocalPath[slot] = entryPath;
                 emit pclArtifactAvailable(role, entryPath, artifactRef);
+                // PCL-only edits republish this artifact without a new
+                // preview, and only the preview callbacks pruned the cache,
+                // so repeated commits left every superseded snapshot on disk
+                // until the next preview arrived. The active preview,
+                // diagnostics and PCL snapshots are pinned.
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
             });
     }
 }
