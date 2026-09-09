@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Sequence
+import itertools
 
 from numcodecs import Blosc
+import numpy as np
 import zarr
 
 
@@ -21,6 +23,30 @@ LABEL_SLICE = 32
 CHUNK_SHAPE = (VOLUME_DEPTH, 128, 128)
 LABEL_COMPRESSOR = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 _ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+
+
+def downsample_mean(block, factors=(2, 2, 2), *, rounding="even"):
+    """Mean-pool integer ZYX data, including partial edge cells, with nearest rounding."""
+    block = np.asarray(block)
+    if block.ndim != 3 or len(factors) != 3 or any(f not in (1, 2) for f in factors):
+        raise ValueError("Expected a ZYX block and factors of one or two")
+    shape = tuple((n + f - 1) // f for n, f in zip(block.shape, factors))
+    total = np.zeros(shape, dtype=np.float64)
+    count = np.zeros(shape, dtype=np.float64)
+    for offsets in itertools.product(*(range(f) for f in factors)):
+        sample = block[tuple(slice(o, None, f) for o, f in zip(offsets, factors))]
+        if sample.size:
+            slices = tuple(slice(0, n) for n in sample.shape)
+            total[slices] += sample
+            count[slices] += 1.0
+    if rounding == "even":
+        rounded = np.rint(total / count)
+    elif rounding == "half_up" and np.issubdtype(block.dtype, np.unsignedinteger):
+        # Matches vc::downsampleTileIntoPreserveZ: (sum + count/2) / count.
+        rounded = np.floor(total / count + 0.5)
+    else:
+        raise ValueError("Unsupported rounding mode or dtype")
+    return np.ascontiguousarray(rounded.astype(block.dtype))
 
 
 def pyramid_shapes(

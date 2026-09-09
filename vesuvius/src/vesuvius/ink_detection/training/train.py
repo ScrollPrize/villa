@@ -1291,6 +1291,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run training through an import-pure argparse command boundary."""
 
     arguments = build_parser().parse_args(argv)
+    with arguments.config_path.open(encoding="utf-8") as stream:
+        model_type = json.load(stream).get("model_type")
+    if model_type == "multiteacher_3d_projection":
+        from vesuvius.ink_detection.training.multiteacher import train
+
+        return train(arguments.config_path)
     request = stage_training_request(arguments.config_path)
     return _run_training(request)
 

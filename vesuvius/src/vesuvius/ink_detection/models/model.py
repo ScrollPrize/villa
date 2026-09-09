@@ -145,6 +145,12 @@ def make_model(config: InkConfig) -> nn.Module:
     """Construct the model selected by a validated ink configuration."""
 
     model_type = config.model.model_type
+    if model_type == "multiteacher_3d_projection":
+        settings = config.model.model_settings_mapping()
+        if settings.get("projection", {}).get("kind") == "canonical_logits":
+            from vesuvius.ink_detection.models.canonical_projection import CanonicalLogitProjection
+            return CanonicalLogitProjection(**settings["canonical"])
+        raise ValueError("This student requires projection.kind=canonical_logits")
     if model_type in {"vesuvius_unet", "unet"}:
         return _build_network(_base_build_mapping(config), op_dims=3)
     if model_type in {"vesuvius_unet_2p5d", "unet_2p5d"}:

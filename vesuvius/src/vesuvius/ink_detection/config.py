@@ -855,6 +855,7 @@ class InkModelConfig:
         allowed = {
             "vesuvius_unet",
             "unet",
+            "multiteacher_3d_projection",
             "vesuvius_unet_2p5d",
             "unet_2p5d",
             "vesuvius_unet_3d_stem_2d",

@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.resnetall import generate_model
+if __package__:
+    from .models.resnetall import generate_model
+else:
+    from models.resnetall import generate_model
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +99,8 @@ class Decoder3DUNet(nn.Module):
             self.aux_head_s2 = AuxHead(decoder_dims[2])
             self.aux_head_s1 = AuxHead(decoder_dims[1])
 
-    def forward(self, feat_maps):
+    def forward_features(self, feat_maps):
+        """Decode once, retaining the feature volume before depth collapse."""
         feats = [self.channel_reduce[i](feat_maps[i]) for i in range(4)]
         aux_outputs = []
 
@@ -117,6 +121,10 @@ class Decoder3DUNet(nn.Module):
         x = torch.cat([x, feats[0]], dim=1)
         x = self.decoder_blocks[2](x)
 
+        return x, aux_outputs
+
+    def forward(self, feat_maps):
+        x, aux_outputs = self.forward_features(feat_maps)
         x = self.depth_collapse(x)
         x = self.logit(x)
 
@@ -141,13 +149,18 @@ class RegressionModel(nn.Module):
         )
         self.normalization = nn.BatchNorm3d(num_features=1) if with_norm else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor):
         if x.ndim == 4:
             x = x[:, None]
         if self.normalization is not None:
             x = self.normalization(x)
-        feat_maps = self.backbone(x)
-        return self.decoder(feat_maps)
+        return self.backbone(x)
+
+    def forward_features(self, x: torch.Tensor):
+        return self.decoder.forward_features(self.encode(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encode(x))
 
     def get_output_scale_factor(self) -> int:
         return 4

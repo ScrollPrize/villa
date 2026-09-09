@@ -739,20 +739,8 @@ def create_output_zarr(
 
 def downsample_mean_3d(block: np.ndarray) -> np.ndarray:
     """Mean-pool a ZYX block by two and round to its input dtype."""
-
-    block = np.asarray(block)
-    output_shape = tuple((value + 1) // 2 for value in block.shape)
-    total = np.zeros(output_shape, dtype=np.float64)
-    count = np.zeros(output_shape, dtype=np.float64)
-    for offsets in itertools.product((0, 1), repeat=3):
-        sample = block[
-            offsets[0] :: 2, offsets[1] :: 2, offsets[2] :: 2
-        ]
-        if sample.size:
-            slices = tuple(slice(0, value) for value in sample.shape)
-            total[slices] += sample
-            count[slices] += 1.0
-    return np.ascontiguousarray(np.rint(total / count).astype(block.dtype))
+    from vesuvius.label_zarr import downsample_mean
+    return downsample_mean(block)
 
 
 def scale_chunks_to_next_level(chunks, *, source_array, target_array) -> set[ChunkId]:

@@ -159,4 +159,10 @@ def config_from_checkpoint(
         raise KeyError(
             f"Checkpoint {str(source)!r} is missing required field 'config'"
         )
-    return InkConfig.from_mapping(checkpoint["config"])
+    mapping = dict(checkpoint["config"])
+    if mapping.get("projection", {}).get("kind") == "canonical_logits":
+        from copy import deepcopy
+        from vesuvius.ink_detection.models.canonical_projection import canonical_source_dir
+        mapping = deepcopy(mapping)
+        mapping["model_config"]["canonical"]["source_dir"] = str(canonical_source_dir())
+    return InkConfig.from_mapping(mapping)
