@@ -326,17 +326,6 @@ def _get_streamable_tiff_metadata(
 _STREAMABLE_COMPRESSIONS = frozenset({1, 5, 8, 32773, 32946})
 
 
-# Memory budget for the streamed level-0 writer: the decode loop visits source
-# chunks in order and holds partially-filled destination blocks until every
-# chunk that can contribute to them has been consumed. This bounds how much is
-# resident at once; it does not affect correctness. A single source chunk that
-# exceeds the budget on its own is still decoded -- refusing would mean falling
-# back to the in-memory path this streaming path exists to avoid.
-_STREAM_DECODE_BUDGET_BYTES = int(
-    os.environ.get("VESUVIUS_STREAM_DECODE_BUDGET_BYTES", 1 << 30)
-)
-
-
 def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> None:
     """Stream a tiled OR striped TIFF's level-0 data into ``dataset``.
 
@@ -360,7 +349,10 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
         tiles_down, tiles_across = page.chunked
 
         # Destination blocks, keyed by (block_y, block_x). Each entry holds the
-        # partially-filled array and a count of source chunks still to come.
+        # partially-filled array and a count of source chunks still to come. A
+        # block is held only while chunks that can contribute to it remain
+        # unread; since chunks are visited in row-major order, at most one row
+        # of destination blocks is resident at a time.
         blocks: dict[tuple[int, int], np.ndarray] = {}
         pending: dict[tuple[int, int], int] = {}
 
@@ -381,10 +373,9 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                     for bx in _block_span(tile_x, tile_width, image_width):
                         pending[(by, bx)] = pending.get((by, bx), 0) + 1
 
-        resident_bytes = 0
         itemsize = np.dtype(page.dtype).itemsize
 
-        def _flush(key: tuple[int, int]) -> int:
+        def _flush(key: tuple[int, int]) -> None:
             block_YX = blocks.pop(key)
             by, bx = key
             dataset[
@@ -392,7 +383,6 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                 by : by + block_YX.shape[0],
                 bx : bx + block_YX.shape[1],
             ] = block_YX
-            return block_YX.nbytes
 
         # Source-chunk-major: decode each chunk exactly once.
         for tile_index in range(tiles_down * tiles_across):
@@ -427,7 +417,6 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                     key = (by, bx)
                     if key not in blocks:
                         blocks[key] = np.zeros((bh, bw), dtype=page.dtype)
-                        resident_bytes += blocks[key].nbytes
                     if tile_YX is not None:
                         y0 = max(by, tile_y)
                         y1 = min(by + bh, tile_y + tile_h)
@@ -441,22 +430,8 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
                             ]
                     pending[key] -= 1
                     if pending[key] == 0:
-                        resident_bytes -= _flush(key)
+                        _flush(key)
                         del pending[key]
-
-            # The budget bounds residency, not correctness: if holding this
-            # chunk's blocks pushed us over, write out whatever is complete
-            # first (there is normally nothing left, since blocks are flushed
-            # the moment their count reaches zero) and then the oldest
-            # partially-filled blocks, which will be re-read on their next
-            # contribution.
-            if resident_bytes > _STREAM_DECODE_BUDGET_BYTES:
-                for key in sorted(blocks):
-                    if resident_bytes <= _STREAM_DECODE_BUDGET_BYTES:
-                        break
-                    if pending.get(key, 0) > 0:
-                        continue
-                    resident_bytes -= _flush(key)
 
         # Any block whose contributions were all skipped (missing offsets in a
         # truncated file) is still zero-filled and must be written.
