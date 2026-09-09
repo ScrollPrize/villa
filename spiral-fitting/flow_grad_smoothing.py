@@ -349,18 +349,23 @@ def _blur_radial_eager_(grad, num_phi, offsets, kernel):
 
 
 def describe_widths(along_voxels, across_voxels, cell_voxels, spatial_scale_factor,
-                    field_type):
+                    field_type, low_res_along_voxels=0.0):
     """One-line report of the effective smoothing widths per lattice.
 
     Converts the configured scroll-voxel widths to cells of the high- and
     low-resolution lattices and says when a kernel collapses to the identity
     (see gaussian_kernel), so a width that is far below the cell size is
-    visible at startup instead of silently doing nothing.
+    visible at startup instead of silently doing nothing. A positive
+    ``low_res_along_voxels`` is the low-resolution lattice's own along-sheet
+    width and is reported in its place.
     """
-    def per_lattice(voxels):
+    def per_lattice(voxels, low_res_voxels=None):
         parts = []
         for name, scale in (('HR', 1), ('LR', spatial_scale_factor)):
-            cells = float(voxels) / (float(cell_voxels) * scale)
+            lattice_voxels = voxels
+            if name == 'LR' and low_res_voxels is not None and float(low_res_voxels) > 0.0:
+                lattice_voxels = low_res_voxels
+            cells = float(lattice_voxels) / (float(cell_voxels) * scale)
             kernel = gaussian_kernel(cells, dtype=torch.float64)
             if kernel is None:
                 parts.append(f'{name} {cells:.2f} cells (identity)')
@@ -369,7 +374,10 @@ def describe_widths(along_voxels, across_voxels, cell_voxels, spatial_scale_fact
         return ', '.join(parts)
 
     report = (f'flow gradient smoothing ({field_type}): along-sheet '
-              f'{float(along_voxels):g} voxels = {per_lattice(along_voxels)}')
+              f'{float(along_voxels):g} voxels')
+    if low_res_along_voxels is not None and float(low_res_along_voxels) > 0.0:
+        report += f' (LR {float(low_res_along_voxels):g} voxels)'
+    report += f' = {per_lattice(along_voxels, low_res_along_voxels)}'
     if field_type == 'cylindrical':
         report += (f'; across rings {float(across_voxels):g} voxels = '
                    f'{per_lattice(across_voxels)}')

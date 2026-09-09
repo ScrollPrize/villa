@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import flow_grad_smoothing
 from config import Config
 from flow_fields import CartesianFlowField, CylindricalFlowField
-from lazy_moment_adamw import LazyMomentAdamW
+from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 from transforms import SpiralAndTransform
 
 
@@ -136,6 +136,12 @@ def test_field_smooth_grad_scales_width_for_the_low_res_lattice(kind, monkeypatc
     expected = [(0.5,), (2.0,)] if kind == 'cartesian' else [(0.5, 0.25), (2.0, 1.0)]
     assert [widths for _, widths in seen] == expected
     assert seen[0][0] == field.flows[0].shape and seen[1][0] == field.flows[1].shape
+    # A low-res width of its own replaces the shared along-sheet width on the
+    # coarse lattice only; the across-ring width still scales as before.
+    seen.clear()
+    field.smooth_grad_(2.0, 1.0, 8.0)
+    expected = [(2.0,), (2.0,)] if kind == 'cartesian' else [(2.0, 0.25), (2.0, 1.0)]
+    assert [widths for _, widths in seen] == expected
     # Untouched lattices (no gradient) are skipped.
     field.flows[0].grad = None
     seen.clear()
@@ -159,11 +165,12 @@ def test_model_converts_voxels_to_cells():
     seen = []
     # Every flow stage module receives the converted widths.
     for flow_field in model.flow_fields:
-        flow_field.smooth_grad_ = lambda sigma, across: seen.append((sigma, across))
+        flow_field.smooth_grad_ = lambda sigma, across, low_res: seen.append((sigma, across, low_res))
     model.smooth_flow_grad_(40.0)
     model.smooth_flow_grad_(40.0, 8.0)
+    model.smooth_flow_grad_(40.0, 8.0, 160.0)
     assert len(model.flow_fields) == 2
-    assert seen == [(2.5, 0.0)] * 2 + [(2.5, 0.5)] * 2
+    assert seen == [(2.5, 0.0, 0.0)] * 2 + [(2.5, 0.5, 0.0)] * 2 + [(2.5, 0.5, 10.0)] * 2
     # The startup report converts the same way and names identity kernels.
     report = model.describe_flow_grad_smoothing(6.0, 0.0)
     assert report.startswith('flow gradient smoothing (cartesian): along-sheet 6 voxels')
@@ -176,6 +183,14 @@ def test_model_converts_voxels_to_cells():
 def test_describe_widths_reports_both_directions_for_cylindrical_lattices():
     report = flow_grad_smoothing.describe_widths(96.0, 16.0, 16.0, 6, 'cylindrical')
     assert 'along-sheet 96 voxels = HR 6.00 cells (radius 18), LR 1.00 cells (radius 3)' in report
+    assert 'across rings 16 voxels = HR 1.00 cells (radius 3), LR 0.17 cells (identity)' in report
+
+
+def test_describe_widths_reports_the_low_res_lattices_own_width():
+    report = flow_grad_smoothing.describe_widths(
+        96.0, 16.0, 16.0, 6, 'cylindrical', low_res_along_voxels=288.0)
+    assert 'along-sheet 96 voxels (LR 288 voxels) = HR 6.00 cells (radius 18), LR 3.00 cells (radius 9)' in report
+    # The across-ring width is unaffected.
     assert 'across rings 16 voxels = HR 1.00 cells (radius 3), LR 0.17 cells (identity)' in report
 
 
@@ -342,10 +357,11 @@ def test_lazy_step_with_no_state_and_first_touch_matches_sparse_adam():
     assert float(param.detach()[0]) == 0.0
 
 
-def _reference_shared_step(param, grad, state, lr, betas, eps, masked):
+def _reference_shared_step(param, grad, state, lr, betas, eps, masked, quantile=None):
     # Plain-torch reference of the shared-denominator step on a [S, C, ...]
-    # parameter: per-cell EMA moments, one denominator per (S, C) plane from
-    # the mean second moment over cells with a nonzero second moment.
+    # parameter: per-cell EMA moments, one denominator per stage S (shared by
+    # its C components) from the mean second moment over cells with a
+    # nonzero second moment, capped at the given quantile of those cells.
     beta1, beta2 = betas
     state['step'] += 1
     step = state['step']
@@ -353,10 +369,16 @@ def _reference_shared_step(param, grad, state, lr, betas, eps, masked):
     state['exp_avg'] = torch.where(touched, torch.lerp(state['exp_avg'], grad, 1 - beta1), state['exp_avg'])
     state['exp_avg_sq'] = torch.where(touched, torch.lerp(state['exp_avg_sq'], grad * grad, 1 - beta2), state['exp_avg_sq'])
     sq = state['exp_avg_sq']
-    planes = sq.reshape(sq.shape[0] * sq.shape[1], -1)
+    planes = sq.reshape(sq.shape[0], -1)
     ever = planes > 0
-    mean_sq = planes.sum(1) / ever.sum(1).clamp(min=1)
-    denom = (mean_sq.sqrt() / (1 - beta2 ** step) ** 0.5 + eps).view(sq.shape[0], sq.shape[1], *([1] * (sq.dim() - 2)))
+    capped = planes
+    if quantile is not None:
+        caps = torch.stack([
+            torch.quantile(row[row > 0].double(), quantile) if (row > 0).any() else torch.tensor(math.inf, dtype=torch.float64)
+            for row in planes]).to(planes.dtype)
+        capped = torch.minimum(planes, caps[:, None])
+    mean_sq = capped.sum(1) / ever.sum(1).clamp(min=1)
+    denom = (mean_sq.sqrt() / (1 - beta2 ** step) ** 0.5 + eps).view(sq.shape[0], *([1] * (sq.dim() - 1)))
     update = state['exp_avg'] / denom * (lr / (1 - beta1 ** step))
     update = torch.where(touched, update, torch.zeros_like(update))
     return param - update
@@ -372,12 +394,13 @@ def test_shared_second_moment_matches_reference_and_keeps_adamw_state(masked):
     optimiser = LazyMomentAdamW([{
         'params': [param], 'weight_decay': 0.0,
         'lazy_moments': masked, 'shared_second_moment': True,
+        'shared_second_moment_clip_quantile': None,
     }], lr=lr, betas=betas, eps=eps)
     ref_state = {'step': 0, 'exp_avg': torch.zeros_like(ref), 'exp_avg_sq': torch.zeros_like(ref)}
     for _ in range(6):
         grad = _sparse_pattern(param.shape, 0.4, generator)
-        # Plane (1, 2) never receives gradient: its denominator falls back to
-        # epsilon and its (zero) first moment keeps it exactly still.
+        # Component (1, 2) never receives gradient: it shares stage 1's
+        # denominator, but its (zero) first moment keeps it exactly still.
         grad[1, 2] = 0.0
         param.grad = grad.clone()
         optimiser.step()
@@ -400,7 +423,7 @@ def test_shared_second_moment_matches_reference_and_keeps_adamw_state(masked):
 
 
 def test_shared_second_moment_keeps_the_gradient_profile_and_is_per_plane():
-    # A smooth gradient profile on two planes, the second ten times larger.
+    # A smooth gradient profile on two stages, the second ten times larger.
     torch.manual_seed(8)
     profile = torch.exp(-0.5 * ((torch.arange(9.0) - 4.0) / 1.5) ** 2)
     grad = torch.stack([profile, 10.0 * profile])[:, None, :].expand(2, 2, 9).clone()
@@ -428,7 +451,7 @@ def test_shared_second_moment_keeps_the_gradient_profile_and_is_per_plane():
 
 
 def test_shared_second_moment_equals_per_cell_for_uniform_gradients():
-    # Every cell of a plane carrying the same gradient makes the mean second
+    # Every cell of a stage carrying the same gradient makes the mean second
     # moment equal to each cell's own, so the two denominators coincide.
     torch.manual_seed(9)
     generator = torch.Generator().manual_seed(10)
@@ -437,17 +460,111 @@ def test_shared_second_moment_equals_per_cell_for_uniform_gradients():
     a = LazyMomentAdamW([{'params': [shared], 'lazy_moments': True, 'shared_second_moment': True}], lr=1e-2)
     b = LazyMomentAdamW([{'params': [cellwise], 'lazy_moments': True}], lr=1e-2)
     for _ in range(5):
-        per_plane = torch.randn(2, 3, 1, 1, generator=generator)
-        shared.grad = per_plane.expand(2, 3, 4, 4).clone()
+        per_stage = torch.randn(2, 1, 1, 1, generator=generator)
+        shared.grad = per_stage.expand(2, 3, 4, 4).clone()
         cellwise.grad = shared.grad.clone()
         a.step()
         b.step()
         torch.testing.assert_close(shared, cellwise, rtol=1e-6, atol=1e-8)
 
 
+def test_shared_second_moment_is_one_scale_per_stage_across_components():
+    # Components of one stage with gradients of very different size share a
+    # denominator, so the update keeps the gradient's direction instead of
+    # inflating the weak components to the strong one's step.
+    param = torch.nn.Parameter(torch.zeros(1, 3, 4))
+    optimiser = LazyMomentAdamW([{
+        'params': [param], 'shared_second_moment': True,
+        'shared_second_moment_clip_quantile': None}], lr=0.1)
+    param.grad = torch.tensor([[[10.0] * 4, [1.0] * 4, [0.1] * 4]])
+    optimiser.step()
+    update = -param.detach()[0]
+    torch.testing.assert_close(update[0] / update[1], torch.full((4,), 10.0), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(update[1] / update[2], torch.full((4,), 10.0), rtol=1e-5, atol=1e-6)
+    stats = optimiser.conditioning_stats[param]
+    assert stats['scale'].shape == (1,)
+    assert stats['update_rms'].shape == (1, 3) and stats['update_count'].shape == (1, 3)
+    torch.testing.assert_close(stats['update_rms'][0], update.abs()[:, 0].double(), rtol=1e-6, atol=1e-9)
+    assert stats['update_count'].tolist() == [[4.0, 4.0, 4.0]]
+
+
+def test_shared_second_moment_winsorises_outlier_cells():
+    # One cell with a huge gradient: the plain mean would let it dominate the
+    # shared scale; the winsorised mean caps it at the quantile of the touched
+    # cells, so the other cells' step barely notices it.
+    param = torch.nn.Parameter(torch.zeros(1, 1, 200))
+    grad = torch.ones(1, 1, 200)
+    grad[0, 0, 7] = 1000.0
+    lr, beta2, eps = 0.1, 0.999, 1e-8
+    optimiser = LazyMomentAdamW([{
+        'params': [param], 'shared_second_moment': True,
+        'shared_second_moment_clip_quantile': 0.99}], lr=lr, eps=eps)
+    param.grad = grad.clone()
+    optimiser.step()
+    sq = grad ** 2 * (1 - beta2)
+    cap = torch.quantile(sq.flatten().double(), 0.99).float()
+    mean_sq = torch.minimum(sq, cap).mean()
+    denom = mean_sq.sqrt() / (1 - beta2) ** 0.5 + eps
+    expected = -lr * grad / denom
+    torch.testing.assert_close(param.detach(), expected, rtol=1e-5, atol=1e-7)
+    # Without the cap the outlier's 10^6 squared gradient shrinks every step
+    # by two orders of magnitude.
+    plain = torch.nn.Parameter(torch.zeros(1, 1, 200))
+    reference = LazyMomentAdamW([{
+        'params': [plain], 'shared_second_moment': True,
+        'shared_second_moment_clip_quantile': None}], lr=lr, eps=eps)
+    plain.grad = grad.clone()
+    reference.step()
+    assert float(plain.detach()[0, 0, 0].abs()) < 0.02 * float(param.detach()[0, 0, 0].abs())
+    # Untouched cells do not enter the statistic (or the count).
+    stats = optimiser.conditioning_stats[param]
+    assert stats['update_count'].tolist() == [[200.0]]
+
+
+def test_robust_clip_bounds_spikes_per_stage_and_reports_them():
+    grad = torch.zeros(2, 3, 50)
+    grad[0, 0] = 1.0
+    grad[0, 1, ::2] = -1.0
+    grad[0, 2, 5] = 500.0        # the spike, in a stage whose median |g| is 1
+    grad[1, 0] = 0.01           # a much smaller stage keeps its own median
+    grad[1, 1, 3] = 5.0
+    reference = grad.clone()
+    threshold, fraction = robust_clip_(grad, 10.0)
+    torch.testing.assert_close(threshold, torch.tensor([10.0, 0.1], dtype=torch.float64), rtol=1e-6, atol=0)
+    torch.testing.assert_close(grad[0, 2, 5], torch.tensor(10.0))
+    torch.testing.assert_close(grad[1, 1, 3], torch.tensor(0.1))
+    # Everything else, zeros included, is untouched.
+    mask = torch.ones_like(grad, dtype=torch.bool)
+    mask[0, 2, 5] = False
+    mask[1, 1, 3] = False
+    assert torch.equal(grad[mask], reference[mask])
+    torch.testing.assert_close(fraction, torch.tensor([1 / 150, 1 / 150], dtype=torch.float64))
+    # A stage with no gradient at all gets an infinite threshold and is left
+    # alone; a non-positive multiple is a no-op returning None.
+    empty = torch.zeros(1, 3, 8)
+    threshold, fraction = robust_clip_(empty, 10.0)
+    assert threshold.tolist() == [math.inf] and fraction.tolist() == [0.0]
+    untouched = torch.randn(1, 3, 8)
+    copy = untouched.clone()
+    assert robust_clip_(untouched, 0.0) is None and torch.equal(untouched, copy)
+
+
+def test_robust_clip_reads_a_fixed_stride_subsample():
+    # The median comes from a fixed-stride subsample, so a plane larger than
+    # the subsample target still gets the median of its (uniform) cells.
+    from lazy_moment_adamw import STATS_SUBSAMPLE
+    grad = torch.ones(1, 1, STATS_SUBSAMPLE * 3 + 17)
+    grad[0, 0, 100] = 1e6
+    threshold, _ = robust_clip_(grad, 4.0)
+    assert threshold.tolist() == [4.0]
+    assert float(grad.max()) == 4.0
+
+
 def test_shared_second_moment_on_a_vector_is_one_plane():
     param = torch.nn.Parameter(torch.zeros(6))
-    optimiser = LazyMomentAdamW([{'params': [param], 'shared_second_moment': True}], lr=0.1)
+    optimiser = LazyMomentAdamW([{
+        'params': [param], 'shared_second_moment': True,
+        'shared_second_moment_clip_quantile': None}], lr=0.1)
     param.grad = torch.tensor([1.0, 2.0, 3.0, 0.0, 0.0, 0.0])
     optimiser.step()
     # mean second moment over the three touched cells: (1 + 4 + 9) / 3 * (1 - beta2)
@@ -480,11 +597,22 @@ def test_new_optimizer_keys_are_run_boundary_and_off_by_default():
     assert fields[shared]['runtime_impact'] == 'run_boundary'
     assert defaults[shared] is False
     assert 'description' in fields[across] and 'description' in fields[shared]
-    # Both postdate durable checkpoints: a checkpoint without them loads as
-    # if they were off.
+    low_res = 'optimizer_flow_grad_smoothing_low_res_sigma_voxels'
+    quantile = 'optimizer_flow_shared_second_moment_clip_quantile'
+    clip = 'optimizer_flow_grad_clip_median_multiple'
+    for key, default in ((low_res, 0.0), (quantile, 0.99), (clip, 0.0)):
+        assert fields[key]['type'] == 'number'
+        assert fields[key]['runtime_impact'] == 'run_boundary'
+        assert defaults[key] == default
+        assert 'description' in fields[key]
+    # All postdate durable checkpoints: a checkpoint without them loads as
+    # if they were off (the quantile only matters with the shared moment on).
     from config import BACKFILLABLE_CONFIG_DEFAULTS
     assert BACKFILLABLE_CONFIG_DEFAULTS[across] == 0.0
     assert BACKFILLABLE_CONFIG_DEFAULTS[shared] is False
+    assert BACKFILLABLE_CONFIG_DEFAULTS[low_res] == 0.0
+    assert BACKFILLABLE_CONFIG_DEFAULTS[quantile] == 0.99
+    assert BACKFILLABLE_CONFIG_DEFAULTS[clip] == 0.0
 
 
 cuda = pytest.mark.skipif(

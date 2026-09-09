@@ -149,7 +149,10 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
     "optimizer_flow_lazy_moments": False,
     "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
     "optimizer_flow_shared_second_moment": False,
+    "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
+    "optimizer_flow_grad_clip_median_multiple": 0.0,
 })
 
 _GAP_EXPANDER_DESCRIPTIONS = {
@@ -188,13 +191,37 @@ _OPTIMIZER_DESCRIPTIONS = {
         "smoothing across rings of a cylindrical lattice, i.e. across "
         "windings; 0 leaves rings uncoupled. Ignored by a Cartesian lattice, "
         "whose smoothing is isotropic at the along-sheet width."),
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": (
+        "Along-sheet smoothing width (scroll voxels) for the low-resolution "
+        "flow lattice alone; 0 gives it the same physical width as the "
+        "high-resolution lattice. Its cells are six times wider, so the "
+        "shared width leaves it about one cell of smoothing; set this to "
+        "several of its cells (a few hundred voxels) to smooth the coarse "
+        "warp at its own scale. The across-ring width is not affected."),
     "optimizer_flow_shared_second_moment": (
         "Give the flow lattices' Adam step one second moment per flow stage "
-        "and vector component (the mean of the stored per-cell second "
-        "moments over the cells ever touched) instead of one per cell, so a "
-        "smoothed gradient's spatial profile survives into the update rather "
-        "than being flattened to its sign. The stored optimizer state is "
-        "unchanged, so the flag can be switched between runs."),
+        "(shared by every cell and vector component of the stage) instead "
+        "of one per cell, so a smoothed gradient's spatial profile and "
+        "direction survive into the update rather than being flattened to a "
+        "per-cell sign. The value is a winsorised mean of the stored "
+        "per-cell second moments over the cells ever touched (see "
+        "optimizer_flow_shared_second_moment_clip_quantile). The stored "
+        "optimizer state is unchanged, so the flag can be switched between "
+        "runs."),
+    "optimizer_flow_shared_second_moment_clip_quantile": (
+        "Quantile (of the touched cells, read from a fixed-stride subsample) "
+        "at which the per-cell second moments are capped before the shared "
+        "second moment averages them, so a few cells with persistently huge "
+        "gradients cannot shrink every other cell's step. 1 disables the cap "
+        "(plain mean)."),
+    "optimizer_flow_grad_clip_median_multiple": (
+        "Clip each flow lattice's gradient, per stage, at this multiple of "
+        "the median nonzero |gradient| of that stage (read from a "
+        "fixed-stride subsample), after the DDP all-reduce and before the "
+        "gradient smoothing and the optimizer moments. Bounds what a cell "
+        "with an unsatisfiable loss can do to its neighbours' smoothed "
+        "gradient and to the shared second moment. 0 disables clipping. "
+        "The threshold and clipped fraction are logged with the losses."),
     "optimizer_flow_lazy_moments": (
         "Lazy Adam moments for the flow lattices (torch SparseAdam's masked "
         "update on the dense gradient): cells no sample touched this step "
@@ -364,8 +391,11 @@ class Config:
         self.optimizer_flow_grad_smoothing = False
         self.optimizer_flow_grad_smoothing_sigma_voxels = 32.0
         self.optimizer_flow_grad_smoothing_across_sigma_voxels = 0.0
+        self.optimizer_flow_grad_smoothing_low_res_sigma_voxels = 0.0
         self.optimizer_flow_lazy_moments = False
         self.optimizer_flow_shared_second_moment = False
+        self.optimizer_flow_shared_second_moment_clip_quantile = 0.99
+        self.optimizer_flow_grad_clip_median_multiple = 0.0
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1
