@@ -326,6 +326,17 @@ def _get_streamable_tiff_metadata(
 _STREAMABLE_COMPRESSIONS = frozenset({1, 5, 8, 32773, 32946})
 
 
+# Memory budget for the streamed level-0 writer: the decode loop visits source
+# chunks in order and holds partially-filled destination blocks until every
+# chunk that can contribute to them has been consumed. This bounds how much is
+# resident at once; it does not affect correctness. A single source chunk that
+# exceeds the budget on its own is still decoded -- refusing would mean falling
+# back to the in-memory path this streaming path exists to avoid.
+_STREAM_DECODE_BUDGET_BYTES = int(
+    os.environ.get("VESUVIUS_STREAM_DECODE_BUDGET_BYTES", 1 << 30)
+)
+
+
 def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> None:
     """Stream a tiled OR striped TIFF's level-0 data into ``dataset``.
 
@@ -346,49 +357,111 @@ def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> No
             )
         image_height, image_width = _normalized_2d_shape(page.shape, input_path)
         tile_height, tile_width = page.chunks
-        _, tiles_across = page.chunked
-        for block_y, block_x, block_height, block_width in _iter_block_slices(
-            image_height, image_width
-        ):
-            block_YX = np.zeros((block_height, block_width), dtype=page.dtype)
-            tile_row_start = block_y // tile_height
-            tile_row_stop = (block_y + block_height + tile_height - 1) // tile_height
-            tile_col_start = block_x // tile_width
-            tile_col_stop = (block_x + block_width + tile_width - 1) // tile_width
-            for tile_row in range(tile_row_start, tile_row_stop):
-                for tile_col in range(tile_col_start, tile_col_stop):
-                    tile_index = tile_row * tiles_across + tile_col
-                    if tile_index >= len(page.dataoffsets):
-                        continue
-                    offset = page.dataoffsets[tile_index]
-                    bytecount = page.databytecounts[tile_index]
-                    tif.filehandle.seek(offset)
-                    data = tif.filehandle.read(bytecount)
-                    decoded, position, _ = page.decode(
-                        data, tile_index, jpegtables=page.jpegtables
-                    )
-                    if decoded is None:
-                        continue
-                    tile_YX = _decoded_block_to_2d(decoded, input_path)
-                    tile_y, tile_x = position[2], position[3]
-                    overlap_y0 = max(block_y, tile_y)
-                    overlap_y1 = min(block_y + block_height, tile_y + tile_YX.shape[0])
-                    overlap_x0 = max(block_x, tile_x)
-                    overlap_x1 = min(block_x + block_width, tile_x + tile_YX.shape[1])
-                    if overlap_y0 >= overlap_y1 or overlap_x0 >= overlap_x1:
-                        continue
-                    block_YX[
-                        overlap_y0 - block_y : overlap_y1 - block_y,
-                        overlap_x0 - block_x : overlap_x1 - block_x,
-                    ] = tile_YX[
-                        overlap_y0 - tile_y : overlap_y1 - tile_y,
-                        overlap_x0 - tile_x : overlap_x1 - tile_x,
-                    ]
+        tiles_down, tiles_across = page.chunked
+
+        # Destination blocks, keyed by (block_y, block_x). Each entry holds the
+        # partially-filled array and a count of source chunks still to come.
+        blocks: dict[tuple[int, int], np.ndarray] = {}
+        pending: dict[tuple[int, int], int] = {}
+
+        def _block_span(start: int, length: int, extent: int) -> range:
+            """Destination block origins covering [start, start+length)."""
+            first = (start // STREAM_BLOCK_SIZE) * STREAM_BLOCK_SIZE
+            stop = min(start + length, extent)
+            return range(first, stop, STREAM_BLOCK_SIZE)
+
+        # Count contributions per destination block up front, from the chunk
+        # grid alone -- no decoding required. A block is complete, and can be
+        # written and released, once its count reaches zero.
+        for tile_row in range(tiles_down):
+            tile_y = tile_row * tile_height
+            for tile_col in range(tiles_across):
+                tile_x = tile_col * tile_width
+                for by in _block_span(tile_y, tile_height, image_height):
+                    for bx in _block_span(tile_x, tile_width, image_width):
+                        pending[(by, bx)] = pending.get((by, bx), 0) + 1
+
+        resident_bytes = 0
+        itemsize = np.dtype(page.dtype).itemsize
+
+        def _flush(key: tuple[int, int]) -> int:
+            block_YX = blocks.pop(key)
+            by, bx = key
             dataset[
                 DEFAULT_LABEL_SLICE,
-                block_y : block_y + block_height,
-                block_x : block_x + block_width,
+                by : by + block_YX.shape[0],
+                bx : bx + block_YX.shape[1],
             ] = block_YX
+            return block_YX.nbytes
+
+        # Source-chunk-major: decode each chunk exactly once.
+        for tile_index in range(tiles_down * tiles_across):
+            if tile_index >= len(page.dataoffsets):
+                continue
+            bytecount = page.databytecounts[tile_index]
+            if bytecount == 0:
+                # Sparse TIFFs may record empty chunks; nothing to scatter, but
+                # the pending counts still have to be settled.
+                decoded = None
+            else:
+                tif.filehandle.seek(page.dataoffsets[tile_index])
+                data = tif.filehandle.read(bytecount)
+                decoded, position, _ = page.decode(
+                    data, tile_index, jpegtables=page.jpegtables
+                )
+
+            if decoded is None:
+                tile_row, tile_col = divmod(tile_index, tiles_across)
+                tile_y, tile_x = tile_row * tile_height, tile_col * tile_width
+                tile_h, tile_w = tile_height, tile_width
+                tile_YX = None
+            else:
+                tile_YX = _decoded_block_to_2d(decoded, input_path)
+                tile_y, tile_x = position[2], position[3]
+                tile_h, tile_w = tile_YX.shape
+
+            for by in _block_span(tile_y, tile_h, image_height):
+                bh = min(STREAM_BLOCK_SIZE, image_height - by)
+                for bx in _block_span(tile_x, tile_w, image_width):
+                    bw = min(STREAM_BLOCK_SIZE, image_width - bx)
+                    key = (by, bx)
+                    if key not in blocks:
+                        blocks[key] = np.zeros((bh, bw), dtype=page.dtype)
+                        resident_bytes += blocks[key].nbytes
+                    if tile_YX is not None:
+                        y0 = max(by, tile_y)
+                        y1 = min(by + bh, tile_y + tile_h)
+                        x0 = max(bx, tile_x)
+                        x1 = min(bx + bw, tile_x + tile_w)
+                        if y0 < y1 and x0 < x1:
+                            blocks[key][
+                                y0 - by : y1 - by, x0 - bx : x1 - bx
+                            ] = tile_YX[
+                                y0 - tile_y : y1 - tile_y, x0 - tile_x : x1 - tile_x
+                            ]
+                    pending[key] -= 1
+                    if pending[key] == 0:
+                        resident_bytes -= _flush(key)
+                        del pending[key]
+
+            # The budget bounds residency, not correctness: if holding this
+            # chunk's blocks pushed us over, write out whatever is complete
+            # first (there is normally nothing left, since blocks are flushed
+            # the moment their count reaches zero) and then the oldest
+            # partially-filled blocks, which will be re-read on their next
+            # contribution.
+            if resident_bytes > _STREAM_DECODE_BUDGET_BYTES:
+                for key in sorted(blocks):
+                    if resident_bytes <= _STREAM_DECODE_BUDGET_BYTES:
+                        break
+                    if pending.get(key, 0) > 0:
+                        continue
+                    resident_bytes -= _flush(key)
+
+        # Any block whose contributions were all skipped (missing offsets in a
+        # truncated file) is still zero-filled and must be written.
+        for key in sorted(blocks):
+            _flush(key)
 
 
 def _write_downsample_block(

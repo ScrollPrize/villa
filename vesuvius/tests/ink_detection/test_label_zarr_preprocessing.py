@@ -9,6 +9,9 @@ import pytest
 import tifffile
 import zarr
 
+from vesuvius.ink_detection.preprocessing import (
+    create_label_zarrs as create_label_zarrs_module,
+)
 from vesuvius.ink_detection.preprocessing.create_label_zarrs import (
     DEFAULT_LABEL_SLICE,
     _STREAMABLE_COMPRESSIONS,
@@ -317,6 +320,72 @@ def test_tiled_input_streams_regardless_of_page_count_and_codec(tmp_path):
     result = convert_image(zstd_path, levels=1)
     assert result["streamed_tiled_tiff"] == "true"
     group = zarr.open_group(zstd_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+@pytest.mark.parametrize(
+    "name,shape,layout",
+    [
+        ("whole_image_strip", (2049, 3073), {}),
+        ("strip_1024", (2049, 2051), {"rowsperstrip": 1024}),
+        ("tiled", (2048, 2048), {"tile": (256, 256)}),
+    ],
+)
+def test_streaming_decodes_each_source_chunk_exactly_once(
+    tmp_path, name, shape, layout
+):
+    """The streaming writer must not re-decode a source chunk.
+
+    Iterating destination blocks and decoding every intersecting source chunk
+    is correct but pathological for striped input: a strip spans the full
+    width, so it is decoded once per horizontal destination block. A default
+    uncompressed ``tifffile.imwrite`` writes ONE whole-image strip, which was
+    previously decoded once per destination block -- 12 times for the
+    2049x3073 case below, and 416 times for the 16125x25690 image in #1231.
+
+    This is invisible to a correctness test: the old code produced byte-exact
+    output while doing all that redundant work. Assert the decode count
+    directly instead.
+    """
+    label_path = tmp_path / f"segment-a_{name}_supervision_mask.tif"
+    height, width = shape
+    image_YX = (
+        np.arange(height * width, dtype=np.int64) % 251
+    ).reshape(height, width).astype(np.uint8)
+    tifffile.imwrite(label_path, image_YX, **layout)
+
+    with tifffile.TiffFile(label_path) as tif:
+        expected_decodes = tif.pages[0].chunked[0] * tif.pages[0].chunked[1]
+
+    calls = {"n": 0}
+    real_tifffile_open = tifffile.TiffFile
+
+    class _CountingTiffFile(real_tifffile_open):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            page = self.pages[0]
+            inner = page.decode  # materialise the cached_property
+
+            def _counting(*a, **k):
+                calls["n"] += 1
+                return inner(*a, **k)
+
+            page.__dict__["decode"] = _counting
+
+    monkey_target = create_label_zarrs_module.tifffile
+    monkey_target.TiffFile = _CountingTiffFile
+    try:
+        result = convert_image(label_path, levels=1)
+    finally:
+        monkey_target.TiffFile = real_tifffile_open
+
+    assert result["streamed_tiled_tiff"] == "true"
+    assert calls["n"] == expected_decodes, (
+        f"{name}: decoded {calls['n']} times for {expected_decodes} source "
+        f"chunks; each chunk must be decoded exactly once"
+    )
+
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
     np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
 
 
