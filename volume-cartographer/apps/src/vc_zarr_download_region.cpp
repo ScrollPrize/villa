@@ -1,6 +1,7 @@
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -243,7 +244,8 @@ int main(int argc, char** argv)
     po::options_description options("vc_zarr_download_region options");
     options.add_options()
         ("help,h", "Show help")
-        ("project", po::value<fs::path>(&projectPath)->required(), "VC3D project file (*.volpkg.json); supplies remote_cache_root")
+        ("project", po::value<fs::path>(&projectPath)->required(),
+         "VC3D project file (*.volpkg.json); used to resolve volume cache layout and auth")
         ("url", po::value<std::string>(&url)->required(), "HTTP/S3 OME-Zarr root or concrete array URL")
         ("dry-run,n", po::bool_switch(&dryRun), "Print the cache destination and uncompressed region size without downloading")
         ("level,l", po::value<int>(),
@@ -251,10 +253,14 @@ int main(int argc, char** argv)
          "Coordinates are at this level, or at the finest present level when omitted")
         ("zmin", po::value<int>(&requested.zMin)->required(), "Inclusive minimum Z voxel")
         ("zmax", po::value<int>(&requested.zMax)->required(), "Inclusive maximum Z voxel")
-        ("ymin", po::value<int>(&requested.yMin)->required(), "Inclusive minimum Y voxel")
-        ("ymax", po::value<int>(&requested.yMax)->required(), "Inclusive maximum Y voxel")
-        ("xmin", po::value<int>(&requested.xMin)->required(), "Inclusive minimum X voxel")
-        ("xmax", po::value<int>(&requested.xMax)->required(), "Inclusive maximum X voxel");
+        ("ymin", po::value<int>(&requested.yMin),
+         "Inclusive minimum Y voxel; omit to start at 0")
+        ("ymax", po::value<int>(&requested.yMax),
+         "Inclusive maximum Y voxel; omit to use the last voxel of the axis")
+        ("xmin", po::value<int>(&requested.xMin),
+         "Inclusive minimum X voxel; omit to start at 0")
+        ("xmax", po::value<int>(&requested.xMax),
+         "Inclusive maximum X voxel; omit to use the last voxel of the axis");
 
     try {
         po::variables_map parsed;
@@ -262,10 +268,11 @@ int main(int argc, char** argv)
         if (parsed.contains("help")) {
             std::cout
                 << "Usage: vc_zarr_download_region --project PROJECT --url URL "
-                   "[--level LEVEL] --zmin Z --zmax Z --ymin Y --ymax Y "
-                   "--xmin X --xmax X [--dry-run]\n\n"
+                   "[--level LEVEL] --zmin Z --zmax Z [--ymin Y] [--ymax Y] "
+                   "[--xmin X] [--xmax X] [--dry-run]\n\n"
                 << "Bounds are inclusive voxel coordinates at --level, or at the "
-                   "finest present level when --level is omitted.\n\n"
+                   "finest present level when --level is omitted. Omitted Y/X "
+                   "bounds default to the full extent of those axes.\n\n"
                 << options << '\n';
             return 0;
         }
@@ -277,7 +284,19 @@ int main(int argc, char** argv)
             if (*requestedLevel < 0)
                 throw std::invalid_argument("--level must be non-negative");
         }
-        validateBounds(requested);
+        if (requested.zMin < 0 ||
+            (parsed.contains("ymin") && requested.yMin < 0) ||
+            (parsed.contains("xmin") && requested.xMin < 0)) {
+            throw std::invalid_argument("minimum coordinates must be non-negative");
+        }
+        if (requested.zMax < requested.zMin ||
+            (parsed.contains("ymin") && parsed.contains("ymax") &&
+             requested.yMax < requested.yMin) ||
+            (parsed.contains("xmin") && parsed.contains("xmax") &&
+             requested.xMax < requested.xMin)) {
+            throw std::invalid_argument(
+                "each maximum coordinate must be greater than or equal to its minimum");
+        }
         if (!fs::is_regular_file(projectPath))
             throw std::invalid_argument(
                 "--project is not a file: " + projectPath.string());
@@ -288,12 +307,7 @@ int main(int argc, char** argv)
         if (!project)
             throw std::runtime_error("failed to load project: " + projectPath.string());
 
-        const fs::path configuredCacheRoot = project->remoteCacheRootOrEmpty();
-        if (configuredCacheRoot.empty()) {
-            throw std::runtime_error(
-                "the project has no remote_cache_root; configure its remote cache "
-                "directory in VC3D first");
-        }
+        const fs::path configuredCacheRoot = vc::settings::remoteCachePath();
 
         const auto spec = vc::parseRemoteVolumeSpec(url);
         const auto projectEntry = project->matchingVolumeEntry(url);
@@ -322,6 +336,18 @@ int main(int argc, char** argv)
             ? *requestedLevel
             : volume->firstPresentScaleLevel();
         const auto coordinateShape = volume->shape(coordinateLevel);
+        if (coordinateShape[1] <= 0 || coordinateShape[2] <= 0) {
+            throw std::runtime_error("volume has an empty Y or X extent");
+        }
+        if (!parsed.contains("ymin"))
+            requested.yMin = 0;
+        if (!parsed.contains("ymax"))
+            requested.yMax = coordinateShape[1] - 1;
+        if (!parsed.contains("xmin"))
+            requested.xMin = 0;
+        if (!parsed.contains("xmax"))
+            requested.xMax = coordinateShape[2] - 1;
+        validateBounds(requested);
         const auto bytesPerVoxel = volume->dtypeSize();
 
         std::vector<vc::render::ChunkKey> keys;
