@@ -20,7 +20,7 @@ _ENUMS = {
     "dense_spacing_density_lambda": [
         "inverse_gap", "soft_mass", "soft_mass_wide"],
     "optimizer_flow_sobolev_curvature": ["none", "finite_difference", "gauss_newton"],
-    "loss_penalty_shape": ["abs", "square"],
+    "loss_penalty_shape": ["abs", "square", "huber"],
     "optimizer_flow_sobolev_preconditioner": ["cg", "gaussian"],
 }
 
@@ -163,6 +163,7 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
 BACKFILLABLE_CONFIG_DEFAULTS.update({
     "loss_penalty_shape": "abs",
     "loss_square_scale_voxels": 16.0,
+    "loss_huber_delta_voxels": 6.0,
 })
 # The Sobolev-damped Hessian-free flow step (sobolev_gauss_newton.py) also
 # postdates durable checkpoints; missing means the AdamW flow update.
@@ -215,8 +216,15 @@ _OPTIMIZER_DESCRIPTIONS = {
         "curvature). 'square' uses magnitude^2 / (2 * loss_square_scale_"
         "voxels): constant Gauss-Newton weights and a smooth minimum, but "
         "outliers gain quadratic influence and family weights tuned for 'abs' "
-        "are only a starting point. The shell term drops its Huber form for "
-        "'square'. DT and relative-winding terms are unchanged."),
+        "are only a starting point. 'huber' is quadratic below "
+        "loss_huber_delta_voxels and L1 beyond: robust to outliers, smooth "
+        "and curvature-bearing inside the tolerance. The shell term keeps "
+        "its own Huber (shell_huber_delta) only for 'abs'. DT and "
+        "relative-winding terms are unchanged."),
+    "loss_huber_delta_voxels": (
+        "Transition d of the 'huber' penalty, in voxels: quadratic below, "
+        "linear above. The default sits near the satisfaction tolerance "
+        "(0.45 winding gaps in radius, 6 voxels in scan distance)."),
     "loss_square_scale_voxels": (
         "Voxel scale s of the 'square' penalty magnitude^2 / (2 s): keeps the "
         "loss in voxel units and matches the abs penalty at 2 s."),
@@ -572,6 +580,7 @@ class Config:
         # Penalty shape of the residual losses (see _OPTIMIZER_DESCRIPTIONS).
         self.loss_penalty_shape = "abs"
         self.loss_square_scale_voxels = 16.0
+        self.loss_huber_delta_voxels = 6.0
         # Sobolev-damped Hessian-free flow step (prototype, off by default;
         # see _OPTIMIZER_DESCRIPTIONS and sobolev_gauss_newton.py).
         self.optimizer_flow_sobolev_gn = False

@@ -1278,12 +1278,18 @@ def test_penalty_shape_defaults_to_abs_and_square_keeps_voxel_units():
     square = penalty(magnitude, {'loss_penalty_shape': 'square', 'loss_square_scale_voxels': 16.0})
     torch.testing.assert_close(square, magnitude ** 2 / 32.0)
     assert float(square[2]) == pytest.approx(32.0)  # equals abs at 2 s
+    huber = penalty(magnitude, {'loss_penalty_shape': 'huber', 'loss_huber_delta_voxels': 6.0})
+    torch.testing.assert_close(huber, torch.tensor([0.0, 8.0 - 3.0, 32.0 - 3.0, 100.0 - 3.0]))
+    inside = penalty(torch.tensor([3.0]), {'loss_penalty_shape': 'huber', 'loss_huber_delta_voxels': 6.0})
+    assert float(inside[0]) == pytest.approx(9.0 / 12.0)
     with pytest.raises(ValueError):
         penalty(magnitude, {'loss_penalty_shape': 'cubic'})
     fields = Config.catalog()['schema']['fields']
     defaults = Config().as_dict()
     assert fields['loss_penalty_shape']['type'] == 'enum'
-    assert fields['loss_penalty_shape']['values'] == ['abs', 'square']
+    assert fields['loss_penalty_shape']['values'] == ['abs', 'square', 'huber']
+    assert defaults['loss_huber_delta_voxels'] == 6.0
+    assert BACKFILLABLE_CONFIG_DEFAULTS['loss_huber_delta_voxels'] == 6.0
     assert fields['loss_penalty_shape']['runtime_impact'] == 'run_boundary'
     assert defaults['loss_penalty_shape'] == 'abs' and BACKFILLABLE_CONFIG_DEFAULTS['loss_penalty_shape'] == 'abs'
     assert defaults['loss_square_scale_voxels'] == 16.0

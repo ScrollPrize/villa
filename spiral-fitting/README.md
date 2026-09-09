@@ -375,6 +375,33 @@ penalty spends its effort pulling in the far outliers. Squared penalties with
 Gauss-Newton were also worse than AdamW when warm-started (above). `abs`
 remains the default; the switch is kept for experiments and is backfilled.
 
+`loss_penalty_shape = "huber"` (quadratic below `loss_huber_delta_voxels`,
+L1 beyond; default δ 6 voxels, near the satisfaction tolerance) was the
+remaining candidate: robust to outliers, smooth and curvature-bearing exactly
+where points are pulled inside the tolerance. Over a longer warm-start window
+(1500 → 2500 steps from the same checkpoint, satisfied area 45.6% at the
+start):
+
+| Warm 1500 → 2500 | satisfied area | PCL points |
+|---|---|---|
+| AdamW, abs | 50.3% | 54.3% |
+| AdamW, Huber δ 6 | 48.9% | 54.0% |
+| Sobolev gradient step, Huber δ 6 | 45.2% | 44.2% |
+| Gauss-Newton, Huber δ 6 | 45.4% | 44.2% |
+
+Huber with AdamW is at parity with abs within run-to-run noise (a point or
+two), so it is a safe alternative but not an improvement. With the flow
+lattices stepped by the Sobolev or Gauss-Newton solver the fit did not
+advance at all in 1000 steps, while AdamW gained 5 points. The curvature term
+stayed at 1 to 2 percent of the model because most residuals that carry
+gradient lie beyond δ, in the L1 regime, and the damping sat at its ceiling
+because even small smoothed steps (Sobolev norm 0.2 to 0.3) raised the
+same-batch loss by 100 to 600 on a third of the probes. The likely reading is
+that this loss is reduced by cell-local flow changes, which per-cell Adam
+scaling follows and a Sobolev-smoothed direction (length 32 voxels, two fine
+cells) suppresses; a shorter length or the unsmoothed metric `A = I` would be
+the test of that, and is left open.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same

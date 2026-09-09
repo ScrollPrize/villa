@@ -754,6 +754,12 @@ def penalty(magnitude, cfg):
       tuned for 'abs' are a reasonable starting point but not equivalent.
       Squared penalties give the Gauss-Newton operator constant residual
       weights instead of 1/|r|, at the cost of L1's outlier robustness.
+    * ``'huber'``: quadratic ``magnitude ** 2 / (2 d)`` below ``d`` =
+      ``cfg['loss_huber_delta_voxels']`` and ``magnitude - d / 2`` beyond,
+      so the penalty is L1 (robust, median-like) for gross residuals and
+      smooth with constant Gauss-Newton weight ``1 / d`` inside ``d``; set
+      ``d`` near the satisfaction tolerance so curvature is informative
+      exactly where points are being pulled inside it.
 
     Applied after any hinge margin, so ``relu(|d| - m)`` becomes
     ``penalty(relu(|d| - m), cfg)``. Losses that raise the magnitude to a
@@ -765,7 +771,10 @@ def penalty(magnitude, cfg):
     if shape == 'square':
         scale = float(cfg.get('loss_square_scale_voxels', 16.0) or 16.0)
         return magnitude * magnitude / (2.0 * scale)
-    raise ValueError(f"loss_penalty_shape must be 'abs' or 'square', got {shape!r}")
+    if shape == 'huber':
+        delta = float(cfg.get('loss_huber_delta_voxels', 6.0) or 6.0)
+        return _huber_abs(magnitude, delta)
+    raise ValueError(f"loss_penalty_shape must be 'abs', 'square' or 'huber', got {shape!r}")
 
 
 def _get_patch_valid_points(patch, device, z_begin, z_end, max_points=None, fixed_num_points=None):
