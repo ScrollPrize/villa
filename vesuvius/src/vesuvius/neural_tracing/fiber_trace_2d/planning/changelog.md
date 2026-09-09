@@ -507,3 +507,14 @@
 - Added reusable actual-distribution blur benchmarks and focused CPU/CUDA
   regression coverage. The final two-H100 path measured 88.487 samples/s versus
   the 95.708 samples/s model-only ceiling.
+
+## 2026-09-09 — Fiber3D LR and gradient diagnostics
+
+- Added exact optimizer-global-batch microbatching, linear warmup, a
+  fresh-initialization exponential LR-range mode, and opt-in pre-clip global L2
+  gradient measurement/clipping with console, JSONL, and TensorBoard logging.
+- Added a one-command tuning suite that derives and runs matched fixed-LR and
+  clipping trials, then emits consolidated JSON and Markdown for manual review.
+- Tuned the S1a target global batch 128 on six available H100s. Fixed-run
+  verification selected peak LR 0.01 with 100 warmup updates and rejected
+  clipping at a threshold slightly above the observed p99 norm.

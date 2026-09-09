@@ -84,6 +84,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
     DistributedSampleIndex,
+    VirtualBatchSampleIndex,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     FiberTrace3DModelConfig,
@@ -153,16 +154,158 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     trace_native_3d_whole_fiber,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _LrRangeTestConfig,
     _TrainingHangDiagnostics,
     _batch_tensor_sha256,
     _diagnostic_cuda_synchronize,
     _autocast_context,
     _conditioned_perpendicular_queries,
+    _linear_warmup_learning_rate,
+    _lr_range_learning_rate,
+    _measure_and_clip_gradient_norm,
+    _optimizer_microbatch_takes,
+    _optimizer_microbatch_loss_scale,
+    _optimizer_virtual_world_size,
+    _optimizer_learning_rate_scales,
+    _set_optimizer_learning_rate,
     _safe_probability_bce,
     _source_batch_tensor_sha256,
     compute_conditioned_losses,
     compute_losses,
 )
+
+
+def test_lr_range_schedule_has_exact_warmup_and_range_endpoints() -> None:
+    config = _LrRangeTestConfig(
+        warmup_steps=100,
+        range_steps=1000,
+        start_lr=1.0e-4,
+        end_lr=1.0,
+    )
+
+    assert _lr_range_learning_rate(config, 1) == pytest.approx(1.0e-6)
+    assert _lr_range_learning_rate(config, 100) == pytest.approx(1.0e-4)
+    assert _lr_range_learning_rate(config, 101) == pytest.approx(1.0e-4)
+    assert _lr_range_learning_rate(config, 1100) == pytest.approx(1.0)
+
+
+def test_lr_range_schedule_without_warmup_starts_at_start_lr() -> None:
+    config = _LrRangeTestConfig(
+        warmup_steps=0,
+        range_steps=3,
+        start_lr=1.0e-3,
+        end_lr=1.0e-1,
+    )
+
+    assert _lr_range_learning_rate(config, 1) == pytest.approx(1.0e-3)
+    assert _lr_range_learning_rate(config, 3) == pytest.approx(1.0e-1)
+
+
+def test_linear_warmup_reaches_and_holds_peak() -> None:
+    assert _linear_warmup_learning_rate(0.01, step=1, warmup_steps=100) == pytest.approx(1.0e-4)
+    assert _linear_warmup_learning_rate(0.01, step=100, warmup_steps=100) == pytest.approx(0.01)
+    assert _linear_warmup_learning_rate(0.01, step=101, warmup_steps=100) == pytest.approx(0.01)
+
+
+def test_optimizer_lr_update_preserves_group_ratios() -> None:
+    first = torch.nn.Parameter(torch.ones(()))
+    second = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW(
+        [{"params": [first], "lr": 0.01}, {"params": [second], "lr": 0.001}]
+    )
+
+    scales = _optimizer_learning_rate_scales(optimizer)
+    _set_optimizer_learning_rate(optimizer, 0.02, group_scales=scales)
+
+    assert scales == pytest.approx((1.0, 0.1))
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [0.02, 0.002]
+    )
+
+
+def test_gradient_norm_measurement_and_clipping_return_preclip_norm() -> None:
+    model = torch.nn.Linear(1, 2, bias=False)
+    model.weight.grad = torch.tensor([[3.0], [4.0]])
+
+    measured = _measure_and_clip_gradient_norm(model, max_norm=None)
+    assert float(measured) == pytest.approx(5.0)
+    assert model.weight.grad.flatten().tolist() == pytest.approx([3.0, 4.0])
+
+    clipped = _measure_and_clip_gradient_norm(model, max_norm=2.0)
+    assert float(clipped) == pytest.approx(5.0)
+    assert model.weight.grad.flatten().tolist() == pytest.approx([1.2, 1.6])
+
+
+def test_optimizer_microbatch_takes_represent_exact_batch_128_on_six_ranks() -> None:
+    takes = [
+        _optimizer_microbatch_takes(
+            local_batch_size=16,
+            world_size=6,
+            rank=rank,
+            optimizer_global_batch_size=128,
+        )
+        for rank in range(6)
+    ]
+
+    assert takes == [
+        (16, 16),
+        (16, 16),
+        (16,),
+        (16,),
+        (16,),
+        (16,),
+    ]
+    assert sum(sum(rank_takes) for rank_takes in takes) == 128
+    scales = [
+        _optimizer_microbatch_loss_scale(
+            take=take,
+            world_size=6,
+            optimizer_global_batch_size=128,
+        )
+        for rank_takes in takes
+        for take in rank_takes
+    ]
+    # DDP averages the accumulated local gradients across six ranks.
+    assert sum(scales) / 6.0 == pytest.approx(1.0)
+
+
+def test_optimizer_virtual_world_requires_full_logical_batches() -> None:
+    assert _optimizer_virtual_world_size(
+        local_batch_size=16,
+        physical_world_size=6,
+        optimizer_global_batch_size=128,
+    ) == 8
+    with pytest.raises(ValueError, match="divisible by the local batch"):
+        _optimizer_virtual_world_size(
+            local_batch_size=16,
+            physical_world_size=6,
+            optimizer_global_batch_size=127,
+        )
+
+
+def test_virtual_batch_sample_index_matches_eight_rank_stream_on_six_ranks() -> None:
+    rank0 = VirtualBatchSampleIndex(
+        batch_size=16,
+        physical_world_size=6,
+        rank=0,
+        virtual_world_size=8,
+    )
+    rank1 = VirtualBatchSampleIndex(
+        batch_size=16,
+        physical_world_size=6,
+        rank=1,
+        virtual_world_size=8,
+    )
+    rank5 = VirtualBatchSampleIndex(
+        batch_size=16,
+        physical_world_size=6,
+        rank=5,
+        virtual_world_size=8,
+    )
+
+    assert [rank0(index) for index in (0, 15, 16, 31, 32)] == [0, 15, 96, 111, 128]
+    assert [rank1(index) for index in (0, 15, 16, 31, 32)] == [16, 31, 112, 127, 144]
+    assert [rank5(index) for index in (0, 15, 16)] == [80, 95, 208]
 
 
 def _run_hang_diagnostics_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:

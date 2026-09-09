@@ -62,6 +62,56 @@ class DistributedSampleIndex:
 
 
 @dataclass(frozen=True)
+class VirtualBatchSampleIndex:
+    """Map physical-rank work onto full logical rank-local batches."""
+
+    batch_size: int
+    physical_world_size: int
+    rank: int
+    virtual_world_size: int
+    start_step: int = 0
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0 or self.physical_world_size <= 0:
+            raise ValueError("batch_size and physical_world_size must be positive")
+        if self.virtual_world_size < self.physical_world_size:
+            raise ValueError(
+                "virtual_world_size must be at least physical_world_size"
+            )
+        if not 0 <= self.rank < self.physical_world_size:
+            raise ValueError("rank must be in [0, physical_world_size)")
+        if self.start_step < 0:
+            raise ValueError("start_step must be nonnegative")
+
+    @property
+    def local_batches_per_step(self) -> int:
+        return (
+            int(self.virtual_world_size)
+            - int(self.rank)
+            + int(self.physical_world_size)
+            - 1
+        ) // int(self.physical_world_size)
+
+    def __call__(self, index: int) -> int:
+        local_batch, offset = divmod(int(index), int(self.batch_size))
+        optimizer_step, local_batch_in_step = divmod(
+            local_batch,
+            self.local_batches_per_step,
+        )
+        virtual_rank = (
+            int(self.rank)
+            + local_batch_in_step * int(self.physical_world_size)
+        )
+        if virtual_rank >= int(self.virtual_world_size):
+            raise RuntimeError("virtual batch mapping produced an invalid rank")
+        global_batch = (
+            (int(self.start_step) + optimizer_step) * int(self.virtual_world_size)
+            + virtual_rank
+        )
+        return global_batch * int(self.batch_size) + offset
+
+
+@dataclass(frozen=True)
 class FiberTrace3DLoadOperation:
     loader: FiberTrace3DLoader
     sample_index_limit: int | None

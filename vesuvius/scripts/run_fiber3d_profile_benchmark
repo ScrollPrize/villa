@@ -16,7 +16,6 @@ while IFS= read -r argument || [[ -n "${argument}" ]]; do
 done < "${request_file}"
 
 export AGENTS_AGENT_MODE=1
-export CUDA_VISIBLE_DEVICES=0,1
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export PYTHONPATH="${villa_root}/vesuvius${PYTHONPATH:+:${PYTHONPATH}}"

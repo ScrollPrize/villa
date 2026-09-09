@@ -522,3 +522,57 @@ Artifacts:
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_scalar_sync_control_20260909_062357_589452`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_062615_301653`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_062808_605523`
+
+## Exact-batch LR range and clipping, 2026-09-09
+
+Peak LR and clipping were tuned from random initialization with the historical
+S1a NML data/configuration, BF16, GroupNorm, output stride 4, and local
+microbatch 16. Physical GPUs `0,1,4,5,6,7` represented the target eight-GPU
+global batch of 128 as eight full logical batches. Physical ranks 0 and 1 each
+processed two logical batches; the remaining ranks each processed one. Every
+backward suppressed automatic DDP synchronization; losses were scaled by 6/8,
+then accumulated gradients were summed and divided by six once per update.
+This preserves the batch-local, data-dependent loss denominators used by a real
+eight-rank run. Its roughly 172--175 samples/s fixed-run throughput is limited
+by the uneven emulation and is not expected production eight-GPU throughput.
+
+The automated suite used 100 linear warmup updates and 600 exponential range
+updates from 0.001 through 3.0. Its bias-corrected EMA loss minimum was at LR
+0.08125 and the 4x-minimum divergence point was LR 1.558. Pre-clip global L2
+gradient norms in usable range rows were median 0.652, p95 2.002, p99 2.780,
+and max 3.905. The saved curve and analysis are:
+
+- `/ephemeral/hendrik/fiber3d_train2/tuning_suite_20260909_091325_561949/tuning_report.md`
+- `/ephemeral/hendrik/fiber3d_train2/tuning_suite_20260909_091325_561949/tuning_report.json`
+- `/ephemeral/hendrik/fiber3d_train2/tuning_suite_20260909_091325_561949/profile_6gpu_off_group_os4_b16_sample_pipeline_async_batch_gpu_all_lr_range_20260909_091327_101834/lr_range.png`
+
+Short fixed-peak verification used the unchanged held-out S1a test set, 100
+warmup updates, and 200 total updates:
+
+| Peak LR | Clip L2 | Clipped updates | Test loss at 200 |
+| ---: | ---: | ---: | ---: |
+| 0.01 | disabled | 0 | **1.431982** |
+| 0.027082 | disabled | 0 | 1.659746 |
+| 0.081246 | disabled | 0 | 1.683198 |
+| 0.155841 | disabled | 0 | 1.766804 |
+| 0.01 | 2.8 | 3 | 1.432956 |
+
+The recommendation for the next eight-GPU 16-sample/GPU run is therefore
+peak LR **0.01**, **100 warmup updates**, and **clipping disabled**. The tested
+threshold of 2.8 is the rounded-up scan p99; it clipped only three of 200
+updates and did not improve the matched held-out result. The LR-range minimum
+alone was not a safe constant peak.
+
+The reusable command reads
+`vesuvius/scripts/fiber3d_profile_benchmark.args`:
+
+```bash
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+With `--tuning-suite`, that one invocation performs the range scan, derives a
+small fixed-LR candidate set from the historical LR, range minimum, and
+divergence point, runs every candidate from the same initialization/sample
+stream, and runs one p99-derived clipping comparison at the best unclipped LR.
+It emits consolidated JSON and Markdown reports but deliberately does not make
+the final configuration choice automatically.

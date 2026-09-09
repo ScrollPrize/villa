@@ -1883,6 +1883,30 @@ Training keys:
   the unbounded `stream_index`, so the subset is deterministic but its
   augmentations and branch-grid offsets keep changing across repeats.
 - `learning_rate`: AdamW learning rate.
+- `learning_rate_warmup_steps`: optional number of one-indexed linear warmup
+  updates. Step 1 uses `learning_rate / learning_rate_warmup_steps`, the last
+  warmup update reaches `learning_rate`, and later updates retain it.
+- `optimizer_global_batch_size`: optional exact number of samples represented
+  by one optimizer update. It defaults to `batch_size * DDP world size`. When
+  larger, it must be an integer multiple of `batch_size`. The trainer models
+  that many full logical rank-local batches, assigns them cyclically to the
+  physical ranks, suppresses automatic DDP reductions, and manually averages
+  the accumulated gradients once per update. This preserves batch-local loss
+  denominators while supporting exact batch-size experiments on fewer physical
+  ranks without increasing per-GPU memory. Because ranks may execute different
+  numbers of forwards, this mode requires the shared sample pipeline, stateless
+  normalization such as GroupNorm, and `ddp_broadcast_buffers: false`.
+- `gradient_norm_log_interval`: optional interval for measuring the global L2
+  norm after DDP has averaged gradients and before clipping. Zero disables
+  measurement unless clipping is enabled. FP16 gradients are unscaled once
+  before measurement; BF16 uses no gradient scaler.
+- `gradient_clip_max_norm`: optional global L2 clipping threshold. Missing or
+  zero disables clipping. The logged norm is always the pre-clip norm.
+- `lr_range_test`: opt-in fresh-initialization diagnostic object containing
+  `warmup_steps`, `range_steps`, `start_lr`, and `end_lr`. It linearly warms to
+  `start_lr`, then exponentially spans both exact endpoints. Its required
+  `max_steps` is `warmup_steps + range_steps`; it cannot be resumed or combined
+  with `learning_rate_warmup_steps`.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.
 - `checkpoint_interval`: interval for writing `snapshots/current.pt`.
@@ -2547,15 +2571,23 @@ DDP training model; evaluation and snapshots use the raw model. An optional
 training.initialization_seed gives paired experiments the same initialization.
 No training sampling, loss, precision, or checkpoint policy is changed.
 
-fiber_trace_3d.profile_experiment launches an isolated normal two-rank torchrun
-using its current Python interpreter. Required --reference is the saved audit
-JSON containing config, and --output is a new experiments root. It pins physical
-GPUs 0,1, batch 8/rank, BF16 and saved LR, sets scalar logging every step, and
-records generated config, launch metadata, run.log and per-rank artifacts.
-Defaults: --steps 120, --compile-mode off, --trace-steps 5. Native thread pools
-are limited before launching processes. Shared input cache remains unchanged
-in config; logs/output/compiler caches live under --output. These are batch-16
-tooling experiments, not batch-64 convergence comparisons.
+fiber_trace_3d.profile_experiment launches an isolated torchrun using its
+current Python interpreter. Required --reference is the saved audit JSON
+containing config, and --output is a new experiments root. `--devices` selects
+physical GPUs, while batch size and optional optimizer-global-batch emulation
+are explicit. It records generated config, launch metadata, run.log and
+per-rank artifacts. Defaults: --steps 120, --compile-mode off, --trace-steps 5.
+Native thread pools are limited before launching processes. Shared input cache
+remains unchanged in config; logs/output/compiler caches live under --output.
+
+The opt-in `--tuning-suite` mode orchestrates a complete fresh-initialization
+LR/clipping study. It first runs the configured exponential range, derives
+fixed candidates from the reference LR, EMA minimum, and divergence point,
+runs matched held-out trials, then runs one rounded-p99 clip comparison at the
+best unclipped LR. All children use the same initialization and deterministic
+sample stream. The suite writes `tuning_report.json` and `tuning_report.md`; it
+records which unclipped result selected the clipping comparison but leaves the
+final configuration decision manual.
 
 ## Bounded per-sample load/augmentation benchmark
 

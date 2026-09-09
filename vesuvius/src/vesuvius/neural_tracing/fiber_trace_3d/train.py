@@ -38,9 +38,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     load_config,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
-    DistributedSampleIndex,
     FiberTrace3DCudaBatchPipeline,
     FiberTrace3DTrainingBatchPipeline,
+    VirtualBatchSampleIndex,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
@@ -97,6 +97,14 @@ class _MixedPrecisionConfig:
     device_type: str
     dtype: torch.dtype | None
     use_grad_scaler: bool
+
+
+@dataclass(frozen=True)
+class _LrRangeTestConfig:
+    warmup_steps: int
+    range_steps: int
+    start_lr: float
+    end_lr: float
 
 
 @dataclass(frozen=True)
@@ -2427,14 +2435,16 @@ def run_training(
             grad_scaler=grad_scaler,
             map_location=device,
         )
+    optimizer_lr_group_scales = _optimizer_learning_rate_scales(optimizer)
 
     ddp_broadcast_buffers = training.get("ddp_broadcast_buffers", True)
+    distributed_model = _wrap_distributed_model(
+        raw_model,
+        distributed,
+        broadcast_buffers=ddp_broadcast_buffers,
+    )
     train_model = compile_training_model(
-        _wrap_distributed_model(
-            raw_model,
-            distributed,
-            broadcast_buffers=ddp_broadcast_buffers,
-        ),
+        distributed_model,
         str(training.get("compile_mode", "off")),
     )
     run_datestr = str(
@@ -2554,13 +2564,67 @@ def run_training(
             f"max_steps={max_steps} checkpoint_step={start_step}"
         )
     sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
+    optimizer_global_batch_size = int(
+        training.get(
+            "optimizer_global_batch_size",
+            loader.config.batch_size * distributed.world_size,
+        )
+    )
+    optimizer_virtual_world_size = _optimizer_virtual_world_size(
+        local_batch_size=loader.config.batch_size,
+        physical_world_size=distributed.world_size,
+        optimizer_global_batch_size=optimizer_global_batch_size,
+    )
+    optimizer_microbatch_takes = _optimizer_microbatch_takes(
+        local_batch_size=loader.config.batch_size,
+        world_size=distributed.world_size,
+        rank=distributed.rank,
+        optimizer_global_batch_size=optimizer_global_batch_size,
+    )
+    optimizer_microbatch_count = len(optimizer_microbatch_takes)
+    manual_gradient_sync = optimizer_virtual_world_size != distributed.world_size
+    if manual_gradient_sync and ddp_broadcast_buffers:
+        raise ValueError(
+            "optimizer_global_batch_size simulation requires "
+            "training.ddp_broadcast_buffers=false because physical ranks may "
+            "execute different numbers of logical batches"
+        )
+    if manual_gradient_sync and (
+        int(normalization_module_counts.get("BatchNorm3d", 0)) > 0
+        or int(normalization_module_counts.get("SyncBatchNorm", 0)) > 0
+    ):
+        raise ValueError(
+            "optimizer_global_batch_size simulation requires stateless "
+            "normalization such as GroupNorm"
+        )
+    if (profile_replay_batch or profile_replay_cpu_batch) and optimizer_microbatch_count != 1:
+        raise ValueError("profile replay modes do not support optimizer microbatching")
     scalar_interval = int(training.get("scalar_log_interval", 100))
     initial_scalar_log_steps = int(training.get("initial_scalar_log_steps", 100))
+    gradient_norm_interval = int(training.get("gradient_norm_log_interval", 0))
+    gradient_clip_raw = training.get("gradient_clip_max_norm")
+    gradient_clip_max_norm = (
+        None
+        if gradient_clip_raw is None or float(gradient_clip_raw) == 0.0
+        else float(gradient_clip_raw)
+    )
+    lr_range_test = _lr_range_test_config(training)
+    learning_rate_warmup_steps = int(
+        training.get("learning_rate_warmup_steps", 0)
+    )
     force_scalar_reduce = training.get("profile_force_scalar_reduce_every_step", False)
     if scalar_interval <= 0:
         raise ValueError("training.scalar_log_interval must be > 0")
     if initial_scalar_log_steps < 0:
         raise ValueError("training.initial_scalar_log_steps must be >= 0")
+    if gradient_norm_interval < 0:
+        raise ValueError("training.gradient_norm_log_interval must be >= 0")
+    if learning_rate_warmup_steps < 0:
+        raise ValueError("training.learning_rate_warmup_steps must be >= 0")
+    if gradient_clip_max_norm is not None and (
+        not math.isfinite(gradient_clip_max_norm) or gradient_clip_max_norm <= 0.0
+    ):
+        raise ValueError("training.gradient_clip_max_norm must be finite and positive")
     if not isinstance(force_scalar_reduce, bool):
         raise ValueError(
             "training.profile_force_scalar_reduce_every_step must be a JSON boolean"
@@ -2585,6 +2649,20 @@ def run_training(
     )
     if sample_vis_count <= 0:
         raise ValueError("training.sample_vis_count must be > 0")
+    if lr_range_test is not None:
+        expected_steps = lr_range_test.warmup_steps + lr_range_test.range_steps
+        if int(start_step) != 0:
+            raise ValueError("training.lr_range_test requires fresh initialization")
+        if max_steps != expected_steps:
+            raise ValueError(
+                "training.max_steps must equal lr_range_test warmup_steps + "
+                f"range_steps ({expected_steps})"
+            )
+        if learning_rate_warmup_steps:
+            raise ValueError(
+                "training.learning_rate_warmup_steps cannot be combined with "
+                "training.lr_range_test"
+            )
     test_sample_vis_interval = int(
         training.get(
             "test_sample_vis_interval",
@@ -2632,7 +2710,9 @@ def run_training(
         print(
             "fiber_trace_3d train: "
             f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
-            f"global_batch_size={loader.config.batch_size * distributed.world_size} "
+            f"global_batch_size={optimizer_global_batch_size} "
+            f"virtual_world_size={optimizer_virtual_world_size} "
+            f"rank0_microbatches_per_update={math.ceil(optimizer_virtual_world_size / distributed.world_size)} "
             f"max_sample_index={sample_index_limit} "
             f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
             f"ddp_enabled={distributed.enabled} ddp_world_size={distributed.world_size} "
@@ -2824,9 +2904,20 @@ def run_training(
 
     remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
     pipeline_batch_count = (
-        1 if profile_replay_batch or profile_replay_cpu_batch else remaining_steps
+        1
+        if profile_replay_batch or profile_replay_cpu_batch
+        else (
+            None
+            if remaining_steps is None
+            else remaining_steps * optimizer_microbatch_count
+        )
     )
     sample_pipeline_workers = _training_sample_pipeline_workers(training)
+    if manual_gradient_sync and sample_pipeline_workers <= 0:
+        raise ValueError(
+            "optimizer_global_batch_size simulation requires "
+            "training.sample_pipeline_workers > 0"
+        )
     if sample_pipeline_workers > 0 and (
         pipeline_batch_count is None or int(pipeline_batch_count) > 0
     ):
@@ -2868,14 +2959,16 @@ def run_training(
             raise ValueError(
                 "sample_pipeline_slots partition must be a positive multiple of batch_size"
             )
+        training_sample_index_map = VirtualBatchSampleIndex(
+            batch_size=loader.config.batch_size,
+            physical_world_size=distributed.world_size,
+            rank=distributed.rank,
+            virtual_world_size=optimizer_virtual_world_size,
+            start_step=int(start_step),
+        )
         train_iterator = FiberTrace3DTrainingBatchPipeline(
             config_path=str(Path(config_path).resolve()),
-            index_map=DistributedSampleIndex(
-                batch_size=loader.config.batch_size,
-                world_size=distributed.world_size,
-                rank=distributed.rank,
-                start_step=int(start_step),
-            ),
+            index_map=training_sample_index_map,
             batch_size=loader.config.batch_size,
             patch_shape_zyx=loader.config.patch_shape_zyx,
             batch_count=int(pipeline_batch_count),
@@ -2893,7 +2986,10 @@ def run_training(
         train_dataloader = _make_batch_dataloader(
             config_path,
             raw_config=raw_config,
-            start_batch_index=start_step * distributed.world_size + distributed.rank,
+            start_batch_index=(
+                start_step * optimizer_microbatch_count * distributed.world_size
+                + distributed.rank
+            ),
             batch_index_stride=distributed.world_size,
             batch_count=pipeline_batch_count,
             sample_index_limit=sample_index_limit,
@@ -2985,62 +3081,6 @@ def run_training(
                     torch.cuda.reset_peak_memory_stats(device)
                 throughput_started = time.perf_counter()
             profile.begin(step)
-            sample_index = _distributed_training_sample_index(
-                step,
-                batch_size=loader.config.batch_size,
-                config=distributed,
-            )
-            if replayed_batch is not None:
-                batch, load_ms, wait_ms, to_device_ms, target_ms = (
-                    _replayed_training_batch(replayed_batch)
-                )
-            elif replayed_cpu_batch is not None:
-                batch, load_ms, wait_ms, to_device_ms, target_ms = (
-                    _replayed_cpu_training_batch(
-                        replayed_cpu_batch,
-                        loader=loader,
-                        device=device,
-                        output_stride=_model_output_stride(raw_model),
-                    )
-                )
-            else:
-                batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
-                    iterator=train_iterator,
-                    loader=loader,
-                    sample_index=sample_index,
-                    sample_index_limit=sample_index_limit,
-                    sample_mode="random",
-                    device=device,
-                    output_stride=_model_output_stride(raw_model),
-                )
-            cuda_value_augmentation_ms = float(
-                (batch.profile_timings_ms or {}).get(
-                    "cuda_pipeline_value_augmentation_ms", 0.0
-                )
-            )
-            optimizer.zero_grad(set_to_none=True)
-            fw_start = time.perf_counter()
-            with profile.stage("forward_loss"), _autocast_context(mixed_precision):
-                loss_tensors = _forward_loss_tensors(
-                    train_model,
-                    batch,
-                    direction_weight=direction_weight,
-                    presence_weight=presence_weight,
-                    conditioned_loss_options=conditioned_loss_options,
-                    training_loss=True,
-                )
-            if _grad_scaler_enabled(grad_scaler):
-                assert grad_scaler is not None
-                with profile.stage("backward"):
-                    grad_scaler.scale(loss_tensors["total"]).backward()
-                with profile.stage("optimizer"):
-                    grad_scaler.step(optimizer)
-                    grad_scaler.update()
-            else:
-                with profile.stage("backward"):
-                    loss_tensors["total"].backward()
-                with profile.stage("optimizer"):
-                    optimizer.step()
             console_metrics_due = _training_scalar_metrics_due(
                 step,
                 scalar_interval=scalar_interval,
@@ -3052,6 +3092,188 @@ def run_training(
             scalar_metrics_due = (
                 console_metrics_due or writer_metrics_due or force_scalar_reduce
             )
+            learning_rate = float(optimizer.param_groups[0]["lr"])
+            lr_range_index: int | None = None
+            if lr_range_test is not None:
+                learning_rate = _lr_range_learning_rate(lr_range_test, step)
+                _set_optimizer_learning_rate(
+                    optimizer,
+                    learning_rate,
+                    group_scales=optimizer_lr_group_scales,
+                )
+                lr_range_index = step - lr_range_test.warmup_steps - 1
+            elif learning_rate_warmup_steps > 0 and step <= learning_rate_warmup_steps:
+                learning_rate = _linear_warmup_learning_rate(
+                    float(optimizer_hparams["lr"]),
+                    step=step,
+                    warmup_steps=learning_rate_warmup_steps,
+                )
+                _set_optimizer_learning_rate(
+                    optimizer,
+                    learning_rate,
+                    group_scales=optimizer_lr_group_scales,
+                )
+            optimizer.zero_grad(set_to_none=True)
+            fw_start: float | None = None
+            scaler_enabled = _grad_scaler_enabled(grad_scaler)
+            load_ms = 0.0
+            wait_ms = 0.0
+            to_device_ms = 0.0
+            target_ms = 0.0
+            cuda_value_augmentation_ms = 0.0
+            batch: FiberTrace3DBatch | None = None
+            loss_tensors: dict[str, torch.Tensor] | None = None
+            for microbatch_index, take in enumerate(optimizer_microbatch_takes):
+                local_batch_ordinal = (
+                    (step - 1) * optimizer_microbatch_count + microbatch_index + 1
+                )
+                sample_index = VirtualBatchSampleIndex(
+                    batch_size=loader.config.batch_size,
+                    physical_world_size=distributed.world_size,
+                    rank=distributed.rank,
+                    virtual_world_size=optimizer_virtual_world_size,
+                    start_step=0,
+                )(
+                    (local_batch_ordinal - 1) * loader.config.batch_size
+                )
+                if replayed_batch is not None:
+                    next_batch, next_load_ms, next_wait_ms, next_to_device_ms, next_target_ms = (
+                        _replayed_training_batch(replayed_batch)
+                    )
+                elif replayed_cpu_batch is not None:
+                    next_batch, next_load_ms, next_wait_ms, next_to_device_ms, next_target_ms = (
+                        _replayed_cpu_training_batch(
+                            replayed_cpu_batch,
+                            loader=loader,
+                            device=device,
+                            output_stride=_model_output_stride(raw_model),
+                        )
+                    )
+                else:
+                    next_batch, next_load_ms, next_wait_ms, next_to_device_ms, next_target_ms = (
+                        _next_training_batch(
+                            iterator=train_iterator,
+                            loader=loader,
+                            sample_index=sample_index,
+                            sample_index_limit=sample_index_limit,
+                            sample_mode="random",
+                            device=device,
+                            output_stride=_model_output_stride(raw_model),
+                        )
+                    )
+                load_ms += next_load_ms
+                wait_ms += next_wait_ms
+                to_device_ms += next_to_device_ms
+                target_ms += next_target_ms
+                cuda_value_augmentation_ms += float(
+                    (next_batch.profile_timings_ms or {}).get(
+                        "cuda_pipeline_value_augmentation_ms", 0.0
+                    )
+                )
+                if int(take) != loader.config.batch_size:
+                    raise RuntimeError(
+                        "optimizer simulation produced a partial logical batch"
+                    )
+                if batch is None:
+                    batch = next_batch
+                loss_scale = _optimizer_microbatch_loss_scale(
+                    take=int(take),
+                    world_size=distributed.world_size,
+                    optimizer_global_batch_size=optimizer_global_batch_size,
+                )
+                sync_context = (
+                    distributed_model.no_sync()
+                    if manual_gradient_sync and distributed.enabled
+                    else (
+                        nullcontext()
+                        if microbatch_index + 1 == optimizer_microbatch_count
+                        or not distributed.enabled
+                        else distributed_model.no_sync()
+                    )
+                )
+                if fw_start is None:
+                    # Preserve the historical metric boundary: exclude the
+                    # first batch wait/transfer, but include the full optimizer
+                    # update from its first forward onward.
+                    fw_start = time.perf_counter()
+                with sync_context:
+                    with profile.stage("forward_loss"), _autocast_context(mixed_precision):
+                        next_losses = _forward_loss_tensors(
+                            train_model,
+                            next_batch,
+                            direction_weight=direction_weight,
+                            presence_weight=presence_weight,
+                            conditioned_loss_options=conditioned_loss_options,
+                            training_loss=True,
+                        )
+                    weighted_losses = {
+                        key: value * loss_scale for key, value in next_losses.items()
+                    }
+                    loss_tensors = (
+                        weighted_losses
+                        if loss_tensors is None
+                        else {
+                            key: loss_tensors[key] + weighted_losses[key]
+                            for key in loss_tensors
+                        }
+                    )
+                    if scaler_enabled:
+                        assert grad_scaler is not None
+                        with profile.stage("backward"):
+                            grad_scaler.scale(weighted_losses["total"]).backward()
+                    else:
+                        with profile.stage("backward"):
+                            weighted_losses["total"].backward()
+            assert batch is not None and loss_tensors is not None and fw_start is not None
+            if manual_gradient_sync:
+                with profile.stage("manual_gradient_sync"):
+                    _distributed_average_model_gradients(raw_model, distributed)
+
+            gradient_norm_due = (
+                gradient_clip_max_norm is not None
+                or (
+                    gradient_norm_interval > 0
+                    and step % gradient_norm_interval == 0
+                )
+            )
+            grad_norm_tensor: torch.Tensor | None = None
+            grad_norm_l2: float | None = None
+            gradient_clipped: bool | None = None
+            if gradient_norm_due:
+                if scaler_enabled:
+                    assert grad_scaler is not None
+                    grad_scaler.unscale_(optimizer)
+                with profile.stage("gradient_norm_clip"):
+                    grad_norm_tensor = _measure_and_clip_gradient_norm(
+                        raw_model,
+                        max_norm=gradient_clip_max_norm,
+                    )
+                materialize_grad_norm = (
+                    scalar_metrics_due
+                    or (
+                        gradient_norm_interval > 0
+                        and step % gradient_norm_interval == 0
+                    )
+                )
+                if materialize_grad_norm:
+                    grad_norm_l2 = float(grad_norm_tensor.detach().cpu())
+                    if not math.isfinite(grad_norm_l2):
+                        raise FloatingPointError(
+                            f"non-finite global L2 gradient norm at step {step}: "
+                            f"{grad_norm_l2}"
+                        )
+                    gradient_clipped = (
+                        gradient_clip_max_norm is not None
+                        and grad_norm_l2 > gradient_clip_max_norm
+                    )
+            if scaler_enabled:
+                assert grad_scaler is not None
+                with profile.stage("optimizer"):
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+            else:
+                with profile.stage("optimizer"):
+                    optimizer.step()
             losses: dict[str, float] | None = None
             if scalar_metrics_due:
                 with profile.stage("scalar_reduce_sync"):
@@ -3064,6 +3286,14 @@ def run_training(
 
             if distributed.is_main and console_metrics_due:
                 assert losses is not None
+                gradient_log = (
+                    ""
+                    if grad_norm_l2 is None
+                    else (
+                        f"grad_norm_l2={grad_norm_l2:.6g} "
+                        f"gradient_clipped={int(bool(gradient_clipped))} "
+                    )
+                )
                 print(
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
@@ -3072,6 +3302,8 @@ def run_training(
                     f"branch0={losses['branch0_fraction']:.3f} "
                     f"branch1={losses['branch1_fraction']:.3f} "
                     f"selected_score={losses['selected_score_mean']:.3f} "
+                    f"lr={learning_rate:.6g} "
+                    f"{gradient_log}"
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"to_device_ms={to_device_ms:.1f} "
                     f"value_aug_cuda_ms={cuda_value_augmentation_ms:.1f} "
@@ -3088,6 +3320,14 @@ def run_training(
                 writer.add_scalar("train/branch0_fraction", losses["branch0_fraction"], step)
                 writer.add_scalar("train/branch1_fraction", losses["branch1_fraction"], step)
                 writer.add_scalar("train/selected_score_mean", losses["selected_score_mean"], step)
+                writer.add_scalar("train/learning_rate", learning_rate, step)
+                if grad_norm_l2 is not None:
+                    writer.add_scalar("train/grad_norm_l2", grad_norm_l2, step)
+                    writer.add_scalar(
+                        "train/gradient_clipped",
+                        float(bool(gradient_clipped)),
+                        step,
+                    )
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/load_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
@@ -3177,12 +3417,25 @@ def run_training(
                 "value_augmentation_cuda_ms": cuda_value_augmentation_ms,
                 "target_ms": target_ms,
                 "fw_bw_step_ms": step_ms,
+                "learning_rate": learning_rate,
                 "loader_profile": (
                     batch.profile_timings_ms if profile_loader else None
                 ),
             }
+            if lr_range_index is not None:
+                profile_timings["lr_range_index"] = lr_range_index
+            if grad_norm_l2 is not None:
+                profile_timings["grad_norm_l2"] = grad_norm_l2
+                profile_timings["gradient_clipped"] = float(
+                    bool(gradient_clipped)
+                )
             if losses is not None:
-                profile_timings["loss_total"] = losses["total"]
+                profile_timings.update(
+                    {
+                        f"loss_{key}": value
+                        for key, value in losses.items()
+                    }
+                )
             profile.end(**profile_timings)
             if throughput_started is not None:
                 throughput_steps += 1
@@ -3197,13 +3450,17 @@ def run_training(
                     "elapsed_seconds_slowest_rank": slowest_elapsed,
                     "world_size": distributed.world_size,
                     "batch_size_per_rank": loader.config.batch_size,
-                    "global_batch_size": loader.config.batch_size * distributed.world_size,
+                    "global_batch_size": optimizer_global_batch_size,
+                    "microbatches_per_update": optimizer_microbatch_count,
                     "global_samples_per_second": (
-                        throughput_steps * loader.config.batch_size * distributed.world_size
+                        throughput_steps * optimizer_global_batch_size
                         / slowest_elapsed
                     ),
                     "samples_per_second_per_gpu": (
-                        throughput_steps * loader.config.batch_size / slowest_elapsed
+                        throughput_steps
+                        * optimizer_global_batch_size
+                        / distributed.world_size
+                        / slowest_elapsed
                     ),
                     "replay_batch": profile_replay_batch,
                     "replay_cpu_batch": profile_replay_cpu_batch,
@@ -4636,6 +4893,189 @@ def _training_scalar_metrics_due(
     if int(initial_steps) < 0:
         raise ValueError("initial_steps must be nonnegative")
     return int(step) <= int(initial_steps) or int(step) % int(scalar_interval) == 0
+
+
+def _lr_range_test_config(training: dict[str, Any]) -> _LrRangeTestConfig | None:
+    raw = training.get("lr_range_test")
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("training.lr_range_test must be an object")
+    config = _LrRangeTestConfig(
+        warmup_steps=int(raw.get("warmup_steps", 100)),
+        range_steps=int(raw.get("range_steps", 1000)),
+        start_lr=float(raw.get("start_lr", 1.0e-4)),
+        end_lr=float(raw.get("end_lr", 1.0)),
+    )
+    if config.warmup_steps < 0:
+        raise ValueError("training.lr_range_test.warmup_steps must be nonnegative")
+    if config.range_steps < 2:
+        raise ValueError("training.lr_range_test.range_steps must be >= 2")
+    if not math.isfinite(config.start_lr) or config.start_lr <= 0.0:
+        raise ValueError("training.lr_range_test.start_lr must be finite and positive")
+    if not math.isfinite(config.end_lr) or config.end_lr <= config.start_lr:
+        raise ValueError("training.lr_range_test.end_lr must exceed start_lr")
+    return config
+
+
+def _lr_range_learning_rate(config: _LrRangeTestConfig, step: int) -> float:
+    """Return the LR for a one-indexed warmup-plus-exponential range step."""
+    step_i = int(step)
+    if step_i <= 0:
+        raise ValueError("LR range step must be positive")
+    if config.warmup_steps > 0 and step_i <= config.warmup_steps:
+        return float(config.start_lr * float(step_i) / float(config.warmup_steps))
+    range_index = step_i - config.warmup_steps - 1
+    range_index = min(max(range_index, 0), config.range_steps - 1)
+    fraction = float(range_index) / float(config.range_steps - 1)
+    return float(
+        config.start_lr
+        * math.exp(math.log(config.end_lr / config.start_lr) * fraction)
+    )
+
+
+def _linear_warmup_learning_rate(
+    peak_learning_rate: float,
+    *,
+    step: int,
+    warmup_steps: int,
+) -> float:
+    """Return a one-indexed linear warmup capped at the configured peak LR."""
+    peak = float(peak_learning_rate)
+    step_i = int(step)
+    warmup_i = int(warmup_steps)
+    if not math.isfinite(peak) or peak <= 0.0:
+        raise ValueError("peak learning rate must be finite and positive")
+    if step_i <= 0:
+        raise ValueError("warmup step must be positive")
+    if warmup_i <= 0:
+        raise ValueError("warmup_steps must be positive")
+    return float(peak * min(step_i, warmup_i) / warmup_i)
+
+
+def _optimizer_microbatch_takes(
+    *,
+    local_batch_size: int,
+    world_size: int,
+    rank: int,
+    optimizer_global_batch_size: int,
+) -> tuple[int, ...]:
+    """Assign full virtual rank-local batches to one physical DDP rank."""
+    local = int(local_batch_size)
+    world = int(world_size)
+    rank_i = int(rank)
+    target = int(optimizer_global_batch_size)
+    if local <= 0 or world <= 0 or target <= 0:
+        raise ValueError("batch sizes and world_size must be positive")
+    if not 0 <= rank_i < world:
+        raise ValueError("rank must be in [0, world_size)")
+    virtual_world = _optimizer_virtual_world_size(
+        local_batch_size=local,
+        physical_world_size=world,
+        optimizer_global_batch_size=target,
+    )
+    local_batches = (virtual_world - rank_i + world - 1) // world
+    return (local,) * local_batches
+
+
+def _optimizer_virtual_world_size(
+    *,
+    local_batch_size: int,
+    physical_world_size: int,
+    optimizer_global_batch_size: int,
+) -> int:
+    """Return the number of full logical rank-local batches per update."""
+    local = int(local_batch_size)
+    physical = int(physical_world_size)
+    target = int(optimizer_global_batch_size)
+    if local <= 0 or physical <= 0 or target <= 0:
+        raise ValueError("batch sizes and world_size must be positive")
+    virtual, remainder = divmod(target, local)
+    if remainder:
+        raise ValueError(
+            "optimizer_global_batch_size must be divisible by the local batch size"
+        )
+    if virtual < physical:
+        raise ValueError(
+            "optimizer_global_batch_size must cover at least one full local "
+            "batch on every physical rank"
+        )
+    return virtual
+
+
+def _optimizer_microbatch_loss_scale(
+    *,
+    take: int,
+    world_size: int,
+    optimizer_global_batch_size: int,
+) -> float:
+    """Scale a local mean so DDP's rank mean becomes the exact sample mean."""
+    if int(take) <= 0 or int(world_size) <= 0 or int(optimizer_global_batch_size) <= 0:
+        raise ValueError("take, world_size, and optimizer batch must be positive")
+    return (
+        float(world_size)
+        * float(take)
+        / float(optimizer_global_batch_size)
+    )
+
+
+def _distributed_average_model_gradients(
+    model: torch.nn.Module,
+    config: _DistributedConfig,
+) -> None:
+    """Apply DDP's SUM/world gradient reduction after local accumulation."""
+    if not config.enabled:
+        return
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            raise RuntimeError(
+                "manual gradient synchronization requires every parameter to have a gradient"
+            )
+        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+        parameter.grad.div_(float(config.world_size))
+
+
+def _measure_and_clip_gradient_norm(
+    model: torch.nn.Module,
+    *,
+    max_norm: float | None,
+) -> torch.Tensor:
+    """Return the pre-clip global L2 norm and optionally clip in place."""
+    return torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=math.inf if max_norm is None else float(max_norm),
+        norm_type=2.0,
+        error_if_nonfinite=False,
+        foreach=True,
+    )
+
+
+def _optimizer_learning_rate_scales(
+    optimizer: torch.optim.Optimizer,
+) -> tuple[float, ...]:
+    if not optimizer.param_groups:
+        raise ValueError("optimizer has no parameter groups")
+    base = float(optimizer.param_groups[0]["lr"])
+    if not math.isfinite(base) or base <= 0.0:
+        raise ValueError("optimizer base learning rate must be finite and positive")
+    return tuple(float(group["lr"]) / base for group in optimizer.param_groups)
+
+
+def _set_optimizer_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    learning_rate: float,
+    *,
+    group_scales: Sequence[float] | None = None,
+) -> None:
+    scales = (
+        tuple(1.0 for _ in optimizer.param_groups)
+        if group_scales is None
+        else tuple(float(value) for value in group_scales)
+    )
+    if len(scales) != len(optimizer.param_groups):
+        raise ValueError("optimizer LR scale count does not match parameter groups")
+    for group, scale in zip(optimizer.param_groups, scales, strict=True):
+        group["lr"] = float(learning_rate) * scale
 
 
 def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:
