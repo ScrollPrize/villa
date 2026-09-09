@@ -2,6 +2,7 @@
 
 #include <QColor>
 #include <QPointF>
+#include <QRect>
 #include <QWidget>
 
 #include <optional>
@@ -22,10 +23,17 @@ public:
                              const QColor& color, bool sourceMarker,
                              qreal radiusX, qreal radiusY, qreal penWidth);
 
+    // Device-space bounds of everything paintEvent would draw right now;
+    // empty when nothing is drawn.
+    QRect cueBounds() const;
+
 protected:
     void paintEvent(QPaintEvent* event) override;
 
 private:
+    // Repaint only where the cues were (`previous`) and are now.
+    void repaintCues(const QRect& previous);
+
     QPointF _position;
     int _diameter = 32;
     bool _brushDiameterVisible = false;

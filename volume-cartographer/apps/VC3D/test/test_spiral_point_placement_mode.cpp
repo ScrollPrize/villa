@@ -22,6 +22,7 @@ private slots:
     void surfaceChangesClearInteraction();
     void cursorCueHasPlacementPrecedence();
     void cursorRendersRetainedPclHover();
+    void cursorCueBoundsCoverOnlyDrawnCues();
 };
 
 namespace {
@@ -311,6 +312,62 @@ void SpiralPointPlacementModeTest::cursorRendersRetainedPclHover()
         std::nullopt, QColor{}, false, 0.0, 0.0, 0.0);
     const QImage cleared = renderCursor(widget);
     QCOMPARE(countPixels(cleared, center, 0.0, 10.0, isCyan), 0);
+}
+
+void SpiralPointPlacementModeTest::cursorCueBoundsCoverOnlyDrawnCues()
+{
+    // The cursor widget covers a QGraphicsView viewport; a repaint of it
+    // redraws the scene beneath. With nothing drawn, plain mouse motion must
+    // not dirty anything, and drawn cues must dirty only their own pixels
+    // rather than the whole viewport.
+    SpiralBrushCursorWidget widget;
+    widget.resize(400, 300);
+    const QPointF center(200.0, 150.0);
+
+    widget.setCursorState(center, 64, false, false);
+    QVERIFY(widget.cueBounds().isEmpty());
+    widget.setCursorState(center + QPointF(37.0, -12.0), 64, false, false);
+    QVERIFY(widget.cueBounds().isEmpty());
+
+    widget.setCursorState(center, 64, false, true);
+    const QRect dot = widget.cueBounds();
+    QVERIFY(dot.contains(center.toPoint()));
+    QVERIFY(dot.width() < 20 && dot.height() < 20);
+    // The cue region tracks the rendered dot.
+    const QImage active = renderCursor(widget);
+    QVERIFY(countPixels(active, center, 0.0, 4.0, isCyan) > 20);
+    for (int y = 0; y < active.height(); ++y) {
+        for (int x = 0; x < active.width(); ++x) {
+            if (active.pixelColor(x, y).alpha() == 0) continue;
+            QVERIFY2(dot.contains(x, y), "painted pixel outside cueBounds()");
+        }
+    }
+
+    widget.setCursorState(center, 64, true, false);
+    const QRect ring = widget.cueBounds();
+    QVERIFY(ring.contains(center.toPoint()));
+    QVERIFY(ring.width() >= 64 && ring.width() < 80);
+    const QImage ringImage = renderCursor(widget);
+    for (int y = 0; y < ringImage.height(); ++y) {
+        for (int x = 0; x < ringImage.width(); ++x) {
+            if (ringImage.pixelColor(x, y).alpha() == 0) continue;
+            QVERIFY2(ring.contains(x, y), "painted ring pixel outside cueBounds()");
+        }
+    }
+
+    const QPointF hoverCenter(60.0, 40.0);
+    widget.setEditablePclHover(hoverCenter, QColor(50, 255, 215), true, 8.0, 6.0, 1.5);
+    const QRect both = widget.cueBounds();
+    QVERIFY(both.contains(hoverCenter.toPoint()));
+    QVERIFY(both.contains(center.toPoint()));
+    QVERIFY(both.width() < widget.width());
+    const QImage hovered = renderCursor(widget);
+    for (int y = 0; y < hovered.height(); ++y) {
+        for (int x = 0; x < hovered.width(); ++x) {
+            if (hovered.pixelColor(x, y).alpha() == 0) continue;
+            QVERIFY2(both.contains(x, y), "painted hover pixel outside cueBounds()");
+        }
+    }
 }
 
 QTEST_MAIN(SpiralPointPlacementModeTest)

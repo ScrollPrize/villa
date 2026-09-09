@@ -156,12 +156,19 @@ void SpiralBrushController::bindViewer(BoundViewer& bound, VolumeViewerBase* vie
         bound.cursorWidget->raise();
     }
     if (bound.viewObject) bound.viewObject->installEventFilter(this);
-    if (view) view->setRenderHint(QPainter::Antialiasing, true);
 }
 
 void SpiralBrushController::bindFlattenedViewer(VolumeViewerBase* viewer)
 {
     bindViewer(_flattened, viewer);
+    // Smooth edges only on the flattened preview, where brush strokes are
+    // painted. This is purely a render-quality hint: the plane viewers still
+    // draw PCL points, labels, hover and placement cues, just without edge
+    // smoothing, matching the CChunkedVolumeViewer default. Turning it on
+    // there made every repaint antialias thousands of intersection paths and
+    // froze the UI when surface intersections were shown.
+    if (auto* view = _flattened.viewer ? _flattened.viewer->graphicsView() : nullptr)
+        view->setRenderHint(QPainter::Antialiasing, true);
     _viewer = _flattened.viewer;
     _viewObject = _flattened.viewObject;
     _viewport = _flattened.viewport;
