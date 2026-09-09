@@ -171,73 +171,66 @@ _GAP_EXPANDER_DESCRIPTIONS = {
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
+    # See README.md, "Flow-gradient conditioning", for literature precedents
+    # and the limitations of these custom combinations.
     "optimizer_flow_grad_smoothing": (
-        "Gaussian-smooth the flow lattices' gradient before each optimizer "
-        "step (gradient descent in a Sobolev metric, as in diffeomorphic "
-        "registration). The loss is unchanged; every update to the flow is "
-        "smooth at the configured width instead of moving each lattice cell "
-        "on its own noisy gradient. Cylindrical lattices smooth along z and "
-        "around each ring, not across rings."),
+        "Gaussian-smooth flow gradients before the optimizer step. The loss "
+        "is unchanged, but Adam scaling and masks mean the resulting update "
+        "need not retain the kernel profile. Cylindrical smoothing runs "
+        "along z and around rings, with optional separate across-ring smoothing."),
     "optimizer_flow_grad_smoothing_sigma_voxels": (
-        "Width (standard deviation, scroll voxels) of the flow gradient "
-        "smoothing kernel along the sheet: along z and, on a cylindrical "
-        "lattice, around each ring; a Cartesian lattice is smoothed "
-        "isotropically at this width. Applies to both lattices at the same "
-        "physical width; a high-resolution flow cell is "
-        "model_flow_voxel_resolution voxels, so a width well under half a "
-        "cell is an identity (the fitter logs the effective width per "
-        "lattice at startup)."),
+        "Standard deviation in scroll-voxel units of the flow frame: along "
+        "z and around cylindrical rings, or isotropically for Cartesian "
+        "lattices. These lattice directions approximate sheet directions. "
+        "Used for both lattices unless the low-resolution override is set. "
+        "Divide by model_flow_voxel_resolution for fine-cell units; coarse "
+        "cells are six times wider. Very small widths become identity kernels. "
+        "Effective widths are logged at startup when smoothing is enabled."),
     "optimizer_flow_grad_smoothing_across_sigma_voxels": (
-        "Width (standard deviation, scroll voxels) of the flow gradient "
-        "smoothing across rings of a cylindrical lattice, i.e. across "
-        "windings; 0 leaves rings uncoupled. Ignored by a Cartesian lattice, "
-        "whose smoothing is isotropic at the along-sheet width."),
+        "Standard deviation in scroll-voxel units for smoothing across "
+        "cylindrical rings at matching angles. This approximates coupling "
+        "across windings; it does not identify sheet boundaries. 0 disables "
+        "across-ring smoothing. Ignored for Cartesian lattices."),
     "optimizer_flow_grad_smoothing_low_res_sigma_voxels": (
-        "Along-sheet smoothing width (scroll voxels) for the low-resolution "
-        "flow lattice alone; 0 gives it the same physical width as the "
-        "high-resolution lattice. Its cells are six times wider, so the "
-        "shared width leaves it about one cell of smoothing; set this to "
-        "several of its cells (a few hundred voxels) to smooth the coarse "
-        "warp at its own scale. The across-ring width is not affected."),
+        "Along-sheet smoothing width for the coarse lattice alone; 0 uses "
+        "the fine lattice's width in scroll-voxel units. For example, at the "
+        "default 16-voxel fine spacing, 32 voxels is 2 fine cells but about "
+        "0.33 coarse cells. The across-ring width is not affected."),
     "optimizer_flow_shared_second_moment": (
-        "Give the flow lattices' Adam step one second moment per flow stage "
-        "(shared by every cell and vector component of the stage) instead "
-        "of one per cell, so a smoothed gradient's spatial profile and "
-        "direction survive into the update rather than being flattened to a "
-        "per-cell sign. The value is a winsorised mean of the stored "
-        "per-cell second moments over the cells ever touched (see "
-        "optimizer_flow_shared_second_moment_clip_quantile). The stored "
-        "optimizer state is unchanged, so the flag can be switched between "
-        "runs."),
+        "Use one Adam denominator across cells and components of each "
+        "lattice slab, separately for each flow stage and coarse/fine lattice. "
+        "Preserves relative first-moment magnitudes before lazy masking and "
+        "weight decay, rather than normalizing each entry independently. "
+        "The denominator uses a winsorised mean of positive stored second "
+        "moments. Full per-entry state is retained; the flag can change "
+        "between runs."),
     "optimizer_flow_shared_second_moment_clip_quantile": (
-        "Quantile (of the touched cells, read from a fixed-stride subsample) "
-        "at which the per-cell second moments are capped before the shared "
-        "second moment averages them, so a few cells with persistently huge "
-        "gradients cannot shrink every other cell's step. 1 disables the cap "
-        "(plain mean)."),
+        "Quantile of positive second-moment entries, estimated from a "
+        "fixed-stride sample, used to cap values before averaging the full "
+        "slab for the shared denominator. Limits outliers' effect on the "
+        "common scale. 1 disables the cap; an empty positive sample also "
+        "leaves values uncapped."),
     "model_flow_field_low_res_lr_scale": (
-        "Optimizer LR of the low-resolution flow lattice relative to "
-        "optimizer_learning_rate (the high-resolution lattice has its own "
-        "ramped scale). With the shared flow second moment the typical cell "
-        "moves several times less per step than under per-cell Adam; raise "
-        "this until the logged coarse-lattice update rms is back where the "
-        "fit needs it, without touching the gap, linear and pitch groups. "
-        "0 freezes the coarse lattice. Read live every step."),
+        "Coarse flow learning-rate multiplier relative to the scheduled "
+        "base rate, independent of the fine flow multiplier. Shared second "
+        "moments can change update sizes; use the logged increments to assess "
+        "the scale. 0 freezes coarse values, including weight decay, but "
+        "moments may still update. Read every step by the fitter; currently "
+        "classified as a model-rebuild setting by the configuration catalog."),
     "optimizer_flow_grad_clip_median_multiple": (
-        "Clip each flow lattice's gradient, per stage, at this multiple of "
-        "the median nonzero |gradient| of that stage (read from a "
-        "fixed-stride subsample), after the DDP all-reduce and before the "
-        "gradient smoothing and the optimizer moments. Bounds what a cell "
-        "with an unsatisfiable loss can do to its neighbours' smoothed "
-        "gradient and to the shared second moment. 0 disables clipping. "
-        "The threshold and clipped fraction are logged with the losses."),
+        "Clip individual gradient components at this multiple of the median "
+        "nonzero absolute component value, per lattice slab, estimated from "
+        "a fixed-stride sample. Runs after DDP averaging and nonfinite "
+        "sanitization, before smoothing and optimizer moments. Limits spike "
+        "propagation but can suppress valid corrections and change vector "
+        "direction. 0 disables clipping. Logs the bound and clipped fraction."),
     "optimizer_flow_lazy_moments": (
-        "Lazy Adam moments for the flow lattices (torch SparseAdam's masked "
-        "update on the dense gradient): cells no sample touched this step "
-        "keep their moments and value instead of decaying the second moment "
-        "toward zero, which otherwise makes a cell's first update after a "
-        "quiet spell disproportionately large. Weight decay still applies to "
-        "every cell."),
+        "Use SparseAdam-style masked updates on dense flow gradients: "
+        "entries with zero gradient after conditioning and influence masks "
+        "retain their moments and receive no gradient update. Smoothing can "
+        "activate entries without direct samples. Preserves history through "
+        "quiet steps, including stale momentum, and does not correct first "
+        "touch scaling. Configured weight decay still applies everywhere."),
 }
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint

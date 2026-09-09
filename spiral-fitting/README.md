@@ -80,25 +80,104 @@ An existing output path is never overwritten.
 
 ## Flow-gradient conditioning
 
-Two optional optimizer settings condition the flow fit without changing the
-loss. Both are read live every step, so they apply at a run boundary (the
-VC3D profile editor shows them as checkboxes in the optimizer group) and
-default to off:
+These optional settings change how the flow lattices are optimized, without
+adding loss terms or changing the model parameterization. The smoothing,
+lazy-moment and shared-second-moment switches default to off; gradient
+clipping defaults to disabled. The `optimizer_flow_*` settings apply at run
+boundaries and are read every step. Older checkpoints backfill these defaults.
 
-- `optimizer_flow_grad_smoothing` Gaussian-smooths the flow lattices'
-  gradient before the optimizer step, i.e. gradient descent in a Sobolev
-  metric as in diffeomorphic registration. Every update to the flow is then
-  smooth at `optimizer_flow_grad_smoothing_sigma_voxels` (scroll voxels,
-  applied at the same physical width to both lattices of every flow stage).
-  Cylindrical lattices smooth along z and around each ring, not across rings.
-  Runs after the DDP all-reduce and before influence masks, as fused Triton
-  kernels on CUDA (`flow_grad_smoothing.py`; a conv fallback serves CPU and
-  as the reference).
-- `optimizer_flow_lazy_moments` gives the flow groups torch SparseAdam's
-  masked update on their dense gradients (`lazy_moment_adamw.LazyMomentAdamW`):
-  cells no sample touched this step keep their moments and value instead of
-  decaying the second moment toward zero. State stays in AdamW's format, so
-  checkpoints round-trip and the flag can be toggled between runs.
+The step order is: DDP gradient averaging, NaN/Inf detection and replacement
+with zero, optional clipping, optional smoothing, influence masks, then the
+optimizer update. Sanitizing before smoothing prevents a single invalid entry
+from contaminating its neighborhood. Influence masks constrain the processed
+gradient after smoothing.
+
+- `optimizer_flow_grad_smoothing` Gaussian-smooths each flow lattice's
+  gradient. `optimizer_flow_grad_smoothing_sigma_voxels` sets the standard
+  deviation in scroll-voxel units of the flow coordinate frame. Cartesian
+  smoothing is isotropic. Cylindrical smoothing runs along z and periodically
+  around each ring, independently for the local z/radial/tangential components.
+  `optimizer_flow_grad_smoothing_across_sigma_voxels` optionally smooths across
+  rings at matching angles; its default of 0 disables this pass. These are
+  lattice directions approximating along/across-sheet directions, not measured
+  sheet tangents or winding boundaries. Kernels are truncated at three sigma
+  and renormalized at nonperiodic borders to preserve constant gradients.
+- `optimizer_flow_grad_smoothing_low_res_sigma_voxels` overrides the coarse
+  lattice's along-sheet width; 0 uses the same width as the fine lattice. With
+  the default fine spacing of 16 voxels and sixfold coarse spacing, a width of
+  32 voxels is 2 fine cells but only about 0.33 coarse cells. Very small widths
+  become identity kernels. The fitter reports effective widths at startup
+  when smoothing is enabled. The across-ring width has no separate coarse
+  override and is ignored for Cartesian fields.
+- `optimizer_flow_lazy_moments` updates moments and applies the gradient step
+  only to entries whose **processed gradient is nonzero**. Smoothing can make
+  an entry active even without a direct sample there. Other entries retain
+  their moments; configured AdamW weight decay still applies everywhere.
+  This preserves gradient-scale history through unsampled steps and suppresses
+  momentum-only movement there, but retains stale history too. It does not
+  prevent large relative steps on a previously untouched smoothing tail.
+- `optimizer_flow_shared_second_moment` uses one denominator across all cells
+  and vector components of each lattice's leading slab, independently for
+  each flow stage and for the coarse/fine lattices. Per-entry Adam scaling can
+  make even a smooth gradient produce nearly sign-sized steps, particularly
+  on first touch. A shared denominator preserves relative magnitudes and
+  direction of the first moment before lazy masking and weight decay; it
+  does not guarantee a smooth final displacement. The shared statistic is the
+  mean of positive stored second moments, capped before averaging at
+  `optimizer_flow_shared_second_moment_clip_quantile` (default 0.99). A value
+  of 1 disables the cap. This limits outliers' effect on the common scale at
+  the cost of local adaptivity. Full per-entry moments remain stored.
+- `optimizer_flow_grad_clip_median_multiple` clips individual gradient
+  components to this multiple of the median nonzero absolute component value,
+  separately for each lattice slab. Zero disables it. Clipping before blur
+  limits how far an extreme gradient can affect neighbors and optimizer
+  moments, but can also suppress legitimate corrections and change vector
+  direction. The median and second-moment cap are estimated from fixed-stride
+  samples; the final averages and clipped fractions use the whole slab.
+  Sampling is deterministic for identical inputs but may miss sparse support.
+- `model_flow_field_low_res_lr_scale` multiplies the scheduled base learning
+  rate for the coarse lattice independently of the fine lattice's existing
+  ramp. It defaults to 1; 0 freezes coarse parameter values, including weight
+  decay, although moments may still update. The fitter reads it every step,
+  but the configuration catalog currently classifies it as a model-rebuild
+  setting, like the other `model_` learning-rate controls.
+
+`flow_grad_smoothing.py` provides Triton CUDA kernels and PyTorch reference/
+fallback paths. `lazy_moment_adamw.LazyMomentAdamW` retains AdamW's state format
+so its flags can be switched between runs without converting moment buffers.
+For custom optimizer updates, diagnostics report the denominator, nonzero
+update fraction, and per-component RMS over nonzero updates in voxel units.
+These describe flow-parameter increments, excluding weight decay, not final
+sheet displacement after integration. After both moment flags are disabled,
+stored optimizer diagnostics can still describe the last custom step rather
+than the current fused AdamW step. Clipping diagnostics report the bound
+and fraction clipped. No full-scroll accuracy or throughput comparison is
+established by the implementation tests.
+
+### Rationale and references
+
+Gaussian update smoothing has precedent in
+[Vercauteren et al., *Diffeomorphic Demons*](https://www-sop.inria.fr/asclepios/Publications/Tom.Vercauteren/DiffeoDemons-NeuroImage08-Vercauteren.pdf).
+Smooth velocity metrics are central to
+[Beg et al., *Computing Large Deformation Metric Mappings*](https://www.cs.jhu.edu/~misha/ReadingSeminar/Papers/Beg05.pdf).
+These motivate the preconditioning here; this discrete blur followed by Adam,
+clipping and masking is not an implementation of classical Sobolev gradient
+descent or LDDMM, and inherits no guarantee of the same fitted solution or
+fold-free numerical integration. Direction-dependent smoothing has a related
+motivation in [Pace et al.'s sliding-organ registration](https://pmc.ncbi.nlm.nih.gov/articles/PMC4112204/),
+although this fitter uses cylindrical coordinates rather than detected sliding
+interfaces.
+
+Lazy moments follow the masked-update idea of
+[PyTorch SparseAdam](https://docs.pytorch.org/docs/main/generated/torch.optim.SparseAdam.html),
+using an explicit nonzero mask on dense gradients, a global per-parameter step
+counter, AdamW's epsilon placement, and optional decoupled weight decay.
+[Adam-mini](https://arxiv.org/abs/2406.16793) provides precedent for sharing
+adaptive scales within parameter blocks; our grouping and winsorization are
+custom choices, and retaining full moments does not provide its state-memory
+saving. [Koloskova et al., *Revisiting Gradient Clipping*](https://proceedings.mlr.press/v202/koloskova23a/koloskova23a.pdf)
+analyze clipping's stabilization and stochastic bias; their results do not
+validate this particular sampled-median rule or its combination with Adam.
 
 ## Spiral service host setup
 
