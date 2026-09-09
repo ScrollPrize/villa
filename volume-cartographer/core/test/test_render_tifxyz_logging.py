@@ -30,7 +30,9 @@ class RenderLoggingTests(unittest.TestCase):
         args = self.args + list(extra)
         if logged:
             args += ["--log-path", str(self.log)]
-        return subprocess.run(args, capture_output=True, text=True, timeout=20)
+        # These cases fail before rendering starts. Allow startup overhead, but
+        # fail if shutdown waits for the flusher's five-second periodic timer.
+        return subprocess.run(args, capture_output=True, text=True, timeout=3)
 
     def assert_logged_error(self, extra, message):
         # Logging must preserve both the diagnostic and the normal error code,
