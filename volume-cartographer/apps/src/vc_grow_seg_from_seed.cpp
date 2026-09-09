@@ -332,7 +332,7 @@ int main(int argc, char *argv[])
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
+        ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
         : Volume::New(vol_path);
     if (!volume->hasScaleLevel(0)) {
         // The tracer reads scale group 0 only; on a sparse pyramid those reads

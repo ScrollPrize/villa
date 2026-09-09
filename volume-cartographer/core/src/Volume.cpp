@@ -30,6 +30,7 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -1323,7 +1324,6 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
-    const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn,
     const utils::Json& metadata,
     bool discoverAwsCredentials)
@@ -1358,7 +1358,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteLocator_ = spec.portableLocator;
     vol->baseScaleLevel_ = spec.baseScaleLevel;
     vol->remoteAuth_ = auth;
-    vol->remoteCacheRoot_ = cacheRoot;
+    vol->remoteCacheRoot_ = vc::settings::remoteCachePath();
     vol->remoteNumScales_ = opened.shapes.size();
     vol->zarrLevelShapes_ = opened.shapes;
     vol->zarrLevelChunkShapes_ = opened.chunkShapes;
