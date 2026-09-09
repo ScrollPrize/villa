@@ -465,9 +465,9 @@ class CartesianFlowField(nn.Module):
                      low_res_sigma_hr_cells=0.0):
         """Gaussian-smooth both lattices' gradients in place (isotropic).
 
-        ``sigma_hr_cells`` is the width in high-resolution cells; the
-        low-resolution lattice's cells are ``spatial_scale_factor`` times
-        larger, so it sees the same physical width in its own cells unless
+        ``sigma_hr_cells`` is the width in nominal high-resolution cells;
+        coarse cells are ``spatial_scale_factor`` times larger, so they see
+        the same flow-frame width in their own cell units unless
         ``low_res_sigma_hr_cells`` (also in high-resolution cells, 0 = same
         as ``sigma_hr_cells``) gives it a width of its own.
         ``across_sigma_hr_cells`` is accepted for signature parity with the
@@ -753,14 +753,14 @@ class CylindricalFlowField(nn.Module):
     def smooth_grad_(self, sigma_hr_cells, across_sigma_hr_cells=0.0,
                      low_res_sigma_hr_cells=0.0):
         """Gaussian-smooth both lattices' gradients in place: ``sigma_hr_cells``
-        along the sheet (along z and around each ring) and
-        ``across_sigma_hr_cells`` across rings; see
+        along z and around each ring (approximating along-sheet directions)
+        and ``across_sigma_hr_cells`` across rings; see
         flow_grad_smoothing.smooth_cylindrical_.
 
-        All widths are in high-resolution cells (radial spacing, z spacing
-        and ring arc length all equal one cell); the low-resolution lattice's
-        cells are ``spatial_scale_factor`` times larger, so it sees the same
-        physical widths in its own cells, except that
+        All widths are in nominal high-resolution cells (ring arc spacing
+        is approximate because angular cell counts are rounded). Coarse
+        cells are ``spatial_scale_factor`` times larger, so they see the same
+        flow-frame widths in their own cell units, except that
         ``low_res_sigma_hr_cells`` (0 = same as ``sigma_hr_cells``) gives it
         an along-sheet width of its own.
         """

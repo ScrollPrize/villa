@@ -2,10 +2,12 @@
 moment for selected parameter groups, plus robust gradient clipping for the
 flow lattices.
 
-Every statistic here (median |g| for clipping, the winsorisation cap of the
-shared second moment) is read from a fixed-stride subsample of the plane, so
-it is deterministic, identical on every DDP rank, and costs the same at any
-lattice size.
+The clipping median and winsorisation quantile use fixed-stride subsamples
+of roughly bounded size. Identical input gradients and state give every DDP
+rank the same samples; structured sparse support may be missed. The final
+shared mean, clipping, and update diagnostics still scan the full lattice.
+See README.md, "Rationale and references", for SparseAdam, Adam-mini and
+clipping precedents; the grouping and robust threshold rules here are custom.
 """
 
 import math
@@ -49,13 +51,15 @@ def _nan_to_inf(value):
 
 def robust_clip_(grad, multiple):
     """Clip a lattice gradient in place, per stage, at ``multiple`` times the
-    median nonzero |g| of that stage.
+    median nonzero absolute component value of that stage. This is
+    componentwise clipping, not vector-norm clipping, and can change direction.
 
-    The median is read from a fixed-stride subsample of the stage's cells
+    The median is read from a fixed-stride subsample of the stage's entries
     (see STATS_SUBSAMPLE), without any host synchronisation. Returns
     ``(threshold, clipped_fraction)``, two float64 tensors of length
-    ``stages`` on ``grad.device`` (threshold is +inf for a stage with no
-    nonzero gradient), or ``None`` when ``multiple`` is not positive, in
+    ``stages`` on ``grad.device`` (threshold is +inf when the sample has no
+    nonzero entry, even if unsampled entries are active), or ``None`` when
+    ``multiple`` is not positive, in
     which case ``grad`` is untouched.
     """
     if multiple is None or float(multiple) <= 0.0:
@@ -81,50 +85,52 @@ def robust_clip_(grad, multiple):
 
 
 class LazyMomentAdamW(torch.optim.AdamW):
-    """AdamW whose ``lazy_moments`` groups update only where the gradient is nonzero.
+    """AdamW with optional masked moments and shared second-moment scaling.
 
-    torch.optim.SparseAdam masks the Adam update to the entries a sparse
-    gradient carries: moments and parameters change only there, and untouched
-    entries keep their moments instead of decaying the second moment toward
-    zero (which otherwise makes an entry's first update after a quiet spell
-    disproportionately large). SparseAdam itself requires sparse-layout
-    gradients and its own optimizer instance; the flow lattices' gradients
-    here are dense accumulators that are mostly zero, so this class applies
-    the same masked update to dense gradients, for the groups flagged
-    ``lazy_moments=True``, and leaves every other group to AdamW's fused step.
+    ``lazy_moments=True`` applies an explicit ``grad != 0`` mask to dense
+    gradients: only these entries update moments and receive a gradient step.
+    This follows torch.optim.SparseAdam's masked-update idea, although that
+    implementation uses materialized sparse entries as its mask. The fitter
+    passes gradients after clipping, smoothing and influence masks, so active
+    entries need not have been directly sampled. Inactive entries retain
+    history, including stale momentum. A global per-parameter step counter
+    drives bias correction; there are no per-entry touch counters. Lazy
+    moments do not resolve first-touch amplification of tiny gradients.
 
-    Groups flagged ``shared_second_moment=True`` (with or without lazy
-    moments) divide by one second moment per *stage* of the parameter (the
-    leading axis of a lattice, see _stage_view; every vector component of a
-    stage shares it) instead of one per cell. Adam's per-cell denominator
-    turns a spatially smooth gradient into (nearly) its sign field; the
-    shared denominator keeps the gradient's spatial profile in the update, so
-    the flow gradient smoothing (flow_grad_smoothing) shapes the step and not
-    just its sign. Sharing across components as well keeps the update's
-    direction that of the gradient: nearly all supervision pushes radially,
-    and a per-component scale would inflate the weakly constrained z and
-    tangential components to the same step as the radial one.
+    ``shared_second_moment=True`` uses one denominator per leading slab of
+    each parameter (see _stage_view), across all its spatial entries and
+    vector components. Coarse/fine lattices and separate flow-stage parameters
+    do not share denominators. Per-entry Adam scaling can produce nearly
+    sign-sized first updates despite very different gradient magnitudes.
+    A shared denominator preserves relative magnitudes and direction of the
+    first moment before lazy masking and weight decay, not necessarily of
+    the current gradient or the final integrated displacement. Sharing across
+    components avoids independently normalizing weak components upward.
+    Adam-mini motivates blockwise scaling, but does not validate this grouping
+    or its robust aggregation for flow fitting (references in README.md).
 
-    The shared value is a winsorised mean of the stored per-cell second
-    moments over the cells ever touched: the plane is capped at the
-    ``shared_second_moment_clip_quantile`` quantile (default 0.99, read from a
-    fixed-stride subsample) of those cells before averaging, so a handful of
-    cells with persistently huge gradients cannot shrink every other cell's
-    step. Set the group's quantile to ``None`` (or >= 1) for the plain mean,
-    which is exactly the EMA of the mean squared gradient over the touched
-    cells. The stored second moment stays per cell.
+    The shared statistic is the mean of positive stored second-moment entries
+    after capping them at ``shared_second_moment_clip_quantile`` (default
+    0.99), estimated from a fixed-stride sample of positive entries. An empty
+    positive sample disables the cap. ``None`` or a value outside (0, 1)
+    also disables it. Positivity is a proxy for past activity, not an explicit
+    ever-touched mask: decayed values may underflow to zero. With lazy updates
+    or changing support, the uncapped mean need not equal a global-time EMA
+    of the active gradients' mean square. Full per-entry moments remain
+    stored; sharing the denominator does not reduce optimizer-state memory.
 
-    After each step ``conditioning_stats[param]`` holds, for every custom
-    group's parameter: ``scale`` (the shared bias-corrected denominator per
-    stage, or None), ``update_rms`` (root mean square of the nonzero update
-    per stage and component, in parameter units) and ``update_count``
-    (cells updated per stage and component), all as device tensors so
-    reading them is a caller-chosen synchronisation.
+    After a custom step, ``conditioning_stats[param]`` holds device tensors:
+    ``scale`` (the shared bias-corrected denominator per slab, or None),
+    ``update_rms`` (RMS over nonzero gradient updates per slab/component,
+    excluding weight decay), and ``update_count`` (nonzero scalar update
+    entries). Entries retain the last custom-step statistics if both flags
+    are subsequently disabled; they are not fresh diagnostics of fused steps.
 
-    State is kept in AdamW's own format (``step``, ``exp_avg``,
-    ``exp_avg_sq``), so checkpoints round-trip with a plain AdamW and both
-    flags can be switched on or off between runs. Decoupled weight decay
-    still applies to every entry of a lazy group (SparseAdam has none).
+    State uses AdamW's ``step``, ``exp_avg`` and ``exp_avg_sq`` format so
+    flags can be toggled and checkpoints exchanged with plain AdamW.
+    Non-custom groups use AdamW's fused step. Unlike SparseAdam, this class
+    uses AdamW's epsilon placement and applies configured decoupled weight
+    decay to every entry, including those masked out of the gradient step.
     """
 
     def __init__(self, *args, **kwargs):
@@ -179,7 +185,7 @@ class LazyMomentAdamW(torch.optim.AdamW):
 
     @staticmethod
     def _shared_second_moment(exp_avg_sq, quantile):
-        """Winsorised mean of the second moment over touched cells, per stage."""
+        """Winsorised mean over positive second-moment entries, per slab."""
         planes = _stage_view(exp_avg_sq)
         stride = _subsample_stride(planes.shape[1])
         shared_sq = torch.zeros(planes.shape[0], dtype=torch.float64, device=planes.device)
@@ -195,9 +201,9 @@ class LazyMomentAdamW(torch.optim.AdamW):
             count = torch.zeros_like(total)
             for start in range(0, row.numel(), _CHUNK_ELEMENTS):
                 chunk = row[start:start + _CHUNK_ELEMENTS]
-                # An untouched cell's second moment is exactly zero (lazy) or
-                # has decayed from zero (plain); either way it says nothing
-                # about the gradient scale, so only touched cells count.
+                # Exclude zero moments from the scale estimate. This is a
+                # positivity test, not a stored activity mask; previously
+                # active moments can also become zero through underflow.
                 count += (chunk > 0).sum(dtype=torch.float64)
                 if cap is not None:
                     chunk = torch.minimum(chunk, cap)

@@ -2272,8 +2272,9 @@ class FitContext:
 
     def _apply_flow_group_settings(self, iteration):
         """Per-step optimizer settings of the two flow-lattice groups: their
-        LR scales relative to the base group and the moment flags. Read from
-        the live configuration every step, so all are run-boundary settings.
+        LR scales relative to the base group and the moment flags are read
+        every step. The catalog exposes optimizer flags at run boundaries,
+        but classifies model_ LR controls as requiring a model rebuild.
         Returns (low-res scale, high-res scale)."""
         high_res_scale = get_flow_field_high_res_lr_scale(self.config, iteration)
         low_res_scale = get_flow_field_low_res_lr_scale(self.config)
@@ -2311,9 +2312,9 @@ class FitContext:
     def _report_flow_grad_conditioning(self):
         """Log the flow gradient smoothing widths in lattice cells.
 
-        The configured widths are scroll voxels, and a width well under half
-        a cell is an identity kernel, so the per-lattice conversion is printed
-        once at build time rather than left implicit.
+        Widths use scroll-voxel units of the flow frame. Very small cell-unit
+        widths collapse to identity kernels. Print the conversion at build
+        time; subsequent live changes do not refresh this startup report.
         """
         if not self.dist.is_main_process:
             return
@@ -2382,8 +2383,11 @@ class FitContext:
         flow-box units to scroll voxels per component (a cylindrical
         lattice's components are z, radial, tangential; a Cartesian one's
         z, y, x), so runs with different smoothing widths or denominators
-        are compared on how far they actually move the field per step. Reads
-        device statistics, so call it only when logging.
+        can be compared using nonzero flow-parameter increments. These RMS
+        values exclude weight decay and do not measure final sheet motion
+        after integration and composition. Optimizer statistics describe the
+        last custom step and may be stale after both moment flags are disabled.
+        Reads device statistics, so call it only when logging.
 
         A flow stage is one flow-field module here (low_res_flow_params[i]
         / high_res_flow_params[i]), whose lattice normally carries a single
@@ -4769,8 +4773,8 @@ class FitContext:
         # (identical on every rank) and before the clipping and smoothing:
         # clamping would turn an infinity into a finite bound and hide it
         # from these counters, and smoothing would spread a single NaN over
-        # every cell within its kernel. Clipping and smoothing finite
-        # gradients cannot produce new nonfinite values.
+        # every cell within its kernel. This does not check for overflow in
+        # subsequent arithmetic or repair invalid parameter/moment state.
         self._sanitize_nonfinite_grads_()
 
         # Clip after the all-reduce (identical gradients and statistics on

@@ -1,21 +1,22 @@
-"""Gaussian smoothing of flow-lattice gradients.
+"""Gaussian preconditioning of flow-lattice gradients.
 
-Smoothing the velocity gradient before the optimizer step is gradient
-descent in a Sobolev metric, the standard preconditioner of diffeomorphic
-registration: the loss and its minima are unchanged, but every update to the
-flow is smooth at the kernel's scale instead of moving each lattice cell
-independently on its own noisy gradient. Both functions smooth in place,
-treat the lattices' leading slab axis (the flow stages) and the vector
-components independently, and renormalise the kernel at lattice borders so a
-constant gradient stays constant.
+This spreads gradient information over neighboring lattice entries without
+adding a loss term. Gaussian update smoothing has precedent in Vercauteren
+et al., Diffeomorphic Demons (2009); smooth velocity metrics appear in Beg
+et al., LDDMM (2005). See README.md, "Rationale and references", for links.
+The discrete blur followed by Adam, clipping and masks is not classical
+Sobolev gradient descent and does not guarantee smooth parameter updates,
+the same fitted solution, or fold-free numerical integration.
 
-Widths are in lattice cells of the lattice being smoothed; the caller
-converts from scroll voxels (see SpiralAndTransform.smooth_flow_grad_).
+Both functions smooth in place, independently for each leading slab and
+vector component. Nonperiodic borders use truncated, renormalised kernels
+so constant gradients stay constant. Widths are in cells of the lattice
+being smoothed; the caller converts from scroll-voxel units of the flow
+frame (see SpiralAndTransform.smooth_flow_grad_).
 
-On a cylindrical lattice the smoothing is anisotropic: one width along the
-sheet (along z and around each ring, which in the flow frame is along the
-model spiral's windings) and a separate, normally much smaller, width across
-rings (across windings). See smooth_cylindrical_.
+Cylindrical smoothing uses separate widths along z/around rings and across
+rings. These coordinate directions approximate along/across-sheet directions;
+they do not track material tangents or detect winding boundaries.
 """
 
 import math
@@ -239,9 +240,10 @@ def smooth_cylindrical_(grad, ring_num_phi, ring_offsets, sigma_cells,
     ``across_sigma_cells`` is the width across rings: each tap reads the
     neighbouring ring at the cell's own angle, linearly interpolated between
     that ring's two nearest cells, with the weights renormalised at the
-    innermost and outermost rings. Ring 0 is the pinned axis cell: it is left
-    alone and never read. Both widths are in cells (the radial spacing, the z
-    spacing and the ring arc length are all one cell). The vector components
+    innermost and outermost rings. The radial pass leaves pinned axis ring 0
+    unchanged and never reads it; the z pass still includes that ring.
+    Widths use nominal lattice-cell spacing (ring arc spacing is approximate
+    because each ring's angular cell count is rounded). The vector components
     are stored in the local (z, radial, tangential) basis, so blurring around
     a ring spreads a radial push as radial pushes at neighbouring angles.
     """

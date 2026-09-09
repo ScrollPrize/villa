@@ -616,13 +616,15 @@ class SpiralAndTransform(nn.Module):
                           low_res_sigma_voxels=0.0):
         """Gaussian-smooth the flow lattices' gradients in place.
 
-        ``sigma_voxels`` is the along-sheet width, ``across_sigma_voxels``
-        the across-winding width (cylindrical lattices only; see
-        flow_grad_smoothing) and ``low_res_sigma_voxels`` an along-sheet
-        width for the low-resolution lattice alone (0 = same as
-        ``sigma_voxels``), all in scroll voxels. A high-resolution flow cell
-        is model_flow_voxel_resolution voxels wide, so the widths convert to
-        cells here and each flow field scales them for its coarser lattice.
+        ``sigma_voxels`` is the z/around-ring width for cylindrical lattices
+        (isotropic for Cartesian), ``across_sigma_voxels`` the across-ring
+        width (cylindrical only), and ``low_res_sigma_voxels`` a coarse-lattice
+        override for the first width (0 = same as ``sigma_voxels``). Directions
+        approximate along/across-sheet directions; see flow_grad_smoothing.
+        All widths use scroll-voxel units of the flow frame, not distances
+        measured on the deformed sheet. Convert using the nominal fine cell
+        width model_flow_voxel_resolution; each field scales for its coarse
+        lattice.
         Applies to every flow stage. Call after apply_accumulated_field_grad
         (and after any all-reduce) and before the optimizer step.
         """
