@@ -215,6 +215,18 @@ class _CommitInputSnapshot:
     incorporated: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class _PreparedPclCommit:
+    """One editable PCL role's staged, not yet published, commit."""
+
+    role: str
+    label: str
+    target: Path
+    temp: Path
+    base_revision: str
+    snapshots: list
+
+
 class ExclusiveFileLock:
     """Small stdlib-only advisory lock shared by independent service processes."""
 
@@ -2519,6 +2531,7 @@ class ServiceState:
                 HTTPStatus.CONFLICT,
                 "Dataset commit is busy in another Spiral session; try again") from exc
         snapshots = []
+        pcl_commits = []
         try:
             # Re-check after acquiring the process-wide lock: another request
             # may have completed while this one was waiting.
@@ -2575,13 +2588,25 @@ class ServiceState:
                 # auto-commit sticky for later revisions.
 
             committed = []
+            # Editable PCL roles: validate and stage every role's merged file
+            # before publishing any of them, so a revision conflict in one
+            # role cannot leave another role's file already rewritten (which
+            # would make the ledger's still-uncommitted mutations of that
+            # role conflict with their own commit on retry).
             handled_editable = set()
+            pcl_commits = []
             for role in EDITABLE_PCL_ROLES:
-                self._commit_editable_pcl_mutations(
-                    role, snapshots, handled_editable, committed)
+                prepared = self._prepare_editable_pcl_commit(
+                    role, snapshots, handled_editable)
+                if prepared is not None:
+                    pcl_commits.append(prepared)
+            for prepared in pcl_commits:
+                self._recheck_editable_pcl_commit(prepared)
+            for prepared in pcl_commits:
+                self._publish_editable_pcl_commit(prepared, committed)
 
             for snapshot in snapshots:
-                if snapshot.id in handled_editable:
+                if (snapshot.kind, snapshot.id) in handled_editable:
                     continue
                 source = Path(snapshot.path)
                 # A still-pending record keeps its staged copy: it remains the
@@ -2640,6 +2665,8 @@ class ServiceState:
             response = {
                 **self.status(), "committed": committed, "accepted": True}
         finally:
+            for prepared in pcl_commits:
+                prepared.temp.unlink(missing_ok=True)
             if snapshots:
                 with self.lock:
                     self._committing_inputs.difference_update(
@@ -2673,13 +2700,16 @@ class ServiceState:
                 for role_value in refreshed_roles}}
         return response
 
-    def _commit_editable_pcl_mutations(self, role, snapshots, handled,
-                                       committed):
-        """Apply one role's staged replace/delete mutations to its file.
+    def _prepare_editable_pcl_commit(self, role, snapshots, handled):
+        """Validate and stage one role's replace/delete mutations.
 
         Ordinary additions of the same role are merged against the same
         in-memory snapshot so a single atomic write covers everything that
-        commit touches in that file. Runs under the dataset commit lock.
+        commit touches in that file. The merged document is written to a
+        temporary sibling of the role file; nothing is published here.
+        Returns None when the role has no staged mutations. Runs under the
+        dataset commit lock. ``handled`` collects the ``(kind, id)`` of every
+        snapshot the returned plan covers.
         """
         role_value = PclRole(role).value
         label = PCL_ROLE_LABELS[role_value]
@@ -2691,7 +2721,7 @@ class ServiceState:
                 "replace_collection", "delete_collection"}
         ]
         if not mutation_snapshots:
-            return
+            return None
         target = self._pcl_source_path(role_value)
         if target is None or not self._pcl_source_editable(role_value, target):
             raise ApiError(
@@ -2734,7 +2764,6 @@ class ServiceState:
                     incoming = json.load(stream)
                 target_collections[target_id] = \
                     incoming["collections"][target_id]
-            handled.add(snapshot.id)
         # Ordinary additions of this role are applied after all
         # replacements, against the same in-memory source snapshot.
         additions = [
@@ -2748,7 +2777,6 @@ class ServiceState:
             with Path(snapshot.path).open("r", encoding="utf-8") as stream:
                 incoming = json.load(stream)
             merged = _merge_pcl_documents(merged, incoming)
-            handled.add(snapshot.id)
         temp = target.with_name(
             f".{target.name}.incoming-{secrets.token_hex(4)}")
         try:
@@ -2756,23 +2784,35 @@ class ServiceState:
                 json.dump(merged, stream, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
-            # Final CAS under the dataset lock closes non-cooperating
-            # source writers between load and publication.
-            late_revision = self._file_sha256(target)
-            if late_revision != base_revision:
-                self._refresh_pcl_artifact(role_value, target)
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    f"The {label} source changed during commit",
-                    payload={"code": "source_revision_conflict",
-                             "current_revision": late_revision})
-            backup = target.with_name(
-                f"{target.name}.{_utc_stamp()}.bak")
-            shutil.copy2(target, backup)
-            os.replace(temp, target)
-        finally:
+        except BaseException:
             temp.unlink(missing_ok=True)
-        for snapshot in mutation_snapshots + additions:
+            raise
+        covered = mutation_snapshots + additions
+        handled.update((snapshot.kind, snapshot.id) for snapshot in covered)
+        return _PreparedPclCommit(
+            role=role_value, label=label, target=target, temp=temp,
+            base_revision=base_revision, snapshots=covered)
+
+    def _recheck_editable_pcl_commit(self, prepared):
+        """Final CAS under the dataset lock, run for every role before any
+        role is published: closes non-cooperating source writers between
+        load and publication without leaving a sibling role half applied."""
+        late_revision = self._file_sha256(prepared.target)
+        if late_revision != prepared.base_revision:
+            self._refresh_pcl_artifact(prepared.role, prepared.target)
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"The {prepared.label} source changed during commit",
+                payload={"code": "source_revision_conflict",
+                         "current_revision": late_revision})
+
+    def _publish_editable_pcl_commit(self, prepared, committed):
+        """Replace the role file with the staged merged document."""
+        backup = prepared.target.with_name(
+            f"{prepared.target.name}.{_utc_stamp()}.bak")
+        shutil.copy2(prepared.target, backup)
+        os.replace(prepared.temp, prepared.target)
+        for snapshot in prepared.snapshots:
             if snapshot.incorporated:
                 Path(snapshot.path).unlink(missing_ok=True)
             committed.append(snapshot.id)
