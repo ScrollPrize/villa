@@ -167,6 +167,22 @@ Right press pauses the mouse hover-follow exactly as the space bar does, so the
 and cancels the pan. While the keyboard is panning, the strips stay centered
 on the current-position line and scroll underneath it.
 
+Ctrl+Shift+wheel (Cmd+Shift+wheel on macOS) in the current cut slides the cut
+plane straight ahead along its own normal instead of following the optimized
+line: the plane travels the same arclength per notch that the green
+current-position marker advances (8 base voxels times the slice step size), so
+with an unrotated cut on a straight stretch of a correct model the two gestures
+coincide, and where the model has curved away from the true fiber the plane
+keeps going straight while the marker keeps counting along the line. The
+direction is fixed at the first notch of the gesture. The side cut and strip
+planes and cameras stay where they are; only the position markers move.
+Release the modifiers and click on the fiber to place a control point at the
+advanced line position with the clicked 3D location, which pulls the
+extrapolation back on track. Any along-line navigation (plain Shift+wheel,
+Left/Right, a strip click, strip hover while hover-follow is on, Space, B, the
+rotation keys) snaps the plane back onto the model line and brings the side
+cut up to the marker.
+
 `/` and `0` both place a control point on the blue current-position dot in the
 current cut, so points can be dropped without leaving the keyboard while
 arrow-panning along the line. The key stops an active pan, because the
