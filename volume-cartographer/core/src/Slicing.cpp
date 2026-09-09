@@ -663,7 +663,7 @@ void readCompositeFastImpl(
                                     best = stack.values[i];
                             val = best;
                         } else {
-                            // alpha / beerLambert / dvr / firstHitIso / ... :
+                            // alpha / beerLambert:
                             // the same compositors the VC3D viewer runs.
                             stack.validCount = count;
                             val = compositeLayerStack(stack, params);
