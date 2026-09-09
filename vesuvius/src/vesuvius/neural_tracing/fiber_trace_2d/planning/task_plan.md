@@ -1,52 +1,72 @@
-# Plan: distribution-invariant Fiber3D losses
+# Plan: integrate Fiberlets development into Fiber3D training
 
-1. Inventory every Fiber3D loss and diagnostic reduction, including direction,
-   positive/negative presence, angle, branch fractions, and selected score.
-2. Represent each reduction by its local differentiable numerator and local
-   denominator. During DDP training, sum denominators and detached numerators
-   across ranks, while scaling each rank's differentiable local numerator so
-   DDP's gradient averaging yields the exact global-ratio gradient.
-3. Preserve the existing per-patch/per-branch balancing semantics: synchronize
-   sums of already formed nonempty group means and their group counts rather
-   than flattening them into a voxel mean. Preserve single-process behavior and
-   avoid collectives during ordinary unit-test/inference loss calls.
-4. Make two-branch quota routing independent of rank partitioning by applying
-   its deterministic score-based repair independently per stable stream/sample,
-   rather than across the rank-local batch. This intentionally corrects the
-   old multi-sample routing semantics while leaving one-sample behavior intact.
-5. Thread one explicit loss-reduction context through the shared training loss
-   entrypoint. Retain and sum local sufficient statistics across all logical
-   microbatches, then perform exactly one packed collective and one backward at
-   the optimizer-update boundary. Use the differentiable surrogate
-   `global_value.detach() + world_size * (local_sum-local_sum.detach()) /
-   global_count`; do not also apply the former sample-based microbatch scaling.
-   This supports unequal logical work without mismatched collectives.
-6. Keep distributed dense-test evaluation on its existing non-lockstep local
-   loss plus row-gather path; training-only reduction must not add test-time
-   collectives.
-7. Add regression tests with deliberately uneven sparse-target placement and
-   compare global objective values and parameter gradients against an
-   equivalent single-batch reference. Cover zero-positive ranks, conditioned
-   and legacy losses, quota-trigger routing, ordinary CPU/Gloo DDP, and unequal
-   virtual-microbatch accumulation.
-8. Benchmark the established two-GPU S1a training workload before and after the
-   synchronized reductions using the same command/data/settings and repeated
-   measured steps. Report global samples/s, step mean/p50/p95, and the dedicated
-   `loss_stat_sync` stage.
-9. Update task log, status, specification, code documentation, profiling notes,
-   and changelog with semantics, commands, results, and limitations.
+## History and safety
+
+1. Fetch the exact remote integration ref and record both tips, their merge
+   base, divergence counts, and worktree cleanliness. Lock the reviewed
+   incoming tip to `b660837d9ef8c0d59eb7783b1dee588d6f382529`; immediately
+   before merging, require `origin/fiberlets-development-integration` to still
+   resolve to that commit or stop and repeat the preview/review.
+2. Use a merge commit on `fiber-training`. Do not rebase the 17 local training
+   commits across the 206-commit integration history: preserving both branch
+   identities and avoiding unnecessary history rewriting is preferable here.
+3. Preview the three-way merge before mutation and classify textual conflicts,
+   files changed on both sides that Git auto-merges, and one-sided additions.
+   Commit these four required integration-planning files first so the worktree
+   is clean and their exact reviewed content is preserved. Record the resulting
+   first-parent tip and updated divergence before starting the merge.
+
+## Merge and semantic conflict resolution
+
+4. Merge exact commit `b660837d9ef8c0d59eb7783b1dee588d6f382529`
+   with `--no-commit` so the complete index/worktree can be audited before the
+   merge commit is created.
+5. Resolve documentation/specification conflicts by retaining both the
+   Fiber3D training contracts and Fiberlet/native-tracing contracts. Preserve
+   the chronological changelog entries from both sides.
+6. Replace only the transient current-task documents (`task.md`,
+   `task_plan.md`, `status.md`, and `task_log.md`) with this integration task,
+   as required by the local workflow. Prior task history remains in Git and
+   durable outcomes remain in `changelog.md` and normative docs.
+7. Review every overlapping code/test auto-merge, especially the shared tiled
+   inference scheduler and native chunk cache, against both side diffs and the
+   combined result. Make the smallest semantic fix needed if an automatic
+   merge drops or invalidates either feature set.
+8. Inspect the full staged merge delta, conflict-marker absence, unexpected
+   deletions, diff formatting, and merge-parent topology before committing.
+
+## Validation
+
+9. Run focused Python tests covering the shared tiled inference changes and
+   Fiber3D training changes. Reuse an existing configured native build directory
+   and toolchain only as configuration, incrementally rebuild the merged
+   `vc_core`, `test_chunk_cache`, `test_chunk_cache_persist`,
+   `test_chunked_plane_sampler`, and `test_chunked_plane_sampler_more` sources,
+   plus `test_volume_extras` (decode statistics/concurrency) and
+   `test_chunked_plane_sampler_fallback` (requested-level locality/worker
+   limits), then execute those freshly linked tests. Do not install or
+   bootstrap dependencies.
+10. If no usable configured native build exists or a required test cannot run
+    in the available environment, record the
+   exact command and reason rather than silently skipping it.
+11. Obtain an independent review of the conflict resolutions, automatic-merge
+    audit, test evidence, and final staged tree before creating the merge
+    commit.
+12. Commit the reviewed merge on `fiber-training`, verify its two parents and
+    clean worktree, and report the conflicts and feature-preserving resolutions.
 
 ## Spec update
 
-Require all optimization losses to use global sufficient-statistic reductions
-and therefore be invariant to physical-rank and logical-microbatch partitioning.
-Reconcile obsolete statements that Fiber3D has no internal microbatching.
+No new product behavior is introduced by the merge itself. Reconcile the
+existing `planning/specs.md` additions from both histories without deleting or
+weakening either branch's requirements.
 
-## Documentation update
+## Docs updates
 
-Document the reduction/gradient-scaling contract and add the measured two-GPU
-collective overhead to the training profiling report.
+Reconcile `docs/code_structure.md` by preserving both Fiber3D training and
+Fiberlet/native-tracing documentation. No new standalone user guide is needed.
 
-## Changelog
+## Changelog update
 
-Add a concise entry for globally normalized Fiber3D DDP losses.
+Preserve both histories' durable entries and add a concise integration entry
+only if conflict resolution changes their organization or adds new behavior.

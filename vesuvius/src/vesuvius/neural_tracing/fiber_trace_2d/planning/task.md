@@ -1,7 +1,11 @@
-# Task: make Fiber3D losses invariant to DDP batch partitioning
+# Task: integrate Fiberlets development into Fiber3D training
 
-Change every Fiber3D training-loss reduction so an optimizer batch produces the
-same objective and gradients regardless of how sparse targets and samples are
-partitioned across DDP ranks. Synchronize the sufficient statistics required by
-the loss, preserve the existing single-process objective, and measure the
-per-step slowdown caused by the added collectives.
+Merge the refreshed `origin/fiberlets-development-integration` history into
+the local `fiber-training` branch and continue development from
+`fiber-training`.
+
+Preserve the complete feature sets from both histories. Review both textual
+conflicts and files that Git merges automatically despite being changed on
+both sides. Resolve conflicts semantically, validate the affected Fiber3D,
+Lasagna, and native chunk-cache paths, and record every conflict and its
+resolution.
