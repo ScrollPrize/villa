@@ -19,6 +19,8 @@ _ENUMS = {
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
     "dense_spacing_density_lambda": [
         "inverse_gap", "soft_mass", "soft_mass_wide"],
+    "optimizer_flow_sobolev_curvature": ["none", "finite_difference"],
+    "optimizer_flow_sobolev_preconditioner": ["cg", "gaussian"],
 }
 
 _NULL_TYPES = {
@@ -155,6 +157,29 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
     "optimizer_flow_grad_clip_median_multiple": 0.0,
 })
+# The Sobolev-damped Hessian-free flow step (sobolev_gauss_newton.py) also
+# postdates durable checkpoints; missing means the AdamW flow update.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "optimizer_flow_sobolev_gn": False,
+    "optimizer_flow_sobolev_length_voxels": 32.0,
+    "optimizer_flow_sobolev_damping": 1.0,
+    "optimizer_flow_sobolev_curvature": "none",
+    "optimizer_flow_sobolev_pcg_iterations": 5,
+    "optimizer_flow_sobolev_pcg_tolerance": 0.1,
+    "optimizer_flow_sobolev_inner_cg_iterations": 20,
+    "optimizer_flow_sobolev_inner_cg_tolerance": 0.001,
+    "optimizer_flow_sobolev_step_scale": 0.1,
+    "optimizer_flow_sobolev_trust_radius": 0.0,
+    "optimizer_flow_sobolev_max_step_voxels": 2.0,
+    "optimizer_flow_sobolev_fd_epsilon_voxels": 1.0,
+    "optimizer_flow_sobolev_diagnostic_interval": 0,
+    "optimizer_flow_sobolev_adapt_damping": True,
+    "optimizer_flow_sobolev_damping_increase": 3.0,
+    "optimizer_flow_sobolev_damping_decrease": 1.5,
+    "optimizer_flow_sobolev_damping_max_factor": 10000.0,
+    "optimizer_flow_sobolev_preconditioner": "cg",
+    "optimizer_flow_sobolev_evaluate_step": False,
+})
 
 _GAP_EXPANDER_DESCRIPTIONS = {
     "model_gap_expander_num_windings": (
@@ -231,6 +256,99 @@ _OPTIMIZER_DESCRIPTIONS = {
         "activate entries without direct samples. Preserves history through "
         "quiet steps, including stale momentum, and does not correct first "
         "touch scaling. Configured weight decay still applies everywhere."),
+    # Sobolev-damped Hessian-free flow step: see sobolev_gauss_newton.py and
+    # SOBOLEV_GAUSS_NEWTON_PLAN.md. A prototype for controlled comparisons;
+    # not shown to improve quality or speed.
+    "optimizer_flow_sobolev_gn": (
+        "Replace the AdamW update of the flow lattices with a damped step "
+        "d solving (H + lambda A) d = -g, where A is a Sobolev metric "
+        "(identity plus scaled lattice Laplacian) and H an optional "
+        "Hessian-vector product. Every other parameter keeps AdamW. Flow "
+        "gradient clipping, smoothing, Adam moments and flow weight decay "
+        "are bypassed while enabled; influence masks still constrain the "
+        "step. Prototype: fixed damping, no line search or acceptance test."),
+    "optimizer_flow_sobolev_length_voxels": (
+        "Sobolev length scale l in scroll voxels of the flow frame: A = I - "
+        "l^2 Laplacian, so updates are smoothed over roughly this distance. "
+        "Converted to cells per lattice (coarse cells are wider). Isotropic "
+        "for Cartesian lattices; along z and around rings for cylindrical "
+        "ones, which have no radial coupling in A."),
+    "optimizer_flow_sobolev_damping": (
+        "Damping lambda. With curvature 'none' the step is -(1/lambda) "
+        "A^-1 g, so lambda sets the step length; with curvature it trades "
+        "the Hessian against the Sobolev metric (large lambda approaches the "
+        "Sobolev gradient step) and is the lower bound of the adapted value. "
+        "Must be positive."),
+    "optimizer_flow_sobolev_curvature": (
+        "'none' takes the Sobolev gradient step. 'finite_difference' solves "
+        "(H + lambda A) d = -g by PCG with Hessian-vector products from a "
+        "forward finite difference of the gradient on the same batch, one "
+        "extra forward/backward pass per PCG iteration. Non-finite values "
+        "or non-positive curvature stop PCG; the last valid iterate, or the "
+        "Sobolev step, is used."),
+    "optimizer_flow_sobolev_pcg_iterations": (
+        "Maximum outer PCG iterations (Hessian-vector products) per step "
+        "when curvature is enabled."),
+    "optimizer_flow_sobolev_pcg_tolerance": (
+        "PCG stops when the residual falls to this fraction of its initial "
+        "norm."),
+    "optimizer_flow_sobolev_inner_cg_iterations": (
+        "Plain CG iterations used to apply the approximate A^-1 "
+        "(preconditioner 'cg'). Fixed count for a near-linear preconditioner."),
+    "optimizer_flow_sobolev_inner_cg_tolerance": (
+        "Relative residual at which the inner CG for A^-1 stops early."),
+    "optimizer_flow_sobolev_step_scale": (
+        "Multiplier applied to the solved step before it is added to the "
+        "flow parameters. Conservative by default; the step is not passed "
+        "through Adam moments or the flow learning rate."),
+    "optimizer_flow_sobolev_trust_radius": (
+        "Scale the joint step down when its Sobolev norm sqrt(d^T A d) over "
+        "all flow lattices (normalised flow-box units) exceeds this. 0 "
+        "disables the trust region."),
+    "optimizer_flow_sobolev_max_step_voxels": (
+        "Scale the scaled joint step down so no lattice's per-component RMS "
+        "increment exceeds this many scroll voxels of flow velocity. The "
+        "raw step is -(1/lambda) A^-1 g, whose size follows the gradient "
+        "scale (unlike Adam), so this cap keeps an untuned damping from "
+        "producing huge updates. 0 disables the cap; the applied scale is "
+        "logged."),
+    "optimizer_flow_sobolev_diagnostic_interval": (
+        "Every this many steps, check the step's quadratic model on the same "
+        "batch: log the actual and predicted loss reduction, rho = "
+        "actual / predicted, and (with curvature) the relative asymmetry of "
+        "the finite-difference Hessian product on two random directions. "
+        "Costs up to four extra forward/backward passes at those steps. 0 "
+        "disables."),
+    "optimizer_flow_sobolev_adapt_damping": (
+        "With curvature enabled, adapt lambda across steps without retries: "
+        "multiply it by optimizer_flow_sobolev_damping_increase after a poor "
+        "solve (non-positive curvature, growing residual, non-finite values) "
+        "and divide by optimizer_flow_sobolev_damping_decrease after a clean "
+        "one, between the configured damping and damping times "
+        "optimizer_flow_sobolev_damping_max_factor. The adapted value is "
+        "saved in checkpoints and logged."),
+    "optimizer_flow_sobolev_damping_increase": (
+        "Factor applied to lambda after a poor solve (must exceed 1)."),
+    "optimizer_flow_sobolev_damping_decrease": (
+        "Factor lambda is divided by after a clean solve (at least 1)."),
+    "optimizer_flow_sobolev_damping_max_factor": (
+        "Upper bound of the adapted lambda relative to the configured damping. "
+        "At the bound the step -(1/lambda) A^-1 g is tiny, so a run whose "
+        "solves keep failing stalls rather than diverges; keep it moderate."),
+    "optimizer_flow_sobolev_fd_epsilon_voxels": (
+        "RMS size, in scroll voxels of flow velocity, of the parameter "
+        "perturbation used for the finite-difference Hessian-vector "
+        "product."),
+    "optimizer_flow_sobolev_preconditioner": (
+        "'cg' applies A^-1 by inner conjugate gradients (rigorous). "
+        "'gaussian' HEURISTICALLY uses the Gaussian gradient smoother and "
+        "its optimizer_flow_grad_smoothing_* widths as an approximate A^-1, "
+        "the only prototype path that couples cylindrical rings; it has not "
+        "been shown self-adjoint, so PCG with it is not a true PCG."),
+    "optimizer_flow_sobolev_evaluate_step": (
+        "Re-evaluate the loss on the same batch after the flow step, at the "
+        "cost of one extra forward/backward pass, and log the before/after "
+        "values. Diagnostic only: the step is never rejected."),
 }
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
@@ -399,6 +517,27 @@ class Config:
         self.optimizer_flow_shared_second_moment = False
         self.optimizer_flow_shared_second_moment_clip_quantile = 0.99
         self.optimizer_flow_grad_clip_median_multiple = 0.0
+        # Sobolev-damped Hessian-free flow step (prototype, off by default;
+        # see _OPTIMIZER_DESCRIPTIONS and sobolev_gauss_newton.py).
+        self.optimizer_flow_sobolev_gn = False
+        self.optimizer_flow_sobolev_length_voxels = 32.0
+        self.optimizer_flow_sobolev_damping = 1.0
+        self.optimizer_flow_sobolev_curvature = "none"
+        self.optimizer_flow_sobolev_pcg_iterations = 5
+        self.optimizer_flow_sobolev_pcg_tolerance = 0.1
+        self.optimizer_flow_sobolev_inner_cg_iterations = 20
+        self.optimizer_flow_sobolev_inner_cg_tolerance = 0.001
+        self.optimizer_flow_sobolev_step_scale = 0.1
+        self.optimizer_flow_sobolev_trust_radius = 0.0
+        self.optimizer_flow_sobolev_max_step_voxels = 2.0
+        self.optimizer_flow_sobolev_diagnostic_interval = 0
+        self.optimizer_flow_sobolev_adapt_damping = True
+        self.optimizer_flow_sobolev_damping_increase = 3.0
+        self.optimizer_flow_sobolev_damping_decrease = 1.5
+        self.optimizer_flow_sobolev_damping_max_factor = 10000.0
+        self.optimizer_flow_sobolev_fd_epsilon_voxels = 1.0
+        self.optimizer_flow_sobolev_preconditioner = "cg"
+        self.optimizer_flow_sobolev_evaluate_step = False
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1

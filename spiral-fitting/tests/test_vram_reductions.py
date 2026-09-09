@@ -664,7 +664,9 @@ class NonFiniteGradCheckTests(unittest.TestCase):
         import flow_grad_smoothing
         from lazy_moment_adamw import robust_clip_
 
-        step_source = inspect.getsource(fit_spiral.FitContext.step)
+        # The gradient pipeline lives in _compute_step_gradients (step()
+        # calls it, then applies the optimizer update).
+        step_source = inspect.getsource(fit_spiral.FitContext._compute_step_gradients)
         self.assertLess(step_source.index('self._sanitize_nonfinite_grads_()'),
                         step_source.index('self._clip_flow_grads()'))
         self.assertLess(step_source.index('self._clip_flow_grads()'),

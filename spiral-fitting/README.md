@@ -179,6 +179,113 @@ saving. [Koloskova et al., *Revisiting Gradient Clipping*](https://proceedings.m
 analyze clipping's stabilization and stochastic bias; their results do not
 validate this particular sampled-median rule or its combination with Adam.
 
+## Sobolev-damped Hessian-free flow step (prototype)
+
+`optimizer_flow_sobolev_gn` replaces the AdamW update of the flow lattices
+with a damped step `d` from `(H + lambda A) d = -g`, where `g` is the flow
+gradient after DDP averaging, non-finite sanitizing and influence masks, `A`
+is a Sobolev metric and `H` an optional Hessian-vector product (see
+`sobolev_gauss_newton.py` and `SOBOLEV_GAUSS_NEWTON_PLAN.md`). Every other
+parameter keeps its AdamW update. While enabled, the flow lattices bypass
+gradient clipping, Gaussian smoothing, Adam moments and flow weight decay;
+influence masks still hold masked cells exactly fixed. Off by default and
+backfilled, so older checkpoints load unchanged; the step keeps no optimizer
+state of its own.
+
+- `A = I + l^2 (Dz^T Dz + Dy^T Dy + Dx^T Dx)` on Cartesian lattices: first
+  differences with Neumann borders, with `l` =
+  `optimizer_flow_sobolev_length_voxels` converted to each lattice's cells
+  (coarse cells are wider). Cylindrical lattices use z edges and cyclic
+  angular edges within each ring; there are **no radial edges**, and ring 0 is
+  pinned. Influence-masked cells are eliminated from the operator (Dirichlet
+  zero at the mask), not masked afterwards.
+- `optimizer_flow_sobolev_curvature` `none` takes the Sobolev gradient step
+  `-(1/lambda) A^-1 g`, with `optimizer_flow_sobolev_damping` as the step
+  length. `finite_difference` solves the damped system by PCG with `A^-1` as
+  preconditioner, using a forward finite difference of the gradient on the
+  same batch as `H v` (the random state is restored before each
+  re-evaluation, so every PCG iteration costs one extra forward/backward).
+  PyTorch second derivatives are not available: the fitter's backward runs
+  family by family through custom Triton kernels and frees each graph. PCG
+  stops at `optimizer_flow_sobolev_pcg_iterations`, at the relative residual
+  `optimizer_flow_sobolev_pcg_tolerance`, on non-finite arithmetic, or on
+  non-positive curvature (the full Hessian may be indefinite), or a residual
+  that grows more than twofold in one iteration (a sign the finite-difference
+  operator is inconsistent). On a growing residual the previous iterate is
+  kept; on non-positive curvature the iterate is moved along that direction
+  to the trust boundary (CG-Steihaug), which is the configured Sobolev trust
+  radius or else the Sobolev norm of the fallback step `-(1/lambda) A^-1 g`;
+  with no valid iterate at all it falls back to that step.
+- `optimizer_flow_sobolev_adapt_damping` (default on) adapts lambda across
+  steps without retries: times `optimizer_flow_sobolev_damping_increase`
+  after a poor solve (negative curvature, growing residual, non-finite
+  values), divided by `optimizer_flow_sobolev_damping_decrease` after a
+  clean one, never below the configured damping nor above it times
+  `optimizer_flow_sobolev_damping_max_factor`. The adapted value is stored
+  in checkpoints (`sobolev_damping`; older checkpoints restart from the
+  configured value) and logged as `lambda before->next`.
+- `A^-1` is applied by a fixed budget of inner CG iterations
+  (`optimizer_flow_sobolev_inner_cg_iterations`, preconditioner `cg`).
+  Preconditioner `gaussian` instead uses the Gaussian gradient smoother and
+  its `optimizer_flow_grad_smoothing_*` widths as an approximate `A^-1`. That
+  path is **heuristic**: the smoother has not been shown self-adjoint under
+  the cell measure, so PCG with it is not a true PCG. It is the only
+  prototype path that couples cylindrical rings.
+- The joint step over all flow lattices is scaled by
+  `optimizer_flow_sobolev_step_scale`, then capped so that no lattice's
+  per-component RMS increment exceeds `optimizer_flow_sobolev_max_step_voxels`
+  (default 2 voxels; 0 disables). Unlike Adam the raw step follows the
+  gradient scale: on the golden workload the uncapped default step was
+  thousands of voxels. `optimizer_flow_sobolev_trust_radius`, when positive,
+  additionally scales the step down to that Sobolev norm. There is no Levenberg-Marquardt retry within a step, line
+  search or acceptance test. `optimizer_flow_sobolev_evaluate_step` re-runs
+  the loss on the same batch after the step, for logging only.
+
+Every 200 steps the fitter logs the curvature mode, termination reason, PCG
+and inner CG iteration counts, initial and final residual, Sobolev step norm,
+solve wall time, per-lattice step RMS in voxels and a dimensionless roughness
+(RMS of first differences over RMS of values), plus the same-batch loss before
+and after when evaluation is enabled. VRAM: the solver holds several
+lattice-sized work vectors per flow parameter (gradient copy, parameter
+backup, PCG vectors), so expect a multiple of the lattice size in transient
+memory. Curvature re-evaluations also add their forward/backward time to the
+profiler's `fwd`/`bwd` buckets and the whole step to `sobolev`.
+
+`tests/test_sobolev_gauss_newton.py` checks the operators against dense
+matrices (symmetry, positive definiteness, borders, periodicity, eliminated
+cells), PCG against a direct solve, the large-damping limit against the
+Sobolev step, the curvature and non-finite fallbacks, exact parameter
+restoration around re-evaluations, and a toy ablation of AdamW, smoothed
+AdamW, shared-denominator AdamW, the Sobolev gradient step and the
+Hessian-free step on a small synthetic sampling problem. That ablation is
+evidence about update smoothness and same-batch loss reduction on a toy; no
+full-scroll quality or wall-clock comparison has been run, and none is
+claimed. The minimum production comparison is described in the plan.
+
+Smoke evidence from the golden-run workload (201 steps, z 10000 to 11000,
+cylindrical, curvature `finite_difference`, 3 PCG iterations, damping 1,
+adaptive damping on): with a 1-voxel finite-difference epsilon the first
+step's residual grew (the guard stopped it), damping climbed to about 9e3 by
+step 200 where PCG then converged in 3 iterations (residual 4.1e3 to 3.3e2)
+and the same-batch loss fell from 740 to 693. Epsilons of 4 and 16 voxels
+were worse: the secant operator was inconsistent almost every step, damping
+ran to its ceiling and training stalled (loss 1297 and 1646 at step 200
+against 740). Keep the epsilon at 1 voxel, and keep the damping ceiling
+moderate. About 2 s per step against 0.5 s for the AdamW path.
+
+A matched cylindrical A/B with `optimizer_flow_sobolev_diagnostic_interval`
+20 (same spec, curvature `none` against `finite_difference`) showed the
+curvature path is not earning its cost in this form. Final losses at step 200
+were 715 (none) and 720 (finite difference) for 0.5 s against 2 s per step.
+The Hessian term was 1 to 5 percent of the predicted reduction at every
+probe, so the damped system is essentially `lambda A`; the finite-difference
+operator's relative asymmetry on random directions ranged from 0.01 to 1.7,
+so it is not the symmetric operator PCG assumes; and `rho` fell from about
+0.95 at step 0 to 0.05 to 0.35 for both variants, meaning the loss has large
+real curvature that the model does not capture. The conclusion is the plan's
+production path: a Gauss-Newton operator built from the residual losses, not a
+secant of the full gradient.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same

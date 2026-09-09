@@ -25,6 +25,7 @@ import torch
 import wandb
 import datetime
 import time
+import math
 import numpy as np
 import scipy.ndimage
 import scipy.sparse
@@ -49,6 +50,8 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
+import sobolev_gauss_newton
+from sobolev_gauss_newton import SobolevSettings
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
@@ -2398,13 +2401,7 @@ class FitContext:
         lines, payload = [], {}
         if not stats and not clip_stats:
             return lines, payload
-        ranges = (self.spiral_and_transform.flow_max_corner_zyx
-                  - self.spiral_and_transform.flow_min_corner_zyx).to(torch.float64).cpu()
-        cylindrical = self.config['model_flow_field_type'] == 'cylindrical'
-        component_names = ('z', 'r', 't') if cylindrical else ('z', 'y', 'x')
-        # Component 0 is z; the in-plane components (radial and tangential,
-        # or y and x) both live in the square yx box.
-        component_voxels = [float(ranges[0]), float(ranges[1]), float(ranges[2])]
+        component_names, component_voxels = self._flow_component_units()
         for name, params in (('LR', self.low_res_flow_params),
                              ('HR', self.high_res_flow_params)):
             for stage, param in enumerate(params):
@@ -2441,6 +2438,331 @@ class FitContext:
                         payload[prefix + 'clip_threshold'] = threshold
                         payload[prefix + 'clipped_fraction'] = fraction
                     lines.append(f'  flow cond {name} {label}: ' + ', '.join(parts))
+        return lines, payload
+
+    def _flow_component_units(self):
+        """Names of the flow vector components and the scroll-voxel size of
+        one normalised unit of each: component 0 is z; the in-plane
+        components (radial and tangential, or y and x) both live in the
+        square yx box."""
+        ranges = (self.spiral_and_transform.flow_max_corner_zyx
+                  - self.spiral_and_transform.flow_min_corner_zyx).to(torch.float64).cpu()
+        cylindrical = self.config['model_flow_field_type'] == 'cylindrical'
+        component_names = ('z', 'r', 't') if cylindrical else ('z', 'y', 'x')
+        component_voxels = [float(ranges[0]), float(ranges[1]), float(ranges[2])]
+        return component_names, component_voxels
+
+    # ---- Sobolev-damped Hessian-free flow step (sobolev_gauss_newton.py) ----
+
+    def _sobolev_settings(self):
+        return SobolevSettings.from_config(self.config)
+
+    def _report_sobolev_settings(self):
+        if not self.dist.is_main_process:
+            return
+        settings = self._sobolev_settings()
+        if not settings.enabled:
+            return
+        print(sobolev_gauss_newton.describe_settings(
+            settings, float(self.config['model_flow_voxel_resolution']),
+            self.spiral_and_transform.flow_field.spatial_scale_factor,
+            self.config['model_flow_field_type']))
+        print('NOTE: the Sobolev flow step is a prototype: fixed damping, no '
+              'acceptance test; flow clipping, smoothing, Adam moments and '
+              'flow weight decay are bypassed while it is enabled')
+
+    def _sobolev_flow_blocks(self):
+        """(flow_field, level, param) for every flow lattice, in the order of
+        the joint block vector: stage-major, low-res lattice first."""
+        blocks = []
+        for flow_field in self.spiral_and_transform.flow_fields:
+            for level, param in enumerate(flow_field.flows):
+                blocks.append((flow_field, level, param))
+        return blocks
+
+    def _sobolev_constrained_mask(self, level):
+        """Cells the influence window pins (mask exactly zero), or None."""
+        if self.influence_state is None or not self.influence_state.active:
+            return None
+        mask = self.influence_state.masks['flow_lr' if level == 0 else 'flow_hr']
+        return mask == 0
+
+    def _sobolev_metrics(self, settings):
+        cell_voxels = float(self.config['model_flow_voxel_resolution'])
+        metrics, preconditioners = [], []
+        along, across, low_res = self._flow_grad_smoothing_widths()
+        for flow_field, level, param in self._sobolev_flow_blocks():
+            scale = flow_field.spatial_scale_factor if level == 0 else 1
+            constrained = self._sobolev_constrained_mask(level)
+            length_cells = sobolev_gauss_newton.lattice_length_cells(
+                settings.length_voxels, cell_voxels, scale)
+            metrics.append(sobolev_gauss_newton.metric_for_flow_field(
+                flow_field, level, length_cells, constrained))
+            if settings.preconditioner == 'gaussian':
+                sigma = low_res if (level == 0 and low_res > 0.0) else along
+                preconditioners.append(
+                    sobolev_gauss_newton.gaussian_preconditioner_for_flow_field(
+                        flow_field, level, sigma / (cell_voxels * scale),
+                        across / (cell_voxels * scale), constrained))
+            else:
+                preconditioners.append(None)
+        return metrics, preconditioners
+
+    def _sobolev_flow_step(self, iteration, settings, rng, loss):
+        """Replace the flow lattices' optimizer update with a damped Sobolev /
+        Hessian-free step on this batch (see sobolev_gauss_newton).
+
+        Runs after the gradients are all-reduced, sanitised and masked. Every
+        rank sees identical gradients and takes identical solver decisions.
+        Finite-difference curvature re-runs _compute_step_gradients on the
+        same batch with the random state restored; the parameters are
+        restored bitwise from a copy afterwards and the non-flow gradients
+        of the original evaluation are put back for the optimizer. The flow
+        gradients are then hidden from the optimizer (set to None), which
+        also skips their AdamW weight decay and moment updates.
+        """
+        blocks = self._sobolev_flow_blocks()
+        params = [param for _, _, param in blocks]
+        flow_ids = {id(param) for param in params}
+        # Gradients alias the flow fields' accumulators, which a
+        # re-evaluation overwrites: copy them.
+        grads = [torch.zeros_like(param) if param.grad is None else param.grad.clone()
+                 for param in params]
+        other_grads = [(param, None if param.grad is None else param.grad.clone())
+                       for param in self.dist_grad_params if id(param) not in flow_ids]
+        nonfinite_steps = self.nonfinite_grad_steps.clone()
+        nonfinite_by_param = {name: count.clone() for name, count in self.nonfinite_grad_by_param.items()}
+        metrics, preconditioners = self._sobolev_metrics(settings)
+        component_names, component_voxels = self._flow_component_units()
+        stats = {'reevaluations': 0, 'reevaluation_nonfinite': 0}
+
+        def reevaluate_flow_gradient(perturbation, scale):
+            """Flow gradients (copies) at params + scale * perturbation on the
+            frozen batch, or None if any is non-finite."""
+            backups = [param.detach().clone() for param in params]
+            with torch.no_grad():
+                for param, delta in zip(params, perturbation):
+                    param.add_(delta, alpha=scale)
+            try:
+                rng.restore()
+                for param in self.dist_grad_params:
+                    param.grad = None
+                before = self.nonfinite_grad_steps.clone()
+                self._compute_step_gradients(iteration, skip_flow_conditioning=True)
+                stats['reevaluations'] += 1
+                if bool(self.nonfinite_grad_steps > before):
+                    stats['reevaluation_nonfinite'] += 1
+                    return None
+                return [torch.zeros_like(param) if param.grad is None else param.grad.clone()
+                        for param in params]
+            finally:
+                with torch.no_grad():
+                    for param, backup in zip(params, backups):
+                        param.copy_(backup)
+
+        hvp = None
+        if settings.uses_curvature:
+            # Perturbation scale: an RMS velocity change of fd_epsilon_voxels
+            # in the (largest) flow-box unit, so the difference stays well
+            # above float32 noise without leaving the local quadratic model.
+            units = settings.fd_epsilon_voxels / max(component_voxels)
+
+            def hvp(v):
+                v_rms = float((sobolev_gauss_newton.block_dot(v, v)
+                               / sum(t.numel() for t in v)).sqrt())
+                if not v_rms > 0.0 or not math.isfinite(v_rms):
+                    return None
+                out = sobolev_gauss_newton.finite_difference_hvp(
+                    reevaluate_flow_gradient, grads, v, units / v_rms)
+                if out is None:
+                    return None
+                # The re-evaluation masks influence-constrained cells (and the
+                # metrics eliminate them); keep the product in the free subspace.
+                for metric, block in zip(metrics, out):
+                    if metric.constrained is not None:
+                        block.masked_fill_(metric.constrained, 0.0)
+                return out
+
+        damping = getattr(self, 'sobolev_damping', None)
+        if damping is None or not settings.adapt_damping:
+            damping = settings.damping
+        steps, solve_stats = sobolev_gauss_newton.sobolev_step(
+            grads, metrics, settings, hvp=hvp, preconditioners=preconditioners,
+            damping=damping)
+        stats.update(solve_stats)
+        self.sobolev_damping = sobolev_gauss_newton.adapt_damping(
+            damping, solve_stats['reason'], settings)
+        stats['next_damping'] = self.sobolev_damping
+        # Cap the applied increment in voxels: the raw step scales with the
+        # gradient, so an untuned damping can otherwise move the lattice by
+        # thousands of voxels in one step.
+        cap_scale = 1.0
+        if settings.max_step_voxels > 0.0:
+            largest = 0.0
+            for block_stats in stats['blocks']:
+                for c, rms in enumerate(block_stats['component_rms']):
+                    largest = max(largest, rms * component_voxels[c] * settings.step_scale)
+            if largest > settings.max_step_voxels:
+                cap_scale = settings.max_step_voxels / largest
+        stats['cap_scale'] = cap_scale
+        sobolev_gauss_newton.apply_steps_(params, steps, settings.step_scale * cap_scale)
+        stats['step_scale'] = settings.step_scale * cap_scale
+        stats['loss_before'] = float(loss)
+        diagnose = (settings.diagnostic_interval > 0
+                    and iteration % settings.diagnostic_interval == 0)
+        if diagnose and hvp is not None:
+            # Quadratic-model check (one extra pass): the predicted reduction
+            # of the applied step and, below, rho = actual / predicted; then
+            # a symmetry probe of the finite-difference operator on two
+            # random directions (two more passes). The base gradient g was
+            # taken before the update, so the products are evaluated around
+            # the pre-update point by undoing the step first.
+            applied = [step * stats['step_scale'] for step in steps]
+            with torch.no_grad():
+                for param, delta in zip(params, applied):
+                    param.sub_(delta)
+            try:
+                hessian_steps = hvp(applied)
+                stats['predicted_reduction'] = sobolev_gauss_newton.predicted_reduction(
+                    grads, applied, hessian_steps)
+                stats['predicted_reduction_linear'] = sobolev_gauss_newton.predicted_reduction(
+                    grads, applied)
+                stats['hessian_term'] = (
+                    None if hessian_steps is None
+                    else 0.5 * float(sobolev_gauss_newton.block_dot(applied, hessian_steps)))
+                generator = torch.Generator(device=params[0].device)
+                generator.manual_seed(int(iteration) + 1)
+                u = [torch.randn(param.shape, generator=generator, device=param.device,
+                                 dtype=param.dtype) for param in params]
+                v = [torch.randn(param.shape, generator=generator, device=param.device,
+                                 dtype=param.dtype) for param in params]
+                for metric, ui, vi in zip(metrics, u, v):
+                    if metric.constrained is not None:
+                        ui.masked_fill_(metric.constrained, 0.0)
+                        vi.masked_fill_(metric.constrained, 0.0)
+                symmetry = sobolev_gauss_newton.symmetry_defect(hvp, u, v)
+                stats['symmetry_defect'] = None if symmetry is None else symmetry[0]
+            finally:
+                with torch.no_grad():
+                    for param, delta in zip(params, applied):
+                        param.add_(delta)
+        elif diagnose:
+            stats['predicted_reduction'] = sobolev_gauss_newton.predicted_reduction(
+                grads, [step * stats['step_scale'] for step in steps])
+        if settings.evaluate_step or diagnose:
+            rng.restore()
+            for param in self.dist_grad_params:
+                param.grad = None
+            loss_after, _, _, _ = self._compute_step_gradients(
+                iteration, skip_flow_conditioning=True)
+            stats['reevaluations'] += 1
+            stats['loss_after'] = float(loss_after)
+        if diagnose and stats.get('predicted_reduction') is not None:
+            actual = stats['loss_before'] - stats['loss_after']
+            predicted = stats['predicted_reduction']
+            stats['rho'] = actual / predicted if predicted != 0.0 else math.nan
+            if self.dist.is_main_process:
+                hess = stats.get('hessian_term')
+                defect = stats.get('symmetry_defect')
+                defect = 'n/a' if defect is None else f'{defect:.3f}'
+                print(f"  flow sobolev diag it={iteration}: lambda {damping:.3g}, "
+                      f"reason {stats['reason']}, pcg {stats['iterations']} it, "
+                      f"actual {actual:.3f}, predicted {predicted:.3f} "
+                      f"(linear {stats.get('predicted_reduction_linear', predicted):.3f}, "
+                      f"hessian {'n/a' if hess is None else f'{hess:.3f}'}), rho {stats['rho']:.3f}, "
+                      f"symmetry defect {defect}", flush=True)
+        if stats['reevaluations'] > 0:
+            # The transform cached by the last re-evaluation may hold fields
+            # materialised from perturbed parameters (see
+            # transforms.Diffeomorphism's cached integrator/sampler); rebuild
+            # it from the updated parameters for this step's later consumers,
+            # as build_device_state does.
+            self.slice_to_spiral_transform = (
+                self.spiral_and_transform.get_slice_to_spiral_transform())
+            self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+        # Label the blocks and convert their RMS to voxels.
+        for (flow_field, level, param), block_stats in zip(blocks, stats['blocks']):
+            stage = self.spiral_and_transform.flow_fields.index(flow_field)
+            block_stats['name'] = f"{'LR' if level == 0 else 'HR'}/stage{stage}"
+            block_stats['component_rms_vox'] = [
+                rms * component_voxels[c] * stats['step_scale']
+                for c, rms in enumerate(block_stats['component_rms'])]
+        self.sobolev_step_stats = stats
+
+        # Restore the counters and the non-flow gradients of the original
+        # evaluation, and hide the flow gradients from the optimizer.
+        self.nonfinite_grad_steps.copy_(nonfinite_steps)
+        for name, count in nonfinite_by_param.items():
+            self.nonfinite_grad_by_param[name].copy_(count)
+        for param, grad in other_grads:
+            param.grad = grad
+        for param in params:
+            param.grad = None
+        conditioning_stats = getattr(self.optimiser, 'conditioning_stats', None)
+        if conditioning_stats:
+            for param in params:
+                conditioning_stats.pop(param, None)
+
+    def _sobolev_report(self):
+        """Step-log lines and metrics of the last Sobolev flow step."""
+        stats = getattr(self, 'sobolev_step_stats', {})
+        lines, payload = [], {}
+        if not stats:
+            return lines, payload
+        prefix = 'flow_sobolev/'
+        parts = [
+            f"{stats['curvature']}",
+            f"reason {stats['reason']}",
+            f"lambda {stats['damping']:.3g}->{stats.get('next_damping', stats['damping']):.3g}",
+            f"pcg {stats['iterations']} it",
+            f"inner cg {stats['inner_cg_iterations']} it",
+            f"resid {stats['residual_initial']:.3e}->{stats['residual_final']:.3e}",
+            f"|d|_A {stats['sobolev_norm']:.3e}",
+            f"{stats['solve_seconds'] * 1000.0:.0f} ms",
+        ]
+        if stats.get('fallback'):
+            parts.append('FALLBACK to Sobolev step')
+        if stats.get('steihaug', 0.0) > 0.0:
+            parts.append(f"steihaug tau {stats['steihaug']:.3g}")
+        if stats['trust_scale'] < 1.0:
+            parts.append(f"trust scale {stats['trust_scale']:.3f}")
+        if stats.get('cap_scale', 1.0) < 1.0:
+            parts.append(f"voxel cap scale {stats['cap_scale']:.3e}")
+        if 'loss_after' in stats:
+            parts.append(f"loss {stats['loss_before']:.2f}->{stats['loss_after']:.2f} (same batch)")
+        lines.append('  flow sobolev: ' + ', '.join(parts))
+        payload[prefix + 'pcg_iterations'] = stats['iterations']
+        payload[prefix + 'inner_cg_iterations'] = stats['inner_cg_iterations']
+        payload[prefix + 'residual_initial'] = stats['residual_initial']
+        payload[prefix + 'residual_final'] = stats['residual_final']
+        payload[prefix + 'sobolev_norm'] = stats['sobolev_norm']
+        payload[prefix + 'trust_scale'] = stats['trust_scale']
+        payload[prefix + 'cap_scale'] = stats.get('cap_scale', 1.0)
+        payload[prefix + 'damping'] = stats['damping']
+        payload[prefix + 'next_damping'] = stats.get('next_damping', stats['damping'])
+        payload[prefix + 'steihaug'] = stats.get('steihaug', 0.0)
+        payload[prefix + 'residual_increased'] = float(stats['reason'] == 'residual_increased')
+        payload[prefix + 'solve_seconds'] = stats['solve_seconds']
+        payload[prefix + 'reevaluations'] = stats['reevaluations']
+        payload[prefix + 'fallback'] = float(bool(stats.get('fallback')))
+        payload[prefix + 'nonpositive_curvature'] = float(stats['reason'] == 'nonpositive_curvature')
+        if 'loss_after' in stats:
+            payload[prefix + 'loss_after_same_batch'] = stats['loss_after']
+            payload[prefix + 'loss_reduction_same_batch'] = stats['loss_before'] - stats['loss_after']
+        for key in ('rho', 'predicted_reduction', 'symmetry_defect'):
+            if stats.get(key) is not None:
+                payload[prefix + key] = stats[key]
+        component_names, _ = self._flow_component_units()
+        for block in stats['blocks']:
+            vox = block['component_rms_vox']
+            lines.append(
+                f"  flow sobolev {block['name']}: step rms vox "
+                + ' '.join(f'{component_names[c]}={v:.4f}' for c, v in enumerate(vox))
+                + f", roughness {block['roughness']:.3f}")
+            block_prefix = prefix + block['name'] + '/'
+            payload[block_prefix + 'roughness'] = block['roughness']
+            for c, v in enumerate(vox):
+                payload[block_prefix + f'step_rms_vox_{component_names[c]}'] = v
         return lines, payload
 
     def _realign_lr_schedule(self, completed_steps):
@@ -2972,6 +3294,7 @@ class FitContext:
         # _apply_flow_group_settings), which keeps AdamW's state format.
         self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
         self._report_flow_grad_conditioning()
+        self._report_sobolev_settings()
         # Influence masks are scoped to one interactive Run request. They are
         # created from that run's pending inputs and discarded before its autosave.
         self.influence_state = None
@@ -3125,6 +3448,13 @@ class FitContext:
         # step's robust flow-gradient clip, for the step log (see
         # _clip_flow_grads).
         self.flow_grad_clip_stats = {}
+        # Diagnostics of the last Sobolev flow step (see _sobolev_flow_step),
+        # for the step log; empty when that step is disabled.
+        self.sobolev_step_stats = {}
+        # The adapted damping of the Sobolev step (cross-step LM, see
+        # sobolev_gauss_newton.adapt_damping); None until the first step,
+        # which starts from the configured damping. Checkpointed.
+        self.sobolev_damping = None
         self.interactive_dt_resume_iteration = None
 
     # What _build_model_state() constructs, and therefore what
@@ -3204,6 +3534,7 @@ class FitContext:
             'z_begin': self.model_z_begin,
             'z_end': self.model_z_end,
             'spiral_outward_sense': self.spiral_outward_sense,
+            'sobolev_damping': getattr(self, 'sobolev_damping', None),
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
@@ -3538,6 +3869,9 @@ class FitContext:
         gap_group['weight_decay'] = self.config['optimizer_weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
+        # Older checkpoints have no adapted damping: restart from the config.
+        damping = checkpoint.get('sobolev_damping')
+        self.sobolev_damping = None if damping is None else float(damping)
 
     def _rebuild_unverified_patch_inputs(self, exclusion_radius):
         """Reload only the unverified-patch pool for a Run-boundary mask edit."""
@@ -4327,9 +4661,54 @@ class FitContext:
         return refreshed
 
     def step(self, iteration):
-        self.step_timer.start('fwd')
         flow_field_low_res_lr_scale, flow_field_high_res_lr_scale = (
             self._apply_flow_group_settings(iteration))
+        sobolev = self._sobolev_settings()
+        # The random state every sampler draws from this step, so the Sobolev
+        # step can re-evaluate the gradient on exactly this batch.
+        rng = sobolev_gauss_newton.RngSnapshot() if sobolev.enabled else None
+
+        loss, losses, log_metrics, shell_metrics = self._compute_step_gradients(
+            iteration, skip_flow_conditioning=sobolev.enabled)
+        log_metrics['flow_field_low_res_lr_scale'] = flow_field_low_res_lr_scale
+        log_metrics['flow_field_high_res_lr_scale'] = flow_field_high_res_lr_scale
+
+        # The unset-potential hard error is deferred off the sampler hot path
+        # (theta_crossing_map.winding_potentials); resolve every pending
+        # verdict before mutating parameters so an invalid batch can never
+        # complete an optimizer update.
+        self.theta_crossing_map.assert_no_pending_potential_errors()
+        if sobolev.enabled:
+            # Updates the flow lattices itself and hides their gradients from
+            # the optimizer below (every other parameter keeps AdamW).
+            self.step_timer.start('sobolev')
+            self._sobolev_flow_step(iteration, sobolev, rng, loss)
+            self.step_timer.stop('sobolev')
+            self.theta_crossing_map.assert_no_pending_potential_errors()
+        self.step_timer.start('opt')
+        self.optimiser.step()
+        self.step_timer.stop('opt')
+        if self.influence_state is not None and self.influence_state.active:
+            self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
+        self.optimiser.zero_grad(set_to_none=True)
+        self.lr_scheduler.step()
+        self.step_timer.tick()
+        self.step_timer.maybe_report(iteration)
+        if self.profiler is not None:
+            self.profiler.step()
+
+        return loss, losses, log_metrics, shell_metrics
+
+    def _compute_step_gradients(self, iteration, *, skip_flow_conditioning=False):
+        """Sample this iteration's batch, accumulate every parameter's gradient
+        and condition it: DDP averaging, non-finite sanitising, then (unless
+        ``skip_flow_conditioning``) flow clipping and smoothing, and finally
+        the influence masks. Returns ``(loss, losses, log_metrics,
+        shell_metrics)`` without touching the parameters or optimizer, so the
+        Sobolev step can call it again on the same batch (after restoring the
+        random state) for finite-difference curvature.
+        """
+        self.step_timer.start('fwd')
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -4350,10 +4729,7 @@ class FitContext:
             self.slice_to_spiral_transform)
 
         losses = {}
-        log_metrics = {
-            'flow_field_low_res_lr_scale': flow_field_low_res_lr_scale,
-            'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
-        }
+        log_metrics = {}
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
@@ -4777,42 +5153,31 @@ class FitContext:
         # subsequent arithmetic or repair invalid parameter/moment state.
         self._sanitize_nonfinite_grads_()
 
-        # Clip after the all-reduce (identical gradients and statistics on
-        # every rank) and before smoothing, so a cell with an unsatisfiable
-        # loss is bounded before its spike is spread over its neighbours.
-        self.step_timer.start('clip')
-        self._clip_flow_grads()
-        self.step_timer.stop('clip')
+        if skip_flow_conditioning:
+            # The Sobolev step conditions the flow gradients itself (its
+            # metric replaces the blur) and needs the raw gradient for its
+            # finite differences, which clipping would distort.
+            self.flow_grad_clip_stats = {}
+        else:
+            # Clip after the all-reduce (identical gradients and statistics on
+            # every rank) and before smoothing, so a cell with an unsatisfiable
+            # loss is bounded before its spike is spread over its neighbours.
+            self.step_timer.start('clip')
+            self._clip_flow_grads()
+            self.step_timer.stop('clip')
 
-        if self.config.get('optimizer_flow_grad_smoothing', False):
-            # After the all-reduce (smoothing is linear, and every rank then
-            # smooths identical gradients) and before the influence masks, so
-            # smoothing cannot leak gradient outside a masked region.
-            self.step_timer.start('smooth')
-            self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
-            self.step_timer.stop('smooth')
+            if self.config.get('optimizer_flow_grad_smoothing', False):
+                # After the all-reduce (smoothing is linear, and every rank then
+                # smooths identical gradients) and before the influence masks, so
+                # smoothing cannot leak gradient outside a masked region.
+                self.step_timer.start('smooth')
+                self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
+                self.step_timer.stop('smooth')
 
         if self.influence_state is not None and self.influence_state.active:
             # After the all-reduce and the accumulated-field-grad handoff, so
             # every rank masks identical averaged gradients on both flow paths.
             self.influence_state.apply_grad_masks_(self.spiral_and_transform)
-
-        # The unset-potential hard error is deferred off the sampler hot path
-        # (theta_crossing_map.winding_potentials); resolve every pending
-        # verdict before mutating parameters so an invalid batch can never
-        # complete an optimizer update.
-        self.theta_crossing_map.assert_no_pending_potential_errors()
-        self.step_timer.start('opt')
-        self.optimiser.step()
-        self.step_timer.stop('opt')
-        if self.influence_state is not None and self.influence_state.active:
-            self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
-        self.optimiser.zero_grad(set_to_none=True)
-        self.lr_scheduler.step()
-        self.step_timer.tick()
-        self.step_timer.maybe_report(iteration)
-        if self.profiler is not None:
-            self.profiler.step()
 
         return loss, losses, log_metrics, shell_metrics
 
@@ -4873,9 +5238,13 @@ class FitContext:
                 conditioning_lines, conditioning_payload = self._flow_conditioning_report()
                 for line in conditioning_lines:
                     print(line)
+                sobolev_lines, sobolev_payload = self._sobolev_report()
+                for line in sobolev_lines:
+                    print(line)
                 payload = {
                     'total_loss': loss.item(),
                     **conditioning_payload,
+                    **sobolev_payload,
                     'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
                     **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
                     **{name + '_loss': value for name, value in losses.items()},
