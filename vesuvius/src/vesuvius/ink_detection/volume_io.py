@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ import zarr
 
 from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
 
+
+LOGGER = logging.getLogger(__name__)
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
@@ -49,8 +52,72 @@ def _evict_to_watermark(
             path.unlink()
         except FileNotFoundError:
             pass
+        except OSError:
+            # Windows refuses to unlink a file that another process still holds
+            # open, so a sibling DataLoader worker reading this entry turns the
+            # sweep into a PermissionError. The entry survives and therefore
+            # still occupies its bytes: skip it without crediting the budget and
+            # evict a different one instead.
+            continue
         total -= size
     return total
+
+
+def _best_effort_cache_store(cache_path: Path) -> Any:
+    """Build the cache-side store, tolerating mutations the OS refuses.
+
+    The disk cache is an optimization, never a source of truth, so a failed
+    cache write or eviction must not abort the read that triggered it. That
+    distinction only becomes visible on Windows: zarr commits each cache entry
+    with ``os.replace`` and drops entries with ``unlink``, and Windows denies
+    both while another process holds the target open. Several DataLoader
+    workers sharing one ``cache_dir`` collide on exactly the same keys, so the
+    failure is routine rather than exotic -- four concurrent readers of one
+    volume fail roughly half the time. POSIX ``rename(2)``/``unlink(2)`` permit
+    both operations, which is why the cache looks reliable on Linux and macOS.
+
+    Losing the write costs one refetch; raising costs the whole run.
+    """
+    from zarr.storage import LocalStore
+
+    class _BestEffortCacheStore(LocalStore):
+        async def get(
+            self,
+            key: str,
+            prototype: Any = None,
+            byte_range: Any = None,
+        ) -> Any:
+            try:
+                return await super().get(key, prototype, byte_range)
+            except OSError as error:
+                # LocalStore.get already reports an unreadable entry as a miss
+                # for FileNotFoundError and friends; on Windows a sibling
+                # process committing the same key denies the read instead, which
+                # means exactly the same thing here.
+                LOGGER.debug("treating unreadable cache entry %s as a miss: %s", key, error)
+                return None
+
+        async def _set(self, key: str, value: Any, exclusive: bool = False) -> None:
+            try:
+                await super()._set(key, value, exclusive=exclusive)
+            except FileExistsError:
+                raise
+            except OSError as error:
+                LOGGER.debug("skipped caching %s: %s", key, error)
+
+        async def delete(self, key: str) -> None:
+            try:
+                await super().delete(key)
+            except OSError as error:
+                LOGGER.debug("skipped evicting %s: %s", key, error)
+
+        async def delete_dir(self, prefix: str) -> None:
+            try:
+                await super().delete_dir(prefix)
+            except OSError as error:
+                LOGGER.debug("skipped evicting %s: %s", prefix, error)
+
+    return _BestEffortCacheStore(cache_path)
 
 
 def load_volume_auth(auth_json_path: str | Path | None) -> tuple[str, str] | None:
@@ -137,7 +204,7 @@ def open_volume_root(
             source_store = LocalStore(path_text, read_only=True)
         store = CacheStore(
             store=source_store,
-            cache_store=LocalStore(cache_path),
+            cache_store=_best_effort_cache_store(cache_path),
             max_size=maximum_bytes,
         )
         return zarr.open(store=store, mode="r")

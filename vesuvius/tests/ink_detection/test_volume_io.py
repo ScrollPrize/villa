@@ -139,7 +139,11 @@ def test_open_sweep_prunes_oldest_recursively_and_leaves_under_budget(
     for timestamp, path in enumerate(over_files, start=1):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(bytes([timestamp]) * 4)
-        os.utime(path, ns=(timestamp, timestamp))
+        # NTFS stores timestamps at 100 ns resolution, so 1 ns spacing collapses
+        # every file to st_mtime_ns == 0 on Windows and destroys the LRU ordering
+        # this test relies on. Space the stamps a second apart to stay portable.
+        stamp_ns = timestamp * 1_000_000_000
+        os.utime(path, ns=(stamp_ns, stamp_ns))
 
     opened = open_volume_root(
         "over.zarr",
@@ -157,7 +161,11 @@ def test_open_sweep_prunes_oldest_recursively_and_leaves_under_budget(
     for timestamp, (path, size) in enumerate(zip(under_files, (4, 6)), start=20):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x" * size)
-        os.utime(path, ns=(timestamp, timestamp))
+        # NTFS stores timestamps at 100 ns resolution, so 1 ns spacing collapses
+        # every file to st_mtime_ns == 0 on Windows and destroys the LRU ordering
+        # this test relies on. Space the stamps a second apart to stay portable.
+        stamp_ns = timestamp * 1_000_000_000
+        os.utime(path, ns=(stamp_ns, stamp_ns))
     before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in under_files]
 
     open_volume_root(
@@ -168,6 +176,77 @@ def test_open_sweep_prunes_oldest_recursively_and_leaves_under_budget(
 
     after = [(path.read_bytes(), path.stat().st_mtime_ns) for path in under_files]
     assert after == before
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_cache_write_denied_by_os_still_serves_correct_data(tmp_path, monkeypatch):
+    from zarr.storage import _local
+
+    source_path = tmp_path / "volume.zarr"
+    expected = np.arange(6 * 7 * 8, dtype=np.uint16).reshape(6, 7, 8) * 11 + 2
+    _write_pyramid(source_path, expected)
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(_local, "_put", denied)
+
+    volume = open_volume(source_path, 0, cache_dir=tmp_path / "cache")
+    assert np.asarray(volume[:]).tobytes() == expected.tobytes()
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_cache_read_denied_by_os_falls_back_to_source(tmp_path, monkeypatch):
+    from zarr.storage import _local
+
+    source_path = tmp_path / "volume.zarr"
+    cache_dir = tmp_path / "cache"
+    expected = np.arange(5 * 6 * 7, dtype=np.uint16).reshape(5, 6, 7) * 19 + 1
+    _write_pyramid(source_path, expected)
+
+    primed = open_volume(source_path, 0, cache_dir=cache_dir)
+    assert np.asarray(primed[:]).tobytes() == expected.tobytes()
+
+    real_get = _local._get
+
+    def denied_under_cache(path, prototype, byte_range=None):
+        if cache_dir in Path(path).parents:
+            raise PermissionError(13, "Permission denied")
+        return real_get(path, prototype, byte_range)
+
+    monkeypatch.setattr(_local, "_get", denied_under_cache)
+
+    volume = open_volume(source_path, 0, cache_dir=cache_dir)
+    assert np.asarray(volume[:]).tobytes() == expected.tobytes()
+
+
+def test_eviction_skips_entries_the_os_refuses_to_delete(tmp_path, monkeypatch):
+    target = disk_cache_subdir("locked.zarr", tmp_path / "cache")
+    files = [target / "zarr.json", target / "c" / "0", target / "c" / "1"]
+    for timestamp, path in enumerate(files, start=1):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 4)
+        stamp_ns = timestamp * 1_000_000_000
+        os.utime(path, ns=(stamp_ns, stamp_ns))
+
+    real_unlink = Path.unlink
+
+    def maybe_denied(self, *args, **kwargs):
+        if self.name == "zarr.json":
+            raise PermissionError(13, "Access is denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", maybe_denied)
+
+    remaining = volume_io._evict_to_watermark(volume_io._cache_snapshot(target), 12)
+
+    # The undeletable oldest entry survives, so it must keep counting against
+    # the budget; the sweep evicts the next-oldest instead of crediting bytes
+    # that are still on disk.
+    assert files[0].exists()
+    assert not files[1].exists()
+    assert files[2].exists()
+    assert remaining == 8
 
 
 @pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
