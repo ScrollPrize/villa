@@ -3557,6 +3557,103 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text()), source)
 
+    def _stage_two_role_deletions(self):
+        relative_source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "wraps", "points": {
+                "0": {"p": [0, 0, 0], "wind_a": 0, "creation_time": 1},
+                "1": {"p": [1, 0, 0], "wind_a": 1, "creation_time": 2}}}},
+        }
+        same_source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"4": {"name": "same", "points": {
+                "0": {"p": [5, 5, 5], "creation_time": 1},
+                "1": {"p": [6, 5, 5], "creation_time": 2}}}},
+        }
+        relative = self.dataset / "relative_windings.json"
+        same = self.dataset / "same_windings.json"
+        relative.write_text(json.dumps(relative_source))
+        same.write_text(json.dumps(same_source))
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-same-4",
+            {"4.json": json.dumps(same_source).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="4",
+            base_source_revision=self.state._file_sha256(same))
+        self.state.finalize_upload(upload_id)
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-rel-2",
+            {"2.json": json.dumps(relative_source).encode()},
+            role="relative", operation="delete_collection",
+            target_collection_id="2",
+            base_source_revision=self.state._file_sha256(relative))
+        self.state.finalize_upload(upload_id)
+        return relative, relative_source, same, same_source
+
+    def test_a_relative_revision_conflict_publishes_no_same_winding_mutation(self):
+        relative, relative_source, same, same_source = \
+            self._stage_two_role_deletions()
+        # The relative source moves under the staged deletion; the
+        # same-winding deletion in the same commit is valid on its own.
+        externally_changed = {**relative_source, "external": True}
+        relative.write_text(json.dumps(externally_changed))
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.commit_inputs()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.payload["code"],
+                         "source_revision_conflict")
+        # Nothing was published: the same-winding file, which the commit
+        # validated first, is untouched, so its staged deletion still
+        # matches the source revision it was taken against.
+        self.assertEqual(json.loads(same.read_text()), same_source)
+        self.assertEqual(json.loads(relative.read_text()), externally_changed)
+        self.assertEqual(list(self.dataset.glob("*.bak")), [])
+        self.assertEqual(list(self.dataset.glob(".*.incoming-*")), [])
+        inputs = self.state.status()["ephemeral_inputs"]
+        self.assertEqual({record["id"]: record["committed"]
+                          for record in inputs},
+                         {"delete-same-4": False, "delete-rel-2": False})
+
+        # Once the relative source is back at the staged revision, the
+        # same commit goes through as a whole.
+        relative.write_text(json.dumps(relative_source))
+        response = self.state.commit_inputs()
+        self.assertEqual(sorted(response["committed"]),
+                         ["delete-rel-2", "delete-same-4"])
+        self.assertEqual(json.loads(same.read_text())["collections"], {})
+        self.assertEqual(json.loads(relative.read_text())["collections"], {})
+        self.assertEqual(list(self.dataset.glob(".*.incoming-*")), [])
+
+    def test_a_fiber_sharing_an_id_with_a_pcl_mutation_is_still_published(self):
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "same", "points": {
+                "0": {"p": [0, 0, 0], "creation_time": 1},
+                "1": {"p": [1, 0, 0], "creation_time": 2}}}},
+        }
+        same = self.dataset / "same_windings.json"
+        same.write_text(json.dumps(source))
+        # The ledger keys inputs by (kind, id), so a fiber and a PCL
+        # mutation may legitimately share an id.
+        self._finalize("fiber", "shared", FIBER_FILES)
+        upload_id = _upload_input(
+            self.state, "pcl", "shared",
+            {"2.json": json.dumps(source).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="2",
+            base_source_revision=self.state._file_sha256(same))
+        self.state.finalize_upload(upload_id)
+
+        response = self.state.commit_inputs()
+        self.assertEqual(response["committed"], ["shared", "shared"])
+        self.assertTrue((self.dataset / "fibers" / "shared.json").is_file())
+        self.assertEqual(json.loads(same.read_text())["collections"], {})
+        inputs = self.state.status()["ephemeral_inputs"]
+        self.assertEqual({(record["kind"], record["id"]): record["committed"]
+                          for record in inputs},
+                         {("fiber", "shared"): True, ("pcl", "shared"): True})
+
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)
         staged = Path(record["path"])
