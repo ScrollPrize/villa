@@ -18,8 +18,11 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DSample,
     FiberTrace3DSharedTensorSlots,
     augment_fiber_trace_3d_raw_sample,
+    apply_value_augmentation_batch_3d,
+    apply_value_augmentation_suffix_batch_3d,
     collate_fiber_trace_3d_samples,
     load_config,
+    prepare_fiber_trace_3d_cuda_suffix,
 )
 from vesuvius.neural_tracing.ordered_sample_pipeline import (
     OrderedTwoStageSamplePipeline,
@@ -144,8 +147,16 @@ class FiberTrace3DFusedLoadFactory:
 class FiberTrace3DAugmentOperation:
     config: object
     profile: bool
+    defer_cuda_suffix: str | None = None
 
-    def __call__(self, raw: FiberTrace3DRawSample) -> FiberTrace3DSample:
+    def __call__(self, raw: FiberTrace3DRawSample) -> FiberTrace3DSample | FiberTrace3DRawSample:
+        if self.defer_cuda_suffix:
+            return prepare_fiber_trace_3d_cuda_suffix(
+                self.config,
+                raw,
+                profile=self.profile,
+                mode=self.defer_cuda_suffix,
+            )
         return augment_fiber_trace_3d_raw_sample(
             self.config,
             raw,
@@ -157,9 +168,14 @@ class FiberTrace3DAugmentOperation:
 class FiberTrace3DAugmentFactory:
     config_path: str
     profile: bool = True
+    defer_cuda_suffix: str | None = None
 
     def __call__(self) -> FiberTrace3DAugmentOperation:
-        return FiberTrace3DAugmentOperation(load_config(self.config_path), self.profile)
+        return FiberTrace3DAugmentOperation(
+            load_config(self.config_path),
+            self.profile,
+            self.defer_cuda_suffix,
+        )
 
 
 class FiberTrace3DTrainingBatchPipeline:
@@ -180,6 +196,7 @@ class FiberTrace3DTrainingBatchPipeline:
         sample_index_limit: int | None,
         sample_mode: str,
         profile: bool,
+        defer_cuda_value_augmentation: str | None = None,
     ) -> None:
         if int(batch_count) <= 0:
             raise ValueError("batch_count must be positive")
@@ -189,12 +206,18 @@ class FiberTrace3DTrainingBatchPipeline:
             raise ValueError("initial_in_flight must be at least one batch")
         self.batch_size = int(batch_size)
         self.profile = bool(profile)
+        self.defer_cuda_value_augmentation = defer_cuda_value_augmentation
         self._leased: list[int] = []
         self.transport = FiberTrace3DSharedTensorSlots(
             start_index=0,
             slot_count=int(slot_count),
             patch_shape_zyx=patch_shape_zyx,
             stream_index_map=index_map,
+            volume_dtype=(
+                torch.uint8
+                if self.defer_cuda_value_augmentation == "all"
+                else torch.float32
+            ),
         )
         self.pipeline = OrderedTwoStageSamplePipeline(
             stage1_factory=FiberTrace3DLoadFactory(
@@ -204,7 +227,11 @@ class FiberTrace3DTrainingBatchPipeline:
                 index_map=index_map,
                 profile=profile,
             ),
-            stage2_factory=FiberTrace3DAugmentFactory(config_path, profile=profile),
+            stage2_factory=FiberTrace3DAugmentFactory(
+                config_path,
+                profile=profile,
+                defer_cuda_suffix=self.defer_cuda_value_augmentation,
+            ),
             start_index=0,
             item_count=int(batch_count) * self.batch_size,
             stage1_workers=0,
@@ -233,12 +260,22 @@ class FiberTrace3DTrainingBatchPipeline:
             for _ in range(self.batch_size)
         ]
         indices = [int(result.index) for result in results]
-        volumes, masks = self.transport.batch_tensors(indices)
+        volumes = self.transport.batch_tensors(indices)
         samples: list[FiberTrace3DSample] = []
+        deferred_kernels: list[Any] = []
+        deferred_params: list[Any] = []
         for result in results:
-            sample = result.value
-            if not isinstance(sample, FiberTrace3DSample):
-                raise RuntimeError("training sample pipeline returned an invalid sample")
+            value = result.value
+            if self.defer_cuda_value_augmentation is not None:
+                if not isinstance(value, FiberTrace3DRawSample):
+                    raise RuntimeError("training sample pipeline lost deferred augmentation")
+                sample = value.sample
+                deferred_kernels.append(value.blur_kernels)
+                deferred_params.append(value.augmentation)
+            else:
+                if not isinstance(value, FiberTrace3DSample):
+                    raise RuntimeError("training sample pipeline returned an invalid sample")
+                sample = value
             if self.profile:
                 timings = dict(sample.profile_timings_ms or {})
                 timings.update(
@@ -255,7 +292,16 @@ class FiberTrace3DTrainingBatchPipeline:
         batch = collate_fiber_trace_3d_samples(
             samples,
             volume_batch=volumes,
-            valid_mask_batch=masks,
+            deferred_augmentation_params=(
+                tuple(deferred_params)
+                if self.defer_cuda_value_augmentation is not None
+                else None
+            ),
+            deferred_blur_kernels=(
+                tuple(deferred_kernels)
+                if self.defer_cuda_value_augmentation is not None
+                else None
+            ),
             profile=self.profile,
             total_start=total_start,
             cpu_total_start=cpu_start,
@@ -280,6 +326,7 @@ class _CudaPreparedBatch:
     pinned_batch: FiberTrace3DBatch
     transfer_started: torch.cuda.Event
     transfer_finished: torch.cuda.Event
+    augmentation_finished: torch.cuda.Event
     preparation_finished: torch.cuda.Event
     queued_at: float
     source_wait_ms: float
@@ -314,6 +361,7 @@ class FiberTrace3DCudaBatchPipeline:
         device: torch.device,
         output_stride: int,
         depth: int = 2,
+        value_augmentation_suffix: str | None = None,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("CUDA batch preparation requires a CUDA device")
@@ -324,6 +372,7 @@ class FiberTrace3DCudaBatchPipeline:
         self.device = device
         self.output_stride = int(output_stride)
         self.depth = int(depth)
+        self.value_augmentation_suffix = value_augmentation_suffix
         self.stream = torch.cuda.Stream(device=device)
         self._results: queue.Queue[object] = queue.Queue()
         self._available = threading.Semaphore(self.depth)
@@ -359,10 +408,34 @@ class FiberTrace3DCudaBatchPipeline:
                 with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
                     transfer_started = torch.cuda.Event(enable_timing=True)
                     transfer_finished = torch.cuda.Event(enable_timing=True)
+                    augmentation_finished = torch.cuda.Event(enable_timing=True)
                     preparation_finished = torch.cuda.Event(enable_timing=True)
                     transfer_started.record(self.stream)
                     device_batch = pinned.to(self.device, non_blocking=True)
                     transfer_finished.record(self.stream)
+                    with torch.autocast(device_type="cuda", enabled=False):
+                        if device_batch.deferred_blur_kernels is not None:
+                            if self.value_augmentation_suffix == "all":
+                                if device_batch.deferred_augmentation_params is None:
+                                    raise RuntimeError("CUDA augmentation parameters are missing")
+                                augmented = apply_value_augmentation_batch_3d(
+                                    self.config,
+                                    device_batch.volume,
+                                    device_batch.deferred_augmentation_params,
+                                    device_batch.deferred_blur_kernels,
+                                )
+                            else:
+                                augmented = apply_value_augmentation_suffix_batch_3d(
+                                    device_batch.volume,
+                                    device_batch.deferred_blur_kernels,
+                                )
+                            device_batch = replace(
+                                device_batch,
+                                volume=augmented,
+                                deferred_augmentation_params=None,
+                                deferred_blur_kernels=None,
+                            )
+                    augmentation_finished.record(self.stream)
                     device_batch = materialize_targets(
                         device_batch,
                         self.config,
@@ -375,6 +448,7 @@ class FiberTrace3DCudaBatchPipeline:
                     pinned_batch=pinned,
                     transfer_started=transfer_started,
                     transfer_finished=transfer_finished,
+                    augmentation_finished=augmentation_finished,
                     preparation_finished=preparation_finished,
                     queued_at=time.perf_counter(),
                     source_wait_ms=0.0,
@@ -441,7 +515,10 @@ class FiberTrace3DCudaBatchPipeline:
         result.preparation_finished.synchronize()
         ready_wait_ms = (time.perf_counter() - ready_wait_started) * 1000.0
         transfer_ms = result.transfer_started.elapsed_time(result.transfer_finished)
-        target_ms = result.transfer_finished.elapsed_time(result.preparation_finished)
+        augmentation_ms = result.transfer_finished.elapsed_time(
+            result.augmentation_finished
+        )
+        target_ms = result.augmentation_finished.elapsed_time(result.preparation_finished)
         current_stream = torch.cuda.current_stream(self.device)
         result.batch.record_stream(current_stream)
         profile_timings = dict(result.batch.profile_timings_ms or {})
@@ -454,6 +531,7 @@ class FiberTrace3DCudaBatchPipeline:
             cuda_pipeline_exposed_queue_wait_ms=float(queue_wait_ms),
             cuda_pipeline_exposed_event_wait_ms=float(ready_wait_ms),
             cuda_pipeline_transfer_ms=float(transfer_ms),
+            cuda_pipeline_value_augmentation_ms=float(augmentation_ms),
             cuda_pipeline_target_ms=float(target_ms),
             cuda_pipeline_pinned_bytes=float(result.pinned_bytes),
         )

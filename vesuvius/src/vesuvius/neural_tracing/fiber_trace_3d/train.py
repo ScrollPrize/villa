@@ -1186,7 +1186,6 @@ def compute_losses(
     assert batch.direction_target_sparse is not None
     assert batch.direction_weight_sparse is not None
     assert batch.presence_target is not None
-    assert batch.presence_mask is not None
     output_shape = tuple(int(v) for v in output.shape[-3:])
     target_shape = tuple(int(v) for v in batch.presence_target.shape[-3:])
     if output_shape != target_shape:
@@ -1251,13 +1250,6 @@ def compute_losses(
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
         angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
         selected_presence = pred_presence_sparse[row_index, selected_branch]
-        positive_presence_mask = batch.presence_mask[
-            indices[:, 0],
-            0,
-            indices[:, 1],
-            indices[:, 2],
-            indices[:, 3],
-        ]
         positive_presence_bce = _safe_probability_bce(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(selected_presence),
@@ -1265,7 +1257,6 @@ def compute_losses(
         )
         branch_patch_count = int(pred_presences.shape[0]) * branch_count
         positive_group_index = indices[:, 0] * branch_count + selected_branch
-        positive_mask_f = positive_presence_mask.to(dtype=positive_presence_bce.dtype)
         positive_group_sum = torch.zeros(
             (branch_patch_count,),
             dtype=positive_presence_bce.dtype,
@@ -1275,9 +1266,13 @@ def compute_losses(
         positive_group_sum.scatter_add_(
             0,
             positive_group_index,
-            positive_presence_bce * positive_mask_f,
+            positive_presence_bce,
         )
-        positive_group_count.scatter_add_(0, positive_group_index, positive_mask_f)
+        positive_group_count.scatter_add_(
+            0,
+            positive_group_index,
+            torch.ones_like(positive_presence_bce),
+        )
         positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
             positive_group_sum,
             positive_group_count,
@@ -1303,8 +1298,7 @@ def compute_losses(
         branch1_fraction = pred_presences.sum() * 0.0
 
     presence_target = batch.presence_target.unsqueeze(1).expand_as(pred_presences)
-    presence_mask = batch.presence_mask.unsqueeze(1).expand_as(pred_presences)
-    negative_mask = (presence_target <= 0.5) & presence_mask
+    negative_mask = presence_target <= 0.5
     negative_presence_bce = _safe_probability_bce(
         pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
         torch.zeros_like(pred_presences),
@@ -1352,7 +1346,6 @@ def compute_conditioned_losses(
     assert batch.direction_target_sparse is not None
     assert batch.direction_weight_sparse is not None
     assert batch.presence_target is not None
-    assert batch.presence_mask is not None
     if not _model_uses_conditioned_decoder(model):
         raise ValueError("compute_conditioned_losses requires conditioned decoder model mode")
     if float(positive_query_weight) < 0.0 or not math.isfinite(float(positive_query_weight)):
@@ -1421,19 +1414,11 @@ def compute_conditioned_losses(
             1.0,
         )
         angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
-        positive_presence_mask = batch.presence_mask.to(device=zero_output.device)[
-            indices[:, 0],
-            0,
-            indices[:, 1],
-            indices[:, 2],
-            indices[:, 3],
-        ]
         positive_presence_bce = _safe_probability_bce(
             pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(pred_presence),
             reduction="none",
         )
-        positive_mask_f = positive_presence_mask[:, None].to(dtype=positive_presence_bce.dtype)
         group_index = (
             indices[:, 0, None] * positive_query_count
             + torch.arange(
@@ -1451,12 +1436,12 @@ def compute_conditioned_losses(
         positive_group_sum.scatter_add_(
             0,
             group_index.reshape(-1),
-            (positive_presence_bce * positive_mask_f).reshape(-1),
+            positive_presence_bce.reshape(-1),
         )
         positive_group_count.scatter_add_(
             0,
             group_index.reshape(-1),
-            positive_mask_f.expand_as(positive_presence_bce).reshape(-1),
+            torch.ones_like(positive_presence_bce).reshape(-1),
         )
         positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
             positive_group_sum,
@@ -1498,14 +1483,13 @@ def compute_conditioned_losses(
         torch.zeros_like(negative_presence),
         reduction="none",
     )
-    negative_mask_f = batch.presence_mask.to(
-        device=negative_presence_bce.device,
-        dtype=negative_presence_bce.dtype,
-    )[:, None].expand_as(negative_presence_bce)
-    negative_group_sum = (negative_presence_bce * negative_mask_f).sum(
+    negative_group_sum = negative_presence_bce.sum(
         dim=(2, 3, 4, 5)
     ).reshape(-1)
-    negative_group_count = negative_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+    negative_group_count = torch.full_like(
+        negative_group_sum,
+        float(depth * height * width),
+    )
     negative_presence_loss, negative_presence_group_count = _mean_over_nonempty_groups(
         negative_group_sum,
         negative_group_count,
@@ -2192,7 +2176,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
         volume=batch.volume[start:stop],
-        valid_mask=batch.valid_mask[start:stop],
+        valid_mask=None if batch.valid_mask is None else batch.valid_mask[start:stop],
         cp_local_zyx=batch.cp_local_zyx[start:stop],
         crop_origin_zyx=batch.crop_origin_zyx[start:stop],
         stream_indices=batch.stream_indices[start:stop],
@@ -2334,6 +2318,12 @@ def run_training(
             "profile_replay_batch and profile_replay_cpu_batch are mutually exclusive"
         )
     cuda_batch_depth = _training_cuda_batch_pipeline_depth(training)
+    cuda_value_augmentation = _training_cuda_value_augmentation(training)
+    if cuda_value_augmentation is not None and cuda_batch_depth <= 0:
+        raise ValueError(
+            "sample_pipeline_cuda_value_augmentation requires "
+            "sample_pipeline_cuda_prefetch_depth > 0"
+        )
     if cuda_batch_depth > 0:
         if profile_replay_batch or profile_replay_cpu_batch:
             raise ValueError("CUDA batch preparation is incompatible with replay modes")
@@ -2870,6 +2860,7 @@ def run_training(
             sample_index_limit=sample_index_limit,
             sample_mode="random",
             profile=profile_loader,
+            defer_cuda_value_augmentation=cuda_value_augmentation,
         )
         train_dataloader = train_iterator
     else:
@@ -2894,6 +2885,7 @@ def run_training(
             device=device,
             output_stride=_model_output_stride(raw_model),
             depth=cuda_batch_depth,
+            value_augmentation_suffix=cuda_value_augmentation,
         )
         train_iterator = cuda_batch_pipeline
         train_dataloader = cuda_batch_pipeline
@@ -2995,6 +2987,11 @@ def run_training(
                     device=device,
                     output_stride=_model_output_stride(raw_model),
                 )
+            cuda_value_augmentation_ms = float(
+                (batch.profile_timings_ms or {}).get(
+                    "cuda_pipeline_value_augmentation_ms", 0.0
+                )
+            )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
             with profile.stage("forward_loss"), _autocast_context(mixed_precision):
@@ -3037,6 +3034,7 @@ def run_training(
                     f"selected_score={losses['selected_score_mean']:.3f} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"to_device_ms={to_device_ms:.1f} "
+                    f"value_aug_cuda_ms={cuda_value_augmentation_ms:.1f} "
                     f"target_ms={target_ms:.1f} "
                     f"fw_bw_step_ms={step_ms:.1f}",
                     flush=True,
@@ -3052,6 +3050,11 @@ def run_training(
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/load_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
+                writer.add_scalar(
+                    "timing/value_augmentation_cuda_ms",
+                    cuda_value_augmentation_ms,
+                    step,
+                )
                 writer.add_scalar("timing/target_ms", target_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
             train_vis_due = sample_vis_interval > 0 and (
@@ -3127,6 +3130,7 @@ def run_training(
             if test_due and cuda_batch_pipeline is not None:
                 cuda_batch_pipeline.resume()
             profile.end(load_ms=load_ms, wait_ms=wait_ms, to_device_ms=to_device_ms,
+                        value_augmentation_cuda_ms=cuda_value_augmentation_ms,
                         target_ms=target_ms, fw_bw_step_ms=step_ms,
                         loss_total=losses["total"],
                         loader_profile=batch.profile_timings_ms if profile_loader else None)
@@ -3904,7 +3908,11 @@ def _make_train_sample_3d_sheet(
             ),
         )
     volume = batch.volume[0, 0].detach().cpu().numpy()
-    valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
+    valid = (
+        np.ones(volume.shape, dtype=bool)
+        if batch.valid_mask is None
+        else batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
+    )
     supervised_presence = F.max_pool3d(
         batch.presence_target[0:1],
         kernel_size=3,
@@ -4050,7 +4058,11 @@ def _make_train_sample_3d_sheet(
     rows.append(
         _make_oblique_sample_row(
             volume_czyx=batch.volume[0],
-            valid_czyx=batch.valid_mask[0],
+            valid_czyx=(
+                torch.ones_like(batch.volume[0], dtype=torch.bool)
+                if batch.valid_mask is None
+                else batch.valid_mask[0]
+            ),
             target_czyx=target_czyx,
             output_czyx=output_sample,
             segments_start_zyx=segments_start_zyx,
@@ -4068,7 +4080,11 @@ def _make_train_sample_3d_sheet(
     rows.append(
         _make_oblique_sample_row(
             volume_czyx=batch.volume[0],
-            valid_czyx=batch.valid_mask[0],
+            valid_czyx=(
+                torch.ones_like(batch.volume[0], dtype=torch.bool)
+                if batch.valid_mask is None
+                else batch.valid_mask[0]
+            ),
             target_czyx=target_czyx,
             output_czyx=output_sample,
             segments_start_zyx=segments_start_zyx,
@@ -4542,6 +4558,18 @@ def _training_cuda_batch_pipeline_depth(training: dict[str, Any]) -> int:
             "training.sample_pipeline_cuda_prefetch_depth must be nonnegative"
         )
     return depth
+
+
+def _training_cuda_value_augmentation(training: dict[str, Any]) -> str | None:
+    mode = training.get("sample_pipeline_cuda_value_augmentation")
+    if mode in {None, False}:
+        return None
+    if mode not in {"blur", "all"}:
+        raise ValueError(
+            "training.sample_pipeline_cuda_value_augmentation must be "
+            "blur or all"
+        )
+    return str(mode)
 
 
 def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:

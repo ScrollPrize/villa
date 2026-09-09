@@ -441,13 +441,21 @@
   loudly. The returned sampler `valid_mask` is only geometry/sample coverage;
   it must not be treated as proof that requested-level data was used.
 - V0 3D value augmentations support normalization, brightness, contrast, gamma,
-  noise, and separable isotropic Gaussian blur. Opt-in anisotropic blur is
+  noise, and separable isotropic Gaussian blur. Isotropic sigma is sampled
+  independently and uniformly from zero through `augment_blur_sigma`. Opt-in
+  anisotropic blur is
   configured with `augment_anisotropic_blur_probability`,
   `augment_anisotropic_blur_sigma_along`,
   `augment_anisotropic_blur_sigma_across`,
   `augment_anisotropic_blur_orientation`, and
-  `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
-  coordinate sampling, not a geometric transform.
+  `augment_anisotropic_blur_roll_degrees`. Along and across sigmas are sampled
+  independently and uniformly from zero through their configured maxima. It is
+  a value augmentation after coordinate sampling, not a geometric transform.
+  Isotropic blur runs first as three separable axis passes; directional blur
+  then runs as one directly evaluated rectangular discrete 3D Gaussian.
+  Directional kernels use deterministic greedy groups capped at 1.25x dense
+  padding inflation, execute serially on the existing CUDA preparation stream,
+  and preserve original sample order.
 - The active 3D multi-direction experiment uses
   `model_3d.conditioned_decoder_enabled: true`. A shared spatial 3D U-Net
   emits a latent feature volume whose width is
@@ -473,8 +481,8 @@
 - Each seven-channel prediction's six direction channels use Lasagna's double-angle projection layout:
   `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
   `dir0_x,dir1_x` for `(ty,tz)`.
-- Direction supervision is computed from the transformed 3D line tangent and is
-  masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
+- Direction supervision is computed from the transformed 3D line tangent only
+  at positive fiber-neighborhood voxels. Projection-magnitude weighting
   may downweight channels whose projection is nearly degenerate.
 - In conditioned mode, sparse positive supervision evaluates two positive
   queries per supervised point with equal weight: the zero/unconditioned query,
@@ -486,7 +494,7 @@
   and the local sparse point coordinate, not from loader order or global RNG.
 - In conditioned mode, dense negative presence supervision decodes both the
   zero query and one deterministic random direction query per patch over all
-  `presence_mask` locations, including positive pixels by design. The weak
+  output locations, including positive pixels by design. The weak
   dense negative BCE at positive pixels is intentional; under the configured
   positive/negative component weights it is equivalent to a softened positive
   target, not contradictory masked supervision.
@@ -729,13 +737,14 @@
   separately. Equivalent sample rates use exactly 128^3 output coordinates for
   this reference and codec rates are N/A when no codec work occurs.
 - 3D DataLoader workers must not materialize full dense direction/presence
-  target tensors. Worker batches carry image/valid tensors plus compact target
+  target tensors. Worker batches carry images plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata plus
   visualization-only transformed line segments, and NML dense-line samples carry
   transformed output-space line segments with precomputed patch bboxes for
-  supervision. Dense `presence_target` and `presence_mask` are created by
+  supervision. Dense `presence_target` is created by
   `fiber_trace_3d.targets.materialize_targets(...)` in the main training process
-  on the training device. Direction supervision is represented sparsely as
+  on the training device. No dense validity or loss mask is collated, pinned,
+  or transferred with a training batch. Direction supervision is represented sparsely as
   `direction_indices_bzyx`, `direction_target_sparse`, and
   `direction_weight_sparse`; normal training must gather predictions at those
   supervised line/CP voxels instead of creating full-patch dense six-channel
@@ -752,8 +761,8 @@
   fiber centerline voxels only, without a radius-expanded distance-to-segment
   tube. Non-NML sources supervise only the sampled CP neighborhood using
   `presence_radius_voxels`; that radius does not apply to NML centerline
-  targets. Presence edge masking applies only to CP-only samples; NML dense-line
-  samples supervise presence over the full valid patch. Lasagna 3x2 direction
+  targets. Every output voxel not covered by a positive target is a presence
+  negative; there is no edge or validity loss mask. Lasagna 3x2 direction
   encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
   Under DDP this count is per rank. `0` is the explicit serial/debug path.
@@ -770,7 +779,7 @@
   generation, batch stacking, worker wall time, and worker CPU time. Dense
   target work is reported separately as main-process GPU target materialization
   timings (`target_ms`, `gpu_ms`, `line_idx`, `cp_idx`, `scatter`, `dir_enc`,
-  `gpu_mask`, `linePts`, `dirPts`, and `posK`). With worker processes, the
+  `linePts`, `dirPts`, and `posK`). With worker processes, the
   first `loader_workers` benchmark rows can include worker-local loader
   construction and should not be used as steady-state throughput.
 - 3D prefetch computes chunk dependencies from a CP-centered selected-level
@@ -1799,8 +1808,8 @@
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Value augmentations after VC3D image loading should run as batched tensor
-  operations where possible. Variable per-patch Gaussian blur uses grouped
-  batched convolutions instead of one CUDA convolution loop per patch.
+  operations where possible. Independently randomized isotropic and directional
+  per-patch Gaussian blur uses deterministic grouped batched convolutions.
   Per-patch operations remain acceptable only when required to preserve behavior,
   such as deterministic per-patch noise streams.
 - VC3D coordinate sampling remains the explicit image I/O boundary unless the
@@ -2858,32 +2867,22 @@
   difference at most one. No fast-math flags are permitted, and scalar portable
   behavior remains available on supported Ubuntu/macOS amd64/arm64 builds.
 
-# Native Fiber3D anisotropic augmentation
+# Fiber3D native value-transform boundary
 
-- `value_augmentation_backend = auto|native|torch` controls oriented blur.
-  `auto` uses the native implementation for contiguous gradient-free float32
-  CPU tensors and falls back only when the binding is absent or the tensor
-  contract is unsupported. Explicit `native` fails clearly; native validation
-  or runtime errors are never hidden by fallback. `torch` is the reference.
-- Native oriented blur is a standalone, GIL-free, one-calling-thread primitive.
-  It preserves the three sequential principal/perpendicular/perpendicular
-  passes, strict stable-basis branch, Gaussian radius and normalized kernels,
-  and replicate-border semantics. Each pass precomputes and merges its constant
-  trilinear stencil and uses two reusable float32 buffers. It must not create
-  full coordinate grids, internally parallelize, mutate its input, or merge
-  across passes.
-- Native/reference comparison uses full 128-cubed, non-power-of-two, border,
-  singleton, impulse, ramp, high-contrast random, and basis-threshold fixtures.
-  Maximum error must be no more than `1e-4 * max(1,max_abs_input)` and mean
-  error no more than `3e-6 * max(1,max_abs_input)`. Shape, float32 dtype,
-  contiguity, determinism, masking, parameter draws and other value transforms
-  remain unchanged.
-- The same backend may use the directional primitive for axis-aligned
-  isotropic blur and a fused native normalization/contrast/brightness/gamma
-  transform. Statistics remain valid-mask-only; empty and constant masks retain
-  reference behavior. Seeded noise remains in Torch. Native fused-transform
-  error is bounded by `1e-6 * max(1,max_abs_reference)` maximum and
-  `1e-7 * max(1,max_abs_reference)` mean on reference fixtures.
+- `value_augmentation_backend = auto|native|torch` controls only the CPU
+  normalization/contrast/brightness/gamma prefix. `auto` uses the native
+  implementation for contiguous gradient-free float32 CPU tensors and falls
+  back when the binding or tensor contract is unavailable. Explicit `native`
+  fails clearly; `torch` is the reference path.
+- Invalid source coordinates are zero-filled by coordinate sampling. Training
+  then normalizes and transforms the complete sampled patch; source validity is
+  discarded and must not cross the shared sample transport. Until the native
+  binding exposes an unmasked entry point, each worker may reuse one immutable
+  all-valid compatibility array local to that worker.
+- Seeded noise remains in Torch. Both CPU and deferred CUDA blur use the shared
+  sequential isotropic/direct-rectangular convolution implementation described
+  above; the old native interpolated directional-blur primitive is not used by
+  Fiber3D training.
 
 # Bounded Fiber3D sample transport
 
@@ -2900,7 +2899,7 @@
   batches fail. Slot storage size is fixed at startup from patch shape and the
   maximum in-flight count.
 - Shared transport must preserve deterministic ordered delivery, sample values,
-  masks and metadata. Worker native compute remains single-threaded and
+  and metadata. It stores no dense validity mask. Worker native compute remains single-threaded and
   GIL-free; transport optimization may not alter augmentation draws or math.
 - Split Fiber3D loading and value augmentation may use one shared process pool.
   Workers claim only runnable work: load indices are monotonically admitted and
@@ -2934,3 +2933,47 @@
   only for its selected preparation event and receives preparation failures in
   order. Evaluation pauses and synchronizes preparation before starting.
   Replay modes and non-CUDA training reject asynchronous preparation.
+
+# Fiber3D CUDA value-augmentation suffix
+
+- `training.sample_pipeline_cuda_value_augmentation` is optional and accepts
+  `blur` or `all`. It requires the shared sample pipeline, CUDA
+  training, and positive `sample_pipeline_cuda_prefetch_depth`; omission keeps
+  the established all-CPU value-augmentation path.
+- Value augmentation retains its canonical order: full-patch normalization,
+  contrast, brightness, gamma, canonical-stream-seeded noise, isotropic blur,
+  and directional blur. Deferral creates
+  one contiguous CPU-prefix/CUDA-suffix cut; data crosses pinned H2D staging
+  once and never returns to CPU.
+- Deferred samples retain their immutable augmentation parameters through the
+  ordered shared-slot pipeline. Slot leases remain live through pinned copying.
+  Parameter draws remain keyed by canonical stream index and independent of
+  worker, queue, rank, batching, and timing.
+- `blur` moves both blur stages to the CUDA preparation stream. Source validity
+  is consumed and discarded before batch collation; there is no final image or
+  loss masking operation.
+- `all` keeps the sampled volume as native `uint8` through shared-memory slots,
+  pinned staging, and H2D transfer. The preparation stream then converts it to
+  FP32 and applies normalization, contrast, brightness, gamma, noise, isotropic
+  blur, and directional blur before target construction. The CPU worker only
+  generates transformed coordinates and performs the native VC3D volume sample.
+- Coordinate generation remains on CPU while VC3D sampling consumes a dense
+  coordinate field on CPU. Generating that field on CUDA would add a roughly
+  24 MiB device-to-host transfer per 128-cubed sample and is therefore not a
+  valid optimization without also moving or fusing the sampler.
+- Batched isotropic CUDA blur uses grouped separable convolution with a common
+  maximum radius, independently sampled per-sample normalized kernels,
+  replicate borders, and delta kernels for zero sigma. Batched directional blur
+  uses directly evaluated rectangular 3D kernels and deterministic greedy
+  grouping with a 1.25x padding-inflation ceiling. Groups execute serially on
+  the existing preparation stream and scatter back to original sample order.
+- CUDA augmentation operates in FP32 outside autocast. Its convolution
+  temporaries belong only to the one batch actively executing on the preparation
+  stream and are not retained in queued prepared batches. The preparation event
+  orders augmentation before target construction and ordinary batch delivery.
+- Same-backend repeated execution with a fixed environment must be deterministic.
+  CPU/CUDA results are tolerance-equivalent rather than promised bitwise equal.
+  CUDA noise is seeded from the canonical sample stream index, so results do not
+  depend on batch partitioning or worker scheduling.
+  CUDA failures propagate through the existing preparation failure channel;
+  pause and close synchronize in-flight augmentation with the preparation stream.

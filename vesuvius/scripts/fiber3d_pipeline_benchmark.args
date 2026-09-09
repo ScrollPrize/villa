@@ -9,9 +9,9 @@
 --shared-workers
 128
 --initial-in-flight
-16
+128
 --shared-load-affinity-workers
-87
+120
 --raw-queue-capacity
 128
 --result-queue-capacity
@@ -32,3 +32,5 @@ native
 --value-augmentation-backend
 native
 --shared-tensor-slots
+--defer-cuda-augmentation
+all

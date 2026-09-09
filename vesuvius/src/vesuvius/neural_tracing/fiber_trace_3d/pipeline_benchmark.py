@@ -25,6 +25,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DSample,
     FiberTrace3DSharedTensorSlots,
     load_config,
+    prepare_fiber_trace_3d_cuda_suffix,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
     FiberTrace3DAugmentFactory,
@@ -63,7 +64,13 @@ def _assert_samples_equal(actual: FiberTrace3DSample, expected: FiberTrace3DSamp
         if getattr(actual, name) != getattr(expected, name):
             raise AssertionError(f"pipeline sample field differs: {name}")
     for name in tensor_fields:
-        if not torch.equal(getattr(actual, name), getattr(expected, name)):
+        actual_value = getattr(actual, name)
+        expected_value = getattr(expected, name)
+        if actual_value is None or expected_value is None:
+            if actual_value is not expected_value:
+                raise AssertionError(f"pipeline sample tensor differs: {name}")
+            continue
+        if not torch.equal(actual_value, expected_value):
             raise AssertionError(f"pipeline sample tensor differs: {name}")
 
 
@@ -322,6 +329,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override Fiber3D value augmentation backend",
     )
+    parser.add_argument(
+        "--defer-cuda-augmentation",
+        choices=("blur", "all"),
+        default=None,
+        help="emit production CUDA descriptors and stop before H2D",
+    )
     parser.add_argument("--multiprocessing-context", choices=("spawn", "forkserver"), default="forkserver")
     parser.add_argument("--startup-timeout-seconds", type=float, default=180.0)
     parser.add_argument("--no-progress-timeout-seconds", type=float, default=300.0)
@@ -422,6 +435,12 @@ def main(argv: list[str] | None = None) -> int:
             }
             if bool(args.raw_only):
                 verify_expected[index] = verifier.load_raw_sample(index, **load_kwargs)
+            elif args.defer_cuda_augmentation is not None:
+                verify_expected[index] = prepare_fiber_trace_3d_cuda_suffix(
+                    verifier.config,
+                    verifier.load_raw_sample(index, **load_kwargs),
+                    mode=str(args.defer_cuda_augmentation),
+                )
             else:
                 verify_expected[index] = verifier.load_sample(index, **load_kwargs)
     verify_seconds = time.perf_counter() - verify_started
@@ -433,6 +452,11 @@ def main(argv: list[str] | None = None) -> int:
             start_index=int(args.start_index),
             slot_count=int(args.max_in_flight),
             patch_shape_zyx=tuple(int(v) for v in config_payload["patch_shape_zyx"]),
+            volume_dtype=(
+                torch.uint8
+                if args.defer_cuda_augmentation == "all"
+                else torch.float32
+            ),
         )
         if bool(args.shared_tensor_slots)
         else None
@@ -448,7 +472,10 @@ def main(argv: list[str] | None = None) -> int:
         stage2_factory=(
             None
             if bool(args.raw_only) or bool(args.fused)
-            else FiberTrace3DAugmentFactory(str(config_path))
+            else FiberTrace3DAugmentFactory(
+                str(config_path),
+                defer_cuda_suffix=args.defer_cuda_augmentation,
+            )
         ),
         start_index=int(args.start_index),
         item_count=total_items,
@@ -486,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         f"raw_only={bool(args.raw_only)} "
         f"fused={bool(args.fused)} "
         f"shared_slots={bool(args.shared_tensor_slots)} "
+        f"defer_cuda_augmentation={args.defer_cuda_augmentation or 'none'} "
         f"raw_queue={args.raw_queue_capacity} result_queue={args.result_queue_capacity} "
         f"in_flight={args.max_in_flight} batch={batch_size} "
         f"warmup={args.warmup_samples} measure={args.samples} native_threads=1",
@@ -511,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             all_completion_ns.append(int(result.stage2_finished_ns))
             expected = verify_expected.get(int(result.index))
             if expected is not None:
-                if bool(args.raw_only):
+                if bool(args.raw_only) or args.defer_cuda_augmentation is not None:
                     _assert_raw_samples_equal(result.value, expected)
                 else:
                     _assert_samples_equal(result.value, expected)
@@ -519,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             if ordinal >= int(args.warmup_samples):
                 timings = (
                     result.value.sample.profile_timings_ms
-                    if bool(args.raw_only)
+                    if bool(args.raw_only) or args.defer_cuda_augmentation is not None
                     else result.value.profile_timings_ms
                 ) or {}
                 measured.append(
@@ -551,13 +579,20 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     stack_started = time.perf_counter()
                     if transport is not None:
-                        volumes, masks = transport.batch_tensors(
+                        volumes = transport.batch_tensors(
                             [item.index for item in batch]
                         )
                     else:
-                        volumes = torch.stack([item.value.volume for item in batch], dim=0)
-                        masks = torch.stack([item.value.valid_mask for item in batch], dim=0)
-                    del volumes, masks
+                        volumes = torch.stack(
+                            [
+                                item.value.sample.volume
+                                if args.defer_cuda_augmentation is not None
+                                else item.value.volume
+                                for item in batch
+                            ],
+                            dim=0,
+                        )
+                    del volumes
                     batch_stack_ms.append((time.perf_counter() - stack_started) * 1000.0)
                     assert batch_started is not None
                     batch_wait_ms.append((stack_started - batch_started) * 1000.0)
@@ -605,7 +640,9 @@ def main(argv: list[str] | None = None) -> int:
     measured_end_to_end_rate = len(measured) / measured_end_to_end_seconds
 
     voxel_count = math.prod(int(value) for value in config_payload["patch_shape_zyx"])
-    raw_sample_bytes = voxel_count * (4 + 1)
+    raw_sample_bytes = voxel_count * (
+        1 if args.defer_cuda_augmentation == "all" else 4
+    )
     conservative_bytes_per_credit = raw_sample_bytes * 2
     result: dict[str, Any] = {
         "schema_version": 1,
@@ -628,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         ),
         "raw_only": bool(args.raw_only),
+        "defer_cuda_augmentation": args.defer_cuda_augmentation,
         "fused": bool(args.fused),
         "shared_tensor_slots": bool(args.shared_tensor_slots),
         "shared_tensor_slot_count": int(args.max_in_flight) if transport is not None else 0,

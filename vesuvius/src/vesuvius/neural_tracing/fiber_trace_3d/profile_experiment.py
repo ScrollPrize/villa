@@ -23,8 +23,9 @@ def summarize_experiment(experiment):
                     and r["step"] % 100 != 0]
         ranks[path.stem] = {
             "rows": len(rows),
-            "steady": {key: distribution(r[key] for r in selected)
+            "steady": {key: distribution(r[key] for r in selected if key in r)
                        for key in ("iteration_wall_ms", "wait_ms", "to_device_ms",
+                                   "value_augmentation_cuda_ms",
                                    "target_ms", "fw_bw_step_ms", "forward_loss_wall_ms",
                                    "backward_wall_ms", "optimizer_wall_ms", "scalar_reduce_sync_wall_ms")},
             "step1": rows[0] if rows else None,
@@ -62,6 +63,12 @@ def main():
         help="prepare two future pinned/CUDA batches outside the training thread",
     )
     parser.add_argument(
+        "--gpu-value-augmentation",
+        choices=("blur", "all"),
+        default=None,
+        help="defer the selected value-augmentation suffix to CUDA preparation",
+    )
+    parser.add_argument(
         "--replay-batch",
         action="store_true",
         help="capture one prepared GPU batch per rank, stop loaders, and replay it",
@@ -81,6 +88,8 @@ def main():
         parser.error("--replay-batch and --replay-cpu-batch are mutually exclusive")
     if args.async_batch_preparation and not args.sample_pipeline:
         parser.error("--async-batch-preparation requires --sample-pipeline")
+    if args.gpu_value_augmentation and not args.async_batch_preparation:
+        parser.error("--gpu-value-augmentation requires --async-batch-preparation")
     if args.async_batch_preparation and (args.replay_batch or args.replay_cpu_batch):
         parser.error("--async-batch-preparation is incompatible with replay modes")
     if args.steps < 30 or args.trace_steps < 0:
@@ -109,6 +118,8 @@ def main():
         suffix += "_sample_pipeline"
     if args.async_batch_preparation:
         suffix += "_async_batch"
+    if args.gpu_value_augmentation:
+        suffix += f"_gpu_{args.gpu_value_augmentation.replace('-', '_')}"
     experiment = args.output.resolve() / f"profile_2gpu_{args.compile_mode}{suffix}_{stamp}"
     experiment.mkdir(parents=True, exist_ok=False)
     training = config["training"]
@@ -128,12 +139,18 @@ def main():
     if args.sample_pipeline:
         training.update(
             sample_pipeline_workers=128,
-            sample_pipeline_load_affinity_workers=87,
+            sample_pipeline_load_affinity_workers=(
+                87
+            ),
             sample_pipeline_slots=512,
             sample_pipeline_initial_in_flight=16,
         )
     if args.async_batch_preparation:
         training["sample_pipeline_cuda_prefetch_depth"] = 2
+    if args.gpu_value_augmentation:
+        training["sample_pipeline_cuda_value_augmentation"] = str(
+            args.gpu_value_augmentation
+        )
     throughput_only = bool(
         args.throughput_only or args.replay_batch or args.replay_cpu_batch
     )
@@ -170,6 +187,7 @@ def main():
                 "profile_loader": args.profile_loader,
                 "sample_pipeline": args.sample_pipeline,
                 "async_batch_preparation": args.async_batch_preparation,
+                "gpu_value_augmentation": args.gpu_value_augmentation,
                 "replay_batch": args.replay_batch,
                 "replay_cpu_batch": args.replay_cpu_batch,
                 "throughput_only": throughput_only}

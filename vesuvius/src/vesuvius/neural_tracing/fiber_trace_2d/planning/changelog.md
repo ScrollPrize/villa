@@ -1,5 +1,11 @@
-# 2026-09-08
+## 2026-09-08 — Fiber3D CUDA augmentation suffix
 
+- Added the Fiber3D `all` CUDA value-augmentation suffix. Native workers
+  transport sampled patches as `uint8`, while normalization, intensity
+  transforms, deterministic noise, and Gaussian blurs execute in FP32 on the
+  asynchronous CUDA preparation stream. The warm 128-worker producer reached
+  339.56 samples/s; matched two-H100 training reached 88.020 samples/s globally
+  with 0.855ms mean H2D time.
 - Added bounded two-batch-ahead pinned staging, asynchronous H2D, and CUDA
   target preparation to the shared Fiber3D training pipeline. Two-GPU native
   stride-4 throughput increased from 83.812 to 91.719 samples/s.
@@ -484,3 +490,14 @@
   averaged 83.81 samples/s on two GPUs versus 60.12 for the old DataLoader.
 - Added CPU-batch replay profiling, measuring an 88.22 samples/s
   transfer/target/model ceiling and isolating the old producer as the main gap.
+## 2026-09-08 — Independent rectangular Fiber3D blur
+
+- Replaced interpolated directional blur with independently randomized
+  separable isotropic and directly evaluated rectangular directional Gaussian
+  kernels, using deterministic low-overhead greedy Conv3d grouping.
+- Removed dense validity/loss masks from batch collation, device transfer,
+  target materialization, and free/conditioned losses; loaded GT lines define
+  positives and every other output voxel is a presence negative.
+- Added reusable actual-distribution blur benchmarks and focused CPU/CUDA
+  regression coverage. The final two-H100 path measured 88.487 samples/s versus
+  the 95.708 samples/s model-only ceiling.

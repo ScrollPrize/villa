@@ -64,11 +64,23 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DSharedTensorSlots,
     _TARGET_MODE_CP_ONLY,
     _TARGET_MODE_DENSE_LINE,
-    _anisotropic_blur_3d,
+    _Augment3DParams,
+    _BlurKernels3D,
+    _DirectGaussianKernel3D,
+    _apply_blur_kernels_3d,
+    _apply_value_augmentation_suffix_3d,
+    _build_blur_kernels_3d,
+    _directional_gaussian_kernel_3d,
+    _directional_kernel_groups,
+    _gaussian_kernel_1d,
     _gaussian_kernel1d,
     _normalize_image,
+    apply_value_augmentation_3d,
+    apply_value_augmentation_batch_3d,
+    apply_value_augmentation_suffix_batch_3d,
     config_from_mapping,
     load_config,
+    prepare_fiber_trace_3d_cuda_suffix,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
     DistributedSampleIndex,
@@ -327,6 +339,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
     _training_cuda_batch_pipeline_depth,
+    _training_cuda_value_augmentation,
     _test_batch_take,
     _validate_snapshot_intervals,
     _write_3d_sample_sheet,
@@ -341,6 +354,20 @@ def test_training_cuda_batch_pipeline_depth_defaults_off_and_validates() -> None
     with pytest.raises(ValueError, match="must be nonnegative"):
         _training_cuda_batch_pipeline_depth(
             {"sample_pipeline_cuda_prefetch_depth": -1}
+        )
+
+
+def test_training_cuda_value_augmentation_validates_suffix() -> None:
+    assert _training_cuda_value_augmentation({}) is None
+    assert _training_cuda_value_augmentation(
+        {"sample_pipeline_cuda_value_augmentation": "blur"}
+    ) == "blur"
+    assert _training_cuda_value_augmentation(
+        {"sample_pipeline_cuda_value_augmentation": "all"}
+    ) == "all"
+    with pytest.raises(ValueError, match="must be blur or all"):
+        _training_cuda_value_augmentation(
+            {"sample_pipeline_cuda_value_augmentation": "noise"}
         )
 
 
@@ -750,7 +777,12 @@ def test_split_raw_and_value_augmentation_matches_composed_sample() -> None:
         "target_segment_bbox_hi_zyx",
         "target_tangent_zyx",
     ):
-        assert torch.equal(getattr(staged, name), getattr(combined, name)), name
+        staged_value = getattr(staged, name)
+        combined_value = getattr(combined, name)
+        if staged_value is None or combined_value is None:
+            assert staged_value is combined_value, name
+        else:
+            assert torch.equal(staged_value, combined_value), name
     assert staged.profile_timings_ms is None
 
 
@@ -861,7 +893,7 @@ def test_shared_tensor_slots_round_trip_and_reject_stale_generation() -> None:
     payload = slots.encode(5, raw, final=False)
     restored = slots.decode(5, payload, final=False)
     assert torch.equal(restored.sample.volume, raw.sample.volume)
-    assert torch.equal(restored.sample.valid_mask, raw.sample.valid_mask)
+    assert restored.sample.valid_mask is None
     assert restored.sample.volume.data_ptr() == slots.volumes[0].data_ptr()
     assert torch.equal(restored.sample.target_tangent_zyx, raw.sample.target_tangent_zyx)
 
@@ -883,9 +915,8 @@ def test_shared_tensor_slots_expose_zero_copy_contiguous_batch() -> None:
         raw = loader.load_raw_sample(index)
         slots.encode(index, raw, final=False)
         expected.append(raw.sample.volume)
-    volumes, masks = slots.batch_tensors([3, 4])
+    volumes = slots.batch_tensors([3, 4])
     assert volumes.shape == (2, 1, 8, 8, 8)
-    assert masks.shape == (2, 1, 8, 8, 8)
     assert volumes.data_ptr() == slots.volumes[0].data_ptr()
     assert torch.equal(volumes[0], expected[0])
     assert torch.equal(volumes[1], expected[1])
@@ -1749,7 +1780,7 @@ def test_loader_clips_long_label_segments_to_patch_domain() -> None:
     assert batch.presence_target[0, 0, int(cp[0]), off_line_y, far_on_segment_x] == 0.0
 
 
-def test_nml_dense_line_presence_mask_covers_patch_edges() -> None:
+def test_nml_dense_line_presence_ignores_obsolete_edge_mask() -> None:
     loader = _long_segment_loader(
         source_format="nml",
         presence_negative_edge_margin_voxels=4,
@@ -1760,9 +1791,8 @@ def test_nml_dense_line_presence_mask_covers_patch_edges() -> None:
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
     z = int(cp[0])
     y = int(cp[1])
-    assert bool(batch.presence_mask[0, 0, z, y, 0])
+    assert batch.presence_mask is None
     assert batch.presence_target[0, 0, z, y, 0] > 0.5
-    assert bool(batch.presence_mask[0, 0, 0, 0, 0])
     assert batch.presence_target[0, 0, 0, 0, 0] == 0.0
 
 
@@ -1778,7 +1808,7 @@ def test_nml_dense_line_batch_keeps_cp_tangent_for_oblique_visuals() -> None:
     )
 
 
-def test_cp_only_presence_mask_keeps_edge_exclusion() -> None:
+def test_cp_only_presence_has_no_edge_exclusion_mask() -> None:
     loader = _long_segment_loader(
         source_format=None,
         presence_negative_edge_margin_voxels=4,
@@ -1786,9 +1816,9 @@ def test_cp_only_presence_mask_keeps_edge_exclusion() -> None:
     batch = _load_materialized_batch(loader, 0, sample_mode="flat")
 
     assert int(batch.target_modes[0]) == _TARGET_MODE_CP_ONLY
-    assert not bool(batch.presence_mask[0, 0, 0, 0, 0])
+    assert batch.presence_mask is None
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
-    assert bool(batch.presence_mask[0, 0, int(cp[0]), int(cp[1]), int(cp[2])])
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
 
 
 def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
@@ -2119,7 +2149,8 @@ def test_native_geometry_preserves_sampled_patch() -> None:
     native = _loader_with_mapping({**common, "geometry_backend": "native"})
     eager_raw = eager.load_raw_sample(2, profile=True)
     native_raw = native.load_raw_sample(2, profile=True)
-    assert torch.equal(native_raw.sample.valid_mask, eager_raw.sample.valid_mask)
+    assert native_raw.sample.valid_mask is None
+    assert eager_raw.sample.valid_mask is None
     difference = torch.abs(
         native_raw.sample.volume.to(torch.int16)
         - eager_raw.sample.volume.to(torch.int16)
@@ -2162,108 +2193,306 @@ def test_native_geometry_binding_validates_arguments() -> None:
         )
 
 
-def test_anisotropic_blur_spreads_along_configured_axis() -> None:
-    volume = torch.zeros((9, 9, 9), dtype=torch.float32)
-    volume[4, 4, 4] = 1.0
-    blurred = _anisotropic_blur_3d(
-        volume,
+def _value_augmentation_params(
+    stream_index: int,
+    *,
+    blur_sigma: float,
+    axis_zyx: np.ndarray | None,
+) -> _Augment3DParams:
+    vector = np.zeros((3,), dtype=np.float32)
+    matrix = np.eye(3, dtype=np.float32)
+    return _Augment3DParams(
+        stream_index=stream_index,
+        cp_local_zyx=vector,
+        cp_volume_zyx=vector,
+        source_to_output_zyx=matrix,
+        output_to_source_zyx=matrix,
+        brightness=0.0,
+        contrast=1.0,
+        gamma=1.0,
+        noise_std=0.0,
+        blur_sigma=blur_sigma,
+        smooth=None,
+        anisotropic_blur_sigma_along=1.1 if axis_zyx is not None else 0.0,
+        anisotropic_blur_sigma_across=0.35 if axis_zyx is not None else 0.0,
+        anisotropic_blur_axis_zyx=axis_zyx,
+    )
+
+
+def test_direct_gaussian_kernel_is_normalized_and_oriented() -> None:
+    params = _value_augmentation_params(
+        0,
+        blur_sigma=0.0,
         axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-        sigma_along=1.5,
-        sigma_across=0.0,
     )
-    assert blurred[3, 4, 4] > 0.0
-    assert blurred[5, 4, 4] > 0.0
-    assert blurred[4, 4, 3] == 0.0
+    kernel = _directional_gaussian_kernel_3d(params)
+    assert kernel is not None
+    dense = kernel.dense_zyx
+    assert dense.shape == (9, 5, 5)
+    assert dense.dtype == np.float32
+    assert np.isclose(float(dense.sum()), 1.0, atol=1.0e-6)
+    assert bool((dense >= 0.0).all())
+    center = tuple(value // 2 for value in dense.shape)
+    assert dense[center[0] + 1, center[1], center[2]] > dense[
+        center[0], center[1] + 1, center[2]
+    ]
+    expected_along_ratio = math.exp(-0.5 / (1.1 * 1.1))
+    assert np.isclose(
+        float(dense[center[0] + 1, center[1], center[2]] / dense[center]),
+        expected_along_ratio,
+        rtol=2.0e-6,
+    )
 
 
-@pytest.mark.parametrize(
-    ("shape", "axis"),
-    (
-        ((17, 19, 23), np.asarray([0.31, 0.83, -0.46], dtype=np.float32)),
-        ((1, 13, 11), np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.8999, 0.436096, 0.0], dtype=np.float32)),
-        ((11, 13, 17), np.asarray([0.9001, 0.435683, 0.0], dtype=np.float32)),
-    ),
-)
-def test_native_anisotropic_blur_matches_torch_reference(
-    shape: tuple[int, int, int], axis: np.ndarray
+def test_direct_gaussian_kernel_oblique_support_and_identity() -> None:
+    identity = _value_augmentation_params(0, blur_sigma=0.0, axis_zyx=None)
+    assert _directional_gaussian_kernel_3d(identity) is None
+    oblique = _value_augmentation_params(
+        1,
+        blur_sigma=0.5,
+        axis_zyx=np.asarray([0.31, 0.83, -0.46], dtype=np.float32),
+    )
+    kernel = _directional_gaussian_kernel_3d(oblique)
+    assert kernel is not None
+    dense = kernel.dense_zyx
+    assert all(value % 2 == 1 for value in dense.shape)
+    assert np.isclose(float(dense.sum()), 1.0, atol=1.0e-6)
+    center = tuple(value // 2 for value in dense.shape)
+    assert dense[center] == dense.max()
+
+
+def test_axis_directional_kernel_and_replicate_border_match_manual_formula() -> None:
+    params = replace(
+        _value_augmentation_params(
+            0,
+            blur_sigma=0.0,
+            axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        ),
+        anisotropic_blur_sigma_along=1.1,
+        anisotropic_blur_sigma_across=0.0,
+    )
+    kernel = _directional_gaussian_kernel_3d(params)
+    assert kernel is not None
+    assert kernel.dense_zyx.shape == (9, 1, 1)
+    source = torch.arange(3 * 2 * 2, dtype=torch.float32).reshape(1, 1, 3, 2, 2)
+    actual = _apply_blur_kernels_3d(
+        source,
+        (_BlurKernels3D(isotropic_1d=None, directional_zyx=kernel),),
+    )
+    expected = torch.zeros_like(source)
+    radius = kernel.dense_zyx.shape[0] // 2
+    for z in range(3):
+        for offset, weight in enumerate(kernel.dense_zyx[:, 0, 0]):
+            source_z = min(max(z + offset - radius, 0), 2)
+            expected[0, 0, z] += source[0, 0, source_z] * float(weight)
+    assert torch.allclose(actual, expected, rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_isotropic_gaussian_kernel_uses_independent_radius() -> None:
+    assert _gaussian_kernel_1d(0.0) is None
+    small = _gaussian_kernel_1d(0.2)
+    large = _gaussian_kernel_1d(0.5)
+    assert small is not None and small.shape == (3,)
+    assert large is not None and large.shape == (5,)
+    assert np.isclose(float(small.sum()), 1.0, atol=1.0e-7)
+    assert np.isclose(float(large.sum()), 1.0, atol=1.0e-7)
+
+
+def test_directional_kernel_grouping_preserves_rectangular_shapes() -> None:
+    def kernel(shape: tuple[int, int, int]) -> object:
+        dense = np.ones(shape, dtype=np.float32)
+        dense /= float(dense.size)
+        return _DirectGaussianKernel3D(dense)
+
+    kernels = (
+        kernel((13, 3, 3)),
+        kernel((3, 13, 3)),
+        kernel((13, 3, 3)),
+        None,
+    )
+    assert _directional_kernel_groups(kernels, max_padding_ratio=1.25) == [[0, 2], [1]]
+
+
+def test_blur_sigmas_are_independently_and_deterministically_sampled() -> None:
+    loader = _loader_with_mapping(
+        {
+            "patch_shape_zyx": [9, 11, 13],
+            "augment_blur_sigma": 0.5,
+            "augment_anisotropic_blur_probability": 1.0,
+            "augment_anisotropic_blur_sigma_along": 1.5,
+            "augment_anisotropic_blur_sigma_across": 0.25,
+        }
+    )
+    first = [loader.load_raw_sample(index).augmentation for index in range(12)]
+    second = [loader.load_raw_sample(index).augmentation for index in range(12)]
+    assert [item.blur_sigma for item in first] == [item.blur_sigma for item in second]
+    assert [item.anisotropic_blur_sigma_along for item in first] == [
+        item.anisotropic_blur_sigma_along for item in second
+    ]
+    assert [item.anisotropic_blur_sigma_across for item in first] == [
+        item.anisotropic_blur_sigma_across for item in second
+    ]
+    assert all(0.0 <= item.blur_sigma <= 0.5 for item in first)
+    assert all(0.0 <= item.anisotropic_blur_sigma_along <= 1.5 for item in first)
+    assert all(0.0 <= item.anisotropic_blur_sigma_across <= 0.25 for item in first)
+    normalized_pairs = {
+        (
+            round(item.anisotropic_blur_sigma_along / 1.5, 7),
+            round(item.anisotropic_blur_sigma_across / 0.25, 7),
+        )
+        for item in first
+    }
+    assert any(along != across for along, across in normalized_pairs)
+
+
+@pytest.mark.parametrize("shape", ((9, 11, 13), (1, 7, 9)))
+def test_direct_gaussian_batch_matches_individual_convolutions(
+    shape: tuple[int, int, int],
 ) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn(shape, generator=torch.Generator().manual_seed(23))
-    source_before = source.clone()
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
+    generator = torch.Generator().manual_seed(83)
+    volumes = torch.randn((3, 1, *shape), generator=generator)
+    params = (
+        _value_augmentation_params(0, blur_sigma=0.0, axis_zyx=None),
+        _value_augmentation_params(
+            1,
+            blur_sigma=0.5,
+            axis_zyx=np.asarray([0.31, 0.83, -0.46], dtype=np.float32),
+        ),
+        _value_augmentation_params(2, blur_sigma=0.9, axis_zyx=None),
     )
-    actual_array = blur(source.numpy(), axis, 1.5, 0.25)
-    actual = torch.from_numpy(actual_array)
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-    assert actual.shape == source.shape
-    assert actual.dtype == torch.float32
-    assert actual_array.flags.c_contiguous
-    assert torch.equal(source, source_before)
-
-
-def test_native_anisotropic_blur_matches_full_training_cube() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((128, 128, 128), generator=torch.Generator().manual_seed(41))
-    axis = np.asarray([0.31, 0.83, -0.46], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
+    kernels = tuple(_build_blur_kernels_3d(item) for item in params)
+    expected = torch.cat(
+        [
+            _apply_blur_kernels_3d(volumes[index : index + 1], (kernels[index],))
+            for index in range(3)
+        ],
+        dim=0,
     )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
+    actual = apply_value_augmentation_suffix_batch_3d(volumes, kernels)
+    assert torch.allclose(actual, expected, rtol=2.0e-5, atol=2.0e-5)
+    assert torch.equal(actual[0], volumes[0])
 
 
-def test_native_axis_aligned_blur_matches_torch_isotropic_reference() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = torch.randn((33, 35, 37), generator=torch.Generator().manual_seed(43))
-    sigma = 0.5
-    kernel = _gaussian_kernel1d(sigma, device=source.device)
-    radius = int((kernel.numel() - 1) // 2)
-    data = source.view(1, 1, *source.shape)
-    for axis in range(3):
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = int(kernel.numel())
-        padding = [0, 0, 0, 0, 0, 0]
-        padding[(2 - axis) * 2] = radius
-        padding[(2 - axis) * 2 + 1] = radius
-        data = torch.nn.functional.conv3d(
-            torch.nn.functional.pad(data, padding, mode="replicate"),
-            kernel.view(*shape),
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_direct_gaussian_cuda_is_repeatable_and_matches_cpu() -> None:
+    source = torch.randn((2, 1, 9, 11, 13), generator=torch.Generator().manual_seed(89))
+    params = (
+        _value_augmentation_params(0, blur_sigma=0.5, axis_zyx=None),
+        _value_augmentation_params(
+            1,
+            blur_sigma=0.9,
+            axis_zyx=np.asarray([0.31, 0.83, -0.46], dtype=np.float32),
+        ),
+    )
+    kernels = tuple(_build_blur_kernels_3d(item) for item in params)
+    expected = apply_value_augmentation_suffix_batch_3d(source, kernels)
+    source_cuda = source.cuda()
+    first = apply_value_augmentation_suffix_batch_3d(source_cuda, kernels)
+    second = apply_value_augmentation_suffix_batch_3d(source_cuda, kernels)
+    torch.cuda.synchronize()
+    assert torch.equal(first, second)
+    assert torch.allclose(first.cpu(), expected, rtol=2.0e-5, atol=2.0e-5)
+
+
+def test_deferred_cuda_suffix_preserves_full_chain_and_kernel() -> None:
+    loader = _loader_with_mapping(
+        {
+            "patch_shape_zyx": [9, 11, 13],
+            "image_normalization": "zscore",
+            "augment_brightness": 0.2,
+            "augment_contrast_min": 0.7,
+            "augment_contrast_max": 1.3,
+            "augment_gamma_min": 0.8,
+            "augment_gamma_max": 1.2,
+            "augment_noise_std": 0.1,
+            "augment_blur_sigma": 0.5,
+            "augment_anisotropic_blur_probability": 1.0,
+            "augment_anisotropic_blur_sigma_along": 1.1,
+            "augment_anisotropic_blur_sigma_across": 0.35,
+            "value_augmentation_backend": "torch",
+        }
+    )
+    raw = loader.load_raw_sample(7)
+    expected = loader.augment_raw_sample(raw)
+    deferred = prepare_fiber_trace_3d_cuda_suffix(loader.config, raw)
+    assert deferred.augmentation is raw.augmentation
+    assert deferred.blur_kernels is not None
+    assert not torch.equal(deferred.sample.volume, expected.volume)
+    actual = apply_value_augmentation_suffix_batch_3d(
+        deferred.sample.volume.unsqueeze(0),
+        (deferred.blur_kernels,),
+    )[0]
+    assert torch.allclose(actual, expected.volume, rtol=2.0e-5, atol=2.0e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_batched_cuda_value_augmentation_matches_cpu_without_noise() -> None:
+    loader = _loader_with_mapping(
+        {
+            "patch_shape_zyx": [9, 11, 13],
+            "image_normalization": "zscore",
+            "augment_blur_sigma": 0.5,
+            "value_augmentation_backend": "torch",
+        }
+    )
+    base = _value_augmentation_params(11, blur_sigma=0.5, axis_zyx=None)
+    params = (replace(base, brightness=0.13, contrast=0.81, gamma=1.17),)
+    source = torch.randn((1, 1, 9, 11, 13), generator=torch.Generator().manual_seed(101))
+    kernels = tuple(_build_blur_kernels_3d(item) for item in params)
+    expected = apply_value_augmentation_3d(loader.config, source[0, 0], params[0])
+    actual = apply_value_augmentation_batch_3d(
+        loader.config,
+        source.cuda(),
+        params,
+        kernels,
+    )[0, 0]
+    torch.cuda.synchronize()
+    assert torch.allclose(actual.cpu(), expected, rtol=3.0e-5, atol=3.0e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_batched_cuda_value_augmentation_noise_is_partition_invariant() -> None:
+    loader = _loader_with_mapping(
+        {
+            "patch_shape_zyx": [9, 11, 13],
+            "image_normalization": "none",
+            "augment_noise_std": 0.1,
+            "value_augmentation_backend": "torch",
+        }
+    )
+    params = tuple(
+        replace(
+            _value_augmentation_params(index + 20, blur_sigma=0.0, axis_zyx=None),
+            noise_std=0.1,
         )
-    expected = data[0, 0]
-    actual = torch.from_numpy(
-        blur(
-            source.numpy(),
-            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-            sigma,
-            sigma,
-        )
+        for index in range(3)
     )
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 2.0e-6
-    assert float(error.mean()) <= 2.0e-7
+    kernels = tuple(_build_blur_kernels_3d(item) for item in params)
+    source = torch.randn((3, 1, 9, 11, 13), generator=torch.Generator().manual_seed(103)).cuda()
+    together = apply_value_augmentation_batch_3d(loader.config, source, params, kernels)
+    permutation = (2, 0, 1)
+    reordered = apply_value_augmentation_batch_3d(
+        loader.config,
+        source[list(permutation)],
+        tuple(params[index] for index in permutation),
+        tuple(kernels[index] for index in permutation),
+    )
+    restored = reordered[[1, 2, 0]]
+    separate = torch.cat(
+        [
+            apply_value_augmentation_batch_3d(
+                loader.config,
+                source[index : index + 1],
+                (params[index],),
+                (kernels[index],),
+            )
+            for index in range(3)
+        ],
+        dim=0,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(together, restored)
+    assert torch.equal(together, separate)
 
 
 @pytest.mark.parametrize("mask_kind", ("all", "partial", "none", "constant"))
@@ -2318,93 +2547,31 @@ def test_native_value_transform_validates_contract() -> None:
         transform(source, valid, "zscore", 0.0, 0.0, 1.0)
 
 
-@pytest.mark.parametrize("kind", ("ramp", "impulse", "high_contrast"))
-def test_native_anisotropic_blur_structured_inputs(kind: str) -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    shape = (17, 19, 23)
-    if kind == "ramp":
-        z, y, x = torch.meshgrid(
-            *(torch.linspace(-2.0, 2.0, length) for length in shape),
-            indexing="ij",
-        )
-        source = (z + 0.3 * y - 0.7 * x).contiguous()
-    elif kind == "impulse":
-        source = torch.zeros(shape, dtype=torch.float32)
-        source[8, 9, 11] = 10.0
-    else:
-        source = 100.0 * torch.randn(
-            shape, generator=torch.Generator().manual_seed(47)
-        )
-    axis = np.asarray([-0.52, 0.17, 0.84], dtype=np.float32)
-    expected = _anisotropic_blur_3d(
-        source,
-        axis_zyx=axis,
-        sigma_along=1.5,
-        sigma_across=0.25,
-    )
-    actual = torch.from_numpy(blur(source.numpy(), axis, 1.5, 0.25))
-    scale = max(1.0, float(torch.max(torch.abs(source))))
-    error = torch.abs(actual - expected)
-    assert float(error.max()) <= 1.0e-4 * scale
-    assert float(error.mean()) <= 3.0e-6 * scale
-
-
-def test_native_anisotropic_blur_validates_input_and_zero_sigma() -> None:
-    native_module = pytest.importorskip("vc.volume")
-    blur = getattr(native_module, "anisotropic_blur_3d", None)
-    if blur is None:
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
-    source = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
-    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    assert np.array_equal(blur(source, axis, 0.0, 0.0), source)
-    with pytest.raises(ValueError, match="positive finite norm"):
-        blur(source, np.zeros((3,), dtype=np.float32), 1.0, 0.0)
-    with pytest.raises(ValueError, match="nonnegative"):
-        blur(source, axis, -1.0, 0.0)
-    reversed_source = source[:, :, ::-1]
-    assert np.array_equal(blur(reversed_source, axis, 0.0, 0.0), reversed_source)
-
-
-def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_value_augmentation_backend_selection() -> None:
     import vc.volume
 
-    if not hasattr(vc.volume, "anisotropic_blur_3d"):
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    if not hasattr(vc.volume, "fiber3d_value_transform"):
+        pytest.skip("volume-cartographer binding lacks native value transform")
     common = {
         "patch_shape_zyx": [17, 15, 13],
-        "augment_blur_sigma": 0.5,
-        "augment_anisotropic_blur_probability": 1.0,
-        "augment_anisotropic_blur_sigma_along": 1.5,
-        "augment_anisotropic_blur_sigma_across": 0.25,
+        "augment_blur_sigma": 0.0,
+        "augment_anisotropic_blur_probability": 0.0,
     }
     native_loader = _loader_with_mapping(
         {**common, "value_augmentation_backend": "native"}
     )
     raw = native_loader.load_raw_sample(2, profile=True)
     native_sample = native_loader.augment_raw_sample(raw, profile=True)
-    native_unprofiled = native_loader.augment_raw_sample(raw, profile=False)
     assert native_sample.profile_timings_ms is not None
     assert native_sample.profile_timings_ms["value_native_transform_used"] == 1.0
-    assert native_sample.profile_timings_ms["value_isotropic_native_used"] == 1.0
-    assert native_sample.profile_timings_ms["value_anisotropic_native_used"] == 1.0
-    assert torch.equal(native_sample.volume, native_unprofiled.volume)
 
-    monkeypatch.delattr(vc.volume, "anisotropic_blur_3d")
-    auto_loader = _loader_with_mapping(
-        {**common, "value_augmentation_backend": "auto"}
+    torch_loader = _loader_with_mapping(
+        {**common, "value_augmentation_backend": "torch"}
     )
-    auto_sample = auto_loader.augment_raw_sample(raw, profile=True)
-    assert auto_sample.profile_timings_ms is not None
-    assert auto_sample.profile_timings_ms["value_isotropic_native_used"] == 0.0
-    assert auto_sample.profile_timings_ms["value_anisotropic_native_used"] == 0.0
-    explicit_loader = _loader_with_mapping(
-        {**common, "value_augmentation_backend": "native"}
-    )
-    with pytest.raises(RuntimeError, match="requires a rebuilt volume-cartographer"):
-        explicit_loader.augment_raw_sample(raw, profile=True)
+    torch_sample = torch_loader.augment_raw_sample(raw, profile=True)
+    assert torch_sample.profile_timings_ms is not None
+    assert torch_sample.profile_timings_ms["value_native_transform_used"] == 0.0
+    assert torch.allclose(native_sample.volume, torch_sample.volume, rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_nonzero_unsupported_3d_shear_and_ringing_raise(tmp_path) -> None:
@@ -4101,7 +4268,7 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
     assert output.grad[0, 6, 0, 0, 8] != 0.0
 
 
-def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
+def test_3d_presence_loss_ignores_legacy_mask_field() -> None:
     target_dir = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
     )[0]
@@ -4140,7 +4307,7 @@ def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
     losses["total"].backward()
 
     assert output.grad[0, 6, 0, 0, 0] == 0.0
-    assert output.grad[0, 13, 0, 0, 0] == 0.0
+    assert output.grad[0, 13, 0, 0, 0] != 0.0
     assert output.grad[0, 6, 0, 0, 1] != 0.0
     assert output.grad[0, 13, 0, 0, 1] != 0.0
 
@@ -4245,10 +4412,9 @@ def test_materialize_targets_uses_native_coarse_lattice_without_losing_cp() -> N
     coarse = materialize_targets(raw, loader.config, output_stride=4)
 
     assert coarse.presence_target is not None
-    assert coarse.presence_mask is not None
+    assert coarse.presence_mask is None
     assert coarse.direction_indices_bzyx is not None
     assert coarse.presence_target.shape[-3:] == (4, 4, 4)
-    assert coarse.presence_mask.shape[-3:] == (4, 4, 4)
     assert int(coarse.direction_indices_bzyx.shape[0]) > 0
     assert torch.all(coarse.direction_indices_bzyx[:, 1:] >= 0)
     assert torch.all(coarse.direction_indices_bzyx[:, 1:] < 4)
@@ -4282,7 +4448,7 @@ def test_native_coarse_targets_keep_source_identity_and_support_backward() -> No
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_native_coarse_targets_use_ceil_shape_and_conservative_validity() -> None:
+def test_native_coarse_targets_use_ceil_shape_without_validity_mask() -> None:
     loader = _loader(augment_enabled=False)
     raw = loader.load_batch(0)
     batch_size = int(raw.volume.shape[0])
@@ -4304,9 +4470,8 @@ def test_native_coarse_targets_use_ceil_shape_and_conservative_validity() -> Non
     coarse = materialize_targets(raw, config, output_stride=4)
 
     assert coarse.presence_target.shape[-3:] == (3, 3, 3)
-    assert not bool(coarse.presence_mask[0, 0, 0, 0, 0])
-    assert bool(coarse.presence_mask[0, 0, 1, 1, 1])
-    assert not bool(coarse.presence_mask[0, 0, 2, 2, 2])
+    assert coarse.presence_mask is None
+    assert coarse.presence_target[0, 0, 0, 0, 0] > 0.5
     assert tuple(coarse.direction_indices_bzyx.shape[1:]) == (4,)
 
 
@@ -4425,8 +4590,8 @@ def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
         [
             -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean(),
             -torch.log(1.0 - torch.tensor([0.1, 0.1, 0.1])).mean(),
-            -torch.log(1.0 - torch.tensor(0.7)),
-            -torch.log(1.0 - torch.tensor(0.6)),
+            -torch.log(1.0 - torch.tensor([0.7, 0.0, 0.0])).mean(),
+            -torch.log(1.0 - torch.tensor([0.6, 0.0, 0.0])).mean(),
         ]
     ).mean()
     global_mean = -torch.log(

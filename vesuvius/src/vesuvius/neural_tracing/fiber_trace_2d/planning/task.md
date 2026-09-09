@@ -1,13 +1,10 @@
-# Task: overlap Fiber3D batch preparation with training
+# Task: move post-sampling Fiber3D augmentation to CUDA
 
-The native quarter-resolution Fiber3D model reaches 95.7 global samples/s when
-replaying a GPU-resident batch, but the shared real-sample trainer reaches only
-83.8 samples/s even though its CPU sample pipeline sustains over 220 samples/s.
+Move every production value augmentation after CPU volume sampling to the
+asynchronous per-GPU preparation stream. Preserve deterministic parameter
+selection and operation order, measure the exact host producer with 128 workers,
+and measure two-GPU end-to-end training using only GPUs 0 and 1.
 
-Move ordered batch collation/staging off the training critical path and keep two
-future batches prepared. Use pinned host staging and a dedicated CUDA stream so
-H2D transfer and GPU target materialization for batch N+2 overlap computation of
-batch N. Preserve deterministic samples, bounded memory, and existing behavior
-when the optimization is disabled or CUDA is unavailable. Measure against both
-the 83.8 samples/s real-pipeline result and 95.7 samples/s replay ceiling on GPUs
-0 and 1.
+Coordinate-lattice generation remains CPU-side because it is the direct input
+to the CPU VC3D sampler; moving it to CUDA alone would require transferring the
+same dense lattice back to the CPU.

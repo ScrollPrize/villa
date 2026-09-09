@@ -1,27 +1,30 @@
-# Task log: overlap Fiber3D batch preparation
+# Task log: CUDA post-sampling augmentation
 
-- Baselines: GPU replay 95.708 global samples/s; shared real pipeline trials
-  84.028 and 83.595 samples/s (83.812 mean); standalone CPU pipeline 222.09
-  production samples/s.
-- Integrated profile attributes the remaining approximately 24ms/step gap to
-  13.6ms synchronous H2D, 4.0ms target construction, 3.7ms mean ordered batch
-  wait/assembly, and residual host/synchronization jitter.
-- Planned implementation keeps deterministic sample production shared and adds
-  a bounded asynchronous preparation stage rather than another loader.
-- Independent review rejected explicitly reusable device slots without consumed
-  events. The implementation will instead keep three allocator-owned live
-  batches (current plus two future), use `record_stream`, report allocated and
-  reserved memory, and quiesce before evaluation.
-- Implemented a depth-two coordinator around the existing shared sample
-  pipeline. It pins and releases ordered CPU batches off-thread, submits H2D and
-  target construction on a dedicated CUDA stream, and exposes failures/events
-  in order. The synchronous path remains the default.
-- Two matched runs reached 91.792 and 91.646 global samples/s (91.719 mean), up
-  9.4% from 83.812 and reaching 95.8% of the 95.708 replay ceiling. Exposed
-  wait was below 0.7ms at p95. Peak allocated/reserved device memory was
-  14.99/20.31GiB per rank; bounded pinned storage was 240.0MiB per rank.
-- Steps 98--100 matched the synchronous run's losses and metrics exactly across
-  many queue wraps. The remaining gap is GPU-side copy/target contention rather
-  than input starvation.
-- Validation: 290 focused Fiber3D, profiling, and ordered-pipeline tests passed;
-  Python compilation and `git diff --check` also passed.
+- Baseline exact production CPU prefix with 128 shared single-threaded workers:
+  262.75 samples/s total, 104.8 CPU cores, before H2D. Stage-one loading averaged
+  327.79ms/sample and the CPU value prefix averaged 66.64ms/sample. Artifact:
+  `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_213630_839413/result.json`.
+- Dense coordinate generation remains CPU-side because VC3D immediately consumes
+  it for CPU volume sampling. No GPU-to-CPU coordinate round trip will be added.
+- Independent review approved that boundary and required per-sample reductions,
+  explicit FP32 stream ordering, partition-invariant noise, metadata lifetime,
+  and distinct `blur`/`all` configuration. CUDA noise is keyed independently by
+  canonical stream index; it is same-backend repeatable but intentionally not
+  CPU-bit-identical because PyTorch CPU and CUDA generators differ.
+- Implemented `all`: workers now retain native `uint8` sampled volumes and pass
+  immutable augmentation parameters to an FP32 CUDA preparation-stream chain
+  covering normalization, contrast, brightness, gamma, noise, and both blurs.
+- Focused CUDA tests: 4 passed. Focused CPU transport/sampling tests: 9 passed.
+- The 128-worker host boundary rose from 262.75 samples/s (104.8 CPU cores) to
+  339.56 samples/s production (122.0 CPU cores) with 120 load-affinity workers;
+  that is 2.783 samples/s per occupied CPU core. A 124-affinity run exhausted
+  native worker resources, so 120 is the measured standalone limit.
+- On two H100 GPUs (global batch 16), end-to-end training reached 88.020
+  samples/s globally, or 44.010 samples/s/GPU. Mean H2D time fell from 8.06ms
+  to 0.855ms/batch after raw uint8 transport; full CUDA value augmentation was
+  35.22ms/batch while overlapped with training. Artifact:
+  `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_gpu_all_20260908_220615_721868`.
+- Final repeats on the completed code measured 339.80 samples/s production
+  (330.04 end-to-end) across 128 CPU workers / 122.0 occupied CPU cores, and
+  88.492 samples/s globally across two H100s (44.246/GPU). Rank-0 iteration
+  mean/median/p95 was 180.45/180.00/189.57ms.

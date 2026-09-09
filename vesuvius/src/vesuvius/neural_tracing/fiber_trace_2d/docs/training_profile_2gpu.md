@@ -326,3 +326,141 @@ Artifacts:
 
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_165937_591417`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_170107_746537`
+
+## Raw loading and CUDA value-augmentation suffix, 2026-09-08
+
+This section records an intermediate prototype. The later independent
+sequential-blur implementation below removes both `final-mask`/`blur-mask`
+modes and all final validity masking.
+
+The standalone warm-cache S1a pipeline was measured without value augmentation,
+while retaining deterministic sample selection, coordinate augmentation, VC3D
+dependency resolution/decoding, and final coordinate sampling. With 128
+single-threaded workers, 128 warmup samples, and 4,096 measured samples it
+reached **324.11 samples/s**. Coordinate generation sustained 24.294 MP/s
+(11.584 samples/s per service core) and coordinate sampling 21.728 MP/s
+(10.361 samples/s per service core). The corresponding full CPU pipeline reached
+222.09 samples/s. Its mean value-augmentation service was 177.59ms/sample:
+47.37ms native normalization/intensity, 21.49ms noise, 63.69ms isotropic blur,
+43.01ms directional blur, and 1.96ms final masking.
+
+The CUDA implementation preserves the existing operation order using one
+contiguous CPU-prefix/CUDA-suffix cut after a single H2D transfer. Two suffixes
+were measured on two H100s with GroupNorm, native output stride 4, global batch
+16, BF16 model training, 30 warmup steps, and 90 measured steps:
+
+| CUDA suffix | Global samples/s | Rank-0 iteration mean / median / p95 | Rank-0 CUDA suffix mean |
+| --- | ---: | ---: | ---: |
+| none (previous asynchronous baseline) | 91.719 | 174.12 / ~173.3 / <181.6 ms | 0 ms |
+| blur + final mask | 86.588 | 184.50 / 183.85 / 188.43 ms | 45.98 ms/batch |
+| final mask only | 91.767 | 174.01 / 172.93 / 178.74 ms | 2.97 ms/batch |
+
+`blur-mask` is a measured negative result: although preparation remained ahead
+of training, its CUDA kernels competed with the U-Net and raised the model/DDP
+step to about 181.5ms. It remains an explicit experimental mode and is not the
+recommended/default path. `final-mask` is the safe first port and was within
+noise of the established baseline; exposed wait remained below 1ms and peak
+allocated memory was about 15.01GiB/rank. CPU/CUDA comparison uses tolerance
+equivalence; repeated execution on the same CUDA/software/hardware backend is
+exactly reproducible in the focused test.
+
+Reusable commands (arguments live in the adjacent `.args` files):
+
+```bash
+vesuvius/scripts/run_fiber3d_pipeline_benchmark
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_173232_814065`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_175210_882168`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_20260908_175613_297576`
+
+## Independent sequential Gaussian blur, 2026-09-08
+
+The production experiment now samples isotropic, directional-along, and
+directional-across sigmas independently and uniformly from zero through the
+configured maxima. Isotropic blur is three separable 1D passes. It is followed
+by one direct rectangular directional Gaussian. Directional kernels are packed
+with a deterministic greedy 1.25x padding limit and all groups run serially on
+the existing CUDA preparation stream. Dense validity/loss masks are no longer
+collated or transferred: GT lines define positives and all other output voxels
+are presence negatives.
+
+The actual S1a distribution (10,000 samples) was 50.34% directional; rectangular
+boxes had mean/median/p95 volumes of 302.6/245/637. Greedy packing inflated
+dense work by 1.055x. On one H100, 32 local batches of eight took 4.134ms/batch
+for the full sequential blur (1,935 samples/s); one common max box was slower at
+1,318 samples/s.
+
+The matched two-H100 training run used GroupNorm, native output stride 4,
+BF16 eager training, local batch 8, 30 warmup steps, and 90 measured steps:
+
+| Path | Global samples/s | Rank-0 iteration mean / median / p95 | Blur CUDA event mean / median / p95 |
+| --- | ---: | ---: | ---: |
+| model-only replay ceiling | 95.708 | 166.98 / 166.98 / 167.36 ms | n/a |
+| prior async pipeline, no GPU blur | 91.719 | 174.12 / ~173.3 / <181.6 ms | 0 ms |
+| independent sequential GPU blur | **88.487** | **180.82 / 180.58 / 188.49 ms** | **30.73 / 31.69 / 40.96 ms** |
+
+The CUDA event is longer than the isolated 4.134ms because preparation-stream
+blur overlaps and competes with model execution. The implementation is faster
+than the earlier dense combined-kernel experiment (83.229 samples/s), but it
+does not yet reach the no-blur pipeline or model-only ceiling.
+
+The CPU fallback, measured on the same warm S1a input with 112 single-threaded
+workers, 128 warmup samples, and 4,096 measured samples, produced 115.76
+samples/s (111.17 including startup/drain). A 128-worker standalone attempt
+failed during VC3D worker initialization with `Resource temporarily unavailable`,
+so the successful worker count is recorded explicitly rather than extrapolated.
+
+Commands:
+
+```bash
+vesuvius/scripts/run_fiber3d_blur_benchmark
+vesuvius/scripts/run_fiber3d_pipeline_benchmark
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/blur_benchmark_20260908_202909.json`
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_205516_907901/result.json`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_gpu_blur_20260908_205620_262669`
+
+## Full post-sampling CUDA augmentation, 2026-09-08
+
+The production `all` suffix leaves only coordinate generation and native VC3D
+volume sampling in the CPU pool. Workers transport the sampled patch as raw
+`uint8`; each rank's asynchronous CUDA preparation stream converts it to FP32
+and applies normalization, contrast, brightness, gamma, stream-index-seeded
+noise, isotropic blur, and directional blur before target materialization.
+
+On the standalone warm-cache S1a producer, 128 single-threaded workers with 120
+load-affinity workers, 128 warmup samples, and 4,096 measured samples sustained
+**339.80 samples/s production** and **330.04 samples/s end-to-end** while using
+**122.0 CPU cores** on average. Production throughput was therefore **2.783
+samples/s per occupied CPU core**. The previous exact CPU-prefix boundary was
+262.75 samples/s on 104.8 CPU cores. A 124-affinity attempt failed in the native
+sampler with `Resource temporarily unavailable`, so it is not a supported point.
+
+The matched two-H100 training run used GroupNorm, output stride 4, BF16 eager
+training, global batch 16, 30 warmup steps, and 90 measured steps. It reached
+**88.020 samples/s globally**, or **44.010 samples/s/GPU**. Mean iteration time
+was 181.44ms, mean H2D was 0.855ms/batch, and the overlapped full CUDA value
+augmentation event was 35.22ms/batch. Peak allocated/reserved device memory was
+16.53/22.13GiB per rank. A final repeat reached **88.492 samples/s globally**,
+or **44.246 samples/s/GPU**, with rank-0 iteration mean/median/p95 of
+180.45/180.00/189.57ms, 1.12ms mean H2D, and 35.40ms mean CUDA value
+augmentation.
+
+Coordinate generation intentionally remains CPU-side: VC3D currently consumes
+the dense coordinate field on CPU, so CUDA generation alone would require a
+roughly 24MiB D2H transfer for every 128-cubed sample. Removing that boundary
+requires a fused native coordinate-generation/sampling implementation or a GPU
+sampler.
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_221924_248510/result.json`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_gpu_all_20260908_221959_719439`

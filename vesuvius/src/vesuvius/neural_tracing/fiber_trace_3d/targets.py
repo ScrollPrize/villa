@@ -46,58 +46,6 @@ def _zyx_grid(
     return grid
 
 
-def _presence_loss_mask(
-    valid_mask: torch.Tensor,
-    *,
-    patch_shape: tuple[int, int, int],
-    config: FiberTrace3DConfig,
-    target_modes: torch.Tensor | None = None,
-    coordinate_scale: int = 1,
-    input_shape: tuple[int, int, int] | None = None,
-) -> torch.Tensor:
-    presence_mask = valid_mask.clone()
-    edge_margin = config.presence_negative_edge_margin_voxels
-    if edge_margin is None:
-        edge_margin = int(math.ceil(max(config.augment_shift_zyx)))
-    if edge_margin > 0:
-        device = valid_mask.device
-        if int(coordinate_scale) == 1:
-            z = torch.arange(patch_shape[0], device=device)
-            y = torch.arange(patch_shape[1], device=device)
-            x = torch.arange(patch_shape[2], device=device)
-            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-            interior = (
-                (zz >= edge_margin)
-                & (zz < patch_shape[0] - edge_margin)
-                & (yy >= edge_margin)
-                & (yy < patch_shape[1] - edge_margin)
-                & (xx >= edge_margin)
-                & (xx < patch_shape[2] - edge_margin)
-            )
-        else:
-            if input_shape is None:
-                raise ValueError("input_shape is required for coarse presence masks")
-            axes = []
-            for output_size, input_size in zip(patch_shape, input_shape):
-                start = torch.arange(output_size, device=device) * int(coordinate_scale)
-                end = torch.clamp(start + int(coordinate_scale), max=int(input_size))
-                axes.append((start >= int(edge_margin)) & (end <= int(input_size) - int(edge_margin)))
-            interior = (
-                axes[0][:, None, None]
-                & axes[1][None, :, None]
-                & axes[2][None, None, :]
-            )
-        interior = interior.view(1, 1, *patch_shape)
-        if target_modes is None:
-            presence_mask = presence_mask & interior
-        else:
-            edge_limited = (
-                target_modes.to(device=device, dtype=torch.long) == _TARGET_MODE_CP_ONLY
-            ).view(-1, 1, 1, 1, 1)
-            presence_mask = presence_mask & (~edge_limited | interior)
-    return presence_mask
-
-
 def _materialize_cp_only_sample(
     *,
     batch: FiberTrace3DBatch,
@@ -114,7 +62,7 @@ def _materialize_cp_only_sample(
     sample_positive = dist2 <= float(radius2)
     positive[sample_index] = sample_positive
     tangent = batch.target_tangent_zyx[sample_index].to(dtype=torch.float32)
-    local_indices = torch.nonzero(sample_positive & batch.valid_mask[sample_index, 0], as_tuple=False)
+    local_indices = torch.nonzero(sample_positive, as_tuple=False)
     if int(local_indices.numel()) == 0:
         return 0
     batch_column = torch.full(
@@ -243,29 +191,17 @@ def _materialize_dense_line_indices(
         patch_shape=patch_shape,
     )
     positive[indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]] = True
-    valid = batch.valid_mask[indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]]
     return (
-        indices[valid],
-        tangents[valid],
+        indices,
+        tangents,
         int(valid_segment.sum().detach().cpu()),
         int(indices.shape[0]),
     )
 
 
-def _coarse_valid_mask(valid_mask: torch.Tensor, output_stride: int) -> torch.Tensor:
-    invalid = (~valid_mask.to(dtype=torch.bool)).to(dtype=torch.float32)
-    return F.max_pool3d(
-        invalid,
-        kernel_size=int(output_stride),
-        stride=int(output_stride),
-        ceil_mode=True,
-    ) == 0.0
-
-
 def _materialize_coarse_cp_only_sample(
     *,
     batch: FiberTrace3DBatch,
-    coarse_valid_mask: torch.Tensor,
     sample_index: int,
     patch_shape: tuple[int, int, int],
     input_shape: tuple[int, int, int],
@@ -306,12 +242,6 @@ def _materialize_coarse_cp_only_sample(
     keep = torch.ones_like(order, dtype=torch.bool)
     keep[1:] = linear[order][1:] != linear[order][:-1]
     coarse = coarse[order[keep]]
-    valid = coarse_valid_mask[
-        sample_index, 0, coarse[:, 0], coarse[:, 1], coarse[:, 2]
-    ]
-    coarse = coarse[valid]
-    if int(coarse.shape[0]) == 0:
-        return 0
     positive[sample_index, coarse[:, 0], coarse[:, 1], coarse[:, 2]] = True
     batch_column = torch.full(
         (int(coarse.shape[0]), 1), sample_index, dtype=torch.long, device=device
@@ -336,7 +266,6 @@ def materialize_targets(
         and batch.direction_target_sparse is not None
         and batch.direction_weight_sparse is not None
         and batch.presence_target is not None
-        and batch.presence_mask is not None
     ):
         return batch
 
@@ -346,13 +275,7 @@ def materialize_targets(
         raise ValueError("output_stride must be > 0")
     input_shape = tuple(int(v) for v in batch.volume.shape[-3:])
     patch_shape = tuple((size + output_stride - 1) // output_stride for size in input_shape)
-    if output_stride == 1:
-        geometry_batch = batch
-    else:
-        geometry_batch = replace(
-            batch,
-            valid_mask=_coarse_valid_mask(batch.valid_mask, output_stride),
-        )
+    geometry_batch = batch
     radius = float(config.presence_radius_voxels)
     radius2 = radius * radius
     timings: dict[str, float] = {}
@@ -408,7 +331,6 @@ def materialize_targets(
             else:
                 cp_direction_points += _materialize_coarse_cp_only_sample(
                     batch=batch,
-                    coarse_valid_mask=geometry_batch.valid_mask,
                     sample_index=sample_index,
                     patch_shape=patch_shape,
                     input_shape=input_shape,
@@ -456,18 +378,6 @@ def materialize_targets(
     if profile:
         _sync_if_cuda(device)
         timings["target_direction_encode_ms"] = (time.perf_counter() - encode_start) * 1000.0
-    mask_start = time.perf_counter()
-    presence_mask = _presence_loss_mask(
-        geometry_batch.valid_mask.to(dtype=torch.bool),
-        patch_shape=patch_shape,
-        config=config,
-        target_modes=batch.target_modes,
-        coordinate_scale=output_stride,
-        input_shape=input_shape,
-    )
-    if profile:
-        _sync_if_cuda(device)
-        timings["target_gpu_mask_ms"] = (time.perf_counter() - mask_start) * 1000.0
     if profile:
         timings["target_gpu_positive_voxels"] = float(positive.sum().detach().cpu())
         timings["target_direction_points"] = float(indices_bzyx.shape[0])
@@ -487,7 +397,7 @@ def materialize_targets(
         direction_weight_sparse=direction_weight_sparse,
         direction_tangent_sparse_zyx=tangents_zyx,
         presence_target=presence_target,
-        presence_mask=presence_mask,
+        presence_mask=None,
         profile_timings_ms=profile_timings if profile_timings else batch.profile_timings_ms,
     )
 
@@ -500,7 +410,6 @@ def require_materialized_targets(batch: FiberTrace3DBatch) -> None:
             "direction_target_sparse",
             "direction_weight_sparse",
             "presence_target",
-            "presence_mask",
         )
         if getattr(batch, name) is None
     ]

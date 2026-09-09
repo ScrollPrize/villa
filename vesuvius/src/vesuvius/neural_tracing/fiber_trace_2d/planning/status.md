@@ -1,10 +1,11 @@
-# Status: overlap Fiber3D batch preparation
+# Status: CUDA post-sampling augmentation
 
-- [x] Record the task
-- [x] Draft the implementation and measurement plan
+- [x] Capture task and plan
 - [x] Independent plan review
-- [x] Implement bounded pinned/CUDA preparation
+- [x] Generalize deferred augmentation payload
+- [x] Implement batched CUDA post-sampling chain
+- [x] Update production training integration
 - [x] Add and run focused tests
-- [x] Run matched two-GPU benchmarks
+- [x] Benchmark 128-worker H2D-boundary producer
+- [x] Benchmark two-GPU training
 - [x] Update specs, docs, changelog, and task log
-- [x] Final review and commit

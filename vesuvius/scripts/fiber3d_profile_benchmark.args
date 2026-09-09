@@ -8,5 +8,7 @@ group
 --throughput-only
 --sample-pipeline
 --async-batch-preparation
+--gpu-value-augmentation
+all
 --trace-steps
 0
