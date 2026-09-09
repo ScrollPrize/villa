@@ -499,3 +499,26 @@ The adjacent confirmation artifacts are:
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b24_sample_pipeline_async_batch_gpu_all_20260909_061011_852473`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_060627_834494`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_060819_313464`
+
+## On-demand scalar metric synchronization, 2026-09-09
+
+Training previously packed, globally reduced, and converted every loss metric
+to Python floats on every step. The loop now performs that synchronization only
+on the rank-consistent union of console and TensorBoard due steps; default
+first-100-step and periodic logging remain unchanged. Non-due profiling rows
+omit `loss_total` rather than forcing a local CUDA synchronization.
+
+A benchmark-only forced-reduction control suppressed output while retaining the
+every-step collective, isolating metric synchronization from terminal I/O. At
+batch 28/GPU it reached **107.672 samples/s globally** (**53.836/GPU**). Two
+on-demand repeats reached **108.949** and **108.808 samples/s globally**
+(**54.474** and **54.404/GPU**), an average improvement of **1.12%**. Aggregate
+throughput uses the synchronized slowest-rank window; per-step wall timings are
+not directly comparable because non-due steps no longer end at a forced CUDA
+synchronization point.
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_scalar_sync_control_20260909_062357_589452`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_062615_301653`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_062808_605523`

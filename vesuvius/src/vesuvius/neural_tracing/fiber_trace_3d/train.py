@@ -2264,6 +2264,18 @@ def _distributed_mean_loss_tensors(
     }
 
 
+def _training_loss_metrics_if_due(
+    losses: dict[str, torch.Tensor],
+    config: _DistributedConfig,
+    *,
+    due: bool,
+) -> dict[str, float] | None:
+    """Materialize globally averaged training metrics only for real consumers."""
+    if not due:
+        return None
+    return _losses_to_float_dict(_distributed_mean_loss_tensors(losses, config))
+
+
 def _distributed_training_batch_index(step: int, config: _DistributedConfig) -> int:
     if int(step) <= 0:
         raise ValueError("training step must be positive")
@@ -2543,6 +2555,20 @@ def run_training(
         )
     sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
     scalar_interval = int(training.get("scalar_log_interval", 100))
+    initial_scalar_log_steps = int(training.get("initial_scalar_log_steps", 100))
+    force_scalar_reduce = training.get("profile_force_scalar_reduce_every_step", False)
+    if scalar_interval <= 0:
+        raise ValueError("training.scalar_log_interval must be > 0")
+    if initial_scalar_log_steps < 0:
+        raise ValueError("training.initial_scalar_log_steps must be >= 0")
+    if not isinstance(force_scalar_reduce, bool):
+        raise ValueError(
+            "training.profile_force_scalar_reduce_every_step must be a JSON boolean"
+        )
+    if force_scalar_reduce and not bool(training.get("profile_enabled", False)):
+        raise ValueError(
+            "training.profile_force_scalar_reduce_every_step requires profile_enabled"
+        )
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     kept_snapshot_interval = int(training.get("kept_snapshot_interval", 10000))
     test_interval = int(training.get("test_interval", 0))
@@ -3015,15 +3041,29 @@ def run_training(
                     loss_tensors["total"].backward()
                 with profile.stage("optimizer"):
                     optimizer.step()
-            with profile.stage("scalar_reduce_sync"):
-                reduced_loss_tensors = _distributed_mean_loss_tensors(loss_tensors, distributed)
-                losses = _losses_to_float_dict(reduced_loss_tensors)
+            console_metrics_due = _training_scalar_metrics_due(
+                step,
+                scalar_interval=scalar_interval,
+                initial_steps=(0 if profile_replay_batch else initial_scalar_log_steps),
+            )
+            writer_metrics_due = bool(training.get("tensorboard_enabled", True)) and (
+                step == 1 or step % scalar_interval == 0
+            )
+            scalar_metrics_due = (
+                console_metrics_due or writer_metrics_due or force_scalar_reduce
+            )
+            losses: dict[str, float] | None = None
+            if scalar_metrics_due:
+                with profile.stage("scalar_reduce_sync"):
+                    losses = _training_loss_metrics_if_due(
+                        loss_tensors,
+                        distributed,
+                        due=True,
+                    )
             step_ms = (time.perf_counter() - fw_start) * 1000.0
 
-            if distributed.is_main and (
-                (not profile_replay_batch and step <= 100)
-                or step % scalar_interval == 0
-            ):
+            if distributed.is_main and console_metrics_due:
+                assert losses is not None
                 print(
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
@@ -3039,7 +3079,8 @@ def run_training(
                     f"fw_bw_step_ms={step_ms:.1f}",
                     flush=True,
                 )
-            if writer is not None and (step == 1 or step % scalar_interval == 0):
+            if writer is not None and writer_metrics_due:
+                assert losses is not None
                 writer.add_scalar("train/loss_total", losses["total"], step)
                 writer.add_scalar("train/loss_direction", losses["direction"], step)
                 writer.add_scalar("train/loss_presence", losses["presence"], step)
@@ -3129,11 +3170,20 @@ def run_training(
                 _distributed_barrier(distributed)
             if test_due and cuda_batch_pipeline is not None:
                 cuda_batch_pipeline.resume()
-            profile.end(load_ms=load_ms, wait_ms=wait_ms, to_device_ms=to_device_ms,
-                        value_augmentation_cuda_ms=cuda_value_augmentation_ms,
-                        target_ms=target_ms, fw_bw_step_ms=step_ms,
-                        loss_total=losses["total"],
-                        loader_profile=batch.profile_timings_ms if profile_loader else None)
+            profile_timings = {
+                "load_ms": load_ms,
+                "wait_ms": wait_ms,
+                "to_device_ms": to_device_ms,
+                "value_augmentation_cuda_ms": cuda_value_augmentation_ms,
+                "target_ms": target_ms,
+                "fw_bw_step_ms": step_ms,
+                "loader_profile": (
+                    batch.profile_timings_ms if profile_loader else None
+                ),
+            }
+            if losses is not None:
+                profile_timings["loss_total"] = losses["total"]
+            profile.end(**profile_timings)
             if throughput_started is not None:
                 throughput_steps += 1
             if throughput_started is not None and max_steps is not None and step == max_steps:
@@ -4570,6 +4620,22 @@ def _training_cuda_value_augmentation(training: dict[str, Any]) -> str | None:
             "blur or all"
         )
     return str(mode)
+
+
+def _training_scalar_metrics_due(
+    step: int,
+    *,
+    scalar_interval: int,
+    initial_steps: int,
+) -> bool:
+    """Return the rank-independent schedule for reducing/logging train metrics."""
+    if int(step) <= 0:
+        raise ValueError("training step must be positive")
+    if int(scalar_interval) <= 0:
+        raise ValueError("scalar_interval must be positive")
+    if int(initial_steps) < 0:
+        raise ValueError("initial_steps must be nonnegative")
+    return int(step) <= int(initial_steps) or int(step) % int(scalar_interval) == 0
 
 
 def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:

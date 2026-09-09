@@ -17,6 +17,12 @@
   per-rank throughput artifacts for Fiber3D training; measured the current
   two-H100 compute ceiling and matched warm-cache real training path.
 
+## 2026-09-09 — Fiber3D on-demand scalar metrics
+
+- Removed unconsumed per-step DDP metric reduction and GPU-to-host scalar
+  conversion while preserving console and TensorBoard schedules. A matched
+  two-H100 batch-28 control measured a 1.12% average throughput improvement.
+
 # 2026-09-07
 
 - Added opt-in normal Fiber training profiling and explicit torch.compile

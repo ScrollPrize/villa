@@ -50,7 +50,8 @@ def summarize_experiment(experiment):
             if all(key in rows[step] for rows in steady_rows_by_rank.values())
         )
         for key in ("iteration_wall_ms", "wait_ms", "to_device_ms",
-                    "value_augmentation_cuda_ms", "target_ms", "fw_bw_step_ms")
+                    "value_augmentation_cuda_ms", "target_ms", "fw_bw_step_ms",
+                    "scalar_reduce_sync_wall_ms")
     }
     result = {"experiment": str(experiment), "ranks": ranks,
               "critical_path": critical_path,
@@ -112,6 +113,11 @@ def main():
         action="store_true",
         help="disable evaluation, visualization, snapshots, TensorBoard, and tracing",
     )
+    parser.add_argument(
+        "--force-scalar-reduce-every-step",
+        action="store_true",
+        help="benchmark control: retain every-step metric reduction without logging",
+    )
     args = parser.parse_args()
     if args.replay_batch and args.replay_cpu_batch:
         parser.error("--replay-batch and --replay-cpu-batch are mutually exclusive")
@@ -154,6 +160,8 @@ def main():
         suffix += "_async_batch"
     if args.gpu_value_augmentation:
         suffix += f"_gpu_{args.gpu_value_augmentation.replace('-', '_')}"
+    if args.force_scalar_reduce_every_step:
+        suffix += "_scalar_sync_control"
     experiment = args.output.resolve() / f"profile_2gpu_{args.compile_mode}{suffix}_{stamp}"
     experiment.mkdir(parents=True, exist_ok=False)
     training = config["training"]
@@ -199,6 +207,10 @@ def main():
             profile_throughput_start_step=31,
             profile_trace_steps=0,
             scalar_log_interval=args.steps + 1,
+            initial_scalar_log_steps=0,
+            profile_force_scalar_reduce_every_step=bool(
+                args.force_scalar_reduce_every_step
+            ),
             tensorboard_enabled=False,
             sample_vis_interval=0,
             test_trace2cp_enabled=False,
@@ -236,6 +248,9 @@ def main():
                 "replay_batch": args.replay_batch,
                 "replay_cpu_batch": args.replay_cpu_batch,
                 "throughput_only": throughput_only,
+                "force_scalar_reduce_every_step": bool(
+                    args.force_scalar_reduce_every_step
+                ),
                 "timeout_seconds": float(args.timeout_seconds)}
     metadata["python"] = sys.version
     metadata["packages"] = {name: importlib.metadata.version(name)

@@ -1,6 +1,5 @@
-# Task: tune Fiber3D training batch size
+# Task: remove unconditional Fiber3D scalar synchronization
 
-Measure two-GPU Fiber3D training throughput across per-GPU batch sizes while
-keeping the model, data path, augmentation, optimizer, precision, and two H100
-devices fixed. Select the fastest safe batch size and report aggregate and
-per-GPU throughput, iteration distribution, and peak device memory.
+Avoid reducing and materializing training metrics on every DDP step when they
+are not logged or otherwise consumed. Preserve logged values and training
+semantics, then measure batch-28 two-GPU throughput against 108.09 samples/s.

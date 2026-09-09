@@ -340,6 +340,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _training_sample_index_limit,
     _training_cuda_batch_pipeline_depth,
     _training_cuda_value_augmentation,
+    _training_scalar_metrics_due,
+    _training_loss_metrics_if_due,
     _test_batch_take,
     _validate_snapshot_intervals,
     _write_3d_sample_sheet,
@@ -369,6 +371,41 @@ def test_training_cuda_value_augmentation_validates_suffix() -> None:
         _training_cuda_value_augmentation(
             {"sample_pipeline_cuda_value_augmentation": "noise"}
         )
+
+
+def test_training_scalar_metrics_due_uses_initial_steps_and_interval() -> None:
+    assert not _training_scalar_metrics_due(
+        1, scalar_interval=100, initial_steps=0
+    )
+    assert _training_scalar_metrics_due(
+        1, scalar_interval=100, initial_steps=10
+    )
+    assert _training_scalar_metrics_due(
+        100, scalar_interval=100, initial_steps=0
+    )
+    assert not _training_scalar_metrics_due(
+        101, scalar_interval=100, initial_steps=10
+    )
+    with pytest.raises(ValueError, match="scalar_interval"):
+        _training_scalar_metrics_due(1, scalar_interval=0, initial_steps=0)
+
+
+def test_training_loss_metrics_are_not_materialized_when_not_due(monkeypatch) -> None:
+    import vesuvius.neural_tracing.fiber_trace_3d.train as train_module
+
+    def unexpected_reduce(*args, **kwargs):
+        raise AssertionError("metric reduction must not run on an unconsumed step")
+
+    monkeypatch.setattr(
+        train_module,
+        "_distributed_mean_loss_tensors",
+        unexpected_reduce,
+    )
+    assert _training_loss_metrics_if_due(
+        {"total": torch.tensor(2.0)},
+        SimpleNamespace(enabled=False),
+        due=False,
+    ) is None
 
 
 def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):

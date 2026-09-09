@@ -2988,3 +2988,15 @@
 - Benchmark batch overrides must not silently change production configuration
   defaults. A larger global optimizer batch requires separate convergence
   validation before adoption.
+
+# Fiber3D training scalar metrics
+
+- Training loss/metric tensors are globally averaged and materialized as Python
+  scalars only when a rank-consistent consumer is due. Console and TensorBoard
+  retain distinct emission schedules; their union determines whether every DDP
+  rank enters the packed metric all-reduce.
+- `training.initial_scalar_log_steps` is a nonnegative integer and defaults to
+  100, preserving verbose startup output. `training.scalar_log_interval` remains
+  positive and controls periodic console and TensorBoard scalars.
+- Profiling rows omit `loss_total` on steps where metrics are not consumed. They
+  must not call `.item()` merely to keep a dense profiling schema.
