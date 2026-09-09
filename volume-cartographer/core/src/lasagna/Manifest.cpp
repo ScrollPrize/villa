@@ -238,4 +238,27 @@ std::string toString(NormalSourceKind kind)
     return "unknown";
 }
 
+bool lasagnaChannelShapeCompatible(
+    const std::array<std::size_t, 3>& baseShapeZYX,
+    double baseSpacing,
+    const std::array<std::size_t, 3>& shapeZYX,
+    const std::array<std::size_t, 3>& chunksZYX) noexcept
+{
+    if (!(baseSpacing > 0.0) || !std::isfinite(baseSpacing))
+        return false;
+    for (std::size_t axis = 0; axis < baseShapeZYX.size(); ++axis) {
+        if (baseShapeZYX[axis] == 0 || shapeZYX[axis] == 0 ||
+            chunksZYX[axis] == 0) {
+            return false;
+        }
+        const auto expected = static_cast<std::size_t>(std::ceil(
+            static_cast<double>(baseShapeZYX[axis]) / baseSpacing));
+        if (shapeZYX[axis] < expected ||
+            shapeZYX[axis] - expected > chunksZYX[axis]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace vc::lasagna

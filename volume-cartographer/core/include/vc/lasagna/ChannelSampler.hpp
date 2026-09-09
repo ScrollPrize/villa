@@ -88,6 +88,13 @@ public:
         LasagnaChannelChunkKeyHash>;
     using PrefetchRequest = std::pair<const LasagnaChannelBinding*, LasagnaChannelChunkKey>;
 
+    struct Stats {
+        size_t cachedBytes = 0;
+        size_t capacityBytes = 0;
+        size_t cachedChunks = 0;
+        size_t loadsInFlight = 0;
+    };
+
     explicit LasagnaChannelChunkCache(size_t capacityBytes);
 
     [[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> get(
@@ -104,6 +111,8 @@ public:
 
     [[nodiscard]] NormalPrefetchReport prefetchInterleaved(
         const std::vector<PrefetchRequest>& requests) const;
+
+    [[nodiscard]] Stats stats() const;
 
 private:
     struct Entry {
@@ -246,6 +255,8 @@ sharedLasagnaChannelChunkCache(size_t capacityBytes);
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
+[[nodiscard]] std::optional<std::array<uint8_t, 2>>
+encodeCompactNormalToRaw(const cv::Vec3d& normal);
 [[nodiscard]] cv::Vec3d principalCompactTensorAxis(
     const cv::Matx33d& tensor,
     const cv::Vec3d& hint);

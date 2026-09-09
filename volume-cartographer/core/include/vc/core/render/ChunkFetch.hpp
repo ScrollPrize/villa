@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -12,6 +13,12 @@
 #include <vector>
 
 namespace vc::render {
+
+class DecodedChunkPayload {
+public:
+    virtual ~DecodedChunkPayload() = default;
+    [[nodiscard]] virtual std::size_t residentBytes() const noexcept = 0;
+};
 
 inline constexpr std::string_view kPersistentSourcePayloadExtension = ".source";
 
@@ -84,6 +91,9 @@ struct ChunkFetchResult {
     bool persistentWriteHandled = false;
     int httpStatus = 0;
     std::string message;
+    // Application-decoded opaque chunks live directly in ChunkCache's LRU.
+    // Dense tensor chunks continue to use `bytes`.
+    std::shared_ptr<const DecodedChunkPayload> payload;
 };
 
 // A logical decoded chunk may be an inner member of one physical storage

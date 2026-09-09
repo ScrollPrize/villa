@@ -44,8 +44,8 @@
    `test_chunked_plane_sampler`, and `test_chunked_plane_sampler_more` sources,
    plus `test_volume_extras` (decode statistics/concurrency) and
    `test_chunked_plane_sampler_fallback` (requested-level locality/worker
-   limits), then execute those freshly linked tests. Do not install or
-   bootstrap dependencies.
+   limits), and `test_fiberlet_storage` (opaque payload accounting), then
+   execute those freshly linked tests. Do not install or bootstrap dependencies.
 10. If no usable configured native build exists or a required test cannot run
     in the available environment, record the
    exact command and reason rather than silently skipping it.

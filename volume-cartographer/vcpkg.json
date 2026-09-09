@@ -15,6 +15,7 @@
         "eigensparse"
       ]
     },
+    "highs",
     "eigen3",
     {
       "name": "opencv4",

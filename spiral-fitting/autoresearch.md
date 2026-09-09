@@ -21,7 +21,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## The goal
 
-**Maximise the area of ink recovered.** After each fit, the fitted meshes are rendered against an ink-prediction volume (`render_ink.py`) and a 2D nnU-Net scores how much ink-like surface was recovered (`get_ink_coverage.py`). The single number we optimise is:
+**Maximise the area of ink recovered.** After each fit, the fitted meshes are rendered against an ink-prediction volume (`render_ink.py`) and a 2D nnU-Net scores how much ink-like surface was recovered (`get_ink_metrics.py`). The single number we optimise is:
 
 > **`total_fg_pixels`** — the total count of ink-foreground pixels across all rendered winding strips. Higher = more ink recovered. This is the metric.
 
@@ -38,7 +38,7 @@ We also track **`overall_fg_fraction`** (foreground pixels ÷ total strip pixels
 - Create/modify your own helper *shell/python scripts* for driving the loop (batch launchers, summarizers, etc.).
 
 **What you CANNOT do:**
-- Touch the **metric / render pipeline**. `render_ink.py`, `get_ink_coverage.py`, the nnU-Net ink model / checkpoint, the ink volume, and the render/score parameters (scale, num-slices, fg-threshold, flatten settings) are all **frozen**. Modifying any of them — or otherwise engineering the score rather than the fit — is cheating.
+- Touch the **metric / render pipeline**. `render_ink.py`, `get_ink_metrics.py`, the nnU-Net ink model / checkpoint, the ink volume, and the render/score parameters (scale, num-slices, fg-threshold, flatten settings) are all **frozen**. Modifying any of them — or otherwise engineering the score rather than the fit — is cheating.
 - Edit **`tifxyz.py`**. It is shared: `render_ink.py` imports it to load the meshes it renders, so any change to it changes the metric. It is frozen even though `fit_spiral.py` also uses it. (`satisfaction_metrics.py` is likewise best left alone — editing it cannot affect the ink score.)
 - Change the number of fit iterations (`num_training_steps` in the config, currently `30000`) **above** its current value. It must stay fixed (it *can* be reduced if that genuinely gives equal-or-better ink coverage).
 - Install new packages or add dependencies. Use only what is already in this conda env.
@@ -57,7 +57,7 @@ Each experiment is one full pipeline run, driven by `run_single.py`, which chain
 
 1. `torchrun --nproc_per_node=<n> fit_spiral.py` — fits the meshes.
 2. `render_ink.py <meshes_dir>` — renders ink strips into `<meshes_dir>/ink`.
-3. `get_ink_coverage.py <meshes_dir>/ink` — scores ink coverage into `<meshes_dir>/ink_metric`.
+3. `get_ink_metrics.py <meshes_dir>/ink` — scores ink coverage into `<meshes_dir>/ink_metric`.
 
 `run_single.py` reads three things from the environment, which the caller sets:
 
@@ -71,7 +71,7 @@ Per-step logs go to `<out_dir>/logs/<tag>.{fit,ink,coverage}.log`, and the ink m
 
 ## Output format — reading the metric
 
-`get_ink_coverage.py` prints a summary near the end of its log (`<out_dir>/logs/<tag>.coverage.log`):
+`get_ink_metrics.py` prints a summary near the end of its log (`<out_dir>/logs/<tag>.coverage.log`):
 
 ```
 ================================================================

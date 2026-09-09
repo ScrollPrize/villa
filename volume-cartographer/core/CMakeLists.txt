@@ -1,6 +1,10 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
 add_library(vc_core
+        src/AtomicFile.cpp
+        src/PolylineObj.cpp
+        src/TexturedMesh.cpp
+        src/SurfaceTexture.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -194,9 +198,38 @@ add_library(vc_atlas
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
+    src/fiber_tracer/BinaryBeliefPropagation.cpp
+    src/fiber_tracer/FiberAnchors.cpp
+    src/fiber_tracer/FiberAnchorObjectives.cpp
+    src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
+    src/fiber_tracer/FiberAxisTensor.cpp
+    src/fiber_tracer/FiberGraph.cpp
+    src/fiber_tracer/FiberLocalScoring.cpp
+    src/fiber_tracer/FiberPaths.cpp
+    src/fiber_tracer/FiberReplay.cpp
+    src/fiber_tracer/FiberReplayMetric.cpp
+    src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
+    src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberletQuantization.cpp
+    src/fiber_tracer/FiberletDataset.cpp
+    src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
+    src/fiber_tracer/FiberletCropTraceArtifact.cpp
+    src/fiber_tracer/FiberTraceConstraints.cpp
+    src/fiber_tracer/FiberTraceBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceWindingLeastSquares.cpp
+    src/fiber_tracer/FiberTraceWindingOrderedCuts.cpp
+    src/fiber_tracer/FiberTraceConsensus.cpp
+    src/fiber_tracer/FiberTraceLabeling.cpp
+    src/fiber_tracer/FiberTraceSeed.cpp
+    src/fiber_tracer/FiberletCropVisualization.cpp
+    src/fiber_tracer/FiberletOnDemand.cpp
+    src/fiber_tracer/FiberletStorage.cpp
+    src/fiber_tracer/LasagnaNormalAlignment.cpp
 )
-target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE highs::highs Eigen3::Eigen Ceres::ceres)
 if(VC_TESTING)
     target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
 endif()

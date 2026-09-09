@@ -164,6 +164,8 @@ vc_add_test(NAME test_fiber_trace_review
     LIBS doctest::doctest vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_fiber_json)
+
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
 vc_add_test(NAME test_lasagna_service_manager_factory
@@ -240,7 +242,26 @@ vc_add_test(NAME test_fiber_slice_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_normal_alignment
+    LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_trace3d
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
+
+vc_add_test(NAME test_fiber_anchors
+    LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_paths
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
+vc_add_test(NAME test_fiber_reference_replay_benchmark
+    LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_storage
+    LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_crop_trace
+    LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_trace_winding_bp
+    LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
 

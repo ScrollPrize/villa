@@ -157,6 +157,7 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
+option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
@@ -414,7 +415,10 @@ endif()
 # LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
 # auto-import/export-all, and link times on the CI runners balloon.
 if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    add_compile_options(${_lto})
+    foreach(_lto_compile_option IN LISTS _lto)
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:C,CXX>:${_lto_compile_option}>")
+    endforeach()
     add_link_options(${_lto})
 endif()
 
@@ -529,6 +533,7 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(highs CONFIG REQUIRED)
 # OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
 # Rodrigues (calib) and estimateAffine3D (geometry), so select both new
 # modules there while retaining the OpenCV 4 module name elsewhere.
@@ -847,6 +852,8 @@ if(VC_TESTING)
         test_lasagna_manifest
         test_lasagna_project_volumes
         test_fiber_trace3d
+        test_fiber_anchors
+        test_fiberlet_paths
         test_open_data_manifest
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces

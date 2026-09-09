@@ -325,3 +325,128 @@ During active remote downloads, the existing cache status bar appends:
 - Worker callbacks only publish activity state. Framebuffer composition and Qt
   repaint requests happen on the UI thread, and diagnostics never queue chunks
   or alter request priority.
+
+## Experimental continuous fiber winding solve
+
+- `vc_fiber_trace_chunk direction-ablation --winding-solver ceres` must leave
+  the default joint-grid and alternating solvers unchanged.
+- Ceres must consume the same public prepared winding model as BP. It must not
+  reconstruct canonical targets, confidence attenuation, class weights,
+  distance decay, sign promotion, incidence, or gauge connectivity from CSV
+  diagnostics.
+- Each piece has bounded horizontalness and activity in `[0,1]` plus an
+  unbounded real winding coordinate. Pair residuals are gated by both endpoint
+  activities; inactive-piece and orientation-extremeness residuals use the
+  prepared incident measurement count.
+- The fixed-scale experiment uses canonical scale-first targets and the
+  existing five magnitude weights, two sign weights, defect cost,
+  piece-break cost, and host-derived thread default. It does not add an integer
+  winding-ladder prior.
+- BP hard continuation and hard signs are explicitly finite approximations in
+  Ceres. Reports must expose remaining violations and must not describe them as
+  exact constraints.
+- A reference benchmark must solve each reference source independently from
+  its selected cross constraints while fixing all connected crop endpoints to
+  the main continuous solution. Ground-truth filename order may only enter a
+  final global sign/half-step offset calibration, not the per-reference solve.
+
+## Reference winding estimate reporting
+
+- The BP per-reference table reports one selected candidate in two coordinate
+  systems. `est_w` is the globally calibrated reference-coordinate value.
+  `raw_w` must be that exact candidate inverse-mapped through the selected
+  global sign and unique candidate-bearing gauge offset. That latent coordinate
+  must then be converted to integer `mapWinding` using the reference H/V class,
+  component phase sign, and selected phase before adding the same output offset
+  used to name published solver winding OBJ layers. It must not run a second
+  raw candidate selection. Consequently `raw_w` directly identifies the
+  inferred winding layer to inspect.
+- With latent class offset `C`, published offset `P`, gauge offset `G`, and
+  global sign `S`, the table follows
+  `raw_w = S * est_w + G - C + P`. No final estimate, evidence in more than one
+  candidate-bearing gauge, or incompatible contributing orientation components
+  reports `NA`. A valid half-step candidate on the opposite H/V output ladder
+  also reports `NA`; a candidate outside the half-step lattice is an invariant
+  error. Ceres keeps its
+  existing independently defined raw/calibrated reporting convention.
+
+## Reference factor conflict diagnostics
+
+- Reference-enabled direction ablation prints separate compact conflict
+  summaries for clamped reference/reference factors and clamped
+  reference/BP factors.
+- Both summaries consume materialized solver factor targets and effective
+  coefficients and use seven classes: perpendicular winding `0.5`,
+  perpendicular winding `1.5+`, perpendicular sign, parallel winding `0`,
+  parallel winding `1`, parallel winding `2+`, and parallel sign.
+- Magnitude and sign are independent. Zero-weight magnitude factors and
+  disabled finite sign factors are absent. Reference/reference diagnostics
+  exclude hard continuity and same-source links.
+- The long raw reference/reference piece-pair tables are opt-in through
+  `--reference-constraint-details`. Compact summaries remain enabled by
+  default.
+
+## Fixed-reference offender-pruning diagnostic
+
+- `vc_fiber_trace_chunk direction-ablation --reference-prune-offenders` is an
+  opt-in joint-grid, fixed-orientation diagnostic. It removes ordinary pieces
+  decoded as Defect by the non-disableable fixed-reference solve, removes their
+  incident factors and all reference state, and solves the retained induced
+  ordinary graph from scratch without a warm start.
+- Selection defaults to conditioned post-projection MAP Defects. The explicit
+  `union-defect` policy selects the union of baseline and conditioned MAP
+  Defects. The explicit `conditioned-posterior` policy selects only ordinary
+  pieces whose conditioned pre-hard-projection Defect marginal is strictly
+  greater than its required finite threshold in `[0,1]`; it does not silently
+  union projected Defects. Reference-prefix pieces are never selected.
+- Policy-specific runs publish distinct `_pruned`, `_pruned_union`, and
+  `_pruned_pF` artifact families and partition selected pieces into mutually
+  exclusive baseline-only, conditioned-only, both-Defect, and neither-Defect
+  cohorts.
+- The final compact report is aligned component-wise to the conditioned gauge.
+  Integer winding, latent coordinates, candidate support, and component phase
+  sign are transformed consistently. The `_pruned_w_N_h/v/disabled.obj`
+  artifacts and the separately headed pruned reference benchmark use this same
+  aligned report and output offset. `_pruned_w_N_broken.obj` remains the removed
+  conditioned cohort.
+- The pruned reference benchmark reuses an induced subset of the original
+  reference cross-constraint report. It retains the complete reference prefix
+  and retained ordinary piece IDs, never regenerates geometry, and applies the
+  same scoring and calibration path as the original benchmark.
+- `conditioned-inliers` constructs a direct reference-conditioned working set
+  instead of defining the fresh reference-free solve as authoritative. It
+  removes conditioned Defects, direct fixed-reference sign conflicts, a
+  deterministic weighted vertex cover of all remaining admitted-sign
+  conflicts, and pieces disconnected from fixed references through satisfied
+  sign or hard-continuation edges.
+- Admitted-sign semantics are shared with the prepared solver diagnostics:
+  dominant relation, nonzero signed target, and either hard enforcement or a
+  finite positive sign penalty. Sign consistency is mandatory for the direct
+  set. Winding magnitude residuals are soft endpoint-ranking support only and
+  default to zero weight.
+- The selector is piece-atomic. Hard continuation supplies equality when both
+  endpoints remain active and supplies connectivity, but does not merge a full
+  source trace into one removable unit.
+- Direct conditioned labels publish under `_inliers`; reason-specific removed
+  layers are `_input_defect`, `_ref_conflict`, `_sign_cover`, and
+  `_disconnected`. A fresh solve of the same retained induced graph publishes
+  separately under `_inliers_fresh` and is a stability diagnostic.
+- `oracle-inliers` is reference-supervised. It re-solves exact induced subsets
+  from original piece IDs, accepts only converged non-regressive reference
+  tuples, permits neutral offender peeling, and prefers an explicit missing
+  estimate to a known wrong estimate after exact-count maximization.
+- Oracle sign consistency is mandatory. Magnitude evidence ranks removals but
+  is not authoritative. References below the configured active-observation
+  threshold are not identifiable oracle targets. Oracle direct and fresh
+  artifacts use `_oracle` and `_oracle_fresh`.
+- Direct inlier reporting groups final active H/V pieces by their assigned
+  half-winding in the inclusive annotated reference interval using the final
+  benchmark calibration. It compares all removed original pieces with final
+  in-range pieces as both a combined-population problematic percentage and a
+  removed/in-range percentage. Source-fiber aggregation is not used.
+- Its constraint benchmark counts each original graph constraint once. Removed-
+  incident constraints, retained constraints neutralized by final Defects, and
+  retained constraints with any infringed factor term are problematic; all
+  other retained constraints are fulfilled. Both combined-population and
+  problematic/fulfilled percentages are reported. Arbitrary retained subsets
+  preserve original constraint identity through conditioned-prefix lookup.

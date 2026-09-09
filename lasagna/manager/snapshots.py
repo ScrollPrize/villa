@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -34,6 +34,7 @@ class SnapshotRecord:
     task: str
     output_schema: dict[str, Any] | None
     code_revision: str | None
+    model_identifier: str | None = None
 
 
 def discover_snapshot_paths(roots: Iterable[Path]) -> list[tuple[str, Path]]:
@@ -91,6 +92,75 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _atlas_checkpoint_identities(config: ManagerConfig) -> dict[str, dict[str, str | None]]:
+    """Index registered Atlas models by their exact checkpoint digest."""
+    atlas_dir = config.resolved_path("atlas_dir")
+    if atlas_dir is None:
+        return {}
+    models_dir = atlas_dir / "data" / "models"
+    if not models_dir.is_dir():
+        return {}
+    identities: dict[str, dict[str, str | None]] = {}
+    for path in sorted(models_dir.rglob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        properties = _mapping(value.get("properties"))
+        digest = str(properties.get("snapshot_sha256") or "").lower()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            continue
+        model_id = str(value.get("id") or "")
+        if not model_id:
+            raise ValueError(f"Atlas model with checkpoint SHA-256 has no id: {path}")
+        creation = _mapping(value.get("creation"))
+        identifier = properties.get("model_identifier")
+        if identifier is not None and (not isinstance(identifier, str) or not identifier.strip()):
+            raise ValueError(f"Atlas model has invalid model_identifier: {path}")
+        identity = {
+            "atlas_model_id": model_id,
+            "model_creation_utc": str(creation.get("date")) if creation.get("date") else None,
+            "model_identifier": identifier.strip() if isinstance(identifier, str) else None,
+        }
+        previous = identities.get(digest)
+        if previous is not None and previous != identity:
+            raise ValueError(
+                f"multiple Atlas models claim checkpoint SHA-256 {digest}: "
+                f"{previous['atlas_model_id']!r} and {model_id!r}"
+            )
+        identities[digest] = identity
+    return identities
+
+
+def _with_atlas_identity(
+    record: SnapshotRecord,
+    identities: Mapping[str, Mapping[str, str | None]],
+) -> SnapshotRecord:
+    identity = identities.get(record.sha256.lower())
+    if identity is None:
+        return record
+    atlas_model_id = identity.get("atlas_model_id")
+    if record.atlas_model_id and record.atlas_model_id[:14] != str(atlas_model_id)[:14]:
+        raise ValueError(
+            f"checkpoint {record.path} embeds Atlas model {record.atlas_model_id!r}, "
+            f"but its SHA-256 is registered as {atlas_model_id!r}"
+        )
+    model_identifier = identity.get("model_identifier")
+    if record.model_identifier and record.model_identifier != model_identifier:
+        raise ValueError(
+            f"checkpoint {record.path} embeds model identifier {record.model_identifier!r}, "
+            f"but Atlas registers {model_identifier!r}"
+        )
+    return replace(
+        record,
+        atlas_model_id=str(atlas_model_id),
+        model_creation_utc=record.model_creation_utc or identity.get("model_creation_utc"),
+        model_identifier=record.model_identifier or model_identifier,
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -178,6 +248,11 @@ def _extract(path: Path, run: str, stat: os.stat_result) -> SnapshotRecord:
     if metric_name is None and top.get("val_loss") is not None:
         metric_name = "validation/loss"
     atlas_model_id = atlas.get("model_id") or config.get("atlas_model_id") or top.get("atlas_model_id")
+    model_identifier = (
+        atlas.get("model_identifier")
+        or config.get("model_identifier")
+        or top.get("model_identifier")
+    )
     record = SnapshotRecord(
         backend=backend,
         run=run,
@@ -202,6 +277,7 @@ def _extract(path: Path, run: str, stat: os.stat_result) -> SnapshotRecord:
         task="lasagna",
         output_schema=output_schema,
         code_revision=str(top.get("code_revision") or config.get("code_revision")) if (top.get("code_revision") or config.get("code_revision")) else None,
+        model_identifier=str(model_identifier) if model_identifier else None,
     )
     return record
 
@@ -214,6 +290,7 @@ def index_snapshots(
 ) -> list[SnapshotRecord]:
     cache_path = _cache_path(config)
     cache = _load_cache(cache_path)
+    atlas_identities = _atlas_checkpoint_identities(config)
     updated: dict[str, dict[str, Any]] = {}
     records: list[SnapshotRecord] = []
     for run, path in discover_snapshot_paths(config.resolved_snapshot_dirs()):
@@ -226,16 +303,21 @@ def index_snapshots(
             continue
         else:
             record = _extract(path, run, stat)
+        # Cache only checkpoint-owned metadata. Atlas registration is projected
+        # on every scan so registry edits take effect without touching weights.
         updated[key] = asdict(record)
-        records.append(record)
+        records.append(_with_atlas_identity(record, atlas_identities))
     if not cached_only and write_cache:
         _atomic_json(cache_path, {"schema_version": 1, "entries": updated})
     return sorted(records, key=lambda record: (record.run, record.checkpoint, record.path))
 
 
-def completion_snapshot_candidates(config: ManagerConfig) -> list[tuple[str, str]]:
+def completion_snapshot_candidates(
+    config: ManagerConfig, *, backend: str | None = None,
+) -> list[tuple[str, str]]:
     """Discover every checkpoint cheaply, enriching candidates from the index."""
     cache = _load_cache(_cache_path(config))
+    atlas_identities = _atlas_checkpoint_identities(config)
     candidates: dict[str, str] = {}
     for run, path in discover_snapshot_paths(config.resolved_snapshot_dirs()):
         try:
@@ -253,6 +335,9 @@ def completion_snapshot_candidates(config: ManagerConfig) -> list[tuple[str, str
             except TypeError:
                 pass
             else:
+                record = _with_atlas_identity(record, atlas_identities)
+                if backend is not None and record.backend != backend:
+                    continue
                 candidates[record.selector] = (
                     f"step {record.step}" if record.step is not None else "snapshot"
                 )

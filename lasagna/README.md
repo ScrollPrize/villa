@@ -27,7 +27,8 @@ Verify the selected PyTorch build and GPU access:
 python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
-The install exposes these commands:
+The install exposes these commands, including the native Fiberlet processor
+packaged by the sibling Volume Cartographer Python distribution:
 
 ```bash
 lasagna-fit-service --help
@@ -37,6 +38,7 @@ lasagna-preprocess --help
 lasagna-preprocess integrate --help
 lasagna-preprocess predict3d --help
 las_manager --help
+vc_fiberlets --help
 ```
 
 The bootstrap installs Lasagna with `-e`, so changes in this checkout are
@@ -57,14 +59,20 @@ las_manager fetch
 las_manager volume ls --sample PHerc0332
 las_manager snapshot ls
 las_manager volume prefetch <volume> 1 --workers 512
-las_manager inference run <snapshot> <volume> 1 -- --devices all
+las_manager inference run <snapshot> <volume> [scale]
+las_manager las-inference <snapshot> <volume> [scale]
+las_manager fiber-inference <snapshot> <volume> [scale]
 las_manager inference ls
+las_manager fiberlet run <completed-fiber-inference>
 ```
 
-Fresh configs include shared inference defaults equivalent to
-`--tile-size 512 --border 32 --overlap 96 --devices all` in the `params` token
-array. Edit that array globally or append arguments after `--` for a single-run
-override.
+Fresh configs use `params` for Fiber inference defaults. Regular Lasagna uses
+its checkpoint and CLI defaults, with `--devices all` supplied by the separate
+`lasagna_params` array. The snapshot and volume remain required, while the
+input scale defaults to OME-Zarr group 2. `las-inference` and
+`fiber-inference` are backend-forcing aliases for `inference run`; all three
+share the same launch path. Arguments after `--` remain available for
+deliberate per-run overrides.
 
 `inference run` returns as soon as its run directory and detached tmux session
 are created. The tmux workflow performs automatic prefetch first and inference
@@ -108,11 +116,19 @@ Cached volumes, snapshots, runs, option values, and locally known OME scale
 indices are completed contextually. A final `help` token shows help for the
 longest recognized command prefix, for example `las_manager vol pre help`.
 
+Managed Fiberlet preprocessing automatically resolves compatible published
+regular Lasagna normals from the open-data catalogue and caches their manifest
+and on-demand chunks under the configured manager cache. See
+[`docs/manager.md`](docs/manager.md#whole-volume-fiberlet-jobs) for explicit
+Atlas/local normal overrides and compatibility rules.
+
 This installation currently expects the `villa` monorepo layout: Lasagna
-packages the sibling `vesuvius/src` implementation and installs its declared
-model dependencies. It deliberately does not build Volume Cartographer, which
-is not needed for preprocessing. Copying only the `lasagna/` directory is
-therefore not yet a supported standalone installation.
+packages the sibling `vesuvius/src` implementation, installs its declared
+model dependencies, and installs the sibling Volume Cartographer Python
+distribution with its `vc_fiberlets` command. Copying only the `lasagna/`
+directory is therefore not yet a supported standalone installation. On Linux,
+the bootstrap selects an available GCC 13 or newer for that C++23 build unless
+`CC` or `CXX` is already set.
 
 ### Batch-download the PHerc scale-0 volumes
 

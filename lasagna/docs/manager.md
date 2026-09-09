@@ -1,9 +1,9 @@
 # `las_manager`
 
 `las_manager` is the shared orchestration CLI for Fiber 3D and Lasagna
-inference. It provides global configuration, open-data and snapshot discovery,
-prefetch, durable Fiber and Lasagna inference runs in tmux, portable inference
-provenance, and atomic Atlas staging/ingestion for both portable bundle forms.
+inference and whole-volume Fiberlet preprocessing. It provides global
+configuration, open-data and snapshot discovery, prefetch, durable tmux jobs,
+portable provenance, and atomic Atlas staging/ingestion.
 
 ## Configuration
 
@@ -29,12 +29,24 @@ cache_dir = "/ephemeral/me/las_manager_cache"
 output_dir = "/ephemeral/me/fiber_inferences"
 venv = "/home/me/.venv_las"
 params = ["--tile-size", "512", "--border", "32", "--overlap", "96", "--devices", "all"]
+lasagna_params = ["--devices", "all"]
+fiberlet_binary = "/path/to/vc_fiberlets" # empty resolves it from PATH
+fiberlet_threads = 32
+fiberlet_params = []
 ```
 
-`params` is a TOML array of backend argv tokens applied to every Fiber and
-Lasagna inference. Arguments supplied after `inference run ... --` follow these
+`params` contains Fiber inference defaults. `lasagna_params` is separate so
+regular Lasagna inference retains its checkpoint tile size and native defaults
+for border, overlap, and output scaledowns; it only selects all GPUs by default.
+Arguments supplied after `inference run ... --` follow the applicable backend
 defaults and override repeated options. An explicit `--device` or `--devices`
 also removes the configured mutually exclusive device selector.
+
+`fiberlet_threads` is the native whole-volume worker budget and is always
+passed as `--threads`. Set it to the host-appropriate value (128 on the current
+large inference host). `fiberlet_params` contains additional native arguments.
+A per-run `fiberlet run ... --threads N` or repeated option after `--` occurs
+last and therefore overrides the configured value.
 
 ## Catalog and volume selectors
 
@@ -211,6 +223,85 @@ the durable inference list and log but correctly reports that no terminal can
 be reattached. Window tabs use the short `inf-<scroll>-<uuid4>` form rather
 than the full run name.
 
+## Whole-volume Fiberlet jobs
+
+Fiberlets consume a completed local manager Fiber 3D prediction with
+`presence`, `nx`, and `ny` plus a regular Lasagna prediction providing
+`grad_mag`, `nx`, and `ny` surface normals. By default the manager refreshes or
+reuses the public catalogue under its normal one-hour policy and selects the
+unique published normal representation for the Fiber run's sample and volume:
+
+```bash
+las_manager fiberlet run <fiber-inference-run>
+las_manager fiberlet run <fiber-inference-run> --threads 128
+las_manager fiberlet ls
+las_manager tmux attach <fiberlet-run>
+las_manager fiberlet resume <fiberlet-run>
+```
+
+If more than one published normal representation matches, select one explicitly
+with `atlas:<model-id>@L<source-level>`. A completed local regular Lasagna run
+remains a valid explicit override:
+
+```bash
+las_manager fiberlet run <fiber-run> atlas:20260419180421@L2
+las_manager fiberlet run <fiber-run> <local-normal-inference-run>
+```
+
+The Fiber and normal source levels need not be equal: each retains its own
+Atlas level and persisted prediction spacing. Compatibility instead requires
+the same sample and source volume, uncropped whole-volume coverage, numeric
+source-to-base mappings, and base shapes within one voxel per axis (the public
+catalogue and manifests use differing extent conventions). Fiber direction
+`nx`/`ny` are never accepted as surface normals. A missing published normal is
+reported before a run directory is created.
+
+For a published normal, the manager uses VC3D's existing open-data cache layout:
+`<cache_dir>/open_data/lasagna/<sample>/<volume>/<identity>/`. The identity is
+VC3D's deterministic identity of the canonical remote artifact URL, model,
+Lasagna version, source-to-base mapping, and parent shape; it is not a manifest
+content hash. The manager downloads only the small root manifest and writes the
+standard `lasagna-remote.json` descriptor there. The native reader then fetches
+only required normal Zarr chunks into that same persistent lazy cache and reuses
+them across manager jobs and VC3D; it does not bulk-prefetch the prediction.
+Shell completion reads only the cached catalogue and never performs network I/O.
+Resolution is strict: a missing `public-read` origin, malformed or mismatched
+cache marker, changed manifest hash on resume, incompatible catalogue/manifest
+coordinates, or unavailable/invalid Zarr descriptor aborts before launch. The
+manager does not fall back to another prediction or cache layout.
+Portable dependency identity records the Atlas model/level and exact remote
+artifact and manifest URLs. Manifest SHA-256 is retained only to detect changed
+or corrupt content during resume; it is neither a source locator nor a cache key.
+
+The native command runs through the same tmux runner, log tee, signal handling,
+PID reconciliation, and durable status machinery as inference. Its layout is:
+
+```text
+<output_dir>/<sample>-<volume>-fiberlets-<uuid8>/
+  metadata.json                 # private manager/job record
+  command.json                  # exact host-local invocation
+  source_context.json           # stable source identities and hashes only
+  run.log
+  cache/fiberlets.anchors.zarr  # local resumable float cache; never uploaded
+  artifacts/
+    fiberlets.json              # bounded portable provenance
+    fiberlets.zarr/             # final combined anchors/prefix/routes dataset
+```
+
+`fiberlet resume` revalidates both upstream manifests and their hashes, then
+reuses the recorded native command, final Zarr, and local anchor cache. The
+manager owns the input, output, normal-manifest, remote-cache, anchor-cache, and source-context
+arguments; configured or passthrough arguments cannot replace them.
+
+The final Zarr is self-describing and contains versioned stable source
+identities plus all effective scientific processing, coordinate, layout,
+storage, quantization, and codec settings needed to open it. Dataset identity
+includes those settings and source hashes but excludes filesystem paths,
+output/cache directories, host identity, and the executable location. Native
+preprocessing rescans source presence and validates every expected sparse tuple
+before it exits successfully; the manager additionally requires completed
+portable provenance.
+
 ## Abbreviations and completion
 
 Command tokens accept only exact or unique-prefix matches. Entity selectors
@@ -278,7 +369,10 @@ Run these commands in order:
 1. Start inference and wait for it to report `completed`:
 
    ```bash
-   las_manager inference run <snapshot> <sample/volume> <scale>
+   las_manager inference run <snapshot> <sample/volume> [scale]
+   las_manager las-inference <snapshot> <sample/volume> [scale]
+   las_manager fiber-inference <snapshot> <sample/volume> [scale]
+   # Group 2 is the default when scale is omitted.
    las_manager inference ls
    ```
 
@@ -300,7 +394,7 @@ Run these commands in order:
    ```
 
    This copies `artifacts/` to
-   `<upload_staging_s3>/<run-uuid>/` (for example,
+   `<upload_staging_s3>/inference/<run-uuid>/` (for example,
    `s3://philodemos/hendrik/lasagna/inference/<run-uuid>/`) and writes or
    updates the corresponding files below `<atlas_dir>/data/models/lasagna/`
    and `<atlas_dir>/data/volumes/`. It does **not** publish to the public
@@ -332,14 +426,14 @@ Run these commands in order:
    then exposes that public origin online; the private staging origin is not
    included in the public metadata.
 
-Validate or upload a completed Fiber or Lasagna run:
+Validate or upload a completed Fiber, Lasagna, or Fiberlet run:
 
 ```bash
 las_manager open-data validate <run>
 las_manager open-data upload <run>
 ```
 
-The manager resolves model identity from the inference checkpoint SHA-256 and
+For inference, the manager resolves model identity from the checkpoint SHA-256 and
 configured `snapshot_dirs`, freshly rehashing candidates before use. A carried
 numeric Atlas ID is honored; otherwise the actual run's single UTC timestamp
 defines the ID. Byte-identical checkpoint aliases are normalized, while hash,
@@ -355,8 +449,12 @@ metadata; `repository.dirty` reports local modifications. Packaged deployments
 outside a Git checkout may supply `VILLA_CODE_COMMIT` and otherwise record
 `null`.
 
-Upload writes `_INCOMPLETE` at the final run-UUID prefix, bulk-copies the fixed
-file inventory with `rclone`, and removes the marker only after rclone succeeds.
+Upload writes `_INCOMPLETE` at the final run-UUID prefix and removes the marker
+only after rclone succeeds. Inference bulk-copies its fixed inventory;
+Fiberlets stream the sparse `artifacts/` tree directly through rclone so the
+manager never materializes millions of payload filenames in RAM. Fiberlet
+staging uses `<upload_staging_s3>/fiberlets/<run-uuid>/`; inference retains
+`<upload_staging_s3>/inference/<run-uuid>/`.
 Retry invokes rclone again so its configured comparison flags resume or skip
 existing objects. Completed run UUIDs and their artifact bundles are immutable:
 `rclone copy --size-only` does not detect changed same-size objects or remove
@@ -375,6 +473,14 @@ plus a relative origin path and joins them for data-sync; public metadata export
 keeps only the subsequently added `public-read` origin. Publication remains an explicit
 `vesuvius-atlas data-sync` operation; the manager never writes the public
 bucket and leaves `atlas_publication = not_started`.
+
+Fiberlets are registered as a derived `fiberlets` volume representation, not
+as a new model. The entry binds the already-published Fiber and normal Lasagna
+models/levels and their manifest hashes to the native dataset fingerprint.
+Atlas plans exactly one canonical copy and, for CC BY-NC volumes, one public
+copy under
+`<sample>/representations/fiberlets/<volume>-fiberlets-<identity>/`. No derive
+workflow is required because the staged combined Zarr is already final.
 
 ### Refinement direction: reuse generic Atlas ingestion
 

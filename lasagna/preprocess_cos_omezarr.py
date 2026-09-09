@@ -1752,6 +1752,7 @@ def run_preprocess_3d(
 			),
 			chunk_size=oc,
 			pyramid_policy=PYRAMID_POLICY_CUSTOM,
+			accumulator_channel_count=7,
 			inference_scaledown=other_sd,
 		),
 		pred_dt_product=(

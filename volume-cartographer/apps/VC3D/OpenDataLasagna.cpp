@@ -150,15 +150,14 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     if (!manifest.baseShapeZYX) return;
     const double spacing = static_cast<double>(group.scaleFactor()) *
                            manifest.sourceToBase;
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        const auto expected = static_cast<std::size_t>(std::ceil(
-            static_cast<double>((*manifest.baseShapeZYX)[axis]) / spacing));
-        const auto actual = meta.shape[axis];
-        const auto padding = meta.chunks[axis];
-        if (actual < expected || actual > expected + padding) {
-            throw std::runtime_error("Lasagna channel group '" + group.name +
-                                     "' shape is incompatible with base_shape_zyx");
-        }
+    const std::array<std::size_t, 3> shape{
+        meta.shape[0], meta.shape[1], meta.shape[2]};
+    const std::array<std::size_t, 3> chunks{
+        meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    if (!vc::lasagna::lasagnaChannelShapeCompatible(
+            *manifest.baseShapeZYX, spacing, shape, chunks)) {
+        throw std::runtime_error("Lasagna channel group '" + group.name +
+                                 "' shape is incompatible with base_shape_zyx");
     }
 }
 

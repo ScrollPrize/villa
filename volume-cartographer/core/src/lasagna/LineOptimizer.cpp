@@ -1568,7 +1568,7 @@ using Clock = std::chrono::steady_clock;
            unitAxis * (unitAxis.dot(vector) * (1.0 - c));
 }
 
-[[nodiscard]] cv::Vec3d transportedDirectionToNormalPlane(
+[[nodiscard]] cv::Vec3d transportDirectionToNormalPlaneImpl(
     const cv::Vec3d& direction,
     const cv::Vec3d& previousNormal,
     cv::Vec3d targetNormal)
@@ -1684,7 +1684,7 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
             const NormalSample sample = sampler.sampleNormal(predicted);
             cv::Vec3d normal = normalizedOrZero(sample.normal);
             if (sample.valid && length(normal) > kEpsilon) {
-                direction = transportedDirectionToNormalPlane(direction, previousNormal, normal);
+                direction = transportDirectionToNormalPlaneImpl(direction, previousNormal, normal);
                 if (length(previousNormal) > kEpsilon && previousNormal.dot(normal) < 0.0) {
                     normal *= -1.0;
                 }
@@ -2098,7 +2098,8 @@ void growNormalConstructedExtension(
         const NormalSample sample = sampler.sampleNormal(predicted);
         cv::Vec3d normal = normalizedOrZero(sample.normal);
         if (sample.valid && length(normal) > kEpsilon) {
-            direction = transportedDirectionToNormalPlane(direction, previousNormal, normal);
+            direction = transportDirectionToNormalPlaneImpl(
+                direction, previousNormal, normal);
             if (length(previousNormal) > kEpsilon && previousNormal.dot(normal) < 0.0) {
                 normal *= -1.0;
             }
@@ -3362,6 +3363,15 @@ void applyHardSpanDirections(
 }
 
 } // namespace
+
+cv::Vec3d transportDirectionToNormalPlane(
+    const cv::Vec3d& direction,
+    const cv::Vec3d& previousNormal,
+    const cv::Vec3d& targetNormal)
+{
+    return transportDirectionToNormalPlaneImpl(
+        direction, previousNormal, targetNormal);
+}
 
 LineControlPointUpdateResult updateExistingLineControlPoint(
     std::vector<cv::Vec3d> linePoints,

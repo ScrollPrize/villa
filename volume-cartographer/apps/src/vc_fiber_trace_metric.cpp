@@ -1,6 +1,7 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
+#include "FiberTraceCli.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -166,85 +167,9 @@ CliOptions parseArgs(int argc, char** argv)
             options.inferenceScaledownPower =
                 parseInt(requireValue(i, argc, argv, "inference-scaledown-power"),
                          "inference-scaledown-power");
-        } else if (arg == "--step-voxels") {
-            options.trace.stepVoxels =
-                parseDouble(requireValue(i, argc, argv, "step-voxels"),
-                            "step-voxels");
-        } else if (arg == "--cone-angle-degrees") {
-            options.trace.coneAngleDegrees =
-                parseDouble(requireValue(i, argc, argv, "cone-angle-degrees"),
-                            "cone-angle-degrees");
-        } else if (arg == "--cone-angle-step-degrees") {
-            options.trace.coneAngleStepDegrees =
-                parseDouble(requireValue(i, argc, argv, "cone-angle-step-degrees"),
-                            "cone-angle-step-degrees");
-        } else if (arg == "--cone-grid-size") {
-            options.trace.coneGridSize =
-                parseInt(requireValue(i, argc, argv, "cone-grid-size"),
-                         "cone-grid-size");
-        } else if (arg == "--beam-width") {
-            options.trace.beamWidth =
-                parseInt(requireValue(i, argc, argv, "beam-width"),
-                         "beam-width");
-        } else if (arg == "--beam-prune-distance-voxels") {
-            options.trace.beamPruneDistanceVoxels =
-                parseDouble(requireValue(i, argc, argv, "beam-prune-distance-voxels"),
-                            "beam-prune-distance-voxels");
-        } else if (arg == "--beam-lookahead-steps") {
-            options.trace.beamLookaheadSteps =
-                parseInt(requireValue(i, argc, argv, "beam-lookahead-steps"),
-                         "beam-lookahead-steps");
-        } else if (arg == "--lookahead-parent-cap") {
-            const int cap = parseInt(
-                requireValue(i, argc, argv, "lookahead-parent-cap"),
-                "lookahead-parent-cap");
-            if (cap < 0)
-                failOption("--lookahead-parent-cap must be non-negative");
-            options.trace.lookaheadParentCap = static_cast<size_t>(cap);
-        } else if (arg == "--lookahead-retry-parent-cap") {
-            const int cap = parseInt(
-                requireValue(i, argc, argv, "lookahead-retry-parent-cap"),
-                "lookahead-retry-parent-cap");
-            if (cap < 0)
-                failOption("--lookahead-retry-parent-cap must be non-negative");
-            options.trace.lookaheadRetryParentCap = static_cast<size_t>(cap);
-        } else if (arg == "--exhaustive-lookahead") {
-            options.trace.lazyLookahead = false;
-        } else if (arg == "--threads") {
-            options.trace.parallelThreads =
-                parseInt(requireValue(i, argc, argv, "threads"), "threads");
-        } else if (arg == "--smoothness-weight") {
-            options.trace.smoothnessWeight =
-                parseDouble(requireValue(i, argc, argv, "smoothness-weight"),
-                            "smoothness-weight");
-        } else if (arg == "--smoothness-normal-weight") {
-            options.trace.smoothnessNormalWeight =
-                parseDouble(requireValue(i, argc, argv, "smoothness-normal-weight"),
-                            "smoothness-normal-weight");
-        } else if (arg == "--smoothness-tangent-weight") {
-            options.trace.smoothnessTangentWeight =
-                parseDouble(requireValue(i, argc, argv, "smoothness-tangent-weight"),
-                            "smoothness-tangent-weight");
-        } else if (arg == "--smoothness-free-angle-degrees") {
-            options.trace.smoothnessFreeAngleDegrees =
-                parseDouble(requireValue(i, argc, argv, "smoothness-free-angle-degrees"),
-                            "smoothness-free-angle-degrees");
-        } else if (arg == "--cumulative-smoothness-steps") {
-            options.trace.cumulativeSmoothnessSteps =
-                parseInt(requireValue(i, argc, argv, "cumulative-smoothness-steps"),
-                         "cumulative-smoothness-steps");
-        } else if (arg == "--cumulative-smoothness-tangent-weight") {
-            options.trace.cumulativeSmoothnessTangentWeight =
-                parseDouble(requireValue(
-                                i,
-                                argc,
-                                argv,
-                                "cumulative-smoothness-tangent-weight"),
-                            "cumulative-smoothness-tangent-weight");
-        } else if (arg == "--max-step-factor") {
-            options.trace.maxStepFactor =
-                parseDouble(requireValue(i, argc, argv, "max-step-factor"),
-                            "max-step-factor");
+        } else if (vc::fiber_tracer::cli::parseTraceOption(
+                       arg, i, argc, argv, options.trace)) {
+            continue;
         } else if (arg == "--error-threshold-base-voxels") {
             options.errorThresholdBaseVoxels =
                 parseDouble(
@@ -263,30 +188,7 @@ CliOptions parseArgs(int argc, char** argv)
             failOption("unknown option: " + arg);
         }
     }
-    if (!(options.trace.stepVoxels > 0.0))
-        failOption("--step-voxels must be positive");
-    if (!(options.trace.coneAngleDegrees >= 0.0))
-        failOption("--cone-angle-degrees must be non-negative");
-    if (options.trace.coneGridSize < 1)
-        failOption("--cone-grid-size must be at least 1");
-    if (options.trace.beamWidth < 1)
-        failOption("--beam-width must be at least 1");
-    if (!(options.trace.beamPruneDistanceVoxels >= 0.0))
-        failOption("--beam-prune-distance-voxels must be non-negative");
-    if (options.trace.beamLookaheadSteps < 1)
-        failOption("--beam-lookahead-steps must be at least 1");
-    if (options.trace.parallelThreads < 0)
-        failOption("--threads must be non-negative");
-    if (!(options.trace.smoothnessWeight >= 0.0) ||
-        !(options.trace.smoothnessNormalWeight >= 0.0) ||
-        !(options.trace.smoothnessTangentWeight >= 0.0) ||
-        !(options.trace.cumulativeSmoothnessTangentWeight >= 0.0)) {
-        failOption("smoothness weights must be non-negative");
-    }
-    if (!(options.trace.smoothnessFreeAngleDegrees >= 0.0))
-        failOption("--smoothness-free-angle-degrees must be non-negative");
-    if (options.trace.cumulativeSmoothnessSteps < 1)
-        failOption("--cumulative-smoothness-steps must be at least 1");
+    vc::fiber_tracer::cli::validateTraceOptions(options.trace);
     if (!(options.errorThresholdBaseVoxels >= 0.0))
         failOption("--error-threshold-base-voxels must be non-negative");
     if (options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30)

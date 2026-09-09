@@ -186,6 +186,9 @@ public:
     };
 
     struct Stats {
+        // Bytes retained by this source, before aggregation into the shared
+        // service budget.
+        std::size_t localDecodedBytes = 0;
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
         std::size_t persistentCacheBytes = 0;
@@ -291,6 +294,10 @@ public:
 
     Stats stats() const;
     void invalidate();
+    // Cancel this cache's queued tasks and wait for its private service stages
+    // and persistent writes to drain. Directly constructed generated caches
+    // own their service, so this cannot drain unrelated volume work.
+    void cancelPendingAndWait();
     void waitForPersistentWrites() const;
     // Uses the service's shared source scheduler and keyed transfer registry.
     // This request never decodes or populates decoded RAM by itself.
@@ -358,6 +365,7 @@ private:
     struct Entry {
         EntryStatus status = EntryStatus::InFlight;
         std::shared_ptr<const std::vector<std::byte>> bytes;
+        std::shared_ptr<const DecodedChunkPayload> payload;
         std::string error;
         std::size_t decodedBytes = 0;
         bool persisted = false;

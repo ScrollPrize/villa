@@ -37,6 +37,10 @@ configure_file(vc/compression/vcz1.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1.py"
     COPYONLY
 )
+configure_file(vc/fiberlets_cli.py
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/fiberlets_cli.py"
+    COPYONLY
+)
 
 nanobind_add_module(vc_lasagna_amgx
     NOMINSIZE
@@ -50,7 +54,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d PROPERTIES
+set_target_properties(vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d PROPERTIES
     INSTALL_RPATH "$ORIGIN"
 )
 
@@ -100,17 +104,22 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
+install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .
 )
+
+if(TARGET vc_fiberlets)
+    install(TARGETS vc_fiberlets RUNTIME DESTINATION vc/bin)
+endif()
 
 install(TARGETS vc_volume vc_surface_index vc_grid_raycast
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )
 install(FILES vc/__init__.py DESTINATION vc)
+install(FILES vc/fiberlets_cli.py DESTINATION vc)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
 install(FILES
     vc/compression/vcz1.py

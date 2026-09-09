@@ -881,6 +881,13 @@ NormalPrefetchReport LasagnaChannelChunkCache::prefetchInterleaved(
     return report;
 }
 
+LasagnaChannelChunkCache::Stats LasagnaChannelChunkCache::stats() const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return {
+        cachedBytes_, capacityBytes_, entries_.size(), inFlight_.size()};
+}
+
 std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
     const LasagnaChannelBinding& binding,
     const utils::ZarrArray& array,
@@ -1281,6 +1288,25 @@ cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy)
     const double ny = decodeCompactNormalComponent(rawNy);
     const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
     return normalizedOrZero({nx, ny, std::sqrt(nzSq)});
+}
+
+std::optional<std::array<uint8_t, 2>>
+encodeCompactNormalToRaw(const cv::Vec3d& input)
+{
+    cv::Vec3d normal = normalizedOrZero(input);
+    const double norm2 = normal.dot(normal);
+    if (!(norm2 > kEpsilon * kEpsilon) ||
+        !std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2])) {
+        return std::nullopt;
+    }
+    if (normal[2] < 0.0)
+        normal *= -1.0;
+    const auto encode = [](double component) {
+        const long raw = std::lround(component * 127.0 + 128.0);
+        return static_cast<uint8_t>(std::clamp(raw, 0L, 255L));
+    };
+    return std::array<uint8_t, 2>{encode(normal[0]), encode(normal[1])};
 }
 
 cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d& hint)

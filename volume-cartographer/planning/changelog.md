@@ -1,5 +1,55 @@
 # Changelog
 
+- Added explicit union-MAP and conditioned-posterior variants to the
+  fixed-reference offender-pruning diagnostic, with policy-qualified artifacts
+  and directly comparable geometry/result reporting.
+
+- Ordered-cut winding diagnostics can use supplied reference fibers as an
+  oracle to select the best split checkpoint for downstream analysis and
+  artifacts.
+
+- Added an experimental fixed-orientation `ordered-cuts` winding solver. It
+  fits sign-only continuous ordering with Ceres, greedily inserts exact
+  infringement-reducing winding cuts, and reports reference agreement at every
+  split plus an independent continuous reference-order diagnostic.
+- Split fixed-reference winding conflicts into five magnitude and two sign
+  classes, added a matching reference/reference summary, made detailed
+  piece-pair rows opt-in, and report orientation-incompatible output layers as
+  `NA`.
+- Made winding-viewer visibility rotation preserve a complete contiguous
+  logical state grid across missing/empty OBJ artifacts, and added active-only
+  per-reference error rows to the winding benchmark.
+
+- Added synchronous interleaved-winding solver progress events and throttled
+  `vc_fiber_trace_chunk` stage output for long crop BP runs.
+- Added `--quality-fraction` to stored crop-trace consumers, reusing quality
+  visualization ranking while retaining original trace ordinals.
+- Added crop-wide aligned-normal signing and factorized two-stage continuous
+  plus adaptive integer BP for trace-piece winding labels, with strict gauge
+  handling, CSV diagnostics, and integer winding OBJ layers.
+- Added an explicit solver-only parallel/separate-winding constraint ablation,
+  retained/excluded link reporting, and direct concise LP artifact names.
+- Added an explicit crop-fiber LP-relaxation diagnostic with raw continuous
+  active, H/V, and parity values in CSV, stable gated XOR edge variables,
+  component gauges, triangle consistency cuts, console quantiles, and five
+  explicitly thresholded relaxation OBJ layers.
+- Added explicit HiGHS parallel-mode and solver selection for the crop-fiber LP
+  diagnostic so automatic, simplex, HiPO, and IPM behavior can be benchmarked
+  without changing the model or MILP defaults.
+
+## 2026-08-26
+
+- Added report-only H/V constraint extraction from durable Fiberlet crop-trace
+  artifacts, including deterministic overlapping trace pieces, exact-radius
+  neighbor search, parallel/perpendicular evidence, hard continuity links, and
+  Lasagna-normal-aligned winding statistics.
+- Batched constraint winding through grouped Lasagna corner sampling and added
+  perpendicular, parallel same-winding, and parallel separate-winding connector
+  OBJ diagnostics.
+- Added a strict 1.5-winding constraint cutoff and HiGHS mixed-integer labeling
+  of crop-trace pieces into H/V, even/odd, and broken states, with five OBJ
+  class views and explicit objective diagnostics.
+
 ## 2026-08-31
 
 - Added optional base-XYZ focus bounds that dim plane and annotation-strip views and roughly constrain new or reoptimized fiber geometry.
@@ -141,3 +191,60 @@
 
 - Added a synthetic Valgrind rendering benchmark with native replay scoring and
   a one-sided performance-only CI regression gate.
+## 2026-08-27
+
+- Added two-stage interleaved-lattice crop winding BP with aligned signed
+  Lasagna evidence, soft V/Mixed/H priors, bounded phase/scale calibration,
+  and per-winding OBJ/CSV diagnostics.
+
+## 2026-08-28
+
+- Added exact-tag selection of VC3D fiber JSON stacks to crop winding
+  diagnostics, crop-bounded ordered-run export to a dedicated reference OBJ
+  sibling, and automatic independent reference-layer loading in the Napari
+  winding viewer.
+- Added canonical constraint extraction diagnostics for cropped tagged
+  reference fibers, presented once as compact per-source
+  perpendicular/parallel tables against filename-ordered virtual half-winding
+  ground truth while excluding hard and same-source links.
+- Corrected H/V-aware winding factors to use unsigned integer parallel
+  distances and signed half-integer perpendicular targets, and added an
+  optional solve-only cutoff for distant parallel winding evidence.
+- Added a diagnostic reference-to-BP winding benchmark with authoritative MAP
+  latent coordinates, independently calibrated winding gauges, and separate
+  perpendicular/parallel same/parallel other correctness rates.
+- BP-only winding now retains and remaps only its largest exact effective
+  winding component. Reference tables print at command end, and the benchmark
+  excludes final Defect/Mixed or invalid-winding endpoints.
+
+## 2026-09-01
+
+- Changed winding measurement calibration to scale raw perpendicular and
+  parallel observations before canonical quantization. Canonical class,
+  distance decay, parallel cutoff, sign activation, solver energy, agreement,
+  and reference inference now consume the same scale-first target.
+- Made local winding-weight refinement test reversible zero-valued coordinates
+  alongside `/2` and `*2`, with canonical tagged cache states and deterministic
+  re-entry from an immutable positive base.
+- Promoted the resulting scale-first 1024 local optimum `0,4,2,2,1` to the
+  shared library and CLI winding-class default.
+
+## 2026-09-02
+
+- Added an opt-in ordered-winding diagnostic that ranks complete source fibers
+  by exact sign-violation percentage, removes every split piece of the worst
+  fiber, refits, and reports deletion-only versus post-refit violations at
+  every iteration.
+- Added an opt-in fixed-reference offender-pruning experiment with exact
+  induced-subgraph re-solving and separate per-winding conditioned-broken and
+  final-disabled visualization layers.
+- Added a separately labeled reference benchmark for the fresh pruned solve;
+  benchmark labels and `_pruned` OBJ suffixes now share one phase-aware aligned
+  report.
+- Added reference-conditioned inlier construction for winding diagnostics,
+  with exact sign-conflict removal, reason-specific visualization layers, and a
+  separate fresh-solve stability result.
+- Added supervised iterative oracle-inlier construction with canonical
+  reference scoring, exact induced-subgraph re-solving, neutral collective
+  offender peeling, bounded graph-neighbor trials, and explicit unsupported
+  reference handling.

@@ -21,6 +21,7 @@ from .completion import (
     shlex_quote,
 )
 from .config import display_config, initialize_config, load_config
+from .fiberlets import fiberlet_runs, launch_fiberlet, resume_fiberlet
 from .prefetch import prefetch_volume
 from .open_data import upload_inference, validate_atlas_inference
 from .runs import (
@@ -70,6 +71,38 @@ def _rewrite_contextual_help(argv: list[str]) -> list[str]:
     return prefix + ["--help"]
 
 
+def _add_inference_launch_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    backend_option: bool = False,
+    legacy_config: bool = False,
+) -> None:
+    parser.add_argument("snapshot")
+    parser.add_argument("volume")
+    parser.add_argument(
+        "scale", type=int, nargs="?", default=2,
+        help="input OME-Zarr group (default: 2)",
+    )
+    if backend_option:
+        parser.add_argument(
+            "--backend", choices=("fiber3d", "lasagna"), default=None,
+            help="Restrict snapshot resolution; normally inferred from the snapshot selector.",
+        )
+    parser.add_argument("--download-workers", type=int, default=64)
+    parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument(
+        "--live-fetch", action="store_true",
+        help="Stream the selected scale through a conservative rolling disk cache.",
+    )
+    parser.add_argument("--live-cache-gib", type=float, default=None)
+    parser.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
+    if legacy_config:
+        parser.add_argument(
+            "--legacy-config", default=None,
+            help="Explicit config JSON for a legacy Fiber checkpoint without embedded config.",
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="las_manager", description="Manage Lasagna and Fiber inference data")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -98,25 +131,36 @@ def _parser() -> argparse.ArgumentParser:
     inference_sub = inference.add_subparsers(dest="inference_command", required=True)
     inference_sub.add_parser("ls", help="list durable inference records")
     inference_run = inference_sub.add_parser("run", help="prefetch and launch inference in tmux")
-    inference_run.add_argument("snapshot")
-    inference_run.add_argument("volume")
-    inference_run.add_argument("scale", type=int)
-    inference_run.add_argument(
-        "--backend", choices=("fiber3d", "lasagna"), default=None,
-        help="Restrict snapshot resolution; normally inferred from the snapshot selector.",
+    _add_inference_launch_arguments(
+        inference_run, backend_option=True, legacy_config=True,
     )
-    inference_run.add_argument("--download-workers", type=int, default=64)
-    inference_run.add_argument("--no-prefetch", action="store_true")
-    inference_run.add_argument(
-        "--live-fetch", action="store_true",
-        help="Stream the selected scale through a conservative rolling disk cache.",
+    las_inference = sub.add_parser(
+        "las-inference", help="launch regular Lasagna inference",
     )
-    inference_run.add_argument("--live-cache-gib", type=float, default=None)
-    inference_run.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
-    inference_run.add_argument(
-        "--legacy-config", default=None,
-        help="Explicit config JSON for a legacy checkpoint without embedded config.",
+    _add_inference_launch_arguments(las_inference)
+    fiber_inference = sub.add_parser(
+        "fiber-inference", help="launch Fiber3D inference",
     )
+    _add_inference_launch_arguments(fiber_inference, legacy_config=True)
+    fiberlet = sub.add_parser("fiberlet")
+    fiberlet_sub = fiberlet.add_subparsers(dest="fiberlet_command", required=True)
+    fiberlet_sub.add_parser("ls", help="list durable Fiberlet processing jobs")
+    fiberlet_run = fiberlet_sub.add_parser(
+        "run", help="launch whole-volume Fiberlet preprocessing in tmux",
+    )
+    fiberlet_run.add_argument("fiber_inference")
+    fiberlet_run.add_argument(
+        "normal_inference", nargs="?",
+        help=(
+            "optional completed local Lasagna run or atlas:<model>@L<level>; "
+            "omitting it selects the unique compatible published normal bundle"
+        ),
+    )
+    fiberlet_run.add_argument("--threads", type=int, default=None)
+    fiberlet_resume = fiberlet_sub.add_parser(
+        "resume", help="resume a recorded Fiberlet preprocessing job",
+    )
+    fiberlet_resume.add_argument("run")
     run = sub.add_parser("run")
     run_sub = run.add_subparsers(dest="run_command", required=True)
     run_sub.add_parser("ls", help="list live manager tmux runs")
@@ -227,6 +271,17 @@ def _age(created_at: str | None) -> str:
 
 
 def _print_run(path, record) -> None:
+    if record.get("job_kind") == "fiberlet":
+        dependencies = record.get("dependencies", {})
+        fiber = dependencies.get("fiber_prediction", {})
+        normal = dependencies.get("normal_prediction", {})
+        print(
+            f"{record.get('run_name', path.name)}\tstatus={record.get('status', '-')}"
+            f"\tage={_age(record.get('created_at'))}\tkind=fiberlet"
+            f"\tfiber={fiber.get('run_name', '-')}\tnormals={normal.get('run_name', '-')}"
+            f"\tsession={record.get('tmux_session', '-')}\tlog={path / record.get('log_path', 'run.log')}"
+        )
+        return
     source = record.get("source", {})
     volume = source.get("volume", {})
     snapshot = record.get("snapshot", {})
@@ -348,17 +403,45 @@ def _print_snapshot(index: int, record) -> None:
     metric = "-" if record.metric_value is None else f"{record.metric_value:.6g}"
     patch = "-" if record.patch_shape is None else "x".join(str(v) for v in record.patch_shape)
     atlas = record.atlas_model_id or "unresolved"
-    print(f"{index}\t{record.selector}\tstep={record.step if record.step is not None else '-'}\tmetric={record.metric_name or '-'}:{metric}\tpatch={patch}\tprecision={record.precision_policy or '-'}\tatlas_model={atlas}\tsha256={record.sha256[:12]}")
+    identifier = record.model_identifier or "-"
+    print(f"{index}\t{record.selector}\tstep={record.step if record.step is not None else '-'}\tmetric={record.metric_name or '-'}:{metric}\tpatch={patch}\tprecision={record.precision_policy or '-'}\tatlas_model={atlas}\tmodel_identifier={identifier}\tsha256={record.sha256[:12]}")
+
+
+def _launch_selected_inference(
+    config,
+    args,
+    *,
+    original_argv: Sequence[str],
+    backend_args: Sequence[str],
+    forced_backend: str | None = None,
+) -> Path:
+    cache = get_catalog(config)
+    volume = resolve_volume(index_volumes(cache), args.volume)
+    snapshots = index_snapshots(config)
+    backend = forced_backend or getattr(args, "backend", None)
+    if backend:
+        snapshots = [record for record in snapshots if record.backend == backend]
+    snapshot = resolve_snapshot(snapshots, args.snapshot)
+    return launch_inference(
+        config, snapshot, volume, args.scale,
+        original_argv=original_argv, extra_args=backend_args,
+        legacy_config=getattr(args, "legacy_config", None),
+        prefetch=not args.no_prefetch and not args.live_fetch,
+        download_workers=args.download_workers,
+        live_fetch=bool(args.live_fetch),
+        live_cache_gib=args.live_cache_gib,
+        live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     try:
-        inference_args: list[str] = []
+        backend_args: list[str] = []
         parse_list = list(args_list)
         if "--" in parse_list:
             separator = parse_list.index("--")
-            inference_args = parse_list[separator + 1:]
+            backend_args = parse_list[separator + 1:]
             parse_list = parse_list[:separator]
         parse_list = _rewrite_contextual_help(parse_list)
         args = _parser().parse_args(_expand_command(parse_list))
@@ -431,25 +514,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "inference":
             if args.inference_command == "ls":
                 for path, record in reconcile_runs(config):
-                    _print_run(path, record)
+                    if record.get("job_kind", "inference") == "inference":
+                        _print_run(path, record)
             else:
-                cache = get_catalog(config)
-                volume = resolve_volume(index_volumes(cache), args.volume)
-                snapshots = index_snapshots(config)
-                if args.backend:
-                    snapshots = [record for record in snapshots if record.backend == args.backend]
-                snapshot = resolve_snapshot(snapshots, args.snapshot)
-                run_dir = launch_inference(
-                    config, snapshot, volume, args.scale,
-                    original_argv=args_list, extra_args=inference_args,
-                    legacy_config=args.legacy_config,
-                    prefetch=not args.no_prefetch and not args.live_fetch,
-                    download_workers=args.download_workers,
-                    live_fetch=bool(args.live_fetch),
-                    live_cache_gib=args.live_cache_gib,
-                    live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
-                )
-                print(run_dir)
+                print(_launch_selected_inference(
+                    config, args, original_argv=args_list,
+                    backend_args=backend_args,
+                ))
+        elif args.command in {"las-inference", "fiber-inference"}:
+            backend = "lasagna" if args.command == "las-inference" else "fiber3d"
+            print(_launch_selected_inference(
+                config, args, original_argv=args_list,
+                backend_args=backend_args, forced_backend=backend,
+            ))
+        elif args.command == "fiberlet":
+            if args.fiberlet_command == "ls":
+                reconcile_runs(config)
+                for path, record in fiberlet_runs(config):
+                    _print_run(path, record)
+            elif args.fiberlet_command == "resume":
+                print(resume_fiberlet(config, args.run))
+            else:
+                extra = list(backend_args)
+                if args.threads is not None:
+                    if args.threads <= 0:
+                        raise ValueError("--threads must be positive")
+                    extra = ["--threads", str(args.threads), *extra]
+                print(launch_fiberlet(
+                    config,
+                    args.fiber_inference,
+                    args.normal_inference,
+                    original_argv=args_list,
+                    extra_args=extra,
+                ))
         elif args.command == "run":
             client = Tmux()
             for path, record in read_runs(config):
@@ -469,7 +566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_uuid = str(record.get("run_uuid") or "")
             window_live = bool(window_id and client.window_matches(window_id, run_uuid))
             if not session_live and not window_live:
-                detail = " (inference process is still alive, but its tmux window is gone)" if _process_matches(record) else ""
+                detail = " (managed process is still alive, but its tmux window is gone)" if _process_matches(record) else ""
                 raise ValueError(f"run {record.get('run_name')!r} has no live tmux window{detail}")
             resolved_window = client.attach(
                 str(session or ""), window_id=window_id or None, run_uuid=run_uuid,
@@ -487,7 +584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "artifact_kind": plan.provenance["artifact_kind"],
                     "model_id": plan.model_id,
                     "staging_url": f"s3://{plan.bucket}/{plan.prefix}/",
-                    "files": len(plan.files),
+                    "files": len(plan.files) if plan.files is not None else "streamed",
                     "atlas": atlas,
                 }, indent=2, sort_keys=True))
             else:

@@ -5,9 +5,10 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 #include "vc/lasagna/NormalAlignment.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceTexture.hpp"
+#include "vc/core/util/TexturedMesh.hpp"
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -33,7 +34,6 @@
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
-constexpr int kTiffCompressionNone = 1;
 
 cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
 {
@@ -780,14 +780,6 @@ void ensureDirectory(const std::filesystem::path& dir)
     }
 }
 
-bool validSurfacePoint(const cv::Vec3f& point)
-{
-    return point[0] != -1.0f &&
-           std::isfinite(point[0]) &&
-           std::isfinite(point[1]) &&
-           std::isfinite(point[2]);
-}
-
 void writeLineObj(const std::vector<cv::Vec3d>& points,
                   const std::filesystem::path& outputPath)
 {
@@ -1012,19 +1004,11 @@ void writeTexturedPlaneSliceObj(const cv::Mat_<cv::Vec3f>& coords,
         throw std::runtime_error("cannot write empty control plane slice OBJ");
     }
 
-    std::ofstream output(objPath);
-    if (!output.good()) {
-        throw std::runtime_error("could not open OBJ output: " + objPath.string());
-    }
-    output.imbue(std::locale::classic());
-    output << "# Textured reinit control-point fitted plane slice\n"
-           << "mtllib " << mtlName << '\n'
-           << "usemtl " << materialName << '\n';
-
+    vc::core::util::TexturedMesh mesh;
     for (int row = 0; row < coords.rows; ++row) {
         for (int col = 0; col < coords.cols; ++col) {
             const cv::Vec3f& point = coords(row, col);
-            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+            mesh.vertices.push_back({point[0], point[1], point[2]});
         }
     }
 
@@ -1032,28 +1016,33 @@ void writeTexturedPlaneSliceObj(const cv::Mat_<cv::Vec3f>& coords,
     const double rowDenom = std::max(1, coords.rows - 1);
     for (int row = 0; row < coords.rows; ++row) {
         for (int col = 0; col < coords.cols; ++col) {
-            output << "vt "
-                   << (static_cast<double>(col) / colDenom) << ' '
-                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
+            mesh.textureCoordinates.push_back({
+                static_cast<double>(col) / colDenom,
+                1.0 - static_cast<double>(row) / rowDenom,
+            });
         }
     }
 
     const auto index = [&](int row, int col) {
-        return row * coords.cols + col + 1;
+        return static_cast<size_t>(row * coords.cols + col);
     };
     for (int row = 0; row + 1 < coords.rows; ++row) {
         for (int col = 0; col + 1 < coords.cols; ++col) {
-            const int v00 = index(row, col);
-            const int v01 = index(row, col + 1);
-            const int v10 = index(row + 1, col);
-            const int v11 = index(row + 1, col + 1);
-            output << "f "
-                   << v00 << '/' << v00 << ' '
-                   << v01 << '/' << v01 << ' '
-                   << v11 << '/' << v11 << ' '
-                   << v10 << '/' << v10 << '\n';
+            const size_t v00 = index(row, col);
+            const size_t v01 = index(row, col + 1);
+            const size_t v10 = index(row + 1, col);
+            const size_t v11 = index(row + 1, col + 1);
+            mesh.quads.push_back({{v00, v01, v11, v10}, {v00, v01, v11, v10}});
         }
     }
+    std::ofstream output(objPath);
+    if (!output.good())
+        throw std::runtime_error("could not open OBJ output: " + objPath.string());
+    output << vc::core::util::texturedMeshObj(
+        mesh,
+        "Textured reinit control-point fitted plane slice",
+        mtlName,
+        materialName);
 }
 
 void writeControlPointsObj(const std::vector<cv::Vec3d>& points,
@@ -1121,13 +1110,7 @@ void writeSurfaceMtl(const std::filesystem::path& path,
     if (!output.good()) {
         throw std::runtime_error("could not open MTL output: " + path.string());
     }
-    output << "newmtl " << materialName << '\n'
-           << "Ka 1 1 1\n"
-           << "Kd 1 1 1\n"
-           << "Ks 0 0 0\n"
-           << "d 1\n"
-           << "illum 1\n"
-           << "map_Kd " << textureName << '\n';
+    output << vc::core::util::textureMaterialMtl(materialName, textureName);
 }
 
 void writeSurfaceObj(const QuadSurface& surface,
@@ -1135,148 +1118,12 @@ void writeSurfaceObj(const QuadSurface& surface,
                      const std::string& materialName,
                      const std::string& mtlName)
 {
-    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
-    if (!points || points->empty()) {
-        throw std::runtime_error("surface has no points for OBJ export");
-    }
-
+    const auto mesh = vc::core::util::texturedSurfaceMesh(surface);
     std::ofstream output(objPath);
-    if (!output.good()) {
+    if (!output.good())
         throw std::runtime_error("could not open OBJ output: " + objPath.string());
-    }
-    output.imbue(std::locale::classic());
-    output << "# VC3D line-view strip\n"
-           << "mtllib " << mtlName << '\n'
-           << "usemtl " << materialName << '\n';
-
-    std::vector<int> vertexIndex(static_cast<size_t>(points->rows * points->cols), 0);
-    int nextVertex = 1;
-    for (int row = 0; row < points->rows; ++row) {
-        for (int col = 0; col < points->cols; ++col) {
-            const cv::Vec3f& point = (*points)(row, col);
-            if (!validSurfacePoint(point)) {
-                continue;
-            }
-            vertexIndex[static_cast<size_t>(row * points->cols + col)] = nextVertex++;
-            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
-        }
-    }
-
-    std::vector<int> uvIndex(static_cast<size_t>(points->rows * points->cols), 0);
-    int nextUv = 1;
-    const double colDenom = std::max(1, points->cols - 1);
-    const double rowDenom = std::max(1, points->rows - 1);
-    for (int row = 0; row < points->rows; ++row) {
-        for (int col = 0; col < points->cols; ++col) {
-            const cv::Vec3f& point = (*points)(row, col);
-            if (!validSurfacePoint(point)) {
-                continue;
-            }
-            uvIndex[static_cast<size_t>(row * points->cols + col)] = nextUv++;
-            output << "vt "
-                   << (static_cast<double>(col) / colDenom) << ' '
-                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
-        }
-    }
-
-    for (int row = 0; row + 1 < points->rows; ++row) {
-        for (int col = 0; col + 1 < points->cols; ++col) {
-            const auto idx = [&](int r, int c) {
-                return static_cast<size_t>(r * points->cols + c);
-            };
-            const int v00 = vertexIndex[idx(row, col)];
-            const int v01 = vertexIndex[idx(row, col + 1)];
-            const int v10 = vertexIndex[idx(row + 1, col)];
-            const int v11 = vertexIndex[idx(row + 1, col + 1)];
-            if (v00 == 0 || v01 == 0 || v10 == 0 || v11 == 0) {
-                continue;
-            }
-            const int t00 = uvIndex[idx(row, col)];
-            const int t01 = uvIndex[idx(row, col + 1)];
-            const int t10 = uvIndex[idx(row + 1, col)];
-            const int t11 = uvIndex[idx(row + 1, col + 1)];
-            output << "f "
-                   << v00 << '/' << t00 << ' '
-                   << v01 << '/' << t01 << ' '
-                   << v11 << '/' << t11 << ' '
-                   << v10 << '/' << t10 << '\n';
-        }
-    }
-}
-
-cv::Mat renderCoordsTexture(const cv::Mat_<cv::Vec3f>& baseCoords,
-                            Volume& textureVolume,
-                            int textureLevel,
-                            int renderScale,
-                            const char* label)
-{
-    if (baseCoords.empty()) {
-        throw std::runtime_error("surface has no points for texture rendering");
-    }
-    renderScale = std::max(1, renderScale);
-    cv::Mat_<cv::Vec3f> coords;
-    if (renderScale == 1) {
-        coords = baseCoords.clone();
-    } else {
-        cv::resize(baseCoords,
-                   coords,
-                   cv::Size(baseCoords.cols * renderScale, baseCoords.rows * renderScale),
-                   0.0,
-                   0.0,
-                   cv::INTER_LINEAR);
-    }
-
-    vc::render::IChunkedArray* cache = textureVolume.chunkedCache();
-    if (!cache) {
-        throw std::runtime_error("texture volume has no chunk cache");
-    }
-    if (cache->dtype() != vc::render::ChunkDtype::UInt8) {
-        throw std::runtime_error(
-            "line probe strip rendering uses the VC3D uint8 chunk sampler; "
-            "choose a uint8 texture zarr");
-    }
-
-    cv::Mat_<uint8_t> sampled(coords.rows, coords.cols, uint8_t(0));
-    cv::Mat_<uint8_t> coverage(coords.rows, coords.cols, uint8_t(0));
-    const vc::render::ChunkedPlaneSampler::Options options(vc::Sampling::Trilinear, 32);
-    const int startLevel = std::clamp(textureLevel, 0, cache->numLevels() - 1);
-
-    for (int level = startLevel; level < cache->numLevels(); ++level) {
-        std::vector<vc::render::ChunkKey> keys =
-            vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-                *cache, level, coords, coverage, options);
-        if (!keys.empty()) {
-            cache->prefetchChunks(keys, true);
-        }
-    }
-
-    const auto stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-        *cache, startLevel, coords, sampled, coverage, options);
-    const int covered = cv::countNonZero(coverage);
-    const int total = coverage.rows * coverage.cols;
-    std::cout << label << ": start_level=" << startLevel
-              << " render_scale=" << renderScale
-              << " size=" << sampled.cols << "x" << sampled.rows
-              << " covered=" << covered << "/" << total
-              << " requested_chunks=" << stats.requestedChunks
-              << " error_chunks=" << stats.errorChunks << '\n';
-    return sampled;
-}
-
-cv::Mat renderSurfaceTexture(const QuadSurface& surface,
-                             Volume& textureVolume,
-                             int textureLevel,
-                             int renderScale)
-{
-    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
-    if (!points || points->empty()) {
-        throw std::runtime_error("surface has no points for texture rendering");
-    }
-    return renderCoordsTexture(*points,
-                               textureVolume,
-                               textureLevel,
-                               renderScale,
-                               "Strip texture sampling");
+    output << vc::core::util::texturedMeshObj(
+        mesh, "VC3D line-view strip", mtlName, materialName);
 }
 
 void writeTif(const std::filesystem::path& path, const cv::Mat& image);
@@ -1339,7 +1186,8 @@ void writePartialSideSliceObjOutput(const vc::lasagna::LineModel& line,
     }
 
     const cv::Mat sideSliceTexture =
-        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
+        vc::core::util::renderSurfaceTextureFineToCoarse(
+            *surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
     writeTif(outputDir / "partial_side_slice.tif", sideSliceTexture);
     writeSurfaceMtl(outputDir / "partial_side_slice.mtl",
                     "partial_side_slice_texture",
@@ -1352,16 +1200,7 @@ void writePartialSideSliceObjOutput(const vc::lasagna::LineModel& line,
 
 void writeTif(const std::filesystem::path& path, const cv::Mat& image)
 {
-    if (image.empty()) {
-        throw std::runtime_error("cannot write empty image: " + path.string());
-    }
-    const std::vector<int> params{
-        cv::IMWRITE_TIFF_COMPRESSION,
-        kTiffCompressionNone,
-    };
-    if (!cv::imwrite(path.string(), image, params)) {
-        throw std::runtime_error("failed to write image: " + path.string());
-    }
+    vc::core::util::writeUncompressedTextureTiff(path, image);
 }
 
 void writeReinitDebugObjOutput(
@@ -1379,11 +1218,13 @@ void writeReinitDebugObjOutput(
         const PlaneSliceBasis basis = fitControlPointPlaneSlice(controlPoints);
         const cv::Mat_<cv::Vec3f> planeCoords =
             makePlaneSliceGrid(basis, 32.0, renderScale);
-        const cv::Mat planeTexture = renderCoordsTexture(planeCoords,
-                                                         *textureVolume,
-                                                         textureLevel,
-                                                         renderScale,
-                                                         "Control plane texture sampling");
+        const cv::Mat planeTexture =
+            vc::core::util::renderCoordsTextureFineToCoarse(
+                planeCoords,
+                *textureVolume,
+                textureLevel,
+                renderScale,
+                "Control plane texture sampling");
         writeTif(outputDir / "control_plane_slice.tif", planeTexture);
         writeSurfaceMtl(outputDir / "control_plane_slice.mtl",
                         "control_plane_slice_texture",
@@ -1474,8 +1315,10 @@ RenderedStrips renderLineViewStrips(const vc::lasagna::LineModel& line,
         throw std::runtime_error("line view builder did not produce both strips");
     }
     return {
-        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale),
-        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale),
+        vc::core::util::renderSurfaceTextureFineToCoarse(
+            *surfaces.lineSurface, textureVolume, textureLevel, renderScale),
+        vc::core::util::renderSurfaceTextureFineToCoarse(
+            *surfaces.lineSideSlice, textureVolume, textureLevel, renderScale),
     };
 }
 
@@ -1512,9 +1355,11 @@ void writeLineViewObjOutput(const vc::lasagna::LineModel& line,
     writeLineObj(linePoints, outputDir / "line.obj");
 
     const cv::Mat lineSurfaceTexture =
-        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale);
+        vc::core::util::renderSurfaceTextureFineToCoarse(
+            *surfaces.lineSurface, textureVolume, textureLevel, renderScale);
     const cv::Mat sideSliceTexture =
-        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
+        vc::core::util::renderSurfaceTextureFineToCoarse(
+            *surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
     writeTif(outputDir / "line_surface.tif", lineSurfaceTexture);
     writeTif(outputDir / "side_slice.tif", sideSliceTexture);
 

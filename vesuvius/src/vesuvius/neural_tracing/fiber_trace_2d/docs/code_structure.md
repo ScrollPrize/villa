@@ -139,18 +139,21 @@ scale relative to the selected input array for runner geometry only; it is not
 serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
-For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
-lattice and never creates its Cartesian job list. By default one shared
+For multi-GPU execution, the runner owns one explicit Z band at a time and
+lazily advances that band's Y/X lattice through bounded windows; it never
+creates a Cartesian job list or retains a whole band. By default one shared
 TensorStore Zarr driver asynchronously reads bounding boxes into an independent
 bounded prefetch window. A ready tile is copied into reusable shared memory only
 when an input slot, result slot, and GPU queue are available. One persistent
 spawned process per GPU performs normalization, model inference, weighting, and
 filtered scaledown. Weighted results use separate fixed shared-memory slots;
-process queues carry descriptors only. Results may complete out of order, but the
-coordinator commits them in canonical order and flushes a Z row only after all
-of that row's inference and skip events commit. Consequently the coordinator
-remains the sole owner of the circular rings, resume checks, progress, and Zarr
-write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
+process queues carry descriptors only. Results may complete out of order, but
+accumulator submission and commit remain canonical. Every input/result slot has
+one explicit band/sequence/stage owner, and the band advances only when every
+event and accumulator acknowledgement has completed and every slot is free.
+Reads, GPU assignment, and accumulation do not cross that barrier. Consequently
+the coordinator remains the sole owner of the circular rings, resume checks,
+progress, and Zarr write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
 `--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
 TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
 fallback uses `--prefetch-workers`. Single-device inference submits the same
@@ -213,14 +216,17 @@ A logical Z plane maps to
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
 each Z row writes before its post-row flush. One runner-wide flush batch handled
-by persistent spawn-process workers may retain the preceding finalized
+by persistent spawn-process workers may retain the preceding frozen
 interval while the next row accumulates.
 The planner simulates that exact write, join/release, submit, next-write order,
 so the enlarged ring has disjoint physical slots without copying live overlap
-or finalized bands. At the following advancing frontier the coordinator waits
-if necessary, then clears/releases the completed interval before submitting
-another; storage slowdown creates bounded backpressure rather than additional
-queued bands. Workers receive only mmap-path/chunk descriptors, reopen mappings
+or finalized bands. The coordinator continuously drains flush acknowledgements
+and clears/releases the interval immediately when the whole combined batch
+succeeds. At the following advancing frontier it waits only if that batch is
+still active before submitting another; storage slowdown creates bounded
+backpressure rather than additional queued bands. Zero-task and synchronous
+batches use the same finalization path. Workers receive only mmap-path/chunk
+descriptors, reopen mappings
 read-only, and allocate one chunk of temporary arrays each. The CLI default is
 the available CPU count capped at 64 workers; zero is the synchronous
 immediate-release baseline. Backing size is
@@ -240,6 +246,29 @@ does not advance `final_z`; completion does. Jobs contain immutable chunk
 descriptors rather than decoded arrays, and shutdown waits for an active mmap
 reader before closing scratch files.
 
+The coordinator pumps reader, GPU, accumulator, and flush completions on every
+cycle. Accumulator queue submission is incremental, so a full stable-owner FIFO
+cannot block the other stages. If unresolved state has no tracked producer it
+fails immediately with Z-band, event-frontier, slot-owner, read, accumulator,
+flush, and worker diagnostics; it does not infer a process-limit failure from an
+elapsed timeout.
+
+For an ordinary local selected level, source-support discovery and bounded read
+submission are one atomic coordinator transition, matching the scheduler used
+before rolling live fetch was added. With `--live-fetch`, only remote
+materialization is additional: a bounded descriptor ledger completes first and
+then hands the tile to that same reader/GPU/accumulator/flush pipeline. Worker
+queues remain descriptor-only; explicit per-worker sequence/task ownership and
+shared-slot ownership are checked throughout the band.
+
+Reads and GPU results may complete out of order, while accumulation stays in
+canonical order. The coordinator therefore skips the canonical sparse/no-op
+prefix to find the effective accumulation frontier and reserves one shared
+input/result pair until that tile enters GPU processing. Later ready tiles can
+use every other pair but cannot occupy the capacity needed to advance the
+frontier. This is an admission invariant, not completion retry logic; worker
+tasks and terminal results remain single fire-and-forget queue messages.
+
 While a flush runs, output completeness checks can inspect future disjoint
 chunks and model inference can overlap product finalization. The shipped
 adapters keep these operations stateless or filesystem-disjoint; custom shared
@@ -252,10 +281,11 @@ Pyramid levels use multiprocessing across output chunks. With the default
 `--pyramid-workers 0`, the existing automatic CPU-count process selection is
 retained. Each process is constrained to one BLAS/OpenMP thread, including
 OpenBLAS, MKL, BLIS, Apple vecLib, and NumExpr runtimes, so native libraries do
-not multiply the process count by another CPU-count-sized thread pool. Parent
-environment and native thread limits are restored when a level finishes or a
-worker fails. `--pyramid-workers` remains available to tune I/O and memory
-bandwidth performance.
+not multiply the process count by another CPU-count-sized thread pool. Its Zarr
+executor and Blosc codec are likewise capped at one thread. Parent environment
+and native thread limits are restored when a level finishes or a worker fails.
+`--pyramid-workers` remains available to tune I/O and memory bandwidth
+performance.
 
 Lasagna's optional `pred_dt` is an external-source stage after neural
 inference. It is independently resumable and never schedules model tiles.
@@ -557,6 +587,8 @@ Ownership changed as follows:
   lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
   full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
   segment fraction only as `restart_fraction_per_segment`.
+- Durable end-to-end native Python Trace2CP measurements and their metric/unit
+  conventions are recorded in `docs/native_trace2cp_benchmarks.md`.
 - The shared C++ CP-pair tracer fuses forward and reverse traces in trace-grid
   3D ZYX coordinates without sorting by straight-axis progress. It repeatedly
   moves a local tangent plane along each resampled path and intersects the
@@ -2521,7 +2553,7 @@ The tests are expected to use fake/local data and not require network access.
 
 ## Shared 3D accumulator pipeline
 
-`lasagna/tiled_predict3d.py` owns accumulation for both Lasagna and Fiber 3D
+`lasagna/tiled_predict3d.py` owns accumulation scheduling for both Lasagna and Fiber 3D
 inference. Multi-device runs send chunk-bounded descriptors to persistent
 spawned processes; result tensors stay in the existing shared-memory slots and
 accumulators stay in the rolling mmap. No tile-sized arrays are serialized
@@ -2529,7 +2561,9 @@ through multiprocessing queues.
 
 `--accumulator-workers` controls process count (default `min(CPU count, 32)`;
 zero selects the synchronous diagnostic baseline). Each spatial output chunk
-has a deterministic worker owner and FIFO ordering. Startup and completion
+has a deterministic worker owner and FIFO ordering. Submission is canonical,
+bounded, and nonblocking so the coordinator can continue draining all stages.
+Startup and completion
 logs report backend, task rate, summed work, queue wait, and wall time.
 
 Product accumulators default to float16 and weights remain float32. The
@@ -2651,3 +2685,192 @@ gathers; the reference path remains selectable for matched measurements.
 coordinator machinery without creating augmentation workers. Complete raw
 samples still cross the output queue, so the mode measures materialization and
 IPC but excludes value augmentation and batch stacking.
+## C++ fiberlet extraction
+
+`volume-cartographer/core/src/fiber_tracer/FiberAnchors.cpp` extracts the
+versioned cell-anchor artifact. `FiberPaths.cpp` strictly reloads that artifact,
+enumerates filled-radius cell-neighborhood pairs, and solves integer prediction-voxel
+paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
+smoothness equations shared by the native greedy tracer and fiberlet DP.
+
+Anchor direction fitting retains the broader cell/halo Gaussian and the
+existing deterministic non-orthogonal two-mode PCA updates. Final spatial
+placement is a separate cached hill climb on an anisotropically integrated
+`presence * abs(direction dot axis)^2` response sampled in the final rotating
+normal plane. The transverse peak sigma defaults to `1.5` prediction voxels;
+the along-direction sigma defaults to `1.5` cell sides so straight-fiber
+evidence remains substantial across several cells. The climb starts near the
+provisional broad-fit position and stops at the first discrete local maximum.
+Production placement then applies independent three-sample parabolic fits in
+the two normal-plane coordinates. Each finite offset is clamped to half a grid
+step; the combined point must remain in the cell's continuous voxel-Voronoi
+ownership box without decreasing the directly evaluated response. Every failed
+combined guard keeps the discrete peak. A full 3x3 joint quadratic is retained
+only as transient benchmark provenance.
+`vc_fiberlets anchors` and `fiber-replay` expose base-voxel controls as
+`--peak-sigma`, `--axial-sigma`, and `--peak-step`; strict artifacts store the
+transverse and axial sigmas in prediction-grid units. The extraction halo
+conservatively encloses both the broad direction-fit kernel and every rotated
+peak kernel.
+
+The peak objective also uses signed local presence-gradient evidence. Each cell
+job computes deterministic separable 3D Sobel gradients from presence-only
+stencils before discarding its dense halo. Normal-plane gradients pointing from
+a sample toward the candidate vote inward; the reverse sign votes outward.
+Votes retain direction-alignment and anisotropic Gaussian weighting and are
+reliability-gated by valid stencil coverage and radial gradient magnitude, so
+flat or incomplete neighborhoods preserve the presence-only result.
+`--gradient-weight` controls the dimensionless contribution, defaults to
+`1.0`, and `0` exactly disables gradient construction and its extra halo.
+Both weight and reliability scale are strict scientific artifact parameters.
+
+`FiberAnchors.cpp::fiberAnchorCellsNearPolyline` provides exact, canonical
+dense-polyline-to-cell selection for replay tubes and localization benchmarks.
+`benchmarkRefinedFiberAnchors` consumes only geometric records from the
+`Refined` diagnostic stage and evaluates exact base-coordinate distances to the
+stored dense fiber line. `vc_fiberlets anchor-benchmark` uses a refined-only
+extraction path that deliberately stops before support filtering and NMS. The
+production anchor uses `separable_1d`; `joint_2d` remains a matched comparison.
+The benchmark labels its three equal-population stages
+`discrete`, `separable_1d`, and `joint_2d`; none of the comparison coordinates
+are serialized. It prints distance statistics plus inclusive 4- and
+8-base-voxel anchor and cell hit rates and does not require a normal manifest or
+write artifacts. Both subpixel variants move only in the fitted anchor's normal
+plane. Their response already integrates an anisotropic 3D support volume, so
+calling the distinction 2D versus 3D would be incorrect; a true 3D positional
+fit would introduce forbidden forward/backward motion along the fiber.
+
+Anchor extraction performs reference/crop selection serially, expands it by a
+conservative direct-NMS context that includes possible displacement of both
+anchors, and partitions the union into deterministic spatial cell tiles. Each
+tile samples one dense ZYX box with the complete fit/peak/gradient halo and
+fits its owned cells through shared strides while preserving each cell's prior
+ZYX observation order. Deterministic splitting and worker selection cap
+coordinate, decoded-sample, and scratch storage under the aggregate byte
+budget. Tile halos may overlap, but shared decoded Zarr chunks avoid repeated
+source reads. Lower-level sampling remains single-threaded per tile.
+
+Anchor duplicate suppression uses radii independent of peak refinement:
+2 stored prediction voxels transverse to the sign-aligned average anchor axis
+and 1 prediction voxel longitudinally. `FiberAnchorConfig` stores both fields,
+both strict anchor JSON writers serialize them, and `FiberPaths.cpp` requires
+them when loading anchors. Crop context preserves the full refinement-window
+displacement before adding this narrower NMS reach.
+
+The napari replay viewer loads the final anchor centre/direction glyphs and all
+five anchor diagnostic Shapes layers by default. `--no-anchor-stages` is an
+explicit fast-start opt-out that skips parsing and hashing the stage artifacts;
+replay reload preserves the selected stage-layer topology.
+The viewer interprets the versioned base-coordinate geometry, not the anchor
+extractor configuration. Its stage reader therefore ignores optional
+`parameters` metadata and future top-level metadata, and parameter differences
+do not enter cross-stage binding checks. Coordinate conventions, finite unit
+axes, identities, lineage, and final geometry consistency remain validated
+because those affect interpretation of the displayed diagnostic stages.
+Its independent anchor-radius control retains defensive full-population
+geometry/features in controller state but assigns only in-radius final anchors,
+stage anchors, cell centers, and refinement offsets to their Napari layers.
+This physical subsetting prevents cutoff-hidden geometry from writing depth and
+causing black occlusion artifacts. Slider widening and artifact rollback rebuild
+the displayed layers from the retained full source in original order.
+Presence and anchor display radii both initialize to 32 base voxels. A separate
+fiberlet-radius control initializes to 16 base voxels and retains a fiberlet if
+its rendered polyline has any point within that exact segment-to-segment
+distance of either the reference or failed trace. The generalized replay
+geometry filter keeps full path geometry, aligned quality features, colormap
+property, and explicit display width while physically removing complete
+out-of-radius paths. Reload recomputes distances and reapplies all three current
+radii without using the extraction-tube radius as a display default.
+
+`FiberPaths.cpp` first generates all candidates in canonical order from every
+nonzero integer cell offset inside the configured outer radius plus margin, so
+shorter anchor pairs and the old outer-radius pairs are searched together. It unions
+their positive-weight native interpolation corners into one deterministic
+global sparse union, samples predictions and normals in coordinate ranges, and
+materializes compact nodes before DP. An interior node stores a checked 32-bit
+row-major local key, authoritative `float32` position, compact two-byte fiber
+and normal axes, byte presence, and validity flags: 24 bytes total. Corner
+addresses and weights are derived from positions during collection and
+materialization rather than retained. Exact endpoint anchors remain doubles.
+A fixed worker pool solves canonical candidate slots; a final serial pass
+derives diagnostics and preserves deterministic artifact order.
+Each nonzero DP transition is first gated against the destination-side dense
+fiber prediction and must have an unoriented angle strictly below 25 degrees to
+that axis. Lasagna normals remain separate and affect only the existing local
+curvature split; an invalid Lasagna normal uses isotropic curvature fallback.
+
+`FiberGraph.cpp` converts every accepted fiberlet to one undirected graph edge
+and two directed arcs. Dense endpoint tangents define canonical strict
+45-degree joins. Its receding-horizon beam router ranks variable-length routes
+by accumulated loss density, prevents node cycles, commits one edge, and uses
+the shared variable-step forward polyline matcher to stop at the first
+reference-distance failure. It retains that first crossing as diagnostic
+metadata, completes the selected fiberlet, then continues through complete
+edges until routed base-voxel postroll reaches the requested distance at an
+anchor or the graph is exhausted. Candidate/arc identities and loss totals
+therefore always describe whole published fiberlets.
+
+Completed tasks update an atomic counter. A separately locked, rate-limited
+progress callback suppresses stale concurrent observations; the coordinator
+emits the terminal update after joining workers and before rethrowing a task or
+callback exception. `vc_fiberlets` formats this callback on stderr with rate
+and ETA, while the core remains independent of console output.
+
+`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`,
+`anchor-benchmark`, `fiber-replay`, and `fiberlet-replay`.
+The latter requires the matching fiber manifest plus a separate regular
+Lasagna normal manifest and writes machine-readable `fiberlets.json` together
+with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ
+coordinates are base-volume coordinates; prediction coordinates are private to
+the anchor fit and DP implementations.
+
+`PolylineGeometry.cpp` owns dense-polyline arclength sampling, slicing, bounded
+exact projection, and the shared expected-advance forward matcher used by both
+greedy and graph replay. `FiberTrace.cpp::traceFiberReplay` adds a committed-
+step stop observer to the existing one-way core; ordinary callers omit it and
+retain their prior behavior. `FiberReplay.cpp` constructs exact base-coordinate
+tubes and atomically publishes content-addressed replay generations. The replay
+CLI uses `--along` as the sole longitudinal comparison extent: it derives the
+greedy postroll count from the effective base-coordinate step and slices the
+displayed greedy trace by exact arclength around failure. Full greedy points,
+losses, and matching indices remain separate authoritative diagnostics in the
+bundle. A shared core helper reduces the requested extent to the symmetric
+arclength available on every reference/greedy side; the reference, greedy
+display, and graph search then share those persisted, strictly checked bounds.
+
+Replay opens separate prediction and normal bindings for native trace space and
+the canonical stored prediction grid. Explicit sparse anchor cells flow through
+the same block fit and NMS implementation as rectangular crops. `FiberPaths.cpp`
+uses its dense preload for standalone paths and a sorted sparse tube preload
+when a replay point predicate is present. The Python viewer keeps the presence
+Zarr external and strictly loads the replay bundle plus its relative artifacts.
+Graph replay adds a strict graph JSON, strict route JSON/OBJ agreement, and an
+independent napari route layer that participates in reload topology but not the
+fiberlet distance filter.
+
+## Crop Fiber Constraints
+
+`FiberTraceConstraints.cpp` splits stored crop traces into overlapping pieces,
+finds nearby piece pairs, and scores parallel versus perpendicular geometry.
+The perpendicular winding observation is the normal-aligned Lasagna integral
+on the closest connector. A parallel-dominant constraint additionally reuses
+every tangent-valid matched pair from its bidirectional parallel-score walk.
+All of those connectors are submitted in the same batched Lasagna sampling
+call; no per-pair volume reads are introduced.
+
+With a crop-aligned normal field, each walk integral is signed by its connector
+direction and aligned midpoint normal. Only samples in the closest connector's
+normal-alignment component enter the deterministic median. The published
+constraint therefore carries distinct closest/perpendicular and
+median/parallel distances plus their signed forms. Winding BP quantizes the
+parallel median onto the signed integer ladder and the perpendicular closest
+measurement onto the signed half-integer ladder. Parallel-dominant OBJ,
+labeling, CLI, and reference diagnostics use the median target.
+
+Before constraint extraction, `LasagnaNormalAlignment.cpp` builds the aligned
+normal lattice in sampling, factor, component, message, and finalize phases.
+`vc_fiber_trace_chunk direction-ablation` prints rate-limited progress for
+those phases. Its preparation ETAs are local to the current phase; message
+progress deliberately reports `eta_to_limit`, the projected time to the
+configured BP iteration limit, because convergence may terminate earlier and
+cannot be predicted from the current residual.

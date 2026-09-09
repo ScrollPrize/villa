@@ -1,3 +1,11 @@
+## 2026-09-09 — Fiberlets/Fiber3D training integration
+
+- Merged the locked Fiberlets development history into the local
+  `fiber-training` branch, retaining the complete Fiber3D training and Fiberlet/native
+  tracing feature sets and reconciling their shared inference/cache contracts.
+- Extended decode-byte profiling to charge opaque Fiberlet payloads by resident
+  bytes; dense chunk accounting remains unchanged.
+
 ## 2026-09-08 — Fiber3D CUDA augmentation suffix
 
 - Added the Fiber3D `all` CUDA value-augmentation suffix. Native workers
@@ -30,6 +38,790 @@
 
 - Added read-only Fiber training event analysis and documented the S1a 8x8
   historical baseline for the one-hour held-out-loss target.
+# 2026-09-04: benchmark experiment-step plots
+
+- Changed fiber benchmark progress plots from calendar-distance coordinates to
+  stable chronological experiment steps. Only strict measured Pareto-frontier
+  points are annotated, regressions and assumptions use distinct markers, and
+  legends are placed below the plots.
+- Corrected reference replay reliability to mean segment length over total
+  tested length, `100/(failures+1)`, and migrated benchmark JSON output to the
+  corresponding version-4 summary fields.
+- Made benchmark labels compositional from a validated stable method label plus
+  an optional BP-stage suffix.
+
+# 2026-09-02: conditioned-reference pruning variants
+
+- Added and evaluated union-MAP and conditioned-posterior offender selection on
+  the 1024 reference crop. Neither variant exceeded the untouched production
+  winding result.
+- Added a sign-consistent reference-conditioned fiber-piece working-set
+  diagnostic and separate direct/fresh winding artifacts for evaluation.
+
+# 2026-09-01: fixed-reference winding conflict diagnostics
+
+- Added solver-consistent reference conditioning diagnostics that clamp known
+  reference H/V and winding labels, then report admitted cross-factor conflict
+  rates, hard violations, weighted losses, and ranked offending BP pieces and
+  factors without changing the production reference-free solution.
+- Added a conditioned-to-ordinary warm-start diagnostic and an identical-support
+  neutral control. The 1024 experiment reproduced the cold solution exactly in
+  the neutral control; the conditioned initialization failed to converge after
+  2000 messages and remained a substantially higher-energy state, so it is not
+  classified as a retained ordinary minimum.
+- Kept this expensive experiment opt-in through
+  `--reference-conditioning-diagnostic`; ordinary reference benchmarks continue
+  to run only the production reference-free solution by default.
+
+# 2026-09-01: promote complete-stack 1024 winding tune
+
+- Promoted winding class weights `0,0,0.5,4,1` and sign weights `1,0.5` to the
+  shared solver and CLI defaults after the zero-aware 1024 search improved the
+  complete 26-reference result from 13/26 to 16/26 exact inferred windings.
+
+# 2026-09-01: separate winding value and sign hardness
+
+- Preserved signed winding-value residuals while adding independently weighted
+  perpendicular and parallel sign-hardness terms across BP, decoded scoring,
+  projection, diagnostics, and reference inference.
+- Split agreement, evidence, CSV, and reference benchmark output into structural
+  winding-value and sign-hardness items whose benchmark denominators do not
+  disappear at zero solver weight.
+- Extended winding-weight searches to seven coordinates. A first cutoff-based
+  result was rejected because it excluded parallel-other and parallel-sign
+  items; the corrected no-cutoff 1024 optimum is winding `0.5,0,1,2,1`, sign
+  hardness `0.5,1`, with `8/8` exact reference windings and `4835/5446` correct
+  reference items.
+
+# 2026-09-01: reversible zero-weight refinement
+
+- Extended local winding-class weight refinement so every coordinate tests
+  zero alongside `/2` and `*2`; zero coordinates can later re-enter their
+  immutable positive starting ladder after other weights change.
+- Canonical tagged zero/exponent states now identify cached successful and
+  failed scenarios deterministically.
+- Promoted the resulting `0,4,2,2,1` scale-first 1024 local optimum to the
+  shared and CLI defaults.
+
+# 2026-09-01: hard split continuity and aligned hard signs
+
+- Made source-fiber split continuity exact and edge-local by default across the
+  orientation prepass and final winding assignment. Two active endpoints must
+  share H/V and winding, while a Defect endpoint neutralizes that edge and may
+  split the source into independent active runs. An explicit finite
+  compatibility mode retains the prior behavior.
+- Promoted enabled dominant perpendicular and parallel signs to exact
+  constraints when their raw aligned-normal agreement is within 30 degrees by
+  default, while retaining finite sign penalties for weaker evidence.
+- Added per-class and aggregate final-solution constraint infringement counts
+  and percentages, with Defect-neutralized factors reported separately.
+
+# 2026-09-01: calibrated reference constraint diagnostics
+
+- Unified reference winding diagnostics under the reference-to-BP benchmark's
+  fitted global sign. Signed reference/reference steps are calibrated before
+  quantization and summary counting, while gauge offsets correctly cancel from
+  pairwise differences.
+- Added solver-weighted raw and canonical reference/reference measurement-scale
+  fits for perpendicular, parallel, combined, and per-class scopes, separating
+  continuous integration bias from quantized solver behavior and explicitly
+  labeling parallel-containing diagnostics as counterfactual.
+- Changed the `direction-ablation` joint-grid default to fixed phase `0.5` and
+  reference-calibrated measurement scale `0.822`; adaptive calibration remains
+  available through `--winding-adaptive-calibration`.
+- Added per-reference inferred half-step parity checks and component-gauged H/V
+  endpoint consistency diagnostics for active reference-to-BP constraints.
+- Added unweighted directional raw-step distributions and a four-gauge
+  reference-only phase fit, exposing H-to-V versus V-to-H asymmetry without
+  reusing production solver weights.
+
+# 2026-08-31: weighted reference winding diagnostics
+
+- Added per-reference finite-L1 diagnostics split into perpendicular `0.5` and
+  `1.5+` and parallel `0`, `1`, and `2+` canonical-step groups, including raw
+  versus cutoff-admitted coefficient, loss at truth, and group-only inferred
+  winding.
+- Made measured BP factors mutually exclusive by retaining only their dominant
+  parallel or perpendicular hypothesis, and unified group inference and
+  `est_w` on that admitted factor. The combined row uses lexicographic
+  hard-sign violation handling for contradictory forced-active evidence.
+
+# 2026-08-28: constraint-scaled BP Defect costs
+
+- Restored per-constraint Mixed/Defect cost coefficients in orientation and
+  winding BP while retaining one non-transitive node-local unary, and changed
+  both default coefficients to `1`.
+- Added a stable source-piece-1 versus remaining-pieces final-state table before
+  each reference benchmark for direct Defect-cost tuning.
+
+# 2026-08-28: extended distance-weighted winding evidence
+
+- Raised H/V diagnostic and winding-BP raw winding admission to the exclusive
+  cutoff `4.0` while preserving the legacy parity default.
+- Added fixed power-of-two decay for complete H/V-aware winding contributions
+  by half-integer distance bin without weakening H/V relation or hard sign
+  evidence.
+
+# 2026-08-28: fixed-prepass winding Defect escape
+
+- Allowed fixed-prepass H/V pieces to become Defect during winding without
+  reopening the opposite direction, using a compact two-state-per-winding
+  layout and distinct pre-pass/final class diagnostics.
+
+# 2026-08-27: winding BP modes
+
+- Added a shared fixed-prepass orientation mode for both winding solvers which
+  freezes the initial H/V choice and removes opposite-direction alternatives
+  from subsequent piece-state and message dimensions.
+- Added a calibration-free joint winding mode selected by an explicit fixed
+  phase and scale, removing calibration states/messages while retaining joint
+  H/V/Mixed, integer-support, and component-sign inference.
+- Added strict CLI validation and fixed/adaptive provenance in progress,
+  reports, console summaries, and consistency CSV output.
+- Made probability-band visualization clamp only roundoff-sized endpoint
+  excursions while reporting the exact index/value for genuinely invalid data.
+- Normalized the joint-grid solver's accumulated H/Mixed/V class marginals and
+  centralized the CLI's checked orientation projection so all downstream
+  diagnostics receive a finite value in `[0,1]`.
+
+# 2026-08-27: winding fiber Napari viewer
+
+- Added a strict per-winding H/V/Broken OBJ viewer with stable bright layer
+  colors, cross-winding category presets, and cyclic H+V winding navigation.
+- Extracted shared global-indexed ordered-polyline OBJ parsing and retained the
+  existing presence viewer's specialized quality and crop validation.
+
+# 2026-08-27: signed crop winding belief propagation
+
+- Added live nested progress for interleaved winding initialization,
+  calibration, adaptive support, and message passing without changing solver
+  numerics.
+- Added stored-trace quality-fraction filtering with canonical cost-density
+  ranking and preserved original trace provenance.
+- Reused crop-wide BP-aligned Lasagna normals to give perpendicular trace
+  constraints a component-safe signed winding difference while preserving the
+  existing unsigned magnitude.
+- Added a gauge-fixed continuous difference solve followed by adaptive local
+  integer sum-product BP, with winding marginals, CSV diagnostics, and one OBJ
+  layer per integer MAP winding.
+- Extracted strict piece/continuity topology preparation for both H/V and
+  winding inference and retained the existing H/V/Mixed results unchanged.
+
+# 2026-08-27: BP-aligned Lasagna normal samples
+
+- Extracted the binary pairwise sum-product engine shared by fiber BP and
+  normal sign alignment without changing existing fiber BP behavior.
+- Added reusable Lasagna normal alignment plus a standalone globally anchored
+  bbox command with paired crossed-base/directed-stroke OBJ diagnostics.
+- Parallelized large binary BP solves with deterministic ordered CSR message
+  storage and added split-phase BP timing/effective-worker diagnostics.
+
+# 2026-08-27: crop tracing lookahead context
+
+- Expanded Fiberlet crop graph materialization and speculative rollout by the
+  configured lookahead distance while retaining requested-crop seed ownership,
+  coverage, first-exit clipping, artifacts, and visualization.
+- Separated graph and seed boxes in bulk materialization, retained complete
+  horizon-crossing Fiberlets without an extra maximum-length pad, and added
+  boundary-choice plus sparse-halo regressions.
+
+# 2026-08-27: split-piece fiber BP
+
+- Made finite `--piece-length` constraint pieces the BP nodes, retained
+  canonical same-source continuity evidence, and preserved source-first gauge
+  selection with deterministic exact piece mapping.
+- Added exact dense piece clipping plus piece-level OBJ, CSV, reference, and
+  consistency diagnostics while preserving full source geometry in no-split
+  runs.
+
+# 2026-08-25: durable Fiberlet crop trace artifacts
+
+- Made a sparse Fiberlet Zarr `traces` dataset the authoritative crop-tracing
+  output. It losslessly stores complete float64 base-coordinate paths, seed
+  data, global selected-route cost, and traced length, with strict inventory,
+  ownership, ordinal, and atomic-publication validation.
+- Split `vc_fiber_trace_chunk` into explicit `trace` and `visualize` commands.
+  Trace mode reopens the published artifact before generating line outputs;
+  visualization-only mode needs no source Fiberlets or normal volume.
+- Added deterministic cost-density histograms and ten rank-decile OBJ subsets
+  while retaining byte-identical all/direction/anchor OBJ geometry.
+
+# 2026-08-25: deterministic parallel Fiberlet crop tracing
+
+- Parallelized independent anchor-seed graph traversal while retaining serial
+  strongest-first result integration, coverage suppression, counters, and OBJ
+  order. Speculative traces covered by an earlier result are discarded.
+- Extracted a reusable immutable, storage-key-based replay source and extended
+  the existing chunk-route bulk materializer with complete route geometry,
+  cost profiles, and stored joins. Chunk reads are prefetched in batches;
+  tracing performs no cache queries.
+- Removed the four-worker cache-contention workaround. Host-CPU tracing reduced
+  the 16-seed trace phase from 17.57 s to about 3-4 s on the Paris4 1024-base
+  crop while preserving the original OBJ byte-for-byte.
+- Replaced synchronized seed batches with bounded continuous computation and
+  ordered ticket commits. Converted the materialized graph to contiguous
+  records with borrowed directional adjacency/route views, eliminating route
+  copies during rejected lookahead. The 500-attempt Paris4 crop remains
+  byte-identical and drops from 86.80 s to 79.66 s wall time.
+- Replaced per-branch committed-set and route-vector copies with compact
+  parent-linked lookahead ancestry. Terminal candidates retain indices and use
+  exact linear minimum selection instead of materializing and sorting every
+  route. The same 500-attempt crop remains byte-identical; three Release runs
+  take 46.81-47.01 s wall with 34.24-34.54 s tracing.
+
+# 2026-08-25: Fiberlet producer cache contract v3
+
+- Moved anchor and Fiberlet generation to one new producer-contract namespace
+  after detecting different stale/current records under the unpublished v2
+  identity. Default runs regenerate into v3 directories; explicit incompatible
+  roots remain strict errors and old directories are not modified.
+- Retained compiler identity/version and build configuration as diagnostics but
+  excluded them from cache compatibility. GCC/Clang generated 2,526 versus
+  2,528 focused Fiberlets in one unresolved comparison; the caches remain
+  interchangeable while the exact divergent decisions are investigated.
+- Made fresh prediction and Lasagna-normal samples authoritative for Fiberlet
+  generation and replay transition scoring. Cached endpoint evidence no longer
+  aborts generation when a compatible producer reconstructs slightly different
+  floats. Scheduled failures retain owner key, terminal cache status, and nested
+  generator cause.
+- Raised the exact chunk-route per-entry state guard from one million to five
+  million, the smallest tested bound that completes the 1024-base staged
+  Paris4 workload without partial results.
+
+# 2026-08-24: memory-first staged Fiberlet overlays
+
+- Added a shared bounded write-back LRU for invocation-local reduction layers.
+  Later boxes and stages read serialized anchor and paired prefix/route chunks
+  directly from memory; asynchronous atomic writes occur only under shared
+  cache pressure, with pending buffers still charged to the budget.
+- Logical stage hashing now combines metadata, spilled chunks, and latest
+  in-memory chunks without forcing a flush. Exact stage ID/payload hashes and
+  final populations remain unchanged.
+- The hot four-stage Paris4 Release workload improved from a 3.93 s median to
+  2.90 s; its 5.56 MB of temporary payloads required no disk spills.
+
+# 2026-08-24: arbitrary staged Fiberlet graph reduction
+
+- Replaced point-query graph construction with chunk-granular anchor,
+  prefix, and route loading, cache-free parallel transition construction, and
+  reusable worker pools. On the hot Paris4 512-base two-stage workload,
+  Release wall time fell from an 8.09 s median to 2.46 s while retained-ID and
+  complete overlay-payload hashes remained exact.
+- Exact entry searches use fixed worker-owned partitions and reusable
+  thread-local scratch, with no synchronization in the per-trace loop. The
+  stage-one search alone improved from 0.852 s at one thread to 0.108 s at 32.
+- Corrected stage tables to report inside anchors, all incident Fiberlets, and
+  per-box interior Fiberlets in that stage's complete box union, with separate
+  original, inherited input, and output counts. The joint table remains scoped
+  to the full selected bbox.
+- Replaced the unpublished fixed two-stage driver with repeatable
+  `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` analysis passes over a selected
+  base-coordinate bbox.
+- Added same-layout sparse anchor/Fiberlet overlays with missing-chunk
+  fall-through, explicit empty overrides, strict prefix/route pairing, and
+  record-exact monotone replacement checks.
+- Made overlapping boxes consume earlier removals in deterministic order and
+  report per-stage plus joint anchor/all/interior reductions. Derived layers
+  are temporary; initial on-demand caches remain reusable and unchanged.
+
+# 2026-08-24: two-stage regional Fiberlet reduction diagnostic
+
+- Added globally reusable aligned stage-one reduction chunks and centered
+  half-offset stage-two analysis without changing the authoritative anchor or
+  Fiberlet caches.
+- Bounded stage two to exactly the selected stage-one owners; incident-halo
+  requests outside that set are in-memory empty views and cannot start or
+  publish extra preprocessing.
+- A hot Paris4 512/256 run reused all eight stage-one chunks, completed stage
+  two in 1.4 s, and reduced 13,750 incident Fiberlets to 4,168 (69.69%) and
+  5,730 internal Fiberlets to 618 (89.21%).
+- Added conservative directed reachability removal, complete unused-anchor
+  removal, exact bidirectional physical macros, disjoint directed-chain
+  detection, and atomic forced-continuation descriptors for each centered
+  stage-two box. Distinct routes are retained; macros remain in-memory and
+  reference their original ordered Fiberlet geometry and objective scalars.
+- On the same hot crop, post-stage-two simplification removed 51/1,515 anchors,
+  merged 73/4,168 physical Fiberlets into 4,095 macros, and found 1,041
+  one-successor directed states with 2.19-macro mean forced rollout length.
+
+# 2026-08-24: chunk-local optimal Fiberlet-route statistics
+
+- Added a shared on-demand cached-graph diagnostic that finds every exact cheapest
+  directed entry-to-first-exit route through a half-open base-coordinate box.
+  It shares regular replay's strict join-angle and normal/tangent-aware join
+  scoring, rejects all revisited anchors, generates missing canonical chunks
+  through the existing preprocessor/cache/LRU path, and reports the retained
+  union and route distributions without pruning graph payloads.
+- In a populated 128-base Paris4 box, exact optima used 55/62 anchors and
+  1,135/1,369 incident fiberlets. Only 45/252 internal Fiberlets survived,
+  giving an 82.14% internal reduction after boundary-crossing edges are
+  excluded. The bounded cold shared-cache fill took 183.71 s and the hot
+  analysis took 0.29 s.
+
+# 2026-08-22: geometrically weighted fiberlet substep costs
+
+- Restored stored whole-fiberlet and join scoring as the default replay cost
+  evaluator. The slower subsegment/grid evaluator is available explicitly as
+  `--cost-mode stepped`; its profile-weight default remains 1. Aggregate mode
+  does not load cost profiles, and cache identity is unchanged.
+- Added replay-only stepped-mode `--cost-profile-weight` in `[0,1]` to blend
+  each fiberlet's decoded average density with its decoded subsegment densities
+  before geometric weighting.
+- On the full Paris4 radius-768 hot-cache corridor, delayed `W=0.99` falloff
+  produced 5/5/3/2/2 failures at profile weights 0/0.25/0.5/0.75/1. With
+  `W=1`, profile weight zero exactly reproduced the two aggregate-baseline
+  failure arcs.
+- A matched-terminal-weight lookahead sweep found no zero-or-one-failure
+  configuration. H384/T0.25 retained two failures; every H512 setting produced
+  four, H768 produced three or four, and H768/T0.5 hit the route-state limit.
+- Removed two long-route quadratic paths discovered after the 5k validation.
+  Score initialization now reads cumulative prefix scalars and visits only the
+  checkpoint/lookahead suffix, while logical-route cleanup uses a bounded
+  persistent cursor instead of rescanning the complete registry.
+- Made `fiberlet-replay --threads` one shared budget for its concurrently
+  running greedy and fiberlet evaluators. This removes the 32-logical-CPU
+  oversubscription cliff without changing search ordering.
+- A hot-cache full Paris4 radius-768 replay crossed the former 65-percent
+  slowdown point at 12 seconds and completed in 22.34 seconds wall time, with
+  14 greedy and 5 fiberlet failures.
+- Repaired the scorer after the first profile integration changed more than the
+  checkpoint-forward term. Ranking now preserves the authoritative unweighted
+  prefix through the checkpoint and integrates decoded subsegment costs only
+  from the checkpoint through the horizon. Decoded profiles are not rescaled to
+  the separately stored whole-edge cost, and one integrator handles every
+  weight, including `W=1`.
+- Restored conservative relaxed cost-to-go pruning and incremental scalar score
+  state. Ordinary cached arc queries no longer load route payloads; profiles use
+  a bounded decision-local cache. On the Paris4 5k hot-cache benchmark, repaired
+  `W=1` had zero fiberlet failures and median wall/CPU ratios of 1.18x/1.21x
+  versus pinned revision `64e5341`.
+- Added opt-in delayed geometric falloff through replay-only `--cost-delay`;
+  zero preserves immediate decay and 192 base voxels covers half the default
+  lookahead before decay begins.
+- Persisted fixed-sqrt `uint16` cost density for every selected DP route
+  segment and changed exact and bounded graph lookahead to integrate those
+  profiles on a checkpoint-rooted base-distance grid.
+- Added replay-only `--cost-weight` and `--cost-step` controls. Weighted ranking
+  remains separate from the unchanged five-component committed diagnostics.
+- On the Paris4 5,000-base-voxel interval, `W=0.99` at both 16- and
+  32-base-voxel spacing completed with zero fiberlet failures, matching the
+  unweighted stored-profile run.
+- Added bounded decision windows and common-start `fiberlet-replay --arc`
+  diagnostics. Two Paris4 wide-radius failures now have constrained-radius
+  proxy routes and ranked alternative cost decompositions without full-fiber
+  reruns; the proxy is explicitly not treated as a same-graph oracle.
+- Clipped retained diagnostic polylines exactly at their checkpoint and
+  lookahead boundaries. The diagnostic-filter regression now also proves that
+  filtering leaves selected geometry and failure counts unchanged.
+
+# 2026-08-22: fractional fiberlet endpoint evaluation
+
+- Replaced the unpublished combined q1/u8 matrix row with a 0.125-base-voxel
+  endpoint, compact-direction, fixed-sqrt `uint16` scenario. Fractional
+  evaluation quanta use shared eager/cache rounding while canonical float
+  anchors and the persistent compact storage schema remain unchanged.
+
+# 2026-08-22: fixed nonlinear uint16 fiberlet cost view
+
+- Added fixed global square-root encoding of cost per prediction voxel with a
+  ceiling of 256. It reconstructs edge totals with the stored path
+  length without adaptive chunk ranges, cache identity changes, or persisted
+  geometry changes.
+- On the full Paris4 radius-768 replay it matched the compact-float control's
+  two failure arcs and reference-distance distribution while reusing the same
+  unchanged geometry cache.
+
+# 2026-08-22: globally ranked incremental exact fiberlet lookahead
+
+- Replaced one-best-continuation-per-checkpoint-prefix exact replay with one
+  multi-source frontier and globally ranked full-horizon beam population.
+  Winning routes now retain their lookahead suffix across checkpoint advances;
+  multiple winners may share a checkpoint prefix.
+- Added a single raw-loss cutoff shared by all source beams, deterministic
+  fixed-batch parallel expansion and state accounting, and selected-prefix-only
+  reference evaluation.
+
+# 2026-08-22: exact full-width fiberlet replay default
+
+- Restored exact cost-bounded lookahead as the replay default after incremental
+  prefix processing removed the actual long-route slowdown. Finite search
+  widths remain available only as an explicit approximate experiment.
+- On the full Paris4 radius-768 replay, exact search completed in 82.66 seconds
+  with five fiberlet failures versus 58.34 seconds and seven failures for width
+  128, using the same hot cache and unchanged one-million-state cap.
+
+# 2026-08-22: explicit fiber replay phases
+
+- Replaced the misleading weighted replay percentage with independent
+  cache/preprocessing and actual reference-trace progress. Visualization and
+  publication now report as a separate output phase.
+- Compact output now removes completed cache progress, shows elapsed time once,
+  adds a rolling current-speed ETA, and reports the latest bounded lookahead's
+  state-expansion count plus its minimum applied local cutoff loss per
+  prediction voxel.
+
+# 2026-08-21: bounded intermediate fiberlet lookahead
+
+- Added deterministic equal-distance intermediate pruning for graph replay,
+  defaulting to a 128-route working frontier at 48-base-voxel intervals over
+  the existing 192-base-voxel lookahead. Exact A* remains selectable with
+  `--search-width 0` for focused comparisons.
+- Preserved exact logical-front cost semantics: the terminal fiberlet remains
+  whole in graph state while only its in-horizon edge fraction is scored, with
+  its entering join charged once. Replay JSON now records search mode and
+  per-front population/pruning diagnostics.
+
+# 2026-08-20: concise fiberlet replay progress
+
+- Replaced default per-stage, per-chunk, and per-evaluator replay chatter with
+  one monotone overall reference-progress bar and ETA. Detailed profiling rows
+  remain available through `fiberlet-replay --stats`.
+
+# 2026-08-20: on-demand fiberlet storage and replay
+
+- Replaced the unpublished cache payload with strict version 2. Float-cache
+  anchors now retain canonical endpoint prediction/normal samples, and
+  prefixes retain all five cost components, authoritative path length, and
+  exact base-space endpoint steps. Cached joins no longer resample source
+  volumes, and committed route reconstruction matches DP duplicate suppression.
+- Canonicalized replay diagnostic indices across eager and cached graph
+  adapters. On the 5,000-base-voxel Paris4 corridor, cold-cache, warm-cache,
+  and eager replay produce byte-identical 342-point/65-edge fiberlet JSON and
+  OBJ, total loss `91.7058129850775`, and loss density
+  `0.14645713824432563`.
+- Added strict version-1 float32 and compact fiberlet structure-of-arrays
+  codecs with independently compressed fields, checksummed headers, stable
+  anchor/edge identities, and separate connectivity and route payloads.
+- Added local sparse Zarr-v2-layout anchor/fiberlet datasets with atomic chunk
+  publication and on-demand float32 generation through the shared chunk cache.
+- Extended `ChunkCache` with variable-length opaque payloads, independent
+  scheduler lanes, lease-aware eviction, and byte-accurate per-cache/shared
+  accounting.
+- Replaced default corridor-wide replay graph materialization with stable-ID,
+  cache-backed adjacency and route queries. The beam retains no permanent graph
+  copy, and evicted connectivity/geometry reloads transparently. The old eager
+  path remains available only through `--eager-graph` for diagnostics.
+- Fixed a lost completion wakeup in parallel anchor fitting by publishing tile
+  and ready-cell completion under the condition predicate mutex. No polling or
+  timeout recovery was added.
+- Added globally referenced replay progress, stable chunk schedule diagnostics,
+  internal fiberlet phases, and independent greedy/fiberlet terminal rows.
+- Parallelized canonical source-anchor candidate generation and released large
+  prepared candidates on their search workers. On the measured Paris4 chunk
+  `107,34,45`, generation wall fell from 34.795 to 4.344 seconds while prefix
+  and route cache payloads remained byte-identical.
+- Stored decoded anchor, prefix, and route objects directly in the existing
+  lease-aware `ChunkCache` LRU. Prefix chunks build one charged incident index,
+  lookahead uses exact endpoint descriptors, and route geometry is loaded only
+  for committed edges. A cache-warm 100-base-voxel Paris4 replay fell from a
+  17.13-second median to 0.20 seconds with byte-identical output.
+# 2026-08-20: shared anchor observations and proposal evidence
+
+- Built compact anchor observations and presence gradients once per bounded
+  exact-union sample, replacing overlapping tile copies with uint32 index maps.
+- Canonical median anchor wall and CPU improved by 11.7% and 11.4%, total wall
+  by 6.7%, and peak RSS by 7.1%, with byte-identical replay artifacts.
+- Added extraction-profile version 24 with shared-observation and tile-map work
+  counters plus complete raw/compact coexistence memory accounting.
+- Materialized eligible robust-proposal evidence once per cell and reused its
+  contiguous 32-byte records across axis and final-membership passes. Median
+  local-refinement work improved 2.5% and anchor CPU 1.3% with byte-identical
+  replay artifacts; profile version 25 reports record preparation and storage.
+- Restricted production fiberlet corridor admission to the two centerline
+  segments incident to each curved-domain layer. Canonical segment tests fell
+  72%, node-enumeration work about 6.6%, and fiberlet CPU about 1.5%, while the
+  complete replay artifact remained byte-identical.
+- Inserted common eight-corner interpolation cells into one resolved sparse
+  bitmap page. Corner-collection work fell about 65%, preparation CPU about
+  28%, and command wall about 4%, with unchanged sampled voxels and byte-
+  identical replay output.
+
+# 2026-08-19: float final anchor support reduction
+
+- Isolated final refined-anchor evaluation in its own translation unit and kept
+  both compact and expanded observation paths in checked float32 arithmetic.
+- Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
+  and total wall by 0.4% with byte-identical replay artifacts.
+- Prepared candidate-side normal-aware smoothness once per outgoing fiberlet DP
+  edge and reused it across incoming states. Canonical search wall and DP worker
+  time improved about 2.0% and 2.1%, respectively, with byte-identical replay
+  artifacts.
+- Prepared current-side and candidate-side multiplicative alignment inputs at
+  their natural DP reuse boundaries. Canonical search wall and DP worker time
+  improved another 2.3% each with byte-identical replay artifacts.
+
+# 2026-08-18: solve-local fiberlet DP reuse
+
+- Cached normalized scoring inputs once per retained node and reused each
+  reached node's outgoing descriptors across its incoming DP states.
+- Replaced all-node cumulative state with rolling two-layer float32 costs and
+  packed-key-derived predecessors, cutting canonical search CPU by 45.9% and
+  total CPU by 8.8% while preserving selected geometry and replay failures.
+- Added extraction-profile version 13 with solve-local memory, node/edge reuse,
+  and node-preparation diagnostics.
+- Deferred interior scoring interpolation until first search access and cached
+  it per candidate. This reduced canonical fiberlet CPU by another 35.9%, total
+  wall by 9.7%, and peak RSS by 14.2% with byte-identical replay artifacts.
+- Added extraction-profile version 14 with endpoint, lazy request/miss/hit, and
+  shared/local scoring-memory diagnostics.
+- Reused an exact ordered support-span stencil for complete anchor cells,
+  reducing canonical anchor CPU by 5.5% and total wall by 3.6% with
+  byte-identical replay artifacts.
+- Added extraction-profile version 15 with support-stencil and clipped-cell
+  counts.
+- Traversed the exact owned-cell cube directly during anchor initialization,
+  reducing canonical fit-setup worker time from 11.00 to about 0.09 seconds and
+  anchor CPU by 4.1% with byte-identical replay artifacts.
+- Added extraction-profile version 16 with public discovery, direct owned, and
+  avoided support-visit counts.
+
+# 2026-08-17: robust sampled-direction anchor refinement
+
+- Replaced joint angular line search with deterministic competitive robust
+  sampled-direction aggregation and position-only bounded refinement.
+- Removed pre-refinement close-direction merging, preserved robust membership
+  through peak fitting, and added strict configuration/artifact diagnostics.
+- Reduced the default alternating robust update budget to one measured pass;
+  `--maximum-iterations` remains the documented quality/speed knob for
+  difficult overlapping-fiber fits, and legacy numeric identity is
+  intentionally not required for this fitter.
+- Fused robust histogram/tensor work, reused tile gradients, paired spatial
+  objectives, and reduced peak-response geometry to transverse coordinates.
+- Increased anchor tiles from four to six cells per axis after measured tile
+  sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
+- Stored transient peak-search observations and evaluated transverse peak
+  responses in float32, reducing canonical anchor wall time to 9.76 seconds.
+- Paired overlapping anchor tiles into bounded sampling jobs and reused raw
+  prediction samples across pair halos. This reduced canonical sampler
+  submissions by 32.6% with unchanged extraction output.
+- Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
+  reducing canonical replay wall time by 2.1% with unchanged path work and
+  replay quality.
+- Replaced repeated scoring-voxel hash lookups with sparse `16^3` pages and
+  dense page-local indices, reducing interpolation materialization by 4.2%
+  while preserving exact replay artifacts.
+- Prepared compact float32 prediction/normal axes and symmetric tensors once
+  per sampled voxel, reducing interpolation materialization by 26.1% while
+  preserving fiberlet geometry and replay outcomes.
+- Replaced fiberlet interpolation's iterative principal-axis solve with a
+  guarded closed form, reducing resolver materialization by another 8.8% with
+  zero fallbacks and byte-identical replay artifacts.
+
+# 2026-08-17: fiberlet extraction profiling
+
+- Added deterministic anchor and fiberlet workload counters and finer-grained
+  wall, CPU, and summed-worker timings without changing extraction decisions.
+- Added one shared versioned extraction-profile row to `vc_fiberlets benchmark`
+  and full `fiberlet-replay` extraction.
+- Documented a reproducible, exact-output performance protocol and recorded the
+  initial optimization candidates for the fiberlet tracing pipeline.
+- Added extraction-profile version 2 with exclusive anchor-fitting subphases,
+  repeated observation-visit counters, and exact peak-cache/backtracking
+  diagnostics. Measurement identified local component refinement, not
+  seed-pair fitting, as the next dominant extraction hotspot.
+
+# 2026-08-13: fiberlet graph replay
+
+- Replaced the quantized world-axis half-grid DP with a deterministic curved
+  cubic-Hermite domain using 2-voxel arclength planes, parallel-transported
+  frames, 0.5-voxel transverse offsets, and floating-point interpolation.
+- Removed the fiberlet lattice's 45-degree smoothness dead zone and scored
+  graph joins with the same shared local alignment and Lasagna-normal
+  tangent/normal objective, including exactly-once replay accounting.
+- Expanded integer-DP candidate generation from the radius-four shell to every
+  shorter cell offset within the same outer bound and added a strict 25-degree
+  sampled-fiber-direction feasibility constraint.
+- Added deterministic bidirectional fiberlet graphs with strict 45-degree
+  anchor joins and loss-density beam routing with anchor-level lookahead.
+- Added `fiberlet-replay`, shared variable-step reference matching, strict
+  graph/route artifacts, and an independent reloadable napari route layer.
+- Unified reference, greedy, and fiberlet longitudinal comparison scope under
+  `--along`; greedy postroll and exact display cropping now derive from it.
+- Fiberlet graph replay now completes the edge containing its first distance
+  failure and continues for anchor-bounded `--along` postroll, with explicit
+  complete/truncated distances, overshoot/shortfall, and whole-edge identities.
+
+# 2026-08-12: narrower independent anchor NMS
+
+- Decoupled transverse anchor NMS from the peak-refinement window and reduced
+  defaults to 2 transverse and 1 longitudinal prediction voxels.
+- Added the transverse radius to strict experimental anchor artifacts and path
+  loading while retaining conservative external crop context.
+
+# 2026-08-12: fiberlet replay distance filtering
+
+- Added an independent napari fiberlet-radius control that physically removes
+  paths wholly outside the exact reference/failed-trace polyline distance.
+- Set display defaults to 32 base voxels for presence and anchors and 16 for
+  fiberlets, with all three values preserved across artifact reload.
+
+# 2026-08-12: parameter-independent anchor visualization
+
+- Decoupled napari anchor-stage visualization compatibility from extractor
+  parameters. Old, absent, or extended parameter metadata now renders without
+  affecting coordinate, geometry, lineage, or final-output consistency checks.
+
+# 2026-08-12: full 2D anchor subpixel experiment
+
+- Replaced independent 1D peak parabolas with a complete 3x3 least-squares 2D
+  quadratic including cross-coupled curvature and conservative Hessian,
+  half-step, owner-domain, and real-response guards.
+- On the fixed David Paris4 benchmark, the 2D fit reproduced the discrete
+  population exactly but scored below the 1D baseline: 29.07%/43.90% versus
+  29.78%/44.88% anchor/cell hits at 4 vx, and 54.09%/80.42% versus
+  54.59%/81.06% at 8 vx.
+- Extending the signed-gradient sweep above its former maximum found a
+  4-voxel optimum near weight `1.0` and an 8-voxel optimum near `1.3-1.5`;
+  weight `1.2` gave the best equal-weight aggregate for joint-2D.
+- Added matched `discrete`, `separable_1d`, and `joint_2d` benchmark positions
+  from one extraction. The old `0.2` 1D result reproduced exactly. Across the
+  complete `0.0-2.0` sweep, separable-1D beat joint-2D on every 4/8 anchor/cell
+  hit rate; separable weight `1.1` scored 31.14%/46.89% at 4 vx and
+  55.97%/82.64% at 8 vx.
+- Selected separable-1D for production anchor placement and gradient weight
+  `1.0` as the default. Joint-2D remains transient benchmark provenance only.
+
+# 2026-08-12: discrete-versus-subpixel anchor benchmark
+
+- Split refined-anchor localization output into equal-population `discrete`
+  and `subpixel` reports while keeping discrete provenance transient and strict
+  version-1 artifacts unchanged.
+- Selected `0.2` as the default signed gradient weight from the fixed David
+  Paris4 sweep. Explicit CLI and artifact values remain authoritative.
+- At `0.2`, subpixel fitting improved 4-base-voxel anchor/cell hit rates from
+  27.79%/41.94% to 29.78%/44.88% and 8-base-voxel rates from 53.76%/79.86% to
+  54.59%/81.06% relative to the discrete peaks.
+
+# 2026-08-12: signed presence-gradient anchor centering
+
+- Added deterministic presence-only 3D Sobel gradients and reliability-gated
+  inward/outward normal-plane voting to the refined-anchor peak objective.
+- Added strict gradient weight/reliability artifact parameters and
+  `--gradient-weight`, with exact weight-zero fallback.
+- On the supplied David Paris4 reference, the default raised 4-base-voxel
+  anchor/cell hits from 1,002/982 to 1,021/1,000 and 8-base-voxel hits from
+  1,884/1,823 to 1,896/1,832 while reducing mean, median, and p95 distance.
+
+# 2026-08-12: outer-parallel anchor extraction
+
+- Parallelized anchor sampling and fitting over canonical cell jobs while
+  forcing every job's lower-level prediction sampler to one thread.
+- Added aggregate concurrent-halo memory bounding, deterministic indexed result
+  and error assembly, and serialized progress/retain handling.
+
+# 2026-08-12: refined-anchor localization benchmark
+
+- Added `vc_fiberlets anchor-benchmark` to extract only geometric refined
+  anchors in exact reference-intersecting cells and measure their exact
+  base-coordinate distance to a strict fiber's dense line.
+- Added stable distribution output and inclusive 4/8-base-voxel anchor and
+  reference-cell hit rates, with empty refined populations kept explicit.
+- Shared exact polyline-to-cell selection with failed-trace replay while
+  preserving replay's positive-radius tube behavior.
+
+# 2026-08-12: physical replay anchor filtering
+
+- Changed the Napari replay anchor-radius cutoff to physically subset final and
+  staged anchors, cell centers, and refinement offsets instead of leaving
+  transparent depth-occluding geometry in the rendered layers.
+- Retained defensive full geometry/features for reversible slider updates and
+  transactional artifact reload/rollback.
+
+# 2026-08-12: local-maximum fiberlet anchors
+
+- Added deterministic direction-conditioned normal-plane peak search after the
+  existing non-orthogonal anchor direction fit.
+- Integrated the peak response with a `1.5`-voxel transverse Gaussian and a
+  longer `1.5`-cell-side along-direction Gaussian, with complete rotated-kernel
+  halo sizing.
+- Added bounded non-decreasing subvoxel peak fitting, continuous owner-cell
+  constraints, normalized edge response, strict transverse/axial peak fields,
+  and base-voxel CLI controls.
+
+# 2026-08-12: faster replay viewer startup
+
+- Kept detailed anchor-stage layers enabled by default so replay diagnostics are
+  immediately available; `--no-anchor-stages` provides an explicit fast-start
+  opt-out and avoids hashing unused stage artifacts.
+- Preserved strict stage schemas and selected-stage topology across artifact
+  reloads.
+
+# 2026-08-11: dense-fiber failure replay
+
+- Added C++ greedy native replay against dense VC3D fiber geometry with bounded
+  monotone matching, typed failure statuses, and exact postroll handling.
+- Added exact tube-selected anchors, tube-constrained integer fiberlets, sparse
+  replay scoring preload, and content-addressed atomic diagnostic bundles.
+- Added strict napari replay loading with external-Zarr validation and separate
+  reference, trace, failure, anchor, and quality-colored fiberlet layers.
+- Kept replay failure-marker styling compatible across napari Points API
+  versions by avoiding the renamed outline-color keyword.
+- Added a replay presence-tube mask using a one-time reference rasterization and
+  base-voxel distance transform, with a runtime radius slider defaulted from the
+  anchor/fiberlet extraction tube.
+- Added replay stage timing plus per-second anchor and fiberlet progress/ETA;
+  anchor progress distinguishes selected-cell fitting from NMS context.
+- Expanded the replay presence mask to the union of the reference fiber and the
+  complete failed greedy trace, including postroll, for direct comparison.
+- Added `anchor_cells.obj` with every selected cell center and retained-anchor
+  displacement lines, exposed as separate clipped napari diagnostic layers.
+- Added strict initialized/refined/support/selection/NMS anchor-stage JSON
+  diagnostics with stable merge lineage, exact filter causes, and actual NMS
+  suppressors, plus independently toggleable napari comparison layers.
+- Added an independent base-voxel anchor-radius slider that filters every replay
+  anchor diagnostic against the exact reference/failed-trace union distance.
+- Added transactional in-process replay-artifact reload with stable empty
+  layers, strict prediction/crop compatibility, derived-distance refresh, and
+  no presence-Zarr reopening.
+
+# 2026-08-11: fiber-centered anchor refinement
+
+- Replaced fixed cell-centroid anchor positions with bounded halo-backed joint
+  direction/position refinement on a rotating plane through each cell pivot.
+- Added deterministic direction-compatible local-maximum NMS across cells,
+  exact crop-boundary context, strict refinement metadata, and focused
+  convergence, locality, determinism, and artifact validation.
+
+# 2026-08-11: fiberlet loss/quality visualization
+
+- Added length-normalized per-fiberlet trace loss, report-relative visual
+  quality, strict napari metric parsing, per-shape features, a runtime napari
+  colormap selector, and density CLI statistics. Path MTL/material output was
+  removed in favor of napari-owned display color.
+
+# 2026-08-10: integer-DP fiberlet paths
+
+- Added strict anchor-artifact loading, radius-four cell-shell pairing, and
+  deterministic integer prediction-voxel DP with exact virtual endpoints.
+- Added the native tracer's shared multiplicative local alignment loss with
+  lattice-edge integration, finite invalid-prediction bridges, and shared
+  native Lasagna-aware direct curvature.
+- Added `vc_fiberlets paths`, versioned JSON/OBJ output, focused regression
+  tests, and real-crop deterministic validation. Global graph construction,
+  deduplication, extension, and H/V/winding assignment remain deferred.
+- Made base-volume coordinates the only spatial contract exposed by the
+  unshipped fiberlet CLI and JSON/OBJ artifacts; no compatibility aliases or
+  legacy coordinate fields are retained.
+- Added `paths --stats`, explicit score-presence semantics, and two-index OBJ
+  path edges.
+- Added independently loadable central XY/XZ/YZ fiber-presence textured-quad
+  OBJ/MTL/PNG context, with direct presence sampling and `--no-slices` opt-out.
+- Materialized each small crop's fiber/normal scoring volume once and moved
+  exact independent DP searches to a deterministic fixed worker pool, removing
+  repeated sampling and nested thread teams.
+- Added monotonic rate-limited path progress with throughput and ETA on stderr.
+
+# 2026-08-10: C++ fiberlet cell anchors
+
+- Added deterministic cell-based extraction of zero, one, or two
+  non-orthogonal unoriented anchors from canonical Fiber Lasagna
+  `presence/nx/ny`, plus the cache-aware `vc_fiberlets anchors` command and
+  sparse JSON/base-coordinate OBJ artifacts. Connection and path stages remain
+  deferred.
+- Merged near-duplicate fitted directions using an angle-plus-objective test
+  and a joint PCA refit, with strict diagnostics and configurable thresholds.
+- Kept the complete anchor OBJ and added separate deterministic component-zero
+  and component-one OBJ layers for inspection.
 
 # 2026-08-07
 
@@ -350,6 +1142,346 @@
   dispatch and restored float16 product rings as the default.
 - Added `--accumulator-workers`, backend/throughput diagnostics, native
   numerical coverage, and process-vs-synchronous output coverage.
+# 2026-08-13: half-voxel fiberlet DP
+
+- Halved anchor-to-anchor fiberlet DP spacing to 0.5 stored prediction voxels,
+  with cached sign-invariant prediction/normal interpolation and unchanged
+  base-coordinate artifacts.
+
+# 2026-08-14: full-reference dual fiber replay
+
+- Added independent reset-capable greedy and fiberlet whole-reference replay,
+  strict version-2 segmented artifacts, optional indexed failure
+  visualizations, and strict napari selection/reload.
+- Replaced whole-graph scoring preloads with deterministic on-demand curve
+  batches through the existing volume samplers and added a reproducible local
+  anchor/fiberlet extraction benchmark with sampling, DP, and peak-memory
+  diagnostics.
+- Replaced curve-batched fiberlet preparation with a global stage-parallel
+  pipeline: each candidate geometry is built once, native corners are globally
+  deduplicated independent of sampler batch size, and materialized nodes are
+  reused by parallel DP. Added actual per-stage process-CPU utilization and
+  coordinate-call diagnostics.
+- Compacted retained fiberlet DP nodes to 24 bytes with checked 32-bit local
+  keys and Lasagna-style axis/presence bytes, removed retained interpolation
+  stencils, and separated prepared-geometry from transient-search memory
+  reporting.
+- Replaced overlapping per-cell anchor reads and the second NMS-context pass
+  with deterministic shared dense tiles over a conservative context population;
+  on the fixed 4096-base-voxel Paris4 workload this reduced anchor time by 42%,
+  total time by 22%, and peak RSS by about 75%.
+- Defaulted `vc_fiberlets benchmark` to the complete reference interval after
+  the first control point; explicit `--along` still requests a shorter interval.
+- Added replay-only `--length` in base voxels so extraction, both evaluators,
+  failure reporting, persisted geometry, and visualizations share one bounded
+  interval; omission retains complete-reference replay.
+- Restored direct replay visualization manifests without a viewer index,
+  published stable per-tracer failure aliases for reload, and restored loading
+  of strict version-1 single-visualization replay artifacts.
+
+# 2026-08-17: CT-rendered replay trace strips
+
+- Added three disconnected, sheet-aligned replay strip OBJ artifacts per
+  failure using the unchanged default `buildLineViewSurfaces()` geometry.
+- Extracted the existing `vc_lasagna_line_probe` fine-to-coarse surface texture,
+  textured-mesh, and TIFF helpers for shared use without changing their sampler
+  behavior.
+- Made `vc_fiberlets fiberlet-replay --vis` require `--volume` to name one
+  concrete CT OME-Zarr array/group. Base trace coordinates are mapped through
+  the parent `multiscales` transform before the unchanged renderer samples that
+  group. Each trace publishes a hashed OBJ/MTL/uncompressed-TIFF triple; the
+  selected group transform is persisted and napari reads only those artifacts.
+- Removed the unpublished replay-only ribbon, mask, uint16, and PNG paths.
+- Accepted equivalent concrete-group paths with or without a trailing directory
+  separator when resolving OME-Zarr multiscales metadata.
+- Replaced fixed replay strip supersampling with automatic endpoint-inclusive
+  source-group voxel resolution. Napari now tessellates the validated textured
+  OBJ to every stored TIFF texel instead of displaying only coarse OBJ-vertex
+  samples.
+- Added `fiber_replay.jpg`, a full-selected-interval top/side CT overview with
+  yellow reference, red greedy, and cyan fiberlet overlays. It uses the same
+  default line-view surfaces and shared renderer, honors `--length`, is emitted
+  even for zero-failure visual runs, and is stored both immutably and at a
+  stable direct-inspection path.
+- Increased only the direct-inspection replay overview to 8x source-group
+  sampling, added full-height pre-reset failure bands, and wrapped long strips
+  into deterministic fraction-aligned panels without resampling. Per-failure
+  OBJ/MTL/TIFF strips remain at native selected-group sampling.
+- Replaced replay's isotropic failure cutoff with one shared Lasagna-normal
+  ellipsoid for greedy samples, fiberlet samples, and fiberlet reseeding: the
+  configured base-voxel radius remains unchanged normal to the sheet and is 4x
+  in the tangent plane. Replay output now stores explicit component diagnostics
+  and rejects inconsistent measurements before publication.
+- Extended the full replay overview with fiberlet-centered top/side CT strips,
+  preserved reset components with explicit raster placement, and changed long
+  output to complete four-strip blocks packed across indexed JPEGs capped at
+  65,000 pixels per dimension.
+
+# 2026-08-17: profiled and accelerated fiberlet extraction
+
+- Added versioned anchor/fiberlet phase profiles to benchmark and replay output,
+  including deterministic work counters and process-CPU measurements.
+- Replaced repeated replay-tube scans with an immutable float32 Boost segment
+  R-tree and prioritized each local corridor's layer-adjacent segment. On the
+  5,000-base-voxel Paris4 replay workload, median wall time fell from 58.61 to
+  25.32 seconds while complete published artifacts remained byte-identical.
+- Added a conservative exact support-sphere broad phase to repeated anchor
+  refined-state evaluation. On the same 5,000-base-voxel replay, median wall
+  time fell from 24.92 to 22.09 seconds and complete artifacts remained
+  byte-identical.
+- Added version-3 local-refinement subphase profiling, identifying repeated
+  refined-state evaluation as roughly 89-90% of remaining local-refinement
+  worker time on the canonical replay.
+
+# 2026-08-18: contiguous anchor peak-grid caching
+
+- Replaced direction-conditioned peak-search ordered maps and repeated grid
+  geometry with checked contiguous row-major caches. The canonical replay's
+  median peak-search worker time improved from roughly 43.9 to 42.84 seconds
+  with byte-identical artifacts and deterministic work counters.
+- Split peak responses into a 16-byte hot stream and sparse retained-evidence
+  storage. Canonical median peak-search worker time improved from 42.84 to
+  39.94 seconds and command wall from 10.43 to 10.25 seconds with unchanged
+  replay artifacts and quality populations.
+- Kept production compact robust direction proposals in float32 through their
+  per-observation loop, widening only fixed-size summaries for the existing
+  double cutoff and eigensolver. Canonical median proposal work improved from
+  25.63 to 23.74 worker-seconds with unchanged populations/failures and a
+  maximum emitted-route displacement of 1.38e-6 base voxels.
+- Isolated retained spatial objectives in a private translation unit and kept
+  production compact objective arithmetic float32 while preserving the public
+  compensated-double path. Canonical median objective work improved from 22.59
+  to 13.86 worker-seconds and command wall from 9.56 to 9.17 seconds with
+  byte-identical replay artifacts.
+
+# 2026-08-19: cooperative ready-cell anchor scheduling
+
+- Work-balanced prepared anchor cells across the bounded sampling-group worker
+  pool while retaining tile-local observation ownership and overlap reuse.
+  Canonical median anchor wall time improved from 5.067 to 4.262 seconds and
+  total wall time from 7.77 to 6.97 seconds with exact replay artifacts.
+- Replaced pair-local raw prediction reuse with bounded exact-union sampling
+  partitions. The canonical replay submitted 77% fewer prediction voxels;
+  median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.
+- Shared one source-private inline implementation between exported local
+  scoring and the prepared fiberlet DP loop. Canonical median DP search wall
+  improved 9.8% and fiberlet wall 5.7% with exact replay artifacts and work
+  counters.
+- Deferred isotropic-angle evaluation in shared local scoring until an invalid
+  normal or degenerate projected tangent requires it. Canonical median DP
+  search wall improved another 6.2% with byte-identical replay artifacts.
+- Batched the four pair-dependent interior-DP alignment dots across compact
+  valid outgoing lanes while retaining scalar transition relaxation order.
+  Matching optimized runs improved median DP search wall by 5.9% and fiberlet
+  wall by 5.7% with byte-identical replay artifacts.
+- Pre-indexed immutable robust-proposal eligibility during compact anchor
+  fitting. Matching optimized runs reduced median proposal work by 20.4%,
+  anchor CPU by 2.2%, and command wall by 0.9% with byte-identical replay
+  artifacts.
+- Removed redundant robust-membership state copies while retaining the original
+  proposal kernel. Matching optimized runs improved median fitting work 1.6%
+  and command wall 1.1% with byte-identical replay artifacts.
+- Moved direction-conditioned peak signal from the dense response stream into
+  sparse evidence, reducing hot records from 16 to 12 bytes. Matching optimized
+  runs improved median peak-search work 5.0% and anchor CPU 1.5% with byte-
+  identical replay artifacts.
+
+# 2026-08-19: fiberlet storage quantization experiment
+
+- Added a one-extraction C++ benchmark for the proposed anchor-position,
+  compact-axis, and per-chunk cost encodings. Endpoint quantization now feeds
+  the regular curved-plane DP rather than attempting to reuse a baseline route.
+- On the canonical Paris4 interval, no quantization added a tracing failure.
+  Maximum Euclidean line separation was 10.15/9.07/11.46 base voxels for
+  position quanta `1/2/4`, 3.56 for compact axes, 5.35 for `uint8` costs, and
+  zero for `uint16` costs; no persistent encoding was selected.
+
+# 2026-08-20: hoisted compact robust-proposal geometry
+
+- Materialized eligible compact proposal observations once per cell and reused
+  their absolute positions, normalized directions, presence, and logical
+  destinations while retaining the original floating-point geometry order.
+- Published selected anchor cells ahead of context-only cells in each prepared
+  tile's cooperative queue, modestly reducing the measured anchor wall tail
+  while preserving byte-identical output.
+- Enforced finite positions once while preparing compact robust-proposal
+  records, eliminating redundant finite checks in three hot passes and reducing
+  proposal worker time by about 9% with byte-identical replay output.
+- Reused each final-evaluation component Gaussian for its denominator and
+  retained numerator, preserving byte-identical replay output while removing
+  duplicate geometry and exponential evaluation.
+- Reused robust-cutoff membership as sparse per-component centroid indices.
+  This removed 98.8% of centroid visits and reduced centroid worker time by
+  64% while preserving a byte-identical canonical replay artifact.
+- Deferred peak direction validation until after retained-component membership
+  succeeds, reducing peak worker time by another 12% with byte-identical replay
+  output.
+- Reused refinement's exact observed support bounds for peak ownership,
+  removing a complete support scan and another 1.04 worker-seconds from peak
+  work with byte-identical replay output.
+- Reused the generated compact range's finite-position invariant in robust
+  preparation, reducing preparation worker time by 11% with byte-identical
+  replay output.
+- Carried full-halo support bounds from the fixed stencil into compact
+  refinement, reducing robust preparation another 12% with byte-identical
+  replay output.
+- Cached configured direction eligibility once per unique compact observation,
+  reducing robust preparation another 33% and anchor CPU by 2.5% with byte-
+  identical replay output and no compact-record size increase.
+- Split dense peak-denominator traversal from sparse positive evidence and
+  removed the dense evidence-index stream, reducing peak and enclosing wall
+  time with byte-identical replay output.
+
+# 2026-08-20: chunk-native replay corridor selection
+
+- Removed the serial full-corridor anchor-cell enumeration performed before
+  cache-backed replay could start. Reference scheduling now selects storage
+  chunks directly, while requested anchor chunks perform the canonical exact
+  segment-to-cell test locally and retain existing NMS and path containment.
+- On the Paris4 full-fiber radius-768 workload, cache work began after 0.006
+  seconds instead of remaining in serial setup beyond 20 seconds. A bounded
+  20.06-second cold-cache run consumed 560.16 CPU seconds (27.9 effective
+  cores). The 5,000-base-voxel radius-64 replay remained byte-identical and
+  completed in 5.90 seconds.
+
+# 2026-08-20: live cached replay progress
+
+- Added generated-or-persisted chunk-resolution accounting to the concise
+  replay progress estimate and a bounded timer repaint so elapsed time, an
+  estimated fraction, and ETA remain live during long cache preprocessing.
+- Isolated progress observer failures from cache results and made ticker and
+  resolution-state shutdown safe for late worker completion. Radius-64 replay
+  output remained byte-identical.
+
+# 2026-08-22: incremental fiberlet replay prefixes
+
+- Replaced repeated logical-route vector construction and visited-set copying
+  with exact canonical logical histories and immutable Patricia cycle state.
+- Made selected-route reference matching, normal-threshold evaluation, and
+  diagnostic index assignment process only newly selected history suffixes;
+  complete public route output is assembled once at segment termination.
+- Preserved the canonical hot-cache replay bundle byte-for-byte while reducing
+  its median wall time from 7.57 to 3.87 seconds and peak RSS from 202,872 KiB
+  to 102,424-104,900 KiB.
+
+# 2026-08-20: cache-backed quantization comparison
+
+- Replaced the eager full-population quantization CLI with sequential baseline
+  and selected-scenario replays over persistent, fingerprinted, bounded caches.
+- Applied endpoint position/direction quantization before fresh sampling and DP,
+  projected compact logical IDs for ordering, and decoded per-owner-chunk costs.
+- Added indexed line comparison with Euclidean, normal, and tangential
+  distributions for baseline-to-scenario and both replay-to-reference paths.
+- Kept quantized anchor identity cell-local after a full-corridor run showed
+  that anchors from several adjacent cells can round to one Q4 coordinate.
+- Added explicit exact-baseline cache reuse and collision-resistant atomic
+  temporary writes so long interrupted comparisons resume safely.
+
+# 2026-08-21: geometry-cache reuse across cost experiments
+
+- Split anchor/fiberlet geometry quantization from replay-only cost decoding,
+  allowing float, uint8, and uint16 cost comparisons to share persistent
+  geometry and DP caches.
+- Added `--scenario all`, which runs one baseline and all 17 non-baseline
+  scenarios while creating at most eight geometry cache groups.
+- Retained the historical u8-tagged namespace only as opaque compatibility
+  metadata so the completed radius-768 Q4+axis cache remains reusable.
+- Made anchor extraction canonical across all geometry scenarios. Quantized
+  endpoint views are now derived once per loaded anchor chunk under a bounded
+  single-flight LRU, while only fiberlet geometry remains scenario-specific.
+- Added producer-group cache cancellation and draining for batch replay so
+  completed full-corridor quantization results no longer hang or crash during
+  process worker-pool teardown.
+- Added float-position compact-axis `uint8` and `uint16` cost scenarios. Both
+  are graph-only views over the existing compact-axis geometry cache.
+- Full radius-768 validation confirmed the shared namespace. Because the
+  existing compact-axis cache was only partially populated, its per-owner cost
+  range scan completed missing geometry chunks in place; it did not create a
+  cost-specific cache.
+
+# 2026-08-21: focused quantization failure replay
+
+- Added atomic baseline/scenario replay artifacts and exact failure-window
+  reporting to the cache-backed quantization benchmark.
+- Added base-voxel `--arc`/`--length` focused intervals and an original
+  `--seed-key` override for deterministic replay of later failure segments.
+- Replaced focused corridor pre-generation with demand-only access to the
+  completed full-corridor cache and added ranked beam-frontier/cost/route
+  comparison artifacts.
+- Added full-route committed-fiberlet cost distributions plus configurable
+  base-voxel exclusion around replay failures.
+
+# 2026-08-21: fixed-distance fiberlet lookahead experiment
+
+- Added an initial local base-voxel lookahead experiment with proportional
+  active-cost scoring and clipped final-fiberlet geometry. It was not shipped
+  and has now been replaced by the persistent search below.
+- On the focused Q1 failure section, 192 base voxels approximates the measured
+  three-edge median (189.1 base voxels). A hot-cache float/Q1 comparison
+  completed with zero failures in both runs, no committed first-edge
+  divergence, and 0.443/0.305/3.689 base-voxel mean/median/maximum line
+  separation. Float/Q1 replay wall times were 2.05/2.26 seconds.
+
+# 2026-08-21: rolling whole-fiberlet beam search
+
+- Replaced both unpublished local lookahead implementations with one persistent
+  beam of up to 16 whole-fiberlet histories from each uninterrupted segment
+  seed.
+- Added a shared logical checkpoint, 192-base-voxel lookahead, and default
+  48-base-voxel checkpoint advance. Every retained history expands through all
+  valid branches to the common logical horizon; the final edge remains whole.
+- Added one deterministic global top-16 prune, whole-fiberlet commitment through
+  the next checkpoint, shared immutable parent histories, explicit state bounds,
+  clipped final-output materialization, and decision diagnostics.
+- Parallelized independent retained-beam expansion under the existing
+  `--threads` setting. The focused 600-base-voxel radius-768 hot-cache replay
+  fell from 17.30 to 6.97 seconds while preserving the same failure and distance
+  results.
+- Added bounded equal-distance fronts and deterministic uniform-cost label
+  search. Reconvergent histories now retain only the best logical-incoming-arc
+  and front-offset label, while exact proportional front scoring and the exact
+  A* oracle remain available for comparison.
+- Restored immediate `fiber_replay_failure` output in compact-progress mode;
+  failure lines now interrupt and redraw the progress bar instead of being
+  suppressed unless `--stats` is enabled.
+
+# 2026-08-22: configurable exact replay beam width
+
+- Removed the unpublished fixed maximum of 16 graph-replay beams. `--beam`
+  now accepts any positive width while retaining 16 as its default and the
+  generated-state limit as the exact-search work bound.
+- Changed exact completion retention to ordered insertion so wider experiments
+  do not sort the complete retained set after every discovered route.
+- Changed the graph replay default lookahead from 192 to 384 base voxels while
+  retaining the independent default checkpoint advance of 48 base voxels.
+- Failure-window diagnostics now use the available match search span when a
+  replay reset fails without advancing near the reference end.
+# 2026-08-22: compact float-position fiberlet default
+
+- Adopted exact float endpoint positions, compact fitted directions, and fixed
+  sqrt-density `uint16` edge costs with ceiling 256 as the default cache-backed
+  fiberlet replay profile. Preserved an explicit all-float correctness oracle,
+  canonical float anchors, and the unchanged unpublished compact serializer.
+- Added fractional base-voxel endpoint evaluation and replaced the unpublished
+  q1/u8 matrix row with the q1/8 compact-direction sqrt-u16 experiment.
+- Full Paris4 radius-768 evaluation produced two failures for both the new
+  default and exact oracle; q1/8 produced three.
+
+# 2026-08-22: sparse whole-volume fiberlet preprocessing
+
+- Added presence-only sparse scanning and deterministic output-chunk mapping.
+- Added a retained intermediate anchor cache and a combined compact final Zarr
+  with anchors, prefixes, and routes. Expected chunks and completeness are
+  reconstructed directly from source presence, intermediate anchors, and final
+  payload tuples without persisted activity or completion markers.
+- Added read-only combined-dataset cache facets configured from a fresh source
+  scan, atomic partial-tuple recovery, and locked stale-temp cleanup.
+- Added `vc_fiberlets preprocess-volume` with Z/Y/X scheduling, resume, and
+  one-second progress, ETA, and compressed-size projection with persistent
+  minute checkpoints.
+- Replaced the whole-volume anchor barrier with a dependency-driven Z-slab
+  pipeline. Ready fiberlets dynamically consume the shared worker budget first;
+  remaining workers generate deduplicated anchor lookahead.
 
 # 2026-08-06: Lasagna manager durable Fiber runs
 
@@ -527,3 +1659,501 @@
 - Made legacy two-branch anti-collapse routing stable under rank partitioning by
   applying its quota per stream/sample. Three matched two-H100 runs measured a
   0.04% throughput change, within run noise.
+## 2026-08-23 — Managed whole-volume Fiberlet artifacts
+
+- Added durable `las_manager fiberlet` processing with shared tmux lifecycle,
+  configurable native thread budget, strict upstream prediction validation,
+  resumable local anchors, and portable final provenance.
+- Made combined Fiberlet Zarr metadata self-describing and independent of
+  runtime paths, with canonical processing/source fingerprints.
+- Added bounded-memory staging and minimal Atlas `fiberlets` copy-first public
+  representation support without registering a synthetic model.
+# 2026-08-23: catalogue-backed managed Fiberlet normals
+
+- Made the normal selector optional for managed Fiberlet jobs. The manager now
+  distinguishes published regular Lasagna normals from Fiber Lasagna outputs
+  through exact Atlas model channels, caches the remote manifest with the VC
+  read-through marker, and lazily reuses normal chunks.
+- Added explicit Atlas normal selectors, cache-only completion, stable remote
+  dependency provenance/resume, and one-voxel base-shape compatibility.
+- Reused VC3D's canonical open-data Lasagna cache URL, identity directory, and
+  marker schema; manifest SHA-256 is now integrity metadata only.
+- Invalid public origins, cache markers, coordinate metadata, and remote group
+  descriptors now fail explicitly instead of selecting or constructing an
+  alternate cache dependency.
+
+## 2026-08-25 - Anchor-seeded Fiberlet crop tracing
+
+- Added standalone bidirectional crop filling from combined Fiberlet datasets,
+  with deterministic anchor seeds, first-exit clipping, cycle rejection, and
+  ordinary stored edge/join costs.
+- Added replay-compatible 20/80-base-voxel anisotropic anchor coverage with
+  direction discrimination, while intentionally deferring output-fiber
+  deduplication.
+- Added combined sparse-dataset consumption without a source Fiber manifest:
+  absent tuples decode as empty and partial tuples fail.
+- Kept whole-volume production sparse as well: missing/all-zero presence input
+  chunks are not scheduled, and generated empty anchor or Fiberlet chunks are
+  not written.
+- Added line OBJ and optional six-face CT texture visualization through the
+  existing VC3D fine-to-coarse sampler.
+
+## 2026-08-25 - Structural Fiberlet normal compatibility
+
+- Replaced the crop tracer's exact Lasagna manifest byte-hash requirement with
+  base-frame, shape, scale, and normal-channel compatibility validation.
+- Reused the established Lasagna one-chunk padding rule and retained manifest
+  hashes only as provenance.
+
+## 2026-08-25 - Fiberlet crop principal-direction visualization
+
+- Added deterministic non-orthogonal two-direction fitting over accepted
+  traces' local axial steps and 75% arc-length dominant/mixed classification.
+- Preserved the complete line OBJ while adding direction-1, direction-2, and
+  mixed line subsets plus matching actual seed-anchor point OBJs.
+
+## 2026-08-25 — Transient staged replay filtering
+
+- Made staged Fiberlet reduction options available to cache-backed replay.
+- Added globally anchored complete-box planning with backward endpoint-reach
+  expansion across stages and storage-layout-independent source coverage.
+- Kept filtered overlays invocation-local while preserving canonical source
+  caches and the original replay-corridor traversal predicate.
+
+## 2026-08-23 — Explicit shared inference Z-band lifecycle
+
+- Replaced the cross-band multi-device event state machine with a lazy explicit
+  Z-band barrier and exact shared-slot ownership for both Fiber and Lasagna.
+- Made accumulator queue submission nonblocking and flush batches finalize and
+  release their circular generations immediately after full acknowledgement.
+- Replaced the flush timeout/process-limit guess with stage-aware quiescence
+  diagnostics, while retaining bounded per-process Zarr and native/Blosc
+  thread limits.
+- Restored atomic read submission for ordinary local inputs after live-fetch
+  integration had routed even its disabled path through the new staged state.
+  Live materialization now remains a bounded upstream ledger feeding the same
+  queue-based inference stages, with checked per-worker task and slot ownership.
+- Fixed a proven canonical-frontier capacity inversion: one input/result pair
+  is now reserved for the first non-skipped accumulation-frontier tile, so
+  later out-of-order GPU results cannot occupy every result slot and deadlock
+  canonical accumulation. Queue delivery remains fire-and-forget.
+
+## 2026-08-26 - H/V-only fiber-piece labeling diagnostic
+
+- Added an opt-in reduced HiGHS model that solves active/broken and H/V labels
+  without parity variables, constraints, or winding costs.
+- Preserved the existing CSV and five OBJ interface by reporting fixed-even
+  parity, leaving the two odd visualization layers empty.
+- Added an explicit diagnostic switch to retain all finite winding-distance
+  constraints without changing the default 1.5-winding cutoff.
+- Added an exact-perpendicular mixed H/V model with binary broken decisions,
+  continuous piece orientation, true absolute-difference edge losses, and no
+  triangle surrogate.
+- Added deterministic iterative H/V consensus growth over original crop
+  fibers, with spatial/count priority, incremental broken decisions, final
+  H/V/broken OBJ layers, and scheduled growth snapshots.
+- Restricted the primary consensus seed to long crop-spanning candidates and
+  ranked equal-straightness candidates by true distance to the crop center.
+- Added final and milestone broken-fiber OBJ layers alongside consensus H/V.
+- Added opt-in deterministic mutual top-K constraint-strength pruning shared by
+  constraint visualization, HiGHS labeling, and iterative consensus, with
+  source-fiber degree and connectivity diagnostics plus minimum-link recovery
+  of the original positive-strength component partition.
+- Exposed the existing crop-direction dominance fraction to trace and stored
+  visualization commands while preserving the 0.75 default.
+- Replaced binary nearest-axis votes in crop direction grouping with calibrated
+  per-segment angular support, so off-axis and bend length gradually moves a
+  fiber into the mixed visualization group without changing the fitted axes.
+- Added `vc_fiber_trace_chunk direction-diagnostic`, which removes mixed
+  direction groups before canonical constraint extraction and discrete
+  H/V-only MILP solving, then reports component-gauge-aligned orientation and
+  broken-label errors against the initial direction assignment.
+- Added `direction-ablation`, which cumulatively admits Mixed fibers by gradual
+  direction confidence, independently rebuilds and solves coarse checkpoints,
+  and reports H/V versus mixed-defect errors for both the discrete MILP and its
+  thresholded LP relaxation under a trusted-only component gauge.
+- Added a ranked-prefix admission limit for fast, repeatable broken-cost
+  ablation sweeps.
+- Added an opt-in perpendicular-only labeling filter for constraint and
+  direction-ablation experiments, retaining existing same-trace continuity
+  evidence and reporting excluded measured links.
+- Added an opt-in no-split post-solve perpendicular consensus diagnostic with
+  confidence-weighted synchronous updates and short fixed-value OBJ layers.
+
+## 2026-08-27 - Binary BP consistency diagnostics
+
+- Added a HiGHS-free final-cohort BP-only direction-ablation path using the
+  shared perpendicular constraint selector.
+- Added per-fiber hard, unresolved, strength-weighted, soft same-label, neighbor
+  support-balance, and neighbor-certainty diagnostics with CSV output, grouped
+  quantiles, and Mixed-vs-trusted AUROC.
+
+## 2026-08-27 - Binary sum-product BP experiment
+
+- Added deterministic log-space sum-product inference over the existing merged
+  perpendicular fiber factor graph, producing normalized approximate `P(H)`
+  marginals without changing the min-sum path.
+- Added exact-tree, damping, sign, gauge-symmetry, low-temperature,
+  nonconvergence, and deterministic-loop validation plus separate OBJ and CSV
+  artifacts with inference and temperature provenance.
+
+## 2026-08-27 - Explicit Mixed-state BP experiment
+
+- Added categorical V/Mixed/H sum-product inference with measurement-scaled
+  defect costs, normalized state marginals, direct Mixed diagnostics, and
+  separate orientation-projection and Mixed-probability OBJ bands.
+- Replaced measurement-scaled defect factors with a node-local Mixed unary and
+  conditionally neutral Mixed factor rows/columns, preventing Mixed labels from
+  propagating transitively through otherwise orientation-only constraints.
+- Enabled combined parallel/perpendicular BP evidence, normalized merged
+  factors to their decisiveness gap, omitted exact neutral cancellations, and
+  generalized binary and ternary consistency diagnostics to each factor's
+  preferred same/different relation.
+
+## 2026-08-27 - Interleaved winding BP
+
+- Added soft-prior two-stage inference over interleaved A/B integer winding
+  lattices, with aligned signed constraints and bounded global phase/scale
+  calibration in raw Lasagna-integral units.
+- Added joint class/winding CSV diagnostics and consecutive per-winding OBJ
+  layers while retaining independent winding inference for other BP modes.
+
+## 2026-08-27 - Joint adaptive-grid winding BP
+
+- Added a default single-pass `joint-grid` solver over H/Mixed/V, integer
+  winding, crop-global phase/scale calibration, and component-local ladder
+  signs without an orientation pre-pass or post-fit.
+- Added an absolute sliding log-gain grid with warm message retention, settled
+  posterior support changes, explicit resource/shift guards, joint progress,
+  and calibration provenance in the existing CSV/report path.
+- Retained the previous multi-start implementation as explicit
+  `--winding-solver alternating` comparison mode with unchanged defaults.
+- Added exact tiny-factor marginal validation, shared-calibration disconnected
+  component coverage, configuration failures, and a measured 384-crop
+  comparison.
+
+## 2026-08-28 - Winding-free Defect fibers
+
+- Replaced per-winding Defect states and their four-substitution factors with
+  one winding-free Defect state whose incident winding constraints are neutral.
+- Removed pre-pass Defect constraints before continuous initialization, made
+  integer support conditional on active mass, and added explicit winding
+  validity to CSV and OBJ output.
+
+## 2026-08-28 - Quantized interleaved winding targets
+
+- Replaced raw floating-point winding observations in H/V-aware BP with signed
+  half-integer interval targets after raw cutoff admission.
+- Preserved raw and effective targets separately in factor diagnostics and
+  documented a deferred continuous Ceres formulation.
+
+## 2026-08-28 - Hard perpendicular winding order
+
+- Made zero and reversed active-active winding predictions impossible for
+  every accepted nonzero signed perpendicular observation in alternating and
+  joint-grid BP.
+- Added exact negative-infinity-safe cavity accumulation and damping, applied
+  the rule to alternating calibration, and added a deterministic final Defect
+  projection for infeasible independently decoded node marginals.
+
+## 2026-08-28 - Separate prepass and winding Defect controls
+
+- Split the orientation-prepass Mixed unary from the winding-stage Defect
+  unary and exposed both costs with unambiguous diagnostics.
+- Added fixed-prepass H/V/Defect OBJ layers alongside the existing final
+  winding classification.
+
+## 2026-08-28 - BP constraint-class cohort diagnostics
+
+- Added central/non-central admitted winding evidence tables split into
+  continuity, perpendicular-value, perpendicular-sign, parallel-same, and
+  parallel-other terms.
+- Reported endpoint incidence and finite coefficient density by final state,
+  with hard signed-order incidence kept separate from the finite
+  perpendicular-value coefficient, before each reference benchmark.
+
+## 2026-08-28 - Split-piece Defect boundary cost
+
+- Added `--piece-break-cost` to both Defect-capable winding BP solvers to
+  penalize active/Defect transitions between consecutive pieces of one trace.
+- Kept the default at zero and recorded the selected value in console and CSV
+  diagnostics. A 512-voxel-piece sweep showed that strong costs reduce local
+  breaks but can disable complete runs, so no nonzero default was selected.
+
+## 2026-08-31 - Signed median parallel winding constraints
+
+- Reused every tangent-valid paired sample from the parallel-direction walk in
+  one batched winding read and replaced closest-point parallel separation with
+  the aligned signed median.
+- Separated parallel integer-ladder targets from closest-point perpendicular
+  half-ladder targets throughout BP, diagnostics, OBJ grouping, and legacy
+  labeling consumers.
+
+## 2026-08-31 - Normal-alignment progress
+
+- Added bounded phase progress for crop normal sampling, factor/component
+  preparation, normal-sign message passing, and finalization.
+- Added serialized binary-BP iteration callbacks with residuals, safe OpenMP
+  exception propagation, and CLI phase-local/message-limit ETAs.
+
+## 2026-08-31 - Estimate-first reference winding calibration
+
+- Replaced tolerance-based per-constraint gauge calibration with one exact
+  half-step vote per raw `(reference, gauge)` winding estimate.
+- Reused the dominant-factor scorer before and after calibration, separated
+  global sign selection from arbitrary gauge-origin magnitude, and kept the
+  `0.5` tolerance reporting-only.
+
+## 2026-08-31 - Direct winding-factor weight search
+
+- Added independent multipliers for the five canonical perpendicular/parallel
+  winding classes and kept solver/reference diagnostic coefficients identical.
+- Added one-command exhaustive reference grid search with reused preprocessing,
+  fixed-denominator ranking, ETA, failed-scenario isolation, and selected-result
+  artifact output.
+- Added cached `/2`, `*2` coordinate search from an explicit tuple, with strict
+  quality-only moves, bounded exact exponent keys, per-neighborhood progress,
+  and final selected-result artifact output.
+- Promoted the locally selected `8,1,2,2,1` tuple to the shared and CLI default
+  for H/V-aware winding solves; explicit all-ones retains neutral weighting.
+
+## 2026-08-31 - Parallel correspondence grid
+
+- Replaced closest-distance phase refinement with an incremental 2D arc-offset
+  grid that balances target step length against connector perpendicularity.
+- Expanded the optional grid's independent correction range from 5% to 25% of
+  the target step while retaining 5% grid resolution.
+- Kept the expanded grid behind `--parallel-correspondence perpendicular-grid`
+  and restored the established closest-distance walk as the default.
+- Added experimental grid range/objective controls and correspondence geometry
+  columns to winding-factor CSV diagnostics. A fixed 1024-crop reference sweep
+  found no grid setting above the distance baseline: independent grid steps
+  improve perpendicularity but perturb signed winding estimates across hard
+  integer-bin boundaries.
+
+## 2026-09-01 - Winding sign and zero-weight controls
+
+- Allowed individual canonical winding magnitude classes to be disabled with
+  zero weights while keeping zero/no-sign observations out of winding
+  connectivity and Defect incidence.
+- Added independent dominant perpendicular and parallel hard-sign controls,
+  including sign-only inference, with matching solver and reference benchmark
+  semantics.
+- On the fixed 1024 crop, the existing perpendicular-sign configuration
+  (`8,1,2,2,1`, Defect cost 50, piece-break cost 0, BP temperature 2.5)
+  remained the best converged result and reproduced exactly on a second run.
+
+## 2026-09-01 - Confidence-weighted winding evidence
+
+- Added linear and cosine post-decision confidence, linear-angle and raw-dot
+  normal confidence, and deterministic median parallel-normal alignment.
+- Added optional finite sign-infringement penalties with matching solver,
+  connectivity, Defect-incidence, diagnostics, and reference semantics while
+  preserving legacy defaults.
+- The fixed 1024-crop sweep found confidence attenuation harmful, but a finite
+  cost of 44 for both sign classes with Defect cost 100 and temperature 1.25
+  retained 8/8 exact reference windings and increased matched constraints from
+  1,784 to 1,875. These parameters are now the standard defaults; the former
+  hard-sign behavior remains available with `--winding-sign-cost hard`.
+
+## 2026-09-01 - Hard-sign falloff retuning
+
+- Retuned the none, linear, and cosine normal-confidence families independently
+  on the 1024 crop with hard continuation and both hard signs fixed at 30
+  degrees; disabled and alternative hard-sign thresholds were excluded.
+- All selected families reached 8/8 exact reference windings and reproduced
+  deterministic quality counts. Linear confidence with decision cosine and
+  weights `0,2,2,2,1` maximized correct reference constraints at 1369/2100;
+  cosine confidence with decision legacy and weights `0,0.5,2,2,1` retained
+  more active pieces and had lower aggregate infringement.
+- Promoted the reference-objective winner to the shared and CLI defaults.
+  Deferred 2048 larger-context validation.
+
+## 2026-09-01 - Independent winding-value and sign-hardness weights
+
+- Kept the ordinary winding residual signed while separating the additional
+  perpendicular and parallel finite/hard sign penalties into two independently
+  tunable weights.
+- Split agreement, evidence, and reference benchmark reporting into winding
+  value and sign-hardness items with weight-independent structural denominators.
+- Extended exhaustive and local reference tuning from five winding coordinates
+  to five winding plus two sign coordinates.
+
+## 2026-09-01 - Complete reference-fiber diagnostics
+
+- Stopped clipping tagged VC3D reference annotations to the traced crop before
+  visualization, reference constraint extraction, and BP benchmarking.
+- Reference diagnostics now retain one complete dense line per selected JSON
+  fiber in deterministic filename order.
+
+## 2026-09-01 - Fixed-reference conditioned winding solve
+
+- Added exact, non-disableable joint-grid states with fixed H/V, integer
+  winding, and phase-direction sign, including independent gauge anchoring and
+  protected hard-factor projection.
+- Added a second diagnostic solve containing the annotated reference pieces and
+  production reference/BP cross factors while preserving the ordinary graph.
+- Added direct-versus-propagated ordinary state changes and before/after
+  cross-factor agreement tables. On the 1024 crop, winding-magnitude conflicts
+  dominated the response; H/V and signed-order conflicts were comparatively
+  small.
+
+## 2026-09-02 - Fractional Ceres winding experiment
+
+- Added an opt-in continuous Ceres backend for joint horizontalness, activity,
+  and real winding using the exact prepared BP targets and coefficients.
+- Added per-reference fixed-source least-squares diagnostics, fractional
+  artifact publication, progress/cost reporting, and synthetic regression
+  coverage while retaining joint-grid as the default.
+
+## 2026-09-02 - Indexed reference winding visualization
+
+- Published one strict reference OBJ per filename-ordered half-step alongside
+  the aggregate reference artifact and added aggregate/selected/hidden viewer
+  modes with parity-preserving reference-mask navigation.
+- Added BP `raw_w` as the exact selected `est_w` inverse-mapped into published
+  solver winding-layer coordinates, while retaining the existing calibrated
+  `est_w` and Ceres output.
+
+## 2026-09-02 - Reference factor conflict diagnostics
+
+- Split fixed-reference conflict reporting into five winding-magnitude and two
+  sign-factor classes, using the exact materialized solver targets and weights.
+- Added the same seven-class summary for constraints between fixed reference
+  fibers, excluding continuity and same-source links.
+- Hid verbose per-reference piece-pair rows behind
+  `--reference-constraint-details` and made valid opposite-ladder output-layer
+  estimates report `NA` instead of aborting the benchmark.
+
+## 2026-09-02 - Sign-only ordered winding cuts
+
+- Added an opt-in `ordered-cuts` backend after fixed H/V/Mixed inference. It
+  uses the shared dominant signed evidence to fit continuous whole-winding
+  offsets, preserves hard-continuation runs while inserting discrete cuts, and
+  accepts only cuts that strictly reduce exact sign infringements.
+- Added zero-cut and per-split independently calibrated reference results plus
+  a fixed-crop continuous reference ordering fit. The first 1024 experiment
+  reached 86.96% pairwise continuous-order agreement and peaked at 16/26 exact
+  discrete reference windings, showing that a cut-count stopping prior remains
+  necessary.
+
+## 2026-09-02 - Iterative ordered-winding offender removal
+
+- Added an opt-in whole-source-fiber pruning diagnostic based on exact
+  continuous sign-violation percentages, with a complete refit and comparable
+  before/after violation counts after every removal.
+- On the 1024 crop at piece length 384, it removed 122/499 traces and reached
+  zero continuous violations, but reduced reference-oracle agreement from
+  19/26 to 16/26 exact windings, so it remains diagnostic rather than a
+  production filter.
+
+## 2026-09-02 - Fixed-reference offender pruning diagnostic
+
+- Added an opt-in fixed-reference experiment that removes ordinary pieces
+  decoded as Defect, re-solves the exact retained ordinary subgraph from scratch,
+  and publishes final active, conditioned-broken, and final-disabled pieces as
+  separate per-winding OBJ layers.
+- Added diagnostic winding hypotheses for projected Defects, independent gauge
+  alignment after graph splitting, and Napari controls for the two Defect
+  cohorts.
+- Added a second, explicitly labeled reference benchmark for the fresh pruned
+  inference. It reuses retained cross constraints and shares its phase-aware
+  aligned winding frame with the `_pruned` OBJ layers.
+- Added supervised oracle inlier diagnostics. The 1024 reference crop retained
+  997/1360 pieces and reached 24 exact, 0 wrong, and 2 missing references over
+  the full 26-reference set in the direct conditioned result.
+
+## 2026-09-03 - Reference-winding population retention
+
+- Added a calibrated per-winding final-piece benchmark and a unique-constraint
+  pruning benchmark for the annotated reference interval. Both report a
+  problematic fraction and problematic-to-retained percentage without
+  source-fiber or multi-term constraint double counting.
+
+## 2026-09-03 - Fiber pruning benchmark guide
+
+- Added a standalone reproducibility guide for the PHercParis4 1024-crop
+  pruning benchmark, covering source prediction, sparse Fiberlet generation,
+  crop/lookahead coordinates, tracing, oracle evaluation, metric definitions,
+  expected results, and validation.
+
+## 2026-09-03 - Reference endpoint replay benchmark
+
+- Added bidirectional replay of every tagged reference-fiber run inside a
+  requested crop, stopping at the first shared anisotropic-threshold failure.
+- Added versioned JSON metrics for mean traced distance, direction completion,
+  and length-weighted success with explicit physical voxel size.
+- Added reproducible per-run Markdown records and a separate combined benchmark
+  result index for endpoint replay and 1024-crop oracle pruning.
+
+## 2026-09-03 - Whole-run endpoint replay evaluation
+
+- Changed the endpoint benchmark to resume with the ordinary deterministic
+  replay reset after every failure and evaluate the full directional reference
+  run.
+- Added version-2 JSON accounting for every failure, seeded interval coverage,
+  failure density, and failure-free span lengths. Superseded interim benchmark
+  records were removed once the final reliability metric was recorded.
+
+## 2026-09-03 - Endpoint replay reliability metric
+
+- Made total evaluated directed length per failure, plus its percentage of
+  tested length, the endpoint benchmark's only CLI headline metrics.
+- Defined zero failures as the complete tested length and 100 percent while
+  retaining detailed failure and coverage diagnostics in version-2 JSON.
+
+## 2026-09-03 - Direct tracer reference replay
+
+- Added direct greedy and reference-tangent Lasagna normal-transport controls
+  to the whole-run reference replay benchmark without enabling them for crop
+  pruning.
+- Shared forward matching, anisotropic failure evaluation, deterministic reset
+  accounting, and distance-per-failure aggregation across direct backends;
+  version-3 JSON records tracer-specific initialization, spacing, settings, and
+  inputs.
+
+## 2026-09-03 - Fiber benchmark progress plots
+
+- Added reproducible percentage-versus-algorithm-date step plots for reference
+  replay reliability and the negated 1024-crop problematic/retained constraint
+  ratio.
+- Kept raw counts and separate algorithm/measurement provenance in an
+  extensible data file, and marked unexecuted direct crop policies as assumed
+  floor markers without fabricated measurements.
+
+## 2026-09-03 - Transient staged crop filtering
+
+- Added repeatable box-driven Fiberlet reduction stages to crop tracing, with
+  recursive dependency closure, progress, and trace-artifact provenance.
+- Reused the shared staged reduction implementation for analysis and tracing,
+  and promoted transient rewrites to a lossless float32 overlay so repeated
+  stages cannot requantize compact source geometry.
+- Ran the 256-aligned, 256-half-offset, and 512-half-offset schedule over the
+  PHercParis4 1024 crop and produced a 2,000-trace output.
+
+## 2026-09-03 - Optional crop no-overtracing
+
+- Added deterministic covered-anchor stopping for crop Fiberlet traces. The
+  opt-in mode leaves beam search unchanged, truncates geometry and cost only at
+  canonical integration, and distinguishes prior accepted coverage from failed
+  seed attempts.
+- Added an absolute inclusive cost-density selector for stored crop traces and
+  online crop acceptance, alongside the existing rank-fraction selector.
+
+## 2026-09-03 - Baseline threshold benchmark
+
+- Tuned absolute stored-trace quality filtering on the ordinary 1024 crop and
+  selected density `0.25`, improving pre-pruning reference accuracy from 80%
+  to 88% while retaining 451 traces.
+- Added a raw-count-derived pre-pruning exact-reference progress plot alongside
+  the existing replay and crop-constraint plots.
+
+## 2026-09-03 - Optional ambiguity-stopping crop tracing
+
+- Added opt-in pre-commit stopping when a geometrically distinct exact-horizon
+  route is within a configured relative cost-density margin of the selected
+  Fiberlet route, without changing beam expansion or ranking.
+- Added anisotropic route comparison, diagnostics and artifact provenance, and
+  selected margin `0.40` with stored quality threshold `0.21` on the reference
+  crop after a joint sweep. This tuned point reached 24/24 exact estimates at
+  oracle round zero and remains disabled by default.

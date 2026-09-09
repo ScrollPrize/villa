@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -17,6 +20,16 @@ struct Vc3dFiberJson {
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<nlohmann::json> segmentMetadata;
+};
+
+struct TaggedVc3dFiberJson {
+    std::filesystem::path path;
+    Vc3dFiberJson fiber;
+};
+
+struct TaggedVc3dFiberJsonSelection {
+    std::size_t scannedJsonFiles = 0;
+    std::vector<TaggedVc3dFiberJson> fibers;
 };
 
 namespace detail
@@ -251,6 +264,66 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
     }
     return fiber;
+}
+
+inline TaggedVc3dFiberJsonSelection loadTaggedVc3dFiberJsonDirectory(
+    const std::filesystem::path& directory,
+    const std::string& tag)
+{
+    if (tag.empty())
+        throw std::runtime_error("VC3D fiber tag must not be empty");
+    if (!std::filesystem::is_directory(directory)) {
+        throw std::runtime_error(
+            "VC3D fiber directory does not exist or is not a directory: " +
+            directory.string());
+    }
+
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json")
+            paths.push_back(entry.path());
+    }
+    std::sort(paths.begin(), paths.end());
+
+    TaggedVc3dFiberJsonSelection selection;
+    selection.scannedJsonFiles = paths.size();
+    for (const auto& path : paths) {
+        nlohmann::json root;
+        try {
+            std::ifstream input(path);
+            if (!input)
+                throw std::runtime_error("failed to open file");
+            input >> root;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                path.string() + " is not valid JSON: " + error.what());
+        }
+
+        if (!root.is_object() || !root.contains("tags"))
+            continue;
+        const auto& tags = root.at("tags");
+        if (!tags.is_array() || std::any_of(
+                tags.begin(), tags.end(),
+                [](const nlohmann::json& value) { return !value.is_string(); })) {
+            throw std::runtime_error(
+                path.string() + " tags must be an array of strings");
+        }
+        const bool selected = std::any_of(
+            tags.begin(), tags.end(), [&](const nlohmann::json& value) {
+                return value.get_ref<const std::string&>() == tag;
+            });
+        if (!selected)
+            continue;
+
+        auto fiber = parseVc3dFiberJson(root, path.string());
+        if (fiber.linePoints.size() < 2) {
+            throw std::runtime_error(
+                path.string() +
+                " has fewer than two dense line points for visualization");
+        }
+        selection.fibers.push_back({path, std::move(fiber)});
+    }
+    return selection;
 }
 
 inline nlohmann::json makeLasagnaSegmentMetadataJson(
