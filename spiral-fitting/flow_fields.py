@@ -83,6 +83,21 @@ def sample_field_bspline(field, normalised_zyx):
     return (fetched * weight.unsqueeze(-1)).sum(0).view(*orig_shape[:-1], 3)
 
 
+def _bspline_w4(f):
+    # Uniform cubic B-spline weights over taps lo-1 .. lo+2 for fractional
+    # offsets f, stacked on a new leading axis :: 4, *f.shape. Same basis as
+    # sample_field_bspline's w0..w3 (which keeps them unstacked to feed the
+    # two-fetch collapse).
+    f2 = f * f
+    f3 = f2 * f
+    return torch.stack([
+        (1. - f) ** 3 / 6.,
+        (3. * f3 - 6. * f2 + 4.) / 6.,
+        (-3. * f3 + 3. * f2 + 3. * f + 1.) / 6.,
+        f3 / 6.,
+    ])
+
+
 _CORNER_BITS_CACHE = {}
 
 
@@ -512,6 +527,21 @@ class CartesianFlowField(nn.Module):
             hr_param.grad.add_(hr_grad)
 
 
+def _sampler_rk4_integrator(sampler):
+    # Sampler-based RK4 integrate(y_flat, h, n_steps) loop for fields without
+    # a fused integration kernel; one autograd graph per sampler call.
+    def integrate(y_flat, h, n_steps):
+        y = y_flat
+        for _ in range(n_steps):
+            k1 = sampler(y)
+            k2 = sampler(y + (h / 2) * k1)
+            k3 = sampler(y + (h / 2) * k2)
+            k4 = sampler(y + h * k3)
+            y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        return y
+    return integrate
+
+
 class _DirectSampledFlowField(nn.Module):
 
     # Base for flow fields whose parameter lattices are sampled directly at
@@ -559,6 +589,43 @@ class _DirectSampledFlowField(nn.Module):
                 outputs,
                 [leaf.grad for _, leaf in pending if leaf.grad is not None],
             )
+
+
+def _cylindrical_query_coords(normalised_zyx, nz, nr):
+    # Shared query-coordinate mapping for the cylindrical lattice samplers
+    # (trilinear and b-spline). normalised_zyx :: *, 3 in [0, 1] (cartesian
+    # box-relative). Returns flat (n,) tensors: continuous z and r lattice
+    # indices (align_corners=True style, z clamped to the lattice and r to the
+    # inscribed disk) plus the query angle, both wrapped to [0, 2pi) for
+    # lattice indexing and raw in (-pi, pi] for the local-basis rotation.
+    pts = normalised_zyx.reshape(-1, 3) * 2. - 1.  # n, 3 in [-1, 1] cartesian
+    z_n, y_n, x_n = pts[:, 0], pts[:, 1], pts[:, 2]
+    # The cylindrical basis is singular exactly on the axis: sqrt(0) and atan2(0, 0)
+    # have finite forward values but undefined gradients. Use a fixed +x basis there.
+    axis_eps = torch.finfo(pts.dtype).eps
+    on_axis = (y_n.abs() <= axis_eps) & (x_n.abs() <= axis_eps)
+    safe_y_n = torch.where(on_axis, torch.zeros_like(y_n), y_n)
+    safe_x_n = torch.where(on_axis, torch.ones_like(x_n), x_n)
+    rr = torch.sqrt(safe_y_n ** 2 + safe_x_n ** 2).clamp(max=1.)  # inscribed-disk clamp
+    rr = torch.where(on_axis, torch.zeros_like(rr), rr)
+    phi = torch.atan2(safe_y_n, safe_x_n)  # in (-pi, pi]
+
+    z_cont = ((z_n + 1.) * 0.5 * (nz - 1)).clamp(0., float(nz - 1))
+    r_cont = rr * (nr - 1)
+    phi_in_2pi = phi % (2. * np.pi)  # in [0, 2pi)
+    return z_cont, r_cont, phi_in_2pi, phi
+
+
+def _cylindrical_local_to_cartesian(sampled, phi, orig_shape):
+    # sampled :: 3, n in the local (z, radial, tangential) basis at query
+    # angle phi :: n. phi = atan2(y, x), so outward-radial in (y, x) is
+    # (sin(phi), cos(phi)) and tangential (d/dphi unit) is (cos(phi),
+    # -sin(phi)). Rotate local (r, phi) components into (y, x).
+    z_c, r_c, p_c = sampled[0], sampled[1], sampled[2]
+    sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
+    y_c = r_c * sin_phi + p_c * cos_phi
+    x_c = r_c * cos_phi - p_c * sin_phi
+    return torch.stack([z_c, y_c, x_c], dim=-1).view(*orig_shape)
 
 
 class CylindricalFlowField(_DirectSampledFlowField):
@@ -633,22 +700,8 @@ class CylindricalFlowField(_DirectSampledFlowField):
         nz = field.shape[1]
         nr = ring_num_phi.shape[0]
         orig_shape = normalised_zyx.shape
-        pts = normalised_zyx.reshape(-1, 3) * 2. - 1.  # n, 3 in [-1, 1] cartesian
-        z_n, y_n, x_n = pts[:, 0], pts[:, 1], pts[:, 2]
-        # The cylindrical basis is singular exactly on the axis: sqrt(0) and atan2(0, 0)
-        # have finite forward values but undefined gradients. Use a fixed +x basis there.
-        axis_eps = torch.finfo(pts.dtype).eps
-        on_axis = (y_n.abs() <= axis_eps) & (x_n.abs() <= axis_eps)
-        safe_y_n = torch.where(on_axis, torch.zeros_like(y_n), y_n)
-        safe_x_n = torch.where(on_axis, torch.ones_like(x_n), x_n)
-        rr = torch.sqrt(safe_y_n ** 2 + safe_x_n ** 2).clamp(max=1.)  # inscribed-disk clamp
-        rr = torch.where(on_axis, torch.zeros_like(rr), rr)
-        phi = torch.atan2(safe_y_n, safe_x_n)  # in (-pi, pi]
-
-        # Map to continuous lattice indices, align_corners=True style.
-        z_cont = ((z_n + 1.) * 0.5 * (nz - 1)).clamp(0., float(nz - 1))
-        r_cont = rr * (nr - 1)
-        phi_in_2pi = phi % (2. * np.pi)  # in [0, 2pi)
+        z_cont, r_cont, phi_in_2pi, phi = _cylindrical_query_coords(
+            normalised_zyx, nz, nr)
 
         z_lo = torch.floor(z_cont).clamp(max=nz - 2).long()
         z_hi = z_lo + 1
@@ -680,14 +733,7 @@ class CylindricalFlowField(_DirectSampledFlowField):
         v_rlo = sample_at_ring(r_lo)
         v_rhi = sample_at_ring(r_hi)
         sampled = v_rlo + (v_rhi - v_rlo) * frac_r  # 3, n in (z, r, phi) local components
-
-        z_c, r_c, p_c = sampled[0], sampled[1], sampled[2]
-        # phi = atan2(y, x), so outward-radial in (y, x) is (sin(phi), cos(phi)) and tangential
-        # (d/dphi unit) is (cos(phi), -sin(phi)). Rotate local (r, phi) components into (y, x).
-        sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
-        y_c = r_c * sin_phi + p_c * cos_phi
-        x_c = r_c * cos_phi - p_c * sin_phi
-        return torch.stack([z_c, y_c, x_c], dim=-1).view(*orig_shape)
+        return _cylindrical_local_to_cartesian(sampled, phi, orig_shape)
 
     def get_sampler(self, t):
         # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t,
@@ -858,19 +904,7 @@ class BSplineFlowField(_DirectSampledFlowField):
             # CPU / no-triton fallback: the sampler-based loop, one autograd
             # graph per sampler call (same path the diffeomorphism used
             # before this integrator existed).
-            sampler = self.get_sampler(0.0)
-
-            def integrate(y_flat, h, n_steps):
-                y = y_flat
-                for _ in range(n_steps):
-                    k1 = sampler(y)
-                    k2 = sampler(y + (h / 2) * k1)
-                    k3 = sampler(y + (h / 2) * k2)
-                    k4 = sampler(y + h * k3)
-                    y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-                return y
-
-            return integrate
+            return _sampler_rk4_integrator(self.get_sampler(0.0))
 
         training_field = torch.is_grad_enabled() and (
             lr_flow.requires_grad or hr_flow.requires_grad)
@@ -939,3 +973,60 @@ class BSplineFlowField(_DirectSampledFlowField):
                 + sample_field_bspline(hr_field, normalised_zyx)
             )
         return sample
+
+
+class BSplineCylindricalFlowField(CylindricalFlowField):
+
+    # CylindricalFlowField's lattice (same packed ragged parameter layout,
+    # per-ring phi counts, local (z, radial, tangential) basis and pinned r=0
+    # ring) sampled with tricubic uniform B-spline weights instead of
+    # trilinear: cubic along z and r with border-replicated taps, periodic
+    # cubic along phi within each ring. Each of the four r-stencil rings is
+    # evaluated with its own phi parameterisation, so the interpolant is a C2
+    # blend of per-ring bicubic splines rather than one tensor-product
+    # spline; every axis' weights still sum to 1, so constants are reproduced
+    # exactly away from the axis. Because the cubic stencil spans rings
+    # r-1 .. r+2 and below-axis taps clamp to the pinned zero ring, the axis
+    # pin suppresses the field over roughly two rings rather than one.
+    # Eager-only: there is no fused Triton path for this interpolant, so
+    # get_time_invariant_integrator is overridden to the sampler-based RK4
+    # loop (the inherited integrator would run the trilinear kernel).
+
+    @staticmethod
+    def _sample_lattice(field, ring_num_phi, ring_offsets, normalised_zyx):
+        # Same contract as CylindricalFlowField._sample_lattice.
+        nz = field.shape[1]
+        nr = ring_num_phi.shape[0]
+        orig_shape = normalised_zyx.shape
+        z_cont, r_cont, phi_in_2pi, phi = _cylindrical_query_coords(
+            normalised_zyx, nz, nr)
+        tap_offsets = torch.arange(-1, 3, device=field.device)  # 4
+
+        z_lo = z_cont.floor()
+        wz = _bspline_w4(z_cont - z_lo)  # 4z, n
+        z_taps = (z_lo.long()[None] + tap_offsets[:, None]).clamp(0, nz - 1)  # 4z, n
+
+        r_lo = r_cont.floor()
+        wr = _bspline_w4(r_cont - r_lo)  # 4r, n
+        r_taps = (r_lo.long()[None] + tap_offsets[:, None]).clamp(0, nr - 1)  # 4r, n
+
+        # Each r-stencil ring has its own phi resolution, hence its own
+        # continuous phi index, fraction and (cyclic) tap indices.
+        num_phi_r = ring_num_phi[r_taps]  # 4r, n
+        offsets_r = ring_offsets[r_taps]  # 4r, n
+        phi_cont = phi_in_2pi[None] * (num_phi_r.to(phi_in_2pi.dtype) / (2. * np.pi))
+        phi_lo = phi_cont.floor()
+        wp = _bspline_w4(phi_cont - phi_lo)  # 4p, 4r, n
+        phi_taps = (phi_lo.long()[None] + tap_offsets[:, None, None]) % num_phi_r[None]
+        flat_taps = offsets_r[None] + phi_taps  # 4p, 4r, n
+
+        values = field[:, z_taps[:, None, None, :], flat_taps[None]]  # 3, 4z, 4p, 4r, n
+        weights = wz[:, None, None, :] * wp[None] * wr[None, None]  # 4z, 4p, 4r, n
+        sampled = (values * weights[None]).sum(dim=(1, 2, 3))  # 3, n local components
+        return _cylindrical_local_to_cartesian(sampled, phi, orig_shape)
+
+    def get_time_invariant_integrator(self):
+        # The inherited fused Triton RK4 kernel evaluates the trilinear
+        # interpolant; the cubic lattice has no fused path.
+        assert self.num_flow_timesteps == 1
+        return _sampler_rk4_integrator(self.get_sampler(0.0))

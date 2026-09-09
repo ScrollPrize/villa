@@ -11,7 +11,7 @@ DEFAULT_GAP_EXPANDER_CAPACITY = 144
 
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
-    "model_flow_field_type": ["cartesian", "cylindrical", "bspline"],
+    "model_flow_field_type": ["cartesian", "cylindrical", "bspline", "bspline_cylindrical"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
