@@ -85,6 +85,11 @@ public:
     std::vector<PreparedPointCollections> preparePointCollections(QStringList& warnings);
     void finalizationSucceeded(const QString& id);
     void finalizationFailed(const QString& id);
+    // The dataset now holds these finalized inputs. Their local drafts are
+    // superseded by the refreshed source snapshot, so they are dropped; in
+    // particular a replaced or deleted collection stops being suppressed in
+    // the display overlay, which otherwise hid it for the rest of the session.
+    void commitSucceeded(const QStringList& ids);
     void discardUnfinalized();
 
 signals:

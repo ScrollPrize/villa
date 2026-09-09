@@ -116,7 +116,18 @@ void PointsOverlayController::applyOverlayPrimitives(
         // fall back to the general materialization, which renders them
         // exactly as before. Only the label-free case -- the display-only
         // point clouds that made this overlay slow -- takes the fast path.
-        clearOverlay(viewer);
+        // Keep the hit index collectPrimitives just built for this viewer:
+        // the labelled relative-winding PCLs are hit-tested and selected
+        // through it, and dropping it here made them unclickable. Only the
+        // retained batch items go.
+        if (_persistentItems && viewer) {
+            const auto found = _persistentItems->viewers.find(viewer);
+            if (found != _persistentItems->viewers.end()) {
+                found->second.lines.clear();
+                found->second.points.clear();
+            }
+        }
+        ViewerOverlayControllerBase::clearOverlay(viewer);
         ViewerOverlayControllerBase::applyOverlayPrimitives(viewer, std::move(primitives));
         return;
     }
@@ -223,8 +234,10 @@ PointsOverlayController::displayPointHitAt(
         || !_persistentItems) return std::nullopt;
     const auto found = _persistentItems->viewers.find(viewer);
     if (found == _persistentItems->viewers.end()) return std::nullopt;
+    // The hit index is rebuilt by every collectPrimitives pass and erased
+    // with clearOverlay, so it is current whether the points were drawn by
+    // the retained batch items or by the label-capable fallback path.
     const auto& items = found->second;
-    if (!items.points) return std::nullopt;
     const auto hit = items.hitIndex.closest(
         devicePosition, radius, [&items, &allowedCollectionIds](std::size_t index) {
             return index < items.hitRecords.size()

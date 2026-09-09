@@ -595,6 +595,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _replacementPointCollectionRoles.remove(id);
                     _visibleUncommittedPointCollectionIds.remove(id);
                 }
+                _brush->commitSucceeded(committed);
                 _brush->setVisiblePointCollectionIds(
                     _visibleUncommittedPointCollectionIds);
                 if (_pendingExitAction && !hasPendingBrushWork()) {

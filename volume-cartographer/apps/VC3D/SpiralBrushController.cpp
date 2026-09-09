@@ -2221,6 +2221,34 @@ void SpiralBrushController::finalizationSucceeded(const QString& id)
     emit paintStateChanged();
 }
 
+void SpiralBrushController::commitSucceeded(const QStringList& ids)
+{
+    if (ids.isEmpty()) return;
+    const QSet<QString> committed(ids.begin(), ids.end());
+    bool removed = false;
+    for (auto line = _polylines.begin(); line != _polylines.end();) {
+        if (line->state != GestureState::Finalized || !committed.contains(line->id)) {
+            ++line;
+            continue;
+        }
+        const int index = static_cast<int>(std::distance(_polylines.begin(), line));
+        if (_activePolyline == index)
+            _activePolyline = -1;
+        else if (_activePolyline > index)
+            --_activePolyline;
+        line = _polylines.erase(line);
+        removed = true;
+    }
+    if (!removed) return;
+    clearEditablePclHover();
+    updateSuppressedPclIds();
+    invalidateEditablePclHitIndex();
+    clearPointChainProjectionCache();
+    updateCursorWidget();
+    refreshAll();
+    emit paintStateChanged();
+}
+
 void SpiralBrushController::finalizationFailed(const QString& id)
 {
     for (auto& gesture : _gestures) {
