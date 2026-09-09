@@ -4,7 +4,8 @@ import json
 import pytest
 
 from config import (
-    Config, FitConfig, MODEL_STAGE_KEYS, NEW_FIT_KEYS, rebuild_stage,
+    Config, FitConfig, MODEL_STAGE_KEYS, NEW_FIT_KEYS, SHELL_ATLAS_KEYS,
+    rebuild_stage,
     unaudited_prefixed_keys)
 from fit_session import run_mutable_config
 
@@ -156,6 +157,14 @@ def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage(["model_flow_bounds_z_margin"]) == "all"
     # Unaudited/unknown keys fail safe rather than raising.
     assert rebuild_stage(["not_a_setting"]) == "all"
+    # The shell atlas settings are run-boundary knobs until the resident
+    # session has filtered its tracks against the shell; then apply_config
+    # refuses them and only a full rebuild can apply them.
+    for key in SHELL_ATLAS_KEYS:
+        assert rebuild_stage([key]) == "model"
+        assert rebuild_stage([key], shell_filtered_tracks=True) == "all"
+    assert rebuild_stage(["loss_weight_shell_outer"],
+                         shell_filtered_tracks=True) == "model"
 
 
 def test_the_allowlist_is_a_subset_of_the_new_fit_settings():

@@ -46,7 +46,7 @@ from ddp_helpers import (
     process_context,
 )
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
-                    Config, FitConfig, durable_config)
+                    Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
 from fit_session import (EDITABLE_PCL_ROLE_VALUES, fit_input,
@@ -4712,12 +4712,7 @@ class FitContext:
                 'track_crossing_mode',
                 'track_crossing_precompute_max',
             })
-            shell_atlas_keys = {
-                'shell_num_theta_bins',
-                'shell_table_smooth_sigma_z',
-                'shell_table_smooth_sigma_theta',
-                'shell_min_confidence',
-            }
+            shell_atlas_keys = SHELL_ATLAS_KEYS
             if (changed & shell_atlas_keys
                     and getattr(self, 'shell_envelope', None) is not None):
                 raise ValueError(

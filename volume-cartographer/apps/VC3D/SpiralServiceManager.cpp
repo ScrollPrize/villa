@@ -1544,7 +1544,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
         const quint64 generation = _connectionGeneration;
         _artifactCache->fetchArtifact(
             sessionId, artifactId,
-            [this, role, slot, artifactId, artifactRef, generation](
+            [this, sessionId, role, slot, artifactId, artifactRef, generation](
                 const QString& entryPath, const QString& error, bool gone) {
                 if (generation != _connectionGeneration) return;
                 if (_fetchingPclArtifact[slot] == artifactId)

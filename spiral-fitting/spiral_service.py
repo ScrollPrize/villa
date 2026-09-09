@@ -1027,7 +1027,9 @@ class ServiceState:
         read before or outside the model. Within ``run.config`` the answer is
         ``config.rebuild_stage`` over the keys whose requested value differs
         from the live session's, which is "model" only for the audited
-        allowlist and "all" for everything else.
+        allowlist and "all" for everything else. The shell atlas keys widen
+        to "all" when the session loaded both a tracks store and an outer
+        shell, because it filtered the tracks against the shell then.
 
         Call with the lock held.
         """
@@ -1050,7 +1052,14 @@ class ServiceState:
             key for key in set(live_config) | set(new_config)
             if live_config.get(key) != new_config.get(key)
         }
-        return rebuild_stage(changed)
+        # _prepare_session_request already blanked either path when its
+        # input toggle is off, so both being named means the resident
+        # session filtered its tracks against the shell at load: the fitter
+        # refuses the shell atlas settings there, and only the full rebuild
+        # can apply them.
+        return rebuild_stage(
+            changed,
+            shell_filtered_tracks=bool(paths.tracks_dbm and paths.outer_shell))
 
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.

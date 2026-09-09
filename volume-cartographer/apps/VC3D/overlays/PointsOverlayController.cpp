@@ -14,9 +14,11 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 namespace
 {
@@ -87,11 +89,27 @@ struct PointsOverlayController::PersistentItems
     std::unordered_map<VolumeViewerBase*, ViewerItems> viewers;
 };
 
+namespace
+{
+
+// Several display-only controllers can share one viewer (the spiral
+// workspace keeps one per editable PCL role). Viewers replace and clear
+// overlay items by group key, so each instance needs its own key or one
+// controller's refresh deletes another's items.
+std::string displayOnlyOverlayGroupKey()
+{
+    static std::atomic<unsigned> counter{0};
+    return "display_only_point_collection_overlay_"
+           + std::to_string(counter.fetch_add(1));
+}
+
+} // namespace
+
 PointsOverlayController::PointsOverlayController(VCCollection* collection, QObject* parent,
                                                  bool displayOnly)
     : ViewerOverlayControllerBase(displayOnly
-                                      ? "display_only_point_collection_overlay"
-                                      : kOverlayGroupPoints,
+                                      ? displayOnlyOverlayGroupKey()
+                                      : std::string(kOverlayGroupPoints),
                                   parent)
     , _persistentItems(std::make_unique<PersistentItems>())
     , _collection(collection)

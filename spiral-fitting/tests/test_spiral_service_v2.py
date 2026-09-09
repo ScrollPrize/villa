@@ -1015,6 +1015,40 @@ class DatasetOwnershipTests(unittest.TestCase):
                                      "config": dict(_NO_DENSE_LOSSES)}}),
             "all")
 
+    def test_shell_atlas_settings_rebuild_everything_once_tracks_were_shell_filtered(self):
+        # Without a shell-filtered track pool the atlas settings are ordinary
+        # run-boundary knobs the model rebuild applies through apply_config.
+        self._attach_session_for_request()
+        self.assertEqual(
+            self._stage_for(self._base_request({"shell_num_theta_bins": 360})),
+            "model")
+        # A session that loaded both a tracks store and an outer shell
+        # filtered the tracks against the shell; apply_config refuses the
+        # atlas settings there, so the request has to rebuild the host inputs.
+        live = SpiralInputPaths.from_mapping({
+            **self.state.session_paths.manifest(),
+            "tracks_dbm": str(self.root / "tracks.dbm"),
+            "outer_shell": str(self.root / "outer_shell"),
+        })
+        self.state.session_paths = live
+        self.state.session_request["paths"] = live.manifest()
+        run = self._base_request({"shell_num_theta_bins": 360})["run"]
+        _, run_config, preview, _ = self.state._prepare_session_request(
+            {"run": run})
+        with self.state.lock:
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    live, run_config, preview, SessionState.Idle),
+                "all")
+            # Other shell loss settings still keep the loaded inputs.
+            _, other_run, _, _ = self.state._prepare_session_request(
+                {"run": self._base_request(
+                    {"shell_huber_delta": 8.0})["run"]})
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    live, other_run, preview, SessionState.Idle),
+                "model")
+
     def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
         self._attach_session_for_request()
         paths, run, preview, _ = self.state._prepare_session_request(

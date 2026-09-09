@@ -40,6 +40,20 @@ _PREPARED_INPUT_FIELDS = {
     "dense_spacing_mode",
 }
 
+# The discretised outer-shell lookup/atlas. These are ordinary run-boundary
+# settings while the resident session only rebuilds its shell polar map from
+# them, but a session whose tracks were filtered against the shell at load
+# (a tracks store and an outer shell both present) consumed them irreversibly:
+# apply_config refuses them there, and a model-only rebuild applies run
+# changes through apply_config before it releases the model, so such a
+# session needs the full rebuild (see rebuild_stage).
+SHELL_ATLAS_KEYS = frozenset({
+    "shell_num_theta_bins",
+    "shell_table_smooth_sigma_z",
+    "shell_table_smooth_sigma_theta",
+    "shell_min_confidence",
+})
+
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
@@ -279,11 +293,19 @@ def known_config_keys():
     return _known_keys_cache
 
 
-def rebuild_stage(changed_keys):
-    """Return the earliest rebuild stage required by changed settings."""
+def rebuild_stage(changed_keys, *, shell_filtered_tracks=False):
+    """Return the earliest rebuild stage required by changed settings.
+
+    ``shell_filtered_tracks`` says whether the resident session filtered its
+    tracks against the outer shell when it loaded them; the shell atlas keys
+    are then a full rebuild rather than run-boundary settings.
+    """
+    changed = set(changed_keys)
+    if shell_filtered_tracks and changed & SHELL_ATLAS_KEYS:
+        return "all"
     known = known_config_keys()
     demanding = {
-        key for key in changed_keys
+        key for key in changed
         if key not in known or _runtime_impact(key) != "run_boundary"
     }
     return "model" if MODEL_STAGE_KEYS.issuperset(demanding) else "all"
