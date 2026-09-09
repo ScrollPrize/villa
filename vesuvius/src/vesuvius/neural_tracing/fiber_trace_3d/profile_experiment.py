@@ -18,7 +18,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.analyze_training import distribution
 
 _MODULE_NAME = "vesuvius.neural_tracing.fiber_trace_3d.profile_experiment"
 _TEST_METRIC_PATTERN = re.compile(
-    r"^test step=(?P<step>\d+) "
+    r"^test (?:samples=\d+ update=|step=)(?P<step>\d+) "
     r"loss_total=(?P<loss_total>[-+0-9.eE]+) "
     r"loss_direction=(?P<loss_direction>[-+0-9.eE]+) "
     r"loss_presence=(?P<loss_presence>[-+0-9.eE]+) "

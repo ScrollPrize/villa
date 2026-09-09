@@ -1,0 +1,50 @@
+# Eight-GPU S1a NML retraining
+
+Config: `fiber_trace_3d/configs/train_s1a_nml_8gpu_fast.json`, using the measured shared sample pipeline, async CUDA preparation, and full CUDA value augmentation. Compare with existing historical runs; no new standard-loader run is configured.
+
+The config uses the exact datasets, affine transform, augmentation settings, held-out data and seed from `training_baseline_s1a_20260729.json`: 8 S1a NML files and 1 held-out JSON, Paris4 level 1, 128³ input, GroupNorm, output stride 4, BF16, eager execution, 16 samples/GPU, global batch 128. Run length is 20,000 optimizer updates (2,560,000 samples). LR warms linearly to 0.01 over 100 updates then stays constant. Clipping is disabled. This is the recorded best short fixed-LR verification, not the LR-range minimum (0.08125). Tuning predates global loss normalization, so the recommendation needs this longer verification.
+
+The fast topology uses 128 total pipeline workers, 87 load-affinity workers, 2048 shared slots (256/rank), initial in-flight 128 (16/rank), and CUDA prefetch depth 2. CPU/CUDA augmentation is tolerance-equivalent, not bitwise identical.
+
+## Launch
+
+Run from `/ephemeral/hendrik/fiber3d_train2`; absolute config paths and explicit PYTHONPATH select the current checkout. This run uses all eight GPUs. No training has been launched by the agent.
+
+```bash
+cd /ephemeral/hendrik/fiber3d_train2
+export PYTHONPATH=/home/hendrik/villa2/vesuvius/src:/home/hendrik/villa2/vesuvius:/home/hendrik/villa2
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
+
+/home/hendrik/.venv_las/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  -m vesuvius.neural_tracing.fiber_trace_3d.train \
+  /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_8gpu_fast.json
+```
+
+Timestamped outputs are under `/ephemeral/hendrik/fiber3d_train2/runs/s1a_repro1_<timestamp>` for this first reproduction test. Evaluation, scalar logging and checkpoint saving remain every 100 steps; visualization every 500; retained snapshots every 10,000. Resume by appending `--resume /absolute/path/to/checkpoint`.
+
+## Interpretation
+
+New TensorBoard scalar/image steps are cumulative global training samples.
+Console metrics show `samples=12800 update=100` after 100 updates at this
+global batch of 128. Evaluation and visualization use the same sample axis;
+evaluation samples do not count toward it. Warmup, stopping, interval settings,
+checkpoint filenames and internal profiling/diagnostic steps still use updates.
+Checkpoints save cumulative samples, preserving the axis when resuming with a
+different batch size. A legacy checkpoint without a saved sample count or
+global batch requires `training.resume_samples_seen` in the config. Existing
+TensorBoard event files retain their old update axis: convert those separately
+when plotting against new sample-axis runs; they do not become comparable
+automatically just by changing the new logger.
+
+This run uses the current trainer, including corrected global loss normalization. The July historical run used BatchNorm, output stride 1 and batch 8/GPU (global64), versus GroupNorm/stride4/global128 here. Thus historical loss is useful context, not a pure speed comparison; coarse output targets also differ. At 20,000 steps this run sees twice as many samples as the historical global64 setup. Compare held-out loss against both elapsed wall time and samples consumed, not only update number. The unchanged reference artifact records historical best held-out loss 1.017569 at update 17,700.
+
+## Validation
+
+The JSON config parses through `load_config`, instantiates a 28,523,527-parameter model, resolves all source globs, and has valid eight-rank pipeline partitions. Native `vc.volume.generate_fiber3d_coords` and `fiber3d_value_transform` import successfully. Config loading was also checked from `/ephemeral/hendrik/fiber3d_train2`. Eight relevant existing tests pass (run this test command from the repository root):
+
+```bash
+PYTHONPATH=/home/hendrik/villa2/vesuvius/src:/home/hendrik/villa2/vesuvius:/home/hendrik/villa2 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 /home/hendrik/.venv_las/bin/python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'linear_warmup or training_cuda_value_augmentation_validates_suffix or config_defaults_volume_cache or config_preserves_volume or distributed_config or mixed_precision_config_parsing_cpu'
+```
+
+Validation did not launch eight-GPU training, fetch volume chunks, or measure new throughput.

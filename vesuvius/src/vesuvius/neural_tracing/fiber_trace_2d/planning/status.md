@@ -1,13 +1,10 @@
-# Status: integrate Fiberlets development into Fiber3D training
+# Status: eight-GPU S1a retraining
 
-- [x] Capture the integration task.
-- [x] Fetch and inspect branch tips, merge base, and divergence.
-- [x] Preview textual conflicts and overlapping automatic merges.
-- [x] Write the feature-preserving merge and validation plan.
-- [x] Obtain independent plan review.
-- [x] Merge into `fiber-training` without committing.
-- [x] Resolve and document all textual conflicts.
-- [x] Audit all automatically merged overlap files.
-- [x] Run focused validation and inspect the staged merge tree.
-- [x] Obtain independent implementation/result review.
-- [x] Commit the merge and verify branch/worktree state.
+- [x] Preserve compression work and create correct branch.
+- [x] Inspect baseline and LR recommendation.
+- [x] Independent plan review.
+- [x] Create configs and guide.
+- [x] Validate and hand off.
+- [x] Change console/TensorBoard progress to cumulative global samples.
+- [x] Preserve checkpoint resume counts across batch-size changes.
+- [x] Review implementation and pass 10 focused logging/resume tests.

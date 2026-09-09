@@ -1,3 +1,16 @@
+## 2026-09-09 — Sample-based training progress
+
+- Fiber3D TensorBoard scalars/images and console metrics now use cumulative
+  global training samples, with optimizer updates kept explicit in console
+  output and unchanged for scheduling. Added checkpoint sample metadata and
+  changed-batch resume support; benchmark parsers accept both console formats.
+
+## 2026-09-09 — Eight-GPU S1a retraining configs
+
+- Added an opt-in fast-pipeline S1a NML reproduction config at
+  global batch 128 with the recorded LR 0.01 / 100-step warmup recommendation.
+  Added launch commands and historical comparison caveats.
+
 ## 2026-09-09 — Fiberlets/Fiber3D training integration
 
 - Merged the locked Fiberlets development history into the local

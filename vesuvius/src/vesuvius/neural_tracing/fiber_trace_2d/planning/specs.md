@@ -604,6 +604,18 @@
   logical batches before one backward/update; any BatchNorm statistics still
   come from each real configured forward batch, so virtual-batch emulation
   requires stateless normalization.
+- TensorBoard scalar/image steps and normal training/evaluation console progress
+  use cumulative globally processed training samples. Console output also
+  reports the optimizer update. Initial evaluation uses zero samples (or the
+  saved count on resume); validation samples do not advance training progress.
+  Warmup, max_steps, logging/evaluation/checkpoint intervals, checkpoint step and
+  filenames, diagnostic traces and profiling JSON remain in optimizer updates.
+  Training checkpoints persist samples_seen and optimizer_global_batch_size.
+  Resuming with a different batch size adds new global batches to the saved
+  sample count. Legacy checkpoints may infer it from a recorded global batch;
+  otherwise training.resume_samples_seen is required, since local batch alone
+  cannot recover the historical world size. Historical TensorBoard files are
+  not rewritten automatically.
 - `training.mixed_precision` controls trainer autocast only and must not
   introduce internal micro-batching. Supported modes are `off`, `bf16`, `fp16`,
   and `auto`. BF16 uses autocast without a scaler; FP16 uses AMP with

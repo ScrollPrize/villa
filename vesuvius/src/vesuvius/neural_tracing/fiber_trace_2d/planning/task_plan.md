@@ -1,72 +1,23 @@
-# Plan: integrate Fiberlets development into Fiber3D training
+# Plan: eight-GPU S1a retraining configuration
 
-## History and safety
+## Active follow-up: sample-count logging
 
-1. Fetch the exact remote integration ref and record both tips, their merge
-   base, divergence counts, and worktree cleanliness. Lock the reviewed
-   incoming tip to `b660837d9ef8c0d59eb7783b1dee588d6f382529`; immediately
-   before merging, require `origin/fiberlets-development-integration` to still
-   resolve to that commit or stop and repeat the preview/review.
-2. Use a merge commit on `fiber-training`. Do not rebase the 17 local training
-   commits across the 206-commit integration history: preserving both branch
-   identities and avoiding unnecessary history rewriting is preferable here.
-3. Preview the three-way merge before mutation and classify textual conflicts,
-   files changed on both sides that Git auto-merges, and one-sided additions.
-   Commit these four required integration-planning files first so the worktree
-   is clean and their exact reviewed content is preserved. Record the resulting
-   first-parent tip and updated divergence before starting the merge.
+Use a sample-axis TensorBoard writer adapter for scalar and image events so evaluation, timing and visualization share the training-sample coordinate. Keep text metadata at step zero. Console metrics show samples and explicit update count. Keep internal step, checkpoint filenames, scheduling, sampling and profiling JSON in optimizer-update units. Store samples_seen and effective global batch in checkpoints; resume uses saved count plus new updates times new global batch. Old checkpoints infer only from a recorded global batch, or require training.resume_samples_seen if historical world size is unknown. Test real TensorBoard events, checkpoint roundtrip and changed-batch resume, legacy handling and timing output. Document historical event axes remain unchanged; no automatic rewrite of old runs. Obtain independent plan and implementation review.
 
-## Merge and semantic conflict resolution
+Scope correction: only create the fast reproduction, label s1a_repro1. Compare against existing runs. The earlier matched-control proposal below is superseded; its config and commands were removed at the user's request.
 
-4. Merge exact commit `b660837d9ef8c0d59eb7783b1dee588d6f382529`
-   with `--no-commit` so the complete index/worktree can be audited before the
-   merge commit is created.
-5. Resolve documentation/specification conflicts by retaining both the
-   Fiber3D training contracts and Fiberlet/native-tracing contracts. Preserve
-   the chronological changelog entries from both sides.
-6. Replace only the transient current-task documents (`task.md`,
-   `task_plan.md`, `status.md`, and `task_log.md`) with this integration task,
-   as required by the local workflow. Prior task history remains in Git and
-   durable outcomes remain in `changelog.md` and normative docs.
-7. Review every overlapping code/test auto-merge, especially the shared tiled
-   inference scheduler and native chunk cache, against both side diffs and the
-   combined result. Make the smallest semantic fix needed if an automatic
-   merge drops or invalidates either feature set.
-8. Inspect the full staged merge delta, conflict-marker absence, unexpected
-   deletions, diff formatting, and merge-parent topology before committing.
+Use saved training_baseline_s1a_20260729.json datasets, transforms, augmentation, evaluation and seed. Create a fast config using the measured GroupNorm/output-stride-4/BF16/global-batch-128 setup, LR 0.01, 100 warmup updates and no clipping. Enable measured shared sample pipeline, async preparation and all CUDA value augmentation. Create a matched standard-loader control with the same model, data, batch and optimizer to isolate the pipeline change. Distinguish this from the historical BatchNorm/stride-1/global-batch-64 baseline. Run length 20,000 updates with evaluation/checkpoints/TensorBoard retained. Prior LR trial predates global loss normalization: recommendation, not guaranteed optimum.
 
-## Validation
+## spec update
 
-9. Run focused Python tests covering the shared tiled inference changes and
-   Fiber3D training changes. Reuse an existing configured native build directory
-   and toolchain only as configuration, incrementally rebuild the merged
-   `vc_core`, `test_chunk_cache`, `test_chunk_cache_persist`,
-   `test_chunked_plane_sampler`, and `test_chunked_plane_sampler_more` sources,
-   plus `test_volume_extras` (decode statistics/concurrency) and
-   `test_chunked_plane_sampler_fallback` (requested-level locality/worker
-   limits), and `test_fiberlet_storage` (opaque payload accounting), then
-   execute those freshly linked tests. Do not install or bootstrap dependencies.
-10. If no usable configured native build exists or a required test cannot run
-    in the available environment, record the
-   exact command and reason rather than silently skipping it.
-11. Obtain an independent review of the conflict resolutions, automatic-merge
-    audit, test evidence, and final staged tree before creating the merge
-    commit.
-12. Commit the reviewed merge on `fiber-training`, verify its two parents and
-    clean worktree, and report the conflicts and feature-preserving resolutions.
+Default console/TensorBoard progress now uses cumulative global training samples. Document checkpoint sample metadata, changed-batch resume and explicit legacy override. Internal scheduling continues to use updates.
 
-## Spec update
+## docs updates
 
-No new product behavior is introduced by the merge itself. Reconcile the
-existing `planning/specs.md` additions from both histories without deleting or
-weakening either branch's requirements.
+Add eight-GPU commands, comparison caveats, output paths and validation record to a retraining guide and task log. Add changelog entry.
 
-## Docs updates
+Follow-up: launch from /ephemeral/hendrik/fiber3d_train2 with absolute config paths, write runs beneath its runs directory, and use short first-reproduction labels s1a_repro1_fast/std. Validate config loading from that working directory.
 
-Reconcile `docs/code_structure.md` by preserving both Fiber3D training and
-Fiberlet/native-tracing documentation. No new standalone user guide is needed.
+## validation
 
-## Changelog update
-
-Preserve both histories' durable entries and add a concise integration entry
-only if conflict resolution changes their organization or adds new behavior.
+Independent plan review. Parse configs with actual loader/model APIs; compare settings except explicit pipeline options and run names; verify source globs. Run relevant existing config/model/training-option tests without starting training. Verify imports resolve to villa2 and report dependency limitations. No installs or training launch.
