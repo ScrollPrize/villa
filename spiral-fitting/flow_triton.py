@@ -1517,3 +1517,349 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
                 HAS_ACC=has_acc, BLOCK=_CYL_BLOCK,
             )
         return grad_pts, None, None, None, None, None, None, None, None, None, None
+
+
+if _HAS_TRITON:
+
+    # ---- b-spline mode: tricubic 4x4x4 stencil per lattice ----
+    # Each lattice is sampled at coord = p * (size - 1) per dim
+    # (align_corners=True), with the query clamped to the lattice box and
+    # out-of-range stencil taps clamped to the edge (replicate). This is the
+    # same interpolant as flow_fields.sample_field_bspline: the eager path
+    # evaluates it as 8 border-clamped trilinear fetches (the Sigg & Hadwiger
+    # decomposition), this kernel evaluates the 64-tap weighted sum directly,
+    # so results agree up to FP association (the tolerance-based contract at
+    # the top of this file).
+
+    @triton.jit
+    def _bspline_weights(f):
+        # Uniform cubic B-spline basis over taps lo-1 .. lo+2, matching
+        # sample_field_bspline's w0..w3.
+        omf = 1.0 - f
+        f2 = f * f
+        f3 = f2 * f
+        w0 = (omf * omf) * omf * (1.0 / 6.0)
+        w1 = (3.0 * f3 - 6.0 * f2 + 4.0) * (1.0 / 6.0)
+        w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) * (1.0 / 6.0)
+        w3 = f3 * (1.0 / 6.0)
+        return w0, w1, w2, w3
+
+    @triton.jit
+    def _bspline_dweights(f):
+        # d/df of _bspline_weights (sums to zero).
+        omf = 1.0 - f
+        f2 = f * f
+        d0 = -0.5 * (omf * omf)
+        d1 = 1.5 * f2 - 2.0 * f
+        d2 = -1.5 * f2 + f + 0.5
+        d3 = 0.5 * f2
+        return d0, d1, d2, d3
+
+    @triton.jit
+    def _bspline_sample_one(ptr, pz, py, px, Z, Y, X, lane_mask):
+        zm1f = (Z - 1).to(tl.float32)
+        ym1f = (Y - 1).to(tl.float32)
+        xm1f = (X - 1).to(tl.float32)
+        cz = tl.minimum(tl.maximum(pz * zm1f, 0.0), zm1f)
+        cy = tl.minimum(tl.maximum(py * ym1f, 0.0), ym1f)
+        cx = tl.minimum(tl.maximum(px * xm1f, 0.0), xm1f)
+        lzf = tl.math.floor(cz)
+        lyf = tl.math.floor(cy)
+        lxf = tl.math.floor(cx)
+        wz0, wz1, wz2, wz3 = _bspline_weights(cz - lzf)
+        wy0, wy1, wy2, wy3 = _bspline_weights(cy - lyf)
+        wx0, wx1, wx2, wx3 = _bspline_weights(cx - lxf)
+        lz = lzf.to(tl.int32)
+        ly = lyf.to(tl.int32)
+        lx = lxf.to(tl.int32)
+        ch = Z.to(tl.int64) * Y * X
+        v0 = tl.zeros(pz.shape, dtype=tl.float32)
+        v1 = tl.zeros(pz.shape, dtype=tl.float32)
+        v2 = tl.zeros(pz.shape, dtype=tl.float32)
+        # Outer axes iterate as device-side loops with branchless weight
+        # selection; a fully static 4x4x4 unroll (x 4 RK4 stages x 2
+        # lattices) made ptxas compile times run to tens of minutes.
+        for dz in range(4):
+            z = tl.minimum(tl.maximum(lz + (dz - 1), 0), Z - 1)
+            wz = tl.where(dz == 0, wz0, tl.where(dz == 1, wz1, tl.where(dz == 2, wz2, wz3)))
+            for dy in range(4):
+                y = tl.minimum(tl.maximum(ly + (dy - 1), 0), Y - 1)
+                wy = tl.where(dy == 0, wy0, tl.where(dy == 1, wy1, tl.where(dy == 2, wy2, wy3)))
+                wzy = wz * wy
+                row = (z.to(tl.int64) * Y + y) * X
+                for dx in tl.static_range(4):
+                    x = tl.minimum(tl.maximum(lx + (dx - 1), 0), X - 1)
+                    wx = wx0 if dx == 0 else (wx1 if dx == 1 else (wx2 if dx == 2 else wx3))
+                    w = wzy * wx
+                    idx = row + x
+                    v0 += tl.load(ptr + idx, mask=lane_mask, other=0.0) * w
+                    v1 += tl.load(ptr + ch + idx, mask=lane_mask, other=0.0) * w
+                    v2 += tl.load(ptr + 2 * ch + idx, mask=lane_mask, other=0.0) * w
+        return v0, v1, v2
+
+    @triton.jit
+    def _bspline_sample_pair(pz, py, px,
+                             lo_ptr, loZ, loY, loX,
+                             hi_ptr, hiZ, hiY, hiX, lane_mask):
+        l0, l1, l2 = _bspline_sample_one(lo_ptr, pz, py, px, loZ, loY, loX, lane_mask)
+        h0, h1, h2 = _bspline_sample_one(hi_ptr, pz, py, px, hiZ, hiY, hiX, lane_mask)
+        return l0 + h0, l1 + h1, l2 + h2
+
+    @triton.jit
+    def _rk4b_fwd_kernel(y_ptr, out_ptr, stages_ptr,
+                         lo_ptr, loZ, loY, loX,
+                         hi_ptr, hiZ, hiY, hiX,
+                         N, h, h_half, h_sixth, n_steps,
+                         STORE_STAGES: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        i = pid * BLOCK + tl.arange(0, BLOCK)
+        m = i < N
+        yz = tl.load(y_ptr + i * 3 + 0, mask=m, other=0.0)
+        yy = tl.load(y_ptr + i * 3 + 1, mask=m, other=0.0)
+        yx = tl.load(y_ptr + i * 3 + 2, mask=m, other=0.0)
+        for step in range(n_steps):
+            if STORE_STAGES:
+                s = (step * 4 + 0) * N.to(tl.int64)
+                tl.store(stages_ptr + (s + i) * 3 + 0, yz, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 1, yy, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 2, yx, mask=m)
+            k1z, k1y, k1x = _bspline_sample_pair(
+                yz, yy, yx, lo_ptr, loZ, loY, loX, hi_ptr, hiZ, hiY, hiX, m)
+            x2z = yz + h_half * k1z
+            x2y = yy + h_half * k1y
+            x2x = yx + h_half * k1x
+            if STORE_STAGES:
+                s = (step * 4 + 1) * N.to(tl.int64)
+                tl.store(stages_ptr + (s + i) * 3 + 0, x2z, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 1, x2y, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 2, x2x, mask=m)
+            k2z, k2y, k2x = _bspline_sample_pair(
+                x2z, x2y, x2x, lo_ptr, loZ, loY, loX, hi_ptr, hiZ, hiY, hiX, m)
+            x3z = yz + h_half * k2z
+            x3y = yy + h_half * k2y
+            x3x = yx + h_half * k2x
+            if STORE_STAGES:
+                s = (step * 4 + 2) * N.to(tl.int64)
+                tl.store(stages_ptr + (s + i) * 3 + 0, x3z, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 1, x3y, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 2, x3x, mask=m)
+            k3z, k3y, k3x = _bspline_sample_pair(
+                x3z, x3y, x3x, lo_ptr, loZ, loY, loX, hi_ptr, hiZ, hiY, hiX, m)
+            x4z = yz + h * k3z
+            x4y = yy + h * k3y
+            x4x = yx + h * k3x
+            if STORE_STAGES:
+                s = (step * 4 + 3) * N.to(tl.int64)
+                tl.store(stages_ptr + (s + i) * 3 + 0, x4z, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 1, x4y, mask=m)
+                tl.store(stages_ptr + (s + i) * 3 + 2, x4x, mask=m)
+            k4z, k4y, k4x = _bspline_sample_pair(
+                x4z, x4y, x4x, lo_ptr, loZ, loY, loX, hi_ptr, hiZ, hiY, hiX, m)
+            yz = yz + h_sixth * (((k1z + 2.0 * k2z) + 2.0 * k3z) + k4z)
+            yy = yy + h_sixth * (((k1y + 2.0 * k2y) + 2.0 * k3y) + k4y)
+            yx = yx + h_sixth * (((k1x + 2.0 * k2x) + 2.0 * k3x) + k4x)
+        tl.store(out_ptr + i * 3 + 0, yz, mask=m)
+        tl.store(out_ptr + i * 3 + 1, yy, mask=m)
+        tl.store(out_ptr + i * 3 + 2, yx, mask=m)
+
+    @triton.jit
+    def _bspline_bwd_one(gz, gy, gx, pz, py, px, ptr, acc_ptr, Z, Y, X,
+                         HAS_ACC: tl.constexpr, lane_mask):
+        # Sampler backward for one lattice: scatter dL/d(control points) into
+        # acc and return dL/d(point). Same clamp/floor cell choice as the
+        # forward sampler, so value and gradient agree with autograd through
+        # sample_field_bspline (tap-index clamping is piecewise-constant and
+        # contributes no gradient; the query-box clamp contributes the
+        # inclusive in-range mask, like torch.clamp).
+        zm1f = (Z - 1).to(tl.float32)
+        ym1f = (Y - 1).to(tl.float32)
+        xm1f = (X - 1).to(tl.float32)
+        crz = pz * zm1f
+        cry = py * ym1f
+        crx = px * xm1f
+        cz = tl.minimum(tl.maximum(crz, 0.0), zm1f)
+        cy = tl.minimum(tl.maximum(cry, 0.0), ym1f)
+        cx = tl.minimum(tl.maximum(crx, 0.0), xm1f)
+        lzf = tl.math.floor(cz)
+        lyf = tl.math.floor(cy)
+        lxf = tl.math.floor(cx)
+        fz = cz - lzf
+        fy = cy - lyf
+        fx = cx - lxf
+        wz0, wz1, wz2, wz3 = _bspline_weights(fz)
+        wy0, wy1, wy2, wy3 = _bspline_weights(fy)
+        wx0, wx1, wx2, wx3 = _bspline_weights(fx)
+        dz0, dz1, dz2, dz3 = _bspline_dweights(fz)
+        dy0, dy1, dy2, dy3 = _bspline_dweights(fy)
+        dx0, dx1, dx2, dx3 = _bspline_dweights(fx)
+        lz = lzf.to(tl.int32)
+        ly = lyf.to(tl.int32)
+        lx = lxf.to(tl.int32)
+        ch = Z.to(tl.int64) * Y * X
+        gcz = tl.zeros(pz.shape, dtype=tl.float32)
+        gcy = tl.zeros(pz.shape, dtype=tl.float32)
+        gcx = tl.zeros(pz.shape, dtype=tl.float32)
+        for dz in range(4):
+            z = tl.minimum(tl.maximum(lz + (dz - 1), 0), Z - 1)
+            wz = tl.where(dz == 0, wz0, tl.where(dz == 1, wz1, tl.where(dz == 2, wz2, wz3)))
+            dwz = tl.where(dz == 0, dz0, tl.where(dz == 1, dz1, tl.where(dz == 2, dz2, dz3)))
+            for dy in range(4):
+                y = tl.minimum(tl.maximum(ly + (dy - 1), 0), Y - 1)
+                wy = tl.where(dy == 0, wy0, tl.where(dy == 1, wy1, tl.where(dy == 2, wy2, wy3)))
+                dwy = tl.where(dy == 0, dy0, tl.where(dy == 1, dy1, tl.where(dy == 2, dy2, dy3)))
+                row = (z.to(tl.int64) * Y + y) * X
+                for dx in tl.static_range(4):
+                    x = tl.minimum(tl.maximum(lx + (dx - 1), 0), X - 1)
+                    wx = wx0 if dx == 0 else (wx1 if dx == 1 else (wx2 if dx == 2 else wx3))
+                    dwx = dx0 if dx == 0 else (dx1 if dx == 1 else (dx2 if dx == 2 else dx3))
+                    idx = row + x
+                    w = (wz * wy) * wx
+                    if HAS_ACC:
+                        tl.atomic_add(acc_ptr + idx, gz * w, mask=lane_mask)
+                        tl.atomic_add(acc_ptr + ch + idx, gy * w, mask=lane_mask)
+                        tl.atomic_add(acc_ptr + 2 * ch + idx, gx * w, mask=lane_mask)
+                    v0 = tl.load(ptr + idx, mask=lane_mask, other=0.0)
+                    v1 = tl.load(ptr + ch + idx, mask=lane_mask, other=0.0)
+                    v2 = tl.load(ptr + 2 * ch + idx, mask=lane_mask, other=0.0)
+                    vdg = (v0 * gz + v1 * gy) + v2 * gx
+                    gcz += vdg * ((dwz * wy) * wx)
+                    gcy += vdg * ((wz * dwy) * wx)
+                    gcx += vdg * ((wz * wy) * dwx)
+        mz = ((crz >= 0.0) & (crz <= zm1f)).to(tl.float32)
+        my = ((cry >= 0.0) & (cry <= ym1f)).to(tl.float32)
+        mx = ((crx >= 0.0) & (crx <= xm1f)).to(tl.float32)
+        return (gcz * mz) * zm1f, (gcy * my) * ym1f, (gcx * mx) * xm1f
+
+    @triton.jit
+    def _bspline_bwd_pair(gz, gy, gx, pz, py, px,
+                          lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                          hi_ptr, acc_hi_ptr, hiZ, hiY, hiX,
+                          HAS_ACC: tl.constexpr, lane_mask):
+        lz, ly, lx = _bspline_bwd_one(gz, gy, gx, pz, py, px, lo_ptr, acc_lo_ptr,
+                                      loZ, loY, loX, HAS_ACC, lane_mask)
+        hz, hy, hx = _bspline_bwd_one(gz, gy, gx, pz, py, px, hi_ptr, acc_hi_ptr,
+                                      hiZ, hiY, hiX, HAS_ACC, lane_mask)
+        return lz + hz, ly + hy, lx + hx
+
+    @triton.jit
+    def _rk4b_bwd_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
+                         lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                         hi_ptr, acc_hi_ptr, hiZ, hiY, hiX,
+                         N, h, h_half, h_sixth, n_steps,
+                         HAS_ACC: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        i = pid * BLOCK + tl.arange(0, BLOCK)
+        m = i < N
+        gz = tl.load(grad_y_ptr + i * 3 + 0, mask=m, other=0.0)
+        gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
+        gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
+        for step in range(n_steps - 1, -1, -1):
+            s1 = (step * 4 + 0) * N.to(tl.int64)
+            s2 = (step * 4 + 1) * N.to(tl.int64)
+            s3 = (step * 4 + 2) * N.to(tl.int64)
+            s4 = (step * 4 + 3) * N.to(tl.int64)
+            g6z = gz * h_sixth
+            g6y = gy * h_sixth
+            g6x = gx * h_sixth
+            pz = tl.load(stages_ptr + (s4 + i) * 3 + 0, mask=m, other=0.0)
+            py = tl.load(stages_ptr + (s4 + i) * 3 + 1, mask=m, other=0.0)
+            px = tl.load(stages_ptr + (s4 + i) * 3 + 2, mask=m, other=0.0)
+            b4z, b4y, b4x = _bspline_bwd_pair(
+                g6z, g6y, g6x, pz, py, px,
+                lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                hi_ptr, acc_hi_ptr, hiZ, hiY, hiX, HAS_ACC, m)
+            pz = tl.load(stages_ptr + (s3 + i) * 3 + 0, mask=m, other=0.0)
+            py = tl.load(stages_ptr + (s3 + i) * 3 + 1, mask=m, other=0.0)
+            px = tl.load(stages_ptr + (s3 + i) * 3 + 2, mask=m, other=0.0)
+            b3z, b3y, b3x = _bspline_bwd_pair(
+                g6z * 2.0 + b4z * h, g6y * 2.0 + b4y * h, g6x * 2.0 + b4x * h,
+                pz, py, px,
+                lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                hi_ptr, acc_hi_ptr, hiZ, hiY, hiX, HAS_ACC, m)
+            pz = tl.load(stages_ptr + (s2 + i) * 3 + 0, mask=m, other=0.0)
+            py = tl.load(stages_ptr + (s2 + i) * 3 + 1, mask=m, other=0.0)
+            px = tl.load(stages_ptr + (s2 + i) * 3 + 2, mask=m, other=0.0)
+            b2z, b2y, b2x = _bspline_bwd_pair(
+                g6z * 2.0 + b3z * h_half, g6y * 2.0 + b3y * h_half, g6x * 2.0 + b3x * h_half,
+                pz, py, px,
+                lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                hi_ptr, acc_hi_ptr, hiZ, hiY, hiX, HAS_ACC, m)
+            pz = tl.load(stages_ptr + (s1 + i) * 3 + 0, mask=m, other=0.0)
+            py = tl.load(stages_ptr + (s1 + i) * 3 + 1, mask=m, other=0.0)
+            px = tl.load(stages_ptr + (s1 + i) * 3 + 2, mask=m, other=0.0)
+            b1z, b1y, b1x = _bspline_bwd_pair(
+                g6z + b2z * h_half, g6y + b2y * h_half, g6x + b2x * h_half,
+                pz, py, px,
+                lo_ptr, acc_lo_ptr, loZ, loY, loX,
+                hi_ptr, acc_hi_ptr, hiZ, hiY, hiX, HAS_ACC, m)
+            gz = ((gz + b4z) + b3z + b2z) + b1z
+            gy = ((gy + b4y) + b3y + b2y) + b1y
+            gx = ((gx + b4x) + b3x + b2x) + b1x
+        tl.store(grad_pts_ptr + i * 3 + 0, gz, mask=m)
+        tl.store(grad_pts_ptr + i * 3 + 1, gy, mask=m)
+        tl.store(grad_pts_ptr + i * 3 + 2, gx, mask=m)
+
+
+def _run_bspline_fwd(y0, low, high, h, n_steps, stages):
+    n = y0.shape[0]
+    out = torch.empty_like(y0)
+    if n > 0:
+        _rk4b_fwd_kernel[(triton.cdiv(n, _BLOCK),)](
+            y0, out, stages if stages is not None else out,
+            low, low.shape[1], low.shape[2], low.shape[3],
+            high, high.shape[1], high.shape[2], high.shape[3],
+            n, float(h), float(h / 2), float(h / 6), int(n_steps),
+            STORE_STAGES=stages is not None, BLOCK=_BLOCK,
+        )
+    return out
+
+
+def rk4_bspline_integrate(y0, low, high, acc_lo, acc_hi, h, n_steps):
+    # RK4 integration of the summed LR + HR tricubic B-spline lattices
+    # (see BSplineFlowField). Field gradients are scattered into the two
+    # caller-owned accumulators, which ARE the parameter gradients (both
+    # lattices enter the sum unscaled).
+    if torch.is_grad_enabled() and y0.requires_grad:
+        return TritonRK4BSplineIntegrate.apply(
+            y0, low, high, acc_lo, acc_hi, h, n_steps)
+    return _run_bspline_fwd(y0.contiguous(), low, high, h, n_steps, None)
+
+
+class TritonRK4BSplineIntegrate(torch.autograd.Function):
+    # Same saved-state footprint and accumulator contract as
+    # TritonRK4DirectIntegrate, with tricubic B-spline sampling.
+
+    @staticmethod
+    def forward(ctx, y0, low, high, acc_lo, acc_hi, h, n_steps):
+        ctx.set_materialize_grads(False)
+        y0 = y0.contiguous()
+        stages = torch.empty(
+            int(n_steps) * 4, y0.shape[0], 3, device=y0.device, dtype=y0.dtype)
+        out = _run_bspline_fwd(y0, low, high, h, n_steps, stages)
+        ctx.save_for_backward(low, high, stages)
+        ctx.accs = (acc_lo, acc_hi)
+        ctx.h = float(h)
+        ctx.n_steps = int(n_steps)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        if grad_y is None:
+            return None, None, None, None, None, None, None
+        low, high, stages = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+        n = grad_y.shape[0]
+        grad_pts = torch.empty_like(grad_y)
+        acc_lo, acc_hi = ctx.accs
+        h = ctx.h
+        if n > 0:
+            _rk4b_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
+                grad_y, grad_pts, stages,
+                low, acc_lo if acc_lo is not None else low,
+                low.shape[1], low.shape[2], low.shape[3],
+                high, acc_hi if acc_hi is not None else high,
+                high.shape[1], high.shape[2], high.shape[3],
+                n, h, float(h / 2), float(h / 6), ctx.n_steps,
+                HAS_ACC=acc_lo is not None, BLOCK=_BLOCK,
+            )
+        return grad_pts, None, None, None, None, None, None

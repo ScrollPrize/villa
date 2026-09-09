@@ -824,8 +824,10 @@ class BSplineFlowField(_DirectSampledFlowField):
     # field. Keeps CartesianFlowField's two-level (low-res + high-res)
     # parameter structure so optimizer grouping, the high-res LR schedule and
     # checkpoint shape checks apply unchanged. Both lattices are sampled
-    # directly at query points; integration uses the diffeomorphism's generic
-    # cached-sampler RK4 loop (there is no fused Triton path). direct_lr is
+    # directly at query points; time-invariant integration runs in the fused
+    # Triton kernel (flow_triton.rk4_bspline_integrate) where available, and
+    # otherwise falls back to a sampler-based RK4 loop over
+    # sample_field_bspline (also the CPU/test reference). direct_lr is
     # accepted for constructor parity and ignored.
 
     def __init__(self, resolution, spatial_scale_factor=6, num_flow_timesteps=1, direct_lr=False):
@@ -840,6 +842,80 @@ class BSplineFlowField(_DirectSampledFlowField):
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, *lr_shape])),
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, *hr_shape])),
         ])
+        self._acc_lo = None
+        self._acc_hi = None
+        self._pending_direct = False
+
+    def get_time_invariant_integrator(self):
+        # Returns integrate(y_flat, h, n_steps) -> y_flat running the whole
+        # RK4 integration as one fused Triton kernel launch (forward and
+        # adjoint each), with field gradients accumulated into per-lattice
+        # buffers. Only valid for num_flow_timesteps == 1.
+        assert self.num_flow_timesteps == 1
+        lr_flow, hr_flow = self.flows[0], self.flows[1]
+        low, high = lr_flow[0], hr_flow[0]
+        if not flow_triton.rk4_triton_available(low, high):
+            # CPU / no-triton fallback: the sampler-based loop, one autograd
+            # graph per sampler call (same path the diffeomorphism used
+            # before this integrator existed).
+            sampler = self.get_sampler(0.0)
+
+            def integrate(y_flat, h, n_steps):
+                y = y_flat
+                for _ in range(n_steps):
+                    k1 = sampler(y)
+                    k2 = sampler(y + (h / 2) * k1)
+                    k3 = sampler(y + (h / 2) * k2)
+                    k4 = sampler(y + h * k3)
+                    y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+                return y
+
+            return integrate
+
+        training_field = torch.is_grad_enabled() and (
+            lr_flow.requires_grad or hr_flow.requires_grad)
+        acc_lo = acc_hi = None
+        if training_field:
+            low, high = low.detach(), high.detach()
+            if self._acc_lo is None or self._acc_lo.shape != low.shape:
+                self._acc_lo = torch.zeros_like(low)
+            else:
+                self._acc_lo.zero_()
+            if self._acc_hi is None or self._acc_hi.shape != high.shape:
+                self._acc_hi = torch.zeros_like(high)
+            else:
+                self._acc_hi.zero_()
+            acc_lo, acc_hi = self._acc_lo, self._acc_hi
+            # Only one pending-gradient record may be armed per iteration; a
+            # stale sampler-path record would double-apply on the parameters
+            # after the direct branch consumed its accumulators.
+            assert self._pending_field_graphs is None
+            self._pending_direct = True
+        low_c, high_c = low.contiguous(), high.contiguous()
+
+        def integrate(y_flat, h, n_steps):
+            return flow_triton.rk4_bspline_integrate(
+                y_flat, low_c, high_c, acc_lo, acc_hi, h, n_steps)
+
+        return integrate
+
+    def apply_accumulated_field_grad(self):
+        if self._pending_direct:
+            self._pending_direct = False
+            for param, acc in (
+                (self.flows[0], self._acc_lo),
+                (self.flows[1], self._acc_hi),
+            ):
+                # Reuse the accumulator storage as the parameter gradient
+                # (both lattices enter the velocity sum unscaled, so the
+                # accumulators are exactly the gradients).
+                grad = acc.unsqueeze(0)
+                if param.grad is None:
+                    param.grad = grad
+                else:
+                    param.grad.add_(grad)
+            return
+        super().apply_accumulated_field_grad()
 
     def get_sampler(self, t):
         # Returns a callable mapping normalised zyx points in [0, 1] to flow

@@ -143,15 +143,15 @@ class CylindricalFlowGradientTests(unittest.TestCase):
         self.assertIsNone(flow._pending_field_graphs)
 
 
-def _make_small_spiral_model(seed, flow_field_type):
+def _make_small_spiral_model(seed, flow_field_type, device='cpu'):
     cfg = Config().as_dict()
     cfg['model_flow_field_type'] = flow_field_type
     cfg['model_gap_expander_num_windings'] = 10
     cfg['model_gap_expander_capacity_windings'] = 10
     z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution
-    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64)
-    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64)
-    zs = torch.arange(0, z_span + 1, dtype=torch.float32)
+    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64, device=device)
+    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64, device=device)
+    zs = torch.arange(0, z_span + 1, dtype=torch.float32, device=device)
     umbilicus_zyx = torch.stack(
         [zs, torch.full_like(zs, 3.), torch.full_like(zs, -2.)], dim=-1)
     torch.manual_seed(seed)
@@ -163,7 +163,7 @@ def _make_small_spiral_model(seed, flow_field_type):
         umbilicus_zyx=umbilicus_zyx,
         config=cfg,
         spiral_outward_sense='CW',
-    )
+    ).to(device)
     with torch.no_grad():
         for parameter in model.parameters():
             if parameter.numel() > 1:
