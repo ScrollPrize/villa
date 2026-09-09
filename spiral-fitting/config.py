@@ -222,7 +222,7 @@ _OPTIMIZER_DESCRIPTIONS = {
         "moves several times less per step than under per-cell Adam; raise "
         "this until the logged coarse-lattice update rms is back where the "
         "fit needs it, without touching the gap, linear and pitch groups. "
-        "Read live every step."),
+        "0 freezes the coarse lattice. Read live every step."),
     "optimizer_flow_grad_clip_median_multiple": (
         "Clip each flow lattice's gradient, per stage, at this multiple of "
         "the median nonzero |gradient| of that stage (read from a "

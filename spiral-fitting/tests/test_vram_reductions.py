@@ -1,3 +1,4 @@
+import inspect
 import types
 import unittest
 from pathlib import Path
@@ -623,6 +624,76 @@ class NonFiniteGradCheckTests(unittest.TestCase):
             self.assertFalse(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
         grad_min, grad_max = torch.aminmax(torch.randn(1024))
         self.assertTrue(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
+
+    @staticmethod
+    def _sanitize(named_params):
+        import fit_spiral
+        context = types.SimpleNamespace(
+            dist_grad_named=named_params,
+            nonfinite_grad_steps=torch.zeros((), dtype=torch.int64),
+            nonfinite_grad_by_param={name: torch.zeros((), dtype=torch.int64)
+                                     for name, _ in named_params},
+        )
+        fit_spiral.FitContext._sanitize_nonfinite_grads_(context)
+        return context
+
+    def test_sanitizer_counts_and_zeroes_only_nonfinite_cells(self):
+        bad = torch.nn.Parameter(torch.ones(1, 3, 5, 5, 5))
+        good = torch.nn.Parameter(torch.ones(4))
+        bad.grad = torch.ones_like(bad)
+        bad.grad[0, 0, 2, 2, 2] = float('nan')
+        bad.grad[0, 1, 0, 0, 0] = float('inf')
+        good.grad = torch.full_like(good, 2.0)
+        context = self._sanitize([('bad', bad), ('good', good)])
+
+        self.assertEqual(int(context.nonfinite_grad_steps), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['bad']), 1)
+        self.assertEqual(int(context.nonfinite_grad_by_param['good']), 0)
+        self.assertEqual(bad.grad[0, 0, 2, 2, 2].item(), 0.0)
+        self.assertEqual(bad.grad[0, 1, 0, 0, 0].item(), 0.0)
+        # Exactly the two nonfinite cells were touched.
+        self.assertEqual(int((bad.grad == 0).sum()), 2)
+        self.assertTrue(torch.equal(good.grad, torch.full_like(good, 2.0)))
+
+    def test_sanitizer_runs_before_clipping_and_smoothing(self):
+        # Clipping would clamp an infinity to a finite bound and hide it from
+        # the nonfinite counters; smoothing would spread one NaN over every
+        # cell within its kernel and the later sanitizer would then discard
+        # all of them. Sanitizing first keeps both to the single bad cell.
+        import fit_spiral
+        import flow_grad_smoothing
+        from lazy_moment_adamw import robust_clip_
+
+        step_source = inspect.getsource(fit_spiral.FitContext.step)
+        self.assertLess(step_source.index('self._sanitize_nonfinite_grads_()'),
+                        step_source.index('self._clip_flow_grads()'))
+        self.assertLess(step_source.index('self._clip_flow_grads()'),
+                        step_source.index('smooth_flow_grad_('))
+
+        torch.manual_seed(0)
+        param = torch.nn.Parameter(torch.zeros(1, 3, 7, 7, 7))
+        param.grad = torch.rand_like(param) + 0.5
+        param.grad[0, 0, 3, 3, 3] = float('nan')
+        param.grad[0, 2, 1, 1, 1] = float('inf')
+        reference = param.grad.clone()
+        reference[0, 0, 3, 3, 3] = 0.0
+        reference[0, 2, 1, 1, 1] = 0.0
+
+        context = self._sanitize([('flow', param)])
+        self.assertEqual(int(context.nonfinite_grad_by_param['flow']), 1)
+        self.assertTrue(torch.equal(param.grad, reference))
+
+        thresholds, fractions = robust_clip_(param.grad, 100.0)
+        # Nothing finite exceeds 100x the median, and the (zeroed) infinity is
+        # no longer counted as a clipped cell.
+        self.assertEqual(float(fractions[0]), 0.0)
+        self.assertTrue(torch.equal(param.grad, reference))
+
+        flow_grad_smoothing.smooth_cartesian_(param.grad, 1.0)
+        self.assertTrue(torch.isfinite(param.grad).all())
+        # Smoothing a finite field leaves its neighbours non-zero rather than
+        # discarding them, as the old ordering did.
+        self.assertGreater(int((param.grad != 0).sum()), param.grad.numel() - 2)
 
 
 class CpuTrackStorageTests(unittest.TestCase):

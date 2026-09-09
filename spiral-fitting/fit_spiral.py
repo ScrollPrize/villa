@@ -908,7 +908,11 @@ def get_flow_field_high_res_lr_scale(cfg, iteration):
 
 def get_flow_field_low_res_lr_scale(cfg):
     """Relative optimizer LR for the low-resolution flow lattice."""
-    return float(cfg.get('model_flow_field_low_res_lr_scale', 1.0) or 1.0)
+    value = cfg.get('model_flow_field_low_res_lr_scale')
+    # Only a missing or null setting takes the default: 0 is a valid scale
+    # that freezes the coarse lattice (a zero AdamW LR also disables its
+    # decoupled weight decay).
+    return 1.0 if value is None else float(value)
 
 
 def set_optimizer_group_lr_scale(
@@ -2332,6 +2336,26 @@ class FitContext:
         low_res = float(self.config.get(
             'optimizer_flow_grad_smoothing_low_res_sigma_voxels', 0.0) or 0.0)
         return along, across, low_res
+
+    def _sanitize_nonfinite_grads_(self):
+        """Count and zero nonfinite entries in every distributed gradient.
+
+        Bumps nonfinite_grad_steps once per step with any nonfinite gradient
+        and nonfinite_grad_by_param per affected parameter, then replaces
+        NaN and +/-inf with zero in place.
+        """
+        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
+        for name, p in self.dist_grad_named:
+            if p.grad is not None:
+                # aminmax propagates NaN and surfaces +/-inf through two scalar
+                # reductions, avoiding the gradient-sized boolean temporaries
+                # that (~torch.isfinite(grad)).any() allocates per parameter.
+                grad_min, grad_max = torch.aminmax(p.grad)
+                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
+                step_had_nonfinite |= param_nonfinite
+                self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
 
     def _clip_flow_grads(self):
         """Robustly clip every flow stage's lattice gradients (see
@@ -4741,6 +4765,14 @@ class FitContext:
         allreduce_grads_(self.dist_grad_params, self.dist.world_size)
         self.step_timer.stop('comm')
 
+        # Detect and zero nonfinite gradients straight after the all-reduce
+        # (identical on every rank) and before the clipping and smoothing:
+        # clamping would turn an infinity into a finite bound and hide it
+        # from these counters, and smoothing would spread a single NaN over
+        # every cell within its kernel. Clipping and smoothing finite
+        # gradients cannot produce new nonfinite values.
+        self._sanitize_nonfinite_grads_()
+
         # Clip after the all-reduce (identical gradients and statistics on
         # every rank) and before smoothing, so a cell with an unsatisfiable
         # loss is bounded before its spike is spread over its neighbours.
@@ -4755,19 +4787,6 @@ class FitContext:
             self.step_timer.start('smooth')
             self.spiral_and_transform.smooth_flow_grad_(*self._flow_grad_smoothing_widths())
             self.step_timer.stop('smooth')
-
-        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
-        for name, p in self.dist_grad_named:
-            if p.grad is not None:
-                # aminmax propagates NaN and surfaces +/-inf through two scalar
-                # reductions, avoiding the gradient-sized boolean temporaries
-                # that (~torch.isfinite(grad)).any() allocates per parameter.
-                grad_min, grad_max = torch.aminmax(p.grad)
-                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
-                step_had_nonfinite |= param_nonfinite
-                self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
 
         if self.influence_state is not None and self.influence_state.active:
             # After the all-reduce and the accumulated-field-grad handoff, so

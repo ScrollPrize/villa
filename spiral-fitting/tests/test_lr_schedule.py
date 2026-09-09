@@ -170,3 +170,7 @@ def test_both_flow_groups_scale_off_the_same_base_group():
     assert scheduler.base_lrs == [1.e-2, 4.e-2, 2.e-3]
     assert fit_spiral.get_flow_field_low_res_lr_scale({"model_flow_field_low_res_lr_scale": 4.}) == 4.
     assert fit_spiral.get_flow_field_low_res_lr_scale({}) == 1.
+    # An explicit zero freezes the coarse lattice; only a missing or null
+    # setting falls back to the default.
+    assert fit_spiral.get_flow_field_low_res_lr_scale({"model_flow_field_low_res_lr_scale": 0.}) == 0.
+    assert fit_spiral.get_flow_field_low_res_lr_scale({"model_flow_field_low_res_lr_scale": None}) == 1.
