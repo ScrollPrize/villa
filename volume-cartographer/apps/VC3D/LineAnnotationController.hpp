@@ -874,6 +874,14 @@ private:
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    // Base grid the fiber's stored geometry lives in: the shape stored in the
+    // fiber itself, else the manifest its trace spans recorded, else the
+    // package's selected fiber-inference dataset (see
+    // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
@@ -1204,6 +1212,11 @@ private:
     };
     mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
         _storageSnapshotCache;
+    // Resolved manifest location -> base_shape_zyx. Opening a fiber session
+    // re-reads the manifest otherwise; successes only, so a failed (moved or
+    // remote) location is retried next time.
+    mutable std::unordered_map<std::string, std::array<std::size_t, 3>>
+        _fiberManifestBaseShapeCache;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

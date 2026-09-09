@@ -1,0 +1,44 @@
+diff a/volume-cartographer/apps/VC3D/LineAnnotationController.cpp b/volume-cartographer/apps/VC3D/LineAnnotationController.cpp	(rejected hunks)
+@@ -2871,40 +2871,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
+         return;
+     }
+ 
+-    std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX =
+-        it->coordinateBaseShapeZYX;
+-    if (!coordinateBaseShapeZYX && _state && _state->vpkg()) {
+-        std::string fiberManifestLocation;
+-        for (const auto& control : it->controlPoints) {
+-            if (control.segmentToNext &&
+-                !control.segmentToNext->fiberManifestLocation.empty()) {
+-                fiberManifestLocation =
+-                    control.segmentToNext->fiberManifestLocation;
+-                break;
+-            }
+-        }
+-        if (!fiberManifestLocation.empty()) {
+-            try {
+-                vc::lasagna::LasagnaDatasetOpenOptions options;
+-                options.remoteCacheRoot = _state->vpkg()->remoteCacheRootOrEmpty();
+-                const std::string resolved =
+-                    vc::project::isLocationRemote(fiberManifestLocation)
+-                    ? fiberManifestLocation
+-                    : vc::project::resolveLocalPath(
+-                          fiberManifestLocation,
+-                          _state->vpkg()->path().parent_path()).string();
+-                coordinateBaseShapeZYX =
+-                    vc::lasagna::LasagnaDataset::openLocation(resolved, options)
+-                        .manifest().baseShapeZYX;
+-            } catch (const std::exception& ex) {
+-                Logger()->warn(
+-                    "Line annotation: could not resolve fiber coordinate shape "
+-                    "for {}: {}",
+-                    it->fileName,
+-                    ex.what());
+-            }
+-        }
+-    }
++    const std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX =
++        resolveStoredFiberCoordinateBaseShape(*it);
+ 
+     double fiberBaseToVolumeScale = 1.0;
+     if (coordinateBaseShapeZYX) {

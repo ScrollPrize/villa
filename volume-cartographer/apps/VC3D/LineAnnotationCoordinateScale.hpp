@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace vc3d::line_annotation {
 
@@ -65,6 +67,26 @@ inline FiberNormalCoordinateScales resolveFiberNormalCoordinateScales(
         fiberBaseToNormalBase,
         traceToNormalBase,
     };
+}
+
+// Manifest locations to consult, in order, for a fiber that does not store
+// its own coordinate base shape: the manifest its trace spans recorded, then
+// the package's selected fiber-inference dataset. Older fibers recorded
+// absolute manifest paths that may since have moved, so the package selection
+// (which is what traces them today) is the fallback.
+inline std::vector<std::string> fiberBaseShapeManifestCandidates(
+    const std::string& fiberManifestLocation,
+    const std::string& selectedFiberInferenceDataset)
+{
+    std::vector<std::string> candidates;
+    if (!fiberManifestLocation.empty()) {
+        candidates.push_back(fiberManifestLocation);
+    }
+    if (!selectedFiberInferenceDataset.empty() &&
+        selectedFiberInferenceDataset != fiberManifestLocation) {
+        candidates.push_back(selectedFiberInferenceDataset);
+    }
+    return candidates;
 }
 
 } // namespace vc3d::line_annotation

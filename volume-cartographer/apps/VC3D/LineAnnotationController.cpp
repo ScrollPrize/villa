@@ -2900,40 +2900,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         return;
     }
 
-    std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX =
-        it->coordinateBaseShapeZYX;
-    if (!coordinateBaseShapeZYX && _state && _state->vpkg()) {
-        std::string fiberManifestLocation;
-        for (const auto& control : it->controlPoints) {
-            if (control.segmentToNext &&
-                !control.segmentToNext->fiberManifestLocation.empty()) {
-                fiberManifestLocation =
-                    control.segmentToNext->fiberManifestLocation;
-                break;
-            }
-        }
-        if (!fiberManifestLocation.empty()) {
-            try {
-                vc::lasagna::LasagnaDatasetOpenOptions options;
-                options.remoteCacheRoot = vc3d::remoteCachePathFs();
-                const std::string resolved =
-                    vc::project::isLocationRemote(fiberManifestLocation)
-                    ? fiberManifestLocation
-                    : vc::project::resolveLocalPath(
-                          fiberManifestLocation,
-                          _state->vpkg()->path().parent_path()).string();
-                coordinateBaseShapeZYX =
-                    vc::lasagna::LasagnaDataset::openLocation(resolved, options)
-                        .manifest().baseShapeZYX;
-            } catch (const std::exception& ex) {
-                Logger()->warn(
-                    "Line annotation: could not resolve fiber coordinate shape "
-                    "for {}: {}",
-                    it->fileName,
-                    ex.what());
-            }
-        }
-    }
+    const std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX =
+        resolveStoredFiberCoordinateBaseShape(*it);
 
     double fiberBaseToVolumeScale = 1.0;
     if (coordinateBaseShapeZYX) {
@@ -13021,6 +12989,80 @@ void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>&
     }
 }
 
+std::optional<std::array<std::size_t, 3>>
+LineAnnotationController::fiberManifestBaseShape(const std::string& location) const
+{
+    if (location.empty() || !_state || !_state->vpkg()) {
+        return std::nullopt;
+    }
+    const auto vpkg = _state->vpkg();
+    const std::string resolved = vc::project::isLocationRemote(location)
+        ? location
+        : vc::project::resolveLocalPath(location, vpkg->path().parent_path())
+              .string();
+    if (auto cached = _fiberManifestBaseShapeCache.find(resolved);
+        cached != _fiberManifestBaseShapeCache.end()) {
+        return cached->second;
+    }
+    try {
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.remoteCacheRoot = vc3d::remoteCachePathFs();
+        const auto shape =
+            vc::lasagna::LasagnaDataset::openLocation(resolved, options)
+                .manifest().baseShapeZYX;
+        if (!shape) {
+            Logger()->warn(
+                "Line annotation: fiber manifest {} has no base_shape_zyx",
+                location);
+            return std::nullopt;
+        }
+        _fiberManifestBaseShapeCache.emplace(resolved, *shape);
+        return shape;
+    } catch (const std::exception& ex) {
+        Logger()->warn(
+            "Line annotation: could not open fiber manifest {}: {}",
+            location,
+            ex.what());
+        return std::nullopt;
+    }
+}
+
+std::optional<std::array<std::size_t, 3>>
+LineAnnotationController::resolveStoredFiberCoordinateBaseShape(
+    const StoredFiber& fiber) const
+{
+    if (fiber.coordinateBaseShapeZYX) {
+        return fiber.coordinateBaseShapeZYX;
+    }
+    if (!_state || !_state->vpkg()) {
+        return std::nullopt;
+    }
+    std::string fiberManifestLocation;
+    for (const auto& control : fiber.controlPoints) {
+        if (control.segmentToNext &&
+            !control.segmentToNext->fiberManifestLocation.empty()) {
+            fiberManifestLocation = control.segmentToNext->fiberManifestLocation;
+            break;
+        }
+    }
+    const auto candidates =
+        vc3d::line_annotation::fiberBaseShapeManifestCandidates(
+            fiberManifestLocation,
+            _state->vpkg()->selectedFiberInferenceDataset());
+    for (const auto& candidate : candidates) {
+        if (const auto shape = fiberManifestBaseShape(candidate)) {
+            return shape;
+        }
+    }
+    if (!candidates.empty()) {
+        Logger()->warn(
+            "Line annotation: could not resolve fiber coordinate shape for {}; "
+            "its geometry will be shown unscaled",
+            fiber.fileName);
+    }
+    return std::nullopt;
+}
+
 fs::path LineAnnotationController::fibersRootDir() const
 {
     const fs::path root = currentVolpkgRoot();
@@ -15343,6 +15385,11 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberManualHvTag = fiber.manualHvTag;
     session->fiberTags = fiber.tags;
     session->fiberOptimizationMode = fiber.optimizationMode;
+    // Carried through to the saved fiber; without it a re-save from this
+    // pane-less session (re-optimization, intersection edits) drops the
+    // fiber's coordinate_base_shape_zyx. Geometry here stays in base
+    // coordinates (fiberBaseToVolumeScale 1.0) since no views are built.
+    session->coordinateBaseShapeZYX = resolveStoredFiberCoordinateBaseShape(fiber);
     session->branches = fiber.branches;
     session->focusedLinePosition = std::clamp(
         focusLinePosition,

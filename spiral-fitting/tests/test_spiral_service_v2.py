@@ -2490,7 +2490,7 @@ class UploadTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ApiError, "requires rebuilding"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
-                "model_num_flow_stages": 2,
+                "model_num_flow_stages": 3,
             }})
         with self.assertRaisesRegex(ApiError, "Invalid value"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
