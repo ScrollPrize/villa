@@ -1530,6 +1530,13 @@ if _HAS_TRITON:
     # decomposition), this kernel evaluates the 64-tap weighted sum directly,
     # so results agree up to FP association (the tolerance-based contract at
     # the top of this file).
+    #
+    # Field VALUES are read from channels-last [Z, Y, X, 3] copies so each
+    # tap's three components come from consecutive addresses (one cache line)
+    # instead of three planes a full channel apart -- with 64 taps per lattice
+    # per stage the read path dominates. The gradient ACCUMULATORS stay in the
+    # parameter layout [3, Z, Y, X] so they serve directly as gradients
+    # (atomics don't coalesce across addresses anyway).
 
     @triton.jit
     def _bspline_weights(f):
@@ -1572,7 +1579,6 @@ if _HAS_TRITON:
         lz = lzf.to(tl.int32)
         ly = lyf.to(tl.int32)
         lx = lxf.to(tl.int32)
-        ch = Z.to(tl.int64) * Y * X
         v0 = tl.zeros(pz.shape, dtype=tl.float32)
         v1 = tl.zeros(pz.shape, dtype=tl.float32)
         v2 = tl.zeros(pz.shape, dtype=tl.float32)
@@ -1591,10 +1597,10 @@ if _HAS_TRITON:
                     x = tl.minimum(tl.maximum(lx + (dx - 1), 0), X - 1)
                     wx = wx0 if dx == 0 else (wx1 if dx == 1 else (wx2 if dx == 2 else wx3))
                     w = wzy * wx
-                    idx = row + x
-                    v0 += tl.load(ptr + idx, mask=lane_mask, other=0.0) * w
-                    v1 += tl.load(ptr + ch + idx, mask=lane_mask, other=0.0) * w
-                    v2 += tl.load(ptr + 2 * ch + idx, mask=lane_mask, other=0.0) * w
+                    idx3 = (row + x) * 3
+                    v0 += tl.load(ptr + idx3, mask=lane_mask, other=0.0) * w
+                    v1 += tl.load(ptr + idx3 + 1, mask=lane_mask, other=0.0) * w
+                    v2 += tl.load(ptr + idx3 + 2, mask=lane_mask, other=0.0) * w
         return v0, v1, v2
 
     @triton.jit
@@ -1713,14 +1719,15 @@ if _HAS_TRITON:
                     wx = wx0 if dx == 0 else (wx1 if dx == 1 else (wx2 if dx == 2 else wx3))
                     dwx = dx0 if dx == 0 else (dx1 if dx == 1 else (dx2 if dx == 2 else dx3))
                     idx = row + x
+                    idx3 = idx * 3
                     w = (wz * wy) * wx
                     if HAS_ACC:
                         tl.atomic_add(acc_ptr + idx, gz * w, mask=lane_mask)
                         tl.atomic_add(acc_ptr + ch + idx, gy * w, mask=lane_mask)
                         tl.atomic_add(acc_ptr + 2 * ch + idx, gx * w, mask=lane_mask)
-                    v0 = tl.load(ptr + idx, mask=lane_mask, other=0.0)
-                    v1 = tl.load(ptr + ch + idx, mask=lane_mask, other=0.0)
-                    v2 = tl.load(ptr + 2 * ch + idx, mask=lane_mask, other=0.0)
+                    v0 = tl.load(ptr + idx3, mask=lane_mask, other=0.0)
+                    v1 = tl.load(ptr + idx3 + 1, mask=lane_mask, other=0.0)
+                    v2 = tl.load(ptr + idx3 + 2, mask=lane_mask, other=0.0)
                     vdg = (v0 * gz + v1 * gy) + v2 * gx
                     gcz += vdg * ((dwz * wy) * wx)
                     gcy += vdg * ((wz * dwy) * wx)
@@ -1806,8 +1813,8 @@ def _run_bspline_fwd(y0, low, high, h, n_steps, stages):
     if n > 0:
         _rk4b_fwd_kernel[(triton.cdiv(n, _BLOCK),)](
             y0, out, stages if stages is not None else out,
-            low, low.shape[1], low.shape[2], low.shape[3],
-            high, high.shape[1], high.shape[2], high.shape[3],
+            low, low.shape[0], low.shape[1], low.shape[2],
+            high, high.shape[0], high.shape[1], high.shape[2],
             n, float(h), float(h / 2), float(h / 6), int(n_steps),
             STORE_STAGES=stages is not None, BLOCK=_BLOCK,
         )
@@ -1816,9 +1823,11 @@ def _run_bspline_fwd(y0, low, high, h, n_steps, stages):
 
 def rk4_bspline_integrate(y0, low, high, acc_lo, acc_hi, h, n_steps):
     # RK4 integration of the summed LR + HR tricubic B-spline lattices
-    # (see BSplineFlowField). Field gradients are scattered into the two
-    # caller-owned accumulators, which ARE the parameter gradients (both
-    # lattices enter the sum unscaled).
+    # (see BSplineFlowField). `low` and `high` are contiguous CHANNELS-LAST
+    # [Z, Y, X, 3] copies of the lattices; the caller-owned accumulators stay
+    # in the parameter layout [3, Z, Y, X] and ARE the parameter gradients
+    # (both lattices enter the sum unscaled).
+    assert low.shape[-1] == 3 and high.shape[-1] == 3
     if torch.is_grad_enabled() and y0.requires_grad:
         return TritonRK4BSplineIntegrate.apply(
             y0, low, high, acc_lo, acc_hi, h, n_steps)
@@ -1856,9 +1865,9 @@ class TritonRK4BSplineIntegrate(torch.autograd.Function):
             _rk4b_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
                 grad_y, grad_pts, stages,
                 low, acc_lo if acc_lo is not None else low,
-                low.shape[1], low.shape[2], low.shape[3],
+                low.shape[0], low.shape[1], low.shape[2],
                 high, acc_hi if acc_hi is not None else high,
-                high.shape[1], high.shape[2], high.shape[3],
+                high.shape[0], high.shape[1], high.shape[2],
                 n, h, float(h / 2), float(h / 6), ctx.n_steps,
                 HAS_ACC=acc_lo is not None, BLOCK=_BLOCK,
             )

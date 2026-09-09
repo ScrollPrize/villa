@@ -891,11 +891,17 @@ class BSplineFlowField(_DirectSampledFlowField):
             # after the direct branch consumed its accumulators.
             assert self._pending_field_graphs is None
             self._pending_direct = True
-        low_c, high_c = low.contiguous(), high.contiguous()
+        # Channels-last copies for the kernel's read path: each stencil tap
+        # then reads its 3 components from consecutive addresses instead of
+        # three planes a full channel apart. One copy per lattice per
+        # iteration, amortised across the integrator's calls; the gradient
+        # accumulators keep the parameter layout.
+        low_cl = low.permute(1, 2, 3, 0).contiguous()
+        high_cl = high.permute(1, 2, 3, 0).contiguous()
 
         def integrate(y_flat, h, n_steps):
             return flow_triton.rk4_bspline_integrate(
-                y_flat, low_c, high_c, acc_lo, acc_hi, h, n_steps)
+                y_flat, low_cl, high_cl, acc_lo, acc_hi, h, n_steps)
 
         return integrate
 

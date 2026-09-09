@@ -125,6 +125,11 @@ def _eager_rk4(low, high, pts, h, n_steps):
     return y
 
 
+def _channels_last(field):
+    # rk4_bspline_integrate reads field values from channels-last copies.
+    return field.permute(1, 2, 3, 0).contiguous()
+
+
 def _mixed_points(num_random, seed, device, dtype):
     # Random interior/exterior points plus exact box corners and edges, so
     # the border clamp and its inclusive gradient mask are exercised.
@@ -158,7 +163,8 @@ class BSplineTritonEquivalenceTests(unittest.TestCase):
 
         with torch.no_grad():
             triton_out = flow_triton.rk4_bspline_integrate(
-                pts, low, high, None, None, self.H, self.N_STEPS)
+                pts, _channels_last(low), _channels_last(high),
+                None, None, self.H, self.N_STEPS)
             eager_out = _eager_rk4(low, high, pts, self.H, self.N_STEPS)
             ref64 = _eager_rk4(
                 low.double(), high.double(), pts.double(), self.H, self.N_STEPS)
@@ -186,7 +192,8 @@ class BSplineTritonEquivalenceTests(unittest.TestCase):
         acc_lo = torch.zeros_like(low)
         acc_hi = torch.zeros_like(high)
         out = flow_triton.rk4_bspline_integrate(
-            triton_pts, low, high, acc_lo, acc_hi, self.H, self.N_STEPS)
+            triton_pts, _channels_last(low), _channels_last(high),
+            acc_lo, acc_hi, self.H, self.N_STEPS)
         (out * proj).sum().backward()
 
         torch.testing.assert_close(
