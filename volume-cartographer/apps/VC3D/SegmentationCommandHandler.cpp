@@ -2053,15 +2053,15 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     // Trim once: the dialog enables its Zarr options on the trimmed path, so the
     // command builder has to use the same value or the two disagree on a pattern
     // with trailing whitespace.
-    const QString outputPattern = dlg.outputPattern().trimmed();
+    const QString chosenOutputPattern = dlg.outputPattern().trimmed();
     _cmdRunner->setSegmentPath(dlg.segmentPath());
-    _cmdRunner->setOutputPattern(outputPattern);
+    _cmdRunner->setOutputPattern(chosenOutputPattern);
     // Interactive renders default to a TIFF stack; a .zarr output path is how
     // the dialog asks for the zarr store instead. That same suffix is what
     // enables its "Also write TIFF slices (Zarr)" checkbox, so the two have to
     // agree or the checkbox has nothing to attach to.
     _cmdRunner->setRenderOutputFormat(
-        outputPattern.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)
+        chosenOutputPattern.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)
             ? CommandLineToolRunner::RenderOutputFormat::Zarr
             : CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
