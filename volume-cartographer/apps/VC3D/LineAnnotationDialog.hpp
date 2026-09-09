@@ -6,6 +6,7 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <functional>
@@ -89,9 +90,12 @@ public:
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
-        QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
+        // One item per link state (kLinkStateCount, indexed by
+        // linkStateIndex): the projected X of a linked fiber and the
+        // connector from the local control point, both in that state's colour.
+        static constexpr size_t kLinkStateCount = 4;
+        std::array<QGraphicsPathItem*, kLinkStateCount> branchLinkFiberIntersections{};
+        std::array<QGraphicsPathItem*, kLinkStateCount> fiberIntersectionConnectors{};
         QGraphicsPathItem* ghostControlPointPrev = nullptr;
         QGraphicsPathItem* ghostControlPointNext = nullptr;
     };
@@ -138,7 +142,9 @@ public:
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {});
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
+        std::function<QString(uint64_t)> fiberDisplayNameForId = {});
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -209,11 +215,11 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
-    void generatedControlPointBranchRequested(const std::string& surfaceName,
-                                              size_t controlPointIndex,
-                                              cv::Vec3f linkedControlPoint,
-                                              bool openAfterCreate,
-                                              cv::Vec3f linkDirection);
+    // New fiber seeded at volumePoint, seed control point linked to the
+    // designated link candidate; linkDirection is the clicked view's normal.
+    void generatedNewLineAnnotationLinkedToCandidateRequested(const std::string& surfaceName,
+                                                              cv::Vec3f volumePoint,
+                                                              cv::Vec3f linkDirection);
     void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
                                                    int branchControlPointIndex);
     void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,

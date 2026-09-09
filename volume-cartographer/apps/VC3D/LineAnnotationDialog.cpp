@@ -75,6 +75,14 @@ namespace {
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
+
+// Index of a link state in the per-state fast overlay item arrays.
+constexpr size_t linkStateIndex(bool pending, bool sameHv)
+{
+    return (pending ? 1u : 0u) | (sameHv ? 2u : 0u);
+}
+constexpr bool linkStatePending(size_t state) { return (state & 1u) != 0; }
+constexpr bool linkStateSameHv(size_t state) { return (state & 2u) != 0; }
 constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
@@ -2333,7 +2341,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState)
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState,
+    std::function<QString(uint64_t)> fiberDisplayNameForId)
 {
     if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
         _generatedViews.linePoints.empty()) {
@@ -2406,6 +2416,8 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.splitFromCandidateEnabled = splitCandidateState.enabled;
     options.splitFromCandidateLabel = splitCandidateState.label;
     options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
+    options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
+    options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
@@ -2413,15 +2425,11 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                   selectedLinePosition,
                                                   selectedPoint);
     };
-    options.addBranch = [this, surfaceName](size_t controlPointIndex,
-                                            cv::Vec3f linkedControlPoint,
-                                            bool openAfterCreate,
-                                            cv::Vec3f linkDirection) {
-        emit generatedControlPointBranchRequested(surfaceName,
-                                                  controlPointIndex,
-                                                  linkedControlPoint,
-                                                  openAfterCreate,
-                                                  linkDirection);
+    options.newLineAnnotationLinkedToCandidate = [this, surfaceName](cv::Vec3f volumePoint,
+                                                                     cv::Vec3f linkDirection) {
+        emit generatedNewLineAnnotationLinkedToCandidateRequested(surfaceName,
+                                                                  volumePoint,
+                                                                  linkDirection);
     };
     options.openBranch = [this](uint64_t branchFiberId, int branchControlPointIndex) {
         emit generatedControlPointBranchOpenRequested(branchFiberId, branchControlPointIndex);
@@ -4134,9 +4142,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
-        !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors ||
+        std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
+                    _fastCurrentCutOverlayItems.branchLinkFiberIntersections.end(),
+                    [](const QGraphicsPathItem* item) { return !item; }) ||
+        std::any_of(_fastCurrentCutOverlayItems.fiberIntersectionConnectors.begin(),
+                    _fastCurrentCutOverlayItems.fiberIntersectionConnectors.end(),
+                    [](const QGraphicsPathItem* item) { return !item; }) ||
         !_fastCurrentCutOverlayItems.ghostControlPointPrev ||
         !_fastCurrentCutOverlayItems.ghostControlPointNext) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
@@ -4234,32 +4245,31 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setZValue(168.5);
 
-        QPen branchLinkFiberIntersectionPen(QColor(210, 95, 255, 245));
-        branchLinkFiberIntersectionPen.setWidthF(1.75);
-        branchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPen(
-            branchLinkFiberIntersectionPen);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setZValue(168.25);
+        // Linked-fiber X markers and their connectors, one item per link
+        // state so each wears its control point's colour.
+        for (size_t state = 0; state < FastCurrentCutOverlayItems::kLinkStateCount; ++state) {
+            const bool pending = linkStatePending(state);
+            const bool sameHv = linkStateSameHv(state);
+            QPen branchLinkFiberIntersectionPen(
+                vc3d::line_annotation::generatedLinkStateColor(pending, sameHv, 245));
+            branchLinkFiberIntersectionPen.setWidthF(1.75);
+            branchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+            auto* xItem = new QGraphicsPathItem();
+            xItem->setPen(branchLinkFiberIntersectionPen);
+            xItem->setBrush(Qt::NoBrush);
+            // Pending glyphs keep drawing over approved ones where they overlap.
+            xItem->setZValue(pending ? 168.3 : 168.25);
+            _fastCurrentCutOverlayItems.branchLinkFiberIntersections[state] = xItem;
 
-        QPen pendingBranchLinkFiberIntersectionPen(QColor(80, 150, 255, 245));
-        pendingBranchLinkFiberIntersectionPen.setWidthF(1.75);
-        pendingBranchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections =
-            new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPen(
-            pendingBranchLinkFiberIntersectionPen);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setZValue(168.3);
-
-        QPen fiberIntersectionConnectorPen(QColor(255, 60, 180, 225));
-        fiberIntersectionConnectorPen.setWidthF(1.4);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPen(
-            fiberIntersectionConnectorPen);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setZValue(164.0);
+            QPen fiberIntersectionConnectorPen(
+                vc3d::line_annotation::generatedLinkStateColor(pending, sameHv, 225));
+            fiberIntersectionConnectorPen.setWidthF(1.4);
+            auto* connectorItem = new QGraphicsPathItem();
+            connectorItem->setPen(fiberIntersectionConnectorPen);
+            connectorItem->setBrush(Qt::NoBrush);
+            connectorItem->setZValue(164.0);
+            _fastCurrentCutOverlayItems.fiberIntersectionConnectors[state] = connectorItem;
+        }
 
         // Hollow dashed rings, deliberately unlike the solid control markers:
         // they sit at a fictional, parallax-shifted spot until they land.
@@ -4276,23 +4286,27 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.ghostControlPointNext->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.ghostControlPointNext->setZValue(155.0);
 
-        viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
-                                {_fastCurrentCutOverlayItems.centerPoint,
-                                 _fastCurrentCutOverlayItems.controlPoints,
-                                 _fastCurrentCutOverlayItems.seedPoints,
-                                 _fastCurrentCutOverlayItems.linkCandidatePoints,
-                                 _fastCurrentCutOverlayItems.splitCandidatePoints,
-                                 _fastCurrentCutOverlayItems.branchControlPoints,
-                                 _fastCurrentCutOverlayItems.pendingBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.fiberIntersections,
-                                 _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
-                                 _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors,
-                                 _fastCurrentCutOverlayItems.ghostControlPointPrev,
-                                 _fastCurrentCutOverlayItems.ghostControlPointNext});
+        std::vector<QGraphicsItem*> groupItems{
+            _fastCurrentCutOverlayItems.centerPoint,
+            _fastCurrentCutOverlayItems.controlPoints,
+            _fastCurrentCutOverlayItems.seedPoints,
+            _fastCurrentCutOverlayItems.linkCandidatePoints,
+            _fastCurrentCutOverlayItems.splitCandidatePoints,
+            _fastCurrentCutOverlayItems.branchControlPoints,
+            _fastCurrentCutOverlayItems.pendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.fiberIntersections,
+            _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
+        for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
+            groupItems.push_back(item);
+        }
+        for (auto* item : _fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
+            groupItems.push_back(item);
+        }
+        groupItems.push_back(_fastCurrentCutOverlayItems.ghostControlPointPrev);
+        groupItems.push_back(_fastCurrentCutOverlayItems.ghostControlPointNext);
+        viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey, std::move(groupItems));
     }
 
     // During an in-place update, draw from the held pre-update views until this
@@ -4444,9 +4458,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
-    QPainterPath branchLinkFiberIntersectionPath;
-    QPainterPath pendingBranchLinkFiberIntersectionPath;
-    QPainterPath fiberIntersectionConnectorPath;
+    std::array<QPainterPath, FastCurrentCutOverlayItems::kLinkStateCount> branchLinkFiberIntersectionPaths;
+    std::array<QPainterPath, FastCurrentCutOverlayItems::kLinkStateCount> fiberIntersectionConnectorPaths;
     auto* currentCutPlane = cutViews.currentCutSurface.get();
     const std::optional<float> intersectionThreshold =
         (currentCutPlane && !cutViews.fiberIntersections.empty())
@@ -4466,20 +4479,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
                 continue;
             }
+            const size_t linkState = linkStateIndex(intersection.pendingBranchLink,
+                                                    intersection.sameHvBranchLink);
             if (intersection.connectorStart && finitePoint(*intersection.connectorStart)) {
                 const QPointF connectorScene =
                     viewer->volumeToScene(*intersection.connectorStart);
                 if (std::isfinite(connectorScene.x()) && std::isfinite(connectorScene.y())) {
-                    fiberIntersectionConnectorPath.moveTo(connectorScene);
-                    fiberIntersectionConnectorPath.lineTo(scenePoint);
+                    fiberIntersectionConnectorPaths[linkState].moveTo(connectorScene);
+                    fiberIntersectionConnectorPaths[linkState].lineTo(scenePoint);
                 }
             }
+            // The link candidate's green keeps precedence on the X.
             QPainterPath& path = intersection.isLinkCandidateFiber
                 ? linkCandidateFiberIntersectionPath
                 : (intersection.projectedBranchLink
-                       ? (intersection.pendingBranchLink
-                              ? pendingBranchLinkFiberIntersectionPath
-                              : branchLinkFiberIntersectionPath)
+                       ? branchLinkFiberIntersectionPaths[linkState]
                        : fiberIntersectionPath);
             path.moveTo(scenePoint + QPointF(-kIntersectionArm, -kIntersectionArm));
             path.lineTo(scenePoint + QPointF(kIntersectionArm, kIntersectionArm));
@@ -4490,12 +4504,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.fiberIntersections->setPath(fiberIntersectionPath);
     _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setPath(
         linkCandidateFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPath(
-        branchLinkFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPath(
-        pendingBranchLinkFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPath(
-        fiberIntersectionConnectorPath);
+    for (size_t state = 0; state < FastCurrentCutOverlayItems::kLinkStateCount; ++state) {
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections[state]->setPath(
+            branchLinkFiberIntersectionPaths[state]);
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors[state]->setPath(
+            fiberIntersectionConnectorPaths[state]);
+    }
 }
 
 void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay,

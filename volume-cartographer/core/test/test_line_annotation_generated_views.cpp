@@ -3805,3 +3805,46 @@ TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the chang
     neverRecorded.orientationEpoch = -1;
     CHECK(paneNeedsOrientationRefresh(neverRecorded, kEpoch));
 }
+
+TEST_CASE("controlled span keeps only the line between the outer control points")
+{
+    using vc3d::line_annotation::linePointsBetweenOuterControlPoints;
+    const std::vector<cv::Vec3d> line{
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
+
+    SUBCASE("interior controls drop both extrapolated tails")
+    {
+        const auto span = linePointsBetweenOuterControlPoints(line, {line[1], line[3]});
+        REQUIRE(span.size() == 3);
+        CHECK(span.front() == line[1]);
+        CHECK(span.back() == line[3]);
+    }
+    SUBCASE("one control is a single point, so nothing of the fiber is drawn")
+    {
+        const auto span = linePointsBetweenOuterControlPoints(line, {line[2]});
+        REQUIRE(span.size() == 1);
+        CHECK(span.front() == line[2]);
+    }
+    SUBCASE("a control off the line has no controlled span")
+    {
+        CHECK(linePointsBetweenOuterControlPoints(line, {line[1], {2.5, 0.0, 0.0}}).empty());
+    }
+    SUBCASE("no controls has no controlled span")
+    {
+        CHECK(linePointsBetweenOuterControlPoints(line, {}).empty());
+    }
+    SUBCASE("a line revisiting a coordinate is mapped in loader order, not by nearest point")
+    {
+        const cv::Vec3d a{0.0, 0.0, 0.0};
+        const cv::Vec3d b{2.0, 0.0, 0.0};
+        const cv::Vec3d c{2.0, 2.0, 0.0};
+        const cv::Vec3d d{0.0, -2.0, 0.0};
+        const std::vector<cv::Vec3d> loop{a, b, c, a, d};
+        const auto span = linePointsBetweenOuterControlPoints(loop, {b, a});
+        // Controls B then A: the second A (index 3), so the span is B, C, A.
+        REQUIRE(span.size() == 3);
+        CHECK(span[0] == b);
+        CHECK(span[1] == c);
+        CHECK(span[2] == a);
+    }
+}
