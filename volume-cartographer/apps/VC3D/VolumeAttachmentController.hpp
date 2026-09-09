@@ -29,7 +29,6 @@ struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
     vc::HttpAuth auth;
-    std::filesystem::path remoteCacheRoot;
     VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
 };
 
