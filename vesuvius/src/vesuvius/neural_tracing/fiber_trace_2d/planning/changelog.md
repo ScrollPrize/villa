@@ -518,3 +518,12 @@
 - Tuned the S1a target global batch 128 on six available H100s. Fixed-run
   verification selected peak LR 0.01 with 100 warmup updates and rejected
   clipping at a threshold slightly above the observed p99 norm.
+
+## 2026-09-09 — Distribution-invariant Fiber3D losses
+
+- Replaced rank-local loss means with one packed global sufficient-statistic
+  reduction per optimizer update, including exact gradient scaling through DDP
+  and unequal virtual microbatches.
+- Made legacy two-branch anti-collapse routing stable under rank partitioning by
+  applying its quota per stream/sample. Three matched two-H100 runs measured a
+  0.04% throughput change, within run noise.

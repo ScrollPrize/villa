@@ -40,7 +40,9 @@ def summarize_experiment(experiment):
                        for key in ("iteration_wall_ms", "wait_ms", "to_device_ms",
                                    "value_augmentation_cuda_ms",
                                    "target_ms", "fw_bw_step_ms", "forward_loss_wall_ms",
-                                   "backward_wall_ms", "optimizer_wall_ms", "scalar_reduce_sync_wall_ms")},
+                                   "loss_stat_sync_wall_ms", "backward_wall_ms",
+                                   "manual_gradient_sync_wall_ms", "optimizer_wall_ms",
+                                   "scalar_reduce_sync_wall_ms")},
             "step1": rows[0] if rows else None,
             "peak_allocated_bytes": max((r.get("peak_allocated_bytes", 0) for r in rows), default=0),
         }
@@ -63,6 +65,7 @@ def summarize_experiment(experiment):
         )
         for key in ("iteration_wall_ms", "wait_ms", "to_device_ms",
                     "value_augmentation_cuda_ms", "target_ms", "fw_bw_step_ms",
+                    "loss_stat_sync_wall_ms", "manual_gradient_sync_wall_ms",
                     "scalar_reduce_sync_wall_ms")
     }
     result = {"experiment": str(experiment), "ranks": ranks,

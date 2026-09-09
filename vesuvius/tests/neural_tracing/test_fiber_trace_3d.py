@@ -164,7 +164,6 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _lr_range_learning_rate,
     _measure_and_clip_gradient_norm,
     _optimizer_microbatch_takes,
-    _optimizer_microbatch_loss_scale,
     _optimizer_virtual_world_size,
     _optimizer_learning_rate_scales,
     _set_optimizer_learning_rate,
@@ -256,19 +255,6 @@ def test_optimizer_microbatch_takes_represent_exact_batch_128_on_six_ranks() -> 
         (16,),
     ]
     assert sum(sum(rank_takes) for rank_takes in takes) == 128
-    scales = [
-        _optimizer_microbatch_loss_scale(
-            take=take,
-            world_size=6,
-            optimizer_global_batch_size=128,
-        )
-        for rank_takes in takes
-        for take in rank_takes
-    ]
-    # DDP averages the accumulated local gradients across six ranks.
-    assert sum(scales) / 6.0 == pytest.approx(1.0)
-
-
 def test_optimizer_virtual_world_requires_full_logical_batches() -> None:
     assert _optimizer_virtual_world_size(
         local_batch_size=16,
@@ -448,6 +434,7 @@ def test_training_hang_watchdog_cancel_and_manual_dump(tmp_path: Path) -> None:
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _DistributedConfig,
+    _LossStatistics,
     _Trace2Cp3DConfig,
     _load_snapshot,
     _optimizer_hparams_from_training,
@@ -470,6 +457,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _distributed_test_batch_indices,
     _distributed_training_batch_index,
     _distributed_training_sample_index,
+    _finalize_loss_statistics,
     _mean_dense_test_rows,
     _report_test_timing,
     _rank_partition,
@@ -480,6 +468,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _require_single_process_cli_mode,
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
+    _slice_batch,
     _training_sample_index_limit,
     _training_cuda_batch_pipeline_depth,
     _training_cuda_value_augmentation,
@@ -549,6 +538,168 @@ def test_training_loss_metrics_are_not_materialized_when_not_due(monkeypatch) ->
         SimpleNamespace(enabled=False),
         due=False,
     ) is None
+
+
+def _synthetic_loss_statistics(value: torch.Tensor, count: int) -> _LossStatistics:
+    zero = value.sum() * 0.0
+    count_tensor = value.new_tensor(float(count))
+    return _LossStatistics(
+        direction_sum=(value.square()).sum(),
+        direction_count=count_tensor,
+        positive_presence_sum=zero,
+        positive_presence_count=zero.detach(),
+        negative_presence_sum=zero,
+        negative_presence_count=zero.detach(),
+        angle_sum=value.sum(),
+        angle_count=count_tensor,
+        branch0_sum=count_tensor,
+        branch1_sum=zero,
+        branch_count=count_tensor,
+        selected_score_sum=value.sum(),
+        selected_score_count=count_tensor,
+    )
+
+
+def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkeypatch) -> None:
+    values = [
+        torch.tensor([1.0], requires_grad=True),
+        torch.tensor([2.0, 4.0], requires_grad=True),
+    ]
+    statistics = [_synthetic_loss_statistics(value, int(value.numel())) for value in values]
+    global_packed = torch.stack(
+        [
+            item.detach().to(dtype=torch.float32).reshape(())
+            for name in (
+                "direction",
+                "positive_presence",
+                "negative_presence",
+                "angle",
+                "branch0",
+                "branch1",
+                "selected_score",
+            )
+            for item in (
+                {
+                    "direction": (sum(s.direction_sum for s in statistics), torch.tensor(3.0)),
+                    "positive_presence": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "negative_presence": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "angle": (sum(s.angle_sum for s in statistics), torch.tensor(3.0)),
+                    "branch0": (torch.tensor(3.0), torch.tensor(3.0)),
+                    "branch1": (torch.tensor(0.0), torch.tensor(3.0)),
+                    "selected_score": (sum(s.selected_score_sum for s in statistics), torch.tensor(3.0)),
+                }[name]
+            )
+        ]
+    )
+
+    def fake_all_reduce(packed, *, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        packed.copy_(global_packed)
+
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.fiber_trace_3d.train.dist.all_reduce",
+        fake_all_reduce,
+    )
+    config = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+    rank_losses = [
+        _finalize_loss_statistics(
+            stat,
+            direction_weight=1.0,
+            presence_weight=0.0,
+            distributed=config,
+        )
+        for stat in statistics
+    ]
+    for loss in rank_losses:
+        assert torch.allclose(loss["direction"], torch.tensor(7.0))
+        loss["total"].backward()
+
+    ddp_averaged_gradient = torch.cat([value.grad for value in values]) / 2.0
+    reference = torch.tensor([1.0, 2.0, 4.0], requires_grad=True)
+    reference.square().mean().backward()
+    assert torch.allclose(ddp_averaged_gradient, reference.grad)
+
+
+def test_two_branch_quota_routing_is_invariant_to_sample_partition() -> None:
+    score = torch.tensor(
+        [[[0.9, 0.1]] * 10 + [[0.8, 0.7]] * 2, [[0.1, 0.9]] * 9 + [[0.7, 0.6]] * 3],
+        dtype=torch.float32,
+    ).reshape(24, 2)
+    indices = torch.zeros((24, 4), dtype=torch.long)
+    indices[:12, 3] = torch.arange(12) * 2
+    indices[12:, 0] = 1
+    indices[12:, 3] = torch.arange(12) * 2
+    streams = torch.tensor([101, 202], dtype=torch.long)
+    together = _select_branch_by_chunked_min_fraction(
+        score,
+        indices,
+        stream_indices=streams,
+        chunk_size=2,
+        min_fraction=0.10,
+    )
+    separate = []
+    for sample in range(2):
+        mask = indices[:, 0] == sample
+        local_indices = indices[mask].clone()
+        local_indices[:, 0] = 0
+        separate.append(
+            _select_branch_by_chunked_min_fraction(
+                score[mask],
+                local_indices,
+                stream_indices=streams[sample : sample + 1],
+                chunk_size=2,
+                min_fraction=0.10,
+            )
+        )
+    assert torch.equal(together, torch.cat(separate))
+
+
+def test_loss_statistics_are_invariant_to_uneven_sparse_sample_partition() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    spatial = tuple(int(v) for v in batch.presence_target.shape[-3:])
+    torch.manual_seed(23)
+    output = torch.sigmoid(torch.randn((2, 7, *spatial), dtype=torch.float32))
+    whole = compute_losses(
+        output,
+        batch,
+        direction_weight=1.25,
+        presence_weight=0.75,
+        _return_statistics=True,
+    )
+    assert isinstance(whole, _LossStatistics)
+    split = None
+    for index in range(2):
+        part = compute_losses(
+            output[index : index + 1],
+            _slice_batch(batch, index, index + 1),
+            direction_weight=1.25,
+            presence_weight=0.75,
+            _return_statistics=True,
+        )
+        assert isinstance(part, _LossStatistics)
+        split = part if split is None else split + part
+    assert split is not None
+    whole_losses = _finalize_loss_statistics(
+        whole,
+        direction_weight=1.25,
+        presence_weight=0.75,
+    )
+    split_losses = _finalize_loss_statistics(
+        split,
+        direction_weight=1.25,
+        presence_weight=0.75,
+    )
+    for key in whole_losses:
+        assert torch.allclose(whole_losses[key], split_losses[key], atol=1.0e-6)
 
 
 def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):

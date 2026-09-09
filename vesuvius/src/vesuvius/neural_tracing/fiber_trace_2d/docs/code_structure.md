@@ -46,10 +46,10 @@ loading.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
-- The fiber 3D wrapper defaults to `BatchNorm3d` normalization. The trainer has
-  no internal micro-batching, so the configured `batch_size` is the real batch
-  used for BatchNorm statistics. Set `model_3d.normalization: "none"` to disable
-  normalization explicitly.
+- The fiber 3D wrapper defaults to `BatchNorm3d` normalization. Configured
+  `batch_size` is the real batch used for each forward's BatchNorm statistics;
+  optional optimizer-global-batch emulation accumulates full logical forwards.
+  Set `model_3d.normalization: "none"` to disable normalization explicitly.
 
 `fiber_trace_3d/inference_adapter.py`
 
@@ -731,8 +731,9 @@ Ownership changed as follows:
   `training.test_control_points: 0` is the explicit full-test sentinel, and
   positive values cap tests to a deterministic random held-out range for
   debugging.
-- `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
-  trainer does not internally micro-batch.
+- `batch_size` is the actual CP-patch batch passed through each 3D U-Net
+  forward. Optimizer-global-batch emulation may retain multiple full logical
+  forward graphs until one globally normalized backward/update.
 - Normal training, distributed dense tests, and `--benchmark --load-only` use
   `torch.utils.data.DataLoader` process workers when
   `training.loader_workers > 0`. Each worker lazily constructs its own
@@ -1891,9 +1892,14 @@ Training keys:
   larger, it must be an integer multiple of `batch_size`. The trainer models
   that many full logical rank-local batches, assigns them cyclically to the
   physical ranks, suppresses automatic DDP reductions, and manually averages
-  the accumulated gradients once per update. This preserves batch-local loss
-  denominators while supporting exact batch-size experiments on fewer physical
-  ranks without increasing per-GPU memory. Because ranks may execute different
+  the accumulated gradients once per update. Loss numerators and denominators
+  are accumulated over every local logical batch and packed into one all-reduce.
+  A detached-value/differentiable-local surrogate compensates for DDP's later
+  physical-world gradient average, giving the same objective and gradients
+  regardless of sparse-target placement. This supports exact batch-size
+  experiments on fewer physical ranks, but ranks assigned multiple logical
+  batches retain multiple forward graphs and therefore use more peak activation
+  memory. Because ranks may execute different
   numbers of forwards, this mode requires the shared sample pipeline, stateless
   normalization such as GroupNorm, and `ddp_broadcast_buffers: false`.
 - `gradient_norm_log_interval`: optional interval for measuring the global L2

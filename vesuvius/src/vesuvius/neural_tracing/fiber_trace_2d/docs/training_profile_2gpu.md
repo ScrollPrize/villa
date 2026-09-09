@@ -532,8 +532,9 @@ global batch of 128 as eight full logical batches. Physical ranks 0 and 1 each
 processed two logical batches; the remaining ranks each processed one. Every
 backward suppressed automatic DDP synchronization; losses were scaled by 6/8,
 then accumulated gradients were summed and divided by six once per update.
-This preserves the batch-local, data-dependent loss denominators used by a real
-eight-rank run. Its roughly 172--175 samples/s fixed-run throughput is limited
+At the time of this tuning run, this preserved rank-local, data-dependent loss
+denominators; the distribution-invariant reduction below supersedes that
+behavior. Its roughly 172--175 samples/s fixed-run throughput is limited
 by the uneven emulation and is not expected production eight-GPU throughput.
 
 The automated suite used 100 linear warmup updates and 600 exponential range
@@ -576,3 +577,45 @@ divergence point, runs every candidate from the same initialization/sample
 stream, and runs one p99-derived clipping comparison at the best unclipped LR.
 It emits consolidated JSON and Markdown reports but deliberately does not make
 the final configuration choice automatically.
+
+## Distribution-invariant loss normalization, 2026-09-09
+
+Fiber3D training now accumulates differentiable numerators and counts for
+direction, positive presence, and negative presence over the complete optimizer
+batch. One packed 14-scalar all-reduce per update supplies global denominators
+and globally identical diagnostics. Positive and negative presence retain the
+existing mean-of-nonempty-sample/branch/query-group balance. The gradient
+surrogate compensates for DDP's subsequent gradient averaging, so uneven sparse
+target placement does not reweight ranks. Legacy two-branch quota repair is now
+per stable stream/sample rather than per rank-local batch.
+
+The matched benchmark used two H100s, 16 samples/GPU, eager BF16 GroupNorm,
+native output stride 4, the S1a NML dataset, shared sample pipeline, asynchronous
+batch preparation, full CUDA value augmentation, 30 warmup steps, and 90
+measured steps:
+
+```bash
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+| Reduction | Global samples/s | Critical step mean / p50 / p95 | Packed loss sync mean / p50 / p95 |
+| --- | ---: | ---: | ---: |
+| old rank-local baseline | 100.948 | 316.66 / 316.02 / 325.75 ms | n/a |
+| global, trial 1 | 100.937 | 315.06 / 316.37 / 327.19 ms | 1.47 / 1.52 / 1.61 ms |
+| global, trial 2 | 100.909 | 315.13 / 315.78 / 326.05 ms | 1.44 / 1.49 / 1.56 ms |
+| global, trial 3 | 100.879 | 315.21 / 316.30 / 326.16 ms | 1.47 / 1.52 / 1.61 ms |
+
+The new mean was 100.908 samples/s, a measured 0.04% reduction from the old
+single trial and well inside run noise. The collective itself occupied about
+1.46ms/update (0.46% of the step), but it overlapped/replaced synchronization
+that the training step already required. A 35-update six-physical-rank smoke
+also completed exact virtual global batch 128 with unequal logical batches;
+`loss_stat_sync` was 1.1--1.6ms on its final update and the existing manual
+gradient reduction remained 6.8--17.9ms across ranks.
+
+Artifacts:
+
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b16_sample_pipeline_async_batch_gpu_all_20260909_102906_490983`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b16_sample_pipeline_async_batch_gpu_all_20260909_103054_457137`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b16_sample_pipeline_async_batch_gpu_all_20260909_103210_548555`
+- `/ephemeral/hendrik/fiber3d_train2/profile_6gpu_off_group_os4_b16_sample_pipeline_async_batch_gpu_all_20260909_103454_880957`

@@ -506,7 +506,17 @@
   positive point by detached
   `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`.
   Legacy two-branch training keeps the deterministic `2x2x2` anti-collapse
-  repair and legacy global-negative branch BCE semantics for old configs.
+  repair, applied independently per stable stream/sample so routing does not
+  depend on DDP partitioning, and legacy global-negative branch BCE semantics
+  for old configs.
+- Every Fiber3D optimization loss is normalized over the complete optimizer
+  batch, independent of its DDP-rank or logical-microbatch partition. Direction
+  uses the global sparse element count. Positive and negative presence retain
+  their balanced mean-of-nonempty-sample/branch/query-group semantics by
+  globally reducing the sums and counts of those group means separately.
+  Training packs all loss and diagnostic sufficient statistics into one
+  all-reduce per optimizer update. Distributed dense tests remain non-lockstep
+  and use their existing local-row gather instead.
 - 3D training defaults `training.direction_weight` to `10.0` and
   `training.presence_weight` to `1.0`, so direction loss is 10x stronger than
   presence loss unless the config overrides it.
@@ -521,7 +531,7 @@
   active multi-direction experiment uses the conditioned query loss above.
   Contrastive embedding remains unsupported by default in the 3D V0 path.
 - The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
-  actual BatchNorm batch because the trainer has no internal micro-batching.
+  actual batch of each model forward.
   `model_3d.normalization` also supports `"group"` and `"none"`. Distributed
   conversion to SyncBatchNorm is controlled by the JSON boolean
   `training.sync_batchnorm` (default true), while DDP buffer broadcast is
@@ -542,9 +552,10 @@
   in-bounds source voxels are valid; negative supervision requires the complete
   source-cell footprint to lie inside configured edge margins.
 - `batch_size` is the actual CP-patch batch passed through the 3D model in one
-  forward/backward call. The 3D trainer does not support internal
-  micro-batching; any BatchNorm statistics must come from the real configured
-  batch.
+  forward. `training.optimizer_global_batch_size` may accumulate multiple full
+  logical batches before one backward/update; any BatchNorm statistics still
+  come from each real configured forward batch, so virtual-batch emulation
+  requires stateless normalization.
 - `training.mixed_precision` controls trainer autocast only and must not
   introduce internal micro-batching. Supported modes are `off`, `bf16`, `fp16`,
   and `auto`. BF16 uses autocast without a scaler; FP16 uses AMP with
