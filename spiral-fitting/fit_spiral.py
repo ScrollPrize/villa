@@ -3921,6 +3921,58 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
+    def _assign_editable_collection_identities(self, record):
+        """Give a committed editable-role addition its role-scoped identity.
+
+        The addition joined the fit under resident ids only; the dataset
+        commit has since renumbered its collections into the role file.
+        Every resident view of them (catalog copy, cross-patch PCL, strip,
+        influence contribution) learns ``(role, committed id)`` so a later
+        replace/delete of that committed collection finds them.
+        """
+        role = record.get('role')
+        input_id = str(record.get('id'))
+        committed_ids = record.get('committed_collection_ids') or {}
+        if role not in EDITABLE_PCL_ROLE_VALUES or not committed_ids:
+            return
+        # Resident collection id -> committed id, from the catalog the
+        # additions were captured into.
+        by_resident_id = {}
+        for cid, pcl in getattr(self, 'regular_pcl_catalog', {}).items():
+            metadata = pcl.get('metadata', {})
+            if metadata.get('ephemeral_input_id') != input_id:
+                continue
+            committed_id = committed_ids.get(
+                str(metadata.get('ephemeral_collection_key')))
+            if committed_id is not None:
+                by_resident_id[cid] = str(committed_id)
+
+        def assign(metadata, committed_id):
+            metadata['logical_input_kind'] = role
+            metadata['logical_input_id'] = committed_id
+            metadata['logical_input_revision'] = None
+
+        for cid, committed_id in by_resident_id.items():
+            assign(self.regular_pcl_catalog[cid].setdefault('metadata', {}),
+                   committed_id)
+        for pcl in self.cross_patch_pcls:
+            metadata = pcl.get('metadata', {})
+            committed_id = by_resident_id.get(
+                metadata.get('resident_collection_id'))
+            if committed_id is not None:
+                assign(metadata, committed_id)
+        for strip in self.unattached_pcl_strips:
+            if strip.get('logical_input_kind') == 'fiber':
+                continue
+            committed_id = by_resident_id.get(strip.get('id'))
+            if committed_id is not None:
+                assign(strip, committed_id)
+        influence_state = getattr(self, 'influence_state', None)
+        if influence_state is not None:
+            for cid, committed_id in by_resident_id.items():
+                influence_state.rename_logical_contribution_(
+                    ('pcl', cid), (role, committed_id))
+
     def _prevalidate_interactive_input(self, record):
         """Load and validate one record without touching resident structures."""
         kind = record.get('kind')
@@ -3954,6 +4006,15 @@ class FitContext:
             if not pcl_input_enabled(self.config, role, path):
                 raise ValueError(
                     f'{role or "legacy"} PCL inputs are disabled for this session')
+            if (role in EDITABLE_PCL_ROLE_VALUES
+                    and record.get('operation') == 'assign_collection_ids'):
+                # Metadata only: the staged copy may already be gone, and
+                # the resident collections it names are found by upload id.
+                if not isinstance(record.get('committed_collection_ids'), dict):
+                    raise ValueError(
+                        f'PCL upload {input_id!r} names no committed '
+                        'collection ids')
+                return
             loaded = load_point_collection(path) or {}
             if not loaded:
                 raise ValueError(
@@ -4228,7 +4289,18 @@ class FitContext:
             deleting_editable_ids = set()
             candidate_fiber_catalog = dict(self.fiber_catalog)
             candidate_next_id = self.next_id
+            # Identity assignments first: a mutation later in this batch may
+            # already target the committed id they hand out.
+            identity_assignments = [
+                record for record in records
+                if record.get('kind') == 'pcl'
+                and record.get('operation') == 'assign_collection_ids'
+            ]
+            for record in identity_assignments:
+                self._assign_editable_collection_identities(record)
             for record in records:
+                if record in identity_assignments:
+                    continue
                 kind = record.get('kind')
                 path = record.get('path')
                 input_id = record.get('id')
@@ -4295,7 +4367,8 @@ class FitContext:
                             (role, str(record.get('target_collection_id'))))
                         replacing_editable = True
                         continue
-                    for pcl in loaded.values():
+                    committed_ids = record.get('committed_collection_ids')
+                    for source_key, pcl in loaded.items():
                         replacement = (
                             editable_role
                             and record.get('operation') == 'replace_collection')
@@ -4337,6 +4410,23 @@ class FitContext:
                                     'base_source_revision'),
                                 'resident_collection_id': collection_id,
                             })
+                        elif editable_role:
+                            # A plain addition. Remember where it came from
+                            # so its committed collection id can be applied
+                            # later; apply it now when commit already
+                            # happened.
+                            pcl['metadata'].update({
+                                'ephemeral_input_id': str(input_id),
+                                'ephemeral_collection_key': str(source_key),
+                            })
+                            committed_id = (committed_ids or {}).get(
+                                str(source_key))
+                            if committed_id is not None:
+                                pcl['metadata'].update({
+                                    'logical_input_kind': role,
+                                    'logical_input_id': str(committed_id),
+                                    'logical_input_revision': None,
+                                })
                         new_collections[collection_id] = pcl
                         new_regular_collections[collection_id] = pcl
                 else:

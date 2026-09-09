@@ -3238,7 +3238,7 @@ class CommitTests(unittest.TestCase):
         active = 0
         max_active = 0
         activity_lock = threading.Lock()
-        original_merge = spiral_service._merge_pcl_documents
+        original_merge = spiral_service._merge_pcl_documents_assigning
 
         def slow_merge(existing, incoming):
             nonlocal active, max_active
@@ -3261,7 +3261,8 @@ class CommitTests(unittest.TestCase):
                 errors.append(exc)
 
         with mock.patch.object(
-                spiral_service, "_merge_pcl_documents", side_effect=slow_merge):
+                spiral_service, "_merge_pcl_documents_assigning",
+                side_effect=slow_merge):
             threads = [
                 threading.Thread(target=commit, args=(self.state,)),
                 threading.Thread(target=commit, args=(state_b,)),
@@ -3653,6 +3654,103 @@ class CommitTests(unittest.TestCase):
         self.assertEqual({(record["kind"], record["id"]): record["committed"]
                           for record in inputs},
                          {("fiber", "shared"): True, ("pcl", "shared"): True})
+
+    def _stage_same_winding_addition(self):
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "old", "points": {}}}}))
+        self._finalize("pcl", "add-same", PCL_FILES, role="same_winding")
+        return target
+
+    def test_committed_addition_ids_travel_with_a_pending_payload(self):
+        # Committed before the fit ever saw it: the payload the next Run
+        # hands the fitter names the collection ids the file assigned, and
+        # incorporation settles the record for good.
+        target = self._stage_same_winding_addition()
+        self.state.commit_inputs()
+        self.assertEqual(
+            sorted(json.loads(target.read_text())["collections"], key=int),
+            ["3", "4"])
+        entry = self.state.status()["ephemeral_inputs"][0]
+        self.assertEqual(entry["committed_collection_ids"], {"0": "4"})
+        self.assertEqual(entry["state"], "pending")
+        self.assertNotIn("operation", entry)
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        self.assertEqual(pending[0]["committed_collection_ids"], {"0": "4"})
+        self.assertNotIn("operation", pending[0])
+        mark(pending)
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+
+    def test_incorporated_addition_is_requeued_to_learn_its_committed_ids(self):
+        # The fit holds the collection under a resident id only; a later
+        # delete/replace of committed collection "4" could not find it.
+        self._stage_same_winding_addition()
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        mark(pending)
+        self.assertEqual(
+            self.state.status()["ephemeral_inputs"][0]["state"],
+            "incorporated")
+        self.state.commit_inputs()
+        entry = self.state.status()["ephemeral_inputs"][0]
+        self.assertEqual(entry["state"], "pending")
+        self.assertTrue(entry["committed"])
+        self.assertEqual(entry["operation"], "assign_collection_ids")
+        self.assertEqual(entry["committed_collection_ids"], {"0": "4"})
+        # It is not an upload any more, so it cannot be withdrawn either.
+        with self.assertRaises(ApiError) as caught:
+            self.state.remove_input("pcl", "add-same")
+        self.assertEqual(caught.exception.status, 409)
+        # A committed record is not offered for commit again.
+        with self.assertRaisesRegex(ApiError, "already committed"):
+            self.state.commit_inputs()
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        self.assertEqual(
+            [(entry["id"], entry["operation"],
+              entry["committed_collection_ids"]) for entry in pending],
+            [("add-same", "assign_collection_ids", {"0": "4"})])
+        mark(pending)
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+
+    def test_addition_committed_while_in_flight_is_requeued_for_its_ids(self):
+        # The payload was claimed (without ids) before the commit happened,
+        # so the incorporation that follows did not deliver them.
+        self._stage_same_winding_addition()
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        self.assertNotIn("committed_collection_ids", pending[0])
+        self.state.commit_inputs()
+        mark(pending)
+        entry = self.state.status()["ephemeral_inputs"][0]
+        self.assertEqual(entry["state"], "pending")
+        self.assertEqual(entry["operation"], "assign_collection_ids")
+        self.assertEqual(entry["committed_collection_ids"], {"0": "4"})
+
+    def test_identity_assignment_is_dispatched_live_to_a_running_fit(self):
+        self._stage_same_winding_addition()
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        mark(pending)
+        self.session.state = SessionState.Running
+        self.state._active_run_influence = {"influence_enabled": True}
+        self.state.commit_inputs()
+        deadline = time.monotonic() + 2
+        while not self.session.live_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(self.session.live_calls), 1)
+        records, _ = self.session.live_calls[0]
+        self.assertEqual(
+            [(entry["id"], entry["operation"],
+              entry["committed_collection_ids"]) for entry in records],
+            [("add-same", "assign_collection_ids", {"0": "4"})])
+        deadline = time.monotonic() + 2
+        while (self.state.status()["ephemeral_inputs"]
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
 
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

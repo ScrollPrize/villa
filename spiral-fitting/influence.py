@@ -394,6 +394,22 @@ class InteractiveInfluenceState:
               f'flow_hr {float((self.masks["flow_hr"] > 0).float().mean()):.4f}, '
               f'anchors held: {int((self.anchor_loss_weight > 0.5).sum())}/{self.anchor_w.shape[0]}')
 
+    def rename_logical_contribution_(self, old_identity, new_identity):
+        """Re-key one input's contribution under its committed identity.
+
+        Masks and anchors are unchanged: the footprint is the same, only the
+        name a later remove_logical_contributions_ finds it under differs.
+        """
+        old_key = (old_identity[0], str(old_identity[1]))
+        new_key = (new_identity[0], str(new_identity[1]))
+        entry = self.contributions.pop(old_key, None)
+        if entry is None:
+            return False
+        entry['kind'], entry['input_id'] = new_key
+        self.contributions[new_key] = entry
+        self.footprints = list(self.contributions.values())
+        return True
+
     @torch.no_grad()
     def remove_logical_contributions_(self, identities, *,
                                       spiral_and_transform, optimiser):

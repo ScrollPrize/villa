@@ -79,12 +79,13 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS,
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
-from service_uploads import (EphemeralLedger, PCL_ROLE_FILES,
+from service_uploads import (EphemeralLedger, PCL_ASSIGN_COLLECTION_IDS,
+                             PCL_ROLE_FILES,
                              UPLOADED_CHECKPOINTS_DIRNAME,
                              UPLOADED_CHECKPOINTS_KEPT,
                              UPLOAD_GC_SECONDS, UploadEnvironment,
                              UploadManager, _copy_publish,
-                             _merge_pcl_documents, _utc_stamp)
+                             _merge_pcl_documents_assigning, _utc_stamp)
 from lasagna_publish import (LasagnaPublisher, PreviewPublication,
                              stop_process_group)
 # Re-exported for the service's own test surface, which addresses the preview
@@ -225,6 +226,8 @@ class _PreparedPclCommit:
     temp: Path
     base_revision: str
     snapshots: list
+    # (kind, id) of each plain addition -> {uploaded key: committed key}
+    collection_ids: dict
 
 
 class ExclusiveFileLock:
@@ -2345,6 +2348,24 @@ class ServiceState:
         return {**self.status(), "input": input_record,
                 "accepted": True}
 
+    def _enqueue_live_incorporation_locked(self, records):
+        """Queue pending records for the running fit; caller holds the lock.
+
+        Nothing happens unless a run with an influence configuration is in
+        progress: the records then wait for the next Run's claim.
+        """
+        if (not records or self.session is None
+                or self.session.status().get("state") != SessionState.Running
+                or self._active_run_influence is None):
+            return
+        for record in records:
+            if record.incorporation != "pending":
+                continue
+            record.incorporation = "queued"
+            if record not in self._live_incorporation_queue:
+                self._live_incorporation_queue.append(record)
+        self._start_live_incorporation_dispatch_locked()
+
     def _start_live_incorporation_dispatch_locked(self):
         """Start the one service dispatcher; caller holds ``self.lock``."""
         if self._live_incorporation_active:
@@ -2359,15 +2380,25 @@ class ServiceState:
     def _finish_incorporation(self, records, *, error=None, outcomes=None,
                               no_future_step=False):
         """Apply a runtime outcome; persistence remains non-fatal."""
+        # Payloads that carried their committed collection ids delivered
+        # the collections' identities with them; an addition committed while
+        # its payload was already in flight has to go back for them.
+        delivered = {
+            (record.get("kind"), record.get("id")) for record in records
+            if record.get("committed_collection_ids") is not None
+        }
         with self.lock:
             resolved = self.ephemeral_records.resolve(records)
             if no_future_step:
                 self.ephemeral_records.return_pending(resolved)
             elif outcomes is not None:
-                self.ephemeral_records.mark_outcomes(outcomes)
+                self.ephemeral_records.mark_outcomes(
+                    outcomes, delivered_identities=delivered)
             else:
                 self.ephemeral_records.mark_incorporated(
-                    resolved, error=error)
+                    resolved, error=error, delivered_identities=delivered)
+            self._enqueue_live_incorporation_locked(
+                self.ephemeral_records.collection_identity_assignments())
             automatic = [
                 (record, record.revision) for record in resolved
                 if record.kind == "fiber" and record.auto_commit
@@ -2602,8 +2633,13 @@ class ServiceState:
                     pcl_commits.append(prepared)
             for prepared in pcl_commits:
                 self._recheck_editable_pcl_commit(prepared)
+            # Editable-role additions learn the collection ids the dataset
+            # file gave them; the resident fit needs them as the collections'
+            # logical identities before a later replace/delete can find them.
+            collection_ids = {}
             for prepared in pcl_commits:
-                self._publish_editable_pcl_commit(prepared, committed)
+                self._publish_editable_pcl_commit(
+                    prepared, committed, collection_ids)
 
             for snapshot in snapshots:
                 if (snapshot.kind, snapshot.id) in handled_editable:
@@ -2629,9 +2665,14 @@ class ServiceState:
                         shutil.copy2(target, backup)
                         with target.open("r", encoding="utf-8") as stream:
                             existing = json.load(stream)
-                        merged = _merge_pcl_documents(existing, incoming)
+                        merged, assigned = _merge_pcl_documents_assigning(
+                            existing, incoming)
                     else:
                         merged = incoming
+                        assigned = {str(int(key)): key
+                                    for key in incoming.get("collections", {})}
+                    if snapshot.role in EDITABLE_PCL_ROLE_VALUES:
+                        collection_ids[(snapshot.kind, snapshot.id)] = assigned
                     temp = target.with_name(
                         f".{target.name}.incoming-{secrets.token_hex(4)}")
                     with temp.open("w", encoding="utf-8") as stream:
@@ -2651,7 +2692,13 @@ class ServiceState:
                         (snapshot.kind, snapshot.id): snapshot.revision
                         for snapshot in snapshots
                         if snapshot.kind == "fiber"
-                    })
+                    },
+                    collection_ids=collection_ids)
+                # Additions the fit already holds under resident ids alone
+                # are re-queued as identity assignments; a running fit takes
+                # them live, an idle one at its next Run.
+                self._enqueue_live_incorporation_locked(
+                    self.ephemeral_records.collection_identity_assignments())
                 if self.dataset_resolution is not None:
                     # Re-advertise the dataset with the committed inputs, but
                     # keep the startup-bound output/cache roots: deployment
@@ -2773,10 +2820,12 @@ class ServiceState:
             and snapshot.record.operation not in {
                 "replace_collection", "delete_collection"}
         ]
+        collection_ids = {}
         for snapshot in additions:
             with Path(snapshot.path).open("r", encoding="utf-8") as stream:
                 incoming = json.load(stream)
-            merged = _merge_pcl_documents(merged, incoming)
+            merged, assigned = _merge_pcl_documents_assigning(merged, incoming)
+            collection_ids[(snapshot.kind, snapshot.id)] = assigned
         temp = target.with_name(
             f".{target.name}.incoming-{secrets.token_hex(4)}")
         try:
@@ -2791,7 +2840,8 @@ class ServiceState:
         handled.update((snapshot.kind, snapshot.id) for snapshot in covered)
         return _PreparedPclCommit(
             role=role_value, label=label, target=target, temp=temp,
-            base_revision=base_revision, snapshots=covered)
+            base_revision=base_revision, snapshots=covered,
+            collection_ids=collection_ids)
 
     def _recheck_editable_pcl_commit(self, prepared):
         """Final CAS under the dataset lock, run for every role before any
@@ -2806,12 +2856,14 @@ class ServiceState:
                 payload={"code": "source_revision_conflict",
                          "current_revision": late_revision})
 
-    def _publish_editable_pcl_commit(self, prepared, committed):
+    def _publish_editable_pcl_commit(self, prepared, committed,
+                                     collection_ids):
         """Replace the role file with the staged merged document."""
         backup = prepared.target.with_name(
             f"{prepared.target.name}.{_utc_stamp()}.bak")
         shutil.copy2(prepared.target, backup)
         os.replace(prepared.temp, prepared.target)
+        collection_ids.update(prepared.collection_ids)
         for snapshot in prepared.snapshots:
             if snapshot.incorporated:
                 Path(snapshot.path).unlink(missing_ok=True)
@@ -2833,7 +2885,8 @@ class ServiceState:
                     HTTPStatus.CONFLICT,
                     "This input is queued for the next optimizer step and "
                     "can no longer be removed")
-            if record.incorporated:
+            if (record.incorporated
+                    or record.operation == PCL_ASSIGN_COLLECTION_IDS):
                 raise ApiError(HTTPStatus.CONFLICT,
                                "This input already joined the resident fit; removing it "
                                "requires reloading the session")

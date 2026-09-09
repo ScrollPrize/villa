@@ -545,6 +545,123 @@ class FiberPointCollectionTests(unittest.TestCase):
             context._build_theta_crossing_map.assert_called_once_with()
 
 
+    def _editable_context(self, cross_patch, strips, groups):
+        context = FitContext.__new__(FitContext)
+        context.config = FitConfig(Config({
+            "z_begin": 0, "z_end": 200,
+        }).as_dict())
+        context.fiber_catalog = {}
+        context.next_id = 30
+        context.verified_patches = {}
+        context.verified_patches_list = []
+        context.cross_patch_pcls = list(cross_patch)
+        context.unattached_pcl_strips = _UnattachedPclStripList(list(strips))
+        context.unattached_strip_sampling_groups = list(groups)
+        context.resolved_links = []
+        context.link_components = []
+        context.link_distance_tolerance = 2.5
+        context.dt_target_cache_manager = mock.Mock()
+        context._rebuild_pcl_sampling_strata = mock.Mock()
+        context._build_theta_crossing_map = mock.Mock(return_value=[])
+        context._trusted_geometry_from_active_inputs = mock.Mock(
+            return_value=torch.empty((0, 3)))
+        context.run_dt_resume_iteration = None
+        context.influence_state = None
+        return context
+
+    def test_live_addition_carrying_committed_ids_is_deletable_by_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            document = {
+                "vc_pointcollections_json_version": "1",
+                "collections": {"5": {"name": "added", "points": {
+                    "0": {"p": [0, 0, 10], "creation_time": 1},
+                    "1": {"p": [4, 0, 12], "creation_time": 2},
+                }}},
+            }
+            addition_path = Path(temporary) / "addition.json"
+            addition_path.write_text(json.dumps(document))
+            deletion_path = Path(temporary) / "deletion.json"
+            deletion_path.write_text(json.dumps(document))
+            context = self._editable_context([], [], [])
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                # Committed before incorporation: the dataset file gave the
+                # uploaded collection "5" the id "9".
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{"kind": "pcl", "id": "add-upload",
+                      "path": str(addition_path), "role": "same_winding",
+                      "committed_collection_ids": {"5": "9"}}],
+                    {"influence_enabled": False})
+                self.assertEqual(len(context.unattached_pcl_strips), 1)
+                strip = context.unattached_pcl_strips[0]
+                self.assertEqual(strip["id"], 30)
+                self.assertEqual((strip["logical_input_kind"],
+                                  strip["logical_input_id"]),
+                                 ("same_winding", "9"))
+                catalog = context.regular_pcl_catalog[30]["metadata"]
+                self.assertEqual(catalog["ephemeral_input_id"], "add-upload")
+                self.assertEqual(catalog["ephemeral_collection_key"], "5")
+                self.assertEqual(catalog["logical_input_id"], "9")
+                # A later deletion of committed collection "9" finds it.
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{"kind": "pcl", "id": "delete-upload",
+                      "path": str(deletion_path), "role": "same_winding",
+                      "operation": "delete_collection",
+                      "target_collection_id": "9",
+                      "base_source_revision": "source-r2"}],
+                    {"influence_enabled": False})
+            self.assertEqual(list(context.unattached_pcl_strips), [])
+            self.assertEqual(context.unattached_strip_sampling_groups, [])
+            self.assertEqual(context.regular_pcl_catalog, {})
+
+    def test_identity_assignment_rekeys_every_resident_view(self):
+        added_metadata = {
+            "input_role": "same_winding",
+            "resident_collection_id": 17,
+            "ephemeral_input_id": "add-upload",
+            "ephemeral_collection_key": "5",
+        }
+        cross = {"id": 17, "metadata": dict(added_metadata), "points": {},
+                 "sampling_group": "staged"}
+        strip = {"id": 17, "logical_input_kind": None,
+                 "logical_input_id": None, "logical_input_revision": None,
+                 "zyxs": np.zeros((2, 3), dtype=np.float32),
+                 "windings": np.zeros(2, dtype=np.float32)}
+        other_strip = {"id": 22, "logical_input_kind": None,
+                       "logical_input_id": None,
+                       "zyxs": np.ones((2, 3), dtype=np.float32),
+                       "windings": np.zeros(2, dtype=np.float32)}
+        context = self._editable_context(
+            [cross], [strip, other_strip], ["staged", "unrelated"])
+        context.regular_pcl_catalog = {
+            17: {"id": 17, "metadata": dict(added_metadata), "points": {}}}
+        context.influence_state = mock.Mock()
+        # The staged copy is gone by now; the assignment must not need it.
+        with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                mock.patch.object(torch.cuda, "set_rng_state_all"):
+            result = context.incorporate_interactive_inputs(
+                [{"kind": "pcl", "id": "add-upload", "role": "same_winding",
+                  "path": "/nowhere/gone.json",
+                  "operation": "assign_collection_ids",
+                  "committed_collection_ids": {"5": "9"}}],
+                {"influence_enabled": False},
+                current_iteration=0, target_iteration=0)
+        self.assertEqual(result["outcomes"][0]["state"], "incorporated")
+        for metadata in (cross["metadata"],
+                         context.regular_pcl_catalog[17]["metadata"]):
+            self.assertEqual((metadata["logical_input_kind"],
+                              metadata["logical_input_id"]),
+                             ("same_winding", "9"))
+        self.assertEqual((strip["logical_input_kind"],
+                          strip["logical_input_id"]), ("same_winding", "9"))
+        self.assertIsNone(other_strip["logical_input_kind"])
+        context.influence_state.rename_logical_contribution_.assert_called_once_with(
+            ("pcl", 17), ("same_winding", "9"))
+        # Metadata only: no pools were rebuilt.
+        context._rebuild_pcl_sampling_strata.assert_not_called()
+        context._build_theta_crossing_map.assert_not_called()
+
+
 class TifxyzMetadataTests(unittest.TestCase):
     def _write_patch(self, root, metadata):
         (root / "meta.json").write_text(json.dumps(metadata))

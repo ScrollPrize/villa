@@ -49,6 +49,14 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Role -> conventional filename for ephemeral PCL uploads, from the
 # declarative fit-input catalog.
+# Staged replace/delete of one committed editable-role collection.
+PCL_MUTATION_OPERATIONS = frozenset({"replace_collection", "delete_collection"})
+# Not an upload: a committed editable-role addition whose collections the
+# resident fit already holds under resident ids only. The fitter applies the
+# committed collection ids as the collections' logical identities so later
+# replace/delete mutations can find them.
+PCL_ASSIGN_COLLECTION_IDS = "assign_collection_ids"
+
 PCL_ROLE_FILES = {
     role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
 
@@ -260,16 +268,29 @@ def _validate_upload_content(kind, role, directory, *, operation=None,
     raise ApiError(HTTPStatus.BAD_REQUEST, f"Unknown input kind {kind!r}")
 
 
-def _merge_pcl_documents(existing, incoming):
-    """Merge the incoming multi-collection document into the existing one."""
+def _merge_pcl_documents_assigning(existing, incoming):
+    """Merge the incoming multi-collection document into the existing one.
+
+    Returns the merged document and the mapping from each incoming
+    collection key to the key it received in the merged document: the
+    identity an editable-role collection has from now on.
+    """
     merged = dict(existing)
     collections = dict(existing.get("collections", {}))
     next_id = max((int(key) for key in collections), default=-1) + 1
-    for _, collection in sorted(incoming.get("collections", {}).items(),
-                                key=lambda item: int(item[0])):
+    assigned = {}
+    for key, collection in sorted(incoming.get("collections", {}).items(),
+                                  key=lambda item: int(item[0])):
         collections[str(next_id)] = collection
+        assigned[str(int(key))] = str(next_id)
         next_id += 1
     merged["collections"] = collections
+    return merged, assigned
+
+
+def _merge_pcl_documents(existing, incoming):
+    """Merge the incoming multi-collection document into the existing one."""
+    merged, _ = _merge_pcl_documents_assigning(existing, incoming)
     return merged
 
 
@@ -345,6 +366,9 @@ class EphemeralInput:
     operation: Optional[str] = None
     target_collection_id: Optional[str] = None
     base_source_revision: Optional[str] = None
+    # Editable-role additions: the collection ids the dataset file gave this
+    # upload's collections at commit, keyed by the uploaded collection key.
+    committed_collection_ids: Optional[dict] = None
 
     @classmethod
     def from_record(cls, record):
@@ -375,6 +399,15 @@ class EphemeralInput:
         # revision cursors even after their current content settles.
         return self.kind != "fiber" and self.committed and self.incorporated
 
+    @property
+    def carries_collection_identity(self):
+        """An editable-role addition whose committed collection ids the
+        resident fit must learn before it can be considered done."""
+        return (self.kind == "pcl"
+                and self.role in EDITABLE_PCL_ROLE_VALUES
+                and self.committed_collection_ids is not None
+                and self.operation in (None, PCL_ASSIGN_COLLECTION_IDS))
+
     def payload(self):
         """The plain record the fitter (and its DDP children) receive."""
         record = {
@@ -393,12 +426,17 @@ class EphemeralInput:
                 "operation": ("replace" if self.incorporated_revision
                               else "add"),
             })
-        if self.operation:
+        if self.operation in PCL_MUTATION_OPERATIONS:
             record.update({
                 "operation": self.operation,
                 "target_collection_id": self.target_collection_id,
                 "base_source_revision": self.base_source_revision,
             })
+        elif self.operation:
+            record["operation"] = self.operation
+        if self.committed_collection_ids is not None:
+            record["committed_collection_ids"] = dict(
+                self.committed_collection_ids)
         return record
 
     def status_entry(self):
@@ -418,12 +456,17 @@ class EphemeralInput:
                 result["error_revision"] = self.error_revision
             if self.revision_errors:
                 result["revision_errors"] = dict(self.revision_errors)
-        if self.operation:
+        if self.operation in PCL_MUTATION_OPERATIONS:
             result.update({
                 "operation": self.operation,
                 "target_collection_id": self.target_collection_id,
                 "base_source_revision": self.base_source_revision,
             })
+        elif self.operation:
+            result["operation"] = self.operation
+        if self.committed_collection_ids is not None:
+            result["committed_collection_ids"] = dict(
+                self.committed_collection_ids)
         return result
 
 
@@ -549,12 +592,19 @@ class EphemeralLedger:
             return [record for record in self._records
                     if (record.kind, record.id) in wanted]
 
-    def mark_incorporated(self, records, error=None):
-        """Record the outcome of one incorporation attempt."""
+    def mark_incorporated(self, records, error=None, delivered_identities=()):
+        """Record the outcome of one incorporation attempt.
+
+        ``delivered_identities`` names the ``(kind, id)`` records whose
+        payload carried their committed collection ids into the fitter.
+        """
+        delivered = set(delivered_identities)
         with self._lock:
             for record in records:
                 record.incorporation = "error" if error else "incorporated"
                 record.error = error
+                if not error:
+                    self._settle_collection_identity(record, delivered)
                 if record.kind == "fiber":
                     if error:
                         record.error_revision = record.revision
@@ -566,12 +616,13 @@ class EphemeralLedger:
             if error is None:
                 self._drop_settled()
 
-    def mark_outcomes(self, outcomes):
+    def mark_outcomes(self, outcomes, delivered_identities=()):
         """Apply per-record runtime outcomes keyed by (kind, id)."""
         by_identity = {
             (outcome.get("kind"), outcome.get("id")): outcome
             for outcome in outcomes
         }
+        delivered = set(delivered_identities)
         with self._lock:
             for record in self._records:
                 outcome = by_identity.get((record.kind, record.id))
@@ -597,13 +648,49 @@ class EphemeralLedger:
                 record.error = outcome.get("error") if state == "error" else None
                 if record.kind == "fiber" and state == "incorporated":
                     record.error_revision = None
+                if state == "incorporated":
+                    self._settle_collection_identity(record, delivered)
             self._drop_settled()
 
-    def mark_committed(self, records, fiber_revisions=None):
+    def _settle_collection_identity(self, record, delivered):
+        """After an incorporation: an editable-role addition whose committed
+        collection ids did not ride along in its payload goes back to
+        pending as an identity assignment. Caller holds the lock."""
+        if (record.carries_collection_identity
+                and (record.kind, record.id) not in delivered):
+            self._schedule_collection_identity_locked(record)
+
+    def _schedule_collection_identity_locked(self, record):
+        record.operation = PCL_ASSIGN_COLLECTION_IDS
+        record.incorporation = "pending"
+        record.error = None
+
+    def collection_identity_assignments(self):
+        """Committed additions the resident fit has yet to learn the ids of."""
+        with self._lock:
+            return [record for record in self._records
+                    if record.operation == PCL_ASSIGN_COLLECTION_IDS
+                    and record.incorporation == "pending"]
+
+    def mark_committed(self, records, fiber_revisions=None,
+                       collection_ids=None):
+        """Record a dataset commit.
+
+        ``collection_ids`` maps ``(kind, id)`` of editable-role additions to
+        the collection ids the dataset file gave their collections. An
+        addition the fit already incorporated under resident ids alone is
+        scheduled as an identity assignment instead of leaving the ledger.
+        """
         fiber_revisions = dict(fiber_revisions or {})
+        collection_ids = dict(collection_ids or {})
         with self._lock:
             for record in records:
                 record.persistence = "committed"
+                assigned = collection_ids.get((record.kind, record.id))
+                if assigned is not None:
+                    record.committed_collection_ids = dict(assigned)
+                    if record.incorporated:
+                        self._schedule_collection_identity_locked(record)
                 if record.kind == "fiber":
                     committed_revision = fiber_revisions.get(
                         (record.kind, record.id), record.revision)
