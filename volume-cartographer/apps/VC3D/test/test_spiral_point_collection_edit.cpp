@@ -16,6 +16,8 @@ private slots:
     void screenSpaceHitIndexVisitsNearbyCellsOnly();
     void hoverScaleAndIncompleteNewCollection();
     void linkedCollectionsAreReadOnly();
+    void relativeWindingsCountFromZeroAndMirrorOnReverse();
+    void relativeImportKeepsAnnotationsAndRequiresThemForEditing();
 };
 
 namespace {
@@ -235,6 +237,115 @@ void SpiralPointCollectionEditTest::hoverScaleAndIncompleteNewCollection()
     QVERIFY(!draft.isIncompleteNewCollection());
     draft.collectionId = QStringLiteral("12");
     QVERIFY(!draft.isIncompleteNewCollection());
+}
+
+void SpiralPointCollectionEditTest::relativeWindingsCountFromZeroAndMirrorOnReverse()
+{
+    using vc3d::spiral::editablePclPointWinding;
+    using vc3d::spiral::editablePclPointWindingLabel;
+
+    vc3d::spiral::EditablePclDraft same;
+    same.appendPreviewPoint({1.0f, 2.0f, 3.0f});
+    same.appendPreviewPoint({4.0f, 5.0f, 6.0f});
+    for (const auto& point : same.points) {
+        QVERIFY(point.sourcePayload.value(QStringLiteral("wind_a")).isNull());
+        QVERIFY(!editablePclPointWinding(point));
+        QVERIFY(editablePclPointWindingLabel(point).isEmpty());
+    }
+    same.reverse();
+    QVERIFY(same.points[0].sourcePayload.value(QStringLiteral("wind_a")).isNull());
+
+    vc3d::spiral::EditablePclDraft relative;
+    relative.role = vc3d::spiral::PclRole::Relative;
+    relative.appendPreviewPoint({1.0f, 0.0f, 0.0f});
+    relative.appendPreviewPoint({2.0f, 0.0f, 0.0f});
+    relative.appendPreviewPoint({3.0f, 0.0f, 0.0f});
+    const auto windings = [](const vc3d::spiral::EditablePclDraft& draft) {
+        QList<double> values;
+        for (const auto& point : draft.points)
+            values.push_back(editablePclPointWinding(point).value_or(-1.0));
+        return values;
+    };
+    QCOMPARE(windings(relative), QList<double>({0.0, 1.0, 2.0}));
+    QCOMPARE(editablePclPointWindingLabel(relative.points[2]), QStringLiteral("2"));
+
+    // Flipping reverses the chain and mirrors the annotations, so the
+    // winding count still ascends along the new order: the constraint's
+    // direction is what changes, not just the point ids.
+    relative.reverse();
+    QCOMPARE(relative.points[0].previewPosition, cv::Vec3f(3.0f, 0.0f, 0.0f));
+    QCOMPARE(windings(relative), QList<double>({0.0, 1.0, 2.0}));
+    relative.appendPreviewPoint({4.0f, 0.0f, 0.0f});
+    QCOMPARE(windings(relative), QList<double>({0.0, 1.0, 2.0, 3.0}));
+    QVERIFY(relative.erase(1));
+    QCOMPARE(windings(relative), QList<double>({0.0, 2.0, 3.0}));
+    relative.reverse();
+    QCOMPARE(windings(relative), QList<double>({0.0, 1.0, 3.0}));
+
+    const QJsonObject points = relative.replacementDocument().object()
+        .value(QStringLiteral("collections")).toObject()
+        .value(QString()).toObject()
+        .value(QStringLiteral("points")).toObject();
+    QCOMPARE(points.value(QStringLiteral("0")).toObject()
+                 .value(QStringLiteral("wind_a")).toDouble(), 0.0);
+    QCOMPARE(points.value(QStringLiteral("2")).toObject()
+                 .value(QStringLiteral("wind_a")).toDouble(), 3.0);
+}
+
+void SpiralPointCollectionEditTest::relativeImportKeepsAnnotationsAndRequiresThemForEditing()
+{
+    QJsonObject annotated = point({1.0, 1.0, 1.0}, 1);
+    annotated[QStringLiteral("wind_a")] = 9.0;
+    QJsonObject annotatedTwo = point({2.0, 2.0, 2.0}, 2);
+    annotatedTwo[QStringLiteral("wind_a")] = 10.0;
+    QJsonObject annotatedThree = point({3.0, 3.0, 3.0}, 3);
+    annotatedThree[QStringLiteral("wind_a")] = 12.0;
+    const QJsonDocument document(QJsonObject{
+        {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
+        {QStringLiteral("collections"), QJsonObject{
+            {QStringLiteral("4"), QJsonObject{
+                {QStringLiteral("name"), QStringLiteral("wraps")},
+                {QStringLiteral("points"), QJsonObject{
+                    {QStringLiteral("0"), annotated},
+                    {QStringLiteral("1"), annotatedTwo},
+                    {QStringLiteral("2"), annotatedThree},
+                }},
+            }},
+            {QStringLiteral("5"), QJsonObject{
+                {QStringLiteral("name"), QStringLiteral("mixed")},
+                {QStringLiteral("points"), QJsonObject{
+                    {QStringLiteral("0"), annotated},
+                    {QStringLiteral("1"), point({2.0, 2.0, 2.0}, 2)},
+                }},
+            }},
+        }},
+    });
+    auto drafts = vc3d::spiral::importEditablePcls(
+        document, 1.0, QString(64, QLatin1Char('e')), true,
+        vc3d::spiral::PclRole::Relative);
+    QCOMPARE(drafts.size(), std::size_t(2));
+    QCOMPARE(static_cast<int>(drafts[0].role),
+             static_cast<int>(vc3d::spiral::PclRole::Relative));
+    QVERIFY(drafts[0].editable);
+    // An unannotated point would be dropped by the fitter on replacement.
+    QVERIFY(!drafts[1].editable);
+
+    auto& wraps = drafts[0];
+    wraps.appendPreviewPoint({4.0f, 4.0f, 4.0f});
+    QCOMPARE(*vc3d::spiral::editablePclPointWinding(wraps.points[3]), 13.0);
+    // Mirroring keeps the range: 9, 10, 12, 13 -> 9, 10, 12, 13 reversed
+    // in space, i.e. the former first point now carries 13.
+    wraps.reverse();
+    QCOMPARE(wraps.points[3].previewPosition, cv::Vec3f(1.0f, 1.0f, 1.0f));
+    QCOMPARE(*vc3d::spiral::editablePclPointWinding(wraps.points[3]), 13.0);
+    QCOMPARE(*vc3d::spiral::editablePclPointWinding(wraps.points[0]), 9.0);
+    QCOMPARE(*vc3d::spiral::editablePclPointWinding(wraps.points[1]), 10.0);
+    QCOMPARE(*vc3d::spiral::editablePclPointWinding(wraps.points[2]), 12.0);
+
+    // Same-winding import ignores annotations and stays editable.
+    const auto sameWinding = vc3d::spiral::importEditablePcls(
+        document, 1.0, QString(64, QLatin1Char('f')), true);
+    QVERIFY(sameWinding[1].editable);
 }
 
 QTEST_MAIN(SpiralPointCollectionEditTest)

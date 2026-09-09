@@ -100,7 +100,10 @@ from config import Config
 # Version 31 is this branch's combined live-input/editor contract. It separates
 # client-local drafts from submitted inputs, adds CAS revisions for fibers and
 # same-winding collections, and publishes the same-winding artifact metadata.
-API_VERSION = 31
+# Version 32 publishes a relative-winding point-cloud artifact next to the
+# same-winding one and opens the collection-mutation protocol to the
+# ``relative`` role, so both editable PCL roles share one client workflow.
+API_VERSION = 32
 
 
 class SessionState(str, Enum):
@@ -151,6 +154,16 @@ class PclRole(str, Enum):
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
     DRAWN_CONTROL_POINTS = "drawn_control_points"
+
+
+# Roles whose conventional file the service snapshots as a display artifact
+# and whose collections a client may replace or delete in place. Both roles
+# share one PointCollections document shape; a relative collection carries an
+# integer ``wind_a`` per point whose pairwise differences are the constraint,
+# a same-winding collection carries none.
+EDITABLE_PCL_ROLES: tuple[PclRole, ...] = (PclRole.SAME_WINDING, PclRole.RELATIVE)
+EDITABLE_PCL_ROLE_VALUES: frozenset[str] = frozenset(
+    role.value for role in EDITABLE_PCL_ROLES)
 
 
 _INPUT_TOGGLE_KEYS = {

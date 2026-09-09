@@ -31,7 +31,8 @@ from typing import Callable, Optional
 
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
-from fit_session import PCL_ROLE_CONVENTIONS, validate_checkpoint_container
+from fit_session import (EDITABLE_PCL_ROLE_VALUES, PCL_ROLE_CONVENTIONS,
+                         validate_checkpoint_container)
 from vc3d_fiber_format_adapter import parse_vc3d_fiber_format
 
 
@@ -143,7 +144,7 @@ def _load_single_json(directory, kind):
         raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
 
 
-def _validate_replacement_document(document, target_collection_id):
+def _validate_replacement_document(document, target_collection_id, role=None):
     collections = document.get("collections")
     if not isinstance(collections, dict) \
             or list(collections) != [target_collection_id]:
@@ -192,6 +193,16 @@ def _validate_replacement_document(document, target_collection_id):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Replacement creation_time values must strictly increase")
         previous_time = creation_time
+        if role == "relative":
+            # The fitter drops unannotated points from a partially annotated
+            # collection, so a relative replacement must annotate every point.
+            winding = point.get("wind_a")
+            if not isinstance(winding, (int, float)) \
+                    or isinstance(winding, bool) or not math.isfinite(winding):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Relative-winding replacement point {point_id} needs a "
+                    "finite wind_a annotation")
 
 
 def _validate_deletion_document(document, target_collection_id):
@@ -242,7 +253,7 @@ def _validate_upload_content(kind, role, directory, *, operation=None,
         if role not in PCL_ROLE_FILES:
             raise ApiError(HTTPStatus.BAD_REQUEST, "PCL uploads must declare a valid role")
         if operation == "replace_collection":
-            _validate_replacement_document(document, target_collection_id)
+            _validate_replacement_document(document, target_collection_id, role)
         elif operation == "delete_collection":
             _validate_deletion_document(document, target_collection_id)
         return
@@ -641,9 +652,10 @@ class UploadEnvironment:
     #: (kind, id, declared bytes, base revision, content revision).
     reserve_ephemeral: Callable[[str, str, int, Optional[str], Optional[str]], None] = \
         lambda kind, input_id, declared, base_revision, revision: None
-    #: CAS and link-safety validation for a same-winding replacement.
-    validate_pcl_replacement: Callable[[str, str], None] = \
-        lambda target_collection_id, base_source_revision: None
+    #: CAS and link-safety validation for an editable-role collection
+    #: replacement. Called with (role, target collection id, base revision).
+    validate_pcl_replacement: Callable[[str, str, str], None] = \
+        lambda role, target_collection_id, base_source_revision: None
 
 
 @dataclass
@@ -763,12 +775,13 @@ class UploadManager:
         target_collection_id = request.get("target_collection_id")
         base_source_revision = request.get("base_source_revision")
         if operation is not None:
-            if kind != "pcl" or role != "same_winding" \
+            if kind != "pcl" or role not in EDITABLE_PCL_ROLE_VALUES \
                     or operation not in {
                         "replace_collection", "delete_collection"}:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "Collection mutations are only valid for same_winding PCL uploads")
+                    "Collection mutations are only valid for same_winding or "
+                    "relative PCL uploads")
             target_collection_id = str(target_collection_id or "")
             if not re.fullmatch(r"0|[1-9][0-9]*", target_collection_id):
                 raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -850,11 +863,12 @@ class UploadManager:
                 self.environment.require_session()
                 if operation in {"replace_collection", "delete_collection"}:
                     self.environment.validate_pcl_replacement(
-                        target_collection_id, base_source_revision)
+                        role, target_collection_id, base_source_revision)
                     if any(
                             pending.record is None
                             and pending.operation in {
                                 "replace_collection", "delete_collection"}
+                            and pending.role == role
                             and pending.target_collection_id == target_collection_id
                             for pending in self.uploads.values()):
                         raise ApiError(
@@ -951,7 +965,8 @@ class UploadManager:
                                 for name in missing])
             if upload.operation in {"replace_collection", "delete_collection"}:
                 self.environment.validate_pcl_replacement(
-                    upload.target_collection_id, upload.base_source_revision)
+                    upload.role, upload.target_collection_id,
+                    upload.base_source_revision)
             _validate_upload_content(
                 upload.kind, upload.role, upload.staging_dir,
                 operation=upload.operation,

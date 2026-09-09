@@ -3,7 +3,6 @@
 
 namespace {
 constexpr qreal kPointPlacementDotRadius = 3.0;
-const QColor kPointPlacementColor(50, 255, 215);
 }
 
 SpiralBrushCursorWidget::SpiralBrushCursorWidget(QWidget* parent)
@@ -16,12 +15,13 @@ SpiralBrushCursorWidget::SpiralBrushCursorWidget(QWidget* parent)
 
 void SpiralBrushCursorWidget::setCursorState(
     const QPointF& position, int diameter, bool brushDiameterVisible,
-    bool pointPlacementVisible)
+    bool pointPlacementVisible, const QColor& pointPlacementColor)
 {
     _position = position;
     _diameter = diameter;
     _brushDiameterVisible = brushDiameterVisible;
     _pointPlacementVisible = pointPlacementVisible;
+    _pointPlacementColor = pointPlacementColor;
     update();
 }
 
@@ -64,7 +64,7 @@ void SpiralBrushCursorWidget::paintEvent(QPaintEvent*)
     }
     if (_pointPlacementVisible) {
         painter.setPen(Qt::NoPen);
-        painter.setBrush(kPointPlacementColor);
+        painter.setBrush(_pointPlacementColor);
         painter.drawEllipse(_position, kPointPlacementDotRadius,
                             kPointPlacementDotRadius);
         return;

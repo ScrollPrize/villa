@@ -62,7 +62,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
+from fit_session import (API_VERSION, EDITABLE_PCL_ROLES,
+                         EDITABLE_PCL_ROLE_VALUES, FIT_INPUT_CATALOG,
+                         SESSION_BUSY_STATES,
                          SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
                          PclRole, ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir,
@@ -95,6 +97,25 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
 
 
 SERVICE_VERSION = "10.0.0"
+# Per editable PCL role: the /session/status key carrying its display
+# artifact, the artifact registry kind, the artifact directory prefix, and the
+# human label used in client-facing messages.
+PCL_ARTIFACT_STATUS_KEYS = {
+    PclRole.SAME_WINDING.value: "same_winding_artifact",
+    PclRole.RELATIVE.value: "relative_winding_artifact",
+}
+PCL_ARTIFACT_KINDS = {
+    PclRole.SAME_WINDING.value: "spiral-same-winding-pcl",
+    PclRole.RELATIVE.value: "spiral-relative-winding-pcl",
+}
+PCL_ARTIFACT_DIR_PREFIXES = {
+    PclRole.SAME_WINDING.value: "same-winding",
+    PclRole.RELATIVE.value: "relative-winding",
+}
+PCL_ROLE_LABELS = {
+    PclRole.SAME_WINDING.value: "same-winding",
+    PclRole.RELATIVE.value: "relative-winding",
+}
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
@@ -571,7 +592,8 @@ class ServiceState:
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
-        self.same_winding_artifact = None
+        # Display artifacts of the editable PCL roles, keyed by role value.
+        self.pcl_artifacts = {}
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -662,7 +684,8 @@ class ServiceState:
             # never opens an overlay never waits for one.
             response["preview_diagnostics_artifact"] = (
                 self._preview.diagnostics_artifact)
-            response["same_winding_artifact"] = self.same_winding_artifact
+            for role_value, status_key in PCL_ARTIFACT_STATUS_KEYS.items():
+                response[status_key] = self.pcl_artifacts.get(role_value)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -1100,8 +1123,8 @@ class ServiceState:
                   preview, scroll),
             name="spiral-session-build", daemon=True).start()
         threading.Thread(
-            target=self._refresh_same_winding_artifact,
-            name="spiral-same-winding-publish", daemon=True).start()
+            target=self._refresh_pcl_artifacts,
+            name="spiral-pcl-artifact-publish", daemon=True).start()
 
     def _build(self, session_id, previous, previous_ephemeral, paths, run,
                preview, scroll):
@@ -1158,13 +1181,16 @@ class ServiceState:
         self.ephemeral_records.clear()
         self.uploads_manager.reset()
         previous_raw = self._preview.reset_session_scope()
-        self.same_winding_artifact = None
+        self.pcl_artifacts = {}
         if previous_raw:
             shutil.rmtree(
                 Path(previous_raw).parent, ignore_errors=True)
 
-    def _publish_same_winding_artifact(self, source_path=None):
-        """Snapshot the active same-winding PCL without exposing host paths."""
+    def _publish_pcl_artifact(self, role, source_path=None):
+        """Snapshot one editable role's PCL file without exposing host paths."""
+        role = PclRole(role)
+        if role not in EDITABLE_PCL_ROLES:
+            raise ValueError(f"{role.value} PCLs have no display artifact")
         with self.lock:
             session_id = self.session_id
             paths = self.session_paths
@@ -1175,36 +1201,38 @@ class ServiceState:
         source = Path(source_path) if source_path else None
         if source is None:
             for pcl in paths.pcls:
-                if pcl.role == PclRole.SAME_WINDING and pcl.path:
+                if pcl.role == role and pcl.path:
                     source = Path(pcl.path)
                     break
         if source is None:
-            candidate = (Path(paths.dataset_root) /
-                         PCL_ROLE_FILES[PclRole.SAME_WINDING.value])
+            candidate = Path(paths.dataset_root) / PCL_ROLE_FILES[role.value]
             if candidate.is_file():
                 source = candidate
         if source is None or not source.is_file():
             with self.lock:
-                self.same_winding_artifact = None
+                self.pcl_artifacts.pop(role.value, None)
             return None
         base_shape = None
         if resolution is not None and resolution.scroll_spec is not None:
             base_shape = resolution.scroll_spec.get("base_shape_zyx")
         if base_shape is None:
             with self.lock:
-                self.same_winding_artifact = None
+                self.pcl_artifacts.pop(role.value, None)
             return None
+        kind = PCL_ARTIFACT_KINDS[role.value]
         root = (Path(paths.output_directory) / ".spiral-artifacts" /
-                f"same-winding-{generation}-{secrets.token_hex(6)}")
+                f"{PCL_ARTIFACT_DIR_PREFIXES[role.value]}-{generation}-"
+                f"{secrets.token_hex(6)}")
         root.mkdir(parents=True, exist_ok=False)
         try:
-            pcl_name = "same_windings.json"
+            pcl_name = PCL_ROLE_FILES[role.value]
             shutil.copy2(source, root / pcl_name)
             source_revision = self._file_sha256(source)
-            editable = self._same_winding_source_editable(source)
+            editable = self._pcl_source_editable(role, source)
             descriptor = {
                 "schema_version": 1,
-                "kind": "spiral-same-winding-pcl",
+                "kind": kind,
+                "role": role.value,
                 "base_shape_zyx": list(base_shape),
                 "pcl_file": pcl_name,
                 "source_revision": source_revision,
@@ -1213,8 +1241,9 @@ class ServiceState:
             (root / "manifest.json").write_text(
                 json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
             ref = self.artifacts.register_directory(
-                "spiral-same-winding-pcl", session_id, generation, root,
+                kind, session_id, generation, root,
                 "manifest.json", delete_root_on_prune=True)
+            ref["role"] = role.value
             ref["base_shape_zyx"] = list(base_shape)
             ref["source_revision"] = source_revision
             ref["editable"] = editable
@@ -1222,22 +1251,28 @@ class ServiceState:
                 if self.session_id != session_id:
                     shutil.rmtree(root, ignore_errors=True)
                     return None
-                self.same_winding_artifact = ref
+                self.pcl_artifacts[role.value] = ref
                 self.status_generation += 1
-            self.artifacts.prune("spiral-same-winding-pcl", session_id, 1)
+            self.artifacts.prune(kind, session_id, 1)
             return ref
         except BaseException:
             shutil.rmtree(root, ignore_errors=True)
             raise
 
-    def _refresh_same_winding_artifact(self, source_path=None):
+    def _refresh_pcl_artifact(self, role, source_path=None):
+        role = PclRole(role)
         try:
-            self._publish_same_winding_artifact(source_path)
+            self._publish_pcl_artifact(role, source_path)
         except Exception as exc:
             self.events.append(
-                "log", f"Same-winding overlay could not be published: "
-                f"{type(exc).__name__}: {exc}", severity="warning",
-                source="service", operation="publishing_same_winding")
+                "log", f"{PCL_ROLE_LABELS[role.value].capitalize()} overlay "
+                f"could not be published: {type(exc).__name__}: {exc}",
+                severity="warning", source="service",
+                operation=f"publishing_{role.value}")
+
+    def _refresh_pcl_artifacts(self):
+        for role in EDITABLE_PCL_ROLES:
+            self._refresh_pcl_artifact(role)
 
     def _status_changed(self, status):
         # Runs on the fitter thread inside the pause/export window, so artifact
@@ -2069,25 +2104,27 @@ class ServiceState:
                 digest.update(block)
         return digest.hexdigest()
 
-    def _same_winding_source_path(self):
+    def _pcl_source_path(self, role):
+        role = PclRole(role)
         with self.lock:
             paths = self.session_paths
         if paths is None:
             return None
         for pcl in paths.pcls:
-            if pcl.role == PclRole.SAME_WINDING and pcl.path:
+            if pcl.role == role and pcl.path:
                 return Path(pcl.path)
         candidate = (Path(paths.dataset_root) /
-                     PCL_ROLE_FILES[PclRole.SAME_WINDING.value])
+                     PCL_ROLE_FILES[role.value])
         return candidate if candidate.is_file() else None
 
-    def _same_winding_source_editable(self, source):
+    def _pcl_source_editable(self, role, source):
+        role = PclRole(role)
         with self.lock:
             paths = self.session_paths
         if paths is None:
             return False
         configured = (Path(paths.dataset_root) /
-                      PCL_ROLE_FILES[PclRole.SAME_WINDING.value])
+                      PCL_ROLE_FILES[role.value])
         try:
             return (Path(source).resolve() == configured.resolve()
                     and Path(source).is_file()
@@ -2123,18 +2160,23 @@ class ServiceState:
                     return True
         return False
 
-    def _validate_pcl_replacement(self, target_collection_id,
+    def _validate_pcl_replacement(self, role, target_collection_id,
                                   base_source_revision):
-        source = self._same_winding_source_path()
-        if source is None or not self._same_winding_source_editable(source):
+        if role not in EDITABLE_PCL_ROLE_VALUES:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Collection mutations are only valid for same_winding or "
+                           "relative PCL uploads")
+        label = PCL_ROLE_LABELS[role]
+        source = self._pcl_source_path(role)
+        if source is None or not self._pcl_source_editable(role, source):
             raise ApiError(HTTPStatus.CONFLICT,
-                           "The same-winding source is not editable")
+                           f"The {label} source is not editable")
         current = self._file_sha256(source)
         if current != base_source_revision:
-            self._refresh_same_winding_artifact(source)
+            self._refresh_pcl_artifact(role, source)
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                "The same-winding source changed since this draft was created",
+                f"The {label} source changed since this draft was created",
                 payload={"code": "source_revision_conflict",
                          "current_revision": current})
         try:
@@ -2142,19 +2184,20 @@ class ServiceState:
                 document = json.load(stream)
         except (OSError, ValueError) as exc:
             raise ApiError(HTTPStatus.CONFLICT,
-                           f"The same-winding source cannot be read: {exc}") from exc
+                           f"The {label} source cannot be read: {exc}") from exc
         collections = document.get("collections")
         if not isinstance(collections, dict) \
                 or target_collection_id not in collections:
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "The target same-winding collection does not exist")
+                           f"The target {label} collection does not exist")
         if self._collection_has_affected_links(collections,
                                                target_collection_id):
             raise ApiError(HTTPStatus.CONFLICT,
-                           "Linked same-winding collections cannot be changed safely")
+                           f"Linked {label} collections cannot be changed safely")
         with self.lock:
             if any(record.operation in {
                        "replace_collection", "delete_collection"}
+                   and record.role == role
                    and record.target_collection_id == target_collection_id
                    for record in self.ephemeral_records.records):
                 raise ApiError(
@@ -2518,103 +2561,13 @@ class ServiceState:
                 # auto-commit sticky for later revisions.
 
             committed = []
-            mutation_snapshots = [
-                snapshot for snapshot in snapshots
-                if snapshot.kind == "pcl"
-                and snapshot.role == PclRole.SAME_WINDING.value
-                and snapshot.record.operation in {
-                    "replace_collection", "delete_collection"}
-            ]
-            handled_same_winding = set()
-            if mutation_snapshots:
-                target = self._same_winding_source_path()
-                if target is None or not self._same_winding_source_editable(target):
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        "The configured same-winding source is no longer editable")
-                bases = {snapshot.record.base_source_revision
-                         for snapshot in mutation_snapshots}
-                if len(bases) != 1:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        "Same-winding changes in one commit must share a source revision")
-                base_revision = next(iter(bases))
-                current_revision = self._file_sha256(target)
-                if current_revision != base_revision:
-                    self._refresh_same_winding_artifact(target)
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        "The same-winding source changed before commit",
-                        payload={"code": "source_revision_conflict",
-                                 "current_revision": current_revision})
-                with target.open("r", encoding="utf-8") as stream:
-                    merged_same_winding = json.load(stream)
-                target_collections = merged_same_winding.get("collections")
-                target_ids = [snapshot.record.target_collection_id
-                              for snapshot in mutation_snapshots]
-                if len(set(target_ids)) != len(target_ids):
-                    raise ApiError(HTTPStatus.CONFLICT,
-                                   "A commit cannot change one collection twice")
-                for snapshot, target_id in zip(mutation_snapshots,
-                                               target_ids):
-                    if target_id not in target_collections:
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            f"Same-winding collection {target_id} no longer exists")
-                    if snapshot.record.operation == "delete_collection":
-                        del target_collections[target_id]
-                    else:
-                        with Path(snapshot.path).open(
-                                "r", encoding="utf-8") as stream:
-                            incoming = json.load(stream)
-                        target_collections[target_id] = \
-                            incoming["collections"][target_id]
-                    handled_same_winding.add(snapshot.id)
-                # Ordinary same-winding additions are applied after all
-                # replacements, against the same in-memory source snapshot.
-                same_winding_additions = [
-                    snapshot for snapshot in snapshots
-                    if snapshot.kind == "pcl"
-                    and snapshot.role == PclRole.SAME_WINDING.value
-                    and snapshot.record.operation not in {
-                        "replace_collection", "delete_collection"}
-                ]
-                for snapshot in same_winding_additions:
-                    with Path(snapshot.path).open("r", encoding="utf-8") as stream:
-                        incoming = json.load(stream)
-                    merged_same_winding = _merge_pcl_documents(
-                        merged_same_winding, incoming)
-                    handled_same_winding.add(snapshot.id)
-                temp = target.with_name(
-                    f".{target.name}.incoming-{secrets.token_hex(4)}")
-                try:
-                    with temp.open("w", encoding="utf-8") as stream:
-                        json.dump(merged_same_winding, stream, indent=2)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    # Final CAS under the dataset lock closes non-cooperating
-                    # source writers between load and publication.
-                    late_revision = self._file_sha256(target)
-                    if late_revision != base_revision:
-                        self._refresh_same_winding_artifact(target)
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            "The same-winding source changed during commit",
-                            payload={"code": "source_revision_conflict",
-                                     "current_revision": late_revision})
-                    backup = target.with_name(
-                        f"{target.name}.{_utc_stamp()}.bak")
-                    shutil.copy2(target, backup)
-                    os.replace(temp, target)
-                finally:
-                    temp.unlink(missing_ok=True)
-                for snapshot in mutation_snapshots + same_winding_additions:
-                    if snapshot.incorporated:
-                        Path(snapshot.path).unlink(missing_ok=True)
-                    committed.append(snapshot.id)
+            handled_editable = set()
+            for role in EDITABLE_PCL_ROLES:
+                self._commit_editable_pcl_mutations(
+                    role, snapshots, handled_editable, committed)
 
             for snapshot in snapshots:
-                if snapshot.id in handled_same_winding:
+                if snapshot.id in handled_editable:
                     continue
                 source = Path(snapshot.path)
                 # A still-pending record keeps its staged copy: it remains the
@@ -2690,18 +2643,125 @@ class ServiceState:
                     for record in fiber_records.values():
                         self._cleanup_fiber_revision_files(record)
             commit_lock.release()
-        same_winding_target = next((
-            str(Path(self.session_paths.dataset_root) /
-                PCL_ROLE_FILES[PclRole.SAME_WINDING.value])
-            for snapshot in snapshots
+        refreshed_roles = sorted({
+            snapshot.role for snapshot in snapshots
             if snapshot.kind == "pcl"
-            and snapshot.role == PclRole.SAME_WINDING.value
-        ), None)
-        if same_winding_target is not None:
-            self._refresh_same_winding_artifact(same_winding_target)
-            response = {**response,
-                        "same_winding_artifact": self.same_winding_artifact}
+            and snapshot.role in EDITABLE_PCL_ROLE_VALUES})
+        for role_value in refreshed_roles:
+            self._refresh_pcl_artifact(
+                role_value,
+                str(Path(self.session_paths.dataset_root) /
+                    PCL_ROLE_FILES[role_value]))
+        if refreshed_roles:
+            response = {**response, **{
+                PCL_ARTIFACT_STATUS_KEYS[role_value]:
+                    self.pcl_artifacts.get(role_value)
+                for role_value in refreshed_roles}}
         return response
+
+    def _commit_editable_pcl_mutations(self, role, snapshots, handled,
+                                       committed):
+        """Apply one role's staged replace/delete mutations to its file.
+
+        Ordinary additions of the same role are merged against the same
+        in-memory snapshot so a single atomic write covers everything that
+        commit touches in that file. Runs under the dataset commit lock.
+        """
+        role_value = PclRole(role).value
+        label = PCL_ROLE_LABELS[role_value]
+        mutation_snapshots = [
+            snapshot for snapshot in snapshots
+            if snapshot.kind == "pcl"
+            and snapshot.role == role_value
+            and snapshot.record.operation in {
+                "replace_collection", "delete_collection"}
+        ]
+        if not mutation_snapshots:
+            return
+        target = self._pcl_source_path(role_value)
+        if target is None or not self._pcl_source_editable(role_value, target):
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"The configured {label} source is no longer editable")
+        bases = {snapshot.record.base_source_revision
+                 for snapshot in mutation_snapshots}
+        if len(bases) != 1:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"{label.capitalize()} changes in one commit must share a "
+                "source revision")
+        base_revision = next(iter(bases))
+        current_revision = self._file_sha256(target)
+        if current_revision != base_revision:
+            self._refresh_pcl_artifact(role_value, target)
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"The {label} source changed before commit",
+                payload={"code": "source_revision_conflict",
+                         "current_revision": current_revision})
+        with target.open("r", encoding="utf-8") as stream:
+            merged = json.load(stream)
+        target_collections = merged.get("collections")
+        target_ids = [snapshot.record.target_collection_id
+                      for snapshot in mutation_snapshots]
+        if len(set(target_ids)) != len(target_ids):
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "A commit cannot change one collection twice")
+        for snapshot, target_id in zip(mutation_snapshots, target_ids):
+            if target_id not in target_collections:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"{label.capitalize()} collection {target_id} no longer exists")
+            if snapshot.record.operation == "delete_collection":
+                del target_collections[target_id]
+            else:
+                with Path(snapshot.path).open(
+                        "r", encoding="utf-8") as stream:
+                    incoming = json.load(stream)
+                target_collections[target_id] = \
+                    incoming["collections"][target_id]
+            handled.add(snapshot.id)
+        # Ordinary additions of this role are applied after all
+        # replacements, against the same in-memory source snapshot.
+        additions = [
+            snapshot for snapshot in snapshots
+            if snapshot.kind == "pcl"
+            and snapshot.role == role_value
+            and snapshot.record.operation not in {
+                "replace_collection", "delete_collection"}
+        ]
+        for snapshot in additions:
+            with Path(snapshot.path).open("r", encoding="utf-8") as stream:
+                incoming = json.load(stream)
+            merged = _merge_pcl_documents(merged, incoming)
+            handled.add(snapshot.id)
+        temp = target.with_name(
+            f".{target.name}.incoming-{secrets.token_hex(4)}")
+        try:
+            with temp.open("w", encoding="utf-8") as stream:
+                json.dump(merged, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Final CAS under the dataset lock closes non-cooperating
+            # source writers between load and publication.
+            late_revision = self._file_sha256(target)
+            if late_revision != base_revision:
+                self._refresh_pcl_artifact(role_value, target)
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"The {label} source changed during commit",
+                    payload={"code": "source_revision_conflict",
+                             "current_revision": late_revision})
+            backup = target.with_name(
+                f"{target.name}.{_utc_stamp()}.bak")
+            shutil.copy2(target, backup)
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+        for snapshot in mutation_snapshots + additions:
+            if snapshot.incorporated:
+                Path(snapshot.path).unlink(missing_ok=True)
+            committed.append(snapshot.id)
 
     def remove_input(self, kind, input_id):
         with self.lock:

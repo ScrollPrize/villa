@@ -266,12 +266,18 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _brush->bindToViewerManager(_viewerManager.get());
     _lineDraftOverlay = std::make_unique<SpiralLineDraftOverlay>(this);
     _lineDraftOverlay->bindToViewerManager(_viewerManager.get());
-    _sameWindingCollection = std::make_unique<VCCollection>(this);
-    _sameWindingOverlay = std::make_unique<PointsOverlayController>(
-        _sameWindingCollection.get(), this, true);
-    _sameWindingOverlay->bindToViewerManager(_viewerManager.get());
-    _sameWindingOverlay->setVisible(false);
-    _brush->setSameWindingHitOverlay(_sameWindingOverlay.get());
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        auto& state = pclOverlay(role);
+        state.collection = std::make_unique<VCCollection>(this);
+        state.overlay = std::make_unique<PointsOverlayController>(
+            state.collection.get(), this, true);
+        state.overlay->bindToViewerManager(_viewerManager.get());
+        state.overlay->setVisible(false);
+        // Relative-winding points are read by their winding labels.
+        state.overlay->setShowWindingLabels(
+            vc3d::spiral::pclRoleHasWindingAnnotations(role));
+        _brush->setPclHitOverlay(role, state.overlay.get());
+    }
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
     _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
@@ -301,6 +307,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                                 appendLineAnnotationDraftPoint(scenePoint, modifiers);
                         });
             }
+        } else {
+            // Point collections can also be placed on the plane views.
+            _brush->bindPlaneViewer(viewer);
         }
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
@@ -413,18 +422,21 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 }
                 maybeCommitForPendingExit();
             });
-    connect(_service, &SpiralServiceManager::sameWindingCommitConflict, this,
+    connect(_service, &SpiralServiceManager::pclCommitConflict, this,
             [this](const QString& currentRevision, const QString&) {
-                _sameWindingCommitConflictRevision = currentRevision;
+                _pclCommitConflictRevision = currentRevision;
             });
     connect(_service,
-            &SpiralServiceManager::sameWindingReplacementUploadFinished,
+            &SpiralServiceManager::pclReplacementUploadFinished,
             this, [this](const QString& inputId, const QString& currentRevision,
                          const QString& error) {
                 auto pending = _pendingPointCollectionPaths.find(inputId);
                 if (pending == _pendingPointCollectionPaths.end()) return;
                 const QString path = pending.value();
                 _pendingPointCollectionPaths.erase(pending);
+                const QString roleName = vc3d::spiral::pclRoleDisplayName(
+                    _replacementPointCollectionRoles.value(
+                        inputId, vc3d::spiral::PclRole::SameWinding));
                 if (error.isEmpty()) {
                     _pointCollectionProvisionalPaths[inputId] = path;
                     _uncommittedPointCollectionIds.insert(inputId);
@@ -434,14 +446,16 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                         _visibleUncommittedPointCollectionIds);
                     _brush->finalizationSucceeded(inputId);
                     statusBar()->showMessage(
-                        tr("Staged same-winding change %1; it is used on the next run")
-                            .arg(inputId), 15000);
+                        tr("Staged %1 change %2; it is used on the next run")
+                            .arg(roleName, inputId), 15000);
                 } else {
                     QFile::remove(path);
+                    _replacementPointCollectionRoles.remove(inputId);
                     _commitAfterBrushUploads = false;
                     if (!currentRevision.isEmpty()) {
                         QMessageBox box(
-                            QMessageBox::Warning, tr("Same-winding source changed"),
+                            QMessageBox::Warning,
+                            tr("%1 source changed").arg(roleName),
                             tr("The source changed after this collection was edited. "
                                "The local draft was not overwritten."),
                             QMessageBox::NoButton, this);
@@ -460,7 +474,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     } else {
                         _brush->finalizationFailed(inputId);
                         QMessageBox::warning(
-                            this, tr("Same-winding change failed"), error);
+                            this, tr("%1 change failed").arg(roleName), error);
                     }
                 }
                 maybeCommitForPendingExit();
@@ -527,13 +541,14 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 if (!error.isEmpty()) {
                     _commitAfterBrushUploads = false;
                     _pendingExitAction = {};
-                    if (!_sameWindingCommitConflictRevision.isEmpty()
+                    if (!_pclCommitConflictRevision.isEmpty()
                         && !_replacementPointCollectionIds.isEmpty()) {
                         QMessageBox box(
                             QMessageBox::Warning,
-                            tr("Same-winding source changed"),
-                            tr("The source changed before the edits were committed. "
-                               "Local drafts were not overwritten."),
+                            tr("Point-collection source changed"),
+                            tr("A same-winding or relative-winding source file changed "
+                               "before the edits were committed. Local drafts were "
+                               "not overwritten."),
                             QMessageBox::NoButton, this);
                         auto* keep = box.addButton(tr("Keep Draft"),
                                                    QMessageBox::RejectRole);
@@ -547,6 +562,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                             const QString path = _pointCollectionProvisionalPaths.take(id);
                             if (!path.isEmpty()) QFile::remove(path);
                             _uncommittedPointCollectionIds.remove(id);
+                            _replacementPointCollectionRoles.remove(id);
                             _visibleUncommittedPointCollectionIds.remove(id);
                             // A pending collection change can be removed immediately.
                             // If it already joined a live run the service keeps
@@ -564,10 +580,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     } else {
                         QMessageBox::warning(this, tr("Commit failed"), error);
                     }
-                    _sameWindingCommitConflictRevision.clear();
+                    _pclCommitConflictRevision.clear();
                     return;
                 }
-                _sameWindingCommitConflictRevision.clear();
+                _pclCommitConflictRevision.clear();
                 for (const QString& id : committed) {
                     const QString path = _brushProvisionalPaths.take(id);
                     if (!path.isEmpty()) QDir(path).removeRecursively();
@@ -576,6 +592,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     if (!pclPath.isEmpty()) QFile::remove(pclPath);
                     _uncommittedPointCollectionIds.remove(id);
                     _replacementPointCollectionIds.remove(id);
+                    _replacementPointCollectionRoles.remove(id);
                     _visibleUncommittedPointCollectionIds.remove(id);
                 }
                 _brush->setVisiblePointCollectionIds(
@@ -679,31 +696,34 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _showSurfaceOverlap = shown;
         updateSurfaceIntersections();
     });
-    connect(_panel, &SpiralPanel::sameWindingPclsChanged, this,
-            [this](bool shown) {
-                _sameWindingPclsVisible = shown;
-                if (_brush) _brush->setSameWindingSourceVisible(shown);
-                if (_sameWindingOverlay) _sameWindingOverlay->setVisible(shown);
+    connect(_panel, &SpiralPanel::pclOverlayChanged, this,
+            [this](vc3d::spiral::PclRole role, bool shown) {
+                auto& state = pclOverlay(role);
+                state.visible = shown;
+                if (_brush) _brush->setPclSourceVisible(role, shown);
+                if (state.overlay) state.overlay->setVisible(shown);
             });
     const auto applyPointViewTolerance = [this](double tolerance) {
-        if (_sameWindingOverlay)
-            _sameWindingOverlay->setViewTolerance(tolerance);
+        for (auto& state : _pclOverlays) {
+            if (state.overlay) state.overlay->setViewTolerance(tolerance);
+        }
         if (_brush) _brush->setPointViewTolerance(tolerance);
     };
     applyPointViewTolerance(_panel->pointViewTolerance());
     connect(_panel, &SpiralPanel::pointViewToleranceChanged,
             this, applyPointViewTolerance);
     connect(_brush.get(),
-            &SpiralBrushController::suppressedSameWindingCollectionIdsChanged,
-            this, [this](const QSet<QString>& ids) {
-                if (!_sameWindingOverlay) return;
+            &SpiralBrushController::suppressedPclCollectionIdsChanged,
+            this, [this](vc3d::spiral::PclRole role, const QSet<QString>& ids) {
+                auto& state = pclOverlay(role);
+                if (!state.overlay) return;
                 QSet<qulonglong> numericIds;
                 for (const QString& id : ids) {
                     bool ok = false;
                     const qulonglong numeric = id.toULongLong(&ok);
                     if (ok) numericIds.insert(numeric);
                 }
-                _sameWindingOverlay->setHiddenCollectionIds(numericIds);
+                state.overlay->setHiddenCollectionIds(numericIds);
             });
     connect(_panel, &SpiralPanel::runDiffChanged, this, [this](bool shown) {
         _runDiffVisible = shown;
@@ -733,8 +753,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::previewDiagnosticsAvailable, this,
             &SpiralWorkspace::installPreviewDiagnostics);
-    connect(_service, &SpiralServiceManager::sameWindingArtifactAvailable, this,
-            &SpiralWorkspace::installSameWindingArtifact);
+    connect(_service, &SpiralServiceManager::pclArtifactAvailable, this,
+            &SpiralWorkspace::installPclArtifact);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
@@ -770,9 +790,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _lineAnnotationController->unregisterExternalFiberSource(
                         _externalFiberSource.toStdString());
                 _externalFiberSource.clear();
-                _sameWindingManifestPath.clear();
-                _sameWindingBaseShapeZYX.reset();
-                refreshSameWindingOverlay();
+                for (auto& state : _pclOverlays) {
+                    state.manifestPath.clear();
+                    state.baseShapeZYX.reset();
+                }
+                refreshPclOverlays();
             });
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this,
             &SpiralWorkspace::updatePendingPatchIds);
@@ -823,7 +845,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _pointCollectionProvisionalPaths.clear();
                 _uncommittedPointCollectionIds.clear();
                 _replacementPointCollectionIds.clear();
-                _sameWindingCommitConflictRevision.clear();
+                _replacementPointCollectionRoles.clear();
+                _pclCommitConflictRevision.clear();
                 _visibleUncommittedPointCollectionIds.clear();
                 _brush->setVisiblePointCollectionIds({});
                 ++_runDiffRequestRevision;
@@ -1062,8 +1085,8 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")
             && (input.value(QStringLiteral("role")).toString()
                     == QStringLiteral("drawn_control_points")
-                || input.value(QStringLiteral("role")).toString()
-                    == QStringLiteral("same_winding"))
+                || vc3d::spiral::pclRoleFromName(
+                    input.value(QStringLiteral("role")).toString()))
             && !input.value(QStringLiteral("committed")).toBool()) {
             uncommittedDrawnPointCollections.insert(
                 input.value(QStringLiteral("id")).toString());
@@ -1673,9 +1696,11 @@ void SpiralWorkspace::finalizeBrushPaint()
                                  tr("Could not write %1").arg(path));
         } else {
             _pendingPointCollectionPaths[document.id] = path;
-            if (!document.operation.isEmpty()) {
-                _service->uploadSameWindingReplacement(
-                    path, document.id, document.operation,
+            const auto role = vc3d::spiral::pclRoleFromName(document.role);
+            if (!document.operation.isEmpty() && role) {
+                _replacementPointCollectionRoles[document.id] = *role;
+                _service->uploadPclReplacement(
+                    *role, path, document.id, document.operation,
                     document.targetCollectionId,
                     document.baseSourceRevision);
             } else {
@@ -1723,7 +1748,8 @@ void SpiralWorkspace::discardBrushWork()
     _pointCollectionProvisionalPaths.clear();
     _uncommittedPointCollectionIds.clear();
     _replacementPointCollectionIds.clear();
-    _sameWindingCommitConflictRevision.clear();
+    _replacementPointCollectionRoles.clear();
+    _pclCommitConflictRevision.clear();
     _visibleUncommittedPointCollectionIds.clear();
     _brush->setVisiblePointCollectionIds({});
     const QStringList brushSurfaceIds = _surfaceCategoryIds.take(QStringLiteral("brush"));
@@ -1743,7 +1769,7 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
     }
     QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral drawn inputs"),
                     tr("This Spiral session contains brush paint, control-point lines, or "
-                       "same-winding point collections that "
+                       "same-winding / relative-winding point collections that "
                        "have not been committed to the dataset."), QMessageBox::NoButton, this);
     auto* commit = box.addButton(tr("Commit"), QMessageBox::AcceptRole);
     auto* exit = box.addButton(tr("Exit Without Commit"), QMessageBox::DestructiveRole);
@@ -2164,7 +2190,7 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _previewSourceId = result.surfaceId;
     _previewBaseShapeZYX = result.baseShapeZYX;
     updatePreviewCoordinateScale();
-    refreshSameWindingOverlay();
+    refreshPclOverlays();
     _previewComponents = result.components;
     _previewWindingIds = result.windingIds;
     _previewRunDiffImagePath = result.runDiffImagePath;
@@ -2223,84 +2249,95 @@ void SpiralWorkspace::installPreviewDiagnostics(const QString& manifestPath,
     updateLossMapOverlay();
 }
 
-void SpiralWorkspace::installSameWindingArtifact(
-    const QString& manifestPath, const QJsonObject& artifactRef)
+void SpiralWorkspace::installPclArtifact(
+    vc3d::spiral::PclRole role, const QString& manifestPath,
+    const QJsonObject& artifactRef)
 {
-    _sameWindingManifestPath = manifestPath;
+    auto& state = pclOverlay(role);
+    state.manifestPath = manifestPath;
     QString shapeError;
-    _sameWindingBaseShapeZYX = parseBaseShapeZYX(
+    state.baseShapeZYX = parseBaseShapeZYX(
         artifactRef.value(QStringLiteral("base_shape_zyx")), &shapeError);
-    if (!_sameWindingBaseShapeZYX) {
+    if (!state.baseShapeZYX) {
         QFile file(manifestPath);
         if (file.open(QIODevice::ReadOnly)) {
             const QJsonObject descriptor =
                 QJsonDocument::fromJson(file.readAll()).object();
-            _sameWindingBaseShapeZYX = parseBaseShapeZYX(
+            state.baseShapeZYX = parseBaseShapeZYX(
                 descriptor.value(QStringLiteral("base_shape_zyx")), &shapeError);
         }
     }
-    refreshSameWindingOverlay();
+    refreshPclOverlay(role);
 }
 
-void SpiralWorkspace::refreshSameWindingOverlay()
+void SpiralWorkspace::refreshPclOverlays()
 {
-    if (!_panel || !_sameWindingCollection || !_sameWindingOverlay) return;
-    _sameWindingOverlay->setVisible(false);
-    _sameWindingCollection->clearAll();
-    if (_sameWindingManifestPath.isEmpty()) {
-        _brush->setSameWindingSource({}, 1.0, {}, false);
-        _panel->setSameWindingPclsAvailable(false);
+    for (const auto role : vc3d::spiral::kEditablePclRoles) refreshPclOverlay(role);
+}
+
+void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
+{
+    auto& state = pclOverlay(role);
+    if (!_panel || !state.collection || !state.overlay) return;
+    const QString roleName = vc3d::spiral::pclRoleDisplayName(role);
+    state.overlay->setVisible(false);
+    state.collection->clearAll();
+    if (state.manifestPath.isEmpty()) {
+        _brush->setPclSource(role, {}, 1.0, {}, false);
+        _panel->setPclOverlayAvailable(role, false);
         return;
     }
-    if (!_previewBaseShapeZYX || !_sameWindingBaseShapeZYX) {
-        _panel->setSameWindingPclsAvailable(
-            false, tr("The preview or same-winding artifact has no coordinate-domain metadata"));
+    if (!_previewBaseShapeZYX || !state.baseShapeZYX) {
+        _panel->setPclOverlayAvailable(
+            role, false,
+            tr("The preview or %1 artifact has no coordinate-domain metadata")
+                .arg(roleName));
         return;
     }
     double scale = 1.0;
     try {
         scale = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
-            *_sameWindingBaseShapeZYX, *_previewBaseShapeZYX);
+            *state.baseShapeZYX, *_previewBaseShapeZYX);
     } catch (const std::exception& error) {
-        _panel->setSameWindingPclsAvailable(
-            false, tr("The same-winding PCL coordinate domain is incompatible: %1")
-                       .arg(QString::fromUtf8(error.what())));
+        _panel->setPclOverlayAvailable(
+            role, false, tr("The %1 PCL coordinate domain is incompatible: %2")
+                             .arg(roleName, QString::fromUtf8(error.what())));
         return;
     }
-    QFile descriptorFile(_sameWindingManifestPath);
+    QFile descriptorFile(state.manifestPath);
     if (!descriptorFile.open(QIODevice::ReadOnly)) {
-        _panel->setSameWindingPclsAvailable(
-            false, tr("The downloaded same-winding descriptor cannot be opened"));
+        _panel->setPclOverlayAvailable(
+            role, false, tr("The downloaded %1 descriptor cannot be opened").arg(roleName));
         return;
     }
     const QJsonObject descriptor =
         QJsonDocument::fromJson(descriptorFile.readAll()).object();
     const QString relative = descriptor.value(QStringLiteral("pcl_file")).toString();
-    const QString pclPath = QDir(QFileInfo(_sameWindingManifestPath).absolutePath())
+    const QString pclPath = QDir(QFileInfo(state.manifestPath).absolutePath())
                                 .filePath(relative);
     QFile pclFile(pclPath);
     if (relative.isEmpty() || !pclFile.open(QIODevice::ReadOnly)) {
-        _panel->setSameWindingPclsAvailable(
-            false, tr("The downloaded same-winding PCL is invalid"));
+        _panel->setPclOverlayAvailable(
+            role, false, tr("The downloaded %1 PCL is invalid").arg(roleName));
         return;
     }
     QJsonParseError parseError;
     const QJsonDocument sourceDocument = QJsonDocument::fromJson(
         pclFile.readAll(), &parseError);
     if (parseError.error != QJsonParseError::NoError || !sourceDocument.isObject()
-        || !_sameWindingCollection->loadFromJSON(pclPath.toStdString())) {
-        _panel->setSameWindingPclsAvailable(
-            false, tr("The downloaded same-winding PCL is invalid"));
+        || !state.collection->loadFromJSON(pclPath.toStdString())) {
+        _panel->setPclOverlayAvailable(
+            role, false, tr("The downloaded %1 PCL is invalid").arg(roleName));
         return;
     }
-    _brush->setSameWindingSource(
-        sourceDocument, scale,
+    _brush->setPclSource(
+        role, sourceDocument, scale,
         descriptor.value(QStringLiteral("source_revision")).toString(),
         descriptor.value(QStringLiteral("editable")).toBool(false));
-    _brush->setSameWindingSourceVisible(_sameWindingPclsVisible);
-    _sameWindingOverlay->setCoordinateScale(scale);
-    _panel->setSameWindingPclsAvailable(true);
-    _sameWindingOverlay->setVisible(_sameWindingPclsVisible);
+    _brush->setPclSourceVisible(role, state.visible);
+    state.overlay->setCoordinateScale(scale);
+    _panel->setPclOverlayAvailable(role, true);
+    state.overlay->setVisible(state.visible);
 }
 
 void SpiralWorkspace::loadRunDiff()

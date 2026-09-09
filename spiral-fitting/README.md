@@ -312,10 +312,19 @@ disables its dependent supervision: phase spacing needs normals and surface
 SDT, while winding inference needs the outer shell.
 
 While a session is active you can right-click a patch in the Surface panel or
-a fiber in the Fibers panel and pick *Add to current spiral fit*. Shift+E in
-the Spiral workspace only marks drawn patches and point collections as local,
-editable drafts; **Add to current fit** snapshots and uploads every ready
-draft. **Commit current inputs** performs that Add first, waits for every
+a fiber in the Fibers panel and pick *Add to current spiral fit*. In the Spiral
+workspace, `Q` toggles same-winding point placement and `E` toggles
+relative-winding point placement; left-click places points on the flattened
+preview or on any of the three plane views. A relative-winding collection
+counts `wind_a` 0, 1, 2, ... in placement order (only the differences matter to
+the fit, so there are no absolute values); `F` flips the active collection,
+reversing the chain and mirroring the annotations so the winding count runs the
+other way; `Delete` removes it after confirmation; `Escape` leaves placement.
+Existing collections from `same_windings.json` and `relative_windings.json` are
+shown through the Display dialog toggles (relative points carry their winding
+labels) and can be selected and edited the same way. Shift+E only marks drawn
+patches and point collections as local, editable drafts; **Add to current fit**
+snapshots and uploads every ready draft. **Commit current inputs** performs that Add first, waits for every
 upload, and only then moves the added inputs into the shared dataset. If an
 upload fails, commit stops and the failed draft remains editable. If a
 multi-step Run is active,

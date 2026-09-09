@@ -40,6 +40,10 @@ public:
     void setCoordinateScale(double scale);
     void setHiddenCollectionIds(const QSet<qulonglong>& ids);
     void setVisible(bool visible);
+    // Display-only overlays skip per-point winding labels by default (see
+    // collectPrimitives); an overlay whose annotations are the point of the
+    // display (relative-winding PCLs) opts back in.
+    void setShowWindingLabels(bool show);
     std::optional<DisplayPointHit> displayPointHitAt(
         VolumeViewerBase* viewer, const QPointF& devicePosition, qreal radius,
         const QSet<qulonglong>& allowedCollectionIds) const;
@@ -77,6 +81,7 @@ private:
     double _viewTolerance{10.0};
     double _coordinateScale{1.0};
     bool _displayOnly{false};
+    bool _showWindingLabels{false};
     QSet<qulonglong> _hiddenCollectionIds;
     bool _visible{true};
     bool _refreshPending{false};

@@ -378,6 +378,99 @@ class FiberPointCollectionTests(unittest.TestCase):
             context._rebuild_pcl_sampling_strata.assert_called_once_with()
             context._build_theta_crossing_map.assert_called_once_with()
 
+    def test_live_relative_replacement_swaps_only_its_own_role(self):
+        # Collection ids are per role file: a relative replacement of
+        # collection "5" must leave a resident same-winding collection "5"
+        # alone, and the swapped strip keeps its winding annotations.
+        with tempfile.TemporaryDirectory() as temporary:
+            replacement_path = Path(temporary) / "replacement.json"
+            replacement_path.write_text(json.dumps({
+                "vc_pointcollections_json_version": "1",
+                "collections": {
+                    "5": {
+                        "id": 5,
+                        "name": "wraps",
+                        "points": {
+                            "0": {"id": 0, "collectionId": 5, "wind_a": 0,
+                                  "p": [0, 0, 10], "creation_time": 1},
+                            "1": {"id": 1, "collectionId": 5, "wind_a": 1,
+                                  "p": [4, 0, 12], "creation_time": 2},
+                        },
+                    },
+                },
+            }))
+            old_relative_strip = {
+                "id": 17,
+                "logical_input_kind": "relative",
+                "logical_input_id": "5",
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.array([3.0, 4.0], dtype=np.float32),
+            }
+            same_winding_strip = {
+                "id": 18,
+                "logical_input_kind": "same_winding",
+                "logical_input_id": "5",
+                "zyxs": np.ones((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {}
+            context.next_id = 30
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = []
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [old_relative_strip, same_winding_strip])
+            context.unattached_strip_sampling_groups = [
+                "old-relative", "same-winding"]
+            context.resolved_links = []
+            context.link_components = []
+            context.regular_pcl_catalog = {}
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.run_dt_resume_iteration = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{
+                        "kind": "pcl", "id": "replacement-upload",
+                        "path": str(replacement_path),
+                        "role": "relative",
+                        "operation": "replace_collection",
+                        "target_collection_id": "5",
+                        "base_source_revision": "source-r1",
+                    }],
+                    {"influence_enabled": False})
+
+            relative_strips = [
+                strip for strip in context.unattached_pcl_strips
+                if strip.get("logical_input_kind") == "relative"
+                and str(strip.get("logical_input_id")) == "5"
+            ]
+            self.assertEqual(len(relative_strips), 1)
+            self.assertEqual(relative_strips[0]["id"], 17)
+            np.testing.assert_array_equal(
+                relative_strips[0]["zyxs"], [[10, 0, 0], [12, 0, 4]])
+            np.testing.assert_array_equal(
+                relative_strips[0]["windings"], [0.0, 1.0])
+            self.assertIn(same_winding_strip, context.unattached_pcl_strips)
+            self.assertNotIn(old_relative_strip, context.unattached_pcl_strips)
+            self.assertEqual(context.next_id, 30)
+            catalog = list(context.regular_pcl_catalog.values())
+            self.assertEqual(len(catalog), 1)
+            self.assertEqual(catalog[0]["metadata"]["logical_input_kind"],
+                             "relative")
+            self.assertEqual(catalog[0]["metadata"]["input_role"], "relative")
+
     def test_live_same_winding_deletion_removes_only_its_logical_pcl(self):
         with tempfile.TemporaryDirectory() as temporary:
             deletion_path = Path(temporary) / "deletion.json"

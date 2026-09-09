@@ -47,7 +47,7 @@ from lasagna_publish import PublishedPreview
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
                          SCROLL_SPEC_OWNED_RUN_KEYS,
-                         AutosaveError, SessionState, SpiralInputPaths,
+                         AutosaveError, PclRole, SessionState, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
@@ -2251,7 +2251,7 @@ class UploadTests(unittest.TestCase):
         with self.assertRaises(ApiError) as wrong_role:
             _upload_input(
                 self.state, "pcl", "wrong-role", replacement,
-                role="relative", operation="replace_collection",
+                role="drawn_control_points", operation="replace_collection",
                 target_collection_id="3", base_source_revision=base)
         self.assertEqual(wrong_role.exception.status, 400)
 
@@ -2279,8 +2279,9 @@ class UploadTests(unittest.TestCase):
             scroll_spec = {"base_shape_zyx": [10, 20, 30]}
 
         self.state.dataset_resolution = Resolution()
-        ref = self.state._publish_same_winding_artifact(target)
+        ref = self.state._publish_pcl_artifact(PclRole.SAME_WINDING, target)
         self.assertTrue(ref["editable"])
+        self.assertEqual(ref["role"], "same_winding")
         self.assertEqual(ref["source_revision"],
                          self.state._file_sha256(target))
         manifests = list((self.output / ".spiral-artifacts").glob(
@@ -2288,8 +2289,127 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         descriptor = json.loads(manifests[0].read_text())
         self.assertTrue(descriptor["editable"])
+        self.assertEqual(descriptor["kind"], "spiral-same-winding-pcl")
         self.assertEqual(descriptor["source_revision"],
                          self.state._file_sha256(target))
+
+    def test_relative_winding_artifact_is_published_alongside_same_winding(self):
+        self._session()
+        relative = self.dataset / "relative_windings.json"
+        relative.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "wraps", "points": {
+                "0": {"p": [1, 2, 3], "wind_a": 0, "creation_time": 1},
+                "1": {"p": [4, 5, 6], "wind_a": 1, "creation_time": 2},
+            }}},
+        }))
+
+        class Resolution:
+            scroll_spec = {"base_shape_zyx": [10, 20, 30]}
+
+        self.state.dataset_resolution = Resolution()
+        self.state._refresh_pcl_artifacts()
+        ref = self.state.pcl_artifacts["relative"]
+        self.assertTrue(ref["editable"])
+        self.assertEqual(ref["role"], "relative")
+        self.assertEqual(ref["source_revision"],
+                         self.state._file_sha256(relative))
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "relative-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        descriptor = json.loads(manifests[0].read_text())
+        self.assertEqual(descriptor["kind"], "spiral-relative-winding-pcl")
+        self.assertEqual(descriptor["pcl_file"], "relative_windings.json")
+        # No same_windings.json in this dataset: its slot stays empty while
+        # the status report still carries both keys.
+        self.assertNotIn("same_winding", self.state.pcl_artifacts)
+        status = self.state.status()
+        self.assertIsNone(status["same_winding_artifact"])
+        self.assertEqual(status["relative_winding_artifact"]["id"], ref["id"])
+
+    def test_relative_winding_replacement_requires_wind_a_on_every_point(self):
+        self._session()
+        target = self.dataset / "relative_windings.json"
+        wraps = {"name": "wraps", "points": {
+            "0": {"p": [1, 2, 3], "wind_a": 0, "creation_time": 10},
+            "1": {"p": [4, 5, 6], "wind_a": 1, "creation_time": 11},
+        }}
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": wraps, "4": wraps, "5": wraps},
+        }
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+
+        def replacement(collection_id, points):
+            return {"replacement.json": json.dumps({
+                "vc_pointcollections_json_version": "1",
+                "collections": {collection_id: {"name": "wraps", "points": points}},
+            }).encode()}
+
+        # A rejected finalize keeps its upload in flight until it is garbage
+        # collected, so each failing case targets its own collection.
+        missing = replacement("3", {
+            "0": {"p": [7, 8, 9], "wind_a": 0, "creation_time": 20},
+            "1": {"p": [10, 11, 12], "creation_time": 21},
+        })
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-missing", missing,
+            role="relative", operation="replace_collection",
+            target_collection_id="3", base_source_revision=base)
+        with self.assertRaisesRegex(ApiError, "wind_a"):
+            self.state.finalize_upload(upload_id)
+
+        null_winding = replacement("4", {
+            "0": {"p": [7, 8, 9], "wind_a": 0, "creation_time": 20},
+            "1": {"p": [10, 11, 12], "wind_a": None, "creation_time": 21},
+        })
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-null", null_winding,
+            role="relative", operation="replace_collection",
+            target_collection_id="4", base_source_revision=base)
+        with self.assertRaisesRegex(ApiError, "wind_a"):
+            self.state.finalize_upload(upload_id)
+
+        complete = replacement("5", {
+            "0": {"p": [7, 8, 9], "wind_a": 0, "creation_time": 20},
+            "1": {"p": [10, 11, 12], "wind_a": 1, "creation_time": 21},
+            "2": {"p": [13, 14, 15], "wind_a": 2, "creation_time": 22},
+        })
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-5", complete,
+            role="relative", operation="replace_collection",
+            target_collection_id="5", base_source_revision=base)
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["role"], "relative")
+        self.assertEqual(record["operation"], "replace_collection")
+
+        # A same-winding mutation aimed at the same numeric id is a different
+        # file, so it is neither an in-flight nor a staged duplicate of the
+        # relative ones.
+        same = self.dataset / "same_windings.json"
+        same.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "same", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 1},
+                "1": {"p": [4, 5, 6], "creation_time": 2},
+            }}, "5": {"name": "same5", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 1},
+                "1": {"p": [4, 5, 6], "creation_time": 2},
+            }}},
+        }))
+        same_base = self.state._file_sha256(same)
+        for collection_id in ("3", "5"):
+            upload_id = _upload_input(
+                self.state, "pcl", f"delete-same-{collection_id}",
+                {"delete.json": json.dumps({
+                    "vc_pointcollections_json_version": "1",
+                    "collections": {collection_id: {"name": "x", "points": {}}},
+                }).encode()},
+                role="same_winding", operation="delete_collection",
+                target_collection_id=collection_id,
+                base_source_revision=same_base)
+            self.state.finalize_upload(upload_id)
 
     def test_same_winding_replacement_rejects_malformed_and_linked_sources(self):
         self._session()
@@ -3280,6 +3400,94 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text()), externally_changed)
         self.assertEqual(list(self.dataset.glob(
             "same_windings.json.*.bak")), [])
+
+    def test_relative_winding_mutations_commit_into_their_own_file(self):
+        relative_source = {
+            "vc_pointcollections_json_version": "1",
+            "custom": "kept",
+            "collections": {
+                "2": {"name": "wraps_a", "points": {
+                    "0": {"p": [0, 0, 0], "wind_a": 0, "creation_time": 1},
+                    "1": {"p": [1, 0, 0], "wind_a": 1, "creation_time": 2}}},
+                "7": {"name": "wraps_b", "points": {
+                    "0": {"p": [0, 1, 0], "wind_a": 0, "creation_time": 3},
+                    "1": {"p": [1, 1, 0], "wind_a": 1, "creation_time": 4}}},
+            },
+        }
+        same_source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "same", "points": {
+                "0": {"p": [5, 5, 5], "creation_time": 1},
+                "1": {"p": [6, 5, 5], "creation_time": 2}}}},
+        }
+        relative = self.dataset / "relative_windings.json"
+        same = self.dataset / "same_windings.json"
+        relative.write_text(json.dumps(relative_source))
+        same.write_text(json.dumps(same_source))
+        relative_base = self.state._file_sha256(relative)
+        same_base = self.state._file_sha256(same)
+
+        # Flip wraps_a: reversed order with mirrored annotations.
+        incoming = {"vc_pointcollections_json_version": "1",
+                    "collections": {"2": {"name": "wraps_a", "points": {
+                        "0": {"p": [1, 0, 0], "wind_a": 0, "creation_time": 10},
+                        "1": {"p": [0, 0, 0], "wind_a": 1, "creation_time": 11},
+                    }}}}
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-rel-2",
+            {"2.json": json.dumps(incoming).encode()},
+            role="relative", operation="replace_collection",
+            target_collection_id="2", base_source_revision=relative_base)
+        self.state.finalize_upload(upload_id)
+        deletion = {"vc_pointcollections_json_version": "1",
+                    "collections": {"7": relative_source["collections"]["7"]}}
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-rel-7",
+            {"7.json": json.dumps(deletion).encode()},
+            role="relative", operation="delete_collection",
+            target_collection_id="7", base_source_revision=relative_base)
+        self.state.finalize_upload(upload_id)
+        # An unrelated same-winding deletion of the same numeric id rides
+        # along in the same commit and must only touch its own file.
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-same-2",
+            {"2.json": json.dumps(same_source).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="2", base_source_revision=same_base)
+        self.state.finalize_upload(upload_id)
+        # A plain relative addition merges against the mutated snapshot.
+        addition = {"vc_pointcollections_json_version": "1",
+                    "collections": {"0": {"name": "wraps_new", "points": {
+                        "0": {"p": [9, 9, 9], "wind_a": 0, "creation_time": 30},
+                        "1": {"p": [9, 9, 10], "wind_a": 1, "creation_time": 31},
+                    }}}}
+        upload_id = _upload_input(
+            self.state, "pcl", "add-rel",
+            {"add.json": json.dumps(addition).encode()}, role="relative")
+        self.state.finalize_upload(upload_id)
+
+        response = self.state.commit_inputs()
+        self.assertEqual(sorted(response["committed"]),
+                         ["add-rel", "delete-rel-7", "delete-same-2",
+                          "replace-rel-2"])
+        self.assertIn("relative_winding_artifact", response)
+        self.assertIn("same_winding_artifact", response)
+        result = json.loads(relative.read_text())
+        self.assertEqual(result["custom"], "kept")
+        # The addition is renumbered onto the merged snapshot (max id + 1
+        # after the deletion of "7").
+        self.assertEqual(sorted(result["collections"], key=int), ["2", "3"])
+        self.assertEqual(
+            [point["wind_a"] for point in
+             result["collections"]["2"]["points"].values()], [0, 1])
+        self.assertEqual(result["collections"]["2"]["points"]["0"]["p"],
+                         [1, 0, 0])
+        self.assertEqual(result["collections"]["3"]["name"], "wraps_new")
+        self.assertEqual(json.loads(same.read_text())["collections"], {})
+        self.assertEqual(len(list(self.dataset.glob(
+            "relative_windings.json.*.bak"))), 1)
+        self.assertEqual(len(list(self.dataset.glob(
+            "same_windings.json.*.bak"))), 1)
 
     def test_same_winding_delete_removes_only_the_target_atomically(self):
         source = {

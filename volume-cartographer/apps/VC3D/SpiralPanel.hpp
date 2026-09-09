@@ -8,8 +8,11 @@
 #include <QWidget>
 #include <functional>
 
+#include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
 #include "elements/VolumeSelector.hpp"
+
+#include <array>
 
 class QCheckBox;
 class QComboBox;
@@ -41,7 +44,10 @@ public:
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
     void setLocalDraftsReady(bool ready);
-    void setSameWindingPclsAvailable(bool available, const QString& reason = {});
+    // Enables the Display toggle of one editable PCL role's overlay; an
+    // unavailable overlay is unchecked and explains itself in the tooltip.
+    void setPclOverlayAvailable(vc3d::spiral::PclRole role, bool available,
+                                const QString& reason = {});
     [[nodiscard]] double pointViewTolerance() const;
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
@@ -57,7 +63,7 @@ signals:
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
-    void sameWindingPclsChanged(bool shown);
+    void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
     void addDraftsRequested(bool commitAfterAdd);
@@ -108,7 +114,7 @@ private:
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
-    QCheckBox* _showSameWindingPcls = nullptr;
+    std::array<QCheckBox*, vc3d::spiral::kEditablePclRoles.size()> _showPclOverlays{};
     QDoubleSpinBox* _pointViewTolerance = nullptr;
     QComboBox* _lossMap = nullptr;
     QCheckBox* _lossMapDiagnostics = nullptr;

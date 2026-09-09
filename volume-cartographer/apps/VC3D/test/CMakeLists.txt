@@ -150,12 +150,15 @@ target_include_directories(test_spiral_point_collection_edit PRIVATE
 
 target_link_libraries(test_spiral_point_collection_edit PRIVATE
     Qt6::Core
+    Qt6::Gui
     Qt6::Test
     opencv_core)
 
 add_test(NAME spiral_point_collection_edit COMMAND test_spiral_point_collection_edit)
 vc_register_test_target(test_spiral_point_collection_edit)
 vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit)
+set_tests_properties(spiral_point_collection_edit PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_download_queue_stats
     test_download_queue_stats.cpp

@@ -36,6 +36,14 @@ bool nonEmptyArray(const QJsonValue& value)
     return value.isArray() && !value.toArray().isEmpty();
 }
 
+std::optional<double> payloadWinding(const QJsonObject& payload)
+{
+    const QJsonValue value = payload.value(QStringLiteral("wind_a"));
+    if (!value.isDouble()) return std::nullopt;
+    const double winding = value.toDouble();
+    return std::isfinite(winding) ? std::optional<double>(winding) : std::nullopt;
+}
+
 bool collectionHasAffectedLinks(const QJsonObject& collections,
                                 const QString& targetId,
                                 const QJsonObject& target)
@@ -87,7 +95,18 @@ void EditablePclDraft::appendPreviewPoint(
         static_cast<double>(previewPosition[1]) * inverseScale,
         static_cast<double>(previewPosition[2]) * inverseScale,
     };
-    payload[QStringLiteral("wind_a")] = QJsonValue::Null;
+    if (pclRoleHasWindingAnnotations(role)) {
+        // New relative collections count from 0; an appended point continues
+        // one past the highest winding already present.
+        double next = 0.0;
+        for (const EditablePclPoint& point : points) {
+            if (const auto winding = payloadWinding(point.sourcePayload))
+                next = std::max(next, *winding + 1.0);
+        }
+        payload[QStringLiteral("wind_a")] = next;
+    } else {
+        payload[QStringLiteral("wind_a")] = QJsonValue::Null;
+    }
     points.push_back({previewPosition, std::move(payload), false,
                       std::move(previewSurfacePosition)});
     dirty = true;
@@ -104,7 +123,42 @@ bool EditablePclDraft::erase(std::size_t index)
 void EditablePclDraft::reverse()
 {
     std::reverse(points.begin(), points.end());
+    if (pclRoleHasWindingAnnotations(role)) mirrorRelativeWindings();
     dirty = true;
+}
+
+void EditablePclDraft::mirrorRelativeWindings()
+{
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (const EditablePclPoint& point : points) {
+        const auto winding = payloadWinding(point.sourcePayload);
+        // A partially annotated collection has no consistent direction to
+        // flip; leave its annotations alone (it is read-only anyway).
+        if (!winding) return;
+        minimum = std::min(minimum, *winding);
+        maximum = std::max(maximum, *winding);
+    }
+    if (points.empty()) return;
+    for (EditablePclPoint& point : points) {
+        const double winding = *payloadWinding(point.sourcePayload);
+        point.sourcePayload[QStringLiteral("wind_a")] = minimum + maximum - winding;
+    }
+}
+
+std::optional<double> editablePclPointWinding(const EditablePclPoint& point)
+{
+    return payloadWinding(point.sourcePayload);
+}
+
+QString editablePclPointWindingLabel(const EditablePclPoint& point)
+{
+    const auto winding = payloadWinding(point.sourcePayload);
+    if (!winding) return {};
+    const double rounded = std::round(*winding);
+    if (std::abs(*winding - rounded) < 1e-6)
+        return QString::number(static_cast<qint64>(rounded));
+    return QString::number(*winding, 'g', 6);
 }
 
 void EditablePclDraft::setDeleted(bool value)
@@ -167,7 +221,7 @@ QJsonDocument EditablePclDraft::replacementDocument() const
 
 std::vector<EditablePclDraft> importEditablePcls(
     const QJsonDocument& document, double sourceToPreviewScale,
-    const QString& sourceRevision, bool sourceEditable)
+    const QString& sourceRevision, bool sourceEditable, PclRole role)
 {
     std::vector<EditablePclDraft> result;
     if (!document.isObject() || !std::isfinite(sourceToPreviewScale)
@@ -178,6 +232,7 @@ std::vector<EditablePclDraft> importEditablePcls(
         const QJsonObject collection = collections.value(collectionId).toObject();
         const QJsonObject sourcePoints = collection.value(QStringLiteral("points")).toObject();
         EditablePclDraft draft;
+        draft.role = role;
         draft.collectionId = collectionId;
         draft.topLevel = root;
         draft.sourceCollection = collection;
@@ -201,6 +256,8 @@ std::vector<EditablePclDraft> importEditablePcls(
                 draft.editable = false;
                 continue;
             }
+            if (pclRoleHasWindingAnnotations(role) && !payloadWinding(payload))
+                draft.editable = false;
             draft.points.push_back({preview, payload, true});
         }
         if (draft.points.size() < 2) draft.editable = false;

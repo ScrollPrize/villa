@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
 
 #include <QJsonObject>
@@ -10,6 +11,7 @@
 #include <QStringList>
 #include <QTimer>
 
+#include <array>
 #include <functional>
 
 class QNetworkAccessManager;
@@ -39,7 +41,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 31;
+    static constexpr int kApiVersion = 32;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -103,11 +105,14 @@ public:
     void uploadJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {},
                          const QString& baseRevision = {});
-    void uploadSameWindingReplacement(const QString& filePath,
-                                      const QString& inputId,
-                                      const QString& operation,
-                                      const QString& targetCollectionId,
-                                      const QString& baseSourceRevision);
+    // CAS-guarded replacement or deletion of one collection of an editable
+    // PCL role (same-winding or relative-winding).
+    void uploadPclReplacement(vc3d::spiral::PclRole role,
+                              const QString& filePath,
+                              const QString& inputId,
+                              const QString& operation,
+                              const QString& targetCollectionId,
+                              const QString& baseSourceRevision);
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
@@ -135,10 +140,11 @@ signals:
     // service as a second artifact once the surface was on its way.
     void previewDiagnosticsAvailable(const QString& manifestPath,
                                      qint64 generation);
-    // Immutable display-only PCL snapshot resolved by the service. The
-    // descriptor carries the source coordinate domain.
-    void sameWindingArtifactAvailable(const QString& manifestPath,
-                                      const QJsonObject& artifactRef);
+    // Immutable display-only PCL snapshot of one editable role resolved by
+    // the service. The descriptor carries the source coordinate domain.
+    void pclArtifactAvailable(vc3d::spiral::PclRole role,
+                              const QString& manifestPath,
+                              const QJsonObject& artifactRef);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -161,11 +167,11 @@ signals:
     void fiberRevisionUploadFinished(const QString& inputId,
                                      const QString& revision,
                                      const QString& error);
-    void sameWindingReplacementUploadFinished(const QString& inputId,
-                                               const QString& currentRevision,
-                                               const QString& error);
-    void sameWindingCommitConflict(const QString& currentRevision,
-                                   const QString& error);
+    void pclReplacementUploadFinished(const QString& inputId,
+                                      const QString& currentRevision,
+                                      const QString& error);
+    void pclCommitConflict(const QString& currentRevision,
+                           const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
@@ -279,13 +285,16 @@ private:
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;
-    QString _installedSameWindingArtifact;
-    QString _fetchingSameWindingArtifact;
+    // Per editable PCL role, indexed by vc3d::spiral::pclRoleIndex.
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _installedPclArtifact;
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _fetchingPclArtifact;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastDiagnosticsLocalPath;
-    QString _lastSameWindingLocalPath;
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _lastPclLocalPath;
     QString _synchronizedSessionId;
+
+    QStringList pclArtifactCachePins() const;
 };

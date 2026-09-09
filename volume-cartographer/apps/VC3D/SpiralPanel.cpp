@@ -486,16 +486,22 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
 
-    _showSameWindingPcls = new QCheckBox(
-        tr("Show same-winding PCLs"), _displayDialog);
-    _showSameWindingPcls->setObjectName(
-        QStringLiteral("spiralShowSameWindingPcls"));
-    _showSameWindingPcls->setEnabled(false);
-    _showSameWindingPcls->setToolTip(
-        tr("No compatible same-winding artifact is available"));
-    connect(_showSameWindingPcls, &QCheckBox::toggled,
-            this, &SpiralPanel::sameWindingPclsChanged);
-    displayDialogLayout->addWidget(_showSameWindingPcls);
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        auto* toggle = new QCheckBox(
+            tr("Show %1 PCLs").arg(vc3d::spiral::pclRoleDisplayName(role)),
+            _displayDialog);
+        toggle->setObjectName(role == vc3d::spiral::PclRole::Relative
+                                  ? QStringLiteral("spiralShowRelativeWindingPcls")
+                                  : QStringLiteral("spiralShowSameWindingPcls"));
+        toggle->setEnabled(false);
+        toggle->setToolTip(tr("No compatible %1 artifact is available")
+                               .arg(vc3d::spiral::pclRoleDisplayName(role)));
+        connect(toggle, &QCheckBox::toggled, this, [this, role](bool shown) {
+            emit pclOverlayChanged(role, shown);
+        });
+        displayDialogLayout->addWidget(toggle);
+        _showPclOverlays[vc3d::spiral::pclRoleIndex(role)] = toggle;
+    }
 
     auto* pointToleranceRow = new QWidget(_displayDialog);
     auto* pointToleranceLayout = new QHBoxLayout(pointToleranceRow);
@@ -509,7 +515,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pointViewTolerance->setSuffix(tr(" vx"));
     _pointViewTolerance->setToolTip(
         tr("Maximum distance from the preview surface at which same-winding "
-           "point markers are shown"));
+           "and relative-winding point markers are shown"));
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         _pointViewTolerance->setValue(
@@ -1303,8 +1309,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                   tr("Move the added inputs into the dataset? Patches go to "
                                      "verified_patches/, fibers to fibers/, and PCL documents "
                                      "merge into their conventional role file (control-point "
-                                     "lines go to drawn_control_points.json; "
-                                     "same-winding point collections go to same_windings.json)."))
+                                     "lines go to drawn_control_points.json; same-winding "
+                                     "point collections go to same_windings.json; "
+                                     "relative-winding point collections go to "
+                                     "relative_windings.json)."))
             != QMessageBox::Yes) return;
         emit addDraftsRequested(true);
     });
@@ -1643,22 +1651,36 @@ void SpiralPanel::setLocalDraftsReady(bool ready)
                                   && (ready || _uncommittedCount > 0));
 }
 
-void SpiralPanel::setSameWindingPclsAvailable(bool available,
-                                               const QString& reason)
+void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
+                                         bool available, const QString& reason)
 {
-    if (!_showSameWindingPcls) return;
-    _showSameWindingPcls->setEnabled(available);
-    if (!available) _showSameWindingPcls->setChecked(false);
-    _showSameWindingPcls->setToolTip(
-        available
-            ? tr("Show same-winding PCLs. Left-click a point to activate its "
-                 "editable collection; Q adds a new collection or appends to "
-                 "the active one; F reverses the active PCL; Delete removes "
-                 "it after confirmation; Escape exits placement and clears "
-                 "the active PCL.")
-                  : reason.isEmpty()
-                        ? tr("No compatible same-winding artifact is available")
-                        : reason);
+    auto* toggle = _showPclOverlays[vc3d::spiral::pclRoleIndex(role)];
+    if (!toggle) return;
+    toggle->setEnabled(available);
+    if (!available) toggle->setChecked(false);
+    QString help;
+    if (!available) {
+        help = reason.isEmpty()
+            ? tr("No compatible %1 artifact is available")
+                  .arg(vc3d::spiral::pclRoleDisplayName(role))
+            : reason;
+    } else if (role == vc3d::spiral::PclRole::Relative) {
+        help = tr("Show relative-winding PCLs with their winding labels. "
+                  "Left-click a point to activate its editable collection; E "
+                  "adds a new collection (winding 0, 1, 2, ... per point) or "
+                  "appends to the active one, on the flattened view or any "
+                  "plane view; F flips the winding direction; Delete removes "
+                  "the collection after confirmation; Escape exits placement "
+                  "and clears the active PCL.");
+    } else {
+        help = tr("Show same-winding PCLs. Left-click a point to activate its "
+                  "editable collection; Q adds a new collection or appends to "
+                  "the active one, on the flattened view or any plane view; F "
+                  "reverses the active PCL; Delete removes it after "
+                  "confirmation; Escape exits placement and clears the active "
+                  "PCL.");
+    }
+    toggle->setToolTip(help);
 }
 
 double SpiralPanel::pointViewTolerance() const

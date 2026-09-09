@@ -49,7 +49,8 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     Config, FitConfig, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
-from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
+from fit_session import (EDITABLE_PCL_ROLE_VALUES, fit_input,
+                         input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
 
@@ -771,6 +772,14 @@ def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
         else:
             run_start = position + 1
     return sorted_items[best_start:best_end]
+
+
+def _logical_identity(record):
+    """Return an editable PCL's role-scoped logical identity, if present."""
+    kind = record.get('logical_input_kind')
+    if kind is None:
+        return None
+    return (kind, str(record.get('logical_input_id')))
 
 
 def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
@@ -1811,9 +1820,11 @@ class FitContext:
                     pcl['metadata']['input_role'] = explicit_role or (
                         'absolute' if os.path.basename(path) == 'abs_winding.json' else 'legacy'
                     )
-                    if explicit_role == 'same_winding':
+                    # Editable collection ids are unique within their role
+                    # file, rather than globally across all PCL inputs.
+                    if explicit_role in EDITABLE_PCL_ROLE_VALUES:
                         pcl['metadata'].update({
-                            'logical_input_kind': 'same_winding',
+                            'logical_input_kind': explicit_role,
                             'logical_input_id': str(source_collection_id),
                             'logical_input_revision': None,
                             'resident_collection_id': next_id,
@@ -3947,7 +3958,7 @@ class FitContext:
             if not loaded:
                 raise ValueError(
                     f'PCL document {input_id!r} contains no collections')
-            if (role == 'same_winding'
+            if (role in EDITABLE_PCL_ROLE_VALUES
                     and record.get('operation') == 'delete_collection'):
                 return
             if role == 'absolute':
@@ -4211,8 +4222,10 @@ class FitContext:
             new_regular_collections = {}
             theta_warnings = []
             new_fibers = []
-            replacing_same_winding = False
-            deleting_same_winding_ids = set()
+            # Live replace/delete of editable-role collections. Identities
+            # are (role, source collection id) pairs: ids are per role file.
+            replacing_editable = False
+            deleting_editable_ids = set()
             candidate_fiber_catalog = dict(self.fiber_catalog)
             candidate_next_id = self.next_id
             for record in records:
@@ -4275,15 +4288,16 @@ class FitContext:
                     loaded = load_point_collection(path) or {}
                     if not loaded:
                         raise RuntimeError(f'PCL document {input_id!r} contains no collections')
-                    if (role == 'same_winding'
+                    editable_role = role in EDITABLE_PCL_ROLE_VALUES
+                    if (editable_role
                             and record.get('operation') == 'delete_collection'):
-                        deleting_same_winding_ids.add(
-                            str(record.get('target_collection_id')))
-                        replacing_same_winding = True
+                        deleting_editable_ids.add(
+                            (role, str(record.get('target_collection_id'))))
+                        replacing_editable = True
                         continue
                     for pcl in loaded.values():
                         replacement = (
-                            role == 'same_winding'
+                            editable_role
                             and record.get('operation') == 'replace_collection')
                         if replacement:
                             logical_id = str(record.get('target_collection_id'))
@@ -4292,21 +4306,21 @@ class FitContext:
                                     'resident_collection_id', pcl.get('id'))
                                 for pcl in self.cross_patch_pcls
                                 if pcl.get('metadata', {}).get(
-                                    'logical_input_kind') == 'same_winding'
+                                    'logical_input_kind') == role
                                 and str(pcl.get('metadata', {}).get(
                                     'logical_input_id')) == logical_id
                             ]
                             resident_ids.extend(
                                 strip.get('id')
                                 for strip in self.unattached_pcl_strips
-                                if strip.get('logical_input_kind') == 'same_winding'
+                                if strip.get('logical_input_kind') == role
                                 and str(strip.get('logical_input_id')) == logical_id)
                             collection_id = (resident_ids[0]
                                              if resident_ids
                                              else candidate_next_id)
                             if not resident_ids:
                                 candidate_next_id += 1
-                            replacing_same_winding = True
+                            replacing_editable = True
                         else:
                             collection_id = candidate_next_id
                             candidate_next_id += 1
@@ -4317,7 +4331,7 @@ class FitContext:
                         pcl['metadata']['resident_collection_id'] = collection_id
                         if replacement:
                             pcl['metadata'].update({
-                                'logical_input_kind': 'same_winding',
+                                'logical_input_kind': role,
                                 'logical_input_id': logical_id,
                                 'logical_input_revision': record.get(
                                     'base_source_revision'),
@@ -4382,10 +4396,8 @@ class FitContext:
                     cid: pcl for cid, pcl in
                     getattr(self, 'regular_pcl_catalog', {}).items()
                     if cid not in new_regular_collections
-                    and not (pcl.get('metadata', {}).get(
-                        'logical_input_kind') == 'same_winding'
-                        and str(pcl.get('metadata', {}).get(
-                            'logical_input_id')) in deleting_same_winding_ids)
+                    and _logical_identity(pcl.get('metadata', {}))
+                    not in deleting_editable_ids
                 }
                 fiber_by_cid = {
                     pcl['id']: pcl
@@ -4396,7 +4408,7 @@ class FitContext:
                     self._relink_resident_points_to_new_patches(
                         new_patches, regular_by_cid, fiber_by_cid))
 
-            if (new_collections or deleting_same_winding_ids
+            if (new_collections or deleting_editable_ids
                     or relinked_regular or fiber_relinked):
                 new_cross_patch = {}
                 new_unattached = {}
@@ -4461,27 +4473,23 @@ class FitContext:
                     ]
                     retained_strips = [strip for strip, _ in retained]
                     retained_strip_groups = [group for _, group in retained]
-                if replacing_same_winding:
+                if replacing_editable:
                     replacing_ids = {
-                        str(pcl.get('metadata', {}).get('logical_input_id'))
+                        _logical_identity(pcl.get('metadata', {}))
                         for pcl in new_regular_collections.values()
                         if pcl.get('metadata', {}).get(
-                            'logical_input_kind') == 'same_winding'
+                            'logical_input_kind') in EDITABLE_PCL_ROLE_VALUES
                     }
-                    replacing_ids.update(deleting_same_winding_ids)
+                    replacing_ids.update(deleting_editable_ids)
                     retained_cross_patch = [
                         pcl for pcl in retained_cross_patch
-                        if not (pcl.get('metadata', {}).get(
-                            'logical_input_kind') == 'same_winding'
-                            and str(pcl.get('metadata', {}).get(
-                                'logical_input_id')) in replacing_ids)
+                        if _logical_identity(pcl.get('metadata', {}))
+                        not in replacing_ids
                     ]
                     retained = [
                         (strip, group) for strip, group in zip(
                             retained_strips, retained_strip_groups)
-                        if not (strip.get('logical_input_kind') == 'same_winding'
-                                and str(strip.get('logical_input_id'))
-                                in replacing_ids)
+                        if _logical_identity(strip) not in replacing_ids
                     ]
                     retained_strips = [strip for strip, _ in retained]
                     retained_strip_groups = [group for _, group in retained]
@@ -4571,14 +4579,12 @@ class FitContext:
                     self.fiber_catalog = candidate_fiber_catalog
                     self.resolved_links[:] = candidate_resolved_links
                     self.link_components[:] = candidate_link_components
-                if replacing_same_winding:
+                if replacing_editable:
                     for cid in [
                             cid for cid, pcl in
                             getattr(self, 'regular_pcl_catalog', {}).items()
-                            if pcl.get('metadata', {}).get(
-                                'logical_input_kind') == 'same_winding'
-                            and str(pcl.get('metadata', {}).get(
-                                'logical_input_id')) in replacing_ids]:
+                            if _logical_identity(pcl.get('metadata', {}))
+                            in replacing_ids]:
                         del self.regular_pcl_catalog[cid]
                 if not hasattr(self, 'regular_pcl_catalog'):
                     self.regular_pcl_catalog = {}
@@ -4586,23 +4592,12 @@ class FitContext:
                 self.next_id = candidate_next_id
                 self._rebuild_pcl_sampling_strata()
 
-            if new_patches or new_collections or deleting_same_winding_ids:
+            if new_patches or new_collections or deleting_editable_ids:
                 # Whole-object DT target caches index the changed object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
-                if new_fibers or replacing_same_winding:
-                    trusted = self._trusted_geometry_from_active_inputs()
-                    trusted_np = np.ascontiguousarray(
-                        trusted.cpu().numpy(), dtype=np.float32)
-                    self.trusted_geometry_tree = (
-                        cKDTree(trusted_np) if len(trusted_np) else None)
-                    generator = torch.Generator().manual_seed(
-                        int(self.config['optimizer_random_seed']))
-                    self.influence_anchor_geometry = subsample_rows(
-                        trusted,
-                        int(self.config[
-                            'sample_count_influence_anchor_geometry_points']),
-                        generator).clone()
+                if new_fibers or replacing_editable:
+                    self._refresh_trusted_geometry()
                 theta_warnings = self._build_theta_crossing_map()
                 # The gate may have rejected one of this incorporation's
                 # patches; downstream influence setup must see only survivors.
@@ -4611,10 +4606,9 @@ class FitContext:
                     if patch_id in self.verified_patches
                 }
 
-            if deleting_same_winding_ids and self.influence_state is not None:
+            if deleting_editable_ids and self.influence_state is not None:
                 self.influence_state.remove_logical_contributions_(
-                    [('same_winding', logical_id)
-                     for logical_id in deleting_same_winding_ids],
+                    sorted(deleting_editable_ids),
                     spiral_and_transform=self.spiral_and_transform,
                     optimiser=self.optimiser)
 

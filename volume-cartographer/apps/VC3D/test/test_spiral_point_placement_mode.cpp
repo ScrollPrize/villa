@@ -14,6 +14,7 @@ class SpiralPointPlacementModeTest : public QObject
 
 private slots:
     void qActivatesAndIsIdempotent();
+    void eActivatesRelativeAndSwitchesRoles();
     void escapeClearsInteractionInOneStep();
     void activeSelectionGatesCollectionKeys();
     void interruptionsDoNotDeactivate();
@@ -36,10 +37,21 @@ QKeyEvent qEvent(QEvent::Type type, bool autoRepeat = false)
     return keyEvent(type, Qt::Key_Q, autoRepeat);
 }
 
+QKeyEvent eEvent(QEvent::Type type, bool autoRepeat = false)
+{
+    return keyEvent(type, Qt::Key_E, autoRepeat);
+}
+
 bool isCyan(const QColor& color)
 {
     return color.alpha() > 100 && color.red() < 100
         && color.green() > 220 && color.blue() > 170;
+}
+
+bool isOrange(const QColor& color)
+{
+    return color.alpha() > 100 && color.red() > 220
+        && color.green() > 130 && color.green() < 210 && color.blue() < 100;
 }
 
 bool isWhite(const QColor& color)
@@ -97,6 +109,59 @@ void SpiralPointPlacementModeTest::qActivatesAndIsIdempotent()
     QVERIFY(result.handled);
     QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::None));
     QVERIFY(mode.active());
+    QVERIFY(mode.activeRole().has_value());
+    QCOMPARE(static_cast<int>(*mode.activeRole()),
+             static_cast<int>(vc3d::spiral::PclRole::SameWinding));
+}
+
+void SpiralPointPlacementModeTest::eActivatesRelativeAndSwitchesRoles()
+{
+    SpiralPointPlacementMode mode;
+    QVERIFY(!mode.activeRole());
+
+    auto result = mode.handleEvent(eEvent(QEvent::KeyPress));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::Activated));
+    QVERIFY(mode.active());
+    QCOMPARE(static_cast<int>(*mode.activeRole()),
+             static_cast<int>(vc3d::spiral::PclRole::Relative));
+
+    // E release, autorepeat, and a repeated press all belong to the mode
+    // without changing it.
+    result = mode.handleEvent(eEvent(QEvent::KeyRelease));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::None));
+    result = mode.handleEvent(eEvent(QEvent::KeyPress, true));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::None));
+    result = mode.handleEvent(eEvent(QEvent::KeyPress));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::None));
+    QCOMPARE(static_cast<int>(*mode.activeRole()),
+             static_cast<int>(vc3d::spiral::PclRole::Relative));
+
+    // The other role's key switches roles in one step, both ways.
+    result = mode.handleEvent(qEvent(QEvent::KeyPress));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::SwitchRole));
+    QCOMPARE(static_cast<int>(*mode.activeRole()),
+             static_cast<int>(vc3d::spiral::PclRole::SameWinding));
+    result = mode.handleEvent(eEvent(QEvent::KeyPress));
+    QCOMPARE(static_cast<int>(result.transition), static_cast<int>(Transition::SwitchRole));
+    QCOMPARE(static_cast<int>(*mode.activeRole()),
+             static_cast<int>(vc3d::spiral::PclRole::Relative));
+
+    // Escape clears the relative mode exactly like the same-winding one.
+    result = mode.handleEvent(keyEvent(QEvent::KeyPress, Qt::Key_Escape));
+    QVERIFY(result.handled);
+    QCOMPARE(static_cast<int>(result.transition),
+             static_cast<int>(Transition::ClearInteraction));
+    QVERIFY(!mode.active());
+    QVERIFY(!mode.activeRole());
+
+    QVERIFY(SpiralPointPlacementMode::roleForKey(Qt::Key_E).has_value());
+    QVERIFY(SpiralPointPlacementMode::roleForKey(Qt::Key_Q).has_value());
+    QVERIFY(!SpiralPointPlacementMode::roleForKey(Qt::Key_F).has_value());
 }
 
 void SpiralPointPlacementModeTest::escapeClearsInteractionInOneStep()
@@ -218,6 +283,16 @@ void SpiralPointPlacementModeTest::cursorCueHasPlacementPrecedence()
     }
     QCOMPARE(countPixels(active, center, 17.0, 23.0, isCyan), 0);
     QCOMPARE(countPixels(active, center, 29.0, 35.0, isWhite), 0);
+
+    // The relative-winding role draws its own accent so the active mode is
+    // readable from the cursor alone.
+    widget.setCursorState(
+        center, 64, true, true,
+        vc3d::spiral::pclRoleAccentColor(vc3d::spiral::PclRole::Relative));
+    const QImage relative = renderCursor(widget);
+    QVERIFY(countPixels(relative, center, 0.0, 4.0, isOrange) > 20);
+    QCOMPARE(countPixels(relative, center, 0.0, 4.0, isCyan), 0);
+    QCOMPARE(countPixels(relative, center, 29.0, 35.0, isWhite), 0);
 }
 
 void SpiralPointPlacementModeTest::cursorRendersRetainedPclHover()

@@ -207,6 +207,13 @@ void PointsOverlayController::setVisible(bool visible)
     refreshAll();
 }
 
+void PointsOverlayController::setShowWindingLabels(bool show)
+{
+    if (_showWindingLabels == show) return;
+    _showWindingLabels = show;
+    refreshAll();
+}
+
 std::optional<PointsOverlayController::DisplayPointHit>
 PointsOverlayController::displayPointHitAt(
     VolumeViewerBase* viewer, const QPointF& devicePosition, qreal radius,
@@ -319,8 +326,10 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             // point clouds rather than a handful of annotations. One text item
             // per point flushes the point-batching groups in applyPrimitives,
             // costing two QGraphicsItems per point; the labels are not
-            // actionable there, so skip them.
-            if (!_displayOnly && !std::isnan(colPoint.winding_annotation)) {
+            // actionable there, so skip them unless the overlay asked for
+            // them (relative-winding PCLs, whose annotations are the display).
+            if ((!_displayOnly || _showWindingLabels)
+                && !std::isnan(colPoint.winding_annotation)) {
                 const QString text = formatWinding(colPoint.winding_annotation, absoluteWinding);
                 entry.hasLabel = !text.isEmpty();
                 entry.label = text;

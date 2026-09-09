@@ -5,11 +5,15 @@
 
 namespace vc3d {
 
+// Cache entries the preview pruner must keep: the installed preview, its
+// diagnostics, and every display-only PCL artifact (one per editable role).
 inline QStringList spiralArtifactCachePins(
     const QString& preview, const QString& diagnostics,
-    const QString& sameWinding)
+    const QStringList& pclArtifacts)
 {
-    return {preview, diagnostics, sameWinding};
+    QStringList pins{preview, diagnostics};
+    pins += pclArtifacts;
+    return pins;
 }
 
 } // namespace vc3d

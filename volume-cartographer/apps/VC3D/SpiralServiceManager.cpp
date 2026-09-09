@@ -245,11 +245,13 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
-    _installedSameWindingArtifact.clear();
-    _fetchingSameWindingArtifact.clear();
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        _installedPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
+        _fetchingPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
+        _lastPclLocalPath[vc3d::spiral::pclRoleIndex(role)].clear();
+    }
     _lastPreviewLocalPath.clear();
     _lastDiagnosticsLocalPath.clear();
-    _lastSameWindingLocalPath.clear();
     _synchronizedSessionId.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
@@ -978,7 +980,7 @@ void SpiralServiceManager::commitInputs()
                   [this](const QString& error, const QJsonObject& body) {
                       if (body.value(QStringLiteral("code")).toString()
                               == QStringLiteral("source_revision_conflict")) {
-                          emit sameWindingCommitConflict(
+                          emit pclCommitConflict(
                               body.value(QStringLiteral("current_revision")).toString(),
                               error);
                       }
@@ -1061,14 +1063,14 @@ void SpiralServiceManager::uploadJsonInput(const QString& kind, const QString& f
                             {}, {}, {});
 }
 
-void SpiralServiceManager::uploadSameWindingReplacement(
-    const QString& filePath, const QString& inputId,
+void SpiralServiceManager::uploadPclReplacement(
+    vc3d::spiral::PclRole role, const QString& filePath, const QString& inputId,
     const QString& operation,
     const QString& targetCollectionId, const QString& baseSourceRevision)
 {
     uploadJsonInputInternal(
         QStringLiteral("pcl_replacement"), filePath, inputId,
-        QStringLiteral("same_winding"), {},
+        vc3d::spiral::pclRoleName(role), {},
         operation, targetCollectionId,
         baseSourceRevision);
 }
@@ -1078,7 +1080,7 @@ void SpiralServiceManager::finishInputUpload(
     const QJsonObject& body)
 {
     if (kind == QStringLiteral("pcl_replacement")) {
-        emit sameWindingReplacementUploadFinished(
+        emit pclReplacementUploadFinished(
             inputId, body.value(QStringLiteral("current_revision")).toString(),
             error);
         return;
@@ -1492,10 +1494,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept,
-                    vc3d::spiralArtifactCachePins(
-                        _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
-                        _lastSameWindingLocalPath));
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
             });
     }
 
@@ -1528,37 +1527,44 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastDiagnosticsLocalPath = entryPath;
                 emit previewDiagnosticsAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept,
-                    vc3d::spiralArtifactCachePins(
-                        _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
-                        _lastSameWindingLocalPath));
+                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
             });
     }
 
-    const QJsonObject sameWindingRef =
-        status.value(QStringLiteral("same_winding_artifact")).toObject();
-    const QString sameWindingId = sameWindingRef.value(QStringLiteral("id")).toString();
-    if (!sameWindingId.isEmpty()
-        && sameWindingId != _installedSameWindingArtifact
-        && sameWindingId != _fetchingSameWindingArtifact) {
-        _fetchingSameWindingArtifact = sameWindingId;
+    // Each editable PCL role publishes its own display-only snapshot.
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        const std::size_t slot = vc3d::spiral::pclRoleIndex(role);
+        const QJsonObject artifactRef =
+            status.value(vc3d::spiral::pclRoleStatusKey(role)).toObject();
+        const QString artifactId = artifactRef.value(QStringLiteral("id")).toString();
+        if (artifactId.isEmpty() || artifactId == _installedPclArtifact[slot]
+            || artifactId == _fetchingPclArtifact[slot])
+            continue;
+        _fetchingPclArtifact[slot] = artifactId;
         const quint64 generation = _connectionGeneration;
         _artifactCache->fetchArtifact(
-            sessionId, sameWindingId,
-            [this, sameWindingId, sameWindingRef, generation](
+            sessionId, artifactId,
+            [this, role, slot, artifactId, artifactRef, generation](
                 const QString& entryPath, const QString& error, bool gone) {
                 if (generation != _connectionGeneration) return;
-                if (_fetchingSameWindingArtifact == sameWindingId)
-                    _fetchingSameWindingArtifact.clear();
+                if (_fetchingPclArtifact[slot] == artifactId)
+                    _fetchingPclArtifact[slot].clear();
                 if (entryPath.isEmpty()) {
                     if (!gone) emit errorOccurred(error);
                     return;
                 }
-                _installedSameWindingArtifact = sameWindingId;
-                _lastSameWindingLocalPath = entryPath;
-                emit sameWindingArtifactAvailable(entryPath, sameWindingRef);
+                _installedPclArtifact[slot] = artifactId;
+                _lastPclLocalPath[slot] = entryPath;
+                emit pclArtifactAvailable(role, entryPath, artifactRef);
             });
     }
+}
+
+QStringList SpiralServiceManager::pclArtifactCachePins() const
+{
+    return vc3d::spiralArtifactCachePins(
+        _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
+        QStringList(_lastPclLocalPath.begin(), _lastPclLocalPath.end()));
 }
 
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,

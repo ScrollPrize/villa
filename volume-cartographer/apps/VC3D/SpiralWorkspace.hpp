@@ -1,6 +1,7 @@
 #pragma once
 
 #include "LineAnnotationController.hpp"
+#include "SpiralPclRole.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -145,9 +146,10 @@ private:
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
-    void installSameWindingArtifact(const QString& manifestPath,
-                                    const QJsonObject& artifactRef);
-    void refreshSameWindingOverlay();
+    void installPclArtifact(vc3d::spiral::PclRole role, const QString& manifestPath,
+                            const QJsonObject& artifactRef);
+    void refreshPclOverlay(vc3d::spiral::PclRole role);
+    void refreshPclOverlays();
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -197,8 +199,21 @@ private:
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
-    std::unique_ptr<VCCollection> _sameWindingCollection;
-    std::unique_ptr<PointsOverlayController> _sameWindingOverlay;
+    // The display-only overlay of one editable PCL role (same-winding or
+    // relative-winding), fed by the service's snapshot artifact of that
+    // role's dataset file.
+    struct PclOverlayState {
+        std::unique_ptr<VCCollection> collection;
+        std::unique_ptr<PointsOverlayController> overlay;
+        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
+        QString manifestPath;
+        bool visible = false;
+    };
+    std::array<PclOverlayState, vc3d::spiral::kEditablePclRoles.size()> _pclOverlays;
+    PclOverlayState& pclOverlay(vc3d::spiral::PclRole role)
+    {
+        return _pclOverlays[vc3d::spiral::pclRoleIndex(role)];
+    }
     LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
@@ -231,8 +246,6 @@ private:
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
-    std::optional<std::array<std::size_t, 3>> _sameWindingBaseShapeZYX;
-    QString _sameWindingManifestPath;
     std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
     std::optional<double> _previewToFiberBaseScale;
     std::optional<double> _fiberBaseToPreviewFactor;
@@ -259,7 +272,6 @@ private:
     bool _pendingPatchesOnly = false;
     bool _runDiffVisible = false;
     bool _windingTransitionsVisible = true;
-    bool _sameWindingPclsVisible = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
@@ -276,7 +288,9 @@ private:
     QHash<QString, QString> _pointCollectionProvisionalPaths;
     QSet<QString> _uncommittedPointCollectionIds;
     QSet<QString> _replacementPointCollectionIds;
-    QString _sameWindingCommitConflictRevision;
+    // Role of each staged collection replacement, for user-facing messages.
+    QHash<QString, vc3d::spiral::PclRole> _replacementPointCollectionRoles;
+    QString _pclCommitConflictRevision;
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime

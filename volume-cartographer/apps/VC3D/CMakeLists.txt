@@ -218,6 +218,7 @@ set(srcs
     SpiralBrushCursorWidget.hpp
     SpiralBrushController.cpp
     SpiralBrushController.hpp
+    SpiralPclRole.hpp
     SpiralPointPlacementMode.hpp
     SpiralPointCollectionEdit.cpp
     SpiralPointCollectionEdit.hpp
