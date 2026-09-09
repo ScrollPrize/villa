@@ -906,6 +906,11 @@ def get_flow_field_high_res_lr_scale(cfg, iteration):
     return min(1., float(initial) + fraction * (float(final) - float(initial)))
 
 
+def get_flow_field_low_res_lr_scale(cfg):
+    """Relative optimizer LR for the low-resolution flow lattice."""
+    return float(cfg.get('model_flow_field_low_res_lr_scale', 1.0) or 1.0)
+
+
 def set_optimizer_group_lr_scale(
         optimiser, lr_scheduler, *, group, reference_group, scale,
         initial_lr):
@@ -2262,10 +2267,15 @@ class FitContext:
                       'phase/SDT assets, see any warnings above).')
 
     def _apply_flow_group_settings(self, iteration):
-        """Per-step optimizer settings of the two flow-lattice groups: the
-        high-resolution LR scale and the lazy-moment flag. Read from the
-        live configuration every step, so both are run-boundary settings."""
-        scale = get_flow_field_high_res_lr_scale(self.config, iteration)
+        """Per-step optimizer settings of the two flow-lattice groups: their
+        LR scales relative to the base group and the moment flags. Read from
+        the live configuration every step, so all are run-boundary settings.
+        Returns (low-res scale, high-res scale)."""
+        high_res_scale = get_flow_field_high_res_lr_scale(self.config, iteration)
+        low_res_scale = get_flow_field_low_res_lr_scale(self.config)
+        # The base group (pitch and shell parameters) carries the scheduled
+        # optimizer_learning_rate unscaled; both flow groups hang off it.
+        base_group = self.optimiser.param_groups[0]
         low_res_group = next(
             group for group in self.optimiser.param_groups
             if any(param is self.low_res_flow_params[0] for param in group['params']))
@@ -2283,15 +2293,16 @@ class FitContext:
             group['lazy_moments'] = lazy_moments
             group['shared_second_moment'] = shared_second_moment
             group['shared_second_moment_clip_quantile'] = clip_quantile
-        set_optimizer_group_lr_scale(
-            self.optimiser,
-            self.lr_scheduler,
-            group=high_res_group,
-            reference_group=low_res_group,
-            scale=scale,
-            initial_lr=self.config['optimizer_learning_rate'],
-        )
-        return scale
+        for group, scale in ((low_res_group, low_res_scale), (high_res_group, high_res_scale)):
+            set_optimizer_group_lr_scale(
+                self.optimiser,
+                self.lr_scheduler,
+                group=group,
+                reference_group=base_group,
+                scale=scale,
+                initial_lr=self.config['optimizer_learning_rate'],
+            )
+        return low_res_scale, high_res_scale
 
     def _report_flow_grad_conditioning(self):
         """Log the flow gradient smoothing widths in lattice cells.
@@ -2909,6 +2920,7 @@ class FitContext:
         grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params}
         other_params = [p for p in self.spiral_and_transform.parameters() if id(p) not in grouped_ids]
         initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(self.config, 0)
+        initial_low_res_lr_scale = get_flow_field_low_res_lr_scale(self.config)
         param_groups = [
             {'params': other_params, 'weight_decay': 0.0},
             {'params': linear_params, 'weight_decay': 0.0},
@@ -2916,7 +2928,8 @@ class FitContext:
             {
                 'params': self.low_res_flow_params,
                 'weight_decay': self.config['optimizer_weight_decay_flow_field'],
-                'lr_scale': 1.,
+                'lr': self.config['optimizer_learning_rate'] * initial_low_res_lr_scale,
+                'lr_scale': initial_low_res_lr_scale,
             },
             {
                 'params': self.high_res_flow_params,
@@ -4287,7 +4300,8 @@ class FitContext:
 
     def step(self, iteration):
         self.step_timer.start('fwd')
-        flow_field_high_res_lr_scale = self._apply_flow_group_settings(iteration)
+        flow_field_low_res_lr_scale, flow_field_high_res_lr_scale = (
+            self._apply_flow_group_settings(iteration))
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -4309,6 +4323,7 @@ class FitContext:
 
         losses = {}
         log_metrics = {
+            'flow_field_low_res_lr_scale': flow_field_low_res_lr_scale,
             'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
         }
 

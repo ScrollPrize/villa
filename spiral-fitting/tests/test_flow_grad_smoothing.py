@@ -605,6 +605,15 @@ def test_new_optimizer_keys_are_run_boundary_and_off_by_default():
         assert fields[key]['runtime_impact'] == 'run_boundary'
         assert defaults[key] == default
         assert 'description' in fields[key]
+    # The low-res LR scale is a model_ key like the high-res scale it sits
+    # beside, so it shares that key's classification and rebuild stage.
+    low_res_lr = 'model_flow_field_low_res_lr_scale'
+    high_res_lr = 'model_flow_field_high_res_lr_scale_initial'
+    assert fields[low_res_lr]['type'] == 'number'
+    assert defaults[low_res_lr] == 1.0
+    assert 'description' in fields[low_res_lr]
+    assert fields[low_res_lr]['runtime_impact'] == fields[high_res_lr]['runtime_impact']
+    assert fields[low_res_lr].get('rebuild_stage') == fields[high_res_lr].get('rebuild_stage')
     # All postdate durable checkpoints: a checkpoint without them loads as
     # if they were off (the quantile only matters with the shared moment on).
     from config import BACKFILLABLE_CONFIG_DEFAULTS
@@ -613,6 +622,7 @@ def test_new_optimizer_keys_are_run_boundary_and_off_by_default():
     assert BACKFILLABLE_CONFIG_DEFAULTS[low_res] == 0.0
     assert BACKFILLABLE_CONFIG_DEFAULTS[quantile] == 0.99
     assert BACKFILLABLE_CONFIG_DEFAULTS[clip] == 0.0
+    assert BACKFILLABLE_CONFIG_DEFAULTS[low_res_lr] == 1.0
 
 
 cuda = pytest.mark.skipif(

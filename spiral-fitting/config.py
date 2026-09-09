@@ -150,6 +150,7 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_lazy_moments": False,
     "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
     "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
+    "model_flow_field_low_res_lr_scale": 1.0,
     "optimizer_flow_shared_second_moment": False,
     "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
     "optimizer_flow_grad_clip_median_multiple": 0.0,
@@ -214,6 +215,14 @@ _OPTIMIZER_DESCRIPTIONS = {
         "second moment averages them, so a few cells with persistently huge "
         "gradients cannot shrink every other cell's step. 1 disables the cap "
         "(plain mean)."),
+    "model_flow_field_low_res_lr_scale": (
+        "Optimizer LR of the low-resolution flow lattice relative to "
+        "optimizer_learning_rate (the high-resolution lattice has its own "
+        "ramped scale). With the shared flow second moment the typical cell "
+        "moves several times less per step than under per-cell Adam; raise "
+        "this until the logged coarse-lattice update rms is back where the "
+        "fit needs it, without touching the gap, linear and pitch groups. "
+        "Read live every step."),
     "optimizer_flow_grad_clip_median_multiple": (
         "Clip each flow lattice's gradient, per stage, at this multiple of "
         "the median nonzero |gradient| of that stage (read from a "
@@ -270,6 +279,7 @@ MODEL_STAGE_KEYS = frozenset({
     "model_flow_bounds_radius",
     "model_flow_voxel_resolution",
     "model_flow_field_type",
+    "model_flow_field_low_res_lr_scale",
     "model_flow_field_high_res_lr_scale_initial",
     "model_flow_field_high_res_lr_scale_final",
     "model_flow_field_high_res_lr_ramp_start_step",
@@ -408,6 +418,9 @@ class Config:
         self.model_flow_field_high_res_lr_scale_final = 0.2
         self.model_flow_field_high_res_lr_ramp_start_step = 0
         self.model_flow_field_high_res_lr_ramp_steps = 1
+        # Both flow lattices' LRs are optimizer_learning_rate times their
+        # scale; the low-resolution one had no scale of its own before.
+        self.model_flow_field_low_res_lr_scale = 1.0
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
         # The physical winding estimate and the allocated transform capacity

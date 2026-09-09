@@ -142,3 +142,31 @@ def test_realign_preserves_parameter_group_lr_scales():
         optimiser.param_groups[0]["lr"] * 0.2,
         rel_tol=1e-12,
     )
+
+
+def test_both_flow_groups_scale_off_the_same_base_group():
+    # The low- and high-resolution flow groups each take their LR relative to
+    # the unscaled base group, so the coarse lattice's scale does not compound
+    # into the fine lattice's.
+    base = torch.nn.Parameter(torch.tensor(0., dtype=torch.float64))
+    low_res = torch.nn.Parameter(torch.tensor(0., dtype=torch.float64))
+    high_res = torch.nn.Parameter(torch.tensor(0., dtype=torch.float64))
+    optimiser = torch.optim.SGD([
+        {"params": [base]},
+        {"params": [low_res], "lr_scale": 1.},
+        {"params": [high_res], "lr_scale": 1.},
+    ], lr=1.e-2)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=1.)
+    base_group, low_group, high_group = optimiser.param_groups
+    for group, scale in ((low_group, 4.), (high_group, 0.2)):
+        set_optimizer_group_lr_scale(
+            optimiser, scheduler, group=group, reference_group=base_group,
+            scale=scale, initial_lr=1.e-2)
+    for param in (base, low_res, high_res):
+        param.grad = torch.ones_like(param)
+    optimiser.step()
+    assert math.isclose(low_res.item() / base.item(), 4., rel_tol=1e-12)
+    assert math.isclose(high_res.item() / base.item(), 0.2, rel_tol=1e-12)
+    assert scheduler.base_lrs == [1.e-2, 4.e-2, 2.e-3]
+    assert fit_spiral.get_flow_field_low_res_lr_scale({"model_flow_field_low_res_lr_scale": 4.}) == 4.
+    assert fit_spiral.get_flow_field_low_res_lr_scale({}) == 1.
