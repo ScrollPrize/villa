@@ -61,10 +61,13 @@ import torch
 import flow_grad_smoothing
 
 
-CURVATURE_MODES = ('none', 'finite_difference')
-# A CG residual growing by more than this factor in one iteration stops the
-# solve (see conjugate_gradient).
-RESIDUAL_GROWTH_LIMIT = 2.0
+CURVATURE_MODES = ('none', 'finite_difference', 'gauss_newton')
+# Default factor by which a CG residual may grow in one iteration before the
+# solve stops (see conjugate_gradient and SobolevSettings.residual_growth_limit).
+# CG's residual 2-norm is not monotone, and with a Gauss-Newton operator whose
+# range is the sampled cells it can spike by several times legitimately, so
+# the default only catches blatant blow-ups.
+RESIDUAL_GROWTH_LIMIT = 10.0
 PRECONDITIONERS = ('cg', 'gaussian')
 
 
@@ -315,14 +318,16 @@ class SolveInfo:
 
 
 def conjugate_gradient(operator, rhs, *, max_iterations, tolerance=0.0,
-                       preconditioner=None, boundary=None):
+                       preconditioner=None, boundary=None,
+                       residual_growth_limit=RESIDUAL_GROWTH_LIMIT):
     """(Preconditioned) conjugate gradients on block vectors.
 
     ``operator(v_list)`` returns ``B v`` as a block vector, or None when it
     failed (non-finite arithmetic). ``preconditioner(r_list)`` returns
     ``M^-1 r``. Starts from zero. Stops at the first of: ``max_iterations``;
     ``||r|| <= tolerance * ||r0||``; a non-finite scalar; the residual norm
-    growing past ``RESIDUAL_GROWTH_LIMIT`` times the previous iterate's
+    growing past ``residual_growth_limit`` times the previous iterate's (0
+    or None disables that check)
     (CG's residual norm is not monotone even for a symmetric positive
     operator, but a jump of that size means the operator is inconsistent,
     e.g. a finite-difference secant across a kink) -- the previous iterate
@@ -382,7 +387,9 @@ def conjugate_gradient(operator, rhs, *, max_iterations, tolerance=0.0,
         for ri, Bpi in zip(r, Bp):
             ri.add_(Bpi, alpha=-alpha)
         r_norm = block_norm(r)
-        if not _is_finite(r_norm) or float(r_norm) > RESIDUAL_GROWTH_LIMIT * info.residual_final:
+        grew = (residual_growth_limit is not None and residual_growth_limit > 0.0
+                and float(r_norm) > residual_growth_limit * info.residual_final)
+        if not _is_finite(r_norm) or grew:
             # Roll the iterate back: its residual is not trustworthy (or
             # worse than the previous iterate's).
             for xi, pi in zip(x, p):
@@ -471,6 +478,11 @@ class SobolevSettings:
     max_step_voxels: float = 2.0
     fd_epsilon_voxels: float = 1.0
     diagnostic_interval: int = 0
+    irls_floor: float = 1.0
+    residual_growth_limit: float = RESIDUAL_GROWTH_LIMIT
+    rho_reject: bool = True
+    rho_poor: float = 0.25
+    rho_good: float = 0.75
     adapt_damping: bool = True
     damping_increase: float = 3.0
     damping_decrease: float = 1.5
@@ -496,6 +508,12 @@ class SobolevSettings:
             trust_radius=float(read('optimizer_flow_sobolev_trust_radius', 0.0)),
             max_step_voxels=float(read('optimizer_flow_sobolev_max_step_voxels', 2.0)),
             diagnostic_interval=int(read('optimizer_flow_sobolev_diagnostic_interval', 0)),
+            irls_floor=float(read('optimizer_flow_sobolev_irls_floor', 1.0)),
+            residual_growth_limit=float(read('optimizer_flow_sobolev_residual_growth_limit',
+                                             RESIDUAL_GROWTH_LIMIT)),
+            rho_reject=bool(read('optimizer_flow_sobolev_rho_reject', True)),
+            rho_poor=float(read('optimizer_flow_sobolev_rho_poor', 0.25)),
+            rho_good=float(read('optimizer_flow_sobolev_rho_good', 0.75)),
             adapt_damping=bool(read('optimizer_flow_sobolev_adapt_damping', True)),
             damping_increase=float(read('optimizer_flow_sobolev_damping_increase', 3.0)),
             damping_decrease=float(read('optimizer_flow_sobolev_damping_decrease', 1.5)),
@@ -518,8 +536,12 @@ class SobolevSettings:
                 f'got {self.preconditioner!r}')
         if not self.damping > 0.0:
             raise ValueError('optimizer_flow_sobolev_damping must be positive')
-        if self.curvature == 'finite_difference' and not self.fd_epsilon_voxels > 0.0:
+        if self.uses_curvature and not self.fd_epsilon_voxels > 0.0:
             raise ValueError('optimizer_flow_sobolev_fd_epsilon_voxels must be positive')
+        if not self.irls_floor > 0.0:
+            raise ValueError('optimizer_flow_sobolev_irls_floor must be positive')
+        if not 0.0 <= self.rho_poor <= self.rho_good:
+            raise ValueError('optimizer_flow_sobolev_rho_poor must lie in [0, rho_good]')
         if self.adapt_damping and not (self.damping_increase > 1.0 and self.damping_decrease >= 1.0
                                        and self.damping_max_factor >= 1.0):
             raise ValueError('optimizer_flow_sobolev_damping_increase must exceed 1, '
@@ -624,7 +646,7 @@ def sobolev_step(grads, metrics, settings, *, hvp=None, preconditioners=None,
         steps, info = conjugate_gradient(
             operator, rhs, max_iterations=settings.pcg_iterations,
             tolerance=settings.pcg_tolerance, preconditioner=preconditioner_recording,
-            boundary=boundary)
+            boundary=boundary, residual_growth_limit=settings.residual_growth_limit)
         fallback = info.iterations == 0 and not info.steihaug > 0.0
         if fallback:
             first = getattr(info, 'first_preconditioned', None)
@@ -704,15 +726,28 @@ POOR_SOLVE_REASONS = ('nonpositive_curvature', 'residual_increased', 'nonfinite'
                       'nonfinite_step', 'indefinite_preconditioner')
 
 
-def adapt_damping(damping, reason, settings):
-    """Next step's lambda from this step's solver outcome (cross-step
-    Levenberg-Marquardt without retries): multiply on a poor solve, divide
-    on a clean one, within [settings.damping, settings.damping *
-    damping_max_factor]. Returns ``damping`` unchanged when adaptation is off
-    or curvature is not used."""
-    if not settings.adapt_damping or not settings.uses_curvature:
+def adapt_damping(damping, reason, settings, rho=None):
+    """Next step's lambda (cross-step Levenberg-Marquardt without retries),
+    within [settings.damping, settings.damping * damping_max_factor].
+
+    With ``rho`` (actual over predicted reduction on the same batch) the
+    rule is the plan's: multiply by ``damping_increase`` when ``rho <
+    rho_poor`` (including rejected steps), divide by ``damping_decrease``
+    when ``rho > rho_good``, else keep. That applies to every curvature mode,
+    since for the Sobolev gradient step lambda is the step length. Without
+    ``rho`` the solver outcome stands in (curvature modes only): multiply on
+    a poor solve, divide on a clean one. Returns ``damping`` unchanged when
+    adaptation is off."""
+    if not settings.adapt_damping:
         return float(damping)
-    if reason in POOR_SOLVE_REASONS:
+    if rho is not None:
+        if not math.isfinite(rho) or rho < settings.rho_poor:
+            damping = damping * settings.damping_increase
+        elif rho > settings.rho_good:
+            damping = damping / settings.damping_decrease
+    elif not settings.uses_curvature:
+        return float(damping)
+    elif reason in POOR_SOLVE_REASONS:
         damping = damping * settings.damping_increase
     elif reason in ('converged', 'max_iterations'):
         damping = damping / settings.damping_decrease
@@ -793,12 +828,19 @@ def describe_settings(settings, cell_voxels, spatial_scale_factor, field_type):
     if settings.uses_curvature:
         report += (f' (PCG <= {settings.pcg_iterations} iterations, tolerance '
                    f'{settings.pcg_tolerance:g}, finite-difference epsilon '
-                   f'{settings.fd_epsilon_voxels:g} voxels)')
+                   f'{settings.fd_epsilon_voxels:g} voxels')
+        if settings.curvature == 'gauss_newton':
+            report += f', IRLS floor {settings.irls_floor:g}'
+        report += ')'
     if settings.max_step_voxels > 0.0:
         report += f'; step capped at {settings.max_step_voxels:g} voxels RMS per component'
-    if settings.uses_curvature and settings.adapt_damping:
-        report += (f'; damping adapts x{settings.damping_increase:g} on poor solves, '
-                   f'/{settings.damping_decrease:g} on clean ones')
+    if settings.adapt_damping and (settings.uses_curvature or settings.evaluate_step):
+        report += (f'; damping adapts x{settings.damping_increase:g} / '
+                   f'/{settings.damping_decrease:g} on '
+                   + ('rho (same-batch evaluation), rejecting rho <= 0'
+                      if settings.evaluate_step and settings.rho_reject
+                      else 'rho (same-batch evaluation)' if settings.evaluate_step
+                      else 'poor / clean solves'))
     if settings.preconditioner == 'gaussian':
         report += ('; preconditioner: Gaussian smoother (HEURISTIC, not shown '
                    'self-adjoint)')

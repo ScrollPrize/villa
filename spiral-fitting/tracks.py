@@ -14,6 +14,8 @@ import tempfile
 
 import kornia
 import numpy as np
+
+import gauss_newton_residuals
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
@@ -3360,7 +3362,8 @@ def _grouped_same_radius_loss(
         target_values, group_id, row_slot, num_groups, group_width,
         target_mode == 'median')
     flat_group_id = group_id[row_id]
-    deviations = (shifted_radii - targets[flat_group_id]).abs()
+    signed_deviations = shifted_radii - targets[flat_group_id]
+    deviations = signed_deviations.abs()
     hinged = F.relu(
         deviations
         - dr_per_winding.detach() * cfg['track_radius_loss_margin'])
@@ -3377,7 +3380,9 @@ def _grouped_same_radius_loss(
     per_group = sums / counts.clamp(min=1)
     if within_p != 1.0:
         per_group = per_group ** (1.0 / within_p)
-    return per_group.mean(), targets, hinged
+    loss = per_group.mean()
+    gauss_newton_residuals.register('track_radius', signed_deviations, loss)
+    return loss, targets, hinged
 
 
 def _crossing_row_alignments(
@@ -3534,8 +3539,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
 
     within_p = cfg['track_dt_within_track_norm_p']
     across_p = cfg['track_dt_norm_p']
-    point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
+    raw_point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
+    point_distances = F.relu(raw_point_distances - dt_hinge_margin) + 1.e-5
     flat_group_id = group_id[row_id]
     sums = torch.zeros(
         num_groups, device=device, dtype=point_distances.dtype)
@@ -3545,6 +3550,7 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     group_losses = (sums / counts.clamp(min=1)) ** (1 / within_p)
     dt_loss = _aggregate_dt_track_losses(
         group_losses, across_p, active_mask)
+    gauss_newton_residuals.register('track_dt', raw_point_distances, dt_loss)
     record_loss_samples(
         'track_dt', target_spiral_zyxs, point_distances,
         active_mask[flat_group_id] if active_mask is not None else None,

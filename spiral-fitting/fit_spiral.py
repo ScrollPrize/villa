@@ -50,6 +50,7 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
+import gauss_newton_residuals
 import sobolev_gauss_newton
 from sobolev_gauss_newton import SobolevSettings
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
@@ -2560,6 +2561,48 @@ class FitContext:
                     for param, backup in zip(params, backups):
                         param.copy_(backup)
 
+        def gauss_newton_product(perturbation, scale):
+            """``J^T W J (scale * perturbation)`` of the residual losses on the
+            frozen batch (see gauss_newton_residuals): a no-grad capture pass
+            at the shifted parameters, then a product pass at the current
+            ones. Returns the flow-lattice blocks, or None on failure."""
+            backups = [param.detach().clone() for param in params]
+            capture = gauss_newton_residuals.ResidualCapture('capture')
+            with torch.no_grad():
+                for param, delta in zip(params, perturbation):
+                    param.add_(delta, alpha=scale)
+            try:
+                rng.restore()
+                with torch.no_grad(), gauss_newton_residuals.active(capture):
+                    self._compute_step_gradients(
+                        iteration, skip_flow_conditioning=True, gauss_newton=capture)
+            finally:
+                with torch.no_grad():
+                    for param, backup in zip(params, backups):
+                        param.copy_(backup)
+            stats['reevaluations'] += 1
+            product = gauss_newton_residuals.ResidualCapture(
+                'product', perturbed=capture.entries, epsilon=scale,
+                floor=settings.irls_floor)
+            rng.restore()
+            for param in self.dist_grad_params:
+                param.grad = None
+            before = self.nonfinite_grad_steps.clone()
+            with gauss_newton_residuals.active(product):
+                self._compute_step_gradients(
+                    iteration, skip_flow_conditioning=True, gauss_newton=product)
+            stats['reevaluations'] += 1
+            stats['gn_terms_used'] = list(product.used)
+            stats['gn_terms_omitted'] = list(product.omitted)
+            if product.failed is not None:
+                stats['gn_failure'] = product.failed
+                return None
+            if bool(self.nonfinite_grad_steps > before):
+                stats['reevaluation_nonfinite'] += 1
+                return None
+            return [torch.zeros_like(param) if param.grad is None else param.grad.clone()
+                    for param in params]
+
         hvp = None
         if settings.uses_curvature:
             # Perturbation scale: an RMS velocity change of fd_epsilon_voxels
@@ -2572,8 +2615,11 @@ class FitContext:
                                / sum(t.numel() for t in v)).sqrt())
                 if not v_rms > 0.0 or not math.isfinite(v_rms):
                     return None
-                out = sobolev_gauss_newton.finite_difference_hvp(
-                    reevaluate_flow_gradient, grads, v, units / v_rms)
+                if settings.curvature == 'gauss_newton':
+                    out = gauss_newton_product(v, units / v_rms)
+                else:
+                    out = sobolev_gauss_newton.finite_difference_hvp(
+                        reevaluate_flow_gradient, grads, v, units / v_rms)
                 if out is None:
                     return None
                 # The re-evaluation masks influence-constrained cells (and the
@@ -2590,9 +2636,6 @@ class FitContext:
             grads, metrics, settings, hvp=hvp, preconditioners=preconditioners,
             damping=damping)
         stats.update(solve_stats)
-        self.sobolev_damping = sobolev_gauss_newton.adapt_damping(
-            damping, solve_stats['reason'], settings)
-        stats['next_damping'] = self.sobolev_damping
         # Cap the applied increment in voxels: the raw step scales with the
         # gradient, so an untuned damping can otherwise move the lattice by
         # thousands of voxels in one step.
@@ -2605,6 +2648,10 @@ class FitContext:
             if largest > settings.max_step_voxels:
                 cap_scale = settings.max_step_voxels / largest
         stats['cap_scale'] = cap_scale
+        # A rejected trial must restore the parameters exactly: keep a copy
+        # (one lattice per flow parameter) while a rejection is possible.
+        pre_step = ([param.detach().clone() for param in params]
+                    if settings.evaluate_step and settings.rho_reject else None)
         sobolev_gauss_newton.apply_steps_(params, steps, settings.step_scale * cap_scale)
         stats['step_scale'] = settings.step_scale * cap_scale
         stats['loss_before'] = float(loss)
@@ -2657,10 +2704,31 @@ class FitContext:
                 iteration, skip_flow_conditioning=True)
             stats['reevaluations'] += 1
             stats['loss_after'] = float(loss_after)
-        if diagnose and stats.get('predicted_reduction') is not None:
+            if 'predicted_reduction' not in stats:
+                # The linear model is enough to judge the step direction
+                # (the quadratic term needs a product pass; see diagnostics).
+                stats['predicted_reduction'] = sobolev_gauss_newton.predicted_reduction(
+                    grads, [step * stats['step_scale'] for step in steps])
+        rho = None
+        if stats.get('predicted_reduction') is not None and 'loss_after' in stats:
             actual = stats['loss_before'] - stats['loss_after']
             predicted = stats['predicted_reduction']
-            stats['rho'] = actual / predicted if predicted != 0.0 else math.nan
+            rho = actual / predicted if predicted != 0.0 else math.nan
+            stats['rho'] = rho
+            stats['actual_reduction'] = actual
+            # The plan's acceptance test: a step that raised the same-batch
+            # loss (or made it non-finite) is undone exactly; lambda grows.
+            rejected = settings.rho_reject and not (math.isfinite(actual) and actual > 0.0)
+            stats['rejected'] = rejected
+            if rejected:
+                with torch.no_grad():
+                    for param, backup in zip(params, pre_step):
+                        param.copy_(backup)
+                rho = 0.0 if not math.isfinite(rho) else min(rho, 0.0)
+        self.sobolev_damping = sobolev_gauss_newton.adapt_damping(
+            damping, solve_stats['reason'], settings, rho=rho)
+        stats['next_damping'] = self.sobolev_damping
+        if diagnose and stats.get('rho') is not None:
             if self.dist.is_main_process:
                 hess = stats.get('hessian_term')
                 defect = stats.get('symmetry_defect')
@@ -2688,6 +2756,13 @@ class FitContext:
                 rms * component_voxels[c] * stats['step_scale']
                 for c, rms in enumerate(block_stats['component_rms'])]
         self.sobolev_step_stats = stats
+        if ('gn_terms_used' in stats and self.dist.is_main_process
+                and not getattr(self, '_sobolev_gn_terms_reported', False)):
+            self._sobolev_gn_terms_reported = True
+            print('flow Sobolev Gauss-Newton curvature from: '
+                  + (', '.join(stats['gn_terms_used']) or 'nothing')
+                  + '; first order only: '
+                  + (', '.join(stats['gn_terms_omitted']) or 'nothing'))
 
         # Restore the counters and the non-flow gradients of the original
         # evaluation, and hide the flow gradients from the optimizer.
@@ -2724,6 +2799,12 @@ class FitContext:
             parts.append('FALLBACK to Sobolev step')
         if stats.get('steihaug', 0.0) > 0.0:
             parts.append(f"steihaug tau {stats['steihaug']:.3g}")
+        if stats.get('gn_failure'):
+            parts.append(f"GN failed: {stats['gn_failure']}")
+        if stats.get('rejected'):
+            parts.append('REJECTED (step undone)')
+        if stats.get('rho') is not None and 'loss_after' in stats:
+            parts.append(f"rho {stats['rho']:.3f}")
         if stats['trust_scale'] < 1.0:
             parts.append(f"trust scale {stats['trust_scale']:.3f}")
         if stats.get('cap_scale', 1.0) < 1.0:
@@ -2742,6 +2823,7 @@ class FitContext:
         payload[prefix + 'next_damping'] = stats.get('next_damping', stats['damping'])
         payload[prefix + 'steihaug'] = stats.get('steihaug', 0.0)
         payload[prefix + 'residual_increased'] = float(stats['reason'] == 'residual_increased')
+        payload[prefix + 'rejected'] = float(bool(stats.get('rejected')))
         payload[prefix + 'solve_seconds'] = stats['solve_seconds']
         payload[prefix + 'reevaluations'] = stats['reevaluations']
         payload[prefix + 'fallback'] = float(bool(stats.get('fallback')))
@@ -4699,7 +4781,8 @@ class FitContext:
 
         return loss, losses, log_metrics, shell_metrics
 
-    def _compute_step_gradients(self, iteration, *, skip_flow_conditioning=False):
+    def _compute_step_gradients(self, iteration, *, skip_flow_conditioning=False,
+                                gauss_newton=None):
         """Sample this iteration's batch, accumulate every parameter's gradient
         and condition it: DDP averaging, non-finite sanitising, then (unless
         ``skip_flow_conditioning``) flow clipping and smoothing, and finally
@@ -4707,6 +4790,13 @@ class FitContext:
         shell_metrics)`` without touching the parameters or optimizer, so the
         Sobolev step can call it again on the same batch (after restoring the
         random state) for finite-difference curvature.
+
+        ``gauss_newton`` is a gauss_newton_residuals.ResidualCapture: in
+        ``'product'`` mode each loss family back-propagates ``W J v`` through
+        its registered residuals instead of its loss (the parameter gradients
+        then hold the Gauss-Newton product), and the caller runs a
+        ``'capture'`` pass under torch.no_grad() to collect the perturbed
+        residuals first.
         """
         self.step_timer.start('fwd')
 
@@ -4737,11 +4827,16 @@ class FitContext:
             if family_loss.requires_grad:
                 self.step_timer.stop('fwd')
                 self.step_timer.start('bwd')
-                # The paths shared with later families end at detached leaves
-                # (shared_transform_leaves and the flow fields' internal
-                # accumulators), so this family's graph is self-contained and
-                # its buffers are freed as the backward pass consumes them.
-                family_loss.backward()
+                if gauss_newton is not None and gauss_newton.mode == 'product':
+                    # Gauss-Newton product: W J v through the registered
+                    # residuals instead of the loss gradient.
+                    gauss_newton.family_backward(weighted_losses)
+                else:
+                    # The paths shared with later families end at detached leaves
+                    # (shared_transform_leaves and the flow fields' internal
+                    # accumulators), so this family's graph is self-contained and
+                    # its buffers are freed as the backward pass consumes them.
+                    family_loss.backward()
                 self.step_timer.stop('bwd')
                 self.step_timer.start('fwd')
             for name, value in weighted_losses.items():

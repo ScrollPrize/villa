@@ -31,6 +31,7 @@ import sobolev_gauss_newton as sgn
 from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
 from flow_fields import CartesianFlowField, CylindricalFlowField
 from lazy_moment_adamw import LazyMomentAdamW
+import gauss_newton_residuals as gnr
 
 torch.set_default_dtype(torch.float32)
 
@@ -412,6 +413,11 @@ def test_sobolev_keys_are_run_boundary_off_by_default_and_backfilled():
         'optimizer_flow_sobolev_max_step_voxels': ('number', 2.0),
         'optimizer_flow_sobolev_adapt_damping': ('boolean', True),
         'optimizer_flow_sobolev_diagnostic_interval': ('integer', 0),
+        'optimizer_flow_sobolev_irls_floor': ('number', 1.0),
+        'optimizer_flow_sobolev_residual_growth_limit': ('number', 10.0),
+        'optimizer_flow_sobolev_rho_reject': ('boolean', True),
+        'optimizer_flow_sobolev_rho_poor': ('number', 0.25),
+        'optimizer_flow_sobolev_rho_good': ('number', 0.75),
         'optimizer_flow_sobolev_damping_increase': ('number', 3.0),
         'optimizer_flow_sobolev_damping_decrease': ('number', 1.5),
         'optimizer_flow_sobolev_damping_max_factor': ('number', 10000.0),
@@ -425,7 +431,7 @@ def test_sobolev_keys_are_run_boundary_off_by_default_and_backfilled():
         assert defaults[key] == default, key
         assert BACKFILLABLE_CONFIG_DEFAULTS[key] == default, key
         assert 'description' in fields[key], key
-    assert fields['optimizer_flow_sobolev_curvature']['values'] == ['none', 'finite_difference']
+    assert fields['optimizer_flow_sobolev_curvature']['values'] == ['none', 'finite_difference', 'gauss_newton']
     assert fields['optimizer_flow_sobolev_preconditioner']['values'] == ['cg', 'gaussian']
     # A checkpoint without the keys resolves to the disabled step.
     settings = sgn.SobolevSettings.from_config({})
@@ -853,6 +859,12 @@ def test_residual_growth_stops_the_solve_and_keeps_the_previous_iterate():
     steps, stats = sgn.sobolev_step([g], [metric], settings, hvp=hvp)
     assert stats['reason'] in ('residual_increased', 'nonpositive_curvature')
     assert stats['residual_final'] <= stats['residual_initial'] * sgn.RESIDUAL_GROWTH_LIMIT
+    # The guard is configurable and can be switched off.
+    settings_off = _settings(damping=1.0, curvature='finite_difference', pcg_iterations=20,
+                             pcg_tolerance=1e-12, inner_cg_iterations=200, inner_cg_tolerance=1e-14,
+                             adapt_damping=False, residual_growth_limit=0.0)
+    _, stats_off = sgn.sobolev_step([g], [metric], settings_off, hvp=hvp)
+    assert stats_off['reason'] != 'residual_increased'
     assert bool(torch.isfinite(steps[0]).all())
     # A symmetric positive operator is never stopped by the growth guard.
     J = torch.randn(n, n, dtype=torch.float64)
@@ -914,6 +926,16 @@ def test_adapt_damping_is_a_bounded_cross_step_lm_rule():
     assert sgn.adapt_damping(7.0, 'nonpositive_curvature', off) == 7.0
     none = _settings(damping=2.0, curvature='none')
     assert sgn.adapt_damping(7.0, 'nonpositive_curvature', none) == 7.0
+    # With rho the plan's rule applies to every mode: poor agreement raises
+    # lambda, good agreement lowers it, in between keeps it; rejected steps
+    # (rho <= 0) and non-finite rho count as poor.
+    assert sgn.adapt_damping(7.0, 'converged', none, rho=0.1) == 21.0
+    assert sgn.adapt_damping(7.0, 'converged', none, rho=0.5) == 7.0
+    assert sgn.adapt_damping(7.0, 'nonpositive_curvature', none, rho=0.9) == pytest.approx(7.0 / 1.5)
+    assert sgn.adapt_damping(7.0, 'converged', none, rho=-1.0) == 21.0
+    assert sgn.adapt_damping(7.0, 'converged', none, rho=math.nan) == 21.0
+    with pytest.raises(ValueError):
+        _settings(rho_poor=0.9, rho_good=0.5)
     with pytest.raises(ValueError):
         _settings(curvature='finite_difference', damping_increase=1.0)
 
@@ -993,3 +1015,252 @@ def test_fitter_hook_diagnostics_report_rho_and_symmetry(monkeypatch, capsys):
     assert 'flow sobolev diag it=0' in out and 'rho 1.00' in out
     _, payload = context._sobolev_report()
     assert payload['flow_sobolev/rho'] == stats['rho']
+
+
+# --------------------------------------------------------------------------
+# Gauss-Newton on registered residuals
+
+
+def test_irls_weights_match_the_analytic_majorizer_weights():
+    r = torch.tensor([-3.0, -0.5, 0.0, 0.2, 2.0, 5.0], dtype=torch.float64, requires_grad=True)
+    # Hinge on |r| with margin 1: weight 1/|r| outside the margin, 0 inside.
+    hinge = torch.relu(r.abs() - 1.0).mean()
+    w = gnr.irls_weights(hinge, r, floor=1e-3)
+    expected = torch.where(r.detach().abs() > 1.0, 1.0 / r.detach().abs(), torch.zeros_like(r.detach())) / r.numel()
+    torch.testing.assert_close(w, expected)
+    # Huber with delta 1: 1/delta inside, 1/|r| outside. At exactly r = 0 the
+    # generic (dL/dr)/r reads 0 rather than the 1/delta limit: a
+    # measure-zero underestimate, accepted for the formula-free weights.
+    huber = torch.where(r.abs() <= 1.0, 0.5 * r ** 2, r.abs() - 0.5).sum()
+    w = gnr.irls_weights(huber, r, floor=1e-3)
+    expected = torch.where(r.detach().abs() <= 1.0, torch.ones_like(r.detach()), 1.0 / r.detach().abs())
+    expected[2] = 0.0
+    torch.testing.assert_close(w, expected)
+    # Squared: exact Gauss-Newton weight 1 (times the mean's 1/n).
+    w = gnr.irls_weights(0.5 * (r ** 2).mean(), r, floor=1e-3)
+    expected = torch.full_like(w, 1.0 / r.numel())
+    expected[2] = 0.0  # r = 0: see the Huber note above
+    torch.testing.assert_close(w, expected)
+    # L1 near zero is floored, and a loss independent of r yields None.
+    w = gnr.irls_weights(r.abs().sum(), r, floor=0.5)
+    assert float(w[2]) == pytest.approx(0.0)  # sign(0) = 0 gradient
+    assert float(w[3]) == pytest.approx(1.0 / 0.5)
+    assert gnr.irls_weights(torch.zeros((), dtype=torch.float64, requires_grad=True) + 1.0, r, 1.0) is None
+
+
+def _linear_residual_problem(seed=51):
+    """Two loss families whose residuals are affine in a flat parameter vector."""
+    torch.manual_seed(seed)
+    n, m1, m2 = 6, 9, 7
+    M1 = torch.randn(m1, n, dtype=torch.float64)
+    c1 = torch.randn(m1, dtype=torch.float64)
+    M2 = torch.randn(m2, n, dtype=torch.float64)
+    c2 = torch.randn(m2, dtype=torch.float64)
+    weights = {'hinge_family': 2.0, 'huber_family': 0.5}
+
+    def families(p, gauss_newton=None):
+        # Family 1: hinge on |r| with margin 0.3; family 2: Huber, delta 1.
+        r1 = M1 @ p + c1
+        loss1 = torch.relu(r1.abs() - 0.3).mean()
+        gnr.register('hinge_family', r1, loss1)
+        weighted1 = {'hinge_family': loss1 * weights['hinge_family']}
+        if gauss_newton is not None and gauss_newton.mode == 'product':
+            gauss_newton.family_backward(weighted1)
+        elif loss1.requires_grad:
+            weighted1['hinge_family'].backward()
+        r2 = M2 @ p + c2
+        loss2 = torch.where(r2.abs() <= 1.0, 0.5 * r2 ** 2, r2.abs() - 0.5).sum()
+        gnr.register('huber_family', r2, loss2)
+        # An unregistered term stays first order.
+        extra = (p ** 2).sum() * 0.1
+        weighted2 = {'huber_family': loss2 * weights['huber_family'], 'extra': extra}
+        if gauss_newton is not None and gauss_newton.mode == 'product':
+            gauss_newton.family_backward(weighted2)
+        elif loss2.requires_grad:
+            sum(weighted2.values()).backward()
+        return (r1.detach(), r2.detach())
+
+    def dense_operator(p):
+        r1 = (M1 @ p + c1)
+        r2 = (M2 @ p + c2)
+        w1 = torch.where(r1.abs() > 0.3, 1.0 / r1.abs().clamp(min=1e-3), torch.zeros_like(r1)) / m1 * weights['hinge_family']
+        w2 = torch.where(r2.abs() <= 1.0, torch.ones_like(r2), 1.0 / r2.abs().clamp(min=1e-3)) * weights['huber_family']
+        return M1.T @ torch.diag(w1) @ M1 + M2.T @ torch.diag(w2) @ M2
+    return n, families, dense_operator
+
+
+def test_gauss_newton_product_matches_the_dense_operator_and_is_symmetric():
+    n, families, dense_operator = _linear_residual_problem()
+    p = torch.randn(n, dtype=torch.float64)
+    G = dense_operator(p)
+
+    def product(v):
+        eps = 1e-3
+        capture = gnr.ResidualCapture('capture')
+        with torch.no_grad(), gnr.active(capture):
+            families(p + eps * v[0], gauss_newton=capture)
+        prod = gnr.ResidualCapture('product', perturbed=capture.entries, epsilon=eps, floor=1e-3)
+        leaf = p.clone().requires_grad_(True)
+        with gnr.active(prod):
+            families(leaf, gauss_newton=prod)
+        assert prod.failed is None
+        assert prod.used == ['hinge_family', 'huber_family']
+        assert prod.omitted == ['extra']
+        return [leaf.grad.clone()]
+    v = torch.randn(n, dtype=torch.float64)
+    torch.testing.assert_close(product([v])[0], G @ v, atol=1e-6, rtol=1e-6)
+    u = torch.randn(n, dtype=torch.float64)
+    defect, _, _ = sgn.symmetry_defect(product, [u], [v])
+    assert defect < 1e-6
+    # Positive semidefinite: every curvature is nonnegative.
+    for _ in range(5):
+        w = torch.randn(n, dtype=torch.float64)
+        assert float(w @ product([w])[0]) >= -1e-9
+    # A capture/product mismatch is reported, not silently mixed.
+    capture = gnr.ResidualCapture('capture')
+    with torch.no_grad(), gnr.active(capture):
+        families(p, gauss_newton=capture)
+    capture.entries[0] = (capture.entries[0][0], capture.entries[0][1][:-1], capture.entries[0][2])
+    prod = gnr.ResidualCapture('product', perturbed=capture.entries, epsilon=1e-3)
+    leaf = p.clone().requires_grad_(True)
+    with gnr.active(prod):
+        families(leaf, gauss_newton=prod)
+    assert prod.failed is not None and 'shape' in prod.failed
+
+
+def test_register_is_a_noop_without_an_active_capture():
+    r = torch.randn(4, requires_grad=True)
+    assert not gnr.is_active()
+    gnr.register('anything', r, r.sum())  # no error, nothing stored
+    capture = gnr.ResidualCapture('capture')
+    with gnr.active(capture):
+        assert gnr.is_active()
+        gnr.register('anything', r, r.sum())
+    assert not gnr.is_active()
+    assert len(capture.entries) == 1 and not capture.entries[0][1].requires_grad
+    with pytest.raises(RuntimeError):
+        capture.family_backward({})
+    with pytest.raises(ValueError):
+        gnr.ResidualCapture('other')
+
+
+def _residual_loss_fn(model, curvature):
+    """A stub gradient pass for the fitter hook whose flow losses are hinge
+    residuals registered for Gauss-Newton and whose pitch loss is plain."""
+    targets = {}
+
+    def compute(context, iteration, *, skip_flow_conditioning=False, gauss_newton=None):
+        loss_total = torch.zeros(())
+        losses = {}
+        for name, param in context.dist_grad_named:
+            target = targets.setdefault(name, torch.randn_like(param) * 0.1)
+            if name.startswith('flow_field'):
+                residual = (param - target) * curvature
+                loss = torch.relu(residual.abs() - 0.01).mean()
+                gnr.register(name, residual, loss)
+                weighted = {name: loss * 3.0}
+            else:
+                loss = 0.5 * ((param - 1.0) ** 2).sum()
+                weighted = {name: loss}
+            if gauss_newton is not None and gauss_newton.mode == 'product':
+                gauss_newton.family_backward(weighted)
+            elif loss.requires_grad:
+                sum(weighted.values()).backward()
+            losses[name] = loss.detach()
+            loss_total = loss_total + loss.detach()
+        context._sanitize_nonfinite_grads_()
+        return loss_total, losses, {}, {}
+    return compute
+
+
+@pytest.mark.parametrize('kind', ['cartesian', 'cylindrical'])
+def test_fitter_hook_gauss_newton_mode_runs_two_passes_per_product(kind, monkeypatch, capsys):
+    context = _stub_context(kind, optimizer_flow_sobolev_curvature='gauss_newton',
+                            optimizer_flow_sobolev_pcg_iterations=4,
+                            optimizer_flow_sobolev_diagnostic_interval=1,
+                            optimizer_flow_sobolev_irls_floor=1e-3)
+    compute = _residual_loss_fn(context.spiral_and_transform, curvature=2.0)
+    monkeypatch.setattr(context, '_compute_step_gradients',
+                        lambda iteration, **kw: compute(context, iteration, **kw))
+    torch.manual_seed(61)
+    flows = list(context.spiral_and_transform.flow_field.flows)
+    with torch.no_grad():
+        for flow in flows:
+            flow.copy_(torch.randn_like(flow) * 0.5)
+    before = [flow.detach().clone() for flow in flows]
+    pitch = context.spiral_and_transform.pitch
+    settings = context._sobolev_settings()
+    rng = sgn.RngSnapshot()
+    loss, *_ = context._compute_step_gradients(0)
+    pitch_grad = pitch.grad.clone()
+    context._sobolev_flow_step(0, settings, rng, loss)
+    stats = context.sobolev_step_stats
+    assert stats['curvature'] == 'gauss_newton'
+    assert stats['reason'] in ('converged', 'max_iterations')
+    assert stats['iterations'] >= 1 and not stats['fallback']
+    # Two passes (capture + product) per operator evaluation, plus the
+    # diagnostic products and the evaluation pass.
+    assert stats['reevaluations'] >= 2 * stats['operator_evaluations'] + 1
+    assert set(stats['gn_terms_used']) == {'flow_field.flows.0', 'flow_field.flows.1'}
+    assert stats['gn_terms_omitted'] == ['pitch']  # unregistered: first order only
+    assert 'gn_failure' not in stats
+    # The IRLS operator is symmetric on this problem, and the step lowered
+    # the same-batch loss.
+    assert stats['symmetry_defect'] < 1e-3
+    assert stats['loss_after'] < stats['loss_before']
+    for flow, start in zip(flows, before):
+        assert not torch.equal(flow.detach(), start)
+        assert flow.grad is None
+    torch.testing.assert_close(pitch.grad, pitch_grad)
+    out = capsys.readouterr().out
+    assert 'Gauss-Newton curvature from: flow_field.flows.0, flow_field.flows.1; first order only: pitch' in out
+
+
+def test_fitter_hook_rejects_ascent_steps_exactly_and_raises_damping(monkeypatch):
+    # A tiny damping makes the Sobolev gradient step overshoot the convex
+    # minimum so the same-batch loss rises: with evaluation on, the step is
+    # undone bitwise, lambda grows, and the pitch still keeps its gradient
+    # for AdamW.
+    context = _stub_context('cartesian', optimizer_flow_sobolev_evaluate_step=True,
+                            optimizer_flow_sobolev_adapt_damping=True,
+                            optimizer_flow_sobolev_step_scale=1.0,
+                            optimizer_flow_sobolev_damping=0.01)
+    compute = _quadratic_loss_fn(context.spiral_and_transform, curvature=1.0, generator_scale=0.0)
+    monkeypatch.setattr(context, '_compute_step_gradients',
+                        lambda iteration, **kw: compute(context, iteration, **kw))
+    torch.manual_seed(71)
+    flows = list(context.spiral_and_transform.flow_field.flows)
+    with torch.no_grad():
+        for flow in flows:
+            flow.copy_(torch.randn_like(flow))
+    before = [flow.detach().clone() for flow in flows]
+    settings = context._sobolev_settings()
+    rng = sgn.RngSnapshot()
+    loss, *_ = context._compute_step_gradients(0)
+    context._sobolev_flow_step(0, settings, rng, loss)
+    stats = context.sobolev_step_stats
+    assert stats['rejected'] and stats['loss_after'] > stats['loss_before']
+    assert stats['rho'] < 0.0
+    assert stats['next_damping'] == pytest.approx(0.01 * 3.0)
+    for flow, start in zip(flows, before):
+        assert torch.equal(flow.detach(), start)
+        assert flow.grad is None
+    lines, payload = context._sobolev_report()
+    assert any('REJECTED' in line for line in lines)
+    assert payload['flow_sobolev/rejected'] == 1.0
+    # A convex loss is accepted and, with good agreement, lowers lambda.
+    context = _stub_context('cartesian', optimizer_flow_sobolev_evaluate_step=True,
+                            optimizer_flow_sobolev_adapt_damping=True,
+                            optimizer_flow_sobolev_damping=30.0)
+    compute = _quadratic_loss_fn(context.spiral_and_transform, curvature=1.0, generator_scale=0.0)
+    monkeypatch.setattr(context, '_compute_step_gradients',
+                        lambda iteration, **kw: compute(context, iteration, **kw))
+    context.sobolev_damping = 90.0
+    settings = context._sobolev_settings()
+    rng = sgn.RngSnapshot()
+    loss, *_ = context._compute_step_gradients(0)
+    context._sobolev_flow_step(0, settings, rng, loss)
+    stats = context.sobolev_step_stats
+    assert not stats['rejected'] and stats['loss_after'] < stats['loss_before']
+    assert stats['rho'] > 0.75
+    assert stats['next_damping'] == pytest.approx(90.0 / 1.5)

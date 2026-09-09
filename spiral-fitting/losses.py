@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import gauss_newton_residuals
 import geom_utils
 import prefetch
 from dt_targets import (
@@ -166,6 +167,7 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
     target_r, scan_r, confidence, valid = shell_map.lookup(outer_scan)
     residual = scan_r - target_r
     shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
+    gauss_newton_residuals.register('shell_outer', residual, shell_outer_loss)
 
     metrics = {}
     if with_metrics:
@@ -547,6 +549,8 @@ def _patch_radius_and_dt_losses(
         radius_point_residuals = F.relu(radius_point_distances - radius_hinge_margin)
         mean_radius_deviation = _masked_mean(
             radius_point_residuals, radius_mask)
+        gauss_newton_residuals.register(
+            f'{diagnostic_prefix}_radius', radius_point_distances, mean_radius_deviation)
         record_loss_samples(
             f'{diagnostic_prefix}_radius', radius_spiral_zyxs,
             radius_point_residuals, radius_mask,
@@ -554,7 +558,8 @@ def _patch_radius_and_dt_losses(
         )
     else:
         # Penalise deviation from the track's mean shifted-radius directly in spiral space.
-        radius_deviations = (radius_shifted_radii - mean_shifted_radii).abs()
+        radius_signed_deviations = radius_shifted_radii - mean_shifted_radii
+        radius_deviations = radius_signed_deviations.abs()
         radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
         if radius_within_norm_p == 1.0:
             mean_radius_deviation = _masked_mean(
@@ -566,6 +571,8 @@ def _patch_radius_and_dt_losses(
                 / radius_counts.squeeze(-1)
             ) ** (1.0 / radius_within_norm_p)
             mean_radius_deviation = per_track.mean()
+        gauss_newton_residuals.register(
+            f'{diagnostic_prefix}_radius', radius_signed_deviations, mean_radius_deviation)
         record_loss_samples(
             f'{diagnostic_prefix}_radius', radius_spiral_zyxs,
             radius_deviations_hinge, radius_mask,
@@ -607,8 +614,8 @@ def _patch_radius_and_dt_losses(
 
         target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
 
-        point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
-        point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
+        raw_point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
+        point_distances = F.relu(raw_point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
         dt_counts = dt_mask.sum(dim=-1).clamp(min=1)
         track_losses = (
             ((point_distances ** dt_within_patch_norm_p) * dt_mask).sum(dim=-1)
@@ -617,6 +624,8 @@ def _patch_radius_and_dt_losses(
         # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
         active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
         patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
+        gauss_newton_residuals.register(
+            f'{diagnostic_prefix}_dt', raw_point_distances, patch_dt_loss)
         diagnostic_mask = dt_mask
         if active_mask is not None:
             diagnostic_mask = diagnostic_mask & active_mask[..., None]
@@ -693,15 +702,19 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
+    gauss_newton_residuals.register('umbilicus', umbilicus_spiral[..., 1:], umbilicus_loss)
 
     if shell_spiral_zyxs is not None:
         radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
         shell_theta, _, shell_shifted_radii = get_theta_and_radii(
             shell_spiral_zyxs[..., 1:], dr_per_winding)
         shell_target = dr_per_winding * float(shell_outer_winding_idx)
+        shell_signed_residual = shell_shifted_radii - shell_target
         shell_patch_radius_residual = F.relu(
-            (shell_shifted_radii - shell_target).abs() - radius_hinge_margin)
+            shell_signed_residual.abs() - radius_hinge_margin)
         shell_patch_radius_loss = shell_patch_radius_residual.mean()
+        gauss_newton_residuals.register(
+            'shell_patch_radius', shell_signed_residual, shell_patch_radius_loss)
         shell_target_radii = (
             shell_target
             + shell_theta / (2 * np.pi) * dr_per_winding.detach()
@@ -1007,7 +1020,8 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
     target = _pinned_to_device(
         torch.as_tensor([row[3] for row in rows], dtype=dr_per_winding.dtype),
         dr_per_winding.device)[:, None] * dr_per_winding
-    error = (shifted - target).abs()
+    signed_error = shifted - target
+    error = signed_error.abs()
 
     target_radii = radius_from_unwrapped_shifted(
         theta, target, adjustments, dr_per_winding)
@@ -1017,7 +1031,9 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
     record_loss_samples(
         'abs_winding', spiral, error, mask,
         display_spiral_zyx=target_spiral)
-    return _masked_mean(error, mask)
+    abs_winding_loss = _masked_mean(error, mask)
+    gauss_newton_residuals.register('abs_winding', signed_error, abs_winding_loss)
+    return abs_winding_loss
 
 
 def _decode_uint8_normal_component(value):
@@ -1506,9 +1522,12 @@ def get_unattached_pcl_strip_losses(
     mean_radii = (
         (normalised_radii * sample_mask).sum(dim=-1, keepdim=True)
         / radius_counts)
-    radius_deviations = (normalised_radii - mean_radii).abs()
+    radius_signed_deviations = normalised_radii - mean_radii
+    radius_deviations = radius_signed_deviations.abs()
     radius_point_residuals = F.relu(radius_deviations - radius_hinge_margin)
     radius_loss = _masked_mean(radius_point_residuals, sample_mask)
+    gauss_newton_residuals.register(
+        'unattached_pcl_radius', radius_signed_deviations, radius_loss)
     if diagnostics_enabled():
         radius_target_shifted = mean_radii + winding_t * dr_per_winding
         radius_target_radii = radius_from_unwrapped_shifted(
@@ -1551,10 +1570,10 @@ def get_unattached_pcl_strip_losses(
 
     within_p = cfg['patch_dt_within_patch_norm_p']
     across_p = cfg['patch_dt_norm_p']
-    valid_point_distances = torch.linalg.norm(
+    raw_valid_point_distances = torch.linalg.norm(
         valid_zyxs - target_scroll_valid, dim=-1)
     valid_point_distances = (
-        F.relu(valid_point_distances - dt_hinge_margin) + 1.e-5)
+        F.relu(raw_valid_point_distances - dt_hinge_margin) + 1.e-5)
     point_distances = torch.zeros_like(theta).masked_scatter(
         sample_mask, valid_point_distances)
     track_losses = (
@@ -1576,6 +1595,8 @@ def get_unattached_pcl_strip_losses(
         diagnostic_mask,
         display_spiral_zyx=target_spiral_zyxs,
     )
+    gauss_newton_residuals.register(
+        'unattached_pcl_dt', raw_valid_point_distances, dt_loss)
 
     return radius_loss, dt_loss
 

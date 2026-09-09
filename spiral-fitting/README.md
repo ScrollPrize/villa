@@ -286,6 +286,60 @@ real curvature that the model does not capture. The conclusion is the plan's
 production path: a Gauss-Newton operator built from the residual losses, not a
 secant of the full gradient.
 
+### Gauss-Newton on residual losses
+
+Curvature `gauss_newton` uses the positive semidefinite operator
+`G v = Jᵀ W J v` of the residual-shaped loss terms (`gauss_newton_residuals.py`).
+Each of those losses registers its residual tensor and unweighted scalar with
+one call (patch, unverified-patch, unattached-PCL and track radius and DT
+terms, umbilicus, shell outer, shell patch radius, absolute winding); every
+other term stays first order and the fitter lists the two groups once at
+startup. Because the penalties are hinges, L1 and Huber, whose residual-space
+curvature is zero almost everywhere, the weights are the IRLS majorizer
+`w = (∂L/∂r)/r` with `|r|` floored at `optimizer_flow_sobolev_irls_floor`.
+That is exact Gauss-Newton for squared penalties and the classical
+reweighting for the L1 family, read off generically with one small autograd
+call per term, so no per-loss formula is maintained. `J v` is a forward
+difference of the residuals at `p + eps v` (a no-grad capture pass), and
+`Jᵀ (W J v)` is the ordinary family-by-family backward with the residuals'
+upstream gradient replaced, so the product costs one forward plus one
+forward/backward and respects the fitter's per-family graph release.
+
+With `optimizer_flow_sobolev_evaluate_step` the fitter also applies the
+plan's acceptance rule: `rho` (actual over predicted same-batch reduction)
+drives the damping (`optimizer_flow_sobolev_rho_poor` / `_rho_good`), and a
+step whose same-batch loss did not fall is undone bitwise from a saved copy
+(`optimizer_flow_sobolev_rho_reject`). PCG's residual-growth guard is
+configurable (`optimizer_flow_sobolev_residual_growth_limit`, default 10x)
+because a Gauss-Newton operator confined to the sampled cells legitimately
+spikes CG's residual norm.
+
+Evidence, cylindrical golden workload, 201 steps, diagnostics every 20:
+
+| Curvature | epsilon (voxels) | symmetry defect | typical rho | loss at 200 |
+|---|---|---|---|---|
+| none | - | - | 0.94 → 0.03 to 0.5 | 715 (767 with rho-LM) |
+| finite difference | 1 | 0.01 to 1.7 | 0.05 to 0.35 | 720 |
+| Gauss-Newton | 1 | 0.02 to 0.49 | 0.1 to 0.99 | 818 |
+| Gauss-Newton | 0.25 | 0.006 to 0.11 | 0.08 to 1.02 | 780 (898 with rho-LM) |
+| Gauss-Newton | 0.1 | 0.003 to 0.05 | 0.05 to 1.03 | 867 |
+
+Reading: the Gauss-Newton product is a consistent symmetric PSD operator at
+epsilon 0.25 or below (use that, not the gradient-difference epsilon of 1),
+and when the model is trusted `rho` is 1.0 within a percent. But on this
+workload its curvature term is only 1 to 5 percent of the predicted
+reduction: the IRLS weights are `1/|r|`, and early in a fit the hinge and L1
+residuals are tens to hundreds of voxels, so the reweighted curvature is weak
+and the step is essentially the Sobolev gradient step at four times the cost.
+The failures that remain (`rho < 0` on a third of the probes for every
+variant) are overshoots across kinks of the loss, hinge activations and points
+crossing lattice cells, which no quadratic model captures; the step-length
+control (damping, voxel cap, rejection) decides progress, not curvature.
+Single runs, GPU-nondeterministic, on one z window: differences of tens in
+the step-200 loss are within run-to-run noise. Whether Gauss-Newton pays off
+late in a fit, when residuals are small and `1/|r|` is informative, has not
+been tested; starting from a converged checkpoint would be the way.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same

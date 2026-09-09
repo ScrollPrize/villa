@@ -19,7 +19,7 @@ _ENUMS = {
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
     "dense_spacing_density_lambda": [
         "inverse_gap", "soft_mass", "soft_mass_wide"],
-    "optimizer_flow_sobolev_curvature": ["none", "finite_difference"],
+    "optimizer_flow_sobolev_curvature": ["none", "finite_difference", "gauss_newton"],
     "optimizer_flow_sobolev_preconditioner": ["cg", "gaussian"],
 }
 
@@ -173,6 +173,11 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_sobolev_max_step_voxels": 2.0,
     "optimizer_flow_sobolev_fd_epsilon_voxels": 1.0,
     "optimizer_flow_sobolev_diagnostic_interval": 0,
+    "optimizer_flow_sobolev_irls_floor": 1.0,
+    "optimizer_flow_sobolev_residual_growth_limit": 10.0,
+    "optimizer_flow_sobolev_rho_reject": True,
+    "optimizer_flow_sobolev_rho_poor": 0.25,
+    "optimizer_flow_sobolev_rho_good": 0.75,
     "optimizer_flow_sobolev_adapt_damping": True,
     "optimizer_flow_sobolev_damping_increase": 3.0,
     "optimizer_flow_sobolev_damping_decrease": 1.5,
@@ -283,8 +288,13 @@ _OPTIMIZER_DESCRIPTIONS = {
         "'none' takes the Sobolev gradient step. 'finite_difference' solves "
         "(H + lambda A) d = -g by PCG with Hessian-vector products from a "
         "forward finite difference of the gradient on the same batch, one "
-        "extra forward/backward pass per PCG iteration. Non-finite values "
-        "or non-positive curvature stop PCG; the last valid iterate, or the "
+        "extra forward/backward pass per PCG iteration; on this loss the "
+        "operator proved indefinite and asymmetric. 'gauss_newton' uses "
+        "the positive semidefinite IRLS Gauss-Newton operator J^T W J of "
+        "the residual-shaped losses (radius, DT, umbilicus, shell, abs "
+        "winding; the rest stay first order), costing one forward and one "
+        "forward/backward per PCG iteration. Non-finite values or "
+        "non-positive curvature stop PCG; the last valid iterate, or the "
         "Sobolev step, is used."),
     "optimizer_flow_sobolev_pcg_iterations": (
         "Maximum outer PCG iterations (Hessian-vector products) per step "
@@ -319,14 +329,37 @@ _OPTIMIZER_DESCRIPTIONS = {
         "the finite-difference Hessian product on two random directions. "
         "Costs up to four extra forward/backward passes at those steps. 0 "
         "disables."),
+    "optimizer_flow_sobolev_irls_floor": (
+        "Floor on |residual| in the Gauss-Newton IRLS weights (dL/dr)/r, in "
+        "the residual's own units (voxels for radius, distance and shell "
+        "terms). Bounds the weight of residuals near zero."),
     "optimizer_flow_sobolev_adapt_damping": (
-        "With curvature enabled, adapt lambda across steps without retries: "
-        "multiply it by optimizer_flow_sobolev_damping_increase after a poor "
-        "solve (non-positive curvature, growing residual, non-finite values) "
-        "and divide by optimizer_flow_sobolev_damping_decrease after a clean "
-        "one, between the configured damping and damping times "
-        "optimizer_flow_sobolev_damping_max_factor. The adapted value is "
-        "saved in checkpoints and logged."),
+        "Adapt lambda across steps without retries, between the configured "
+        "damping and damping times optimizer_flow_sobolev_damping_max_factor. "
+        "With optimizer_flow_sobolev_evaluate_step the rule uses rho = "
+        "actual / predicted same-batch reduction: multiply by "
+        "optimizer_flow_sobolev_damping_increase when rho < rho_poor, divide "
+        "by optimizer_flow_sobolev_damping_decrease when rho > rho_good "
+        "(every curvature mode; for the Sobolev gradient step lambda is the "
+        "step length). Without evaluation, curvature modes adapt on the "
+        "solver outcome instead (poor: non-positive curvature, growing "
+        "residual, non-finite values; clean: converged or max iterations). "
+        "The adapted value is saved in checkpoints and logged."),
+    "optimizer_flow_sobolev_residual_growth_limit": (
+        "Stop PCG when its residual norm grows by more than this factor in "
+        "one iteration and keep the previous iterate. CG's residual is not "
+        "monotone, and a Gauss-Newton operator confined to the sampled cells "
+        "can legitimately spike it severalfold, so keep this loose; 0 "
+        "disables the check."),
+    "optimizer_flow_sobolev_rho_reject": (
+        "With optimizer_flow_sobolev_evaluate_step, undo the flow step "
+        "exactly (parameters restored bitwise, no optimizer state touched) "
+        "when the same-batch loss did not decrease or is non-finite; lambda "
+        "then increases. Every other parameter still takes its AdamW step."),
+    "optimizer_flow_sobolev_rho_poor": (
+        "rho below which lambda increases (and the step counts as poor)."),
+    "optimizer_flow_sobolev_rho_good": (
+        "rho above which lambda decreases."),
     "optimizer_flow_sobolev_damping_increase": (
         "Factor applied to lambda after a poor solve (must exceed 1)."),
     "optimizer_flow_sobolev_damping_decrease": (
@@ -531,6 +564,11 @@ class Config:
         self.optimizer_flow_sobolev_trust_radius = 0.0
         self.optimizer_flow_sobolev_max_step_voxels = 2.0
         self.optimizer_flow_sobolev_diagnostic_interval = 0
+        self.optimizer_flow_sobolev_irls_floor = 1.0
+        self.optimizer_flow_sobolev_residual_growth_limit = 10.0
+        self.optimizer_flow_sobolev_rho_reject = True
+        self.optimizer_flow_sobolev_rho_poor = 0.25
+        self.optimizer_flow_sobolev_rho_good = 0.75
         self.optimizer_flow_sobolev_adapt_damping = True
         self.optimizer_flow_sobolev_damping_increase = 3.0
         self.optimizer_flow_sobolev_damping_decrease = 1.5
