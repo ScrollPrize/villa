@@ -28,7 +28,7 @@ RESERVED_IMAGE_FILENAMES = {"x.tif", "y.tif", "z.tif", "mask.tif"}
 _BBOX_UNRESOLVED = object()
 
 
-@dataclass
+@dataclass(init=False)
 class TifxyzInfo:
     """Lightweight metadata for a tifxyz segment without loading coordinates.
 
@@ -46,6 +46,28 @@ class TifxyzInfo:
     uuid: str
     stored_bbox: Optional[Tuple[float, float, float, float, float, float]] = None
     _bbox: Any = field(default=_BBOX_UNRESOLVED, init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        path: Path,
+        scale: Tuple[float, float],
+        bbox: Optional[Tuple[float, float, float, float, float, float]] = None,
+        uuid: str = "",
+        stored_bbox: Optional[Tuple[float, float, float, float, float, float]] = None,
+    ) -> None:
+        """Keep the original ``(path, scale, bbox, uuid)`` signature.
+
+        ``TifxyzInfo`` is public API. Making ``bbox`` a lazy property is only safe if the
+        constructor still takes ``bbox`` in the same position and by the same name: callers
+        writing ``TifxyzInfo(path, scale, bbox, uuid)`` or ``TifxyzInfo(..., bbox=b, uuid=u)``
+        must keep working. ``stored_bbox`` is accepted too so the field name is usable
+        directly, but ``bbox`` wins if both are given.
+        """
+        self.path = path
+        self.scale = scale
+        self.uuid = uuid
+        self.stored_bbox = bbox if bbox is not None else stored_bbox
+        self._bbox = _BBOX_UNRESOLVED
 
     @property
     def bbox(self) -> Optional[Tuple[float, float, float, float, float, float]]:

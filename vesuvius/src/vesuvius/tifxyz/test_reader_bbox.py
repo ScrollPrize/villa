@@ -74,3 +74,32 @@ def test_read_tifxyz_object_gets_the_recomputed_bbox(tmp_path: Path) -> None:
         return
     lo, hi = _segment_z_bounds(surface)
     assert abs(lo - 3000.0) < 1e-3 and abs(hi - 4000.0) < 1e-3
+
+
+def test_tifxyzinfo_keeps_its_original_constructor_signature():
+    """``bbox`` must stay accepted by name and by position (raised in review of #1731).
+
+    ``TifxyzInfo`` is public API. Turning ``bbox`` into a lazily resolved property is only
+    safe if construction is unchanged for existing callers. Without this, keyword use
+    raises TypeError, and positional use is worse than an error: the bbox tuple lands in
+    ``uuid`` and the uuid string in the stored bbox, failing later and somewhere else.
+    """
+    from pathlib import Path
+    from vesuvius.tifxyz.reader import TifxyzInfo
+
+    bbox = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+
+    positional = TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), bbox, "uuid-positional")
+    assert positional.uuid == "uuid-positional"
+    assert positional.bbox == bbox
+
+    keyword = TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), bbox=bbox, uuid="uuid-keyword")
+    assert keyword.uuid == "uuid-keyword"
+    assert keyword.bbox == bbox
+
+    # the field name works too, and bbox wins when both are supplied
+    by_field = TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), uuid="u", stored_bbox=bbox)
+    assert by_field.bbox == bbox
+
+    # and a segment with no bbox stays None rather than raising
+    assert TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), uuid="u").bbox is None
