@@ -1,11 +1,9 @@
-# Status: CUDA post-sampling augmentation
+# Status: tune Fiber3D training batch size
 
-- [x] Capture task and plan
+- [x] Capture task
+- [x] Write benchmark plan
 - [x] Independent plan review
-- [x] Generalize deferred augmentation payload
-- [x] Implement batched CUDA post-sampling chain
-- [x] Update production training integration
-- [x] Add and run focused tests
-- [x] Benchmark 128-worker H2D-boundary producer
-- [x] Benchmark two-GPU training
-- [x] Update specs, docs, changelog, and task log
+- [x] Add benchmark-only batch-size override and tests
+- [x] Sweep two-GPU batch sizes
+- [x] Confirm fastest safe point
+- [x] Update specs, profiling docs, status, and task log

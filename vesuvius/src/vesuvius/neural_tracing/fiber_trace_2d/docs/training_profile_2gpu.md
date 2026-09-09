@@ -464,3 +464,38 @@ Artifacts:
 
 - `/ephemeral/hendrik/fiber3d_train2/sample_pipeline_20260908_221924_248510/result.json`
 - `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_sample_pipeline_async_batch_gpu_all_20260908_221959_719439`
+
+## Per-GPU batch-size sweep, 2026-09-09
+
+The real-sample end-to-end path was swept on two H100 GPUs with GroupNorm,
+output stride 4, BF16 eager training, full post-sampling CUDA augmentation, 30
+warmup steps, and 90 measured steps. One sample is one 128-cubed CP patch.
+Throughput uses slowest-rank elapsed time; iteration statistics use the
+per-step maximum across both ranks.
+
+| Batch/GPU | Global batch | Global samples/s | Samples/s/GPU | Critical-path iteration mean/median/p95 | Peak reserved/GPU |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 16 | 88.492 | 44.246 | ~180.5/~180.0/~189.6ms | 20.61GiB |
+| 12 | 24 | 96.419 | 48.209 | 248.63/248.39/258.45ms | 30.46GiB |
+| 16 | 32 | 100.948 | 50.474 | 316.66/316.02/325.75ms | 40.42GiB |
+| 24 | 48 | 105.330; 105.666 | 52.665; 52.833 | 455.30/454.78/464.33ms; 453.91/453.49/464.47ms | 60.45GiB |
+| 28 | 56 | **107.972; 108.088** | **53.986; 54.044** | 518.36/518.76/530.56ms; 517.79/517.42/530.51ms | 70.48GiB |
+
+Batch 28 is the fastest benchmark-safe point and improved aggregate throughput
+by about 22.1% over batch 8. It leaves only roughly 11--12% device-memory
+headroom, so it is not yet production-safe for evaluation/visualization, and
+the larger global optimizer batch still needs convergence validation. The next
+point was not run because projected reserved memory falls below the declared
+10% headroom threshold.
+
+Reusable command:
+
+```bash
+vesuvius/scripts/run_fiber3d_profile_benchmark
+```
+
+The adjacent confirmation artifacts are:
+
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b24_sample_pipeline_async_batch_gpu_all_20260909_061011_852473`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_060627_834494`
+- `/ephemeral/hendrik/fiber3d_train2/profile_2gpu_off_group_os4_b28_sample_pipeline_async_batch_gpu_all_20260909_060819_313464`

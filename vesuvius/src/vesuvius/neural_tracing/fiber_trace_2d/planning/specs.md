@@ -2977,3 +2977,14 @@
   depend on batch partitioning or worker scheduling.
   CUDA failures propagate through the existing preparation failure channel;
   pause and close synchronize in-flight augmentation with the preparation stream.
+
+# Fiber3D training batch-size benchmarks
+
+- Batch size is reported per GPU rank; global batch is per-GPU batch multiplied
+  by DDP world size. One sample is one 128-cubed CP training patch.
+- End-to-end throughput uses the synchronized measurement window and the
+  slowest-rank elapsed time. Iteration distributions use the per-step maximum
+  across ranks, which is the DDP critical path.
+- Benchmark batch overrides must not silently change production configuration
+  defaults. A larger global optimizer batch requires separate convergence
+  validation before adoption.

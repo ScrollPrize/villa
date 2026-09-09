@@ -1,39 +1,38 @@
-# Plan: CUDA post-sampling augmentation
+# Plan: tune Fiber3D training batch size
 
-1. Generalize the deferred augmentation payload from blur kernels to the full
-   immutable augmentation parameters plus prebuilt blur kernels.
-2. Implement a shared batched CUDA helper preserving normalization, contrast,
-   brightness, gamma, deterministic noise, isotropic blur, and directional blur
-   order. Keep the ordinary CPU path using the same parameter semantics.
-3. Make asynchronous training defer the entire post-sampling chain; keep one
-   H2D transfer and no device-to-host round trip.
-4. Extend the reusable CPU benchmark to stop exactly at the production H2D
-   boundary, then benchmark 128 workers. Run the approved two-GPU benchmark on
-   GPUs 0 and 1 and report per-GPU and aggregate throughput.
-5. Add focused CPU/GPU equivalence and determinism tests and run the approved
-   test callers.
-
-Independent-review constraints: reductions are per sample over CZYX; CUDA work
-runs explicitly in FP32 and in canonical operation order on the preparation
-stream. CUDA noise uses one canonical-stream-index-keyed generator per sample,
-so it is invariant to worker/rank/batch partition and repeatable on the same
-CUDA stack, but it is intentionally not bit-identical to PyTorch's CPU RNG.
-Equivalence tests therefore disable noise, while permutation/partition tests
-cover CUDA noise. Deferred compact metadata remains alive through enqueue and
-is cleared only from the returned prepared batch.
+1. Add a benchmark-only `--batch-size-per-gpu` override to the existing
+   reproducible two-GPU profile harness and record it in artifact metadata and
+   names. Do not change production defaults.
+2. Establish batch 8 as the matched final-code baseline, then sweep larger
+   per-GPU batches on GPUs 0 and 1. Keep GroupNorm, output stride 4, BF16,
+   post-sampling CUDA augmentation, workers, warmup, and measured steps fixed.
+3. Stop increasing after an OOM or after throughput clearly ceases improving.
+   For each successful point report global samples/s, samples/s/GPU, iteration
+   mean/median/p95, and peak allocated/reserved GiB per GPU.
+4. Select the highest-throughput safe point, update the reusable benchmark args,
+   and run a confirmation repeat.
+5. Run focused harness tests and update task status, task log, and the two-GPU
+   profiling document.
 
 ## Spec update
 
-Change the CUDA augmentation contract from blur-only deferral to complete
-post-sampling value-augmentation deferral. Document that coordinate generation
-remains colocated with CPU sampling and that `all` is distinct from legacy
-`blur` rather than silently changing that mode.
+No production contract changes. Record that benchmark batch-size comparisons
+must use a per-GPU value and report both global and per-GPU throughput.
 
 ## Documentation update
 
-Record exact commands, artifacts, host production rate, GPU augmentation time,
-and two-GPU end-to-end throughput in the training profile document.
+Add the batch-size sweep table, exact reusable command, artifacts, selected
+point, and memory limitation to the training profiling document.
 
 ## Changelog
 
-Add one entry for complete asynchronous CUDA value augmentation.
+No entry unless the selected size is applied to a production configuration.
+
+Independent-review refinements: each point runs in a fresh DDP process group
+with a five-minute fail-fast timeout. Throughput uses the slowest-rank elapsed
+window and latency uses the per-step maximum across ranks. The declared sweep is
+8, 12, 16, 24, then 28 samples/GPU; it stops before a projected point would
+leave less than 10% reserved-memory headroom. Contenders 24 and 28 receive
+confirmation runs. One sample means one 128-cubed CP patch and GiB means 2^30
+bytes. The result is benchmark-safe only; changing global optimizer batch size
+requires a later convergence evaluation.

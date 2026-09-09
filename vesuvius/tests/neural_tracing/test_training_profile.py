@@ -101,3 +101,34 @@ def test_summary_keeps_loader_stalls_excludes_warmup_and_test(tmp_path):
     stats = result["ranks"]["timings_rank0"]["steady"]["iteration_wall_ms"]
     assert stats["count"] == 2
     assert stats["mean"] == 4500
+
+
+def test_summary_reports_per_step_ddp_critical_path(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.profile_experiment import summarize_experiment
+
+    run = tmp_path / "s1a_test"
+    run.mkdir()
+    keys = (
+        "iteration_wall_ms", "wait_ms", "to_device_ms",
+        "value_augmentation_cuda_ms", "target_ms", "fw_bw_step_ms",
+    )
+    for rank, values in enumerate(((10.0, 40.0), (20.0, 30.0))):
+        rows = [
+            dict(
+                step=step,
+                trace_active=False,
+                **{key: value for key in keys},
+            )
+            for step, value in zip((31, 32), values, strict=True)
+        ]
+        (run / f"timings_rank{rank}.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows)
+        )
+
+    result = summarize_experiment(tmp_path)
+
+    stats = result["critical_path"]["iteration_wall_ms"]
+    assert stats["count"] == 2
+    assert stats["mean"] == 30.0
+    assert stats["min"] == 20.0
+    assert stats["max"] == 40.0
