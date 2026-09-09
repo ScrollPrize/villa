@@ -452,12 +452,15 @@ class CartesianFlowField(nn.Module):
         else:
             hr_param.grad.add_(hr_grad)
 
-    def smooth_grad_(self, sigma_hr_cells):
-        """Gaussian-smooth both lattices' gradients in place.
+    def smooth_grad_(self, sigma_hr_cells, across_sigma_hr_cells=0.0):
+        """Gaussian-smooth both lattices' gradients in place (isotropic).
 
         ``sigma_hr_cells`` is the width in high-resolution cells; the
         low-resolution lattice's cells are ``spatial_scale_factor`` times
         larger, so it sees the same physical width in its own cells.
+        ``across_sigma_hr_cells`` is accepted for signature parity with the
+        cylindrical lattice and ignored: a Cartesian lattice has no
+        across-winding axis to smooth differently.
         """
         for level, flow in enumerate(self.flows):
             if flow.grad is None:
@@ -734,14 +737,16 @@ class CylindricalFlowField(nn.Module):
                 [leaf.grad for _, leaf in pending if leaf.grad is not None],
             )
 
-    def smooth_grad_(self, sigma_hr_cells):
-        """Gaussian-smooth both lattices' gradients in place (along z and
-        around each ring; see flow_grad_smoothing.smooth_cylindrical_).
+    def smooth_grad_(self, sigma_hr_cells, across_sigma_hr_cells=0.0):
+        """Gaussian-smooth both lattices' gradients in place: ``sigma_hr_cells``
+        along the sheet (along z and around each ring) and
+        ``across_sigma_hr_cells`` across rings; see
+        flow_grad_smoothing.smooth_cylindrical_.
 
-        ``sigma_hr_cells`` is the width in high-resolution cells (radial
-        spacing, z spacing and ring arc length all equal one cell); the
-        low-resolution lattice's cells are ``spatial_scale_factor`` times
-        larger, so it sees the same physical width in its own cells.
+        Both widths are in high-resolution cells (radial spacing, z spacing
+        and ring arc length all equal one cell); the low-resolution lattice's
+        cells are ``spatial_scale_factor`` times larger, so it sees the same
+        physical widths in its own cells.
         """
         tables = ((self._lr_num_phi, self._lr_offsets), (self._hr_num_phi, self._hr_offsets))
         for level, (flow, (num_phi, offsets)) in enumerate(zip(self.flows, tables)):
@@ -749,4 +754,5 @@ class CylindricalFlowField(nn.Module):
                 continue
             scale = self.spatial_scale_factor if level == 0 else 1
             flow_grad_smoothing.smooth_cylindrical_(
-                flow.grad, num_phi, offsets, float(sigma_hr_cells) / scale)
+                flow.grad, num_phi, offsets, float(sigma_hr_cells) / scale,
+                float(across_sigma_hr_cells) / scale)

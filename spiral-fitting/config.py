@@ -148,6 +148,8 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_grad_smoothing": False,
     "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
     "optimizer_flow_lazy_moments": False,
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
+    "optimizer_flow_shared_second_moment": False,
 })
 
 _GAP_EXPANDER_DESCRIPTIONS = {
@@ -174,9 +176,25 @@ _OPTIMIZER_DESCRIPTIONS = {
         "around each ring, not across rings."),
     "optimizer_flow_grad_smoothing_sigma_voxels": (
         "Width (standard deviation, scroll voxels) of the flow gradient "
-        "smoothing kernel. Applies to both lattices at the same physical "
-        "width; a high-resolution flow cell is model_flow_voxel_resolution "
-        "voxels."),
+        "smoothing kernel along the sheet: along z and, on a cylindrical "
+        "lattice, around each ring; a Cartesian lattice is smoothed "
+        "isotropically at this width. Applies to both lattices at the same "
+        "physical width; a high-resolution flow cell is "
+        "model_flow_voxel_resolution voxels, so a width well under half a "
+        "cell is an identity (the fitter logs the effective width per "
+        "lattice at startup)."),
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": (
+        "Width (standard deviation, scroll voxels) of the flow gradient "
+        "smoothing across rings of a cylindrical lattice, i.e. across "
+        "windings; 0 leaves rings uncoupled. Ignored by a Cartesian lattice, "
+        "whose smoothing is isotropic at the along-sheet width."),
+    "optimizer_flow_shared_second_moment": (
+        "Give the flow lattices' Adam step one second moment per flow stage "
+        "and vector component (the mean of the stored per-cell second "
+        "moments over the cells ever touched) instead of one per cell, so a "
+        "smoothed gradient's spatial profile survives into the update rather "
+        "than being flattened to its sign. The stored optimizer state is "
+        "unchanged, so the flag can be switched between runs."),
     "optimizer_flow_lazy_moments": (
         "Lazy Adam moments for the flow lattices (torch SparseAdam's masked "
         "update on the dense gradient): cells no sample touched this step "
@@ -341,11 +359,13 @@ class Config:
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
         # Flow-lattice gradient conditioning (see _OPTIMIZER_DESCRIPTIONS).
-        # Both are read live every step, so they apply at a run boundary
+        # All are read live every step, so they apply at a run boundary
         # without a rebuild. Off by default.
         self.optimizer_flow_grad_smoothing = False
         self.optimizer_flow_grad_smoothing_sigma_voxels = 32.0
+        self.optimizer_flow_grad_smoothing_across_sigma_voxels = 0.0
         self.optimizer_flow_lazy_moments = False
+        self.optimizer_flow_shared_second_moment = False
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1

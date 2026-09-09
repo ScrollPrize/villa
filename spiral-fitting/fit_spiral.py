@@ -2273,10 +2273,13 @@ class FitContext:
             group for group in self.optimiser.param_groups
             if any(param is self.high_res_flow_params[0] for param in group['params']))
         # A loaded checkpoint's groups replace the live hyperparameters, so
-        # the flag is re-applied here rather than kept in the group.
+        # the flags are re-applied here rather than kept in the group.
         lazy_moments = bool(self.config.get('optimizer_flow_lazy_moments', False))
-        low_res_group['lazy_moments'] = lazy_moments
-        high_res_group['lazy_moments'] = lazy_moments
+        shared_second_moment = bool(
+            self.config.get('optimizer_flow_shared_second_moment', False))
+        for group in (low_res_group, high_res_group):
+            group['lazy_moments'] = lazy_moments
+            group['shared_second_moment'] = shared_second_moment
         set_optimizer_group_lr_scale(
             self.optimiser,
             self.lr_scheduler,
@@ -2286,6 +2289,26 @@ class FitContext:
             initial_lr=self.config['optimizer_learning_rate'],
         )
         return scale
+
+    def _report_flow_grad_conditioning(self):
+        """Log the flow gradient smoothing widths in lattice cells.
+
+        The configured widths are scroll voxels, and a width well under half
+        a cell is an identity kernel, so the per-lattice conversion is printed
+        once at build time rather than left implicit.
+        """
+        if not self.dist.is_main_process:
+            return
+        if not self.config.get('optimizer_flow_grad_smoothing', False):
+            return
+        along = float(self.config['optimizer_flow_grad_smoothing_sigma_voxels'])
+        across = float(self.config.get(
+            'optimizer_flow_grad_smoothing_across_sigma_voxels', 0.0) or 0.0)
+        print(self.spiral_and_transform.describe_flow_grad_smoothing(along, across))
+        if not self.config.get('optimizer_flow_lazy_moments', False):
+            print('NOTE: flow gradient smoothing without optimizer_flow_lazy_moments: '
+                  'the smoothed tails reach cells whose Adam second moment has '
+                  'decayed, so their first step is far larger than the tail warrants')
 
     def _realign_lr_schedule(self, completed_steps):
         """Align optimizer/scheduler state to the current absolute horizon."""
@@ -2813,6 +2836,7 @@ class FitContext:
         # with lazy moments (optimizer_flow_lazy_moments, applied per step by
         # _apply_flow_group_settings), which keeps AdamW's state format.
         self.optimiser = LazyMomentAdamW(param_groups, lr=self.config['optimizer_learning_rate'], betas=(0.9, 0.999), eps=1.e-8, fused=True)
+        self._report_flow_grad_conditioning()
         # Influence masks are scoped to one interactive Run request. They are
         # created from that run's pending inputs and discarded before its autosave.
         self.influence_state = None
@@ -4610,7 +4634,9 @@ class FitContext:
             # smoothing cannot leak gradient outside a masked region.
             self.step_timer.start('smooth')
             self.spiral_and_transform.smooth_flow_grad_(
-                float(self.config['optimizer_flow_grad_smoothing_sigma_voxels']))
+                float(self.config['optimizer_flow_grad_smoothing_sigma_voxels']),
+                float(self.config.get(
+                    'optimizer_flow_grad_smoothing_across_sigma_voxels', 0.0) or 0.0))
             self.step_timer.stop('smooth')
 
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)

@@ -9,6 +9,7 @@ import pyro.distributions
 from einops import rearrange
 from torchdiffeq import odeint
 
+import flow_grad_smoothing
 import gap_triton
 import sample_spiral
 from flow_fields import CartesianFlowField, CylindricalFlowField
@@ -611,18 +612,31 @@ class SpiralAndTransform(nn.Module):
         return lower_bounded_dr(
             self.dr_per_winding_logit, self.gap_min_gap)
 
-    def smooth_flow_grad_(self, sigma_voxels):
+    def smooth_flow_grad_(self, sigma_voxels, across_sigma_voxels=0.0):
         """Gaussian-smooth the flow lattices' gradients in place.
 
-        ``sigma_voxels`` is in scroll voxels; a high-resolution flow cell is
-        model_flow_voxel_resolution voxels wide, so the width converts to
-        cells here and each flow field scales it for its coarser lattice.
-        Applies to every flow stage. Call after apply_accumulated_field_grad
-        (and after any all-reduce) and before the optimizer step.
+        ``sigma_voxels`` is the along-sheet width and ``across_sigma_voxels``
+        the across-winding width (cylindrical lattices only; see
+        flow_grad_smoothing), both in scroll voxels. A high-resolution flow
+        cell is model_flow_voxel_resolution voxels wide, so the widths
+        convert to cells here and each flow field scales them for its
+        coarser lattice. Applies to every flow stage. Call after
+        apply_accumulated_field_grad (and after any all-reduce) and before
+        the optimizer step.
         """
         cell_voxels = float(self.cfg['model_flow_voxel_resolution'])
         for flow_field in self.flow_fields:
-            flow_field.smooth_grad_(float(sigma_voxels) / cell_voxels)
+            flow_field.smooth_grad_(
+                float(sigma_voxels) / cell_voxels,
+                float(across_sigma_voxels) / cell_voxels)
+
+    def describe_flow_grad_smoothing(self, sigma_voxels, across_sigma_voxels=0.0):
+        """The effective smoothing widths per lattice, for the startup log."""
+        return flow_grad_smoothing.describe_widths(
+            sigma_voxels, across_sigma_voxels,
+            float(self.cfg['model_flow_voxel_resolution']),
+            self.flow_field.spatial_scale_factor,
+            self.cfg['model_flow_field_type'])
 
     def get_shared_transform_tensors(self):
         """The tiny graph paths every evaluation of one transform instance
