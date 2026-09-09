@@ -97,6 +97,7 @@ class FakeSession:
         self.path_change_calls = []
         self.model_rebuilds = []
         self.progress = None
+        self.live_calls = []
 
     def status(self):
         applied = ({"applied_config": dict(self.applied_config)}
@@ -123,6 +124,18 @@ class FakeSession:
         self.autosave_calls.append(autosave_on_pause)
         self.run_config.update(run_config or {})
         return 5 + count
+
+    def incorporate_live(self, records, influence_config=None):
+        records = list(records)
+        self.live_calls.append((records, dict(influence_config or {})))
+        return {
+            "no_future_step": False,
+            "outcomes": [
+                {"id": record["id"], "kind": record["kind"],
+                 "state": "incorporated"}
+                for record in records
+            ],
+        }
 
     def save_checkpoint(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +289,9 @@ def _digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _upload_input(state, kind, input_id, files, role=None):
+def _upload_input(state, kind, input_id, files, role=None, base_revision=None,
+                  operation=None, target_collection_id=None,
+                  base_source_revision=None):
     request = {
         "kind": kind, "id": input_id,
         "files": [{"name": name, "size": len(data), "sha256": _digest(data)}
@@ -284,6 +299,14 @@ def _upload_input(state, kind, input_id, files, role=None):
     }
     if role:
         request["role"] = role
+    if base_revision is not None:
+        request["base_revision"] = base_revision
+    if operation is not None:
+        request.update({
+            "operation": operation,
+            "target_collection_id": target_collection_id,
+            "base_source_revision": base_source_revision,
+        })
     upload_id = state.begin_upload(request)["upload_id"]
     for name, data in files.items():
         state.receive_upload_file(upload_id, name, io.BytesIO(data), len(data))
@@ -971,18 +994,20 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self._stage_for(self._base_request()), "model")
         self.assertEqual(
             self._stage_for(self._base_request(
-                {"model_num_flow_integration_steps": 5})),
+                {"model_linear_z_resolution": 24})),
             "model")
         # An unaudited key alongside an allowlisted one is still the whole
         # build, and so is anything outside run.config.
         self.assertEqual(
             self._stage_for(self._base_request({
-                "model_num_flow_integration_steps": 5,
+                "model_linear_z_resolution": 24,
                 "optimizer_random_seed": 7})),
             "all")
+        # A run-boundary key is applied through apply_config by the model
+        # rebuild, so it never widens the stage on its own.
         self.assertEqual(
             self._stage_for(self._base_request({"loss_weight_patch_radius": 1.0})),
-            "all")
+            "model")
         self.assertEqual(
             self._stage_for(self._base_request(run_tag="second")), "all")
         self.assertEqual(
@@ -993,7 +1018,7 @@ class DatasetOwnershipTests(unittest.TestCase):
     def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
         self._attach_session_for_request()
         paths, run, preview, _ = self.state._prepare_session_request(
-            self._base_request({"model_num_flow_integration_steps": 5}))
+            self._base_request({"model_linear_z_resolution": 24}))
         with self.state.lock:
             self.assertEqual(
                 self.state._rebuild_stage_locked(
@@ -1004,7 +1029,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         session = self._attach_session_for_request()
         generation = self.state.session_generation
         response = self.state.rebuild(
-            self._base_request({"model_num_flow_integration_steps": 5}))
+            self._base_request({"model_linear_z_resolution": 24}))
         self.assertEqual(response["stage"], "model")
         deadline = time.monotonic() + 5.0
         while self.state._building and time.monotonic() < deadline:
@@ -1017,12 +1042,12 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self.state.session_generation, generation)
         self.assertEqual(len(session.model_rebuilds), 1)
         rebuilt_paths, rebuilt_run = session.model_rebuilds[0]
-        self.assertEqual(rebuilt_run.config["model_num_flow_integration_steps"], 5)
+        self.assertEqual(rebuilt_run.config["model_linear_z_resolution"], 24)
         self.assertEqual(rebuilt_paths.manifest(),
                          self.state.session_request["paths"])
         self.assertEqual(
             self.state.session_request["run"]["config"]
-            ["model_num_flow_integration_steps"], 5)
+            ["model_linear_z_resolution"], 24)
 
     def test_dataset_request_filters_resolved_paths_with_input_toggles(self):
         request = self.state._dataset_session_request({
@@ -1398,7 +1423,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         # preflight only complained about the model.
         error = self._refuse_load(session, self._write_checkpoint(
             "host.ckpt", {**live, "model_num_flow_stages": 3,
-                          "track_exclusion_radius": 99.0}))
+                          "patch_erode_patches": 3}))
         self.assertEqual(error.payload["stage"], "all")
         # And a model z-domain mismatch reaches "all" through z_begin/z_end
         # rather than through a rule of its own.
@@ -1908,6 +1933,24 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
                          "patch-1")
 
+    def test_finalizing_while_running_dispatches_live_incorporation(self):
+        session = self._session()
+        session.state = SessionState.Running
+        self.state._active_run_influence = {"influence_enabled": True}
+        upload_id = _upload_input(self.state, "patch", "live-patch", PATCH_FILES)
+        response = self.state.finalize_upload(upload_id)
+        self.assertIn(response["input"]["state"], {"queued", "incorporated"})
+        deadline = time.monotonic() + 2
+        while not session.live_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(session.live_calls), 1)
+        records, influence = session.live_calls[0]
+        self.assertEqual([record["id"] for record in records], ["live-patch"])
+        self.assertEqual(influence, {"influence_enabled": True})
+        self.assertEqual(
+            self.state.status()["ephemeral_inputs"][0]["state"],
+            "incorporated")
+
     def test_upload_put_retries_are_content_addressed(self):
         self._session()
         data = PATCH_FILES["meta.json"]
@@ -1960,6 +2003,135 @@ class UploadTests(unittest.TestCase):
                 upload_id, "fiber.json",
                 io.BytesIO(FIBER_FILES["fiber.json"]),
                 len(FIBER_FILES["fiber.json"]))
+
+    def test_fiber_revision_cas_and_settled_retention(self):
+        self._session()
+        first_upload = _upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES)
+        first = self.state.finalize_upload(first_upload)["input"]
+        self.assertEqual(first["revision"], _digest(FIBER_FILES["fiber.json"]))
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.assertEqual(record.incorporated_revision, first["revision"])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised_files = {"fiber.json": json.dumps(document).encode()}
+        second_upload = _upload_input(
+            self.state, "fiber", "fiber-1", revised_files,
+            base_revision=first["revision"])
+        second = self.state.finalize_upload(second_upload)["input"]
+        self.assertNotEqual(second["revision"], first["revision"])
+        self.assertEqual(second["incorporated_revision"], first["revision"])
+        self.assertEqual(second["state"], "pending")
+
+        with self.assertRaises(ApiError) as stale:
+            _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES,
+                          base_revision=first["revision"])
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         second["revision"])
+
+        self.state.ephemeral_records.mark_incorporated([record])
+        record.persistence = "committed"
+        record.committed_revision = record.revision
+        record.auto_commit = True
+        self.state.ephemeral_records._drop_settled()
+        status = self.state.status()["ephemeral_inputs"]
+        self.assertEqual(len(status), 1)
+        self.assertTrue(status[0]["auto_commit"])
+        self.assertEqual(status[0]["committed_revision"], second["revision"])
+
+    def test_idle_fiber_saves_remove_unprotected_superseded_revisions(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        first_path = Path(first["path"])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"]))["input"]
+
+        self.assertFalse(first_path.exists())
+        self.assertEqual(
+            list(Path(second["path"]).parent.glob("*.json")),
+            [Path(second["path"])])
+
+    def test_idle_cleanup_preserves_incorporated_revision_until_replaced(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"]))["input"]
+        self.assertTrue(Path(first["path"]).exists())
+
+        self.state._finish_incorporation([{
+            "id": "fiber-1", "kind": "fiber",
+            "revision": second["revision"],
+        }], outcomes=[{
+            "id": "fiber-1", "kind": "fiber",
+            "revision": second["revision"], "state": "incorporated",
+        }])
+
+        self.assertFalse(Path(first["path"]).exists())
+        self.assertTrue(Path(second["path"]).exists())
+
+    def test_concurrent_fiber_finalizations_cas_at_publication(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        revisions = []
+        for generation in (2, 3):
+            document = json.loads(FIBER_FILES["fiber.json"])
+            document["generation"] = generation
+            files = {"fiber.json": json.dumps(document).encode()}
+            revisions.append(_upload_input(
+                self.state, "fiber", "fiber-1", files,
+                base_revision=first["revision"]))
+        accepted = self.state.finalize_upload(revisions[0])["input"]
+        with self.assertRaises(ApiError) as stale:
+            self.state.finalize_upload(revisions[1])
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         accepted["revision"])
+
+    def test_stale_finalize_preserves_reused_incorporated_revision(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+
+        # Both transfers are admitted against revision A. The retry contains
+        # A itself, so finalize reuses A's already-published file.
+        retry = _upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES,
+            base_revision=first["revision"])
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        replacement = _upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"])
+
+        second = self.state.finalize_upload(replacement)["input"]
+        with self.assertRaises(ApiError) as stale:
+            self.state.finalize_upload(retry)
+
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         second["revision"])
+        self.assertTrue(Path(first["path"]).exists())
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -2032,6 +2204,193 @@ class UploadTests(unittest.TestCase):
         _, pending, _, _, _ = session.run_calls[-1]
         self.assertEqual([(record["id"], record["role"]) for record in pending],
                          [("drawn-1", "drawn_control_points")])
+
+    def test_same_winding_replacement_validates_role_shape_links_and_cas(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "top": "preserved",
+            "collections": {
+                "3": {"name": "target", "points": {
+                    "0": {"p": [1, 2, 3], "creation_time": 10},
+                    "1": {"p": [4, 5, 6], "creation_time": 11},
+                }},
+                "8": {"name": "other", "points": {}},
+            },
+        }
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        replacement = {"replacement.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "top": "preserved",
+            "collections": {"3": {"name": "target", "points": {
+                "0": {"p": [7, 8, 9], "creation_time": 20},
+                "1": {"p": [10, 11, 12], "creation_time": 21},
+            }}},
+        }).encode()}
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-3", replacement,
+            role="same_winding", operation="replace_collection",
+            target_collection_id="3", base_source_revision=base)
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["operation"], "replace_collection")
+        self.assertEqual(record["target_collection_id"], "3")
+
+        with self.assertRaisesRegex(ApiError, "already"):
+            _upload_input(
+                self.state, "pcl", "duplicate-target", replacement,
+                role="same_winding", operation="replace_collection",
+                target_collection_id="3", base_source_revision=base)
+        with self.assertRaisesRegex(ApiError, "does not exist"):
+            _upload_input(
+                self.state, "pcl", "missing-target", replacement,
+                role="same_winding", operation="replace_collection",
+                target_collection_id="999", base_source_revision=base)
+
+        with self.assertRaises(ApiError) as wrong_role:
+            _upload_input(
+                self.state, "pcl", "wrong-role", replacement,
+                role="relative", operation="replace_collection",
+                target_collection_id="3", base_source_revision=base)
+        self.assertEqual(wrong_role.exception.status, 400)
+
+        target.write_text(json.dumps({**source, "external": True}))
+        with self.assertRaises(ApiError) as stale:
+            _upload_input(
+                self.state, "pcl", "stale", replacement,
+                role="same_winding", operation="replace_collection",
+                target_collection_id="3", base_source_revision=base)
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["code"],
+                         "source_revision_conflict")
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         self.state._file_sha256(target))
+
+    def test_same_winding_artifact_advertises_revision_and_editability(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "zero", "points": {}}},
+        }))
+
+        class Resolution:
+            scroll_spec = {"base_shape_zyx": [10, 20, 30]}
+
+        self.state.dataset_resolution = Resolution()
+        ref = self.state._publish_same_winding_artifact(target)
+        self.assertTrue(ref["editable"])
+        self.assertEqual(ref["source_revision"],
+                         self.state._file_sha256(target))
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "same-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        descriptor = json.loads(manifests[0].read_text())
+        self.assertTrue(descriptor["editable"])
+        self.assertEqual(descriptor["source_revision"],
+                         self.state._file_sha256(target))
+
+    def test_same_winding_replacement_rejects_malformed_and_linked_sources(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "target", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 1},
+                "1": {"p": [4, 5, 6], "creation_time": 2},
+            }, "windings_linked": [8]}, "8": {"name": "other", "points": {}}},
+        }
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        valid = {"vc_pointcollections_json_version": "1", "collections": {
+            "3": {"name": "target", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 2},
+                "1": {"p": [4, 5, 6], "creation_time": 1},
+            }}}}
+        with self.assertRaisesRegex(ApiError, "Linked"):
+            _upload_input(
+                self.state, "pcl", "linked", {"x.json": json.dumps(valid).encode()},
+                role="same_winding", operation="replace_collection",
+                target_collection_id="3", base_source_revision=base)
+
+        source["collections"]["3"].pop("windings_linked")
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        upload_id = _upload_input(
+            self.state, "pcl", "malformed", {"x.json": json.dumps(valid).encode()},
+            role="same_winding", operation="replace_collection",
+            target_collection_id="3", base_source_revision=base)
+        with self.assertRaisesRegex(ApiError, "strictly increase"):
+            self.state.finalize_upload(upload_id)
+
+    def test_same_winding_replacement_rechecks_cas_at_finalize(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "target", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 1},
+                "1": {"p": [4, 5, 6], "creation_time": 2},
+            }}},
+        }
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        replacement = {"x.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "target", "points": {
+                "0": {"p": [7, 8, 9], "creation_time": 10},
+                "1": {"p": [10, 11, 12], "creation_time": 11},
+            }}},
+        }).encode()}
+        upload_id = _upload_input(
+            self.state, "pcl", "finalize-cas", replacement,
+            role="same_winding", operation="replace_collection",
+            target_collection_id="3", base_source_revision=base)
+        target.write_text(json.dumps({**source, "external": True}))
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.finalize_upload(upload_id)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.payload["code"],
+                         "source_revision_conflict")
+        self.assertEqual(caught.exception.payload["current_revision"],
+                         self.state._file_sha256(target))
+
+    def test_same_winding_deletion_uses_the_mutation_protocol(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"3": {"name": "target", "points": {
+                "0": {"p": [1, 2, 3], "creation_time": 1},
+                "1": {"p": [4, 5, 6], "creation_time": 2},
+            }}},
+        }
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-3",
+            {"delete.json": json.dumps(source).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="3", base_source_revision=base)
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["operation"], "delete_collection")
+        self.assertEqual(record["target_collection_id"], "3")
+
+        source["collections"]["3"]["windings_linked"] = [8]
+        source["collections"]["8"] = {"name": "linked", "points": {}}
+        target.write_text(json.dumps(source))
+        with self.assertRaisesRegex(ApiError, "Linked"):
+            _upload_input(
+                self.state, "pcl", "delete-linked",
+                {"delete.json": json.dumps({
+                    "vc_pointcollections_json_version": "1",
+                    "collections": {"3": source["collections"]["3"]},
+                }).encode()},
+                role="same_winding", operation="delete_collection",
+                target_collection_id="3",
+                base_source_revision=self.state._file_sha256(target))
 
     def test_quota_is_enforced(self):
         self._session()
@@ -2457,6 +2816,15 @@ class EphemeralLedgerTests(unittest.TestCase):
         ledger.mark_incorporated([record])
         self.assertEqual(ledger.records, [])
 
+    def test_claimed_inputs_are_queued_and_can_return_to_pending(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        self.assertEqual(ledger.claim_pending(), [record])
+        self.assertEqual(record.status_entry()["state"], "queued")
+        self.assertEqual(ledger.uncommitted(), [record])
+        ledger.return_pending([record])
+        self.assertEqual(record.status_entry()["state"], "pending")
+
     def test_incorporation_can_precede_persistence(self):
         ledger = self._ledger()
         record = ledger.find("patch", "patch-1")
@@ -2478,6 +2846,7 @@ class EphemeralLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pending(), [])
         self.assertEqual(ledger.uncommitted(), [])
         self.assertEqual(record.status_entry()["state"], "error")
+        self.assertEqual(record.status_entry()["error"], "RuntimeError: boom")
 
     def test_fitter_payloads_resolve_back_to_their_records(self):
         ledger = self._ledger()
@@ -2574,7 +2943,116 @@ class CommitTests(unittest.TestCase):
         mark(pending)
         status = self.state.status()
         self.assertEqual(status["committed_not_incorporated"], [])
-        self.assertEqual(status["ephemeral_inputs"], [])
+        self.assertEqual(len(status["ephemeral_inputs"]), 1)
+        self.assertEqual(status["ephemeral_inputs"][0]["kind"], "fiber")
+        self.assertTrue(status["ephemeral_inputs"][0]["auto_commit"])
+
+    def test_committed_fiber_revision_auto_commits_after_incorporation(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.state.commit_inputs()
+        self.assertTrue(record.auto_commit)
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        upload_id = _upload_input(
+            self.state, "fiber", "fiber-9", revised,
+            base_revision=first["revision"])
+        second = self.state.finalize_upload(upload_id)["input"]
+        self.state.ephemeral_records.mark_outcomes([{
+            "id": "fiber-9", "kind": "fiber",
+            "revision": second["revision"], "state": "incorporated",
+        }])
+        self.state._auto_commit_fiber(record)
+
+        self.assertEqual(record.committed_revision, second["revision"])
+        self.assertEqual(
+            (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
+            revised["fiber.json"])
+
+    def test_run_incorporation_contains_automatic_commit_failure(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.state.commit_inputs()
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-9", revised,
+            base_revision=first["revision"]))["input"]
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+
+        with mock.patch.object(
+                self.state, "_auto_commit_fiber",
+                side_effect=FileLockUnavailable("busy")):
+            mark(pending)
+
+        self.assertEqual(record.incorporation, "incorporated")
+        self.assertEqual(record.incorporated_revision, second["revision"])
+        self.assertEqual(record.committed_revision, first["revision"])
+        self.assertEqual(record.error_revision, second["revision"])
+        self.assertIn("Automatic commit failed", record.error)
+
+        # An explicit retry persists the same revision and clears the stale
+        # persistence error without revisiting incorporation.
+        self.state.commit_inputs()
+        self.assertEqual(record.committed_revision, second["revision"])
+        self.assertIsNone(record.error)
+        self.assertIsNone(record.error_revision)
+
+    def test_fiber_commit_uses_immutable_revision_snapshot(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        first_path = Path(first["path"])
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+        original_copy = spiral_service._copy_publish
+
+        def blocked_copy(source, destination, keep_source=False):
+            if Path(destination).name == "fiber-9.json":
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("timed out waiting for revised fiber")
+            return original_copy(source, destination, keep_source)
+
+        def commit():
+            try:
+                self.state.commit_inputs()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                spiral_service, "_copy_publish", side_effect=blocked_copy):
+            thread = threading.Thread(target=commit)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            second = self.state.finalize_upload(_upload_input(
+                self.state, "fiber", "fiber-9", revised,
+                base_revision=first["revision"]))["input"]
+            # Idle cleanup must retain the source captured by the in-flight
+            # commit even though it is no longer the logical current path.
+            self.assertTrue(first_path.exists())
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
+            FIBER_FILES["fiber.json"])
+        self.assertEqual(record.revision, second["revision"])
+        self.assertEqual(record.committed_revision, first["revision"])
+        self.assertTrue(record.auto_commit)
+        self.assertFalse(record.committed)
 
     def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)
@@ -2723,6 +3201,119 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(list(merged["collections"]["3"]["points"]), ["0", "1"])
         self.assertEqual(len(list(self.dataset.glob(
             "same_windings.json.*.bak"))), 1)
+
+    def test_same_winding_replacements_commit_atomically_without_duplicates(self):
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "custom": {"preserved": True},
+            "collections": {
+                "2": {"name": "two", "points": {
+                    "0": {"p": [0, 0, 0], "creation_time": 1},
+                    "1": {"p": [1, 0, 0], "creation_time": 2}}},
+                "7": {"name": "seven", "points": {
+                    "0": {"p": [0, 1, 0], "creation_time": 3},
+                    "1": {"p": [1, 1, 0], "creation_time": 4}}},
+            },
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        for collection_id, y in (("2", 20), ("7", 70)):
+            incoming = {"vc_pointcollections_json_version": "1",
+                        "collections": {collection_id: {
+                            "name": source["collections"][collection_id]["name"],
+                            "points": {
+                                "0": {"p": [0, y, 0], "creation_time": 10},
+                                "1": {"p": [1, y, 0], "creation_time": 11},
+                            }}}}
+            upload_id = _upload_input(
+                self.state, "pcl", f"replace-{collection_id}",
+                {f"{collection_id}.json": json.dumps(incoming).encode()},
+                role="same_winding", operation="replace_collection",
+                target_collection_id=collection_id,
+                base_source_revision=base)
+            self.state.finalize_upload(upload_id)
+
+        response = self.state.commit_inputs()
+        self.assertEqual(sorted(response["committed"]),
+                         ["replace-2", "replace-7"])
+        result = json.loads(target.read_text())
+        self.assertEqual(list(result["collections"]), ["2", "7"])
+        self.assertEqual(result["collections"]["2"]["points"]["0"]["p"],
+                         [0, 20, 0])
+        self.assertEqual(result["collections"]["7"]["points"]["0"]["p"],
+                         [0, 70, 0])
+        self.assertEqual(result["custom"], {"preserved": True})
+        self.assertEqual(len(list(self.dataset.glob(
+            "same_windings.json.*.bak"))), 1)
+
+    def test_same_winding_replacement_rechecks_cas_at_commit(self):
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "two", "points": {
+                "0": {"p": [0, 0, 0], "creation_time": 1},
+                "1": {"p": [1, 0, 0], "creation_time": 2},
+            }}},
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        replacement = {"vc_pointcollections_json_version": "1",
+                       "collections": {"2": {"name": "two", "points": {
+                           "0": {"p": [0, 2, 0], "creation_time": 10},
+                           "1": {"p": [1, 2, 0], "creation_time": 11},
+                       }}}}
+        upload_id = _upload_input(
+            self.state, "pcl", "replace-2",
+            {"2.json": json.dumps(replacement).encode()},
+            role="same_winding", operation="replace_collection",
+            target_collection_id="2", base_source_revision=base)
+        self.state.finalize_upload(upload_id)
+        externally_changed = {**source, "external": True}
+        target.write_text(json.dumps(externally_changed))
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.commit_inputs()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.payload["code"],
+                         "source_revision_conflict")
+        self.assertEqual(json.loads(target.read_text()), externally_changed)
+        self.assertEqual(list(self.dataset.glob(
+            "same_windings.json.*.bak")), [])
+
+    def test_same_winding_delete_removes_only_the_target_atomically(self):
+        source = {
+            "vc_pointcollections_json_version": "1",
+            "custom": "preserved",
+            "collections": {
+                "2": {"name": "delete me", "points": {
+                    "0": {"p": [0, 0, 0], "creation_time": 1},
+                    "1": {"p": [1, 0, 0], "creation_time": 2}}},
+                "7": {"name": "keep me", "points": {
+                    "0": {"p": [0, 1, 0], "creation_time": 3},
+                    "1": {"p": [1, 1, 0], "creation_time": 4}}},
+            },
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(source))
+        base = self.state._file_sha256(target)
+        deletion = {"vc_pointcollections_json_version": "1",
+                    "collections": {"2": source["collections"]["2"]}}
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-2",
+            {"2.json": json.dumps(deletion).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="2", base_source_revision=base)
+        self.state.finalize_upload(upload_id)
+
+        response = self.state.commit_inputs()
+        self.assertEqual(response["committed"], ["delete-2"])
+        result = json.loads(target.read_text())
+        self.assertEqual(list(result["collections"]), ["7"])
+        self.assertEqual(result["custom"], "preserved")
+        backups = list(self.dataset.glob("same_windings.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text()), source)
 
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

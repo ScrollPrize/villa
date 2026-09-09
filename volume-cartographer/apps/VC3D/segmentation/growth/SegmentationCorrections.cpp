@@ -40,7 +40,7 @@ void CorrectionsState::setCollection(VCCollection* collection)
     _collection = collection;
     _pendingCollectionIds.clear();
     _managedCollectionIds.clear();
-    _activeCollectionId = 0;
+    _activeCollectionId.reset();
 
     if (_collection) {
         const auto& collections = _collection->getAllCollections();
@@ -56,12 +56,6 @@ void CorrectionsState::setCollection(VCCollection* collection)
 void CorrectionsState::setActiveCollection(uint64_t collectionId, bool userInitiated)
 {
     if (!_collection) {
-        return;
-    }
-
-    if (collectionId == 0) {
-        _activeCollectionId = 0;
-        refreshWidget();
         return;
     }
 
@@ -84,6 +78,12 @@ void CorrectionsState::setActiveCollection(uint64_t collectionId, bool userIniti
         emitStatus(QObject::tr("Active correction set changed."), kStatusShort);
     }
 
+    refreshWidget();
+}
+
+void CorrectionsState::clearActiveCollection()
+{
+    _activeCollectionId.reset();
     refreshWidget();
 }
 
@@ -117,12 +117,12 @@ uint64_t CorrectionsState::createCollection(bool announce)
 
 void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
 {
-    if (!_collection || _activeCollectionId == 0) {
+    if (!_collection || !_activeCollectionId) {
         return;
     }
 
     const auto& collections = _collection->getAllCollections();
-    auto it = collections.find(_activeCollectionId);
+    auto it = collections.find(*_activeCollectionId);
     if (it == collections.end()) {
         pruneMissing();
         refreshWidget();
@@ -132,9 +132,9 @@ void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
     ColPoint pt = _collection->addPoint(it->second.name, worldPos);
 
     // Priority: auto-fill mode > d.tif lookup
-    auto mode = _collection->getAutoFillMode(_activeCollectionId);
+    auto mode = _collection->getAutoFillMode(*_activeCollectionId);
     if (mode != VCCollection::WindingFillMode::None) {
-        float autoVal = _collection->computeAutoFillValue(_activeCollectionId);
+        float autoVal = _collection->computeAutoFillValue(*_activeCollectionId);
         if (!std::isnan(autoVal)) {
             pt.winding_annotation = autoVal;
             _collection->updatePoint(pt);
@@ -147,12 +147,12 @@ void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
 
 void CorrectionsState::handlePointRemoved(const cv::Vec3f& worldPos)
 {
-    if (!_collection || _activeCollectionId == 0) {
+    if (!_collection || !_activeCollectionId) {
         return;
     }
 
     const auto& collections = _collection->getAllCollections();
-    auto it = collections.find(_activeCollectionId);
+    auto it = collections.find(*_activeCollectionId);
     if (it == collections.end()) {
         pruneMissing();
         refreshWidget();
@@ -164,7 +164,7 @@ void CorrectionsState::handlePointRemoved(const cv::Vec3f& worldPos)
         return;
     }
 
-    uint64_t closestId = 0;
+    std::optional<uint64_t> closestId;
     float closestDistance = std::numeric_limits<float>::max();
     for (const auto& entry : points) {
         const float dist = cv::norm(entry.second.p - worldPos);
@@ -174,8 +174,8 @@ void CorrectionsState::handlePointRemoved(const cv::Vec3f& worldPos)
         }
     }
 
-    if (closestId != 0) {
-        _collection->removePoint(closestId);
+    if (closestId) {
+        _collection->removePoint({*_activeCollectionId, *closestId});
     }
 }
 
@@ -230,7 +230,7 @@ void CorrectionsState::clearAll()
 
     _pendingCollectionIds.clear();
     _managedCollectionIds.clear();
-    _activeCollectionId = 0;
+    _activeCollectionId.reset();
 
     // Repopulate _pendingCollectionIds with surviving persistent collections
     // (those with anchor2d set that were not cleared above)
@@ -267,12 +267,7 @@ void CorrectionsState::refreshWidget()
         }
     }
 
-    std::optional<uint64_t> active;
-    if (_activeCollectionId != 0) {
-        active = _activeCollectionId;
-    }
-
-    _widget->setCorrectionCollections(entries, active);
+    _widget->setCorrectionCollections(entries, _activeCollectionId);
     _widget->setCorrectionsEnabled(correctionsAvailable);
 }
 
@@ -281,7 +276,7 @@ void CorrectionsState::pruneMissing()
     if (!_collection) {
         _pendingCollectionIds.clear();
         _managedCollectionIds.clear();
-        _activeCollectionId = 0;
+        _activeCollectionId.reset();
         return;
     }
 
@@ -304,8 +299,8 @@ void CorrectionsState::pruneMissing()
         }
     }
 
-    if (_activeCollectionId != 0 && collections.find(_activeCollectionId) == collections.end()) {
-        _activeCollectionId = 0;
+    if (_activeCollectionId && collections.find(*_activeCollectionId) == collections.end()) {
+        _activeCollectionId.reset();
     }
 }
 
@@ -330,8 +325,8 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload(bool onlyActiveCol
     std::vector<uint64_t> idsToInclude;
     if (onlyActiveCollection) {
         // Only include the active collection (if valid)
-        if (_activeCollectionId != 0 && collections.find(_activeCollectionId) != collections.end()) {
-            idsToInclude.push_back(_activeCollectionId);
+        if (_activeCollectionId && collections.find(*_activeCollectionId) != collections.end()) {
+            idsToInclude.push_back(*_activeCollectionId);
         }
     } else {
         // Include all pending collections
@@ -373,7 +368,7 @@ SegmentationCorrectionsPayload CorrectionsState::buildPayload(bool onlyActiveCol
 SegmentationCorrectionsPayload CorrectionsState::buildPayloadForCollection(uint64_t collectionId) const
 {
     SegmentationCorrectionsPayload payload;
-    if (!_collection || collectionId == 0) {
+    if (!_collection) {
         return payload;
     }
 
@@ -418,7 +413,7 @@ void CorrectionsState::onCollectionRemoved(uint64_t id)
     if (id == sentinel) {
         _pendingCollectionIds.clear();
         _managedCollectionIds.clear();
-        _activeCollectionId = 0;
+        _activeCollectionId.reset();
         refreshWidget();
         return;
     }
@@ -430,8 +425,8 @@ void CorrectionsState::onCollectionRemoved(uint64_t id)
 
     _managedCollectionIds.erase(id);
 
-    if (_activeCollectionId == id) {
-        _activeCollectionId = 0;
+    if (_activeCollectionId && *_activeCollectionId == id) {
+        _activeCollectionId.reset();
     }
 
     refreshWidget();

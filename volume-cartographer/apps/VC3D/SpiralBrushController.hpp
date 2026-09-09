@@ -1,25 +1,34 @@
 #pragma once
 
+#include "SpiralPointPlacementMode.hpp"
+#include "SpiralPointCollectionEdit.hpp"
 #include "SpiralPointChain.hpp"
+#include "overlays/ScreenSpacePointIndex.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 
 #include <QColor>
 #include <QJsonDocument>
 #include <QPainterPath>
 #include <QPointF>
+#include <QPointer>
 #include <QSet>
+#include <QSize>
 #include <QString>
+#include <QTransform>
 
 #include <opencv2/core/types.hpp>
 
 #include <memory>
+#include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 class QuadSurface;
 class VolumeViewerBase;
 class SpiralBrushCursorWidget;
+class PointsOverlayController;
 
 // Spiral-only drawn inputs. This deliberately does not use VC3D's annotation
 // or segmentation drawing paths: brush marks are true swept-circle vector
@@ -37,6 +46,9 @@ public:
         QString id;
         QString role;
         QJsonDocument document;
+        QString operation;
+        QString targetCollectionId;
+        QString baseSourceRevision;
     };
 
     explicit SpiralBrushController(QObject* parent = nullptr);
@@ -44,9 +56,19 @@ public:
     void bindFlattenedViewer(VolumeViewerBase* viewer);
     void setPaintSurface(const std::shared_ptr<QuadSurface>& surface);
     void setVisiblePointCollectionIds(const QSet<QString>& ids);
+    void setSameWindingSource(const QJsonDocument& document,
+                              double sourceToPreviewScale,
+                              const QString& sourceRevision,
+                              bool editable);
+    void setSameWindingSourceVisible(bool visible);
+    void setSameWindingHitOverlay(PointsOverlayController* overlay);
+    void setPointViewTolerance(double tolerance);
+    void replacementConflict(const QString& id, bool discardDraft);
     void resetSession();
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
+    bool hasReadyDrafts() const;
+    void markDraftsReady();
     int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
@@ -59,6 +81,7 @@ signals:
     void paintStateChanged();
     void brushDiameterChanged(int diameterPx);
     void pointPlacementRejected(const QString& message);
+    void suppressedSameWindingCollectionIdsChanged(const QSet<QString>& ids);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -66,7 +89,7 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    enum class GestureState { Painted, Finalizing, Finalized };
+    enum class GestureState { Painted, Ready, Finalizing, Finalized };
     struct Gesture {
         QString id;
         QColor color;
@@ -85,10 +108,32 @@ private:
         std::vector<vc3d::spiral::PointChainAnchor> anchors;
         std::vector<QPointF> surfacePoints;
         std::vector<cv::Vec3f> volumePoints;
+        std::optional<vc3d::spiral::EditablePclDraft> pclEdit;
         qint64 creationTime = 0;
         int sequence = 0;
         Kind kind = Kind::Freehand;
         GestureState state = GestureState::Painted;
+    };
+    struct EditablePclHit {
+        std::optional<std::size_t> sourceIndex;
+        int polylineIndex = -1;
+        std::size_t pointIndex = 0;
+        QPointF scenePosition;
+        QPointF devicePosition;
+        QColor color;
+        bool sourceMarker = false;
+        std::uint64_t stableCollectionOrder = 0;
+        std::uint64_t stablePointOrder = 0;
+    };
+    struct EditablePclHitIndexState {
+        std::vector<EditablePclHit> records;
+        ScreenSpacePointIndex index;
+        std::unordered_map<int, std::vector<cv::Vec3f>> projectionPositions;
+        SurfaceProjectionContext projectionContext;
+        QTransform viewportTransform;
+        QSize viewportSize;
+        std::uint64_t contentRevision = 0;
+        bool valid = false;
     };
     enum class DragMode { None, Paint, Polyline, Erase };
 
@@ -104,7 +149,24 @@ private:
     void appendAnchoredPoint(const QPointF& devicePos);
     void finishAnchoredPolyline();
     void appendPointCollectionPoint(const QPointF& devicePos);
-    void finishPointCollection();
+    std::optional<EditablePclHit> editablePclHitAt(
+        const QPointF& devicePos);
+    void updateEditablePclHover(const QPointF& devicePos);
+    void clearEditablePclHover();
+    void invalidateEditablePclHitIndex();
+    void rebuildEditablePclHitIndex();
+    std::optional<EditablePclHit> draftEditablePclHitAt(
+        const QPointF& devicePos);
+    void selectEditablePcl(const EditablePclHit& hit);
+    void selectEditablePcl(std::size_t sourceIndex);
+    void reverseActivePcl();
+    void confirmDeleteActivePcl();
+    const std::vector<cv::Vec3f>& pointCollectionPositions(
+        const PolylineGesture& line) const;
+    bool pointCollectionHasChanges(const PolylineGesture& line) const;
+    void updateSuppressedSameWindingIds();
+    void finishPointCollection(bool removeIncompleteNewCollection = true);
+    void deactivatePointPlacement();
     void beginErase(const QPointF& devicePos);
     void extendDrag(const QPointF& devicePos);
     void finishDrag(const QPointF& devicePos);
@@ -132,6 +194,14 @@ private:
     std::vector<Gesture> _gestures;
     std::vector<PolylineGesture> _polylines;
     QSet<QString> _visiblePointCollectionIds;
+    std::vector<vc3d::spiral::EditablePclDraft> _sameWindingSources;
+    std::unordered_map<std::uint64_t, std::size_t> _sameWindingSourceIndexById;
+    QSet<qulonglong> _editableSameWindingCollectionIds;
+    QPointer<PointsOverlayController> _sameWindingHitOverlay;
+    EditablePclHitIndexState _editablePclHitIndex;
+    std::uint64_t _editablePclHitContentRevision = 1;
+    QSet<QString> _suppressedSameWindingCollectionIds;
+    bool _sameWindingSourceVisible = false;
     QSet<QRgb> _usedColors;
     std::optional<QColor> _sampledColor;
     QPointF _cursorDevicePos;
@@ -148,6 +218,8 @@ private:
     bool _controlHeld = false;
     bool _vHeld = false;
     bool _vClickConsumed = false;
-    bool _qHeld = false;
-    bool _qClickConsumed = false;
+    SpiralPointPlacementMode _pointPlacement;
+    std::optional<EditablePclHit> _hoveredEditablePcl;
+    bool _pclLeftClickConsumed = false;
+    float _pointViewToleranceVoxels = 100.0f;
 };

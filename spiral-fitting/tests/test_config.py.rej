@@ -1,0 +1,107 @@
+diff a/spiral-fitting/tests/test_config.py b/spiral-fitting/tests/test_config.py	(rejected hunks)
+@@ -123,35 +123,89 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
+         "track_radius_target", "track_radius_loss_margin",
+         "track_radius_within_norm_p", "track_dt_within_track_norm_p",
+         "track_dt_norm_p", "track_dt_loss_margin",
++        # Consumed while preparing the retained raw tracks, which
++        # apply_config prepares again.
++        "track_crossing_precompute_max", "track_crossing_mode",
++        "track_exclusion_radius",
+     }
+     assert all(fields[key]["runtime_impact"] == "run_boundary"
+                for key in mutable_tracks)
+-    assert all(fields[key]["runtime_impact"] == "new_fit"
+-               for key in {
+-                   "track_crossing_precompute_max", "track_crossing_mode",
+-                   "track_exclusion_radius",
+-               })
+-
+-    # The vertical-fiber radial offset is refilled onto retained strips at a
+-    # Run boundary; every other pcl_ setting shapes prepared inputs.
+-    run_mutable_pcl = {
+-        "pcl_vertical_fiber_radial_offset_enabled",
+-        "pcl_vertical_fiber_radial_offset_voxels",
+-    }
++    assert all(key.startswith("track_") for key in mutable_tracks)
++    assert {key for key in fields if key.startswith("track_")} <= mutable_tracks
++
++    # Every pcl_ setting is applied to the resident session: the sampling
++    # flags are read live or rebuild the strata, the radial offset is
++    # refilled, and the view-shaping settings re-derive the strips and
++    # cross-patch views from the retained catalogs.
+     for key, field in fields.items():
+         if key.startswith("pcl_"):
++            assert field["runtime_impact"] == "run_boundary", key
++
++    # model_ keys: tensor-shaping/integrator settings demand a new model;
++    # the LR ramp, the Dirichlet epsilon and the legacy winding estimate are
++    # read live.
++    run_mutable_model = {
++        "model_num_flow_integration_steps",
++        "model_flow_field_high_res_lr_scale_initial",
++        "model_flow_field_high_res_lr_scale_final",
++        "model_flow_field_high_res_lr_ramp_start_step",
++        "model_flow_field_high_res_lr_ramp_steps",
++        "model_sym_dirichlet_finite_difference_epsilon",
++        "model_gap_expander_num_windings",
++    }
++    for key, field in fields.items():
++        if key.startswith("model_"):
+             expected = (
+-                "run_boundary" if key in run_mutable_pcl else "new_fit")
++                "run_boundary" if key in run_mutable_model else "new_fit")
+             assert field["runtime_impact"] == expected, key
++        if key.startswith("input_"):
++            assert field["runtime_impact"] == "new_fit", key
++    assert fields["loss_weight_fiber_directions"]["runtime_impact"] == (
++        "run_boundary")
++    assert fields["optimizer_random_seed"]["runtime_impact"] == "new_fit"
++
++
++def test_runtime_impact_is_an_explicit_audit_not_a_prefix_rule():
++    keys = set(Config().as_dict())
++    # Every model_/input_/pcl_ key is named by a classification table; an
++    # unnamed one would be reported as new_fit by construction, and this is
++    # where that omission becomes visible.
++    assert unaudited_prefixed_keys(keys) == []
++    assert NEW_FIT_KEYS <= keys
++    fields = Config.catalog()["schema"]["fields"]
++    for key, field in fields.items():
++        if field["runtime_impact"] == "new_fit":
++            assert field["rebuild_stage"] == (
++                "model" if key in MODEL_STAGE_KEYS else "all"), key
++        else:
++            assert "rebuild_stage" not in field, key
++
++
++def test_rebuild_stage_ignores_run_boundary_keys():
++    # A rebuild applies run-boundary changes through apply_config, so they
++    # never widen the stage a model-stage change needs.
++    assert rebuild_stage(["loss_weight_patch_radius"]) == "model"
++    assert rebuild_stage(["model_num_flow_timesteps",
++                          "pcl_sampling_weights",
++                          "model_num_flow_integration_steps",
++                          "model_flow_field_high_res_lr_scale_final"]) == (
++        "model")
++    assert rebuild_stage(["model_num_flow_timesteps",
++                          "input_use_tracks"]) == "all"
++    advertised = set(Config.catalog()["schema"]["model_stage_keys"])
++    fields = Config.catalog()["schema"]["fields"]
++    assert advertised == MODEL_STAGE_KEYS | {
++        key for key, spec in fields.items()
++        if spec["runtime_impact"] == "run_boundary"}
+ 
+ 
+ def test_rebuild_stage_is_model_only_for_the_allowlist():
+     assert rebuild_stage([]) == "model"
+-    assert rebuild_stage(["model_num_flow_integration_steps"]) == "model"
+-    assert rebuild_stage(["model_num_flow_integration_steps",
++    assert rebuild_stage(["model_num_flow_timesteps"]) == "model"
++    assert rebuild_stage(["model_num_flow_timesteps",
+                           "model_linear_z_resolution"]) == "model"
+     # One unlisted key in the set is enough to demand the whole build.
+-    assert rebuild_stage(["model_num_flow_integration_steps",
++    assert rebuild_stage(["model_num_flow_timesteps",
+                           "z_begin"]) == "all"
+     assert rebuild_stage(["optimizer_random_seed"]) == "all"
+     assert rebuild_stage(["model_flow_bounds_z_margin"]) == "all"

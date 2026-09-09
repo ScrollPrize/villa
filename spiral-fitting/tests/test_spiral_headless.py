@@ -73,7 +73,7 @@ class ScrollSpecTests(unittest.TestCase):
                 future_extension={"enabled": True})
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
-            self.assertNotIn("base_shape_zyx", spec.manifest())
+            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
             self.assertNotIn("future_extension", spec.manifest())
 
     def test_unknown_path_override_keys_are_rejected(self):
@@ -96,11 +96,22 @@ class ScrollSpecTests(unittest.TestCase):
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_base_shape_is_validated_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
+            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
+                write_scroll_spec(temporary, base_shape_zyx=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
+                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -505,6 +516,109 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._collective_state, SessionState.Idle)
         session._events.put(None)
         listener.join(2)
+
+    def test_distributed_incorporation_forwards_per_record_outcomes(self):
+        session = self._proxy()
+        records = [{"id": "fiber-a", "kind": "fiber", "revision": "r1"}]
+        outcomes = [{**records[0], "state": "rejected", "error": "invalid"}]
+        received = []
+        with session._condition:
+            session._incorporation_callbacks["run-1"] = (
+                lambda callback_records, **result: received.append(
+                    (callback_records, result)),
+                records)
+
+        listener = threading.Thread(target=session._listen)
+        listener.start()
+        session._events.put((
+            "incorporated", "run-1", None, outcomes, False))
+        self.assertTrue(self._wait_for(lambda: received))
+        session._events.put(None)
+        listener.join(2)
+
+        self.assertEqual(received, [(records, {"outcomes": outcomes})])
+        self.assertNotIn("run-1", session._incorporation_callbacks)
+
+    def test_distributed_live_incorporation_returns_mixed_outcomes(self):
+        session = self._proxy()
+        session._status.update({
+            "state": SessionState.Running,
+            "current_iteration": 12,
+        })
+        valid = {"id": "fiber-a", "kind": "fiber", "revision": "r1"}
+        invalid = {"id": "patch-b", "kind": "patch"}
+        accepted = {**valid, "state": "incorporated"}
+        rejected = {**invalid, "state": "error", "error": "invalid"}
+        incorporation_calls = []
+
+        def fake_call(name, arguments=None, **kwargs):
+            if name == "reserve_incorporation":
+                return {
+                    rank: {"reserved": True}
+                    for rank in range(len(session._processes))
+                }
+            if name == "prevalidate_incorporation":
+                return {
+                    rank: {"no_future_step": False,
+                           "outcomes": [accepted, rejected]}
+                    for rank in range(len(session._processes))
+                }
+            if name == "incorporate":
+                incorporation_calls.append((arguments, kwargs))
+                return {
+                    rank: {"no_future_step": False,
+                           "incorporated": 1,
+                           "outcomes": [accepted]}
+                    for rank in range(len(session._processes))
+                }
+            self.fail(f"unexpected distributed call: {name}")
+
+        session._call = fake_call
+
+        result = session.incorporate_live([valid, invalid])
+
+        self.assertEqual(result["outcomes"], [accepted, rejected])
+        self.assertEqual(result["incorporated"], 1)
+        self.assertEqual(len(incorporation_calls), 1)
+        arguments, call_options = incorporation_calls[0]
+        self.assertEqual(arguments["records"], [valid])
+        self.assertEqual(arguments["timeout"],
+                         spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S)
+        self.assertEqual(
+            call_options["timeout"],
+            spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S
+            + spiral_runtime.COMMAND_ACK_GRACE_S)
+
+    def test_rank_zero_worker_emits_per_record_incorporation_outcomes(self):
+        records = [{"id": "fiber-a", "kind": "fiber", "revision": "r1"}]
+        outcomes = [{**records[0], "state": "rejected", "error": "invalid"}]
+        commands = queue.Queue()
+        events = queue.Queue()
+        commands.put((None, "run-1", "run", {
+            "count": 1, "pending_inputs": records}))
+        commands.put((None, "close-1", "close", {}))
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, count, pending_inputs=None, mark_incorporated=None,
+                    **kwargs):
+                mark_incorporated(pending_inputs, outcomes=outcomes)
+                return {"accepted": True}
+
+            def close(self, *args, **kwargs):
+                pass
+
+        context = SimpleNamespace(rank=0, world_size=1, local_rank=0)
+        with mock.patch.object(
+                spiral_runtime, "InteractiveFitSession", FakeSession):
+            spiral_runtime._distributed_session_worker(
+                context, 0, None, None, None, None, None, commands, events)
+
+        emitted = [events.get_nowait() for _ in range(events.qsize())]
+        self.assertIn(("incorporated", "run-1", None, outcomes, False), emitted)
+        self.assertIn(("ack", "run-1", 0, True, {"accepted": True}), emitted)
 
     def test_all_rank_commands_carry_a_monotonic_epoch(self):
         session = self._proxy()
@@ -970,6 +1084,75 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(command.command_id)
         self.assertEqual(command.session_generation, 0)
         self.assertEqual(command.expected_iteration, 10)
+
+    def test_timed_out_queued_live_incorporation_is_cancelled(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._live_reservation_iteration = 10
+        session._live_reservation_epoch = 7
+        command = IncorporateCommand(
+            records=[{"id": "fiber-a", "kind": "fiber"}],
+            reservation_epoch=7)
+
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            session._queue_command(command, timeout=0)
+
+        self.assertTrue(command.cancelled)
+        self.assertEqual(session._commands, [])
+        self.assertIsNone(session._live_reservation_iteration)
+        self.assertEqual(session._state, SessionState.Running)
+
+    def test_live_incorporation_defaults_to_the_operation_timeout(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._target = 12
+        session._live_reservation_iteration = 10
+        session._live_reservation_epoch = 7
+        observed = []
+        session._queue_command = lambda command, timeout: observed.append(timeout)
+
+        session.incorporate_live(
+            [{"id": "fiber-a", "kind": "fiber"}],
+            target_iteration=10,
+            reservation_epoch=7)
+
+        self.assertEqual(observed,
+                         [spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S])
+
+    def test_timed_out_active_live_incorporation_fail_stops_session(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._pending = 3
+        session._target = 13
+        session._warnings = []
+        session._error = None
+        session._live_reservation_iteration = 10
+        session._live_reservation_epoch = 8
+        session._publish_status = lambda: None
+        command = IncorporateCommand(
+            records=[{"id": "fiber-a", "kind": "fiber"}],
+            reservation_epoch=8)
+        claimed = threading.Event()
+
+        def take_command():
+            with session._condition:
+                while not session._commands:
+                    session._condition.wait()
+                session._commands.pop(0)
+                claimed.set()
+
+        fitter = threading.Thread(target=take_command)
+        fitter.start()
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            session._queue_command(command, timeout=0.05)
+        fitter.join(1)
+
+        self.assertTrue(claimed.is_set())
+        self.assertEqual(session._state, SessionState.Error)
+        self.assertEqual(session._pending, 0)
+        self.assertEqual(session._target, session._completed)
+        self.assertIsNone(session._live_reservation_iteration)
+        self.assertIn("timed out", session._error)
 
     def test_run_configuration_is_queued_before_input_incorporation(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

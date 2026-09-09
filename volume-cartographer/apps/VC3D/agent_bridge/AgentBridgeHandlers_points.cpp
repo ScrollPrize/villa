@@ -75,10 +75,38 @@ uint64_t resolveCollectionId(VCCollection* pc, const QJsonObject& p)
         throwParamError("collection", QStringLiteral("is required"));
 
     const QString name = p.value("collection").toString();
-    const uint64_t id = pc->getCollectionId(name.toStdString());  // 0 when absent
-    if (id == 0)
+    const auto id = pc->getCollectionId(name.toStdString());
+    if (!id)
         throwUnknownCollection(name);
-    return id;
+    return *id;
+}
+
+vc::PointRef resolvePointRef(VCCollection* pc, const QJsonObject& params)
+{
+    const uint64_t pointId = static_cast<uint64_t>(params.value("pointId").toDouble());
+    if (params.contains("collectionId")) {
+        const vc::PointRef ref{
+            static_cast<uint64_t>(params.value("collectionId").toDouble()), pointId};
+        if (!pc->getPoint(ref)) throwUnknownPoint(pointId);
+        return ref;
+    }
+
+    const std::vector<vc::PointRef> candidates = pc->findPointRefs(pointId);
+    if (candidates.empty()) throwUnknownPoint(pointId);
+    if (candidates.size() == 1) return candidates.front();
+
+    QJsonArray collectionIds;
+    for (const vc::PointRef& candidate : candidates) {
+        collectionIds.append(static_cast<double>(candidate.collectionId));
+    }
+    QJsonObject data;
+    data["kind"] = "point";
+    data["id"] = static_cast<double>(pointId);
+    data["candidateCollectionIds"] = collectionIds;
+    throw AgentBridgeError{
+        -32008,
+        QStringLiteral("Ambiguous point %1; specify collectionId").arg(pointId),
+        data};
 }
 
 // [r, g, b] float triple (colors travel as an array, not an {x,y,z} object, so
@@ -190,7 +218,7 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
     }
 
     QJsonObject result;
-    result["collectionId"] = static_cast<double>(pc->getCollectionId(col));
+    result["collectionId"] = static_cast<double>(pc->getCollectionId(col).value());
     result["pointIds"] = pointIds;
     return result;
 }
@@ -206,7 +234,7 @@ QJsonObject AgentBridgeServer::handlePointsList(const QJsonValue& params)
 
     QJsonArray collections;
     if (pc) {
-        if (!filter.isEmpty() && pc->getCollectionId(filter.toStdString()) == 0) {
+        if (!filter.isEmpty() && !pc->getCollectionId(filter.toStdString())) {
             QJsonObject data;
             data["kind"] = "collection";
             data["id"] = filter;
@@ -334,11 +362,8 @@ QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const uint64_t pointId =
-        static_cast<uint64_t>(p.value("pointId").toDouble());
-    std::optional<ColPoint> cp = pc->getPoint(pointId);
-    if (!cp)
-        throwUnknownPoint(pointId);
+    const vc::PointRef point = resolvePointRef(pc, p);
+    std::optional<ColPoint> cp = pc->getPoint(point);
 
     if (p.contains("position"))
         cp->p = jsonToVec3(p.value("position"), "position");
@@ -354,6 +379,7 @@ QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
     pc->updatePoint(*cp);
 
     QJsonObject result;
+    result["collectionId"] = static_cast<double>(cp->collectionId);
     result["id"] = static_cast<double>(cp->id);
     result["position"] = vec3ToJson(cp->p);
     result["winding"] = windingToJson(cp->winding_annotation);
@@ -367,14 +393,13 @@ QJsonObject AgentBridgeServer::handlePointsRemovePoint(const QJsonValue& params)
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const uint64_t pointId =
-        static_cast<uint64_t>(p.value("pointId").toDouble());
-    if (!pc->getPoint(pointId))
-        throwUnknownPoint(pointId);
-    pc->removePoint(pointId);
+    const vc::PointRef point = resolvePointRef(pc, p);
+    pc->removePoint(point);
 
     QJsonObject result;
     result["removed"] = true;
+    result["collectionId"] = static_cast<double>(point.collectionId);
+    result["pointId"] = static_cast<double>(point.pointId);
     return result;
 }
 

@@ -11,6 +11,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import copy
 import concurrent.futures
 import gc
+import hashlib
 import multiprocessing
 import json
 import glob
@@ -76,6 +77,7 @@ from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
     link_points_to_patches,
+    link_unattached_points_to_patches,
     load_point_collection,
     normalise_pcl_winding_annotations,
 )
@@ -750,6 +752,201 @@ class _UnattachedPclStripList(list):
     pass
 
 
+def catalog_copy_of_pcl(pcl):
+    """Copy a regular PCL without derived chain and patch-view state."""
+    return copy.deepcopy({
+        key: value for key, value in pcl.items()
+        if key not in ('chain', 'points_by_patch')
+    })
+
+
+def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
+    """Return the longest contiguous id-sorted run inside the z window."""
+    best_start = best_end = run_start = 0
+    for position, (_, point) in enumerate(sorted_items):
+        z = point['zyx'][0]
+        if z_begin - z_margin <= z < z_end + z_margin:
+            if position + 1 - run_start > best_end - best_start:
+                best_start, best_end = run_start, position + 1
+        else:
+            run_start = position + 1
+    return sorted_items[best_start:best_end]
+
+
+def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
+    """Materialize the unattached-loss strip of a regular PCL."""
+    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+    if len(sorted_items) < 2:
+        return None
+    zyxs = np.stack(
+        [point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
+    windings = np.array(
+        [point['winding_annotation'] for _, point in sorted_items],
+        dtype=np.float32)
+    zyxs, keep = _decimate_ordered_points_min_spacing(
+        zyxs, min_point_spacing, return_indices=True,
+        force_keep={len(zyxs) - 1})
+    metadata = pcl.get('metadata', {})
+    return {
+        'id': pcl_id,
+        'name': pcl.get('name'),
+        'source_file': pcl.get('source_file'),
+        'zyxs': zyxs,
+        'windings': windings[keep],
+        'link_points': {},
+        'logical_input_kind': metadata.get('logical_input_kind'),
+        'logical_input_id': metadata.get('logical_input_id'),
+        'logical_input_revision': metadata.get('logical_input_revision'),
+    }
+
+
+def materialize_fiber_fit_inputs(
+        fiber_catalog, verified_patches, *, z_begin, z_end, z_margin,
+        min_point_spacing, use_links=True, use_pending_links=False):
+    """Derive every CPU training view from the resident fiber catalog.
+
+    ``fiber_catalog`` is ordered by logical input id and owns the canonical
+    fiber containers. The returned cross-patch PCLs and strips refer to their
+    geometry, but trimming and decimation never mutate the catalog's point
+    membership. Re-running this function over the same catalog therefore
+    produces the same graph and ordered training views.
+    """
+    point_collections = {}
+    for logical_id, pcl in fiber_catalog.items():
+        logical_id = str(logical_id)
+        metadata = pcl.setdefault('metadata', {})
+        metadata['logical_input_kind'] = 'fiber'
+        metadata['logical_input_id'] = logical_id
+        metadata['winding_is_absolute'] = False
+        metadata.setdefault('input_role', 'fiber')
+        pcl['file_basename'] = f'{logical_id}.json'
+        pcl['sampling_group'] = 'fibers'
+        pcl['chain'] = SequenceChain(pcl)
+        for point in pcl['points'].values():
+            point['collectionId'] = pcl['id']
+            if 'zyx' not in point:
+                point['zyx'] = np.asarray(
+                    [point['p'][2], point['p'][1], point['p'][0]],
+                    dtype=np.float32)
+        if pcl['id'] in point_collections:
+            raise ValueError(f'duplicate resident fiber collection id {pcl["id"]!r}')
+        point_collections[pcl['id']] = pcl
+
+    resolved_links = []
+    if use_links:
+        resolved_links = resolve_fiber_links(
+            point_collections, include_pending=use_pending_links,
+            assume_unannotated=True)
+    link_components = build_link_components(resolved_links)
+    catalog_position = {
+        pcl['id']: position
+        for position, pcl in enumerate(fiber_catalog.values())
+    }
+    link_components = [
+        (sorted(member_cids, key=catalog_position.__getitem__), member_links)
+        for member_cids, member_links in link_components
+    ]
+    link_components.sort(
+        key=lambda component: min(
+            catalog_position[cid] for cid in component[0]))
+    linked_cids = {
+        cid for member_cids, _ in link_components for cid in member_cids
+    }
+
+    cross_patch = {}
+    strip_sources = []
+    for cid, pcl in point_collections.items():
+        num_attached = sum(
+            1 for point in pcl['points'].values() if 'on_patch' in point)
+        num_unattached = len(pcl['points']) - num_attached
+        if num_attached >= 2:
+            cross_patch[cid] = pcl
+        if num_unattached >= 1 or cid in linked_cids:
+            strip_sources.append((cid, pcl))
+
+    if link_components:
+        cross_patch, _ = merge_linked_point_collections(
+            point_collections, link_components, cross_patch)
+
+    # Fiber files carry no winding annotations. Their point dictionaries are
+    # shared by the catalog and derived PCLs, so normalize them directly after
+    # link resolution; subsequent materializations explicitly resolve catalog
+    # fibers as unannotated above.
+    for pcl in point_collections.values():
+        pcl['has_winding_annotations'] = False
+        for point in pcl['points'].values():
+            point['winding_annotation'] = 0.0
+
+    for pcl in cross_patch.values():
+        points_by_patch = {}
+        for _, point in sorted(pcl['points'].items(), key=lambda item: int(item[0])):
+            if 'on_patch' not in point:
+                continue
+            patch_id = point['on_patch']['id']
+            if patch_id in verified_patches:
+                points_by_patch.setdefault(patch_id, []).append(point)
+        pcl['points_by_patch'] = points_by_patch
+
+    link_point_ids_by_coll = {}
+    for link in resolved_links:
+        link_point_ids_by_coll.setdefault(link['a_coll'], set()).add(
+            link['a_point'])
+        link_point_ids_by_coll.setdefault(link['b_coll'], set()).add(
+            link['b_point'])
+
+    strips = _UnattachedPclStripList()
+    sampling_groups = []
+    for cid, pcl in strip_sources:
+        sorted_items = sorted(pcl['points'].items(), key=lambda item: int(item[0]))
+        best_start = best_end = run_start = 0
+        for position, (_, point) in enumerate(sorted_items):
+            z = point['zyx'][0]
+            if z_begin - z_margin <= z < z_end + z_margin:
+                if position + 1 - run_start > best_end - best_start:
+                    best_start, best_end = run_start, position + 1
+            else:
+                run_start = position + 1
+        kept_items = sorted_items[best_start:best_end]
+        if len(kept_items) < 2:
+            continue
+
+        link_ids = link_point_ids_by_coll.get(cid, ())
+        force_keep = {
+            position for position, (point_id, _) in enumerate(kept_items)
+            if int(point_id) in link_ids
+        }
+        zyxs = np.stack(
+            [point['zyx'] for _, point in kept_items], axis=0).astype(np.float32)
+        windings = np.asarray(
+            [point['winding_annotation'] for _, point in kept_items],
+            dtype=np.float32)
+        zyxs, keep = _decimate_ordered_points_min_spacing(
+            zyxs, min_point_spacing, return_indices=True,
+            force_keep=force_keep | {len(zyxs) - 1})
+        windings = windings[keep]
+        link_points = {
+            int(kept_items[original_position][0]): strip_position
+            for strip_position, original_position in enumerate(keep)
+            if original_position in force_keep
+        }
+        metadata = pcl.get('metadata', {})
+        strips.append({
+            'id': cid,
+            'name': pcl.get('name'),
+            'source_file': pcl.get('source_file'),
+            'zyxs': zyxs,
+            'windings': windings,
+            'link_points': link_points,
+            'logical_input_kind': 'fiber',
+            'logical_input_id': metadata.get('logical_input_id'),
+            'logical_input_revision': metadata.get('logical_input_revision'),
+        })
+        sampling_groups.append(pcl['sampling_group'])
+
+    return (list(cross_patch.values()), strips, sampling_groups,
+            resolved_links, link_components)
+
+
 def _build_strip_flat_bundle(strip_arrays, device):
     # Concatenate per-strip (zyxs, windings) arrays into one flat GPU tensor so the
     # downstream computations can run a single transform call plus segmented reductions
@@ -836,39 +1033,33 @@ def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
     return int(start_iteration) + int(run_iterations * fraction)
 
 
-def unresolved_fiber_link_warning(new_fibers, *, use_links, use_pending_links,
+def unresolved_fiber_link_warning(fiber_catalog, *, use_links, use_pending_links,
                                   max_named=6):
-    """Warn that uploaded fibers' cross-fiber links are inert this session.
-
-    Cross-fiber links are resolved once, over the resident inputs
-    (load_host_inputs): an uploaded fiber joins the pool as its own singleton
-    component, so any branch the user drew on it does nothing until the input
-    is committed and the fit rebuilt. Rather than let that pass silently, count
-    the links that *would* be used after a rebuild -- so nothing is reported
-    when links are configured off, and pending links only count when they are
-    configured in -- and describe them.
-
-    new_fibers is an iterable of (input_id, pcl). Returns the warning text, or
-    None when there is nothing to warn about.
-    """
+    """Warn only for active catalog branches whose target fiber is absent."""
     if not use_links:
         return None
+    resident_basenames = {
+        pcl.get('file_basename') for pcl in fiber_catalog.values()
+    }
     counted = []
-    for input_id, pcl in new_fibers:
-        num_links = sum(1 for branch in pcl.get('branches', ())
-                        if use_pending_links or not branch['pending'])
-        if num_links:
-            counted.append((input_id, num_links))
+    for input_id, pcl in fiber_catalog.items():
+        missing = [
+            branch['branch_file'] for branch in pcl.get('branches', ())
+            if (use_pending_links or not branch['pending'])
+            and branch['branch_file'] not in resident_basenames
+        ]
+        if missing:
+            counted.append((input_id, missing))
     if not counted:
         return None
-    named = ', '.join(f'{input_id} ({count})' for input_id, count in counted[:max_named])
+    named = ', '.join(
+        f'{input_id} -> {", ".join(missing)}'
+        for input_id, missing in counted[:max_named])
     if len(counted) > max_named:
         named += f', and {len(counted) - max_named} more'
     return (
-        f'{sum(count for _, count in counted)} cross-fiber link(s) on '
-        f'{len(counted)} added fiber(s) are not used by this session: links are '
-        f'resolved when the fit is built. Commit the inputs and rebuild the fit '
-        f'to apply them. Fibers: {named}')
+        f'{sum(len(missing) for _, missing in counted)} active cross-fiber '
+        f'branch(es) target absent resident fibers: {named}')
 
 
 def get_dense_attachment_ramp(cfg, iteration):
@@ -1168,6 +1359,7 @@ class FitContext:
         # Scroll physical facts.
         self.scroll_name = scroll.name
         self.voxel_size_um = float(scroll.voxel_size_um)
+        self.base_shape_zyx = scroll.base_shape_zyx
         self.spiral_outward_sense = scroll.spiral_outward_sense
         self.normal_zarr_group = scroll.normal_zarr_group
         # The surf-SDT store's scale/encoding are read from the store's own
@@ -1500,7 +1692,7 @@ class FitContext:
           (+ unverified_patches_list), shell_patch
         - point collections: cross_patch_pcls, unattached_pcl_strips,
           unattached_strip_sampling_groups, pcl_sampling_strata, next_id,
-          link_distance_tolerance, resolved_links, link_components,
+          fiber_catalog, link_distance_tolerance, resolved_links, link_components,
           unattached_components / _component_groups / _component_edges
         - sampling: patch_sampling_probabilities, patch_atlas,
           unverified_patch_sampling_probabilities, unverified_patch_atlas
@@ -1605,6 +1797,7 @@ class FitContext:
             for path in expanded:
                 loaded = load_point_collection(path) or {}
                 for pcl in loaded.values():
+                    source_collection_id = pcl['id']
                     pcl['source_file'] = path
                     pcl['sampling_group'] = path
                     # Absolute-winding status is determined solely by the source file:
@@ -1618,6 +1811,13 @@ class FitContext:
                     pcl['metadata']['input_role'] = explicit_role or (
                         'absolute' if os.path.basename(path) == 'abs_winding.json' else 'legacy'
                     )
+                    if explicit_role == 'same_winding':
+                        pcl['metadata'].update({
+                            'logical_input_kind': 'same_winding',
+                            'logical_input_id': str(source_collection_id),
+                            'logical_input_revision': None,
+                            'resident_collection_id': next_id,
+                        })
                     point_collections[next_id] = pcl
                     next_id += 1
             progress.update(
@@ -1633,6 +1833,25 @@ class FitContext:
         # sampling group, rather than one group per source file like the regular pcls.
         for pcl in fiber_point_collections.values():
             pcl['sampling_group'] = 'fibers'
+            source = pcl.get('source_file', '')
+            logical_id = os.path.splitext(os.path.basename(source))[0]
+            try:
+                with open(source, 'rb') as stream:
+                    revision = hashlib.sha256(stream.read()).hexdigest()
+            except OSError:
+                revision = None
+            pcl.setdefault('metadata', {}).update({
+                'logical_input_kind': 'fiber',
+                'logical_input_id': logical_id,
+                'logical_input_revision': revision,
+            })
+            # Staging paths are content-addressed; branch records address the
+            # stable logical document name instead.
+            pcl['file_basename'] = f'{logical_id}.json'
+        fiber_catalog = {
+            str(pcl['metadata']['logical_input_id']): pcl
+            for pcl in fiber_point_collections.values()
+        }
         point_collections.update(fiber_point_collections)
 
         for pcl in point_collections.values():
@@ -1673,6 +1892,15 @@ class FitContext:
             general_hit_policy='largest_area',
         )
 
+        # Keep pristine linked regular collections. Derived training views may
+        # trim or decimate points, but live patches must still be offered every
+        # resident point that has not already attached to a patch.
+        regular_pcl_catalog = {
+            pid: catalog_copy_of_pcl(pcl)
+            for pid, pcl in point_collections.items()
+            if pid not in fiber_point_collections
+        }
+
         # Every pcl carries the uniform chain interface (pcl['chain'], see
         # spiral_helpers.Chain): a SequenceChain over the id-sorted point order
         # (lazy, so later point-dict replacements are picked up). Consumers go
@@ -1683,34 +1911,7 @@ class FitContext:
             pcl['chain'] = SequenceChain(pcl)
 
         # ==========================================================================
-        # Cross-fiber links ("branches")
-        # ==========================================================================
-        # Resolve stored branch metadata into concrete point-to-point links. Handled
-        # symmetrically for fibers and pcls (pcls simply carry no branches today). Two
-        # effects downstream: link-connected collections merge into one cross-patch
-        # "component pcl" carrying an explicit fiber graph (see
-        # merge_linked_point_collections), so the rel-winding loss ties patches on
-        # different fibers with delta 0 through chains that hop fibers at each junction
-        # (an ordinary |dtheta| < pi chain step, theta=0-unwrapped like any other); and
-        # the unattached-strip loss samples chain walks through the same junctions
-        # (branching randomly at each one), pulling every linked fiber onto one shared
-        # winding via the ordinary constant-radius-along-strip target.
-        resolved_links = []
-        if self.config['pcl_use_fiber_links']:
-            resolved_links = resolve_fiber_links(
-                point_collections,
-                include_pending=self.config['pcl_use_pending_fiber_links'],
-            )
-            print(f'fiber links: {len(resolved_links)} resolved')
-        # One shared component decomposition over the link graph, consumed twice:
-        # the cross-patch merge below unions each component's attached points, and
-        # _rebuild_unattached_components maps the same components onto unattached
-        # strips for the walk-sampling loss.
-        link_components = build_link_components(resolved_links)
-        linked_cids = {cid for member_cids, _ in link_components for cid in member_cids}
-
-        # ==========================================================================
-        # Point collection classification
+        # Regular point collection classification
         # ==========================================================================
 
         # Classify each pcl from how its points attach to patches:
@@ -1732,6 +1933,8 @@ class FitContext:
         cross_patch_point_collections = {}
         unattached_point_collections = {}
         for pid, pcl in point_collections.items():
+            if pid in fiber_point_collections:
+                continue
             num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
             num_unattached = len(pcl['points']) - num_attached
             if pcl.get('metadata', {}).get('winding_is_absolute', False):
@@ -1760,28 +1963,8 @@ class FitContext:
                 continue
             if num_attached >= 2:
                 cross_patch_point_collections[pid] = pcl
-            # Link-component members join the unattached pool even when fully
-            # attached: their strip is the geometry the component's chain walks (and
-            # theta=0 unwrap) run through between the fibers they link.
-            if num_unattached >= 1 or pid in linked_cids:
+            if num_unattached >= 1:
                 unattached_point_collections[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
-
-        # Merge each set of collections joined by cross-fiber links into one
-        # cross-patch "component pcl" with an explicit graph over its members. The
-        # merged pcl exposes the union of the members' attached points (so pairs of
-        # patches on different fibers feed the rel-winding loss with delta 0) plus a
-        # chain function that routes between any two points along the fibers, hopping
-        # to the linked fiber at each junction. A junction hop is just another chain
-        # step between nearly-coincident points (|dtheta| < pi), so the ordinary
-        # theta=0 unwrap along the chain handles the seam. Members are removed
-        # from the cross-patch pool (the merged pcl subsumes their within-fiber
-        # pairs); their unattached role is untouched (handled by the walk-sampling in
-        # the unattached-strip loss).
-        if link_components:
-            cross_patch_point_collections, num_merged = merge_linked_point_collections(
-                point_collections, link_components, cross_patch_point_collections)
-            if num_merged:
-                print(f'fiber links: merged into {num_merged} cross-patch components')
 
         # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
         # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
@@ -1833,43 +2016,57 @@ class FitContext:
         # corresponding winding annotations. Strips with <2 points are dropped.
         # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
         # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
-        # The first and last points are always kept, as are cross-fiber link endpoints
-        # (their strip positions are recorded in strip['link_points'], keyed by the
-        # pcl-local point id, so _rebuild_unattached_components can place junctions).
-        link_point_ids_by_coll = {}
-        for link in resolved_links:
-            link_point_ids_by_coll.setdefault(link['a_coll'], set()).add(link['a_point'])
-            link_point_ids_by_coll.setdefault(link['b_coll'], set()).add(link['b_point'])
+        # The first and last points are always kept. Fiber junction retention is
+        # handled by materialize_fiber_fit_inputs below.
         for pcl_id, pcl in unattached_point_collections.items():
             sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
             if len(sorted_items) < 2:
                 continue
-            link_ids = link_point_ids_by_coll.get(pcl_id, ())
-            force_keep = {pos for pos, (point_id, _) in enumerate(sorted_items)
-                          if int(point_id) in link_ids}
-
             zyxs = np.stack([point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
             windings = np.array([point['winding_annotation'] for _, point in sorted_items], dtype=np.float32)
 
             zyxs, keep = _decimate_ordered_points_min_spacing(
                 zyxs, min_point_spacing, return_indices=True,
-                force_keep=force_keep | {len(zyxs) - 1})
+                force_keep={len(zyxs) - 1})
             windings = windings[keep]
-
-            link_points = {
-                int(sorted_items[orig_pos][0]): strip_pos
-                for strip_pos, orig_pos in enumerate(keep)
-                if orig_pos in force_keep
-            }
             unattached_pcl_strips.append({
                 'id': pcl_id,
                 'name': pcl.get('name'),
                 'source_file': pcl.get('source_file'),
                 'zyxs': zyxs,
                 'windings': windings,
-                'link_points': link_points,
+                'link_points': {},
+                'logical_input_kind': pcl.get('metadata', {}).get(
+                    'logical_input_kind'),
+                'logical_input_id': pcl.get('metadata', {}).get(
+                    'logical_input_id'),
+                'logical_input_revision': pcl.get('metadata', {}).get(
+                    'logical_input_revision'),
             })
             unattached_strip_sampling_groups.append(pcl['sampling_group'])
+
+        (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
+         resolved_links, link_components) = materialize_fiber_fit_inputs(
+            fiber_catalog,
+            verified_patches,
+            z_begin=self.z_begin,
+            z_end=self.z_end,
+            z_margin=self.config['patch_loss_z_margin'],
+            min_point_spacing=min_point_spacing,
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'],
+        )
+        cross_patch_point_collections.update(
+            {pcl['id']: pcl for pcl in fiber_cross_patch})
+        unattached_pcl_strips.extend(fiber_strips)
+        unattached_strip_sampling_groups.extend(fiber_sampling_groups)
+        print(f'fiber links: {len(resolved_links)} resolved')
+        link_warning = unresolved_fiber_link_warning(
+            fiber_catalog,
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'])
+        if link_warning is not None:
+            print(f'WARNING: {link_warning}')
 
         cross_patch_pcls = list(cross_patch_point_collections.values())
         print(
@@ -1903,6 +2100,8 @@ class FitContext:
         self.cross_patch_pcls = cross_patch_pcls
         self.unattached_pcl_strips = unattached_pcl_strips
         self.unattached_strip_sampling_groups = unattached_strip_sampling_groups
+        self.fiber_catalog = fiber_catalog
+        self.regular_pcl_catalog = regular_pcl_catalog
         self.resolved_links = resolved_links
         self.link_components = link_components
         # The unattached loss consumes strips through these link components; see
@@ -2234,6 +2433,14 @@ class FitContext:
         return subsample_rows(
             patch.valid_zyxs, int(self.config['sample_count_shell_samples']), pool_generator,
         ).to(device=self.device, dtype=torch.float32)
+
+    def _make_shell_polar_map(self):
+        return ShellPolarMap(
+            self.shell_patch, self.umbilicus,
+            z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+            z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
+            num_theta_bins=self.config['shell_num_theta_bins'],
+            device=self.device, config=self.config)
 
     def _infer_outer_winding_idx_for_this_run(self):
         return _infer_shell_outer_winding_idx(
@@ -2580,6 +2787,15 @@ class FitContext:
                 for patch_id in rejected_verified:
                     points_by_patch.pop(patch_id, None)
             self._rebuild_pcl_sampling_strata()
+        if rejected_verified:
+            # Rejected attachments become eligible for a later live patch.
+            for catalog in (self.regular_pcl_catalog, self.fiber_catalog):
+                for pcl in catalog.values():
+                    for point in pcl['points'].values():
+                        attachment = point.get('on_patch')
+                        if (attachment is not None and
+                                attachment['id'] in rejected_verified):
+                            del point['on_patch']
 
         if rejected_verified:
             # Future interactive masking and influence anchors must not retain
@@ -2653,7 +2869,6 @@ class FitContext:
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
 
-        self.num_slices_for_visualisation = self.config.get('output_num_slices_for_visualization', 20)
         self.device = torch.device('cuda')
         self.patch_atlas.materialize(self.device)
         if self.unverified_patch_atlas is not None:
@@ -2959,7 +3174,7 @@ class FitContext:
     # prepared_main_tracks/preview_extent_tracks are deliberately absent: see
     # the retained_tracks note in _build_model_state.
     _MODEL_STAGE_ATTRIBUTES = (
-        'num_slices_for_visualisation', 'device', 'umbilicus_zyx',
+        'device', 'umbilicus_zyx',
         'start_iteration', 'model_z_begin', 'model_z_end',
         'flow_field_radius', 'flow_min_corner_spiral_zyx',
         'flow_max_corner_spiral_zyx', 'num_training_steps',
@@ -3018,6 +3233,9 @@ class FitContext:
             'resolved_config': durable_config(self.config),
             'lasagna_scale': self.lasagna_scale,
             'lasagna_group': self.normal_zarr_group,
+            'base_shape_zyx': (
+                list(self.base_shape_zyx)
+                if self.base_shape_zyx is not None else None),
             'surf_sdt_fingerprint': (
                 self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
             'winding_inference_fingerprint': (
@@ -3140,6 +3358,23 @@ class FitContext:
                     f'checkpoint outward sense '
                     f'{checkpoint.get("spiral_outward_sense")!r} does not '
                     f'match requested sense {self.spiral_outward_sense!r}')
+        checkpoint_base_shape = checkpoint.get('base_shape_zyx')
+        if checkpoint_base_shape is not None:
+            if (not isinstance(checkpoint_base_shape, (list, tuple))
+                    or len(checkpoint_base_shape) != 3
+                    or any(type(value) is not int or value <= 0
+                           for value in checkpoint_base_shape)):
+                reasons.append(
+                    'checkpoint base_shape_zyx is not a ZYX list of three positive integers')
+            else:
+                checkpoint_base_shape = tuple(checkpoint_base_shape)
+                if self.base_shape_zyx is None:
+                    reasons.append(
+                        'checkpoint declares base_shape_zyx but this dataset scroll spec does not')
+                elif checkpoint_base_shape != tuple(self.base_shape_zyx):
+                    reasons.append(
+                        f'checkpoint base_shape_zyx={list(checkpoint_base_shape)!r} '
+                        f'does not match this dataset ({list(self.base_shape_zyx)!r})')
         checkpoint_dataset = str(
             (checkpoint.get('input_manifest') or {}).get('dataset_root') or '')
         dataset_root = str(getattr(self.paths, 'dataset_root', '') or '')
@@ -3213,6 +3448,14 @@ class FitContext:
                     + ', '.join(
                         f'{key}={checkpoint_cfg[key]!r} != {self.config[key]!r}'
                         for key in incompatible))
+            steps_key = 'model_num_flow_integration_steps'
+            if (steps_key in checkpoint_cfg
+                    and checkpoint_cfg[steps_key] != self.config[steps_key]):
+                print(
+                    f'NOTE: checkpoint was written with {steps_key}='
+                    f'{checkpoint_cfg[steps_key]!r}; resuming with the live '
+                    f'{self.config[steps_key]!r} perturbs the transform by '
+                    'the integration discretisation difference')
         elif checkpoint_cfg is not None:
             reasons.append('checkpoint configuration is not a mapping')
 
@@ -3389,7 +3632,8 @@ class FitContext:
         zs = np.linspace(
             self.z_begin,
             self.z_end - 1,
-            min(self.num_slices_for_visualisation, self.z_end - 1 - self.z_begin),
+            min(int(self.config['output_num_slices_for_visualization']),
+                self.z_end - 1 - self.z_begin),
             dtype=np.int64,
         )
         if self.scroll_zarr is not None:
@@ -3467,6 +3711,7 @@ class FitContext:
                 get_or_build_unattached_pcl_flat,
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
+                base_shape_zyx=self.base_shape_zyx,
                 progress=progress,
             )
             if not diagnostics:
@@ -3665,21 +3910,288 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
+    def _prevalidate_interactive_input(self, record):
+        """Load and validate one record without touching resident structures."""
+        kind = record.get('kind')
+        path = record.get('path')
+        input_id = record.get('id')
+        if kind == 'patch':
+            if not input_source_enabled(self.config, 'verified_patches'):
+                raise ValueError('verified-patch inputs are disabled for this session')
+            if input_id in self.verified_patches:
+                raise ValueError(f'Patch {input_id!r} is already part of this session')
+            patch = load_tifxyz(path)
+            cells = patch.erosion_cells(self.config['patch_erode_patches'])
+            if cells > 0 and not erode_patch_valid_region(patch, cells):
+                raise ValueError(f'Patch {input_id!r} has no valid quads after erosion')
+            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
+                raise ValueError(
+                    f'Patch {input_id!r} does not intersect the fitted z range '
+                    f'[{self.z_begin}, {self.z_end})')
+            return
+        if kind == 'fiber':
+            if not input_source_enabled(self.config, 'fibers'):
+                raise ValueError('fiber inputs are disabled for this session')
+            pcl = load_fiber_point_collection(
+                path, self.next_id,
+                min_point_spacing=self.config['pcl_fiber_min_point_spacing'])
+            if pcl is None:
+                raise ValueError(f'Fiber {input_id!r} has no usable control points')
+            groups = ['fibers']
+        elif kind == 'pcl':
+            role = record.get('role')
+            if not pcl_input_enabled(self.config, role, path):
+                raise ValueError(
+                    f'{role or "legacy"} PCL inputs are disabled for this session')
+            loaded = load_point_collection(path) or {}
+            if not loaded:
+                raise ValueError(
+                    f'PCL document {input_id!r} contains no collections')
+            if (role == 'same_winding'
+                    and record.get('operation') == 'delete_collection'):
+                return
+            if role == 'absolute':
+                for pcl in loaded.values():
+                    for point in pcl.get('points', {}).values():
+                        value = point.get('winding_annotation')
+                        if value is not None and (not np.isfinite(value) or value <= 0):
+                            raise ValueError(
+                                f'Absolute-winding pcl {pcl.get("name")!r} must '
+                                'use positive winding annotations')
+            groups = [path] * len(loaded)
+        else:
+            raise ValueError(f'Unknown ephemeral input kind {kind!r}')
+        if self.config['pcl_sampling_weights'] is not None:
+            build_pcl_sampling_strata(groups, self.config)
+
+    def _fiber_views_from_catalog(self, fiber_catalog, cross_patch, strips,
+                                  strip_groups):
+        """Build all fiber-derived training views without mutating inputs."""
+        cross_patch = [
+            pcl for pcl in cross_patch
+            if pcl.get('metadata', {}).get('input_role')
+            not in {'fiber', 'fiber_link_component'}
+            and pcl.get('metadata', {}).get('logical_input_kind') != 'fiber'
+        ]
+        retained = [
+            (strip, group) for strip, group in zip(strips, strip_groups)
+            if strip.get('logical_input_kind') != 'fiber'
+        ]
+        strips = [strip for strip, _ in retained]
+        strip_groups = [group for _, group in retained]
+        (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
+         resolved_links, link_components) = materialize_fiber_fit_inputs(
+            fiber_catalog,
+            self.verified_patches,
+            z_begin=self.z_begin,
+            z_end=self.z_end,
+            z_margin=self.config['patch_loss_z_margin'],
+            min_point_spacing=self.config[
+                'pcl_unattached_pcl_min_point_spacing'],
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'],
+        )
+        return (cross_patch + list(fiber_cross_patch),
+                strips + list(fiber_strips),
+                strip_groups + list(fiber_sampling_groups),
+                resolved_links, link_components)
+
+    def _refresh_trusted_geometry(self):
+        trusted = self._trusted_geometry_from_active_inputs()
+        trusted_np = np.ascontiguousarray(
+            trusted.cpu().numpy(), dtype=np.float32)
+        self.trusted_geometry_tree = (
+            cKDTree(trusted_np) if len(trusted_np) else None)
+        generator = torch.Generator().manual_seed(
+            int(self.config['optimizer_random_seed']))
+        self.influence_anchor_geometry = subsample_rows(
+            trusted,
+            int(self.config['sample_count_influence_anchor_geometry_points']),
+            generator).clone()
+
+    def _commit_rederived_pcl_views(self, cross_patch, strips, strip_groups,
+                                    resolved_links=None, link_components=None):
+        self.cross_patch_pcls[:] = cross_patch
+        self.unattached_pcl_strips[:] = strips
+        self.unattached_strip_sampling_groups[:] = strip_groups
+        self.unattached_pcl_strips.flat = None
+        if resolved_links is not None:
+            self.resolved_links[:] = resolved_links
+            self.link_components[:] = link_components
+        self._rebuild_pcl_sampling_strata()
+        self.dt_target_cache_manager.reset()
+        self._refresh_trusted_geometry()
+        for warning in self._build_theta_crossing_map() or ():
+            print(f'WARNING: {warning}')
+
+    def _rematerialize_fiber_views(self):
+        views = self._fiber_views_from_catalog(
+            self.fiber_catalog, list(self.cross_patch_pcls),
+            list(self.unattached_pcl_strips),
+            list(self.unattached_strip_sampling_groups))
+        self._commit_rederived_pcl_views(*views)
+        link_warning = unresolved_fiber_link_warning(
+            self.fiber_catalog,
+            use_links=self.config['pcl_use_fiber_links'],
+            use_pending_links=self.config['pcl_use_pending_fiber_links'])
+        if link_warning is not None:
+            print(f'WARNING: {link_warning}')
+
+    def _rederive_regular_unattached_strips(self):
+        min_point_spacing = self.config[
+            'pcl_unattached_pcl_min_point_spacing']
+        z_margin = self.config['patch_loss_z_margin']
+        rederived = {}
+        for pid, catalog_pcl in self.regular_pcl_catalog.items():
+            if catalog_pcl.get('metadata', {}).get(
+                    'winding_is_absolute', False):
+                continue
+            if all('on_patch' in point
+                   for point in catalog_pcl['points'].values()):
+                continue
+            pcl = catalog_copy_of_pcl(catalog_pcl)
+            kept_items = longest_run_in_z_window(
+                sorted(pcl['points'].items(), key=lambda kv: int(kv[0])),
+                self.z_begin, self.z_end, z_margin)
+            if len(kept_items) < 2:
+                continue
+            pcl['points'] = dict(kept_items)
+            rederived[pid] = pcl
+        normalise_pcl_winding_annotations(rederived)
+        strips, strip_groups = [], []
+        for pid, pcl in rederived.items():
+            strip = regular_unattached_strip(pid, pcl, min_point_spacing)
+            if strip is not None:
+                strips.append(strip)
+                strip_groups.append(pcl.get('sampling_group'))
+        for strip, group in zip(self.unattached_pcl_strips,
+                                self.unattached_strip_sampling_groups):
+            if strip.get('logical_input_kind') == 'fiber':
+                strips.append(strip)
+                strip_groups.append(group)
+        self._commit_rederived_pcl_views(
+            list(self.cross_patch_pcls), strips, strip_groups)
+
+    def _reingest_fiber_documents(self, current_iteration):
+        records = []
+        missing = []
+        for logical_id, pcl in self.fiber_catalog.items():
+            path = pcl.get('source_file')
+            if not path or not os.path.isfile(path):
+                missing.append(str(logical_id))
+                continue
+            records.append({
+                'kind': 'fiber', 'path': path, 'id': str(logical_id),
+                'revision': pcl.get('metadata', {}).get(
+                    'logical_input_revision'),
+            })
+        if missing:
+            raise ValueError(
+                'pcl_fiber_min_point_spacing cannot change at a Run boundary: '
+                f'{len(missing)} resident fiber document(s) are no longer on '
+                f'disk (e.g. {missing[:3]}); rebuild the fit instead')
+        if records:
+            warnings = self._incorporate_prevalidated_interactive_inputs(
+                records, influence_config={'influence_enabled': False})
+            for warning in warnings or ():
+                print(f'WARNING: {warning}')
+
+    def _relink_resident_points_to_new_patches(
+            self, new_patches, regular_by_cid, fiber_by_cid):
+        """Attach still-unattached resident points to newly added patches."""
+        regular_gained = link_unattached_points_to_patches(
+            regular_by_cid,
+            self.verified_patches,
+            new_patches,
+            tolerance=self.link_distance_tolerance,
+            surface_index_tolerance=self.link_distance_tolerance,
+            distance_scale=1.0,
+            general_hit_policy='largest_area',
+        )
+        fiber_gained = link_unattached_points_to_patches(
+            fiber_by_cid,
+            self.verified_patches,
+            new_patches,
+            tolerance=self.link_distance_tolerance,
+            surface_index_tolerance=self.link_distance_tolerance,
+            distance_scale=1.0,
+            general_hit_policy='largest_area',
+        )
+        relinked_regular = {}
+        for cid in regular_gained:
+            working = catalog_copy_of_pcl(regular_by_cid[cid])
+            working['chain'] = SequenceChain(working)
+            relinked_regular[cid] = working
+        print(f'relinked {sum(regular_gained.values())} regular points in '
+              f'{len(regular_gained)} collections and '
+              f'{sum(fiber_gained.values())} fiber points in '
+              f'{len(fiber_gained)} fibers to {len(new_patches)} added patches')
+        return relinked_regular, bool(fiber_gained)
+
     def incorporate_interactive_inputs(self, records, influence_config=None, *,
                                        current_iteration, target_iteration):
-        """Append uploaded ephemeral inputs to the resident fit structures.
+        """Prevalidate independently, then atomically apply all valid records."""
+        outcomes = self.prevalidate_interactive_inputs(records)
+        valid_identities = {
+            (outcome['kind'], outcome['id'], outcome.get('revision'))
+            for outcome in outcomes
+            if outcome['state'] == 'incorporated'
+        }
+        valid = [record for record in records
+                 if (record.get('kind'), record.get('id'),
+                     record.get('revision')) in valid_identities]
+        warnings = []
+        if valid:
+            warnings = self._incorporate_prevalidated_interactive_inputs(
+                valid, influence_config,
+                current_iteration=current_iteration,
+                target_iteration=target_iteration)
+        return {'outcomes': outcomes, 'warnings': list(warnings or ())}
+
+    def prevalidate_interactive_inputs(self, records):
+        """Return deterministic per-record verdicts without resident mutation."""
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            outcomes = []
+            for record in records:
+                try:
+                    self._prevalidate_interactive_input(record)
+                except (OSError, ValueError, KeyError, TypeError,
+                        RuntimeError) as exc:
+                    outcomes.append({
+                        'id': record.get('id'), 'kind': record.get('kind'),
+                        'revision': record.get('revision'),
+                        'state': 'error',
+                        'error': f'{type(exc).__name__}: {exc}',
+                    })
+                else:
+                    outcomes.append({
+                        'id': record.get('id'), 'kind': record.get('kind'),
+                        'revision': record.get('revision'),
+                        'state': 'incorporated',
+                    })
+            return outcomes
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    def _incorporate_prevalidated_interactive_inputs(
+            self, records, influence_config=None, *, current_iteration=0,
+            target_iteration=0):
+        """Incorporate uploaded inputs without rebuilding device/model state.
 
         current_iteration/target_iteration describe the Run request queued
         alongside the new inputs (the runtime sets the target before this
         method runs at the pause boundary); they size the DT-free window.
 
-        Runs on the fitter thread at a pause boundary. Incorporation is
-        append-only: only the new items are loaded and validated, and they are
-        concatenated onto the structures the fitter already holds (the patch
-        GPU atlas, the sampling caches, the PCL strip list). Existing tensors
-        and prepared samplers are reused untouched. The record order is the
-        service's deterministic order, so a multi-rank session would append the
-        same items in the same order on every rank.
+        Runs on the fitter thread at a pause boundary. Patches and regular PCLs
+        retain their resident append-only behavior. Fiber documents replace or
+        append entries in a candidate logical-id catalog, then all fiber-derived
+        CPU views are materialized once and swapped together. Existing model,
+        optimizer, patch-atlas, and device tensors remain resident.
 
         Returns the warnings this incorporation raised, for the runtime to
         publish on the session status (nothing here is fatal enough to refuse
@@ -3692,17 +4204,17 @@ class FitContext:
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
         try:
-            # Be defensive about a previously interrupted boundary: a new
-            # batch must never union with an earlier Run request's masks.
-            self.clear_interactive_influence()
             run_cfg = dict(self.config)
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            new_regular_collections = {}
             theta_warnings = []
-            # (input_id, pcl) per uploaded fiber, for the unresolved-link
-            # warning below.
             new_fibers = []
+            replacing_same_winding = False
+            deleting_same_winding_ids = set()
+            candidate_fiber_catalog = dict(self.fiber_catalog)
+            candidate_next_id = self.next_id
             for record in records:
                 kind = record.get('kind')
                 path = record.get('path')
@@ -3729,17 +4241,31 @@ class FitContext:
                     if not input_source_enabled(self.config, 'fibers'):
                         raise RuntimeError(
                             'fiber inputs are disabled for this session')
+                    logical_id = str(input_id)
+                    resident = candidate_fiber_catalog.get(logical_id)
+                    collection_id = (
+                        resident['id'] if resident is not None
+                        else candidate_next_id)
                     pcl = load_fiber_point_collection(
-                        path, self.next_id, min_point_spacing=self.config['pcl_fiber_min_point_spacing'])
+                        path, collection_id,
+                        min_point_spacing=self.config[
+                            'pcl_fiber_min_point_spacing'])
                     if pcl is None:
                         raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
                     pcl['source_file'] = path
                     pcl.setdefault('metadata', {})['winding_is_absolute'] = False
                     pcl['metadata']['input_role'] = 'fiber'
+                    pcl['metadata']['logical_input_kind'] = 'fiber'
+                    pcl['metadata']['logical_input_id'] = logical_id
+                    pcl['metadata']['logical_input_revision'] = record.get(
+                        'revision')
                     pcl['sampling_group'] = 'fibers'
-                    new_fibers.append((input_id, pcl))
-                    new_collections[self.next_id] = pcl
-                    self.next_id += 1
+                    pcl['file_basename'] = f'{logical_id}.json'
+                    new_fibers.append((logical_id, pcl))
+                    new_collections[collection_id] = pcl
+                    candidate_fiber_catalog[logical_id] = pcl
+                    if resident is None:
+                        candidate_next_id += 1
                 elif kind == 'pcl':
                     role = record.get('role')
                     if not pcl_input_enabled(self.config, role, path):
@@ -3749,13 +4275,56 @@ class FitContext:
                     loaded = load_point_collection(path) or {}
                     if not loaded:
                         raise RuntimeError(f'PCL document {input_id!r} contains no collections')
+                    if (role == 'same_winding'
+                            and record.get('operation') == 'delete_collection'):
+                        deleting_same_winding_ids.add(
+                            str(record.get('target_collection_id')))
+                        replacing_same_winding = True
+                        continue
                     for pcl in loaded.values():
+                        replacement = (
+                            role == 'same_winding'
+                            and record.get('operation') == 'replace_collection')
+                        if replacement:
+                            logical_id = str(record.get('target_collection_id'))
+                            resident_ids = [
+                                pcl.get('metadata', {}).get(
+                                    'resident_collection_id', pcl.get('id'))
+                                for pcl in self.cross_patch_pcls
+                                if pcl.get('metadata', {}).get(
+                                    'logical_input_kind') == 'same_winding'
+                                and str(pcl.get('metadata', {}).get(
+                                    'logical_input_id')) == logical_id
+                            ]
+                            resident_ids.extend(
+                                strip.get('id')
+                                for strip in self.unattached_pcl_strips
+                                if strip.get('logical_input_kind') == 'same_winding'
+                                and str(strip.get('logical_input_id')) == logical_id)
+                            collection_id = (resident_ids[0]
+                                             if resident_ids
+                                             else candidate_next_id)
+                            if not resident_ids:
+                                candidate_next_id += 1
+                            replacing_same_winding = True
+                        else:
+                            collection_id = candidate_next_id
+                            candidate_next_id += 1
                         pcl['source_file'] = path
                         pcl['sampling_group'] = path
                         pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
                         pcl['metadata']['input_role'] = role
-                        new_collections[self.next_id] = pcl
-                        self.next_id += 1
+                        pcl['metadata']['resident_collection_id'] = collection_id
+                        if replacement:
+                            pcl['metadata'].update({
+                                'logical_input_kind': 'same_winding',
+                                'logical_input_id': logical_id,
+                                'logical_input_revision': record.get(
+                                    'base_source_revision'),
+                                'resident_collection_id': collection_id,
+                            })
+                        new_collections[collection_id] = pcl
+                        new_regular_collections[collection_id] = pcl
                 else:
                     raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
 
@@ -3783,13 +4352,13 @@ class FitContext:
                     )
 
             # ---- Point collections: link, classify, strip-materialise ----
+            for pcl in new_collections.values():
+                for point in pcl['points'].values():
+                    point['zyx'] = np.array(
+                        [point['p'][2], point['p'][1], point['p'][0]],
+                        dtype=np.float32)
+                pcl['chain'] = SequenceChain(pcl)
             if new_collections:
-                for pcl in new_collections.values():
-                    for point in pcl['points'].values():
-                        point['zyx'] = np.array(
-                            [point['p'][2], point['p'][1], point['p'][0]],
-                            dtype=np.float32)
-                    pcl['chain'] = SequenceChain(pcl)
                 link_points_to_patches(
                     self.verified_patches,
                     new_collections,
@@ -3798,9 +4367,42 @@ class FitContext:
                     distance_scale=1.0,
                     general_hit_policy='largest_area',
                 )
+
+            # Capture uploads before classification trims or normalizes them.
+            catalog_additions = {
+                cid: catalog_copy_of_pcl(pcl)
+                for cid, pcl in new_regular_collections.items()
+            }
+
+            relinked_regular = {}
+            fiber_relinked = False
+            if new_patches:
+                new_fiber_ids = {logical_id for logical_id, _ in new_fibers}
+                regular_by_cid = {
+                    cid: pcl for cid, pcl in
+                    getattr(self, 'regular_pcl_catalog', {}).items()
+                    if cid not in new_regular_collections
+                    and not (pcl.get('metadata', {}).get(
+                        'logical_input_kind') == 'same_winding'
+                        and str(pcl.get('metadata', {}).get(
+                            'logical_input_id')) in deleting_same_winding_ids)
+                }
+                fiber_by_cid = {
+                    pcl['id']: pcl
+                    for logical_id, pcl in candidate_fiber_catalog.items()
+                    if logical_id not in new_fiber_ids
+                }
+                relinked_regular, fiber_relinked = (
+                    self._relink_resident_points_to_new_patches(
+                        new_patches, regular_by_cid, fiber_by_cid))
+
+            if (new_collections or deleting_same_winding_ids
+                    or relinked_regular or fiber_relinked):
                 new_cross_patch = {}
                 new_unattached = {}
-                for pid, pcl in new_collections.items():
+                classify = (list(relinked_regular.items()) +
+                            list(new_regular_collections.items()))
+                for pid, pcl in classify:
                     num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
                     num_unattached = len(pcl['points']) - num_attached
                     if pcl.get('metadata', {}).get('winding_is_absolute', False):
@@ -3841,6 +4443,82 @@ class FitContext:
                 normalise_pcl_winding_annotations(new_cross_patch)
                 normalise_pcl_winding_annotations(new_unattached)
 
+                retained_cross_patch = list(self.cross_patch_pcls)
+                retained_strips = list(self.unattached_pcl_strips)
+                retained_strip_groups = list(
+                    self.unattached_strip_sampling_groups)
+                if relinked_regular:
+                    retained_cross_patch = [
+                        pcl for pcl in retained_cross_patch
+                        if pcl.get('metadata', {}).get('resident_collection_id')
+                        not in relinked_regular
+                    ]
+                    retained = [
+                        (strip, group) for strip, group in zip(
+                            retained_strips, retained_strip_groups)
+                        if not (strip.get('logical_input_kind') != 'fiber'
+                                and strip.get('id') in relinked_regular)
+                    ]
+                    retained_strips = [strip for strip, _ in retained]
+                    retained_strip_groups = [group for _, group in retained]
+                if replacing_same_winding:
+                    replacing_ids = {
+                        str(pcl.get('metadata', {}).get('logical_input_id'))
+                        for pcl in new_regular_collections.values()
+                        if pcl.get('metadata', {}).get(
+                            'logical_input_kind') == 'same_winding'
+                    }
+                    replacing_ids.update(deleting_same_winding_ids)
+                    retained_cross_patch = [
+                        pcl for pcl in retained_cross_patch
+                        if not (pcl.get('metadata', {}).get(
+                            'logical_input_kind') == 'same_winding'
+                            and str(pcl.get('metadata', {}).get(
+                                'logical_input_id')) in replacing_ids)
+                    ]
+                    retained = [
+                        (strip, group) for strip, group in zip(
+                            retained_strips, retained_strip_groups)
+                        if not (strip.get('logical_input_kind') == 'same_winding'
+                                and str(strip.get('logical_input_id'))
+                                in replacing_ids)
+                    ]
+                    retained_strips = [strip for strip, _ in retained]
+                    retained_strip_groups = [group for _, group in retained]
+                if new_fibers or fiber_relinked:
+                    retained_cross_patch = [
+                        pcl for pcl in retained_cross_patch
+                        if pcl.get('metadata', {}).get('input_role')
+                        not in {'fiber', 'fiber_link_component'}
+                        and pcl.get('metadata', {}).get(
+                            'logical_input_kind') != 'fiber'
+                    ]
+                    retained = [
+                        (strip, group) for strip, group in zip(
+                            retained_strips, retained_strip_groups)
+                        if strip.get('logical_input_kind') != 'fiber'
+                    ]
+                    retained_strips = [strip for strip, _ in retained]
+                    retained_strip_groups = [group for _, group in retained]
+
+                    (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
+                     candidate_resolved_links,
+                     candidate_link_components) = materialize_fiber_fit_inputs(
+                        candidate_fiber_catalog,
+                        self.verified_patches,
+                        z_begin=self.z_begin,
+                        z_end=self.z_end,
+                        z_margin=self.config['patch_loss_z_margin'],
+                        min_point_spacing=self.config[
+                            'pcl_unattached_pcl_min_point_spacing'],
+                        use_links=self.config['pcl_use_fiber_links'],
+                        use_pending_links=self.config[
+                            'pcl_use_pending_fiber_links'],
+                    )
+                    retained_cross_patch.extend(fiber_cross_patch)
+                    retained_strips.extend(fiber_strips)
+                    retained_strip_groups.extend(fiber_sampling_groups)
+
                 for pcl in new_cross_patch.values():
                     points_by_patch = {}
                     for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
@@ -3851,7 +4529,7 @@ class FitContext:
                             continue
                         points_by_patch.setdefault(pid, []).append(point)
                     pcl['points_by_patch'] = points_by_patch
-                    self.cross_patch_pcls.append(pcl)
+                    retained_cross_patch.append(pcl)
 
                 min_point_spacing = self.config['pcl_unattached_pcl_min_point_spacing']
                 for pcl_id, pcl in new_unattached.items():
@@ -3863,38 +4541,68 @@ class FitContext:
                     windings = np.array(
                         [point['winding_annotation'] for _, point in sorted_items],
                         dtype=np.float32)
-                    if min_point_spacing > 0 and len(zyxs) > 2:
-                        keep = [0]
-                        last_kept = zyxs[0]
-                        for i in range(1, len(zyxs) - 1):
-                            if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
-                                keep.append(i)
-                                last_kept = zyxs[i]
-                        keep.append(len(zyxs) - 1)
-                        zyxs = zyxs[keep]
-                        windings = windings[keep]
-                    self.unattached_pcl_strips.append({
+                    zyxs, keep = _decimate_ordered_points_min_spacing(
+                        zyxs, min_point_spacing, return_indices=True,
+                        force_keep={len(zyxs) - 1})
+                    windings = windings[keep]
+                    retained_strips.append({
                         'id': pcl_id,
                         'name': pcl.get('name'),
                         'source_file': pcl.get('source_file'),
                         'zyxs': zyxs,
                         'windings': windings,
+                        'logical_input_kind': pcl.get('metadata', {}).get(
+                            'logical_input_kind'),
+                        'logical_input_id': pcl.get('metadata', {}).get(
+                            'logical_input_id'),
+                        'logical_input_revision': pcl.get('metadata', {}).get(
+                            'logical_input_revision'),
+                        'link_points': {},
                     })
-                    self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
-                # No 'link_points' on these strips: an uploaded fiber's
-                # branches are not resolved (see unresolved_links above), so
-                # each new strip is its own singleton component with no
-                # junctions to walk.
-                # The flat GPU bundle is derived from the strip list; drop it so
-                # the next consumer rebuilds it including the appended strips.
+                    retained_strip_groups.append(pcl.get('sampling_group'))
+
+                # Commit the catalog and all derived fiber views together only
+                # after the catalog-wide materialization has succeeded.
+                self.cross_patch_pcls[:] = retained_cross_patch
+                self.unattached_pcl_strips[:] = retained_strips
+                self.unattached_strip_sampling_groups[:] = retained_strip_groups
                 self.unattached_pcl_strips.flat = None
-                # Sampling strata index into the (now longer) pools.
+                if new_fibers or fiber_relinked:
+                    self.fiber_catalog = candidate_fiber_catalog
+                    self.resolved_links[:] = candidate_resolved_links
+                    self.link_components[:] = candidate_link_components
+                if replacing_same_winding:
+                    for cid in [
+                            cid for cid, pcl in
+                            getattr(self, 'regular_pcl_catalog', {}).items()
+                            if pcl.get('metadata', {}).get(
+                                'logical_input_kind') == 'same_winding'
+                            and str(pcl.get('metadata', {}).get(
+                                'logical_input_id')) in replacing_ids]:
+                        del self.regular_pcl_catalog[cid]
+                if not hasattr(self, 'regular_pcl_catalog'):
+                    self.regular_pcl_catalog = {}
+                self.regular_pcl_catalog.update(catalog_additions)
+                self.next_id = candidate_next_id
                 self._rebuild_pcl_sampling_strata()
 
-            if new_patches or new_collections:
-                # Whole-object DT target caches index the (now longer) object
+            if new_patches or new_collections or deleting_same_winding_ids:
+                # Whole-object DT target caches index the changed object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
+                if new_fibers or replacing_same_winding:
+                    trusted = self._trusted_geometry_from_active_inputs()
+                    trusted_np = np.ascontiguousarray(
+                        trusted.cpu().numpy(), dtype=np.float32)
+                    self.trusted_geometry_tree = (
+                        cKDTree(trusted_np) if len(trusted_np) else None)
+                    generator = torch.Generator().manual_seed(
+                        int(self.config['optimizer_random_seed']))
+                    self.influence_anchor_geometry = subsample_rows(
+                        trusted,
+                        int(self.config[
+                            'sample_count_influence_anchor_geometry_points']),
+                        generator).clone()
                 theta_warnings = self._build_theta_crossing_map()
                 # The gate may have rejected one of this incorporation's
                 # patches; downstream influence setup must see only survivors.
@@ -3903,8 +4611,17 @@ class FitContext:
                     if patch_id in self.verified_patches
                 }
 
+            if deleting_same_winding_ids and self.influence_state is not None:
+                self.influence_state.remove_logical_contributions_(
+                    [('same_winding', logical_id)
+                     for logical_id in deleting_same_winding_ids],
+                    spiral_and_transform=self.spiral_and_transform,
+                    optimiser=self.optimiser)
+
             if run_cfg['influence_enabled'] and (new_patches or new_collections):
-                self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
+                if self.influence_state is None:
+                    self.influence_state = make_influence_state(
+                        run_cfg, torch.device('cuda'))
                 self.influence_state.activate_or_extend_(
                     new_patches=new_patches,
                     new_collections=new_collections,
@@ -3928,7 +4645,12 @@ class FitContext:
                 target_iteration,
                 run_cfg['influence_disable_dt_frac'],
             )
-            self.interactive_dt_resume_iteration = dt_resume_iteration
+            if getattr(self, 'interactive_dt_resume_iteration', None) is None:
+                self.interactive_dt_resume_iteration = dt_resume_iteration
+            else:
+                self.interactive_dt_resume_iteration = max(
+                    self.interactive_dt_resume_iteration,
+                    dt_resume_iteration)
 
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session; '
@@ -3936,7 +4658,7 @@ class FitContext:
 
             warnings = list(theta_warnings)
             link_warning = unresolved_fiber_link_warning(
-                new_fibers,
+                candidate_fiber_catalog,
                 use_links=self.config['pcl_use_fiber_links'],
                 use_pending_links=self.config['pcl_use_pending_fiber_links'])
             if link_warning is not None:
@@ -3982,10 +4704,8 @@ class FitContext:
                     'dt_target_update_interval': cadence,
                 })
                 changed.update(cadence_keys)
-            # Static path changes are rejected by the service. Shell atlas
-            # construction settings are classified as prepared-input changes
-            # and likewise never reach this live boundary; ordinary shell
-            # parameters are just run configuration.
+            # Static path changes are rejected by the service. Settings below
+            # either read live or rebuild a derivation from retained inputs.
             rebuilt_tracks = None
             replace_prepared_tracks = False
             rebuilt_shell_map = self.shell_map
@@ -3995,7 +4715,33 @@ class FitContext:
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
                 'track_exclusion_radius',
+                'track_crossing_mode',
+                'track_crossing_precompute_max',
             })
+            shell_atlas_keys = {
+                'shell_num_theta_bins',
+                'shell_table_smooth_sigma_z',
+                'shell_table_smooth_sigma_theta',
+                'shell_min_confidence',
+            }
+            if (changed & shell_atlas_keys
+                    and getattr(self, 'shell_envelope', None) is not None):
+                raise ValueError(
+                    'the shell atlas settings filtered this session tracks '
+                    'against the outer shell when they were loaded; rebuild '
+                    'the fit to change them')
+            if ('loss_weight_fiber_directions' in changed
+                    and self.config['loss_weight_fiber_directions'] > 0
+                    and getattr(self, 'fiber_direction_samples', None) is None):
+                raise ValueError(
+                    'loss_weight_fiber_directions > 0 needs resident '
+                    'fiber-direction samples; rebuild with that input enabled')
+            rebuild_strata = 'pcl_sampling_weights' in changed
+            if rebuild_strata and self.config['pcl_sampling_weights'] is not None:
+                build_pcl_sampling_strata(
+                    [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
+                    + list(self.unattached_strip_sampling_groups),
+                    self.config)
             if reprepare_tracks and rebuilt_tracks is None and self.tracks:
                 rebuilt_tracks = prepare_main_phase_tracks(
                     self.tracks, None, float(self.config['track_exclusion_radius']),
@@ -4055,12 +4801,7 @@ class FitContext:
             # settings themselves require a full prepared-input rebuild.
             if 'loss_weight_shell_outer' in changed:
                 rebuilt_shell_map = (
-                    ShellPolarMap(
-                        self.shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device=self.device, config=self.config)
+                    self._make_shell_polar_map()
                     if (self.shell_patch is not None
                         and (self.config['loss_weight_shell_outer'] > 0
                              or self.winding_model_mode)) else None
@@ -4072,6 +4813,10 @@ class FitContext:
                         and self.config['loss_weight_shell_patch_radius'] > 0)
                     else None
                 )
+            if (changed & (shell_atlas_keys - {'shell_min_confidence'})
+                    and 'loss_weight_shell_outer' not in changed
+                    and rebuilt_shell_map is not None):
+                rebuilt_shell_map = self._make_shell_polar_map()
             if 'shell_outer_winding_idx' in changed:
                 rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
 
@@ -4105,11 +4850,34 @@ class FitContext:
                     'optimizer_num_training_steps',
             }:
                 self._realign_lr_schedule(current_iteration)
+
+            fiber_view_keys = {
+                'pcl_use_fiber_links',
+                'pcl_use_pending_fiber_links',
+                'pcl_unattached_pcl_min_point_spacing',
+            }
+            fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
+            rederived_views = False
+            if 'pcl_fiber_min_point_spacing' in changed and fiber_catalog:
+                self._reingest_fiber_documents(current_iteration)
+                rederived_views = True
+            elif changed & fiber_view_keys and fiber_catalog:
+                self._rematerialize_fiber_views()
+                rederived_views = True
+            if ('pcl_unattached_pcl_min_point_spacing' in changed
+                    and getattr(self, 'regular_pcl_catalog', None)):
+                self._rederive_regular_unattached_strips()
+                rederived_views = True
+            if rebuild_strata and not rederived_views:
+                self._rebuild_pcl_sampling_strata()
         except Exception:
             self.config.update(old_values)
             raise
 
         self.shell_map = rebuilt_shell_map
+        if 'model_num_flow_integration_steps' in changed:
+            self.spiral_and_transform.flow_integration_steps = int(
+                self.config['model_num_flow_integration_steps'])
         self.shell_outer_winding_idx = rebuilt_shell_outer
         self.shell_valid_zyxs_gpu = rebuilt_shell_valid
         if replace_prepared_tracks:

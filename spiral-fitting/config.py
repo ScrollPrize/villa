@@ -30,25 +30,14 @@ _NULL_TYPES = {
     "patch_uuid_filter_regex": "string",
 }
 
+# Settings host preparation consumes irreversibly: the patch loader erodes and
+# filters entries before they reach the resident pools, and the dense-spacing
+# mode decides which dense stores are opened. Nothing retained by a resident
+# session can re-derive their effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
     "patch_uuid_filter_regex",
-    "track_crossing_precompute_max",
-    "track_crossing_mode",
-    "track_exclusion_radius",
     "dense_spacing_mode",
-    "loss_weight_fiber_directions",
-    "output_first_winding",
-    "output_winding_margin",
-    "output_step_size",
-    "output_num_slices_for_visualization",
-    # These values define the discretised outer-shell lookup/atlas. Unlike
-    # ordinary shell loss parameters they cannot be changed on an existing
-    # prepared shell.
-    "shell_num_theta_bins",
-    "shell_table_smooth_sigma_z",
-    "shell_table_smooth_sigma_theta",
-    "shell_min_confidence",
 }
 
 _SCALE_WITH_Z_FIELDS = {
@@ -162,8 +151,12 @@ _GAP_EXPANDER_DESCRIPTIONS = {
 # is refused rather than reshaped: a domain/structure change is the explicit
 # rebuild path's job. Configuration metadata, so it lives here beside the
 # rest of it and is readable without importing the fitter.
+# model_num_flow_integration_steps is deliberately absent: the RK4 step count
+# changes the map a fixed parameter set produces (by the discretisation
+# difference) but reshapes nothing, so it is a run-boundary setting and a
+# checkpoint written under another count loads with a printed notice.
 CHECKPOINT_MODEL_SHAPE_KEYS = (
-    "model_num_flow_integration_steps", "model_flow_integration_solver",
+    "model_flow_integration_solver",
     "model_num_flow_timesteps", "model_flow_bounds_z_margin",
     "model_flow_bounds_radius", "model_flow_voxel_resolution",
     "model_flow_field_type", "model_gap_expander_logit_resolution",
@@ -189,53 +182,111 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
 # Both are therefore absent, and a key nobody has audited is absent by
 # construction — the safe answer.
 MODEL_STAGE_KEYS = frozenset({
-    "model_num_flow_integration_steps",
     "model_flow_integration_solver",
     "model_num_flow_timesteps",
     "model_num_flow_stages",
     "model_flow_bounds_radius",
     "model_flow_voxel_resolution",
     "model_flow_field_type",
-    "model_flow_field_high_res_lr_scale_initial",
-    "model_flow_field_high_res_lr_scale_final",
-    "model_flow_field_high_res_lr_ramp_start_step",
-    "model_flow_field_high_res_lr_ramp_steps",
     "model_flow_field_direct_lr",
     "model_gap_expander_logit_resolution",
-    "model_gap_expander_num_windings",
     "model_gap_expander_capacity_windings",
     "model_gap_expander_min_gap",
     "model_gap_expander_softplus_bias",
     "model_gap_expander_lr_scale",
     "model_linear_z_resolution",
     "model_initial_dr_per_winding",
-    "model_sym_dirichlet_finite_difference_epsilon",
 })
 
+_MODEL_STRUCTURE_KEYS = frozenset({
+    "model_flow_integration_solver",
+    "model_num_flow_timesteps",
+    "model_num_flow_stages",
+    "model_flow_bounds_z_margin",
+    "model_flow_bounds_radius",
+    "model_flow_voxel_resolution",
+    "model_flow_field_type",
+    "model_flow_field_direct_lr",
+    "model_gap_expander_logit_resolution",
+    "model_gap_expander_capacity_windings",
+    "model_gap_expander_lr_scale",
+    "model_gap_expander_min_gap",
+    "model_gap_expander_softplus_bias",
+    "model_linear_z_resolution",
+    "model_initial_dr_per_winding",
+})
 
-def rebuild_stage(changed_keys):
-    """The build stage a set of changed configuration keys requires.
+_RUN_MUTABLE_MODEL_KEYS = frozenset({
+    "model_num_flow_integration_steps",
+    "model_flow_field_high_res_lr_scale_initial",
+    "model_flow_field_high_res_lr_scale_final",
+    "model_flow_field_high_res_lr_ramp_start_step",
+    "model_flow_field_high_res_lr_ramp_steps",
+    "model_sym_dirichlet_finite_difference_epsilon",
+    "model_gap_expander_num_windings",
+})
 
-    ``"model"`` when every changed key is on MODEL_STAGE_KEYS, ``"all"``
-    otherwise. The stages are one ordinal, not a graph: "all" is the whole
-    build as it has always run, and "model" is a strict suffix of it.
+_INPUT_GATE_KEYS = frozenset(_INPUT_TOGGLE_DESCRIPTIONS) | {
+    "input_disable_patches",
+}
 
-    Anything unrecognised falls to "all", so this fails safe: a new key gets
-    today's behaviour until somebody audits its consumers.
-    """
-    return "model" if MODEL_STAGE_KEYS.issuperset(changed_keys) else "all"
+_RUN_MUTABLE_PCL_KEYS = frozenset({
+    "pcl_rel_winding_adjacent_patches_only",
+    "pcl_stratified_pcl_sampling",
+    "pcl_sampling_weights",
+    "pcl_use_fiber_links",
+    "pcl_use_pending_fiber_links",
+    "pcl_unattached_pcl_min_point_spacing",
+    "pcl_fiber_min_point_spacing",
+})
+
+NEW_FIT_KEYS = frozenset(
+    set(_Z_RANGE_DESCRIPTIONS)
+    | _MODEL_STRUCTURE_KEYS
+    | _INPUT_GATE_KEYS
+    | _PREPARED_INPUT_FIELDS
+    | {"optimizer_random_seed"}
+)
+
+_AUDITED_PREFIXES = ("model_", "input_", "pcl_")
 
 
 def _runtime_impact(key):
-    if key in _Z_RANGE_DESCRIPTIONS:
-        # Changing the z-range invalidates host inputs, dense stores, and the
-        # model's flow-field domain: a new fit, never a run-boundary tweak.
+    if key in NEW_FIT_KEYS:
         return "new_fit"
-    if key.startswith("model_") or key == "optimizer_random_seed":
-        return "new_fit"
-    if key.startswith(("input_", "pcl_")) or key in _PREPARED_INPUT_FIELDS:
+    if key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS:
+        return "run_boundary"
+    if key.startswith(_AUDITED_PREFIXES):
         return "new_fit"
     return "run_boundary"
+
+
+def unaudited_prefixed_keys(keys):
+    """Return prefixed settings missing from the explicit audit tables."""
+    tables = NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
+    return sorted(key for key in keys
+                  if key.startswith(_AUDITED_PREFIXES) and key not in tables)
+
+
+_known_keys_cache = None
+
+
+def known_config_keys():
+    """Return every configuration key defined by Config."""
+    global _known_keys_cache
+    if _known_keys_cache is None:
+        _known_keys_cache = frozenset(Config().as_dict())
+    return _known_keys_cache
+
+
+def rebuild_stage(changed_keys):
+    """Return the earliest rebuild stage required by changed settings."""
+    known = known_config_keys()
+    demanding = {
+        key for key in changed_keys
+        if key not in known or _runtime_impact(key) != "run_boundary"
+    }
+    return "model" if MODEL_STAGE_KEYS.issuperset(demanding) else "all"
 
 
 def _field_spec(key, default):
@@ -263,6 +314,9 @@ def _field_spec(key, default):
         "label": key.split("_", 1)[-1].replace("_", " ").title(),
         "runtime_impact": _runtime_impact(key),
     }
+    if spec["runtime_impact"] == "new_fit":
+        # The build stage a rebuild changing only this key needs.
+        spec["rebuild_stage"] = "model" if key in MODEL_STAGE_KEYS else "all"
     if kind in ("integer", "number"):
         spec.update(
             minimum=(
@@ -644,9 +698,15 @@ class Config:
                 "paths": {},
                 # The keys a rebuild can apply without reloading the session's
                 # inputs, advertised so a client can say in advance which kind
-                # of rebuild its pending changes would cause. Authoritative
-                # answers still come from the service (see rebuild_stage).
-                "model_stage_keys": sorted(MODEL_STAGE_KEYS),
+                # of rebuild its pending changes would cause: the model-stage
+                # allowlist plus every run-boundary key, which rebuild_stage()
+                # ignores because a rebuild applies those through
+                # FitContext.apply_config first. Authoritative answers still
+                # come from the service (see rebuild_stage).
+                "model_stage_keys": sorted(
+                    MODEL_STAGE_KEYS | {
+                        key for key, spec in fields.items()
+                        if spec["runtime_impact"] == "run_boundary"}),
                 "fields": fields,
                 # API run-block fields shown in the left-side dock. They are
                 # catalogued for clients but deliberately absent from the

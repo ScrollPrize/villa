@@ -184,6 +184,9 @@ set(srcs
     overlays/FiberSliceOverlayController.hpp
     overlays/FiberOverlayController.cpp
     overlays/FiberOverlayController.hpp
+    overlays/OverlayBatchItem.cpp
+    overlays/OverlayBatchItem.hpp
+    overlays/ScreenSpacePointIndex.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
@@ -211,8 +214,13 @@ set(srcs
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
     SpiralArtifactCache.hpp
+    SpiralBrushCursorWidget.cpp
+    SpiralBrushCursorWidget.hpp
     SpiralBrushController.cpp
     SpiralBrushController.hpp
+    SpiralPointPlacementMode.hpp
+    SpiralPointCollectionEdit.cpp
+    SpiralPointCollectionEdit.hpp
     SpiralPointChain.cpp
     SpiralPointChain.hpp
     SpiralServiceManager.cpp

@@ -338,7 +338,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             scheduleCorrectionsAutoSave();
         });
 
-        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](vc::PointRef) {
             scheduleCorrectionsAutoSave();
         });
     }
@@ -498,6 +498,8 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
             this, &SegmentationModule::onCorrectionsCollectionSelected);
+    connect(_widget, &SegmentationWidget::correctionsCollectionSelectionCleared,
+            this, &SegmentationModule::clearActiveCorrectionCollection);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
     connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
@@ -1500,18 +1502,26 @@ void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bo
     }
 }
 
+void SegmentationModule::clearActiveCorrectionCollection()
+{
+    if (_corrections) {
+        _corrections->clearActiveCollection();
+    }
+}
+
 uint64_t SegmentationModule::createCorrectionCollection(bool announce)
 {
     return _corrections ? _corrections->createCollection(announce) : 0;
 }
 
-void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId)
+void SegmentationModule::handleCorrectionPointAdded(
+    const cv::Vec3f& worldPos, std::optional<uint64_t> collectionId)
 {
     if (!_corrections) return;
 
     // If a specific collection is requested, switch to it
-    if (collectionId != 0) {
-        _corrections->setActiveCollection(collectionId, false);
+    if (collectionId) {
+        _corrections->setActiveCollection(*collectionId, false);
     }
 
     // Auto-create collection on first annotation
@@ -1644,10 +1654,10 @@ void SegmentationModule::finishCorrectionDrag()
     }
 
     // Ensure we have an active collection
-    uint64_t collectionId = _corrections->activeCollection();
-    if (collectionId == 0) {
+    auto collectionId = _corrections->activeCollection();
+    if (!collectionId) {
         collectionId = _corrections->createCollection(true);
-        if (collectionId == 0) {
+        if (!collectionId || *collectionId == 0) {
             emit statusMessageRequested(tr("Failed to create correction collection"), kStatusMedium);
             return;
         }
@@ -1655,7 +1665,7 @@ void SegmentationModule::finishCorrectionDrag()
 
     // Set anchor2d on the collection (the grid location where user started dragging)
     cv::Vec2f anchor2d(static_cast<float>(anchorCol), static_cast<float>(anchorRow));
-    _pointCollection->setCollectionAnchor2d(collectionId, anchor2d);
+    _pointCollection->setCollectionAnchor2d(*collectionId, anchor2d);
 
     // Look up winding depth index from d.tif at the anchor position → store in winding_annotation
     float wind_a = lookupDepthIndex(activeBaseSurface(), anchorRow, anchorCol);
@@ -1698,8 +1708,7 @@ SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(cons
         for (const auto& [ptId, pt] : col.points) {
             const float dist = static_cast<float>(cv::norm(pt.p - worldPos));
             if (dist < result.distance && dist <= maxDist) {
-                result.pointId = ptId;
-                result.collectionId = colId;
+                result.point = vc::PointRef{colId, ptId};
                 result.distance = dist;
             }
         }
@@ -1710,6 +1719,11 @@ SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(cons
 void SegmentationModule::setSelectedAnnotationCollection(uint64_t collectionId)
 {
     _selectedAnnotationCollectionId = collectionId;
+}
+
+void SegmentationModule::clearSelectedAnnotationCollection()
+{
+    _selectedAnnotationCollectionId.reset();
 }
 
 void SegmentationModule::beginPointMoveDrag(uint64_t pointId, uint64_t collectionId,
@@ -1754,7 +1768,7 @@ void SegmentationModule::finishPointMoveDrag()
     if (didMove) {
         // Update point position
         if (_pointCollection) {
-            auto ptOpt = _pointCollection->getPoint(pointId);
+            auto ptOpt = _pointCollection->getPoint({collectionId, pointId});
             if (ptOpt) {
                 ColPoint updated = *ptOpt;
                 updated.p = targetWorld;
@@ -1766,7 +1780,7 @@ void SegmentationModule::finishPointMoveDrag()
         updateCorrectionsWidget();
     } else {
         // Click without drag: select the point
-        emit annotationPointSelected(pointId);
+        emit annotationPointSelected({collectionId, pointId});
         emit annotationCollectionSelected(collectionId);
     }
 }

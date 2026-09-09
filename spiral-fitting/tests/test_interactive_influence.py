@@ -453,6 +453,80 @@ class ActivateAndAnchorTests(unittest.TestCase):
         self.assertGreater(float((state.masks['gap'] > 0).float().mean()),
                            float((gap_before > 0).float().mean()))
 
+    def test_fiber_revision_replaces_its_influence_contribution(self):
+        model = make_tiny_model()
+        optimiser = make_optimiser(model)
+        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
+        anchor_geometry = torch.stack([
+            torch.empty([512]).uniform_(10., 180.),
+            torch.empty([512]).uniform_(-70., 70.),
+            torch.empty([512]).uniform_(-70., 70.),
+        ], dim=-1)
+        first = self._make_collection()
+        first['metadata'] = {
+            'logical_input_kind': 'fiber',
+            'logical_input_id': 'fiber-7',
+            'logical_input_revision': 'r1',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={1: first},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=anchor_geometry)
+        old_footprint = state.contributions[('fiber', 'fiber-7')]['zst'].clone()
+
+        revised = self._make_collection()
+        for point in revised['points'].values():
+            point['zyx'] = point['zyx'] + np.array([60., 0., 0.], dtype=np.float32)
+        revised['metadata'] = {
+            'logical_input_kind': 'fiber',
+            'logical_input_id': 'fiber-7',
+            'logical_input_revision': 'r2',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={2: revised},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=None)
+
+        self.assertEqual(list(state.contributions), [('fiber', 'fiber-7')])
+        contribution = state.contributions[('fiber', 'fiber-7')]
+        self.assertEqual(contribution['revision'], 'r2')
+        self.assertGreater(float(contribution['zst'][:, 0].mean()),
+                           float(old_footprint[:, 0].mean()) + 40.)
+
+    def test_deleting_logical_pcl_removes_its_influence_contribution(self):
+        model = make_tiny_model()
+        optimiser = make_optimiser(model)
+        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
+        first = self._make_collection()
+        first['metadata'] = {
+            'logical_input_kind': 'same_winding',
+            'logical_input_id': '5',
+        }
+        second = self._make_collection()
+        for point in second['points'].values():
+            point['zyx'] = point['zyx'] + np.array(
+                [60., 0., 0.], dtype=np.float32)
+        second['metadata'] = {
+            'logical_input_kind': 'same_winding',
+            'logical_input_id': '7',
+        }
+        state.activate_or_extend_(
+            new_patches={}, new_collections={1: first, 2: second},
+            spiral_and_transform=model, optimiser=optimiser,
+            cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
+            anchor_geometry_zyx=None)
+
+        state.remove_logical_contributions_(
+            [('same_winding', '5')],
+            spiral_and_transform=model, optimiser=optimiser)
+
+        self.assertEqual(list(state.contributions),
+                         [('same_winding', '7')])
+        self.assertEqual(state.footprints[0]['input_id'], '7')
+        self.assertTrue(state.active)
+
 
 class SubsampleTests(unittest.TestCase):
     def test_subsample_is_deterministic_for_a_seed(self):
