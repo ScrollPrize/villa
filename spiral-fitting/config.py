@@ -20,6 +20,7 @@ _ENUMS = {
     "dense_spacing_density_lambda": [
         "inverse_gap", "soft_mass", "soft_mass_wide"],
     "optimizer_flow_sobolev_curvature": ["none", "finite_difference", "gauss_newton"],
+    "loss_penalty_shape": ["abs", "square"],
     "optimizer_flow_sobolev_preconditioner": ["cg", "gaussian"],
 }
 
@@ -157,6 +158,12 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
     "optimizer_flow_grad_clip_median_multiple": 0.0,
 })
+# The penalty shape postdates durable checkpoints; missing means the
+# historical abs/hinge penalties.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "loss_penalty_shape": "abs",
+    "loss_square_scale_voxels": 16.0,
+})
 # The Sobolev-damped Hessian-free flow step (sobolev_gauss_newton.py) also
 # postdates durable checkpoints; missing means the AdamW flow update.
 BACKFILLABLE_CONFIG_DEFAULTS.update({
@@ -201,6 +208,18 @@ _GAP_EXPANDER_DESCRIPTIONS = {
 }
 
 _OPTIMIZER_DESCRIPTIONS = {
+    "loss_penalty_shape": (
+        "Per-residual penalty of the radius, umbilicus, shell, absolute "
+        "winding and track radius terms after their hinge margins. 'abs' is "
+        "the historical L1/hinge form (outlier-robust, zero residual-space "
+        "curvature). 'square' uses magnitude^2 / (2 * loss_square_scale_"
+        "voxels): constant Gauss-Newton weights and a smooth minimum, but "
+        "outliers gain quadratic influence and family weights tuned for 'abs' "
+        "are only a starting point. The shell term drops its Huber form for "
+        "'square'. DT and relative-winding terms are unchanged."),
+    "loss_square_scale_voxels": (
+        "Voxel scale s of the 'square' penalty magnitude^2 / (2 s): keeps the "
+        "loss in voxel units and matches the abs penalty at 2 s."),
     # See README.md, "Flow-gradient conditioning", for literature precedents
     # and the limitations of these custom combinations.
     "optimizer_flow_grad_smoothing": (
@@ -550,6 +569,9 @@ class Config:
         self.optimizer_flow_shared_second_moment = False
         self.optimizer_flow_shared_second_moment_clip_quantile = 0.99
         self.optimizer_flow_grad_clip_median_multiple = 0.0
+        # Penalty shape of the residual losses (see _OPTIMIZER_DESCRIPTIONS).
+        self.loss_penalty_shape = "abs"
+        self.loss_square_scale_voxels = 16.0
         # Sobolev-damped Hessian-free flow step (prototype, off by default;
         # see _OPTIMIZER_DESCRIPTIONS and sobolev_gauss_newton.py).
         self.optimizer_flow_sobolev_gn = False

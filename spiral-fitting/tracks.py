@@ -16,6 +16,7 @@ import kornia
 import numpy as np
 
 import gauss_newton_residuals
+from spiral_helpers import penalty
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
@@ -3364,9 +3365,9 @@ def _grouped_same_radius_loss(
     flat_group_id = group_id[row_id]
     signed_deviations = shifted_radii - targets[flat_group_id]
     deviations = signed_deviations.abs()
-    hinged = F.relu(
+    hinged = penalty(F.relu(
         deviations
-        - dr_per_winding.detach() * cfg['track_radius_loss_margin'])
+        - dr_per_winding.detach() * cfg['track_radius_loss_margin']), cfg)
     within_p = cfg['track_radius_within_norm_p']
     if within_p == 1.0:
         per_point = hinged

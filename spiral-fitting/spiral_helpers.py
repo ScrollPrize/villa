@@ -741,6 +741,33 @@ def _huber_abs(residual, delta):
     )
 
 
+def penalty(magnitude, cfg):
+    """Per-residual penalty of a nonnegative residual magnitude (a hinge
+    excess, a distance, or an absolute deviation), selected by
+    ``cfg['loss_penalty_shape']``:
+
+    * ``'abs'`` (default, the historical behaviour): the magnitude itself,
+      an L1-type penalty whose residual-space curvature is zero.
+    * ``'square'``: ``magnitude ** 2 / (2 * s)`` with ``s`` =
+      ``cfg['loss_square_scale_voxels']``, so the penalty keeps voxel units
+      and equals the abs penalty at ``magnitude == 2 s``; family weights
+      tuned for 'abs' are a reasonable starting point but not equivalent.
+      Squared penalties give the Gauss-Newton operator constant residual
+      weights instead of 1/|r|, at the cost of L1's outlier robustness.
+
+    Applied after any hinge margin, so ``relu(|d| - m)`` becomes
+    ``penalty(relu(|d| - m), cfg)``. Losses that raise the magnitude to a
+    configurable power already (the DT power means) are left alone.
+    """
+    shape = cfg.get('loss_penalty_shape', 'abs') if hasattr(cfg, 'get') else 'abs'
+    if shape == 'abs':
+        return magnitude
+    if shape == 'square':
+        scale = float(cfg.get('loss_square_scale_voxels', 16.0) or 16.0)
+        return magnitude * magnitude / (2.0 * scale)
+    raise ValueError(f"loss_penalty_shape must be 'abs' or 'square', got {shape!r}")
+
+
 def _get_patch_valid_points(patch, device, z_begin, z_end, max_points=None, fixed_num_points=None):
     valid_mask = patch.valid_vertex_mask
     z_in_roi = (patch.zyxs[..., 0] >= z_begin) & (patch.zyxs[..., 0] < z_end)

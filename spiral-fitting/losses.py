@@ -20,7 +20,7 @@ from sample_spiral import (
     get_theta_and_radii,
     radius_from_unwrapped_shifted,
 )
-from spiral_helpers import _huber_abs
+from spiral_helpers import _huber_abs, penalty
 
 
 def _masked_mean(values, mask):
@@ -166,7 +166,11 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
 
     target_r, scan_r, confidence, valid = shell_map.lookup(outer_scan)
     residual = scan_r - target_r
-    shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
+    if cfg.get('loss_penalty_shape', 'abs') == 'abs':
+        shell_penalty = _huber_abs(residual, huber_delta)
+    else:
+        shell_penalty = penalty(residual.abs(), cfg)
+    shell_outer_loss = _masked_mean(shell_penalty, valid)
     gauss_newton_residuals.register('shell_outer', residual, shell_outer_loss)
 
     metrics = {}
@@ -501,7 +505,7 @@ def _patch_radius_and_dt_losses(
     radius_loss_margin, radius_loss_inv, radius_within_norm_p,
     dt_loss_margin, dt_norm_p, dt_within_patch_norm_p,
     patch_indices=None, sample_ijs=None, dt_target_cache=None, sample_mask=None,
-    diagnostic_prefix='patch',
+    diagnostic_prefix='patch', cfg=None,
 ):
     # Shared radius + DT patch losses, operating on padded uniform 2D samples
     # (all_*; see _sample_patch_tracks). Pulled out of get_patch_and_umbilicus_losses so the
@@ -546,7 +550,8 @@ def _patch_radius_and_dt_losses(
         radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
 
         radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
-        radius_point_residuals = F.relu(radius_point_distances - radius_hinge_margin)
+        radius_point_residuals = penalty(
+            F.relu(radius_point_distances - radius_hinge_margin), cfg or {})
         mean_radius_deviation = _masked_mean(
             radius_point_residuals, radius_mask)
         gauss_newton_residuals.register(
@@ -560,7 +565,8 @@ def _patch_radius_and_dt_losses(
         # Penalise deviation from the track's mean shifted-radius directly in spiral space.
         radius_signed_deviations = radius_shifted_radii - mean_shifted_radii
         radius_deviations = radius_signed_deviations.abs()
-        radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
+        radius_deviations_hinge = penalty(
+            F.relu(radius_deviations - radius_hinge_margin), cfg or {})
         if radius_within_norm_p == 1.0:
             mean_radius_deviation = _masked_mean(
                 radius_deviations_hinge, radius_mask)
@@ -694,14 +700,14 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
             cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
             patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
             sample_mask=sample_mask,
-            diagnostic_prefix='patch',
+            diagnostic_prefix='patch', cfg=cfg,
         )
 
     umbilicus_spiral = extra_spiral[:n_umb]
     shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
-    umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
+    umbilicus_loss = penalty(umbilicus_spiral[..., 1:].abs(), cfg).mean()
     gauss_newton_residuals.register('umbilicus', umbilicus_spiral[..., 1:], umbilicus_loss)
 
     if shell_spiral_zyxs is not None:
@@ -710,8 +716,8 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
             shell_spiral_zyxs[..., 1:], dr_per_winding)
         shell_target = dr_per_winding * float(shell_outer_winding_idx)
         shell_signed_residual = shell_shifted_radii - shell_target
-        shell_patch_radius_residual = F.relu(
-            shell_signed_residual.abs() - radius_hinge_margin)
+        shell_patch_radius_residual = penalty(F.relu(
+            shell_signed_residual.abs() - radius_hinge_margin), cfg)
         shell_patch_radius_loss = shell_patch_radius_residual.mean()
         gauss_newton_residuals.register(
             'shell_patch_radius', shell_signed_residual, shell_patch_radius_loss)
@@ -775,7 +781,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         cfg['patch_unverified_patch_dt_loss_margin'], cfg['patch_unverified_patch_dt_norm_p'], cfg['patch_unverified_patch_dt_within_patch_norm_p'],
         patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
         sample_mask=sample_mask,
-        diagnostic_prefix='unverified_patch',
+        diagnostic_prefix='unverified_patch', cfg=cfg,
     )
 
 
@@ -1031,7 +1037,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
     record_loss_samples(
         'abs_winding', spiral, error, mask,
         display_spiral_zyx=target_spiral)
-    abs_winding_loss = _masked_mean(error, mask)
+    abs_winding_loss = _masked_mean(penalty(error, cfg), mask)
     gauss_newton_residuals.register('abs_winding', signed_error, abs_winding_loss)
     return abs_winding_loss
 
@@ -1524,7 +1530,8 @@ def get_unattached_pcl_strip_losses(
         / radius_counts)
     radius_signed_deviations = normalised_radii - mean_radii
     radius_deviations = radius_signed_deviations.abs()
-    radius_point_residuals = F.relu(radius_deviations - radius_hinge_margin)
+    radius_point_residuals = penalty(
+        F.relu(radius_deviations - radius_hinge_margin), cfg)
     radius_loss = _masked_mean(radius_point_residuals, sample_mask)
     gauss_newton_residuals.register(
         'unattached_pcl_radius', radius_signed_deviations, radius_loss)

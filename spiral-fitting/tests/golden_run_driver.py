@@ -228,6 +228,10 @@ def run(spec_path, result_path, out_dir):
         out_base_dir=out_dir,
         run_name=wandb.run.name if wandb.run is not None else None,
         cache_dir=spec.get('cache_path') or '../cache',
+        # Optional warm start: a checkpoint to restore before fitting (its
+        # completed iteration count sets the resume step), for comparisons
+        # that need a partly converged state.
+        resume_path=spec.get('resume_path'),
     )
 
     checkpoints = glob.glob(f'{out_dir}/*/checkpoint_fitted.ckpt')

@@ -336,9 +336,44 @@ variant) are overshoots across kinks of the loss, hinge activations and points
 crossing lattice cells, which no quadratic model captures; the step-length
 control (damping, voxel cap, rejection) decides progress, not curvature.
 Single runs, GPU-nondeterministic, on one z window: differences of tens in
-the step-200 loss are within run-to-run noise. Whether Gauss-Newton pays off
-late in a fit, when residuals are small and `1/|r|` is informative, has not
-been tested; starting from a converged checkpoint would be the way.
+the step-200 loss are within run-to-run noise. Warm-started from a
+1500-step AdamW checkpoint (satisfied area 45.6%), 200 further steps gave
+47.0% for AdamW, 44.7% for Gauss-Newton with abs penalties and 40.6% with
+squared ones, and 38.4% for the Sobolev gradient step with squared penalties:
+even late in the fit the curvature term stays 1 to 5 percent of the model, and
+the flow-lattice second-order step loses ground while AdamW gains. A zero step
+reproduces the same-batch loss exactly, so the negative `rho` values are the
+true jaggedness of the batch loss, not noise.
+
+### Squared penalties (`loss_penalty_shape`)
+
+`loss_penalty_shape = "square"` replaces the hinge and L1 penalties of the
+radius, umbilicus, shell, absolute-winding and track-radius terms by
+`magnitude² / (2 s)` with `s = loss_square_scale_voxels` (see
+`spiral_helpers.penalty`), giving Gauss-Newton constant residual weights. It
+was tried because the `1/|r|` weights above are the reason curvature carries
+so little information, and it did not pay:
+
+| Run (401 steps from scratch unless noted) | satisfied area | PCL points |
+|---|---|---|
+| AdamW, abs (baseline) | 25.1% | 37.1% |
+| AdamW, square, s = 16 / 64 / 256 | 16.5% / 16.3% / 16.2% | 28.8% / 25.3% / 24.2% |
+| AdamW, square, s = 64, rel-winding weight ×4 | 16.2% | 24.4% |
+| AdamW, square, s = 64, rel-winding ×4, shell outer ×0.3 | 17.5% | 23.7% |
+| AdamW, square, s = 64, rel-winding ×8, shell outer ×0.3 | 17.4% | 23.1% |
+| warm 1500 → 1700, AdamW, abs | 47.0% | 45.5% |
+| warm, AdamW, square, s = 16 | 45.0% | 49.1% |
+| warm, AdamW, square, rebalanced (×4, ×0.3) / (×8, ×0.3) | 41.9% / 40.8% | 44.5% / 42.2% |
+
+The scale `s` is irrelevant for AdamW (it rescales the squared families as a
+block and Adam is scale-invariant), and rebalancing the two families whose
+relative weight the squaring changed most (relative winding stays L1 and lost
+about 7×; shell outer gained about 3×) moved the result by a point or two. The
+gap is structural: the satisfaction metric counts points within a tolerance,
+which is what median-like L1 and hinge penalties optimise, while a squared
+penalty spends its effort pulling in the far outliers. Squared penalties with
+Gauss-Newton were also worse than AdamW when warm-started (above). `abs`
+remains the default; the switch is kept for experiments and is backfilled.
 
 ## Spiral service host setup
 

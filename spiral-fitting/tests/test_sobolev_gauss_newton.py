@@ -32,6 +32,7 @@ from config import BACKFILLABLE_CONFIG_DEFAULTS, Config
 from flow_fields import CartesianFlowField, CylindricalFlowField
 from lazy_moment_adamw import LazyMomentAdamW
 import gauss_newton_residuals as gnr
+from spiral_helpers import penalty
 
 torch.set_default_dtype(torch.float32)
 
@@ -1264,3 +1265,44 @@ def test_fitter_hook_rejects_ascent_steps_exactly_and_raises_damping(monkeypatch
     assert not stats['rejected'] and stats['loss_after'] < stats['loss_before']
     assert stats['rho'] > 0.75
     assert stats['next_damping'] == pytest.approx(90.0 / 1.5)
+
+
+# --------------------------------------------------------------------------
+# Penalty shape
+
+
+def test_penalty_shape_defaults_to_abs_and_square_keeps_voxel_units():
+    magnitude = torch.tensor([0.0, 8.0, 32.0, 100.0])
+    assert torch.equal(penalty(magnitude, {}), magnitude)
+    assert torch.equal(penalty(magnitude, {'loss_penalty_shape': 'abs'}), magnitude)
+    square = penalty(magnitude, {'loss_penalty_shape': 'square', 'loss_square_scale_voxels': 16.0})
+    torch.testing.assert_close(square, magnitude ** 2 / 32.0)
+    assert float(square[2]) == pytest.approx(32.0)  # equals abs at 2 s
+    with pytest.raises(ValueError):
+        penalty(magnitude, {'loss_penalty_shape': 'cubic'})
+    fields = Config.catalog()['schema']['fields']
+    defaults = Config().as_dict()
+    assert fields['loss_penalty_shape']['type'] == 'enum'
+    assert fields['loss_penalty_shape']['values'] == ['abs', 'square']
+    assert fields['loss_penalty_shape']['runtime_impact'] == 'run_boundary'
+    assert defaults['loss_penalty_shape'] == 'abs' and BACKFILLABLE_CONFIG_DEFAULTS['loss_penalty_shape'] == 'abs'
+    assert defaults['loss_square_scale_voxels'] == 16.0
+    assert 'description' in fields['loss_penalty_shape']
+
+
+def test_square_penalty_gives_constant_gauss_newton_weights():
+    r = torch.tensor([-40.0, -3.0, 0.5, 6.0, 90.0], dtype=torch.float64, requires_grad=True)
+    margin = 2.0
+    hinge_abs = penalty(torch.relu(r.abs() - margin), {}).mean()
+    w_abs = gnr.irls_weights(hinge_abs, r, floor=1e-3)
+    # L1: weights fall off as 1/|r| and vanish inside the margin.
+    active = r.detach().abs() > margin
+    assert float(w_abs[~active].abs().sum()) == 0.0
+    assert float(w_abs[0]) < float(w_abs[1])
+    cfg = {'loss_penalty_shape': 'square', 'loss_square_scale_voxels': 16.0}
+    hinge_sq = penalty(torch.relu(r.abs() - margin), cfg).mean()
+    w_sq = gnr.irls_weights(hinge_sq, r, floor=1e-3)
+    # Square: d/dr [(|r|-m)^2 / 2s] / r = (|r|-m)/(s |r|) -> 1/s for |r| >> m.
+    expected = ((r.detach().abs() - margin) / (16.0 * r.detach().abs())).clamp(min=0.0) / r.numel()
+    torch.testing.assert_close(w_sq, expected)
+    assert float(w_sq[4]) == pytest.approx(float(w_sq[0]), rel=0.1)
