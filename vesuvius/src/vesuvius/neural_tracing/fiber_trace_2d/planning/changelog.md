@@ -1,3 +1,15 @@
+## 2026-09-10 — Cooperative GPU management and elastic Fiber3D training
+
+- Added standalone cooperative CPU/GPU/VRAM manager and opt-in Fiber supervisor,
+  shared bounded gradient accumulation, persistent canonical sample ownership,
+  RAM cohort handoff and resumable evaluation. Protocol v1 is locked after CPU
+  conformance/failure tests and real two-GPU S1A calibration, pause/resize and
+  gradient checks. BF16 compute is retained; resized trajectory differences and
+  the bounded accumulation cost are documented, not hidden by relaxed tolerances.
+- Normal cooperative tests have a five-minute total cap; long repeated timing
+  sweeps were cancelled at user request after one complete comparison. Native
+  prerequisites support missing HiGHS and initialize bounded worker pools.
+
 ## 2026-09-09 — Fiberlets/Fiber3D training integration
 
 - Merged the locked Fiberlets development history into the local

@@ -11,6 +11,23 @@ loading.
 
 ## 3D CP Model Package
 
+`fiber_trace_3d/cooperative_training.py` (experimental opt-in)
+
+- CPU supervisor connecting the standalone root `gpu_manager/` service to the
+  shared `train.training_units` iterator; ordinary training exhausts that same
+  iterator. `cooperative_cohort.py` and `cooperative_worker.py` adapt gated spawned
+  processes, full release/join, and restored fixed-effective-batch training.
+- `sample_broker.py` owns canonical CPU sample leases across GPU cohorts, reusing
+  the elastic worker limit in `ordered_sample_pipeline.py`. `cooperative_logging.py`
+  keeps one parent-owned TensorBoard writer. `training_state.py` shares durable
+  snapshot payloads with RAM-only handoff, including partially completed tests.
+- `loss_statistics.py` and `gradient_accumulation.py` share the original loss
+  statistics and bounded component-gradient reductions. `cooperative_resources.py`
+  partitions the fixed effective batch using measured physical-batch allowances;
+  `memory_calibration.py` probes the shared trainer explicitly on reserved GPUs.
+- See [cooperative training](cooperative_training.md) for commands, constraints
+  and pending reference CUDA validation. The protocol is not yet locked.
+
 `fiber_trace_3d/direction.py`
 
 - Implements Lasagna's 3D direction target layout as three ambiguous 2D

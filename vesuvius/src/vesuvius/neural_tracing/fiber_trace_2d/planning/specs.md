@@ -391,6 +391,39 @@
 
 ## 3D CP-Centered Fiber Model Variant
 
+- `training.bounded_gradient_accumulation` is opt-in and defaults false. The
+  experimental fixed-cohort path rejects batch-dependent normalization and
+  uses three FP32 numerator-gradient banks with end-update SUM reduction and
+  global component counts, retaining only one microbatch graph. It reuses the
+  existing loss functions, optimizer, test and snapshot semantics. FP16 local
+  VJP scaling uses actual counts, with reversible overflow attenuation rather
+  than dense-volume count bounds. CUDA equivalence/performance validation is
+  still required before production use. This option alone does not enable
+  dynamic GPU reconfiguration.
+- `training.cooperative` or `--manager-socket` selects the opt-in CPU supervisor
+  with a measured config-matched memory calibration and complete resource request.
+  Protocol authority is `gpu_manager/docs/protocol-v1.md`; it remains draft until
+  reference CUDA validation. Ordinary unmanaged configs retain their defaults.
+- Managed updates own exactly the configured effective batch's canonical stream
+  IDs, supporting unequal/partial physical microbatches and zero-work ranks. GPU
+  allocations change only through full cohort exit/join and a fresh process group.
+  RAM handoff preserves model/optimizer/scaler, RNG, run identity, best metric,
+  canonical frontier and pending evaluation progress; it is not a public snapshot.
+- The persistent CPU pool retains current-batch leases until all ranks commit;
+  parked workers do not retain CPU compute allocation. Pending GPU input may be
+  discarded on resize without consuming future canonical samples. Native compute,
+  decode and sampling use one thread per active managed loading worker.
+- Dense evaluation preserves original logical test-group normalization and yields
+  between group waves. Trace evaluation yields between CP segments. Completed
+  test rows and single-writer logging survive reconfiguration without duplicate
+  metrics/snapshots. Visualization selection is canonical rather than rank-local;
+  managed train visualization reloads existing CPU augmentation for those samples
+  (small differences from CUDA augmentation affect visualization only).
+- Memory observations must cover the requested GPU count and match model/config,
+  GPU model and software identity. Only measured physical batch sizes are admitted;
+  unexpected OOM/over-budget driver usage fails rather than changing training.
+  Actual CUDA pause/memory/AMP/performance validation is still pending.
+
 - Normal 3D training optionally accepts training.profile_enabled (default false).
   Enabled runs write per-rank iteration/stage wall timings and a bounded CPU/CUDA
   trace beginning at profile_trace_start (default 21) for profile_trace_steps

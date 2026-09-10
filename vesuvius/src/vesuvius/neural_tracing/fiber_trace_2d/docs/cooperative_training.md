@@ -1,0 +1,248 @@
+# Cooperative resource management
+
+The approved work spans a reusable [manager](../../../../../../gpu_manager/README.md)
+and Fiber3D training. The opt-in launcher is connected and validated with CPU
+failure/recovery tests and real S1A CUDA lifecycle/gradient checks. See the
+[validation report](cooperative_validation.md) for measured scope and limitations.
+Validation used GPUs 0/1 only, below 20 GiB/GPU; other configurations need calibration.
+
+## Implemented foundations
+
+- `gpu_manager/`: independent Unix-socket client/server, deterministic CPU/VRAM
+  reservations, release-before-regrant, priority/exclusive/manual controls,
+  process identities, journal recovery, CPU conformance tests.
+- `fiber_trace_3d/loss_statistics.py`: the shared statistics used by the existing
+  trainer and bounded accumulation; no copied loss implementation.
+- `gradient_accumulation.py`: three FP32 numerator-gradient banks, one graph at
+  a time, end-update SUM reductions, preserved global loss normalization.
+- `cooperative_resources.py`: explicitly calibrated memory bounds and canonical
+  effective-batch partitions, including unequal VRAM grants. No implicit estimate.
+
+## Fixed-cohort training option
+
+Set `training.bounded_gradient_accumulation: true`, use GroupNorm, and set
+`training.ddp_broadcast_buffers: false`. Existing defaults remain unchanged.
+This enables bounded activation memory in the **existing fixed-cohort** trainer;
+arbitrary/partial physical batches and zero-work ranks are supported in the shared
+trainer. Physical partitioning does not change the effective batch's sample IDs.
+
+Each microbatch contributes gradients of direction, positive-presence and
+negative-presence numerators separately. Only at the effective-update boundary
+are gradient banks and counts globally summed and normalized. There are no DDP
+forward/backward hooks in this mode. The existing finalizer, clipping, optimizer,
+test and snapshot handling stay shared. Three FP32 banks cost 12 bytes/trainable
+parameter, plus combined gradients and optimizer state, and up to three VJPs
+per microbatch. At the capped reference microbatch 2/GPU, the bounded path measured
+about 16 global samples/s across two H100 GPUs. This is not the earlier larger-
+microbatch, graph-retaining trainer's performance ceiling.
+
+Local actual counts normalize VJPs before backward; FP32 banks undo that scaling.
+Dense-volume bounds cannot safely normalize sparse FP16 gradients. FP16 retries
+locally overflowing VJPs with reversible power-of-two attenuation, keeping only
+the current graph and leaving the global scaler unchanged. CPU numerical tests
+and small CUDA numerical tests cover this. Changed floating-point order does not
+promise bitwise-identical trajectories across different GPU/microbatch counts.
+
+### Precision and numerical validation
+
+Production honors `training.mixed_precision` unchanged: BF16 model operations
+remain under the shared trainer's BF16 autocast. FP32 master parameters, optimizer
+state and component gradient banks are deliberate. Loss/reduction operations
+may also use FP32 for stability; this is not an all-BF16 pipeline.
+`cooperative_reference_validation.py` optionally sets `mixed_precision="off"`
+in **generated test configs only** to isolate summation from BF16 kernel effects.
+The frozen-gradient test additionally uses FP64 shadow sums, only in the oracle.
+
+Real S1A B128 validation on GPUs 0/1 (GroupNorm, quarter-output, six updates):
+
+- Fixed FP32 repeat and same-allocation FP32/BF16 pause/restart: byte-identical
+  model, optimizer and final test metric. Pause during testing also covered.
+- Frozen FP32 gradients: exact sample IDs/counts, matching one-/two-GPU FP64
+  shadow sums; every component/layer within the computed FP32 summation bound.
+- Resize trajectories are diagnostics, not a widened tolerance gate. Original
+  pointwise comparisons failed for a small subset of weights. FP32 final model
+  relative L2 difference was 1.39e-5; BF16 was 5.90e-5. Final test losses were
+  2.242254823/2.242277861 (FP32), 2.239006564/2.239104435 (BF16), fixed/dynamic.
+  The FP32 shadow test isolates accumulation roundoff, not every BF16 kernel effect.
+
+Evidence paths and remaining gates are recorded in `planning/task_log.md`.
+
+The existing approved profile caller accepts `--bounded-accumulation` via its
+argument file. Native worker pools are bounded; HiGHS is optional, and its
+dependent features are disabled when unavailable. The tested QuickBuild uses
+`-O3` without LTO. Tests load isolated native bindings; they do not replace a
+running training's venv. The shared single-GPU preparation path resolves the CUDA
+device index before entering its background thread.
+
+## CPU-only verification
+
+### Reusable test caller
+
+Run the fixed command (no arguments):
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+Test selection lives in `vesuvius/scripts/fiber3d_cooperative_tests.json`, so
+changing suites/devices does not change the approved launcher command. Named
+suites are `cpu`, `manager`, `cuda-amp`, `cuda-cohort`, `cuda-reference`, and
+`native-build`, `native-configure` and `native-tests`; they run sequentially.
+The default is CPU/manager tests (about 90 seconds here), with GPUs hidden.
+Every invocation has a **five-minute total ceiling**, not five minutes per suite.
+Long benchmark sweeps are rejected. CUDA tests remain explicitly selected.
+`native-configure` selects QuickBuild -O3 without LTO and one autogen thread.
+`native-build` builds the existing VC3D
+Python/test targets without installing. Setting `native_build: true` selects
+that build's Python bindings for isolated tests, leaving the venv unchanged.
+`cuda-reference` implements calibration and a separate lifecycle phase, using the archived S1A
+data selection, GroupNorm, quarter-resolution output and effective batch 128;
+its control records microbatch sizes, steps and CPU workers. The lifecycle phase
+requires `calibration` pointing to a prior calibration.json and at least six
+steps; it compares fixed allocation with pause/shrink/expand, including pause
+during an unfinished test wave and a driver check that paused GPU workers have
+disappeared. Diagnostic end states are retained before numerical comparison so
+failures can be inspected without repeating the entire run. One extended
+unmanaged/fixed/dynamic comparison completed; the user stopped the redundant
+repetitions. That historical benchmark is not part of the normal test command.
+The `profile` phase accepts two updates and records a short trace of the same trainer; repeated
+microbatch stage wall times sum over the update. Stage host times are not CUDA
+kernel duration; use the recorded CUDA trace/operator tables for device time.
+CPU suites hide GPUs. CUDA suites use tiny models and explicit allocator caps:
+4 GiB for the numerical oracle, at most 6 GiB per cohort worker plus a 4 GiB
+driver reserve. These caps are below the authorized 20 GiB total per GPU; they
+are not a general CUDA driver-enforced memory quota. This caller does not run
+uncapped reference benchmarks. Timeout cleanup targets only its test process
+group. The shared driver monitor records only this test's process-tree memory
+and aborts that test if observed use exceeds 20 GiB per GPU; the lower allocator
+caps leave headroom. Reference calibration uses a 16 GiB allowance with 4 GiB
+reserved outside the allocator (12 GiB allocator cap). Control, command, source
+revision/worktree status, logs and results are
+saved below `/ephemeral/hendrik/fiber3d_train2/cooperative-tests`.
+
+### Direct CPU-only invocation
+
+From `vesuvius/`, with GPUs explicitly hidden:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 /home/hendrik/.venv_las/bin/python -m pytest -q tests/neural_tracing/test_gradient_accumulation.py tests/neural_tracing/test_cooperative_resources.py
+```
+
+The Gloo test needs local loopback socket access, but uses no GPUs. From the
+Villa root: `python -m pytest -q gpu_manager/tests`.
+
+## Managed launch
+
+Explicitly install the independent package into the training venv:
+`python -m pip install -e ./gpu_manager` from Villa. Nothing installs or starts a
+service on import. Start the manager on explicitly available GPU UUIDs using its
+README, then run one CPU supervisor, **not torchrun**:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json --manager-socket /path/to/manager.sock
+```
+
+Alternatively specify `training.cooperative.socket`. Ordinary configs without
+`cooperative` retain unmanaged behavior. Add this object at `training.cooperative`:
+
+```json
+{
+  "socket": "/path/to/manager.sock",
+  "request": {
+    "max_cpu_cores": 128,
+    "max_gpus": 8,
+    "min_vram_bytes_per_gpu": 8589934592,
+    "max_vram_bytes_per_gpu": 68719476736,
+    "allowed_gpu_uuids": [],
+    "priority": 0,
+    "exclusive": false
+  },
+  "input_queue_depth": 2,
+  "memory_calibration": "REPLACE WITH THE MEASURED JSON OBJECT"
+}
+```
+
+Those byte counts illustrate units, not a measured recommendation. The calibration
+must be an object, not the placeholder. Keep the numerical/data configuration,
+including `optimizer_global_batch_size` (e.g. 128). Use sample-independent layers,
+`sync_batchnorm: false`, `ddp_broadcast_buffers: false`, finite `max_steps`, and the
+shared sample pool. `sample_pipeline_workers` is its maximum size, capped by grants;
+`sample_pipeline_slots` must fit one whole effective batch. Initial lookahead can
+remain small and uses the existing bounded ramp. `--resume` starts from a durable
+test snapshot; live reallocations use RAM, not training-step snapshots.
+
+### Memory probe — run only after GPU permission
+
+Reserve idle GPUs before running this bootstrap measurement:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.memory_calibration CONFIG.json --gpu-uuids GPU-UUID-ONE GPU-UUID-TWO --microbatch-sizes 1 4 8 16 --cpu-workers 8 --steps 3 --vram-limit-bytes 17179869184 --reserve-bytes 4294967296 --output /ephemeral/hendrik/fiber3d_train2/memory-calibration.json
+```
+
+The explicit VRAM limit is required. Shared GPUs are rejected unless
+`--allow-shared` is supplied with authorization; the allowance still applies to
+this probe, not other users' processes. Use the intended maximum GPU count; a one-GPU calibration cannot authorize an
+eight-GPU request. The shared trainer measures cold initialization, configured
+initial tests/visualization, optimizer state, gradient banks, asynchronous prepared
+batches and distributed communicator overhead. A fresh cohort is used per size.
+The report records allocator peaks, polled driver-visible memory, GPU/PyTorch/CUDA
+identity and config fingerprint. Copy its JSON object into `memory_calibration`.
+Manager control settings are excluded from the fingerprint; numerical/data config
+changes require recalibration. Only measured batch sizes are selected. The reserve
+is still needed: driver polling can miss transient peaks and other group sizes can
+select different communicator algorithms. A two-GPU S1A BF16 calibration has
+passed; this does not calibrate other model/data configurations or eight GPUs.
+
+Runtime checks GPU/software identity, self-limits the caching allocator below the
+grant minus reserve, and monitors its own driver-visible process memory. OOM or an
+over-budget observation fails and releases the task, not an implicit change of B,
+precision, LR or augmentation. Calibration is not a formal upper-bound proof.
+
+## Ownership and pause
+
+- `gpu_manager/supervisor.py` / `cohort.py`: gated spawned children, polled work
+  boundaries, nonblocking private controls and join-before-release. Children are
+  reported before CUDA initialization. Model handoff uses opaque CPU shared memory.
+- `cooperative_training.py`, `cooperative_cohort.py`, `cooperative_worker.py`:
+  connect the existing trainer to replaceable GPU processes. Each cohort has a
+  fresh process group and exactly its granted UUIDs. The supervisor owns no CUDA.
+- `sample_broker.py` / existing `ordered_sample_pipeline.py`: persistent elastic
+  CPU pool and canonical slots. Current effective-batch slots stay leased until all
+  ranks commit; speculative GPU inputs can be discarded without consuming samples.
+  Workers finish jobs then park on shrink. One active worker can execute both stages.
+  Native compute, volume decoding and sampling use one thread per active worker.
+- `training_state.py`: shared snapshot helpers and RAM model/optimizer/scaler/RNG,
+  sample frontier, run identity, best metric and pending test rows.
+- `cooperative_logging.py`: one CPU-owned TensorBoard writer across cohorts.
+
+Dense evaluation preserves original logical groups while physically microbatching.
+It yields after a wave of at most one group per rank; completed rows survive resize.
+Trace evaluation yields between CP segments. Metrics and snapshots are not repeated.
+Test visualization forwards one sample at a time. Managed training visualization
+deterministically reloads the first canonical samples on CPU, independent of rank
+placement; existing CPU augmentation may differ slightly from the optimized CUDA
+augmentation. This affects visualization only, not training inputs or losses.
+
+Full pause joins all GPU workers/preparation streams/process groups. CPU samples,
+writer and handoff may remain in RAM. Neither `empty_cache()` nor socket EOF proves
+release. Queue feeder failures are surfaced; CPU draining also has a deadline.
+Worker errors abort owned children rather than continue a partly updated step.
+
+## Validation scope
+
+CPU tests cover partial/arbitrary microbatches, interruption during evaluation,
+actual two-process to one-process Gloo training restart, optimizer equivalence and
+one writer. Relevant additional tests: `test_training_state.py`,
+`test_sample_broker.py`, `test_cooperative_integration.py`, `test_memory_calibration.py`.
+The small CUDA oracle now passes FP32/FP16/BF16 checks and the two-GPU to one-GPU
+restart scenario. These use synthetic data/tiny models, not the reference UNet.
+Real S1A BF16 resize/pause/expand completed, including driver-verified GPU-free
+pauses; reference FP32 frozen-gradient and FP32/BF16 exact same-allocation restart checks
+also pass. BF16 resized trajectory differences are not asserted bit-identical:
+after 110 updates the fixed/dynamic test losses were 1.582692/1.606135. Exact
+same-allocation restart and preserved gradient semantics do not establish equal
+long-run convergence across changing physical batch shapes.
+The completed extended case exercised repeated GPU-free pauses, partial VRAM,
+shrink and expansion; further timing repeats were stopped at the user's request.
+Host queue memory is structurally bounded/tested; no long pause-RAM plateau study
+or eight-GPU throughput/convergence claim is made. No unrelated process was stopped.
