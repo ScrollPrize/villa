@@ -316,6 +316,66 @@ def test_public_substring_http_uses_real_backend_without_s3_options(tmp_path):
 
 
 @pytest.mark.skipif(not _ZARR_V3, reason="direct FsspecStore is a Zarr-3 path")
+def test_truncated_chunk_is_retried_and_absent_chunk_is_not(tmp_path):
+    requests: dict[str, int] = {}
+
+    class TruncateOnceHandler(SimpleHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):
+            del format, args
+
+        def do_GET(self):
+            requests[self.path] = requests.get(self.path, 0) + 1
+            target = tmp_path / self.path.lstrip("/")
+            if not target.is_file():
+                self.send_error(404)
+                return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.path.endswith("/0.0.0") and requests[self.path] == 1:
+                self.wfile.write(body[: len(body) // 3])
+                self.close_connection = True
+                return
+            self.wfile.write(body)
+
+    expected = np.arange(24, dtype=np.uint16).reshape(2, 3, 4)
+    source_path = tmp_path / "volume.zarr"
+    zarr.open_array(
+        source_path,
+        mode="w",
+        shape=(4, 3, 4),
+        chunks=expected.shape,
+        dtype=expected.dtype,
+        zarr_format=2,
+    )[:2] = expected
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TruncateOnceHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    opened = None
+    try:
+        opened = open_volume_root(
+            f"http://127.0.0.1:{server.server_port}/volume.zarr"
+        )
+        read = np.asarray(opened[:])
+    finally:
+        if opened is not None:
+            filesystem = opened.store.fs
+            opened.store.close()
+            filesystem.close_session(filesystem.loop, filesystem._session)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=10)
+
+    np.testing.assert_array_equal(read[:2], expected)
+    np.testing.assert_array_equal(read[2:], np.zeros_like(expected))
+    assert requests["/volume.zarr/0.0.0"] == 2
+    assert requests["/volume.zarr/1.0.0"] == 1
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="direct FsspecStore is a Zarr-3 path")
 def test_private_https_basic_auth_is_unchanged(tmp_path, monkeypatch):
     captured = {}
 
