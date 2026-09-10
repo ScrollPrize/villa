@@ -19,9 +19,10 @@ def main():
         run = Path(control["run"])
         report = json.loads((run / "benchmark.json").read_text())
         assert report.get("exact_unmanaged_fixed_state") is True, "benchmark incomplete"
-        evidence = {str(repeat): validate_benchmark_transitions(
-            run / f"repeat-{repeat}-dynamic/lifecycle.json")
-            for repeat in range(1, report["repeats"] + 1)}
+        evidence = {str(row["repeat"]): validate_benchmark_transitions(
+            Path(row.get("artifact_dir", run / f"repeat-{row['repeat']}-dynamic")) / "lifecycle.json")
+            for row in report["cases"] if row["mode"] == "dynamic"}
+        assert len(evidence) == report["repeats"]
         (output / "transition-validation.json").write_text(json.dumps(evidence, indent=2) + "\n")
         print(f"validated applied resize sequences for {len(evidence)} repetitions", flush=True)
         return 0
@@ -37,7 +38,8 @@ def main():
         from .cooperative_reference_benchmark import run
         run(Path(control["calibration"]), output, uuids,
             warmup=int(control.get("warmup", 10)), measured=int(control.get("measured", 100)),
-            repeats=int(control.get("repeats", 3)), timeout=int(control.get("case_timeout", 7200)))
+            repeats=int(control.get("repeats", 3)), timeout=int(control.get("case_timeout", 7200)),
+            previous=Path(control["previous"]) if control.get("previous") else None)
         return 0
     if control["phase"] == "gradient":
         from .cooperative_reference_gradient import validate

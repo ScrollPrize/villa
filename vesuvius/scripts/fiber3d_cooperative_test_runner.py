@@ -46,6 +46,15 @@ SUITES = {
 }
 
 
+def test_budget_seconds(control):
+    timeout = control["timeout_seconds"]
+    if type(timeout) is not int or not 1 <= timeout <= 300:
+        raise ValueError("test timeout_seconds must be an integer in [1,300] for the entire invocation")
+    if "cuda-reference" in control["suites"] and control.get("reference", {}).get("phase") == "benchmark":
+        raise ValueError("long benchmark sweeps are not tests; use a short reference lifecycle or profile")
+    return timeout
+
+
 def main():
     control = json.loads((SCRIPT_DIR / "fiber3d_cooperative_tests.json").read_text())
     if set(control) - {"suites", "gpu_devices", "timeout_seconds", "output_root", "reference", "native_build"}:
@@ -59,9 +68,7 @@ def main():
         raise ValueError("duplicate GPU device")
     if "cuda-amp" in suites and not devices or "cuda-cohort" in suites and len(devices) != 2:
         raise ValueError("CUDA oracle needs a device; cohort test needs exactly two")
-    timeout = control["timeout_seconds"]
-    if type(timeout) is not int or not 1 <= timeout <= 21600:
-        raise ValueError("timeout_seconds must be an integer in [1,21600]")
+    timeout = test_budget_seconds(control)
     output = Path(control["output_root"]).expanduser() / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     (output / "control.json").write_text(json.dumps(control, indent=2) + "\n")
@@ -69,6 +76,7 @@ def main():
     diff = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     (output / "source.json").write_text(json.dumps({"commit": revision, "worktree_status": diff}, indent=2) + "\n")
     results = []
+    invocation_started = time.monotonic()
     for suite in suites:
         env = dict(os.environ, AGENTS_AGENT_MODE="1", CUDA_VISIBLE_DEVICES="",
                    OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
@@ -127,7 +135,7 @@ def main():
             try:
                 known_pids = {process.pid}
                 while process.poll() is None:
-                    if time.monotonic() - started > timeout:
+                    if time.monotonic() - invocation_started > timeout:
                         raise subprocess.TimeoutExpired(command, timeout)
                     if monitor is not None:
                         try:

@@ -14,6 +14,23 @@ import tempfile
 import time
 
 
+class _PauseDeadline:
+    """A driver-observation deadline belongs to one cohort, not the whole run."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.started = None
+
+    def check(self, now):
+        if self.started is None:
+            self.started = now
+        if now - self.started > 20:
+            raise AssertionError("paused GPU ownership did not disappear from driver inventory")
+        return self.started
+
+
 def validate_benchmark_transitions(saved):
     """Check applied resize evidence, including retrospectively saved lifecycle JSON.
 
@@ -171,8 +188,9 @@ def validate(config, calibration_path, output, devices, *, steps=6, modes=("fixe
     calibration = MemoryCalibration(**estimate)
     allowance = 16 * 1024**3
     minimum = calibration.estimated_bytes(calibration.measured_peaks[0][0])
-    if minimum > allowance or len(devices) != 2 or steps < 6:
-        raise ValueError("lifecycle needs two GPUs, six updates, and a fitting calibration")
+    required_steps = 6 if "dynamic" in modes else 2
+    if minimum > allowance or len(devices) != 2 or steps < required_steps:
+        raise ValueError(f"reference needs two GPUs, {required_steps} updates, and a fitting calibration")
     inventory = {"cpu_cores": int(raw["training"]["sample_pipeline_workers"]),
                  "gpus": {gpu: allowance for gpu in devices}}
     request = dict(max_cpu_cores=inventory["cpu_cores"], max_gpus=2,
@@ -202,6 +220,7 @@ def validate(config, calibration_path, output, devices, *, steps=6, modes=("fixe
         last_frontier = 0
         phase = 0
         paused_at = None
+        pause_deadline = _PauseDeadline()
         owned_gpu_pids = set()
         completed_boundaries = []
         unit_timings = []
@@ -250,6 +269,7 @@ def validate(config, calibration_path, output, devices, *, steps=6, modes=("fixe
 
         def factory(grant, state):
             nonlocal broker
+            pause_deadline.reset()
             if broker is None:
                 broker = CanonicalSampleBroker.create(config_path=config,
                     loader_config=load_config(config), start_step=0, max_steps=steps,
@@ -275,10 +295,7 @@ def validate(config, calibration_path, output, devices, *, steps=6, modes=("fixe
             nonlocal paused_at
             assert supervisor.cohort is None
             assert not torch.cuda.is_initialized()
-            if paused_at is None:
-                paused_at = time.monotonic()
-            if time.monotonic() - paused_at > 20:
-                raise AssertionError("paused GPU ownership did not disappear from driver inventory")
+            paused_at = pause_deadline.check(time.monotonic())
             if monitor.last_snapshot_at is None or monitor.last_snapshot_at <= paused_at:
                 return False
             assert monitor.last_snapshot is not None
@@ -342,6 +359,7 @@ def validate(config, calibration_path, output, devices, *, steps=6, modes=("fixe
                         client.set_request(dict(request, max_gpus=1, max_vram_bytes_per_gpu=minimum)
                                            if resize else request)
                         client.pause(False)
+                        paused_at = None
                         phase = 6
                 time.sleep(0.005)
             if mode == "dynamic" and (phase != 7 or len(changes) < (6 if resize else 5)):

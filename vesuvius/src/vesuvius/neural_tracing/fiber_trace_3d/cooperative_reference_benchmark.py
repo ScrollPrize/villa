@@ -22,7 +22,8 @@ def timing_summary(values):
                 minimum=values[0], maximum=values[-1])
 
 
-def run(calibration_path, output, devices, *, warmup=10, measured=100, repeats=3, timeout=7200):
+def run(calibration_path, output, devices, *, warmup=10, measured=100, repeats=3, timeout=7200,
+        previous=None):
     import torch
     from .cooperative_reference_lifecycle import validate, describe_state_differences
     if warmup < 5 or measured < 100 or repeats < 3:
@@ -34,11 +35,29 @@ def run(calibration_path, output, devices, *, warmup=10, measured=100, repeats=3
               "cases": []}
     modes = ("unmanaged", "fixed", "dynamic")
     started = time.monotonic()
+    previous_report = json.loads((previous / "benchmark.json").read_text()) if previous else None
+    if previous_report:
+        previous_control = json.loads((previous / "control.json").read_text())["reference"]
+        previous_calibration = json.loads(Path(previous_control["calibration"]).read_text())
+        current_calibration = json.loads(Path(calibration_path).read_text())
+        assert previous_calibration == current_calibration, "completed benchmark used different calibration/config"
+        for key in ("warmup_updates", "measured_updates", "repeats", "effective_batch", "devices", "baseline"):
+            assert previous_report[key] == report[key], f"incompatible completed benchmark {key}"
     for repeat in range(repeats):
         # Counterbalance execution order; never run GPU cases concurrently.
         order = modes[repeat % 3:] + modes[:repeat % 3]
         states = {}
         for mode in order:
+            old = next((row for row in previous_report["cases"]
+                        if row["repeat"] == repeat + 1 and row["mode"] == mode), None) if previous_report else None
+            if old is not None:
+                folder = Path(old.get("artifact_dir", previous / f"repeat-{repeat + 1}-{mode}"))
+                state_path = folder / f"{mode}-validation-state.pt"
+                assert state_path.is_file() and (folder / "lifecycle.json").is_file()
+                report["cases"].append(dict(old, artifact_dir=str(folder), reused_completed=True))
+                states[mode] = state_path
+                print(f"benchmark reuse completed repeat={repeat + 1} mode={mode} from {folder}", flush=True)
+                continue
             folder = output / f"repeat-{repeat + 1}-{mode}"
             folder.mkdir()
             print(f"benchmark repeat={repeat + 1}/{repeats} mode={mode} start", flush=True)
@@ -51,7 +70,7 @@ def run(calibration_path, output, devices, *, warmup=10, measured=100, repeats=3
                 raise AssertionError("benchmark did not measure every canonical update")
             active = timing_summary(row["seconds"] for row in units)
             elapsed = timing_summary(wall)
-            case = dict(repeat=repeat + 1, mode=mode, active_update_seconds=active,
+            case = dict(repeat=repeat + 1, mode=mode, artifact_dir=str(folder), active_update_seconds=active,
                         wall_update_seconds=elapsed, global_samples_per_second=128 / elapsed["mean"],
                         active_global_samples_per_second=128 / active["mean"],
                         total_seconds=result["seconds"], transitions=result["transitions"],

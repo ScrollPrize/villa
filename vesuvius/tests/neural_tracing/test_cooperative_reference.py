@@ -4,6 +4,17 @@ import pytest
 import torch
 
 
+def test_regular_launcher_rejects_long_sweeps():
+    from scripts.fiber3d_cooperative_test_runner import test_budget_seconds
+    assert test_budget_seconds({"suites": ["cpu", "manager"], "timeout_seconds": 300}) == 300
+    for timeout in (0, 301, 21600, True):
+        with pytest.raises(ValueError, match="entire invocation"):
+            test_budget_seconds({"suites": ["cpu"], "timeout_seconds": timeout})
+    with pytest.raises(ValueError, match="not tests"):
+        test_budget_seconds({"suites": ["cuda-reference"], "timeout_seconds": 300,
+                             "reference": {"phase": "benchmark"}})
+
+
 def test_benchmark_requires_successful_applied_resize_evidence(tmp_path):
     import copy
     import json
@@ -93,3 +104,14 @@ def test_unmanaged_reference_driver_drains_before_finishing():
     assert cohort.authorized and not runner.finished
     runner.tick()
     assert runner.finished and runner.state == "state" and runner.cohort is None
+def test_pause_deadline_is_per_cohort():
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d.cooperative_reference_lifecycle import _PauseDeadline
+    deadline = _PauseDeadline()
+    assert deadline.check(100) == 100
+    assert deadline.check(101) == 100
+    deadline.reset()  # A new cohort resumed and worked for a minute.
+    assert deadline.check(161) == 161
+    assert deadline.check(162) == 161
+    with pytest.raises(AssertionError, match="ownership"):
+        deadline.check(182)
