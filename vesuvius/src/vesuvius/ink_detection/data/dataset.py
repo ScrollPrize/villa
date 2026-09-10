@@ -389,6 +389,23 @@ class InkDataset(Dataset):
             x0=support_x0,
             x1=support_x1,
         )
+        # Positive ink normally implies supervision. Restrict that contract
+        # only for explicit exclusions, leaving physical surface support intact.
+        # Cached ordinary training patches repeat the generic mask as an
+        # override; that is not a distinct restriction.
+        scoped_override = (
+            patch.supervision_mask_override is not None
+            and str(patch.supervision_mask_override)
+            != str(patch.segment.supervision_mask)
+        )
+        if patch.is_validation or scoped_override:
+            support_labels = np.where(
+                np.asarray(support_supervision) > 0, support_labels, 0
+            )
+        elif validation_volume is not None:
+            support_labels = exclude_validation_voxels(
+                support_labels, support_validation
+            )
         (
             support_bbox,
             support_positions,
@@ -468,6 +485,9 @@ class InkDataset(Dataset):
             if segment.segment_relpath == patch.segment.segment_relpath:
                 continue
             if segment.inklabels is None or segment.supervision_mask is None:
+                continue
+            if patch.is_validation and segment.validation_mask is None:
+                # A training-only segment contributes no held-out annotations.
                 continue
             patch_tifxyz = self._tifxyz(segment)
             coarse_positions, coarse_valid = self._coarse_positions(
