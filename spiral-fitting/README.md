@@ -399,8 +399,20 @@ because even small smoothed steps (Sobolev norm 0.2 to 0.3) raised the
 same-batch loss by 100 to 600 on a third of the probes. The likely reading is
 that this loss is reduced by cell-local flow changes, which per-cell Adam
 scaling follows and a Sobolev-smoothed direction (length 32 voxels, two fine
-cells) suppresses; a shorter length or the unsmoothed metric `A = I` would be
-the test of that, and is left open.
+cells) suppresses; a shorter length or the unsmoothed metric `A = I` was the
+test of that, and it refuted it: over the same 1500 → 2500 window the Sobolev
+gradient step with Huber penalties reached 42.8% at length 8 voxels and 43.1%
+at length 0 (identity metric, a capped gradient step with rho acceptance),
+against 45.2% at length 32 and 48.9% for AdamW. The smoothing prior is not
+what holds the step back; the gradient direction itself, scaled by one step
+length for the whole lattice, is. Gradient magnitudes differ by orders of
+magnitude between densely sampled and barely sampled cells, so a global step
+either overshoots the former (the negative `rho` probes) or freezes the
+latter, and the reweighted curvature is too weak in the L1 regime to equalise
+them. Per-cell normalisation, which is what AdamW provides, is the property
+that matters on this loss; a diagonal (Jacobi) preconditioner built from the
+Gauss-Newton operator would be the principled version of it and is the one
+direction from this work not yet tried.
 
 ## Spiral service host setup
 
