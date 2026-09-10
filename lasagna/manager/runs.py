@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,17 @@ from .config import ManagerConfig
 from .prefetch import build_prefetch_request, volume_cache_root
 from .snapshots import SnapshotRecord
 from .tmux import Tmux
+
+try:
+    from lasagna.live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB, DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        path_has_download_source,
+    )
+except ImportError:  # pragma: no cover
+    from live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB, DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        path_has_download_source,
+    )
 
 
 SCHEMA_VERSION = 1
@@ -156,6 +168,19 @@ def _inference_args(configured: Sequence[str], explicit: Sequence[str]) -> tuple
     return (*filtered, *explicit)
 
 
+def _has_cli_option(values: Sequence[str], option: str) -> bool:
+    return any(value == option or value.startswith(f"{option}=") for value in values)
+
+
+def _cli_option_value(values: Sequence[str], option: str) -> str | None:
+    for index, value in enumerate(values):
+        if value.startswith(f"{option}="):
+            return value.split("=", 1)[1]
+        if value == option and index + 1 < len(values):
+            return values[index + 1]
+    return None
+
+
 def build_fiber_command(
     config: ManagerConfig,
     snapshot: SnapshotRecord,
@@ -227,6 +252,9 @@ def launch_inference(
     legacy_config: str | Path | None = None,
     prefetch: bool = True,
     download_workers: int = 64,
+    live_fetch: bool = False,
+    live_cache_gib: float | None = None,
+    live_fetch_ahead_tiles: int | None = None,
     remote_inventory: bool = True,
     tmux: Tmux | None = None,
     now: datetime | None = None,
@@ -235,6 +263,27 @@ def launch_inference(
         raise ValueError(f"unsupported inference backend: {snapshot.backend}")
     if snapshot.backend == "lasagna" and legacy_config is not None:
         raise ValueError("--legacy-config applies only to Fiber checkpoints")
+    if int(download_workers) <= 0:
+        raise ValueError("download_workers must be a positive integer")
+    if live_fetch and prefetch:
+        raise ValueError("live fetch and the manager bulk-prefetch phase are mutually exclusive")
+    resolved_live_cache_gib = float(
+        DEFAULT_LIVE_CACHE_GIB if live_cache_gib is None else live_cache_gib
+    )
+    resolved_live_lookahead = int(
+        DEFAULT_LIVE_FETCH_AHEAD_TILES
+        if live_fetch_ahead_tiles is None else live_fetch_ahead_tiles
+    )
+    if live_cache_gib is not None and not live_fetch:
+        raise ValueError("--live-cache-gib requires --live-fetch")
+    if live_fetch_ahead_tiles is not None and not live_fetch:
+        raise ValueError("--live-fetch-ahead-tiles requires --live-fetch")
+    if (
+        not math.isfinite(resolved_live_cache_gib)
+        or resolved_live_cache_gib <= 0
+        or resolved_live_lookahead <= 0
+    ):
+        raise ValueError("live cache target and lookahead must be > 0")
     output_root = config.resolved_path("output_dir", required=True)
     assert output_root is not None
     python = _runtime_python(config)
@@ -299,6 +348,25 @@ def launch_inference(
         "manager": {"version": "0.1"},
     }
     generated_args: tuple[str, ...] = ()
+    if live_fetch:
+        generated_args = (
+            "--live-fetch",
+            "--live-cache-gib", str(resolved_live_cache_gib),
+            "--live-fetch-ahead-tiles", str(resolved_live_lookahead),
+            "--download-workers", str(int(download_workers)),
+        )
+    elif not prefetch:
+        generated_args = ("--download-workers", str(int(download_workers)))
+    backend_args = _inference_args(config.params, (*generated_args, *extra_args))
+    if live_fetch and _has_cli_option(backend_args, "--no-download"):
+        raise ValueError("live fetch conflicts with --no-download in manager params/backend arguments")
+    if live_fetch and any(
+        _has_cli_option(backend_args, option) for option in ("--crop", "--crop-xyzwhd")
+    ):
+        raise ValueError("live fetch supports only full, non-cropped inference")
+    pred_dt = _cli_option_value(backend_args, "--pred-dt")
+    if live_fetch and pred_dt and path_has_download_source(pred_dt):
+        raise ValueError("live fetch does not yet support a separately remote --pred-dt source")
     if not prefetch:
         if not volume.s3_url:
             raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
@@ -307,9 +375,7 @@ def launch_inference(
         initialize_download_source(
             str(volume_cache_root(config, volume)), volume.s3_url, True,
         )
-        generated_args = ("--download-workers", str(int(download_workers)))
     if snapshot.backend == "fiber3d":
-        backend_args = _inference_args(config.params, (*generated_args, *extra_args))
         command, manifest = build_fiber_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
@@ -317,7 +383,6 @@ def launch_inference(
         )
         artifact_kind = "fiber3d-prediction"
     else:
-        backend_args = _inference_args(config.params, (*generated_args, *extra_args))
         command, manifest = build_lasagna_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
@@ -361,6 +426,12 @@ def launch_inference(
             "prefetch": "pending" if prefetch else "skipped",
             "inference": "created", "staging_upload": "not_started",
             "atlas_ingest": "not_started", "atlas_publication": "not_started",
+        },
+        "live_fetch": {
+            "enabled": bool(live_fetch),
+            "cache_target_gib": resolved_live_cache_gib if live_fetch else None,
+            "lookahead_tiles": resolved_live_lookahead if live_fetch else None,
+            "download_workers": int(download_workers) if live_fetch else None,
         },
         "prefetch": {
             "started_at": None, "ended_at": None, "error": None,

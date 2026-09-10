@@ -1,4 +1,5 @@
 #include "CState.hpp"
+
 #include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 
@@ -180,13 +181,9 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(
-    size_t cacheSizeBytes,
-    QObject* parent,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget)
+CState::CState(QObject* parent, bool debugDownloadQueue)
     : QObject(parent)
-    , _cacheSizeBytes(cacheSizeBytes)
-    , _decodedCacheBudget(std::move(decodedCacheBudget))
+    , _debugDownloadQueue(debugDownloadQueue)
 {
     _pointCollection = new VCCollection(this);
 
@@ -198,16 +195,15 @@ CState::CState(
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
 }
 
-CState::~CState()
-{
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
-}
+CState::~CState() = default;
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
+    if (_vpkg != pkg) {
+        clearFocusBounds();
+    }
     _vpkg = std::move(pkg);
     emit vpkgChanged(_vpkg);
 }
@@ -229,17 +225,11 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     if (_currentVolume == vol) {
-        applyCacheBudget(vol);
         resolveCurrentVolumeId();
         emit volumeChanged(_currentVolume, _currentVolumeId);
         return;
     }
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
     _currentVolume = std::move(vol);
-    applyCacheBudget(_currentVolume);
-    if (_currentVolume)
-        _currentVolume->retainCacheClient();
     resolveCurrentVolumeId();
     _pointCollection->setFileMetadata(
         (_vpkg && !_currentVolumeId.empty())
@@ -248,6 +238,57 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
                       *_vpkg, _currentVolumeId))
             : utils::Json::object());
     emit volumeChanged(_currentVolume, _currentVolumeId);
+}
+
+std::optional<Rect3D> CState::focusBounds() const { return _focusBounds; }
+
+std::optional<Rect3D> CState::activeFocusBounds() const
+{
+    return _focusBoundsEnabled ? _focusBounds : std::nullopt;
+}
+
+bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
+
+uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
+
+void CState::setFocusBounds(const Rect3D& bounds)
+{
+    Rect3D normalized;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(bounds.low[axis]) || !std::isfinite(bounds.high[axis])) {
+            return;
+        }
+        normalized.low[axis] = std::min(bounds.low[axis], bounds.high[axis]);
+        normalized.high[axis] = std::max(bounds.low[axis], bounds.high[axis]);
+    }
+    if (_focusBounds && _focusBounds->low == normalized.low &&
+        _focusBounds->high == normalized.high) {
+        return;
+    }
+    _focusBounds = normalized;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::setFocusBoundsEnabled(bool enabled)
+{
+    if (_focusBoundsEnabled == enabled) {
+        return;
+    }
+    _focusBoundsEnabled = enabled;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::clearFocusBounds()
+{
+    if (!_focusBounds && !_focusBoundsEnabled) {
+        return;
+    }
+    _focusBounds.reset();
+    _focusBoundsEnabled = false;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -283,21 +324,6 @@ void CState::clearActiveSurface()
 }
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
-
-size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
-
-std::shared_ptr<vc::render::DecodedChunkCacheBudget>
-CState::decodedCacheBudget() const
-{
-    return _decodedCacheBudget;
-}
-
-void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
-{
-    if (vol && _cacheSizeBytes > 0) {
-        vol->setCacheBudget(_cacheSizeBytes, _decodedCacheBudget);
-    }
-}
 
 void CState::resolveCurrentVolumeId()
 {
@@ -336,8 +362,6 @@ void CState::closeAll()
         }
     }
 
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();

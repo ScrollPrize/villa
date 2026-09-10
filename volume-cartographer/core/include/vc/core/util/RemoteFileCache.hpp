@@ -31,6 +31,9 @@ struct RemoteFileCacheOptions {
     RemoteFileCachePolicy policy = RemoteFileCachePolicy::CacheFirst;
     RemoteFileCacheAccounting accounting = RemoteFileCacheAccounting::Unmanaged;
     vc::HttpAuth auth;
+    // When false and auth is empty, S3 requests are always anonymous and the
+    // machine's ambient AWS configuration is not consulted.
+    bool discoverAwsCredentials = true;
     RemoteFileFetcher fetcher;
 };
 

@@ -1,0 +1,5 @@
+{
+    "patch_radius_loss_inv": true,
+    "model_flow_integration_solver": "rk4",
+    "model_num_flow_integration_steps": 16
+}

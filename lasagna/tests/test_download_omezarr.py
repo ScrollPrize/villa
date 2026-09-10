@@ -95,6 +95,26 @@ def test_download_rejects_non_positive_worker_count():
         dl.download("s3://bucket/volume.zarr", "volume.zarr", workers=0)
 
 
+def test_s3_client_uses_bounded_standard_retries(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def client(self, service, *, config, region_name):
+            captured.update(service=service, config=config, region=region_name)
+            return object()
+
+    monkeypatch.setattr(dl.boto3, "Session", FakeSession)
+    dl._thread_local.s3_client_cache = None
+    dl._get_s3_client(True, "us-east-1")
+
+    assert captured["service"] == "s3"
+    assert captured["region"] == "us-east-1"
+    assert captured["config"].retries == {
+        "mode": "standard",
+        "total_max_attempts": 5,
+    }
+
+
 def test_stats_snapshots_noremote_sets_by_value():
     stats = dl.Stats()
     stats.noremote_keys = {0: {"0.0.0"}}
@@ -231,6 +251,62 @@ def test_scanner_uses_cached_missing_only_without_remote_inventory(tmp_path):
     assert snap["remote"] == 7
     assert snap["missing_remote"] == 1
     assert "0.0.1" not in _drain_chunk_keys(q)
+
+
+def test_scanner_transport_failure_is_reported_to_coordinator(tmp_path, monkeypatch):
+    def fail_iter(_bucket, _prefix, _anon):
+        raise dl.botocore.exceptions.ReadTimeoutError(endpoint_url="https://example.invalid")
+
+    monkeypatch.setattr(dl, "_s3_iter_objects", fail_iter)
+    stats = dl.Stats()
+    q: queue.Queue = queue.Queue()
+
+    dl._guarded_scanner(
+        "bucket",
+        "vol.zarr",
+        str(tmp_path / "vol.zarr"),
+        {0: {"shape": (2, 2, 2), "chunks": (2, 2, 2), "dim_sep": "."}},
+        None,
+        {0: [1.0, 1.0, 1.0]},
+        {0: set()},
+        True,
+        True,
+        "z",
+        q,
+        stats,
+        threading.Event(),
+    )
+
+    snapshot = stats.snapshot()
+    assert snapshot["scan_done"] is True
+    assert snapshot["inventory_done"] == 0
+    assert snapshot["inventory_failed"] == 1
+    assert "Read timeout" in snapshot["scan_error"]
+    assert "s3://bucket/vol.zarr/0/0." in snapshot["scan_error"]
+    with pytest.raises(dl._ScannerFailure, match="Read timeout"):
+        dl._drain_download_queue(
+            q, stats, bucket="bucket", anon=True, workers=2,
+            local_root=str(tmp_path / "vol.zarr"), levels=[0],
+        )
+
+
+def test_progress_reporter_is_silent_while_idle_and_writes_history_for_progress():
+    stats = dl.Stats()
+    reporter = dl._ProgressReporter(history_interval=60.0)
+
+    assert reporter.update(stats.snapshot(), 0.0) == ("[starting scan...]", False)
+    assert reporter.update(stats.snapshot(), 30.0) is None
+    assert reporter.update(stats.snapshot(), 61.0) is None
+
+    stats.inc(total_chunks=10, scanned=1, local=1)
+    live = reporter.update(stats.snapshot(), 62.0)
+    assert live is not None and live[1] is True
+    assert "scan 10.0%" in live[0]
+
+    assert reporter.update(stats.snapshot(), 123.0) is None
+    stats.inc(scanned=1, remote=1)
+    assert reporter.update(stats.snapshot(), 124.0)[1] is True
+    assert reporter.update(stats.snapshot(), 185.0) is None
 
 
 def test_remaining_download_estimate_counts_queued_404s_as_resolved():

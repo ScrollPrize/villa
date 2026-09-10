@@ -21,6 +21,8 @@ struct LasagnaDatasetOpenOptions {
     vc::HttpAuth remoteAuth;
     vc::core::util::RemoteFileCachePolicy cachePolicy = vc::core::util::RemoteFileCachePolicy::CacheFirst;
     vc::core::util::RemoteFileFetcher remoteFileFetcher;
+    // False forces anonymous S3 access for both the manifest and its groups.
+    bool discoverAwsCredentials = true;
 };
 
 struct MaterializedLasagnaManifest {

@@ -1,10 +1,95 @@
+import math
 import os
+import warnings
 from datetime import datetime
 
 import torch
 
 from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
 from vesuvius.neural_tracing.nets.models import load_checkpoint, resolve_checkpoint_path
+
+
+def _positive_finite_float_or_none(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+AUTO_DISPLACEMENT_SCALE = "auto"
+
+
+def is_auto_displacement_scale(value):
+    """True when a --displacement-scale value asks for checkpoint derivation."""
+    return isinstance(value, str) and value.strip().lower() == AUTO_DISPLACEMENT_SCALE
+
+
+def resolve_displacement_scale(displacement_scale, model_config, inference_voxel_size_um):
+    """Resolve the factor applied to predicted displacement vectors (#1149).
+
+    Displacement checkpoints predict offsets in voxels of their training
+    volumes, so applying them to a volume with a different voxel size may need
+    rescaling by training_voxel_size_um / inference_voxel_size_um to preserve
+    the physical hop length. Whether that is the intended contract is still an
+    open question in #1149, so scaling is strictly opt-in here.
+
+    ``displacement_scale`` accepts:
+
+    * ``None`` (no flag): scale 1.0, matching current behavior exactly. A
+      warning is emitted only when the checkpoint advertises a training voxel
+      size that differs from the inference one, so a real mismatch is not
+      silent.
+    * a positive float: used as given.
+    * ``"auto"``: derive training_voxel_size_um / inference_voxel_size_um from
+      the checkpoint config, erroring if either value is unavailable.
+
+    Returns (scale, source) with source one of "cli", "auto", or "default".
+    """
+    training_voxel_size_um = None
+    if isinstance(model_config, dict):
+        training_voxel_size_um = _positive_finite_float_or_none(model_config.get("training_voxel_size_um"))
+    inference_voxel_size_um = _positive_finite_float_or_none(inference_voxel_size_um)
+    derived_scale = None
+    if training_voxel_size_um is not None and inference_voxel_size_um is not None:
+        derived_scale = training_voxel_size_um / inference_voxel_size_um
+
+    if is_auto_displacement_scale(displacement_scale):
+        if derived_scale is None:
+            missing = (
+                "the checkpoint config does not store 'training_voxel_size_um'"
+                if training_voxel_size_um is None
+                else "the inference voxel size is unknown (pass --tifxyz-voxel-size-um)"
+            )
+            raise ValueError(f"--displacement-scale auto cannot derive a scale because {missing}.")
+        return derived_scale, "auto"
+
+    if displacement_scale is not None:
+        scale = float(displacement_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"displacement scale must be a positive finite number, got {displacement_scale!r}")
+        if derived_scale is not None and not math.isclose(scale, derived_scale, rel_tol=1e-3):
+            warnings.warn(
+                f"--displacement-scale {scale:.6g} differs from the checkpoint-derived value "
+                f"{derived_scale:.6g} (training_voxel_size_um={training_voxel_size_um:.6g}, "
+                f"inference voxel size={inference_voxel_size_um:.6g} um); using the explicit value.",
+                stacklevel=2,
+            )
+        return scale, "cli"
+
+    if derived_scale is not None and not math.isclose(derived_scale, 1.0, rel_tol=1e-3):
+        warnings.warn(
+            f"Checkpoint reports training_voxel_size_um={training_voxel_size_um:.6g} but inference runs "
+            f"at {inference_voxel_size_um:.6g} um. Displacements are applied unscaled (unchanged "
+            f"behavior); pass --displacement-scale {derived_scale:.6g} or --displacement-scale auto to "
+            "rescale them. See issue #1149.",
+            stacklevel=2,
+        )
+    return 1.0, "default"
 
 
 def predict_displacement(args, model_state, model_inputs, use_tta=None, profiler=None):

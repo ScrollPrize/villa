@@ -76,12 +76,14 @@ public:
                          std::filesystem::path target,
                          std::vector<std::filesystem::path> replacements,
                          std::uint64_t reservedGrowth,
-                         std::uint64_t reservedTemporaryBytes);
+                         std::uint64_t reservedTemporaryBytes,
+                         bool managed);
         std::shared_ptr<PersistentZarrCacheBudget> owner_;
         std::filesystem::path target_;
         std::vector<std::filesystem::path> replacements_;
         std::uint64_t reservedGrowth_ = 0;
         std::uint64_t reservedTemporaryBytes_ = 0;
+        bool managed_ = true;
     };
 
     // Nested roots reuse an existing containing budget. Configuring a broader
@@ -104,6 +106,27 @@ public:
         const std::filesystem::path& target,
         std::uint64_t newSize,
         std::vector<std::filesystem::path> replacedPaths = {});
+    // Reserves temporary disk space and pins the path without adding it to
+    // the evictable managed-byte set. Used for structural Zarr metadata.
+    WriteReservation reserveProtectedWrite(
+        const std::filesystem::path& target,
+        std::uint64_t newSize);
+
+    // Atomically retires an exact cache subtree and forgets every managed entry
+    // beneath it as one budget-coordinated operation. Recursive deletion and
+    // accounting refresh then run in the background. Overlapping reads/writes
+    // are drained, but an in-progress startup scan is restarted rather than
+    // blocking a format transition.
+    bool removeCacheSubtree(const std::filesystem::path& subtree,
+                            std::error_code& ec);
+
+    // Atomically moves an exact cache subtree within this budget root. Budget
+    // accounting is refreshed asynchronously, including when a startup scan is
+    // already running, so callers do not wait on a whole-root index walk. The
+    // destination must not exist.
+    bool moveCacheSubtree(const std::filesystem::path& source,
+                          const std::filesystem::path& destination,
+                          std::error_code& ec);
 
     // Primarily useful for deterministic tests and orderly shutdown checks.
     void waitForIdle();
@@ -116,12 +139,20 @@ private:
                               SpaceProvider spaceProvider);
     void startScan();
     void startTrim();
+    void removeRetiredSubtreeAsync(std::filesystem::path retired,
+                                   bool alreadyRegistered = false);
     void releaseRead(const std::filesystem::path& path, bool touch);
     void finishWrite(const std::filesystem::path& target,
                      const std::vector<std::filesystem::path>& replacements,
                      std::uint64_t reservedGrowth,
                      std::uint64_t reservedTemporaryBytes,
-                     bool committed);
+                     bool committed,
+                     bool managed);
+    WriteReservation reserveWriteImpl(
+        const std::filesystem::path& target,
+        std::uint64_t newSize,
+        std::vector<std::filesystem::path> replacedPaths,
+        bool managed);
 
     std::unique_ptr<Impl> impl_;
 };

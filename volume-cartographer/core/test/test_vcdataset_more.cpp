@@ -37,7 +37,8 @@ TEST_CASE("buildZarrCodecRegistry returns a registry with the known codecs")
 {
     auto reg1 = vc::buildZarrCodecRegistry(1);
     auto reg2 = vc::buildZarrCodecRegistry(2);
-    // Should have entries for blosc/zstd/lz4/gzip/zlib/c3d.
+    CHECK(reg1.contains(vc::kDelta3dCodecName));
+    CHECK(reg1.contains(vc::kVcz1CodecName));
     CHECK(reg1.size() >= 4);
     CHECK(reg2.size() >= 4);
 }
@@ -86,6 +87,10 @@ TEST_CASE("ZarrArray::read_chunk_into decodes vcz1 chunks")
 
     const auto encoded = vc::cacheCompress(
         std::span<const std::byte>(payload.data(), payload.size()), shape, 1);
+    auto legacyEncoded = encoded;
+    legacyEncoded[0] = std::byte{'V'};
+    legacyEncoded[1] = std::byte{'C'};
+    legacyEncoded[2] = std::byte{'Z'};
 
     std::ofstream(d / ".zarray") << R"({
         "zarr_format": 2,
@@ -99,8 +104,8 @@ TEST_CASE("ZarrArray::read_chunk_into decodes vcz1 chunks")
         "dimension_separator": "."
     })";
     std::ofstream chunk(d / "0.0.0", std::ios::binary);
-    chunk.write(reinterpret_cast<const char*>(encoded.data()),
-                static_cast<std::streamsize>(encoded.size()));
+    chunk.write(reinterpret_cast<const char*>(legacyEncoded.data()),
+                static_cast<std::streamsize>(legacyEncoded.size()));
     chunk.close();
 
     auto array = utils::ZarrArray::open(d, vc::buildZarrCodecRegistry(1));
@@ -223,15 +228,17 @@ TEST_CASE("readChunkOrFill: present chunk returns true; output mirrors written d
 
 TEST_CASE("ZarrArray reads a v2 array stored with the vcz1 codec")
 {
-    // Mirrors what scripts/recompress_zarr.py produces: VCZ1 chunk payloads
-    // plus a .zarray whose compressor id is "vcz1".
-    auto d = tmpDir("vcdeltazstd_read");
+    // Existing arrays pair VCZ1 chunk payloads with compressor id "vcz1".
+    auto d = tmpDir("vcdelta_read");
     const std::array<int, 3> shape{4, 4, 4};
     std::vector<std::byte> voxels(64);
     for (std::size_t i = 0; i < voxels.size(); ++i)
         voxels[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
-    const auto encoded = vc::cacheCompress(
+    auto encoded = vc::cacheCompress(
         std::span<const std::byte>(voxels.data(), voxels.size()), shape, 1);
+    encoded[0] = std::byte{'V'};
+    encoded[1] = std::byte{'C'};
+    encoded[2] = std::byte{'Z'};
 
     {
         std::ofstream meta(d / ".zarray");

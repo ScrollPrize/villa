@@ -56,9 +56,11 @@ static std::shared_ptr<Volume> New(std::filesystem::path path,
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
     const std::string& url,
-    const std::filesystem::path& cacheRoot = {},
     const vc::HttpAuth& auth = {});
 ```
+
+Remote volumes always use the process-wide remote cache root configured by
+VC3D.
 
 `New(path, options)` creates a local zarr pyramid when `path` has no existing
 zarr array, or when `options.overwriteExisting` is true. Existing volumes are
@@ -146,12 +148,32 @@ are currently supported by this API.
 
 ### Cache and Sampling
 
+All normal volumes use the core-owned process `ChunkCacheService`. Configure
+that service directly before or during use:
+
+| Process API | Description |
+|-------------|-------------|
+| `vc::render::processChunkCacheService()` | Return the process-lifetime regular cache service |
+| `configureDecodedByteCapacity(bytes)` | Change the global decoded RAM ceiling in place |
+| `configureFetchConcurrency(count, adaptive)` | Change global source-read admission in place |
+
+Python exposes the equivalent module-level functions
+`vc.set_chunk_cache_budget(bytes)` and
+`vc.set_chunk_cache_io_threads(count)`. The latter selects fixed admission.
+Cache policy is deliberately not configured through a `Volume` instance.
+
+For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
+mirror: metadata and fetched storage objects keep their source-relative paths
+and exact encoded bytes. Sharded arrays cache one complete outer shard and fan
+out requested inner-chunk decodes from that shared payload. Adjacent `.empty`
+markers represent missing whole objects. Existing legacy
+`level_N/z/y/x.<ext>` caches are detected automatically and remain readable and
+writable without migration; no new decoded-cache recompression is performed.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `chunkedCache()` | `vc::render::IChunkedArray*` | Shared chunked cache for local or remote reads |
-| `createChunkCache(Options)` | `std::shared_ptr<ChunkCache>` | Create an independent cache |
-| `setCacheBudget(size_t hotBytes)` | `void` | Set decoded cache capacity and reset the shared cache |
-| `setIOThreads(int count)` | `void` | Set background chunk read concurrency and reset the shared cache |
+| `sharedChunkCache()` | `std::shared_ptr<ChunkCache>` | Shared process cache handle for this source |
 | `invalidateCache()` | `void` | Drop decoded/read cache state |
 | `sample(Mat_<uint8_t>&, coords, params)` | `void` | Sample into an 8-bit image |
 | `sample(Mat_<uint16_t>&, coords, params)` | `void` | Sample into a 16-bit image |
@@ -387,10 +409,14 @@ volume->updateMetadata(patch);
   using power-of-two level indices, with limited per-level padding tolerance.
 - Local zarr arrays may be stored as scale directories (`0`, `1`, `2`, ...)
   or as a root array for level 0.
-- Remote `s3://` URLs are resolved to HTTPS. AWS SigV4 credentials are used
-  when available, with anonymous fallback for public buckets if stale
-  credentials are rejected.
-- Cache settings are applied by resetting the shared cache; existing independent
-  caches created by `createChunkCache()` are not modified.
+- Remote `s3://` URLs are resolved to HTTPS and opened anonymously first. AWS
+  SigV4 credentials are used when anonymous access is denied.
+- `processChunkCacheService()` retains regular source state for the process.
+  Capacity and concurrency changes preserve source identity and all
+  queued/running work. A capacity reduction evicts globally oldest decoded
+  entries but does not cancel fetch/decode work. Acquiring a volume source
+  never changes either policy. Low-level standalone cache factories create a
+  fully independent service and budget; normal `Volume` users cannot attach a
+  private or partially shared service.
 - Region writes and raw chunk writes are local-only and invalidate the shared
   cache after successful mutation.

@@ -917,7 +917,6 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     if (!attachment->prepare(
             location,
             std::move(tags),
-            VolumeAttachmentPresentation::Silent,
             &request,
             &error,
             &preparationFailure)) {

@@ -398,3 +398,13 @@
   and automatic minimal Atlas model registration.
 - Standardized Fiber Atlas models as `fiber3d/unet` Lasagna models with numeric
   references, relative snapshot path, and snapshot SHA-256.
+
+## 2026-08-11 — Shared live selected-scale inference cache
+
+- Added opt-in Fiber/Lasagna full-volume live S3 materialization with a bounded
+  lazy tile window, authoritative active-plane inventory, atomic transfer, and
+  conservative whole-Z-plane eviction behind the canonical commit frontier.
+- Added selected-level reader/mutator locking, manager launch/provenance support,
+  and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
+- Made live progress cadence independent of TTY detection and report unique
+  remote-missing chunks per listed Z plane.

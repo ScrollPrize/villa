@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dinovol-2"
+version = "0.1.0"
+description = "3d adaptation of dinov2 pretraining for larger than memory ome-zarr arrays"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "einops",
+    "fft-conv-pytorch",
+    "fsspec>=2026.2.0",
+    "numpy>=2.4.3",
+    "pillow>=12.1.1",
+    "scikit-image",
+    "scipy",
+    "s3fs",
+    "timm==1.0.20",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+    "zarr>=3.1.5",
+    "wandb>=0.25.1",
+    "tifffile>=2026.3.3",
+    "imagecodecs>=2026.3.6",
+    "numcodecs>=0.16.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["dinovol_2*"]

@@ -41,6 +41,21 @@ import torch
 import zarr
 
 try:
+	from live_omezarr_cache import (
+		DEFAULT_LIVE_CACHE_GIB,
+		DEFAULT_LIVE_FETCH_AHEAD_TILES,
+		LiveOmeZarrCache,
+		path_has_download_source,
+	)
+except ImportError:
+	from lasagna.live_omezarr_cache import (
+		DEFAULT_LIVE_CACHE_GIB,
+		DEFAULT_LIVE_FETCH_AHEAD_TILES,
+		LiveOmeZarrCache,
+		path_has_download_source,
+	)
+
+try:
 	from tiled_predict3d import (
 		DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
 		DEFAULT_INPUT_CACHE_BYTES,
@@ -50,6 +65,7 @@ try:
 		DEFAULT_OME_COMPRESSOR,
 		OME_COMPRESSOR_CHOICES,
 		DEFAULT_PREFETCH_TILES_PER_GPU,
+		_auto_download as _shared_auto_download,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
 		OutputAdapter,
@@ -107,6 +123,7 @@ except ImportError:
 		DEFAULT_OME_COMPRESSOR,
 		OME_COMPRESSOR_CHOICES,
 		DEFAULT_PREFETCH_TILES_PER_GPU,
+		_auto_download as _shared_auto_download,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
 		OutputAdapter,
@@ -1384,116 +1401,6 @@ def _calibrate_instance_norm(
 	print("[calibrate_norm] done")
 
 
-def _find_zarr_group_root(path: str) -> Path | None:
-	"""Walk up from a zarr array path to find the group root (.zattrs or .zgroup).
-
-	Handles trailing slashes, numeric level dirs, and nested structures
-	like ``volpkg/volumes/vol.zarr/2``.
-	"""
-	p = Path(str(path).rstrip("/")).resolve()
-	# Start from p itself, walk up until we find .zattrs or .zgroup
-	check = p
-	for _ in range(5):  # don't walk up forever
-		if (check / ".zattrs").is_file() or (check / ".zgroup").is_file():
-			return check
-		if check.parent == check:
-			break
-		check = check.parent
-	return None
-
-
-def _download_one_path(
-	zarr_path: str,
-	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
-	download_workers: int = 64,
-) -> None:
-	"""Download chunks for a single zarr path from its S3 source.
-
-	Walks up from *zarr_path* to find the group root with ``_download``
-	metadata.  Downloads only the level indicated by the path's trailing
-	numeric component (e.g. ``vol.zarr/2`` → scale 2).
-	"""
-	import json as _json
-	import sys as _sys
-	_lasagna_dir = str(Path(__file__).resolve().parent)
-	if _lasagna_dir not in _sys.path:
-		_sys.path.insert(0, _lasagna_dir)
-	from scripts.download_omezarr import download
-
-	p = Path(str(zarr_path).rstrip("/")).resolve()
-
-	# Find group root with _download metadata
-	group_root = None
-	dl_meta = None
-	check = p
-	for _ in range(5):
-		zattrs_path = check / ".zattrs"
-		if zattrs_path.is_file():
-			zattrs = _json.loads(zattrs_path.read_text(encoding="utf-8"))
-			if "_download" in zattrs:
-				group_root = check
-				dl_meta = zattrs["_download"]
-				break
-		if check.parent == check:
-			break
-		check = check.parent
-
-	if group_root is None or dl_meta is None:
-		raise ValueError(
-			f"no _download metadata found walking up from {zarr_path} — "
-			"run download_omezarr.py on this volume first "
-			"(it records the S3 source), or pass --no-download to skip"
-		)
-
-	# Determine scale from path (e.g. vol.zarr/2 → scale 2)
-	scales: list[int] | None = None
-	if p.name.isdigit():
-		scales = [int(p.name)]
-
-	# Convert crop to bbox (base coords)
-	bbox: tuple[int, int, int, int, int, int] | None = None
-	if crop_xyzwhd is not None:
-		x, y, z, w, h, d = crop_xyzwhd
-		bbox = (x, y, z, x + w, y + h, z + d)
-
-	source_uri = dl_meta["source"]
-	anon = dl_meta.get("anon", False)
-	region = dl_meta.get("region")
-
-	print(f"[predict3d] downloading {source_uri} "
-		  f"scales={scales or 'all'} dest={group_root} ...", flush=True)
-	ret = download(
-		source=source_uri,
-		dest=str(group_root),
-		scales=scales,
-		bbox_xyzxyz=bbox,
-		anon=anon,
-		region=region,
-		workers=int(download_workers),
-	)
-	if ret != 0:
-		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
-
-
-def _auto_download(
-	input_path: str,
-	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
-	pred_dt_path: str | None,
-	download_workers: int = 64,
-) -> None:
-	"""Auto-download input and pred-dt data from S3.
-
-	Each path is resolved independently to its own zarr group root —
-	they may come from different S3 sources.
-	"""
-	if int(download_workers) <= 0:
-		raise ValueError("download_workers must be a positive integer")
-	_download_one_path(input_path, crop_xyzwhd, int(download_workers))
-	if pred_dt_path:
-		_download_one_path(pred_dt_path, crop_xyzwhd, int(download_workers))
-	print("[predict3d] all downloads complete", flush=True)
-
-
 def _resolve_base_shape(
 	input_path: str,
 	base_ref: str | None,
@@ -1611,6 +1518,7 @@ def run_preprocess_3d(
 	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
 	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	download_workers: int = 64,
+	live_cache: LiveOmeZarrCache | None = None,
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str = "float16",
 ) -> None:
@@ -1986,6 +1894,7 @@ def run_preprocess_3d(
 			profile_pipeline=bool(profile_pipeline),
 			product_accumulator_dtype=str(product_accumulator_dtype),
 			accumulator_workers=int(accumulator_workers),
+			live_cache=live_cache,
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -2827,6 +2736,12 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Spawned chunk accumulation processes (default: min(CPU count, 32)); 0 is synchronous.")
 	p.add_argument("--download-workers", type=int, default=64,
 		help="Parallel S3 chunk download threads used by automatic download.")
+	p.add_argument("--live-fetch", action="store_true",
+		help="Fetch the selected input scale lazily and evict only safe old Z-chunk planes.")
+	p.add_argument("--live-cache-gib", type=float, default=None,
+		help=f"Selected-scale disk-cache target in GiB (default: {DEFAULT_LIVE_CACHE_GIB}).")
+	p.add_argument("--live-fetch-ahead-tiles", type=int, default=None,
+		help=f"Lazy materialization lookahead in canonical tiles (default: {DEFAULT_LIVE_FETCH_AHEAD_TILES}).")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
 	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
 	p.add_argument("--edt-chunk-depth", type=int, default=256, help="EDT chunk depth in Z (default 256).")
@@ -2869,9 +2784,29 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		p.error("--input-io-threads must be > 0")
 	if int(args.input_copy_threads) <= 0:
 		p.error("--input-copy-threads must be > 0")
+	if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
+		p.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
+	if args.live_fetch and args.no_download:
+		p.error("--live-fetch conflicts with --no-download")
+	if args.live_fetch and args.crop_xyzwhd is not None:
+		p.error("--live-fetch supports only full, non-cropped inference")
+	if args.live_fetch and args.pred_dt and path_has_download_source(args.pred_dt):
+		p.error("--live-fetch does not yet support a separately remote --pred-dt source")
+	if args.live_fetch:
+		live_cache_gib = float(
+			DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
+		)
+		live_lookahead = int(
+			DEFAULT_LIVE_FETCH_AHEAD_TILES
+			if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
+		)
+		if not math.isfinite(live_cache_gib) or live_cache_gib <= 0:
+			p.error("--live-cache-gib must be finite and > 0")
+		if live_lookahead <= 0:
+			p.error("--live-fetch-ahead-tiles must be > 0")
 
-	if not args.no_download:
-		_auto_download(
+	if not args.no_download and not args.live_fetch:
+		_shared_auto_download(
 			input_path=str(args.input),
 			crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
 			pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
@@ -2924,6 +2859,17 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			"ome_chunk": int(args.ome_chunk),
 			"ome_compressor_requested": str(args.ome_compressor),
 			"product_accumulator_dtype": str(args.product_accumulator_dtype),
+			"live_fetch": {
+				"enabled": bool(args.live_fetch),
+				"cache_target_gib": float(
+					DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
+				),
+				"lookahead_tiles": int(
+					DEFAULT_LIVE_FETCH_AHEAD_TILES
+					if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
+				),
+				"download_workers": int(args.download_workers),
+			},
 		},
 		"atlas_model_identity": {
 			"model_id": context.get("model", {}).get("atlas_model_id") if isinstance(context.get("model"), dict) else None,
@@ -2939,7 +2885,20 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		"manifest": output_manifest.name,
 	})
 	write_provenance(provenance_path, provenance)
+	live_cache = None
 	try:
+		if args.live_fetch:
+			live_cache = LiveOmeZarrCache(
+				str(args.input),
+				max_bytes=int(float(
+					DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
+				) * (1 << 30)),
+				lookahead_tiles=int(
+					DEFAULT_LIVE_FETCH_AHEAD_TILES
+					if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
+				),
+				workers=int(args.download_workers),
+			)
 		a_in = zarr.open(str(args.input), mode="r")
 		input_shape = tuple(int(value) for value in a_in.shape)
 		base_shape = _resolve_base_shape(str(args.input), args.base_ref, args.base_scale)
@@ -2989,13 +2948,20 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		profile_pipeline=bool(args.profile_pipeline),
 		product_accumulator_dtype=str(args.product_accumulator_dtype),
 		download_workers=int(args.download_workers),
+		live_cache=live_cache,
 		)
+		if live_cache is not None:
+			live_cache.close()
+			provenance["inference"]["live_fetch"]["final_stats"] = live_cache.snapshot()
 		provenance["product"] = _lasagna_product_provenance(output_manifest)
 		finalize_document(
 			provenance, path=provenance_path, status="completed",
 			manifest_path=output_manifest,
 		)
 	except BaseException as error:
+		if live_cache is not None:
+			live_cache.close()
+			provenance["inference"]["live_fetch"]["final_stats"] = live_cache.snapshot()
 		finalize_document(
 			provenance, path=provenance_path,
 			status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
@@ -3003,6 +2969,9 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			error=type(error).__name__,
 		)
 		raise
+	finally:
+		if live_cache is not None:
+			live_cache.close()
 	return 0
 
 

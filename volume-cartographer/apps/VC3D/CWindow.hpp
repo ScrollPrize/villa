@@ -31,7 +31,6 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-namespace vc::render { class DecodedChunkCacheBudget; }
 #include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
@@ -75,6 +74,7 @@ struct RenderBenchOptions {
     bool replayTimedProfile = false;
     int replayTimedProfilePeriodMs = 200;
     int replayLimit = 0;
+    bool debugDownloadQueue = false;
 };
 
 struct AtlasSearchFiberSnapshot {
@@ -129,6 +129,7 @@ class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
+class FiberMapWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -219,6 +220,11 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    // Coalesced entry point: fiberSaved fires once per saved fiber and a
+    // single edit saves the session plus its linked peers, so refreshes fold
+    // into one dock rebuild per burst instead of one per signal.
+    void scheduleAtlasSearchDockRefresh();
+    bool _atlasSearchDockRefreshQueued = false;
     void remapCurrentAtlas();
     // Starts atlas remapping without dialogs. The interactive caller can add
     // its completion UI through onFinished.
@@ -285,7 +291,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         const QString& location,
         std::vector<std::string> tags = {},
-        const QString& remoteCacheRoot = {},
         const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
@@ -313,6 +318,8 @@ private slots:
     void onEditMaskPressed(const QString& segmentId);
     void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
+    void onFocusBoundsEdited();
+    void onFocusBoundsToggled(bool enabled);
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
@@ -325,6 +332,7 @@ private slots:
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
+    void refreshFocusBoundsUi();
 
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;
@@ -349,6 +357,7 @@ private slots:
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
+    void updateSharedStatusLabel();
     void onZScrollSensitivityChanged(double sensitivity);
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
@@ -400,10 +409,10 @@ private:
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
-    QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
+    QStringList _sharedCacheStatsItems;
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
@@ -421,6 +430,7 @@ private:
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
+    FiberMapWorkspace* _fiberMapWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
@@ -455,7 +465,6 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedChunkCacheBudget;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

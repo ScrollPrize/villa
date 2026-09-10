@@ -156,6 +156,20 @@ TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
 fallback uses `--prefetch-workers`. Single-device inference submits the same
 bounded canonical TensorStore future window before synchronous model forwards.
 
+For volumes too large to retain locally, both entry points can pass
+`--live-fetch`. `lasagna.live_omezarr_cache` validates the selected local
+numeric level against its S3 source, lazily materializes at most 10,000 cheap
+canonical tile descriptors ahead, and admits only completed materializations
+to the independently bounded TensorStore tile-array window. It inventories and
+accounts only the selected scale. After a complete canonical Z row commits,
+the runner may delete whole cached Z-chunk planes strictly behind the safe
+input frontier until actual resident bytes fall below the default 10 TiB
+target. Protected/current/future planes are never deleted, and lack of a safe
+plane produces a conservative temporary overshoot rather than a stall.
+Selected-level advisory locks prevent cooperating bulk download, live mutation,
+and ordinary inference readers from colliding. Remote listings are authoritative;
+`.noremote` remains advisory and eviction never records remote absence.
+
 The shared multi-device runner's opt-in `--profile-pipeline` diagnostics use
 streaming aggregates and callbacks bounded by that prefetch window. They report
 read service/active span/throughput/effective outstanding-request concurrency,

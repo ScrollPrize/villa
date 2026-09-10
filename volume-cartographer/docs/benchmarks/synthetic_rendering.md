@@ -2,9 +2,11 @@
 
 `bench_render_synthetic` measures the production
 `ChunkedPlaneSampler::sampleCoordsFineToCoarse` path without storage, network,
-decompression, or asynchronous chunk scheduling. It uses a four-level synthetic
-resident array whose deterministic pseudo-random chunk bytes are materialized
-before measurement.
+decompression, or asynchronous chunk scheduling. It uses the production
+`ChunkCache` with a four-level deterministic `IChunkFetcher`. The fetcher
+materializes pseudo-random chunk bytes during preload, and the benchmark fails
+if rendering reaches it after measurement setup. Production cache lookup,
+locking, and request-context handling remain inside the measured path.
 
 ## Scenarios
 
@@ -936,9 +938,9 @@ native difference between correlated and shuffled memory access.
 
 The CI gate uses `scripts/run_render_valgrind_ci.py` and writes under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`. Every case
-has a separate-thread Callgrind artifact. Parallel cases additionally have a
-DRD trace/event artifact. Collection manifests are written atomically after
-validation, and each raw file is hashed before evaluation.
+has one separate-thread Callgrind execution. Parallel cases use the scheduler
+and futex stream from that same execution. Collection manifests are written
+atomically after validation, and each raw file is hashed before evaluation.
 
 The frozen model is `core/test/data/render_valgrind_ci_model.json`. It uses the
 seven synthetic-only data-read event coefficients. Serial score is total
@@ -962,18 +964,19 @@ modeled-runtime score only. It must not be described as estimated native wall
 time. Each candidate score must fall in `[0.90, 1.10]` times the checked
 reference.
 
-The gate rejects model hashes, checksums, incomplete DRD dependencies, compiler,
-cache geometry, architecture, fixture shape, repetition count, and worker count
-that differ from the reference. It records reference and observed Valgrind
-versions but does not reject a version change by itself; material profiler
-effects remain subject to the modeled-score tolerance. CI retains the complete
-`render-valgrind-ci/` tree even on failure.
+Historical model hashes, checksums, compiler, cache geometry, architecture,
+fixture shape, repetition count, worker count, and Valgrind version are
+diagnostic and do not fail comparison with the reference. Current-run metadata,
+the measured window, and successful futex dependencies must still be internally
+valid. Material profiler effects remain subject to the modeled-score tolerance.
+CI retains the complete `render-valgrind-ci/` tree even on failure.
 
-The CI runtime does not import NumPy. Its standard-library Python coordinator
-collects and validates artifacts, while the versioned C++ replay engine computes
-event features, per-thread modeled costs, serial totals, cost attribution, and
-parallel replay. The `test_render_valgrind_ci_no_site` CTest runs this boundary
-under `python3 -S`.
+The regular estimate does not run Python. Ninja invokes Callgrind directly, and
+the versioned C++ replay engine parses its periodic profiles and scheduler log,
+computes event features and per-thread modeled costs, then performs serial
+aggregation or parallel replay. Python remains a maintenance tool for freezing
+models and references. The `test_render_valgrind_ci_no_site` CTest verifies that
+maintenance boundary under `python3 -S`.
 
 The 2026-08-07 GCC 15.3.0/Valgrind 3.25.1 reference collection took 15.73 s on
 the four-core calibration host. A second fresh collection and gate took 16.38

@@ -11,7 +11,7 @@ import {
 } from './vercel-preview-cli.mjs';
 
 const sha = '0123456789abcdef0123456789abcdef01234567';
-const ref = 'refs/heads/codex/progress-prize-smoke-20260720';
+const ref = 'refs/heads/codex/progress-prize-2026-08';
 
 function environment(overrides = {}) {
   return {
@@ -99,7 +99,7 @@ test('binds trusted environment values to the verifier and writes only safe stat
   const written = appends.map(({ contents }) => contents).join('\n');
   assert.doesNotMatch(
     written,
-    /private|0123456789abcdef|progress-prize-smoke|forms\.gle|890972577|121906140/,
+    /private|0123456789abcdef|progress-prize|forms\.gle|890972577|121906140/,
   );
 });
 

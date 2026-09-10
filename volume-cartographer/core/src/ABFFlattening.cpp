@@ -2405,6 +2405,13 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
     QuadSurface* result = new QuadSurface(outPoints, outScale);
 
+    // Carry the source segment's provenance forward. The points+scale
+    // constructor above leaves meta empty; without this, every flattened
+    // surface loses scroll_source/target_volume/seed/etc. and QuadSurface::save()
+    // has nothing to preserve but the 5 keys it sets itself (bbox/type/uuid/
+    // format/scale) — see villa#1321.
+    result->meta = surface.meta;
+
     // Step 7: Optionally rotate to place highest Z values at top (row 0)
     if (config.rotateHighZToTop) {
         result->orientZUp();

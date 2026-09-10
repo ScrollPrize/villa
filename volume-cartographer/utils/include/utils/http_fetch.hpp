@@ -14,6 +14,7 @@
 #include <span>
 #include <atomic>
 #include <filesystem>
+#include <functional>
 
 // NOTE: <curl/curl.h> is intentionally NOT included here. All curl-typed
 // code lives in http_fetch.cpp so the ~88 TUs that pull this header in
@@ -29,6 +30,8 @@ struct HttpResponse {
     std::vector<std::byte> body;
     std::string content_type;
     std::size_t content_length = 0;
+    // Populated when libcurl fails before an HTTP response is received.
+    std::string error_message;
 
     [[nodiscard]] bool ok() const noexcept { return status_code >= 200 && status_code < 300; }
     [[nodiscard]] bool not_found() const noexcept { return status_code == 404; }
@@ -111,11 +114,35 @@ struct AwsAuth {
 // ---------------------------------------------------------------------------
 class HttpClient final {
 public:
+    using DownloadObserver = std::function<void(std::size_t)>;
+
+    // Observes response-body bytes received by HttpClient calls on the current
+    // thread. Scoping keeps unrelated HTTP and metadata traffic out of callers'
+    // transfer measurements.
+    class ScopedDownloadObserver final {
+    public:
+        explicit ScopedDownloadObserver(DownloadObserver observer);
+        ~ScopedDownloadObserver();
+
+        ScopedDownloadObserver(const ScopedDownloadObserver&) = delete;
+        ScopedDownloadObserver& operator=(const ScopedDownloadObserver&) = delete;
+        ScopedDownloadObserver(ScopedDownloadObserver&&) = delete;
+        ScopedDownloadObserver& operator=(ScopedDownloadObserver&&) = delete;
+
+    private:
+        DownloadObserver previous_;
+    };
+
     struct Config {
         HttpAuth auth{};
         AwsAuth aws_auth{};  // AWS SigV4 authentication (takes precedence over auth if non-empty)
         std::chrono::seconds connect_timeout{10};
         std::chrono::seconds transfer_timeout{30};
+        // A zero transfer timeout disables the total wall-clock deadline.
+        // When both low-speed values are non-zero, curl aborts only after the
+        // transfer remains below the byte rate for the configured duration.
+        std::size_t low_speed_limit_bytes_per_second{0};
+        std::chrono::seconds low_speed_time{0};
         bool follow_redirects{true};
         std::size_t max_retries{3};
         std::string user_agent{"utils-http/1.0"};

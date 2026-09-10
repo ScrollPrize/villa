@@ -298,15 +298,21 @@ TEST_CASE("isRemote is false for purely-local projects")
     fs::remove_all(d);
 }
 
-TEST_CASE("hasRemoteCacheRoot + remoteCacheRootOrEmpty round-trip")
+TEST_CASE("runtime remote cache root is not persisted in projects")
 {
-    auto p = VolumePkg::newEmpty();
-    CHECK_FALSE(p->hasRemoteCacheRoot());
-    CHECK(p->remoteCacheRootOrEmpty().empty());
-    auto d = tmpDir("rcr");
-    p->setRemoteCacheRoot(d);
-    CHECK(p->hasRemoteCacheRoot());
-    CHECK(p->remoteCacheRootOrEmpty() == d.string());
+    auto d = tmpDir("runtime_cache_root");
+    const auto project = d / "project.volpkg.json";
+    vc::project::LoadOptions options;
+    auto pkg = VolumePkg::newEmpty(options);
+    pkg->save(project);
+
+    std::ifstream input(project);
+    REQUIRE(input.good());
+    const std::string json(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    CHECK(json.find("remote_cache_root") == std::string::npos);
+
     fs::remove_all(d);
 }
 

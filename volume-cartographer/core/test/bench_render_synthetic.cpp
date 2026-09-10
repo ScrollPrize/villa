@@ -1,5 +1,6 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
-#include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/ChunkFetch.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -38,13 +39,18 @@
 namespace
 {
 
+using vc::render::ChunkCache;
+using vc::render::ChunkCacheService;
 using vc::render::ChunkDtype;
 using vc::render::ChunkedPlaneSampler;
+using vc::render::ChunkFetchResult;
+using vc::render::ChunkFetchStatus;
 using vc::render::ChunkKey;
 using vc::render::ChunkKeyHash;
 using vc::render::ChunkResult;
 using vc::render::ChunkStatus;
 using vc::render::IChunkedArray;
+using vc::render::IChunkFetcher;
 
 constexpr int kLevels = 4;
 constexpr int kTileSize = 32;
@@ -151,79 +157,53 @@ std::uint64_t keySeed(const ChunkKey& key)
     return splitmix64(value ^ (std::uint64_t(static_cast<std::uint32_t>(key.ix)) << 32U));
 }
 
-class SyntheticResidentArray final : public IChunkedArray
+class SyntheticChunkFetcher final : public IChunkFetcher
 {
 public:
-    SyntheticResidentArray(const cv::Mat_<cv::Vec3f>& coords, const cv::Mat_<uint8_t>& expectedLevels)
+    SyntheticChunkFetcher(const cv::Mat_<cv::Vec3f>& coords, const cv::Mat_<uint8_t>& expectedLevels)
     {
         if (coords.size() != expectedLevels.size())
             throw std::runtime_error("coordinate and expected-level shapes differ");
         buildEntries(coords, expectedLevels);
     }
 
-    int numLevels() const override { return kLevels; }
+    ChunkFetchResult fetch(const ChunkKey& key) override { return decodeFetched(key, fetchEncoded(key)); }
 
-    std::array<int, 3> shape(int level) const override
+    ChunkFetchResult fetchEncoded(const ChunkKey& key) override
     {
-        const int scale = 1 << level;
-        return {kLevel0Shape[0] / scale, kLevel0Shape[1] / scale, kLevel0Shape[2] / scale};
+        fetchCalls_.fetch_add(1, std::memory_order_relaxed);
+        const auto found = entries_.find(normalized(key));
+        if (found == entries_.end())
+            return {ChunkFetchStatus::IoError, {}, {}, false, false, 0, "synthetic fixture accessed an undeclared chunk"};
+        ChunkFetchResult result;
+        result.status = found->second == ChunkStatus::Data ? ChunkFetchStatus::Found : ChunkFetchStatus::Missing;
+        return result;
     }
 
-    std::array<int, 3> chunkShape(int) const override { return kChunkShape; }
-    ChunkDtype dtype() const override { return ChunkDtype::UInt8; }
-    double fillValue() const override { return 0.0; }
-
-    LevelTransform levelTransform(int level) const override
+    ChunkFetchResult decodeFetched(const ChunkKey& key, ChunkFetchResult fetched) const override
     {
-        const double scale = 1.0 / double(1 << level);
-        return {{scale, scale, scale}, {0.0, 0.0, 0.0}};
+        if (fetched.status != ChunkFetchStatus::Found)
+            return fetched;
+        const std::size_t chunkBytes = std::size_t(kChunkShape[0]) * std::size_t(kChunkShape[1]) * std::size_t(kChunkShape[2]);
+        fetched.bytes.resize(chunkBytes);
+        std::uint64_t state = keySeed(normalized(key));
+        const int base = key.level * kValueBand + 8;
+        for (std::size_t i = 0; i < fetched.bytes.size(); ++i) {
+            state = splitmix64(state + i);
+            fetched.bytes[i] = std::byte(base + int(state % 24U));
+        }
+        return fetched;
     }
 
-    ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
-    {
-        recordThread();
-        return lookup({level, iz, iy, ix});
-    }
+    const std::unordered_map<ChunkKey, ChunkStatus, ChunkKeyHash>& entries() const { return entries_; }
 
-    ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override
-    {
-        recordThread();
-        return lookup({level, iz, iy, ix});
-    }
-
-    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override { return lookup({level, iz, iy, ix}); }
-
-    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
-    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
-    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
-
-    void startThreadTracking()
-    {
-        std::lock_guard lock(threadMutex_);
-        threadIds_.clear();
-        trackThreads_.store(true, std::memory_order_release);
-    }
-
-    std::size_t stopThreadTracking()
-    {
-        trackThreads_.store(false, std::memory_order_release);
-        std::lock_guard lock(threadMutex_);
-        return threadIds_.size();
-    }
+    std::size_t fetchCalls() const { return fetchCalls_.load(std::memory_order_relaxed); }
 
 private:
-    struct Entry {
-        ChunkStatus status = ChunkStatus::Missing;
-        std::shared_ptr<const std::vector<std::byte>> bytes;
-    };
-
-    ChunkResult lookup(const ChunkKey& key) const
+    static ChunkKey normalized(ChunkKey key)
     {
-        const auto found = entries_.find(key);
-        if (found == entries_.end()) {
-            return {ChunkStatus::Error, ChunkDtype::UInt8, kChunkShape, {}, "synthetic fixture accessed an undeclared chunk"};
-        }
-        return {found->second.status, ChunkDtype::UInt8, kChunkShape, found->second.bytes, {}};
+        key.sourceId = {};
+        return key;
     }
 
     static std::array<ChunkKey, 8> dependencies(const cv::Vec3f& coord, int level)
@@ -244,8 +224,8 @@ private:
 
     void declareEntry(const ChunkKey& key, ChunkStatus status)
     {
-        auto [it, inserted] = entries_.try_emplace(key, Entry{status, {}});
-        if (!inserted && it->second.status != status) {
+        auto [it, inserted] = entries_.try_emplace(key, status);
+        if (!inserted && it->second != status) {
             throw std::runtime_error("synthetic fallback regions share a chunk with conflicting residency");
         }
     }
@@ -264,35 +244,105 @@ private:
                 }
             }
         }
-
-        const std::size_t chunkBytes = std::size_t(kChunkShape[0]) * std::size_t(kChunkShape[1]) * std::size_t(kChunkShape[2]);
-        for (auto& [key, entry] : entries_) {
-            if (entry.status != ChunkStatus::Data)
-                continue;
-            auto bytes = std::make_shared<std::vector<std::byte>>(chunkBytes);
-            std::uint64_t state = keySeed(key);
-            const int base = key.level * kValueBand + 8;
-            for (std::size_t i = 0; i < bytes->size(); ++i) {
-                state = splitmix64(state + i);
-                (*bytes)[i] = std::byte(base + int(state % 24U));
-            }
-            entry.bytes = std::move(bytes);
-        }
     }
 
+    std::unordered_map<ChunkKey, ChunkStatus, ChunkKeyHash> entries_;
+    std::atomic_size_t fetchCalls_{0};
+};
+
+class ThreadTrackingArray final : public IChunkedArray
+{
+public:
+    explicit ThreadTrackingArray(ChunkCache& cache) : cache_(cache) {}
+
+    int numLevels() const override { return cache_.numLevels(); }
+    std::array<int, 3> shape(int level) const override { return cache_.shape(level); }
+    std::array<int, 3> chunkShape(int level) const override { return cache_.chunkShape(level); }
+    ChunkDtype dtype() const override { return cache_.dtype(); }
+    double fillValue() const override { return cache_.fillValue(); }
+    LevelTransform levelTransform(int level) const override { return cache_.levelTransform(level); }
+
+    ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
+    {
+        recordThread();
+        return cache_.tryGetChunk(level, iz, iy, ix);
+    }
+
+    ChunkResult tryGetChunk(int level, int iz, int iy, int ix, const vc::render::ChunkRequestContext& request) override
+    {
+        recordThread();
+        return cache_.tryGetChunk(level, iz, iy, ix, request);
+    }
+
+    ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override
+    {
+        recordThread();
+        return cache_.getChunkIfCached(level, iz, iy, ix);
+    }
+
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override { return cache_.getChunkBlocking(level, iz, iy, ix); }
+
+    void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset) override
+    {
+        cache_.prefetchChunks(keys, wait, priorityOffset);
+    }
+
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback callback) override
+    {
+        return cache_.addChunkReadyListener(std::move(callback));
+    }
+
+    void removeChunkReadyListener(ChunkReadyCallbackId id) override { cache_.removeChunkReadyListener(id); }
+
+    std::size_t observedThreads() const
+    {
+        std::lock_guard lock(threadMutex_);
+        return threadIds_.size();
+    }
+
+private:
     void recordThread()
     {
-        if (!trackThreads_.load(std::memory_order_acquire))
-            return;
         std::lock_guard lock(threadMutex_);
         threadIds_.insert(std::this_thread::get_id());
     }
 
-    std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
-    std::atomic_bool trackThreads_{false};
-    std::mutex threadMutex_;
+    ChunkCache& cache_;
+    mutable std::mutex threadMutex_;
     std::set<std::thread::id> threadIds_;
 };
+
+std::unique_ptr<ChunkCache> makeSyntheticCache(const std::shared_ptr<SyntheticChunkFetcher>& fetcher)
+{
+    std::vector<ChunkCache::LevelInfo> levels;
+    levels.reserve(kLevels);
+    for (int level = 0; level < kLevels; ++level) {
+        const int scale = 1 << level;
+        levels.push_back({
+            {kLevel0Shape[0] / scale, kLevel0Shape[1] / scale, kLevel0Shape[2] / scale},
+            kChunkShape,
+            {{1.0 / double(scale), 1.0 / double(scale), 1.0 / double(scale)}, {0.0, 0.0, 0.0}},
+        });
+    }
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+    serviceOptions.fetchConcurrency.workerCapacity = 16;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 16;
+    std::vector<std::shared_ptr<IChunkFetcher>> fetchers(kLevels, fetcher);
+    return std::make_unique<ChunkCache>(std::move(levels), std::move(fetchers), 0.0, ChunkDtype::UInt8, std::move(options), std::move(serviceOptions));
+}
+
+void preloadSyntheticCache(ChunkCache& cache, const SyntheticChunkFetcher& fetcher)
+{
+    for (const auto& [key, expected] : fetcher.entries()) {
+        const ChunkResult result = cache.getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        if (result.status != expected) {
+            throw std::runtime_error("synthetic cache preload produced an unexpected chunk state");
+        }
+    }
+}
 
 struct Fixture {
     cv::Mat_<cv::Vec3f> coords;
@@ -372,7 +422,7 @@ struct RunResult {
     int coveredPixels = 0;
 };
 
-RunResult renderOnce(SyntheticResidentArray& array, const Fixture& fixture, cv::Mat_<uint8_t>& output, cv::Mat_<uint8_t>& coverage, const ChunkedPlaneSampler::Options& options)
+RunResult renderOnce(IChunkedArray& array, const Fixture& fixture, cv::Mat_<uint8_t>& output, cv::Mat_<uint8_t>& coverage, const ChunkedPlaneSampler::Options& options)
 {
     const auto stats = ChunkedPlaneSampler::sampleCoordsFineToCoarse(array, 0, fixture.coords, output, coverage, options);
     return {0, stats.coveredPixels};
@@ -407,14 +457,17 @@ struct CaseResult {
 CaseResult runCase(Scenario scenario, const FixtureSize& size, int repetitions, int nativeTrials, bool callgrind, bool requireParallelExecution = false)
 {
     Fixture fixture = makeFixture(scenario, size);
-    SyntheticResidentArray array(fixture.coords, fixture.expectedLevels);
+    auto fetcher = std::make_shared<SyntheticChunkFetcher>(fixture.coords, fixture.expectedLevels);
+    auto cache = makeSyntheticCache(fetcher);
+    preloadSyntheticCache(*cache, *fetcher);
+    const std::size_t preloadFetchCalls = fetcher->fetchCalls();
     ChunkedPlaneSampler::Options options(vc::Sampling::Trilinear, kTileSize);
     options.queueMisses = true;
     options.queuedFallbackLevels = 0;
 
     cv::Mat_<uint8_t> warmOutput(size.height, size.width, uint8_t(0));
     cv::Mat_<uint8_t> warmCoverage(size.height, size.width, uint8_t(0));
-    RunResult warm = renderOnce(array, fixture, warmOutput, warmCoverage, options);
+    RunResult warm = renderOnce(*cache, fixture, warmOutput, warmCoverage, options);
     warm.checksum = checksum(warmOutput);
     validateResult(fixture, warmOutput, warmCoverage, warm);
 
@@ -427,9 +480,9 @@ CaseResult runCase(Scenario scenario, const FixtureSize& size, int repetitions, 
     for (int attempt = 0; attempt < (requireMultipleThreads ? 4 : 1); ++attempt) {
         threadOutput.setTo(uint8_t(0));
         threadCoverage.setTo(uint8_t(0));
-        array.startThreadTracking();
-        RunResult threadRun = renderOnce(array, fixture, threadOutput, threadCoverage, options);
-        observedThreads = std::max(observedThreads, array.stopThreadTracking());
+        ThreadTrackingArray trackingArray(*cache);
+        RunResult threadRun = renderOnce(trackingArray, fixture, threadOutput, threadCoverage, options);
+        observedThreads = std::max(observedThreads, trackingArray.observedThreads());
         threadRun.checksum = checksum(threadOutput);
         validateResult(fixture, threadOutput, threadCoverage, threadRun);
         if (!requireMultipleThreads || observedThreads >= 2)
@@ -470,7 +523,7 @@ CaseResult runCase(Scenario scenario, const FixtureSize& size, int repetitions, 
             if (callgrind)
                 CALLGRIND_START_INSTRUMENTATION;
 #endif
-            runs[repetition] = renderOnce(array, fixture, outputs[repetition], coverages[repetition], options);
+            runs[repetition] = renderOnce(*cache, fixture, outputs[repetition], coverages[repetition], options);
 #if VC_HAS_CALLGRIND_CLIENT
             if (callgrind)
                 CALLGRIND_STOP_INSTRUMENTATION;
@@ -486,6 +539,9 @@ CaseResult runCase(Scenario scenario, const FixtureSize& size, int repetitions, 
             if (runs[repetition].checksum != result.checksum)
                 throw std::runtime_error("render checksum changed between repetitions");
         }
+    }
+    if (fetcher->fetchCalls() != preloadFetchCalls) {
+        throw std::runtime_error("timed render unexpectedly fetched a synthetic source chunk");
     }
     return result;
 }
@@ -602,13 +658,7 @@ int main(int argc, char** argv)
         if (args.callgrind && !RUNNING_ON_VALGRIND)
             throw std::runtime_error("--callgrind must run under Valgrind Callgrind");
 #endif
-        const CaseResult result = runCase(
-            args.scenario,
-            *args.size,
-            args.repetitions,
-            args.nativeTrials,
-            args.callgrind,
-            args.requireParallelExecution);
+        const CaseResult result = runCase(args.scenario, *args.size, args.repetitions, args.nativeTrials, args.callgrind, args.requireParallelExecution);
         const std::string json = resultJson(args.scenario, *args.size, result, args.callgrind);
         std::cout << json << '\n';
         writeText(args.metadataPath, json);

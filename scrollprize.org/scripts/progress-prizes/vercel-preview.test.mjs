@@ -11,7 +11,7 @@ import {
 
 const projectId = 'project_internal_identifier';
 const sha = '0123456789abcdef0123456789abcdef01234567';
-const ref = 'refs/heads/codex/progress-prize-smoke-20260720';
+const ref = 'refs/heads/codex/progress-prize-2026-08';
 const responderUri = 'https://forms.gle/SmokeForm_20260720';
 const bypassSecret = 'vercel-bypass-private-value';
 
@@ -131,7 +131,7 @@ test('requires every supplied deployment alias to be consistent', () => {
     (error) => error instanceof PreviewVerificationError && error.code === 'EVENT',
   );
 
-  const bareRef = 'codex/progress-prize-smoke-20260720';
+  const bareRef = 'codex/progress-prize-2026-08';
   assert.equal(
     validateVercelDispatch({
       event: dispatch({

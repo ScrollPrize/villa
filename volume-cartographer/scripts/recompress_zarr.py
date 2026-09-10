@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recompress a local zarr array/tree with the VCZ1 rANS codec.
+"""Recompress a local zarr array/tree with the VC-Delta3D rANS codec.
 
 This is intentionally a small zarr-python example:
 
@@ -10,9 +10,8 @@ This is intentionally a small zarr-python example:
     python scripts/recompress_zarr.py --in-place \
         /home/sean/Desktop/paris4_level5only.zarr
 
-The output is zarr v2 metadata with compressor id "vcz1".  The chunks are
-self-describing VCZ1 payloads written by vc.compression.vcz1, using rANS by
-default.
+The output is zarr v2 metadata with compressor id "vc-delta3d". The chunks are
+self-describing D3D1 payloads written by vc_delta3d using rANS.
 zarr-python 2.x and 3.x both use the numcodecs registration below for v2
 arrays; under zarr-python 3.x the script passes zarr_format=2 explicitly.
 """
@@ -38,11 +37,10 @@ except ImportError as e:  # pragma: no cover
 import numpy as np
 
 try:
-    from vc.compression.vcz1_numcodecs import Vcz1
+    from vc_delta3d.numcodecs import Delta3D
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "install the volume-cartographer Python bindings so "
-        "`from vc.compression.vcz1_numcodecs import Vcz1` works"
+        "install the `vc-delta3d` Python package"
     ) from e
 
 try:
@@ -93,7 +91,7 @@ def create_array_for_spec(
     chunks: tuple[int, ...],
     dtype,
     fill_value,
-    codec: Vcz1,
+    codec: Delta3D,
 ):
     kwargs = dict(
         shape=shape,
@@ -108,7 +106,7 @@ def create_array_for_spec(
     return zarr.create(store=str(path), **kwargs)
 
 
-def create_array(path: Path, src, *, codec: Vcz1):
+def create_array(path: Path, src, *, codec: Delta3D):
     return create_array_for_spec(
         path,
         shape=tuple(src.shape),
@@ -327,10 +325,10 @@ def write_chunk_payload_atomic(path: Path, payload: bytes | bytearray | memoryvi
         raise
 
 
-def chunk_has_vcz1_payload(path: Path) -> bool:
+def chunk_has_delta3d_payload(path: Path) -> bool:
     try:
         with path.open("rb") as f:
-            return f.read(4) == b"VCZ1"
+            return f.read(4) == b"D3D1"
     except FileNotFoundError:
         return False
 
@@ -356,25 +354,25 @@ def in_place_jobs(
     src_path: Path,
     original_meta: dict[str, Any],
     codec_config: dict[str, Any],
-    skip_existing_vcz1: bool,
+    skip_existing_delta3d: bool,
     shape: tuple[int, ...],
     chunks: tuple[int, ...],
 ) -> Iterable[InPlaceJob]:
     for idx in chunk_indices(shape, chunks):
-        yield (str(src_path), original_meta, codec_config, skip_existing_vcz1, idx, shape, chunks)
+        yield (str(src_path), original_meta, codec_config, skip_existing_delta3d, idx, shape, chunks)
 
 
 def recompress_chunk_in_place(job: InPlaceJob) -> int:
-    src_path_str, original_meta, codec_config, skip_existing_vcz1, idx, shape, chunks = job
+    src_path_str, original_meta, codec_config, skip_existing_delta3d, idx, shape, chunks = job
     src_path = Path(src_path_str)
     slc = chunk_slice_for_index(idx, shape, chunks)
     chunk_path = chunk_storage_path(src_path, original_meta, idx)
-    if skip_existing_vcz1 and chunk_has_vcz1_payload(chunk_path):
+    if skip_existing_delta3d and chunk_has_delta3d_payload(chunk_path):
         return int(np.prod([s.stop - s.start for s in slc]))
 
     src = zarr.open(src_path_str, mode="r")
     block = np.ascontiguousarray(src[slc])
-    codec = Vcz1(**{k: v for k, v in codec_config.items() if k != "id"})
+    codec = Delta3D(**{k: v for k, v in codec_config.items() if k != "id"})
     payload = codec.encode(block)
     write_chunk_payload_atomic(chunk_path, payload)
     return int(np.prod([s.stop - s.start for s in slc]))
@@ -488,7 +486,7 @@ def relative_s3_array_path(src_root: str, src_array: str) -> Path:
     return Path(rel)
 
 
-def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers: int) -> None:
+def recompress_array(src_path: str | Path, dst_path: Path, codec: Delta3D, workers: int) -> None:
     src_path_str = str(src_path)
     src = open_zarr(src_path_str, mode="r")
     if len(src.shape) != 3:
@@ -513,7 +511,7 @@ def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers:
     run_chunk_jobs(copy_chunk, jobs, total_jobs=total_jobs, workers=workers, desc=f"  {src_name}")
 
 
-def recompress_array_in_place(src_path: Path, codec: Vcz1, workers: int) -> None:
+def recompress_array_in_place(src_path: Path, codec: Delta3D, workers: int) -> None:
     state = load_in_place_state(src_path)
     if state is not None:
         requested_target_meta: dict[str, Any] = dict(state["target_meta"])
@@ -548,12 +546,12 @@ def recompress_array_in_place(src_path: Path, codec: Vcz1, workers: int) -> None
     print(f"  shape={src.shape} chunks={src.chunks} dtype={src.dtype} codec={codec_config}")
     print("  recovery: rerun the same --in-place command to continue an interrupted conversion")
     original_compressor = original_meta.get("compressor")
-    skip_existing_vcz1 = not (
+    skip_existing_delta3d = not (
         isinstance(original_compressor, dict)
-        and original_compressor.get("id") == "vcz1"
+        and original_compressor.get("id") in {"vc-delta3d", "vcz1"}
         and original_compressor != codec_config
     )
-    jobs = in_place_jobs(src_path, original_meta, codec_config, skip_existing_vcz1, shape, chunks)
+    jobs = in_place_jobs(src_path, original_meta, codec_config, skip_existing_delta3d, shape, chunks)
     run_chunk_jobs(
         recompress_chunk_in_place,
         jobs,
@@ -612,7 +610,7 @@ def create_ome_root(dst_root: Path, *, name: str, downsample_type: str) -> None:
 def recompress_flat_array_as_ome(
     src_path: str | Path,
     dst_root: Path,
-    codec: Vcz1,
+    codec: Delta3D,
     workers: int,
     downsample_type: str = "mean",
 ) -> None:
@@ -659,12 +657,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=str, help="input zarr array or group; local path or s3:// URI")
     parser.add_argument("output", nargs="?", type=Path, help="output zarr array or group")
-    parser.add_argument("--codec", choices=("rans", "zstd"), default="rans")
     parser.add_argument(
         "--quant",
         type=int,
         default=1,
-        help="VCZ1 quantization bin width; 1 is lossless",
+        help="VC-Delta3D quantization bin width; 1 is lossless",
     )
     parser.add_argument(
         "--overwrite",
@@ -727,7 +724,7 @@ def main() -> None:
     if not arrays:
         raise SystemExit(f"{input_path}: no .zarray found")
 
-    codec = Vcz1(codec=args.codec, quant=args.quant)
+    codec = Delta3D(quant=args.quant)
     is_single_array = arrays == [input_path] if input_is_s3 else arrays == [Path(input_path)]
     if args.in_place:
         for src_array in arrays:

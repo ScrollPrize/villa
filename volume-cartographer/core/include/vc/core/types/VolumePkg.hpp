@@ -21,6 +21,8 @@ class QuadSurface;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kAnonymousRemoteAuthTag =
+    "vc-remote-auth:anonymous";
 
 struct Entry {
     std::string location;
@@ -28,12 +30,12 @@ struct Entry {
 };
 
 [[nodiscard]] bool hasEntryTag(const Entry& entry, std::string_view tag);
+[[nodiscard]] bool usesAnonymousRemoteAuth(const Entry& entry);
 [[nodiscard]] bool isFiberLasagnaEntry(const Entry& entry);
 
 enum class Category { Volumes, Segments, NormalGrids };
 
 struct LoadOptions {
-    std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
     bool deferResolution = false;
 };
@@ -120,8 +122,7 @@ public:
     AttachVolumeResult attachPreparedVolume(
         const std::string& location,
         std::vector<std::string> tags,
-        const std::shared_ptr<Volume>& volume,
-        const std::filesystem::path& remoteCacheRoot = {});
+        const std::shared_ptr<Volume>& volume);
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
     // Replace singleton keyed tags and merge ordinary tags in one operation,
     // refreshing a loaded remote volume at most once.
@@ -164,7 +165,6 @@ public:
         std::vector<std::string> manifestTags,
         bool fiberInference,
         const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-        const std::filesystem::path& remoteCacheRoot = {},
         bool updateSelection = true,
         bool persistChanges = true,
         const std::vector<std::string>& manifestSingletonPrefixes = {});
@@ -183,6 +183,13 @@ public:
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
+
+    // The project's umbilicus polyline, if one has been attached explicitly.
+    // Declaring it here removes the ambiguity of searching directories for
+    // umbilicus.json when a project references several packages.
+    [[nodiscard]] std::string umbilicus() const;
+    void setUmbilicus(std::string location);
+    [[nodiscard]] std::filesystem::path umbilicusPath() const;
 
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
@@ -222,9 +229,6 @@ public:
 
     void setSegmentsChangedCallback(std::function<void()> cb);
 
-    [[nodiscard]] bool hasRemoteCacheRoot() const;
-    [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
-    void setRemoteCacheRoot(const std::filesystem::path& dir);
     // Completes a deferred load. Ordinary load() callers remain eager.
     void resolveDeferredEntries();
 
@@ -246,7 +250,6 @@ private:
     std::string name_ = "Untitled";
     int version_ = 1;
     vc::project::LoadOptions opts_;
-    std::filesystem::path remoteCacheRoot_;
     bool automaticPersistence_ = true;
 
     std::vector<vc::project::Entry> volumes_;
@@ -256,6 +259,7 @@ private:
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> umbilicus_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

@@ -26,6 +26,15 @@ prunes entries for files gone from both sides) and never hides a pending
 difference. 'reset' stamps the current state as the synced baseline, which
 discards pending differences — it asks for confirmation.
 
+Conflict resolution: a conflict whose content cannot be merged three-way is
+put to the user first ([l]ocal / [r]emote / [s]kip). Auto-merges of linked
+fibers are then planned against the decided world, so a decided root
+un-blocks its dependents in the same run and only skipped files cascade to
+the files that depend on them. A dropped link to a peer that will not exist
+after the sync (deleted on both sides, or pending local deletion) needs no
+reciprocal fix and no longer forces manual resolution. --dry-run previews
+content-merge eligibility only; link consistency is assessed in a real run.
+
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
     python s3_sync.py status <directory> [--verbose] [--sync-backups]
@@ -33,6 +42,42 @@ Usage:
     python s3_sync.py update <directory> [--sync-backups]
     python s3_sync.py reset <directory> [--sync-backups]
     python s3_sync.py hfsync <directory> [--dry-run]
+    python s3_sync.py ash-init <directory> <remote_path> [--creds=<file>]
+    python s3_sync.py ash-status <directory> [--verbose] [--sync-backups]
+    python s3_sync.py ash-sync <directory> [--dry-run] [--sync-backups]
+    python s3_sync.py ash-update <directory> [--sync-backups]
+    python s3_sync.py ash-reset <directory> [--sync-backups]
+
+SFTP sync (the ash-* commands):
+    The same interactive bidirectional sync, but against a folder on an SFTP
+    server, transferred through rclone's sftp backend (rclone is required —
+    there is no aws-CLI fallback). Tracking is fully independent of the S3
+    sync: ash-* commands use .ashsync.json / .ashsync.db / .ashsync-base /
+    .ashsync-conflicts, so one directory can sync to both S3 and the SFTP
+    server. SFTP has no ETags or object versioning, so remote change
+    detection uses one batched server-side `rclone md5sum` for
+    annotation-sized JSON files (mtime+size for everything else), and merge
+    bases come only from the local .ashsync-base shadow copies. The remote
+    shell type is pinned to unix with GNU md5sum/sha1sum (the ash server is
+    a Linux box); on a server without those commands, change detection
+    falls back to size+mtime with a one-time warning.
+
+    Credentials live in a JSON file OUTSIDE the sync tree (default
+    ~/.vc_ash_sftp.json, override at ash-init time with --creds). Keep it
+    chmod 600. Format:
+
+        {
+          "host": "ash.example.org",
+          "user": "myuser",
+          "pass": "my-password",
+          "port": 2022
+        }
+
+    "port" is optional (defaults to 22), as is "known_hosts_file" (a path
+    such as "~/.ssh/known_hosts" enables host-key pinning; the default
+    "none" skips validation, matching rclone's sftp default). The password
+    is handed to rclone obscured and via environment variables only — it
+    never appears on a command line.
 
 Hugging Face sync (hfsync):
     Pushes fiber JSONs carrying a given tag to a Hugging Face storage bucket.
@@ -53,6 +98,7 @@ Hugging Face sync (hfsync):
 """
 
 import os
+import re
 import sys
 import json
 import shlex
@@ -61,8 +107,10 @@ import sqlite3
 import hashlib
 import argparse
 import tempfile
+import traceback
 import subprocess
 from datetime import datetime, timezone
+from collections import namedtuple
 from enum import Enum
 from contextlib import contextmanager
 
@@ -95,9 +143,40 @@ HASH_MAX_BYTES = 16 * 1024 * 1024
 BASE_DIR_NAME = '.s3sync-base'          # last-synced copies (3-way merge base)
 CONFLICT_DIR_NAME = '.s3sync-conflicts'  # versions preserved before overwrite
 
+# The ash (SFTP) sync keeps fully independent tracking state, all
+# dot-prefixed for the same scan-exclusion reason.
+ASH_CONFIG_NAME = '.ashsync.json'
+ASH_DB_NAME = '.ashsync.db'
+ASH_BASE_DIR_NAME = '.ashsync-base'
+ASH_CONFLICT_DIR_NAME = '.ashsync-conflicts'
+ASH_DEFAULT_CREDS = '~/.vc_ash_sftp.json'
+
 # Tag the merge puts on fibers whose line it could not re-fit; mirrored here
 # so hfsync still recognizes them when fiber_merge is unavailable.
 REOPTIMIZE_TAG = getattr(fiber_merge, 'REOPTIMIZE_TAG', 'needs_reoptimization')
+
+
+def _exception_location(ex):
+    """' at file.py:123 in func' for the innermost frame of `ex`, or ''.
+
+    Demotion reasons carry this so a merge-machinery bug reads as a bug
+    (with a place to look) instead of as undiagnosable annotation data —
+    a bare str(ex) once hid a crash behind weeks of manual conflicts."""
+    frames = traceback.extract_tb(getattr(ex, '__traceback__', None))
+    if not frames:
+        return ''
+    frame = frames[-1]
+    return (f" at {os.path.basename(frame.filename)}:{frame.lineno} "
+            f"in {frame.name}")
+
+
+def _print_debug_traceback():
+    """Full traceback for the exception being handled, only when the user
+    opted in (VC_SYNC_DEBUG=1): unconditional stacks would bury the merge
+    preview and the interactive conflict prompt."""
+    if os.environ.get('VC_SYNC_DEBUG'):
+        for line in traceback.format_exc().rstrip().splitlines():
+            print(f"      {line}")
 
 class SyncAction(Enum):
     UPLOAD = "upload"
@@ -106,6 +185,10 @@ class SyncAction(Enum):
     SKIP = "skip"
     DELETE_LOCAL = "delete_local"
     DELETE_REMOTE = "delete_remote"
+
+
+PlanResult = namedtuple('PlanResult',
+                        'pending peer_fixes manual resolved stats')
 
 
 def is_backup_file(filename):
@@ -140,11 +223,19 @@ class S3SyncManager:
     RCLONE_TRANSFERS = 16
     RCLONE_CHECKERS = 32
 
+    # Per-remote identity: the SFTP subclass overrides these so its tracking
+    # state never collides with the S3 sync's in the same directory.
+    REMOTE_NAME = 'S3'
+    CONFIG_NAME = '.s3sync.json'
+    DB_NAME = '.s3sync.db'
+    BASE_DIR = BASE_DIR_NAME
+    CONFLICT_DIR = CONFLICT_DIR_NAME
+
     def __init__(self, local_dir, s3_bucket=None, s3_prefix=None,
                  aws_profile=None):
         self.local_dir = os.path.abspath(local_dir)
-        self.config_file = os.path.join(self.local_dir, '.s3sync.json')
-        self.db_file = os.path.join(self.local_dir, '.s3sync.db')
+        self.config_file = os.path.join(self.local_dir, self.CONFIG_NAME)
+        self.db_file = os.path.join(self.local_dir, self.DB_NAME)
 
         # Load or create config
         if os.path.exists(self.config_file):
@@ -161,6 +252,11 @@ class S3SyncManager:
             self.aws_profile = aws_profile
             self._save_config()
 
+        self._finish_init()
+
+    def _finish_init(self):
+        """Shared tail of construction (subclasses call this after their
+        own config handling)."""
         # Initialize database
         self._init_db()
 
@@ -407,6 +503,13 @@ class S3SyncManager:
             return True
         return self._remote_md5(path) == md5
 
+    def _remote_changed(self, tracked_info, remote_info):
+        """Whether the remote side changed since the tracked baseline.
+        S3: size + ETag (ETags change on every overwrite, so this catches
+        size-preserving edits). Subclasses without ETags override this."""
+        return (tracked_info.get('s3_size') != remote_info['s3_size'] or
+                tracked_info.get('s3_etag') != remote_info['s3_etag'])
+
     def _bucket_versioning_enabled(self):
         """Whether the target bucket keeps object versions (cached)."""
         if self._bucket_versioning is None:
@@ -420,6 +523,12 @@ class S3SyncManager:
                 self._bucket_versioning = False
         return self._bucket_versioning
 
+    def _fetch_remote_file(self, path, dst):
+        """Download one remote file to a local destination path (raises on
+        failure). The single remote-fetch primitive shared by hashing,
+        conflict stashing, and merge-base/remote-JSON fetches."""
+        self._run_aws_command(['aws', 's3', 'cp', self._get_s3_url(path), dst])
+
     def _remote_md5(self, path):
         """Definitive remote content hash: download the object to a temp
         file and hash it. Cached per run; returns None when the fetch
@@ -431,7 +540,7 @@ class S3SyncManager:
         tmp = self._merge_tmp_path(path, '.hashcheck')
         md5 = None
         try:
-            self._run_aws_command(['aws', 's3', 'cp', self._get_s3_url(path), tmp])
+            self._fetch_remote_file(path, tmp)
             md5 = self._file_md5(tmp)
         except Exception:
             md5 = None
@@ -448,7 +557,9 @@ class S3SyncManager:
     # annotation files. Scope matches _should_hash.
 
     def _shadow_path(self, path):
-        return os.path.join(self.local_dir, BASE_DIR_NAME, path)
+        # normpath: sync paths are '/'-keyed, so on Windows the raw join
+        # mixes separators and defeats _remove_shadow's prefix check
+        return os.path.normpath(os.path.join(self.local_dir, self.BASE_DIR, path))
 
     def _update_shadow(self, path):
         """Record the current local file as the last-synced (base) version."""
@@ -474,7 +585,7 @@ class S3SyncManager:
             os.remove(dst)
         except OSError:
             return
-        shadow_root = os.path.join(self.local_dir, BASE_DIR_NAME)
+        shadow_root = os.path.join(self.local_dir, self.BASE_DIR)
         dirpath = os.path.dirname(dst)
         while dirpath != shadow_root and dirpath.startswith(shadow_root + os.sep):
             try:
@@ -494,13 +605,13 @@ class S3SyncManager:
         """
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         stem, ext = os.path.splitext(os.path.basename(path))
-        dst = os.path.join(self.local_dir, CONFLICT_DIR_NAME,
+        dst = os.path.join(self.local_dir, self.CONFLICT_DIR,
                            os.path.dirname(path),
                            f"{stem}.conflict-{stamp}-{side}{ext}")
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if source is None and side == 'remote':
-                self._run_aws_command(['aws', 's3', 'cp', self._get_s3_url(path), dst])
+                self._fetch_remote_file(path, dst)
             else:
                 shutil.copy2(source or os.path.join(self.local_dir, path), dst)
         except Exception as e:
@@ -626,7 +737,7 @@ class S3SyncManager:
         — the caller stashes/removes temp_path — or (None, None)."""
         tmp = self._merge_tmp_path(path, '.remote')
         try:
-            self._run_aws_command(['aws', 's3', 'cp', self._get_s3_url(path), tmp])
+            self._fetch_remote_file(path, tmp)
             with open(tmp) as f:
                 return json.load(f), tmp
         except Exception:
@@ -644,23 +755,28 @@ class S3SyncManager:
         {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
         to apply with _apply_pending_merges() AFTER the user confirms the
         sync (or discard with _discard_pending_merges() on cancellation).
-        Returns a preview string in dry-run mode, or None when the file is
-        not eligible, no base is available, or the merge has genuine
-        conflicts (all three versions are stashed in that case and the
-        caller falls back to the interactive prompt).
+        Returns None when the file is not eligible, no base is available,
+        or the merge has genuine conflicts (all three versions are stashed
+        in that case and the caller falls back to the interactive prompt).
+        In dry-run mode nothing is stashed and the return is a dict:
+        {'summary', 'merged_doc', 'base_doc', 'peer_files'} for a clean
+        content merge (link consistency is NOT assessed), or {'reason'}.
         """
+        def fail(reason):
+            return {'reason': reason} if dry_run else None
+
         if fiber_merge is None or not local_info or not s3_info:
-            return None
+            return fail("merge support unavailable")
         if not self._should_hash(path, local_info.get('local_size')):
-            return None
+            return fail("not an annotation-sized file")
         local_path = os.path.join(self.local_dir, path)
         try:
             with open(local_path) as f:
                 local_doc = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return None
+            return fail("local file unreadable")
         if not fiber_merge.is_fiber_doc(local_doc):
-            return None
+            return fail("not a fiber document")
 
         with self._get_db() as conn:
             row = conn.execute('SELECT * FROM files WHERE path = ?',
@@ -670,7 +786,7 @@ class S3SyncManager:
         if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
             if not dry_run:
                 print(f"  (no merge base available for {path})")
-            return None
+            return fail("no merge base")
 
         remote_doc, remote_tmp = self._fetch_remote_json(path)
         if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
@@ -679,7 +795,7 @@ class S3SyncManager:
                     os.remove(remote_tmp)
                 except OSError:
                     pass
-            return None
+            return fail("remote copy unreadable")
 
         keep_remote_tmp = False
         try:
@@ -688,11 +804,17 @@ class S3SyncManager:
             try:
                 result = fiber_merge.merge_fibers(base_doc, local_doc, remote_doc)
             except Exception as ex:
-                print(f"  ⚠️  merge failed for {path} ({ex}); manual resolution")
-                return None
+                print(f"  ⚠️  merge failed for {path} "
+                      f"({ex}{_exception_location(ex)}); manual resolution")
+                _print_debug_traceback()
+                return fail("merger error")
             summary = fiber_merge.summarize(result)
             if dry_run:
-                return f"would auto-merge ({summary})" if result['ok'] else None
+                if not result['ok']:
+                    return fail("content conflict: " + '; '.join(result['conflicts']))
+                return {'summary': summary, 'merged_doc': result['merged'],
+                        'base_doc': base_doc,
+                        'peer_files': result.get('peer_files', [])}
 
             if not result['ok']:
                 print(f"  ✗ cannot auto-merge {path}:")
@@ -792,7 +914,20 @@ class S3SyncManager:
             f.write('\n')
         plan['merged_doc'] = doc
 
-    def _plan_link_consistency(self, pending_merges, download_paths):
+    def _absent_locally(self, path):
+        """True only when the path provably does not exist in the sync
+        dir. Unreadable/inaccessible ("cannot tell") is NOT absent: the
+        caller then reads it and demotes on failure, as before."""
+        try:
+            os.lstat(os.path.join(self.local_dir, path))
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _plan_link_consistency(self, pending_merges, download_paths,
+                               vanishing_paths=frozenset(), remote_paths=None):
         """Mirror each auto-merged fiber's link decisions into its peer
         files (fiber_merge.refresh_pair_links) so VC3D's index-exact
         cross-file reciprocity holds on the post-sync state.
@@ -800,18 +935,32 @@ class S3SyncManager:
         Pure planning over the files' FUTURE content (pending merge
         results, remote content for scheduled downloads, local content
         otherwise); nothing on disk is touched. Returns (peer_fixes,
-        demoted): peer_fixes maps non-merge peer paths to their fixed
-        docs (to write after downloads and upload), demoted lists
-        (path, reason) merges that must fall back to manual resolution.
+        demoted, notes): peer_fixes maps non-merge peer paths to their
+        fixed docs (to write after downloads and upload), demoted lists
+        (path, reason) merges that must fall back to manual resolution,
+        notes lists (path, peer_name) going-away peers that were skipped.
         Pending files of merges whose far-side fields were refreshed are
         rewritten in place (they are plan artifacts, not user files).
+
+        A peer that will not exist after this sync — pending local
+        deletion (`vanishing_paths`), or absent locally AND absent from
+        the remote inventory (`remote_paths`) AND not being downloaded —
+        has nothing to reciprocate, so a merged doc that dropped its link
+        to it is not a dangling link (it used to demote as "missing").
+        Such a peer is never read: reading a file pending deletion would
+        let refresh_pair_links strip its stale reciprocal and schedule an
+        upload of a file being deleted. A merged doc that STILL links a
+        going-away peer is dangling and demotes. Without a remote
+        inventory (`remote_paths=None`) absence cannot be established and
+        a locally missing peer demotes, as before.
         """
         if fiber_merge is None:
-            return {}, []
+            return {}, [], []
         plans = dict(pending_merges)
         future_docs = {path: plan['merged_doc'] for path, plan in pending_merges}
         changed = set()
         demoted = []
+        notes = []
 
         def future_doc(path):
             if path in future_docs:
@@ -870,9 +1019,34 @@ class S3SyncManager:
                 # POSIX join: sync paths are '/'-keyed everywhere (scans,
                 # download_paths), regardless of host OS.
                 peer_path = f"{a_dir}/{peer_name}" if a_dir else peer_name
+                if peer_path not in future_docs:
+                    # Going-away peers are decided before any read. A
+                    # pending merge is served from future_docs first: the
+                    # action sets (conflict / delete-local / download) are
+                    # disjoint per path in analyze_changes, so a pending
+                    # peer can never be going away.
+                    remote_absent = (remote_paths is not None and
+                                     peer_path not in remote_paths)
+                    going_away = (peer_path in vanishing_paths or
+                                  (remote_absent and
+                                   peer_path not in download_paths and
+                                   self._absent_locally(peer_path)))
+                    if going_away:
+                        if fiber_merge.links_to(a_doc, peer_name):
+                            failure = (f"linked fiber {peer_name} is pending "
+                                       f"deletion or missing")
+                            break
+                        notes.append((path, peer_name))
+                        continue
                 b_doc = future_doc(peer_path)
                 if b_doc is None or not fiber_merge.is_fiber_doc(b_doc):
                     failure = f"linked fiber {peer_name} is missing or unreadable"
+                    if (remote_paths is not None and peer_path in remote_paths
+                            and peer_path not in download_paths
+                            and self._absent_locally(peer_path)):
+                        failure += (" (peer is absent locally but still present "
+                                    f"on {self.REMOTE_NAME}; resolve this file "
+                                    "manually)")
                     break
                 # A refresh bug on malformed input must demote this merge,
                 # never abort the whole sync mid-planning.
@@ -888,7 +1062,9 @@ class S3SyncManager:
                         if refreshed['b_changed']:
                             json.dumps(refreshed['b_doc'], allow_nan=False)
                 except Exception as ex:
-                    failure = f"refresh against {peer_name} failed ({ex})"
+                    failure = (f"refresh against {peer_name} failed "
+                               f"({ex}{_exception_location(ex)})")
+                    _print_debug_traceback()
                     break
                 if not refreshed['ok']:
                     failure = '; '.join(refreshed['conflicts'])
@@ -908,13 +1084,13 @@ class S3SyncManager:
                 changed.add(path)
 
         if demoted:
-            return {}, demoted
+            return {}, demoted, notes
 
         for path in changed & set(plans):
             self._rewrite_pending(plans[path], future_docs[path])
         peer_fixes = {path: future_docs[path]
                       for path in changed if path not in plans}
-        return peer_fixes, demoted
+        return peer_fixes, demoted, notes
 
     def _apply_peer_fixes(self, peer_fixes):
         """Write link-consistency fixes into peer files, stashing the prior
@@ -943,29 +1119,68 @@ class S3SyncManager:
 
     def _plan_conflict_resolutions(self, conflicts, local_files, s3_files,
                                    download_paths, delete_local_paths,
-                                   auto_merge):
-        """Split conflicts into planned auto-merges (with their peer fixes)
-        and manual conflicts.
+                                   auto_merge, resolve=None):
+        """Split conflicts into planned auto-merges (with their peer fixes),
+        user decisions, and skipped conflicts.
 
-        ONE fixpoint drives both demotion causes — peers that are manual
-        conflicts or pending local deletion, and peers the link-consistency
-        planner cannot resolve — so a demotion from either stage re-runs
-        the other. This is what guarantees a peer fix is never computed
-        for (or applied over) a file whose fate the user later decides at
-        the interactive prompt.
+        Each conflict is content-merged exactly once. Conflicts that cannot
+        be merged, and merges demoted later by either stage, are put to the
+        user through `resolve(path, reason) -> SyncAction` BEFORE any link
+        planning depends on them, so a peer fix is never computed for (or
+        applied over) a file whose fate is undecided or skipped, while a
+        decided file ([l]ocal / [r]emote) is a known source the planner can
+        plan against. Only skipped files block their dependents; a decided
+        root un-blocks them in the same run (the 2026-09-08 reconciliation
+        needed three runs for what this does in one).
 
-        Returns (pending_merges, peer_fixes, manual_conflicts).
+        Loop: prompt everything awaiting a decision; stage 1 demotes merges
+        whose peers are skipped (or pending local deletion while still
+        linked); if anything new awaits, prompt again; otherwise stage 2
+        plans cross-file link consistency over an all-decided world and
+        its demotions feed back the same way. 2*len(pending)+len(awaiting)
+        strictly decreases on every prompt and every demotion, so this
+        terminates without a round cap. No path is prompted twice.
+
+        With resolve=None (legacy callers, --no-auto-merge paths, tests)
+        every demotion is recorded as a manual conflict immediately and
+        acts as a blocker from that moment — today's eager fixpoint, with
+        identical membership, order and reasons.
+
+        Returns PlanResult(pending, peer_fixes, manual, resolved, stats):
+        pending [(path, plan)], peer_fixes {path: doc}, manual
+        [(path, reason)] skipped decisions in prompt order (all demotions
+        when resolve is None), resolved [(path, UPLOAD|DOWNLOAD)] in prompt
+        order, stats {merged, content_conflicts, blocked_by_skip,
+        blocked_by_delete, link_state, decisions: {l, r, s}} — demotion
+        classes counted once per merge (skip wins over delete); with
+        resolve=None every manual conflict counts as 's'. Every
+        prompted path is in exactly one of manual/resolved.
+        `download_paths` is not modified.
         """
         pending_merges = []
+        awaiting = []            # (path, reason) to put to the user next
         manual_conflicts = []
+        resolved = []
+        blockers = set()         # skipped paths (and, legacy, all demotions)
+        prompted = set()
+        effective_downloads = set(download_paths)
+        delete_local_paths = set(delete_local_paths)
+        remote_paths = set(s3_files)
+        printed_notes = set()
+        stats = {'merged': 0, 'content_conflicts': 0, 'blocked_by_skip': 0,
+                 'blocked_by_delete': 0, 'link_state': 0,
+                 'decisions': {'l': 0, 'r': 0, 's': 0}}
+
         for path, reason in conflicts:
+            plan = None
             if auto_merge:
                 plan = self._attempt_auto_merge(path, local_files.get(path),
                                                 s3_files.get(path))
-                if isinstance(plan, dict):
-                    pending_merges.append((path, plan))
-                    continue
-            manual_conflicts.append((path, reason))
+            if isinstance(plan, dict):
+                pending_merges.append((path, plan))
+            else:
+                awaiting.append((path, reason))
+        stats['content_conflicts'] = len(awaiting)
 
         def peer_paths(path, plan):
             directory = os.path.dirname(path)
@@ -973,45 +1188,91 @@ class S3SyncManager:
                     for name in plan.get('peer_files') or []
                     if name != os.path.basename(path)]
 
+        def blocks(plan, peer_path):
+            # A skipped peer always blocks. A peer pending local deletion
+            # blocks only while the merged doc still links it (a dangling
+            # link); a dropped link to a going-away peer needs no
+            # reciprocal fix, and stage 2 skips that peer without reading it.
+            if peer_path in blockers:
+                return True
+            return (peer_path in delete_local_paths and
+                    bool(fiber_merge.links_to(plan['merged_doc'],
+                                              os.path.basename(peer_path))))
+
         def demote(path, plan, reason):
             self._demote_merge(path, plan, reason)
             # Keep the real reason ("Both ..." prefix preserved for the
             # prompt's both-modified warning).
-            manual_conflicts.append(
-                (path, "Both local and S3 modified since last sync; "
-                       f"auto-merge failed: {reason}"))
-            manual_paths.add(path)
+            awaiting.append(
+                (path, f"Both local and {self.REMOTE_NAME} modified since "
+                       f"last sync; auto-merge failed: {reason}"))
+            if resolve is None:
+                # Legacy: a demotion is manual at once, so later entries in
+                # the same stage-1 scan already see it (today's ordering).
+                blockers.add(path)
 
-        manual_paths = {p for p, _ in manual_conflicts} | set(delete_local_paths)
+        def drain():
+            nonlocal awaiting
+            batch, awaiting = awaiting, []
+            for path, reason in batch:
+                if path in prompted:
+                    raise RuntimeError(f"BUG: conflict prompted twice: {path}")
+                prompted.add(path)
+                if resolve is None:
+                    manual_conflicts.append((path, reason))
+                    blockers.add(path)
+                    stats['decisions']['s'] += 1
+                    continue
+                action = resolve(path, reason)
+                if action in (SyncAction.UPLOAD, SyncAction.DOWNLOAD):
+                    resolved.append((path, action))
+                    if action == SyncAction.DOWNLOAD:
+                        effective_downloads.add(path)
+                    stats['decisions']['r' if action == SyncAction.DOWNLOAD
+                                       else 'l'] += 1
+                else:
+                    manual_conflicts.append((path, reason))
+                    blockers.add(path)
+                    stats['decisions']['s'] += 1
+
         peer_fixes = {}
-        while True:
-            # Stage 1: cascade blocked-peer demotions to a fixpoint.
-            progressed = True
-            while progressed:
-                progressed = False
-                still_pending = []
-                for path, plan in pending_merges:
-                    blocked = sorted(os.path.basename(p)
-                                     for p in peer_paths(path, plan)
-                                     if p in manual_paths)
-                    if blocked:
-                        demote(path, plan,
-                               "linked fiber(s) with unresolved conflicts "
-                               "or pending deletion: " + ", ".join(blocked))
-                        progressed = True
-                    else:
-                        still_pending.append((path, plan))
-                pending_merges = still_pending
+        while pending_merges or awaiting:
+            drain()
+            # Stage 1: demote merges whose peers are skipped (or pending
+            # deletion while still linked). One pass; anything demoted
+            # awaits a decision, and the loop re-enters stage 1 after it.
+            still_pending = []
+            for path, plan in pending_merges:
+                blocking = [p for p in peer_paths(path, plan) if blocks(plan, p)]
+                blocked = sorted(os.path.basename(p) for p in blocking)
+                if blocked:
+                    stats['blocked_by_skip' if any(p in blockers for p in blocking)
+                          else 'blocked_by_delete'] += 1
+                    demote(path, plan,
+                           "linked fiber(s) with unresolved conflicts "
+                           "or pending deletion: " + ", ".join(blocked))
+                else:
+                    still_pending.append((path, plan))
+            pending_merges = still_pending
+            if awaiting:
+                continue        # never run stage 2 with undecided paths
             if not pending_merges:
                 peer_fixes = {}
                 break
-            # Stage 2: plan the cross-file link consistency; its demotions
-            # feed back into stage 1 on the next iteration.
-            peer_fixes, demoted = self._plan_link_consistency(
-                pending_merges, download_paths)
+            # Stage 2: plan the cross-file link consistency over an
+            # all-decided world; its demotions feed back into stage 1.
+            peer_fixes, demoted, notes = self._plan_link_consistency(
+                pending_merges, effective_downloads,
+                vanishing_paths=delete_local_paths, remote_paths=remote_paths)
+            for note in notes:
+                if note not in printed_notes:
+                    printed_notes.add(note)
+                    print(f"  (peer {note[1]} of {note[0]} is going away and the "
+                          "merge dropped its link; no reciprocal fix needed)")
             if not demoted:
                 break
             demoted_reasons = dict(demoted)
+            stats['link_state'] += len(demoted_reasons)
             still_pending = []
             for path, plan in pending_merges:
                 if path in demoted_reasons:
@@ -1020,7 +1281,9 @@ class S3SyncManager:
                     still_pending.append((path, plan))
             pending_merges = still_pending
 
-        return pending_merges, peer_fixes, manual_conflicts
+        stats['merged'] = len(pending_merges)
+        return PlanResult(pending_merges, peer_fixes, manual_conflicts, resolved,
+                          stats)
 
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
@@ -1288,8 +1551,9 @@ class S3SyncManager:
                     else:
                         actions[path] = (SyncAction.SKIP, "Backup file (in sync)")
                 elif s3_info and not local_info:
-                    # Backup exists on S3 but not locally - skip (never download backups)
-                    actions[path] = (SyncAction.SKIP, "Backup file (S3 only, not downloading)")
+                    # Backup exists remotely but not locally - skip (never download backups)
+                    actions[path] = (SyncAction.SKIP,
+                                     f"Backup file ({self.REMOTE_NAME} only, not downloading)")
                 continue
 
             # Regular file logic (non-backup)
@@ -1302,11 +1566,12 @@ class S3SyncManager:
                         # Surface delete-vs-edit explicitly; the perform
                         # phase stashes a conflict copy before deleting.
                         actions[path] = (SyncAction.DELETE_LOCAL,
-                                         "S3 file was deleted; local copy has "
-                                         "unsynced edits (conflict copy will "
-                                         "be saved)")
+                                         f"{self.REMOTE_NAME} file was deleted; "
+                                         "local copy has unsynced edits "
+                                         "(conflict copy will be saved)")
                     else:
-                        actions[path] = (SyncAction.DELETE_LOCAL, "S3 file was deleted")
+                        actions[path] = (SyncAction.DELETE_LOCAL,
+                                         f"{self.REMOTE_NAME} file was deleted")
                 else:
                     actions[path] = (SyncAction.UPLOAD, "New local file")
 
@@ -1315,7 +1580,7 @@ class S3SyncManager:
                 if tracked_info.get('local_size') is not None:
                     actions[path] = (SyncAction.DELETE_REMOTE, "Local file was deleted")
                 else:
-                    actions[path] = (SyncAction.DOWNLOAD, "New S3 file")
+                    actions[path] = (SyncAction.DOWNLOAD, f"New {self.REMOTE_NAME} file")
 
             # File exists in both places
             elif local_info and s3_info:
@@ -1341,8 +1606,7 @@ class S3SyncManager:
                             # current content as the tracked content.
                             md5_backfills.append((current_md5, path))
 
-                    s3_changed = (tracked_info.get('s3_size') != s3_info['s3_size'] or
-                                  tracked_info.get('s3_etag') != s3_info['s3_etag'])
+                    s3_changed = self._remote_changed(tracked_info, s3_info)
 
                     if local_changed and s3_changed:
                         if (current_md5 and
@@ -1355,11 +1619,13 @@ class S3SyncManager:
                             converged.append(path)
                         else:
                             actions[path] = (SyncAction.CONFLICT,
-                                             "Both local and S3 modified since last sync")
+                                             f"Both local and {self.REMOTE_NAME} "
+                                             "modified since last sync")
                     elif local_changed:
                         actions[path] = (SyncAction.UPLOAD, "Local file modified")
                     elif s3_changed:
-                        actions[path] = (SyncAction.DOWNLOAD, "S3 file modified")
+                        actions[path] = (SyncAction.DOWNLOAD,
+                                         f"{self.REMOTE_NAME} file modified")
                     else:
                         actions[path] = (SyncAction.SKIP, "Files are in sync")
                 else:
@@ -1448,7 +1714,7 @@ class S3SyncManager:
         if local_info and s3_info:
             print(f"  Local:  Size={local_info['local_size']:,} bytes, "
                   f"Modified={datetime.fromtimestamp(local_info['local_mtime'])}")
-            print(f"  S3:     Size={s3_info['s3_size']:,} bytes, "
+            print(f"  {self.REMOTE_NAME + ':':<7} Size={s3_info['s3_size']:,} bytes, "
                   f"Modified={datetime.fromtimestamp(s3_info['s3_mtime'])}")
 
             if "both" in reason.lower():
@@ -1476,8 +1742,8 @@ class S3SyncManager:
                     print("  (previous remote version remains available "
                           "through S3 bucket versioning)")
                 else:
-                    print("  ⚠️  Bucket versioning is NOT enabled: the "
-                          "previous remote version will be overwritten "
+                    print("  ⚠️  No remote version history is available: "
+                          "the previous remote version will be overwritten "
                           "without a preserved copy")
 
             return {'l': SyncAction.UPLOAD,
@@ -1882,7 +2148,7 @@ class S3SyncManager:
         if not paths:
             return 0
 
-        print(f"  Deleting {len(paths)} files from S3...")
+        print(f"  Deleting {len(paths)} files from {self.REMOTE_NAME}...")
         ok = self._run_rclone(['delete', self._rclone_remote()], paths)
         if not ok:
             print("  ⚠️  rclone reported errors during deletion; verifying what was deleted")
@@ -1899,7 +2165,8 @@ class S3SyncManager:
         with self._get_db() as conn:
             for path in paths:
                 if path in fresh_s3:
-                    print(f"  ❌ {path} is still present on S3; will retry on next sync")
+                    print(f"  ❌ {path} is still present on {self.REMOTE_NAME}; "
+                          f"will retry on next sync")
                     continue
                 conn.execute('DELETE FROM files WHERE path = ?', (path,))
                 deleted_paths.append(path)
@@ -1908,7 +2175,7 @@ class S3SyncManager:
         for path in deleted_paths:
             self._remove_shadow(path)
 
-        print(f"  ✓ Deleted {success_count}/{len(paths)} files from S3")
+        print(f"  ✓ Deleted {success_count}/{len(paths)} files from {self.REMOTE_NAME}")
         return success_count
 
     def _print_file_preview(self, files, title, max_files=50):
@@ -2004,7 +2271,8 @@ class S3SyncManager:
         self._print_file_preview(uploads, "Files to Upload")
         self._print_file_preview(downloads, "Files to Download")
         self._print_file_preview(deletes_local, "Files to Delete Locally")
-        self._print_file_preview(deletes_remote, "Files to Delete from S3")
+        self._print_file_preview(deletes_remote,
+                                 f"Files to Delete from {self.REMOTE_NAME}")
         self._print_file_preview(conflicts, "Conflicts to Resolve")
 
         # Flag suspect upload candidates (zero-byte files, unparseable JSON)
@@ -2016,27 +2284,57 @@ class S3SyncManager:
                 for path, problem in invalid_uploads:
                     print(f"  {path}: {problem}")
             if conflicts and auto_merge and fiber_merge is not None:
-                print("\nMerge preview for conflicts (fetches remote copies "
-                      "to test-merge; local files are not touched):")
+                print("\nDry-run conflict preview (fetches remote copies to "
+                      "test-merge; local files are not touched; link "
+                      "consistency between fibers is only assessed in a real run):")
+                mergeable = 0
                 for path, reason in conflicts:
                     probe = self._attempt_auto_merge(path,
                                                      local_files.get(path),
                                                      s3_files.get(path),
                                                      dry_run=True)
-                    print(f"  {path}: {probe or 'manual resolution required'}")
+                    if 'summary' in probe:
+                        mergeable += 1
+                        print(f"  {path}: content merge possible ({probe['summary']})")
+                    else:
+                        print(f"  {path}: manual resolution required "
+                              f"({probe['reason']})")
+                print(f"  {mergeable} of {len(conflicts)} conflict(s) are "
+                      "content-merge candidates")
             self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
                                      "Conflicts", len(conflicts))
             print("\n--dry-run mode: No changes will be made")
             return
 
-        # Process conflicts first: plan auto-merges (and their cross-file
-        # link-consistency fixes) for what we safely can, prompt for the
-        # rest. Merges are only applied after confirmation.
-        pending_merges, peer_fixes, manual_conflicts = \
-            self._plan_conflict_resolutions(conflicts, local_files, s3_files,
-                                            {p for p, _ in downloads},
-                                            {p for p, _ in deletes_local},
-                                            auto_merge)
+        # Process conflicts first: content conflicts are put to the user,
+        # then auto-merges (and their cross-file link-consistency fixes)
+        # are planned against the decided world; merges whose peers were
+        # skipped are prompted too. Merges are only applied after
+        # confirmation.
+        plan = self._plan_conflict_resolutions(
+            conflicts, local_files, s3_files,
+            {p for p, _ in downloads}, {p for p, _ in deletes_local},
+            auto_merge,
+            resolve=lambda path, reason: self.resolve_conflict(
+                path, reason, local_files.get(path), s3_files.get(path)))
+        pending_merges, peer_fixes = plan.pending, plan.peer_fixes
+        if conflicts:
+            st, dec = plan.stats, plan.stats['decisions']
+            print(f"\nConflicts: {st['merged']} auto-merged, "
+                  f"{st['content_conflicts']} needed a decision, "
+                  f"{st['blocked_by_skip']} blocked by skipped peers, "
+                  f"{st['blocked_by_delete']} blocked by pending deletions, "
+                  f"{st['link_state']} with unresolvable link state; "
+                  f"decisions: {dec['l']} local, {dec['r']} remote, {dec['s']} skipped")
+
+        # A decided root that received a reciprocal correction is written
+        # and uploaded once as a peer fix: the fix doc embodies the chosen
+        # source (local or remote) plus the correction.
+        decisions = dict(plan.resolved)
+        resolved_actions = [(p, a) for p, a in plan.resolved
+                            if p not in peer_fixes]
+        resolved_download_paths = {p for p, a in resolved_actions
+                                   if a == SyncAction.DOWNLOAD}
 
         for path, _ in pending_merges:
             uploads.append((path, "Auto-merged local + remote changes"))
@@ -2047,16 +2345,12 @@ class S3SyncManager:
             downloads = [(p, r) for p, r in downloads if p not in peer_fixes]
         for path in sorted(peer_fixes):
             if all(existing != path for existing, _ in uploads):
-                uploads.append((path, "Link consistency for merged fiber"))
-
-        resolved_actions = []
-        for path, reason in manual_conflicts:
-            action = self.resolve_conflict(path, reason, local_files.get(path),
-                                           s3_files.get(path))
-            if action != SyncAction.SKIP:
-                resolved_actions.append((path, action))
-        resolved_download_paths = {p for p, a in resolved_actions
-                                   if a == SyncAction.DOWNLOAD}
+                reason = "Link consistency for merged fiber"
+                if path in decisions:
+                    reason += (" (resolved: keep local)"
+                               if decisions[path] == SyncAction.UPLOAD
+                               else " (resolved: take remote)")
+                uploads.append((path, reason))
 
         merged_count = len(pending_merges)
         if merged_count:
@@ -2065,17 +2359,23 @@ class S3SyncManager:
         if peer_fixes:
             print(f"✓ {len(peer_fixes)} linked fiber file(s) will receive "
                   f"reciprocal link fixes and be uploaded")
+            for path in sorted(peer_fixes):
+                if path in decisions:
+                    chosen = ("local" if decisions[path] == SyncAction.UPLOAD
+                              else self.REMOTE_NAME)
+                    print(f"    {path}: your choice ({chosen}) is applied together "
+                          "with a reciprocal link fix and uploaded once")
 
         # Let the user decide what to do with suspect upload candidates
         invalid_uploads += self._validate_upload_candidates(
             [p for p, a in resolved_actions if a == SyncAction.UPLOAD])
 
+        skip_paths = set()
         if invalid_uploads:
             print(f"\n⚠️  {len(invalid_uploads)} upload candidate(s) look invalid:")
             for path, problem in invalid_uploads:
                 print(f"  {path}: {problem}")
 
-            skip_paths = set()
             for path, problem in invalid_uploads:
                 response = prompt_choice(
                     f"\n{path} ({problem}) — [u]pload anyway, [s]kip? ", ('u', 's'))
@@ -2101,9 +2401,17 @@ class S3SyncManager:
 
         # The summary sits right next to the confirmation prompt: with a long
         # file list above, this is what makes the decision readable
+        unresolved = len(plan.manual) + len(skip_paths & set(decisions))
         self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
-                                 "Conflicts skipped",
-                                 len(conflicts) - len(resolved_actions) - merged_count)
+                                 "Conflicts unresolved", unresolved)
+
+        # A going-away peer is never read by the planner, so it can never
+        # be scheduled for upload; make that impossible to regress silently.
+        clash = {p for p, _ in uploads} & {p for p, _ in deletes_local}
+        if clash:
+            self._discard_pending_merges(pending_merges)
+            raise RuntimeError("BUG: upload scheduled for a file pending local "
+                               f"deletion: {', '.join(sorted(clash))}")
 
         total_operations = (len(uploads) + len(downloads) +
                             len(deletes_local) + len(deletes_remote))
@@ -2177,9 +2485,9 @@ class S3SyncManager:
 
     def show_status(self, verbose=False, include_backups=False):
         """Show sync status"""
-        print(f"S3 Sync Status")
+        print(f"{self.REMOTE_NAME} Sync Status")
         print(f"Local directory: {self.local_dir}")
-        print(f"S3 location: s3://{self.s3_bucket}/{self.s3_prefix}/")
+        print(f"{self.REMOTE_NAME} location: {self._get_s3_url()}")
 
         if self.aws_profile:
             print(f"AWS Profile: {self.aws_profile}")
@@ -2213,7 +2521,8 @@ class S3SyncManager:
         print(f"\nSummary:")
         print(f"  Files to upload:     {action_counts.get(SyncAction.UPLOAD, 0)}")
         print(f"  Files to download:   {action_counts.get(SyncAction.DOWNLOAD, 0)}")
-        print(f"  Files to delete (S3): {action_counts.get(SyncAction.DELETE_REMOTE, 0)}")
+        print(f"  Files to delete ({self.REMOTE_NAME}): "
+              f"{action_counts.get(SyncAction.DELETE_REMOTE, 0)}")
         print(f"  Files to delete (local): {action_counts.get(SyncAction.DELETE_LOCAL, 0)}")
         print(f"  Conflicts:           {action_counts.get(SyncAction.CONFLICT, 0)}")
         if action_counts.get(SyncAction.CONFLICT) and fiber_merge is not None:
@@ -2237,6 +2546,394 @@ class S3SyncManager:
                     print(f"\n{action.value.replace('_', ' ').title()} ({len(files)} files):")
                     for path, reason in sorted(files):
                         print(f"  {path}: {reason}")
+
+
+def load_sftp_credentials(creds_file):
+    """Load SFTP credentials for the ash sync from a JSON file.
+
+    Required keys: host, user, pass. Optional: port (default 22) and
+    known_hosts_file (path for host-key pinning, e.g. ~/.ssh/known_hosts;
+    default "none" = no host-key validation, matching rclone's sftp
+    default). The file lives outside the sync tree (default
+    ~/.vc_ash_sftp.json) and should be chmod 600; permissive modes only
+    warn so a sync is never blocked on a permissions fix."""
+    path = os.path.expanduser(creds_file)
+    if not os.path.exists(path):
+        print(f"Error: SFTP credentials file not found: {path}")
+        print("Create it with (chmod 600) content like:")
+        print(json.dumps({'host': 'ash.example.org', 'user': 'myuser',
+                          'pass': 'my-password', 'port': 22}, indent=2))
+        sys.exit(1)
+
+    # POSIX only: Windows synthesizes st_mode, so the check would always
+    # fire there despite NTFS ACLs protecting the file
+    if os.name == 'posix':
+        try:
+            mode = os.stat(path).st_mode
+            if mode & 0o077:
+                print(f"⚠️  {path} is readable by other users — "
+                      f"consider: chmod 600 {path}")
+        except OSError:
+            pass
+
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error: could not read SFTP credentials file {path}: {e}")
+        sys.exit(1)
+
+    missing = [key for key in ('host', 'user', 'pass')
+               if not isinstance(data.get(key), str) or not data.get(key)]
+    if missing:
+        print(f"Error: SFTP credentials file {path} is missing required "
+              f"string field(s): {', '.join(missing)}")
+        sys.exit(1)
+
+    port = data.get('port', 22)
+    if not isinstance(port, int):
+        print(f"Error: 'port' in {path} must be an integer, got {port!r}")
+        sys.exit(1)
+
+    known_hosts = data.get('known_hosts_file', 'none')
+    if not isinstance(known_hosts, str) or not known_hosts:
+        print(f"Error: 'known_hosts_file' in {path} must be a non-empty "
+              f"string (use \"none\" to disable host-key validation)")
+        sys.exit(1)
+
+    return {'host': data['host'], 'user': data['user'],
+            'pass': data['pass'], 'port': port,
+            'known_hosts_file': known_hosts}
+
+
+class SftpSyncManager(S3SyncManager):
+    """The same interactive sync engine against a folder on an SFTP server.
+
+    All remote I/O goes through rclone's sftp backend (rclone is REQUIRED;
+    there is no serial aws-CLI fallback). The tracking DB reuses the s3_*
+    column names for remote metadata, but lives in its own files so it never
+    collides with an S3 sync of the same directory.
+
+    SFTP has no ETags: the s3_etag slot instead carries a real content MD5
+    for hash-scoped (annotation-sized JSON) files, computed server-side in
+    one batched `rclone md5sum` per scan. Where that is unavailable, remote
+    change detection falls back to size + mtime (rclone preserves mtimes
+    over SFTP), and content verification downloads-and-hashes on demand.
+    There is no remote version history, so merge bases come only from the
+    local shadow copies."""
+
+    REMOTE_NAME = 'SFTP'
+    CONFIG_NAME = ASH_CONFIG_NAME
+    DB_NAME = ASH_DB_NAME
+    BASE_DIR = ASH_BASE_DIR_NAME
+    CONFLICT_DIR = ASH_CONFLICT_DIR_NAME
+
+    # SFTP servers commonly cap concurrent sessions (OpenSSH MaxSessions
+    # defaults to 10); stay comfortably below what the S3 path uses.
+    RCLONE_TRANSFERS = 8
+    RCLONE_CHECKERS = 8
+
+    # SFTP mtimes have 1-second granularity; mirror the local scan's
+    # tolerance with a margin for the round-trip through setstat.
+    MTIME_TOLERANCE = 2.0
+
+    def __init__(self, local_dir, remote_path=None, creds_file=None):
+        self.local_dir = os.path.abspath(local_dir)
+        self.config_file = os.path.join(self.local_dir, self.CONFIG_NAME)
+        self.db_file = os.path.join(self.local_dir, self.DB_NAME)
+        self.aws_profile = None  # unused; kept for shared engine paths
+
+        if os.path.exists(self.config_file):
+            self._load_config()
+        else:
+            if not remote_path:
+                raise ValueError("remote_path required for initialization")
+            os.makedirs(self.local_dir, exist_ok=True)
+            self.remote_path = remote_path.rstrip('/')
+            self.creds_file = creds_file or ASH_DEFAULT_CREDS
+            self._save_config()
+
+        self._creds = load_sftp_credentials(self.creds_file)
+
+        self._finish_init()
+
+        if not self.use_rclone:
+            print(f"Error: the SFTP sync requires rclone: "
+                  f"{self.rclone_unavailable_reason}")
+            sys.exit(1)
+
+        self._sftp_pass_obscured = self._rclone_obscure(self._creds['pass'])
+        # One-shot notice when the server can't hash (printed by
+        # _remote_md5sums); None = not probed yet.
+        self._remote_hashing_works = None
+
+    def _load_config(self):
+        with open(self.config_file, 'r') as f:
+            data = json.load(f)
+        self.remote_path = data['remote_path']
+        self.creds_file = data.get('creds_file') or ASH_DEFAULT_CREDS
+
+    def _save_config(self):
+        data = {
+            'local_dir': self.local_dir,
+            'remote_path': self.remote_path,
+            'creds_file': self.creds_file,
+            'last_updated': datetime.now().isoformat()
+        }
+        with open(self.config_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def _rclone_obscure(password):
+        """rclone requires the sftp password in its obscured form; feed the
+        plaintext via stdin so it never appears in a process listing."""
+        try:
+            result = subprocess.run(['rclone', 'obscure', '-'],
+                                    input=password, capture_output=True,
+                                    text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"Error: 'rclone obscure' failed: {e}")
+            sys.exit(1)
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"Error: 'rclone obscure' failed: "
+                  f"{(result.stderr or '').strip()}")
+            sys.exit(1)
+        return result.stdout.strip()
+
+    def _run_aws_command(self, cmd):
+        raise RuntimeError(
+            f"BUG: aws CLI call {cmd[:3]}... reached the SFTP sync manager")
+
+    def _get_s3_url(self, relative_path=None):
+        """Display-only remote location (all transfers go through rclone)."""
+        base = (f"sftp://{self._creds['user']}@{self._creds['host']}:"
+                f"{self._creds['port']}/{self.remote_path.lstrip('/')}")
+        if relative_path:
+            return f"{base}/{relative_path}"
+        return f"{base}/"
+
+    def _rclone_remote(self):
+        """On-the-fly sftp remote; connection details travel as RCLONE_SFTP_*
+        env vars (see _rclone_env) so nothing sensitive is on the argv."""
+        return f":sftp:{self.remote_path}"
+
+    def _rclone_env(self):
+        env = os.environ.copy()
+        env['RCLONE_SFTP_HOST'] = self._creds['host']
+        env['RCLONE_SFTP_USER'] = self._creds['user']
+        env['RCLONE_SFTP_PORT'] = str(self._creds['port'])
+        env['RCLONE_SFTP_PASS'] = self._sftp_pass_obscured
+        # Pin the server shell type and hash commands instead of letting
+        # rclone probe for them. The probe is lazy and per-connection, and
+        # an on-the-fly :sftp: backend has no config section to persist its
+        # result into (rclone's "Can't save config" notices) — so a batched
+        # `rclone md5sum` over N --checkers connections races the probe and
+        # most files come back "hash unsupported" (seen live: 1/70 hashed),
+        # degrading change detection to size+mtime. On a server without
+        # md5sum the pinned command fails cleanly per file and the
+        # server-side-hashing-unavailable fallback in _remote_md5sums
+        # still applies.
+        env['RCLONE_SFTP_SHELL_TYPE'] = 'unix'
+        env['RCLONE_SFTP_MD5SUM_COMMAND'] = 'md5sum'
+        env['RCLONE_SFTP_SHA1SUM_COMMAND'] = 'sha1sum'
+        # Only set when a real path is configured (host-key pinning).
+        # The "none" default must leave the variable UNSET: older rclone
+        # treats any value as a literal path and fails to open "none";
+        # unset simply means rclone's own default of no validation (newer
+        # rclone then prints a one-line NOTICE per invocation — harmless).
+        known_hosts = self._creds['known_hosts_file']
+        if known_hosts.lower() != 'none':
+            env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] = os.path.expanduser(known_hosts)
+        return env
+
+    def _run_rclone_capture(self, args, timeout=None):
+        """Run one rclone command against the SFTP remote, capturing output.
+        Returns the CompletedProcess (never raises on non-zero exit)."""
+        cmd = ['rclone'] + args
+        extra_flags = os.environ.get('VC_SYNC_RCLONE_FLAGS')
+        if extra_flags:
+            cmd += shlex.split(extra_flags)
+        return subprocess.run(cmd, env=self._rclone_env(),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _fetch_remote_file(self, path, dst):
+        result = self._run_rclone_capture(
+            ['copyto', f"{self._rclone_remote()}/{path}", dst])
+        if result.returncode != 0:
+            detail_lines = (result.stderr or '').strip().splitlines()
+            detail = detail_lines[-1] if detail_lines else "unknown error"
+            raise RuntimeError(f"rclone copyto failed for {path}: {detail}")
+
+    def _bucket_versioning_enabled(self):
+        return False
+
+    def _fetch_base_from_history(self, path, etag):
+        # No version history on SFTP; merge bases come from shadow copies only
+        return None
+
+    def _content_matches_remote(self, path, md5, etag):
+        """Unlike an S3 ETag, the etag slot here carries a genuine content
+        MD5 whenever the server can hash, so a mismatch IS proof of
+        difference — no need to download and re-hash."""
+        if not md5:
+            return False
+        if etag:
+            # The etag IS the remote content hash: seed the cache so later
+            # _remote_md5 lookups (e.g. the could-not-verify distinction in
+            # analyze_changes) don't re-download the file.
+            self._remote_md5_cache.setdefault(path, etag)
+            return md5 == etag
+        return self._remote_md5(path) == md5
+
+    def _remote_changed(self, tracked_info, remote_info):
+        """Size first; then content MD5s when both sides carry one (they
+        live in the s3_etag slot); mtime as the last resort — an SFTP
+        overwrite that preserves size, mtime, and (where hashed) content is
+        indistinguishable from no change."""
+        if tracked_info.get('s3_size') != remote_info['s3_size']:
+            return True
+        tracked_md5 = tracked_info.get('s3_etag')
+        fresh_md5 = remote_info.get('s3_etag')
+        if tracked_md5 and fresh_md5:
+            return tracked_md5 != fresh_md5
+        tracked_mtime = tracked_info.get('s3_mtime')
+        remote_mtime = remote_info.get('s3_mtime')
+        return bool(tracked_mtime and remote_mtime and
+                    abs(tracked_mtime - remote_mtime) > self.MTIME_TOLERANCE)
+
+    @staticmethod
+    def _parse_rclone_time(timestamp_str):
+        """rclone lsjson ModTime → Unix timestamp. rclone emits RFC 3339
+        with up to nanosecond precision; fromisoformat only takes
+        microseconds, so trim the fraction."""
+        ts = timestamp_str.replace('Z', '+00:00')
+        ts = re.sub(r'\.(\d{6})\d+', r'.\1', ts)
+        return datetime.fromisoformat(ts).timestamp()
+
+    def _remote_md5sums(self, paths):
+        """{path: md5} for the given remote paths via ONE batched
+        `rclone md5sum` run (server-side hashing over a single SSH
+        connection). Returns {} when the server cannot hash — callers then
+        fall back to mtime comparison / on-demand download-and-hash."""
+        if not paths or self._remote_hashing_works is False:
+            return {}
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                         dir=self.local_dir,
+                                         prefix='.ashsync-files-') as f:
+            f.write('\n'.join(paths) + '\n')
+            list_path = f.name
+        try:
+            result = self._run_rclone_capture(
+                ['md5sum', self._rclone_remote(),
+                 '--files-from', list_path,
+                 '--checkers', str(self.RCLONE_CHECKERS)])
+        finally:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+
+        md5s = {}
+        for line in (result.stdout or '').splitlines():
+            # "<32-hex>  <path>"; unsupported hashes show up as empty or
+            # "UNSUPPORTED" and are simply not adopted
+            hash_part, sep, name = line.partition('  ')
+            if sep and re.fullmatch(r'[0-9a-f]{32}', hash_part):
+                md5s[name] = hash_part
+
+        if not md5s:
+            if self._remote_hashing_works is None:
+                self._remote_hashing_works = False
+                print("  ⚠️  Server-side MD5 hashing unavailable on the SFTP "
+                      "remote; falling back to size+mtime change detection "
+                      "(content is fetched to verify only where needed)")
+            return {}
+        self._remote_hashing_works = True
+        if result.returncode != 0:
+            # Partial output (e.g. one unreadable file) is still usable as
+            # positive evidence; missing entries just stay unhashed.
+            print("  ⚠️  rclone md5sum reported errors; "
+                  f"got hashes for {len(md5s)}/{len(paths)} file(s)")
+        return md5s
+
+    def _attach_remote_md5s(self, files):
+        """Fill the s3_etag slot with real content MD5s for hash-scoped
+        files in a remote listing (in place)."""
+        hash_paths = [path for path, info in files.items()
+                      if self._should_hash(path, info['s3_size'])]
+        for path, md5 in self._remote_md5sums(hash_paths).items():
+            if path in files:
+                files[path]['s3_etag'] = md5
+
+    def scan_s3_files(self, include_backups=False):
+        """Scan the remote SFTP folder (name kept for the shared engine)."""
+        print(f"Scanning SFTP: {self._get_s3_url()}")
+        result = self._run_rclone_capture(
+            ['lsjson', '-R', '--files-only', '--no-mimetype',
+             self._rclone_remote()])
+        if result.returncode != 0:
+            stderr = (result.stderr or '').strip()
+            if 'directory not found' in stderr.lower():
+                print("Remote folder does not exist yet "
+                      "(it will be created by the first upload)")
+                return {}
+            detail = stderr.splitlines()[-1] if stderr else "unknown error"
+            print(f"Error: could not list the SFTP remote: {detail}")
+            sys.exit(1)
+
+        files = {}
+        for entry in json.loads(result.stdout or '[]'):
+            relative_path = entry['Path']
+            if self._is_ignored(relative_path, include_backups):
+                continue
+            files[relative_path] = {
+                'path': relative_path,
+                's3_size': entry['Size'],
+                's3_mtime': self._parse_rclone_time(entry['ModTime']),
+                's3_etag': None,
+                'is_backup': is_backup_file(os.path.basename(relative_path))
+            }
+
+        self._attach_remote_md5s(files)
+
+        print(f"Found {len(files)} remote files")
+        return files
+
+    def _fetch_s3_info(self, paths, include_backups=False):
+        """Fresh remote metadata for post-transfer verification (see the
+        base method for the contract: absent paths are omitted, unverifiable
+        ones stay with unknown size)."""
+        if len(paths) > self.VERIFY_HEAD_MAX:
+            print("  Verifying against a fresh remote listing...")
+            return self.scan_s3_files(include_backups)
+
+        print(f"  Verifying {len(paths)} file(s) against the SFTP remote...")
+        info = {}
+        for path in paths:
+            result = self._run_rclone_capture(
+                ['lsjson', '--stat', '--no-mimetype',
+                 f"{self._rclone_remote()}/{path}"])
+            if result.returncode != 0:
+                stderr = (result.stderr or '').strip()
+                # 3/4 are rclone's directory/file-not-found exit codes
+                if (result.returncode in (3, 4) or
+                        'not found' in stderr.lower()):
+                    continue  # confirmed absent
+                print(f"  ⚠️  Could not verify {path}: {stderr}")
+                info[path] = {'path': path, 's3_size': None, 's3_mtime': None}
+                continue
+            entry = json.loads(result.stdout)
+            info[path] = {
+                'path': path,
+                's3_size': entry['Size'],
+                's3_mtime': self._parse_rclone_time(entry['ModTime']),
+                's3_etag': None,
+            }
+
+        verified = {path: meta for path, meta in info.items()
+                    if meta['s3_size'] is not None}
+        self._attach_remote_md5s(verified)
+        return info
 
 
 HFSYNC_CONFIG_NAME = '.hfsync.json'
@@ -2476,67 +3173,137 @@ def main():
     hfsync_parser.add_argument('--dry-run', action='store_true',
                                help='Show what would be synced without doing it')
 
+    # SFTP (ash) sync commands: same engine, independent tracking state
+    ash_init_parser = subparsers.add_parser(
+        'ash-init', help='Initialize SFTP sync configuration (rclone sftp backend)')
+    ash_init_parser.add_argument('directory', help='Local directory to sync')
+    ash_init_parser.add_argument('remote_path',
+                                 help='Folder on the SFTP server (leading / for '
+                                      'an absolute path, otherwise relative to '
+                                      'the login home)')
+    ash_init_parser.add_argument('--creds', default=None,
+                                 help=f'SFTP credentials JSON file '
+                                      f'(default: {ASH_DEFAULT_CREDS})')
+
+    ash_status_parser = subparsers.add_parser('ash-status', help='Show SFTP sync status')
+    ash_status_parser.add_argument('directory', help='Local directory')
+    ash_status_parser.add_argument('--verbose', '-v', action='store_true',
+                                   help='Show detailed file list')
+    ash_status_parser.add_argument('--sync-backups', action='store_true',
+                                   help='Include backups/ directories in sync')
+
+    ash_sync_parser = subparsers.add_parser(
+        'ash-sync', help='Perform interactive sync with the SFTP remote')
+    ash_sync_parser.add_argument('directory', help='Local directory')
+    ash_sync_parser.add_argument('--dry-run', action='store_true',
+                                 help='Show what would be synced without doing it')
+    ash_sync_parser.add_argument('--sync-backups', action='store_true',
+                                 help='Include backups/ directories in sync')
+    ash_sync_parser.add_argument('--no-auto-merge', action='store_true',
+                                 help='Disable the fiber-aware three-way merge for '
+                                      'conflicting annotation files')
+
+    ash_update_parser = subparsers.add_parser(
+        'ash-update',
+        help='Refresh SFTP sync tracking without hiding pending changes')
+    ash_update_parser.add_argument('directory', help='Local directory')
+    ash_update_parser.add_argument('--sync-backups', action='store_true',
+                                   help='Include backups/ directories in tracking')
+
+    ash_reset_parser = subparsers.add_parser(
+        'ash-reset',
+        help='Reset SFTP sync tracking (marks ALL files as synced, '
+             'discarding pending differences)')
+    ash_reset_parser.add_argument('directory', help='Local directory')
+    ash_reset_parser.add_argument('--sync-backups', action='store_true',
+                                  help='Include backups/ directories in reset')
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    if args.command == 'init':
+    def run_init(manager, sync_cmd):
         # Initialize new sync configuration. No transfers happen here: files
-        # identical on both sides are recorded as in sync, and everything else
-        # (S3-only, local-only, size mismatches) is left for 'sync' to resolve.
-        manager = S3SyncManager(args.directory, args.s3_bucket, args.s3_prefix, args.profile)
+        # identical on both sides are recorded as in sync, and everything
+        # else (remote-only, local-only, size mismatches) is left for the
+        # sync command to resolve.
+        remote = manager.REMOTE_NAME
         print(f"Initialized sync configuration in {args.directory}")
-        print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
+        print(f"{remote} location: {manager._get_s3_url()}")
 
         print("\nScanning initial state...")
         local_files = manager.scan_local_files(include_backups=False)
         s3_files = manager.scan_s3_files(include_backups=False)
 
-        manager._record_untracked_synced(local_files, s3_files)
+        try:
+            manager._record_untracked_synced(local_files, s3_files)
+        finally:
+            # Content verification may fetch remote copies into the run
+            # scratch dir; never leave them in the system tmp dir.
+            manager._cleanup_run_tmp()
 
-        s3_only = sum(1 for path in s3_files if path not in local_files)
+        remote_only = sum(1 for path in s3_files if path not in local_files)
         local_only = sum(1 for path in local_files if path not in s3_files)
-        if s3_only:
-            print(f"{s3_only} file(s) exist only on S3 and can be downloaded with 'sync'")
+        if remote_only:
+            print(f"{remote_only} file(s) exist only on {remote} and can be "
+                  f"downloaded with '{sync_cmd}'")
         if local_only:
-            print(f"{local_only} file(s) exist only locally and can be uploaded with 'sync'")
+            print(f"{local_only} file(s) exist only locally and can be "
+                  f"uploaded with '{sync_cmd}'")
 
         print("\n✓ Initialization complete!")
-        print("Use 'sync' to transfer differences and 'status' to see current sync state")
+        print(f"Use '{sync_cmd}' to transfer differences and "
+              f"'{sync_cmd.replace('sync', 'status')}' to see current sync state")
+
+    if args.command == 'init':
+        run_init(S3SyncManager(args.directory, args.s3_bucket,
+                               args.s3_prefix, args.profile), 'sync')
+
+    elif args.command == 'ash-init':
+        run_init(SftpSyncManager(args.directory, args.remote_path,
+                                 args.creds), 'ash-sync')
 
     elif args.command == 'hfsync':
         # Independent of the S3 sync configuration; gated only on .hfsync.json
         hf_sync(args.directory, args.dry_run)
 
     else:
+        # The ash-* commands are the same engine over the SFTP manager,
+        # with its own configuration/tracking files
+        is_ash = args.command.startswith('ash-')
+        command = args.command[len('ash-'):] if is_ash else args.command
+        manager_cls = SftpSyncManager if is_ash else S3SyncManager
+
         # Check for existing configuration
-        config_file = os.path.join(args.directory, '.s3sync.json')
+        config_file = os.path.join(args.directory, manager_cls.CONFIG_NAME)
 
         if not os.path.exists(config_file):
+            init_cmd = 'ash-init' if is_ash else 'init'
             print(f"Error: No sync configuration found in {args.directory}")
-            print("Run 'init' command first to set up sync configuration")
+            print(f"Run '{init_cmd}' command first to set up sync configuration")
             sys.exit(1)
 
-        manager = S3SyncManager(args.directory)
+        manager = manager_cls(args.directory)
 
         try:
-            if args.command == 'status':
+            if command == 'status':
                 manager.show_status(args.verbose, args.sync_backups)
 
-            elif args.command == 'sync':
+            elif command == 'sync':
                 manager.sync(args.dry_run, args.sync_backups,
                              auto_merge=not args.no_auto_merge)
 
-            elif args.command == 'update':
+            elif command == 'update':
                 manager.refresh_tracking(args.sync_backups)
 
-            elif args.command == 'reset':
+            elif command == 'reset':
                 print("Resetting sync tracking...")
                 print("This will mark ALL current files as synced, discarding any pending differences.")
-                print("Files that currently differ between local and S3 will also lose their "
-                      "merge base until the next successful sync.")
+                print(f"Files that currently differ between local and "
+                      f"{manager.REMOTE_NAME} will also lose their "
+                      f"merge base until the next successful sync.")
                 if not args.sync_backups:
                     print("Note: Excluding backups/ directories (use --sync-backups to include them)")
 

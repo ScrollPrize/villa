@@ -21,22 +21,24 @@
 
 - The benchmark must exercise the production `ChunkedPlaneSampler`
   fine-to-coarse coordinate rendering path.
-- It must use a deterministic synthetic chunked volume with four pyramid
-  levels and pseudo-random decoded `uint8` chunk contents.
+- It must use the production `ChunkCache` with a deterministic synthetic
+  `IChunkFetcher`, four pyramid levels, and pseudo-random decoded `uint8`
+  chunk contents.
 - Synthetic chunk materialization must occur before the measured region. The
   measured workload must represent rendering against controlled resident,
-  missing, and fallback states, without storage, network, compression, or
-  asynchronous cache scheduling costs.
+  missing, and fallback states, including production cache lookup and locking
+  costs but excluding storage, network, compression, decode, and asynchronous
+  cache scheduling costs. No fetcher call may occur after preload.
 - The coordinate fixture must include substantial contiguous runs of spatially
   correlated coordinates, matching the usual surface-rendering access pattern.
 - The fixture must use trilinear sampling with every coordinate and all eight
   required voxels in bounds at every pyramid level. For a coordinate assigned
   to level `L`, at least one required chunk must be missing at each finer level
   and all required chunks must be resident data at level `L`.
-- Both `tryGetChunk()` and `getChunkIfCached()` must return pre-materialized
-  states without allocation or mutation. The benchmark must use
-  `queueMisses=true` and `queuedFallbackLevels=0` so level 0 follows the normal
-  request path and fallback levels use resident-only reads.
+- Both `tryGetChunk()` and `getChunkIfCached()` must resolve through the real
+  cache from pre-materialized states. The benchmark must use `queueMisses=true`
+  and `queuedFallbackLevels=0` so level 0 follows the normal request path and
+  fallback levels use resident-only reads.
 - The benchmark must provide these scenarios:
   - `full_res`: every coordinate is available at level 0.
   - `fallback_3`: every coordinate falls back through levels 0, 1, and 2 and
@@ -116,22 +118,32 @@
   instrumented guest is serialized by Valgrind, CI uses the runner's available
   logical CPU count as Ninja concurrency and may run one independent Valgrind
   process per host CPU even when each guest configures four renderer workers.
-- The CI regression graph must generate fresh separate-thread Callgrind
-  profiles for all eight cases and fresh complete DRD dependency graphs for the
-  four parallel cases. A collector publishes its completion manifest atomically
-  only after all raw files and metadata validate; evaluators depend on those
-  manifests and may not rerun collection.
+- The CI regression graph must run Callgrind exactly once for each of the eight
+  cases. Every run generates fresh separate-thread periodic profiles; each
+  parallel run also records the scheduler and futex stream from that same
+  execution. Ninja publishes a collection stamp only after Valgrind exits
+  successfully; native evaluators depend on those stamps and may not rerun
+  collection.
 - The CI relative modeled-runtime score uses the frozen synthetic-only
-  data-read event model. Feature extraction, event-cost evaluation, deterministic
-  numeric-thread summation, cost attribution, and replay must run in the native
-  C++ replay engine. The Python CI coordinator must use only the standard
-  library at runtime; a `python3 -S` test must exercise dependency parsing and
-  native scoring. Serial score is summed per-thread modeled work per render
-  call. Parallel score is native FIFO replay makespan per render call with four
-  workers plus one caller core, equal attribution,
+  data-read event model. Raw profile and scheduler/futex parsing, feature
+  extraction, event-cost evaluation, direct per-thread cost attribution,
+  replay, and result output must run in the native C++ replay engine. Python
+  must not be used in the regular evaluation path. Serial score is summed
+  per-thread modeled work per render call. Parallel score is native FIFO replay
+  makespan per render call with four workers plus one caller core,
   `residual_fraction=0.5`, zero wake latency, the frozen cross-thread release
   latency, and unit replay/dependency-excess scales. Process startup and native
   wall timing are excluded.
+- Callgrind must use the fair scheduler and fixed scheduling quantum without
+  application markers or measured-program changes. The synchronization graph
+  must be trimmed to the unique passive clock-call pair around the render.
+  Periodic Callgrind deltas must be placed chronologically over that same run's
+  scheduler work windows while preserving each thread's exact aggregate
+  modeled cost.
+- Callgrind worker IDs identify both costs and scheduler/futex events because
+  they come from the same process. Costs must be attributed directly to the
+  originating thread; no cross-run matching, worker permutation, or inferred
+  identity assignment is permitted.
 - The relative modeled-runtime score is not a validated absolute runtime claim.
   Each case may be at most the configured tolerance slower than its versioned
   reference, initially 10%. Faster scores are accepted without a lower bound.
@@ -146,10 +158,12 @@
   worker count, and profiler version are diagnostic-only and must not affect
   reference pass/fail. The reference schema and case key remain required to
   locate and interpret the score baseline.
-- Current-run artifact integrity remains mandatory. Paired Callgrind and DRD
-  artifacts must describe the same case and metadata and use the same Valgrind
-  version. Parallel traces must have no unresolved happens-before edge or
-  unmatched blocking wait.
+- Current-run artifact integrity remains mandatory. Callgrind metadata must
+  describe the requested case, dimensions, repetitions, worker count, and
+  checksum. Parallel traces must have one unambiguous measured window and no
+  unresolved successful in-window futex wait.
+- Collection or attribution failures are hard errors. A valid modeled-runtime
+  regression must never be retried as an attribution failure.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,
@@ -197,38 +211,36 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   threshold protocol.
 - Passive synchronization extraction must not require application markers or
   alter the benchmark binary. On Linux amd64 the dispatch fixture may use
-  Valgrind's core scheduler and syscall debug streams. Renderer replay must use
-  DRD vector clocks so nonblocking userspace synchronization is represented in
-  addition to scheduler quanta and futex syscalls.
+  Valgrind's core scheduler and syscall debug streams. The rendering gate must
+  derive costs, scheduler quanta, and futex dependencies from one Callgrind
+  execution so thread identities are exact.
 - A passive event stream must preserve thread IDs and global order, represent
   fixed-basic-block work slices, pair blocking futex waits with guest wakes or
   observed thread completion, and fail timing validation when dependencies are
   unresolved.
-- Passive event scoring and playback must use the native persistent replay
-  engine. Python remains responsible for Valgrind collection, dependency
-  extraction, model fitting, orchestration, and reports, but production callers
-  must ask the native engine to evaluate profile costs, load each event graph
-  once, cache named cost attributions, and submit ordered replay batches through
-  the versioned protocol. Missing native replay is an error; there is no silent
-  Python fallback. The Python replay and NumPy event model are retained only as
-  calibration/parity tools and must not be used for production benchmark
+- Passive event scoring and playback must use the native replay engine. The
+  rendering gate must also perform raw Valgrind parsing, dependency extraction,
+  orchestration, and reporting natively. The persistent JSON protocol remains
+  available to offline calibration tools. Missing native replay is an error;
+  there is no Python fallback. Python replay and NumPy event models are retained
+  only as calibration/parity tools and must not produce production benchmark
   results.
 - Valgrind elapsed timestamps must not be used as native duration or as work
   weights. State names must distinguish traced blocking from native scheduler
   state; simulated core idle is never an observed native metric.
-- Callgrind work weights and native timing must cover the same explicit
-  measured loop. The passive DRD dependency graph may span the process, but
-  allocation, fixture construction, verification, and teardown must not be
-  assigned measured work. Partial scheduler quanta and scheduler tie-breaking
-  must be reported as sensitivity ranges.
+- Callgrind work weights and synchronization events must cover the same
+  explicit measured loop. Allocation, fixture construction, verification, and
+  teardown must not be assigned measured work. Partial scheduler quanta and
+  scheduler tie-breaking must be reported as sensitivity ranges.
 - Native renderer replay must reserve one CPU for the submitting caller:
   `parallel_cores = workers + 1`. The one-CCD domain therefore ends at seven
   workers on CPUs 0--7. Comparing `workers` threads on only `workers` CPUs is a
   saturated diagnostic and must not be used as renderer validation.
 - Renderer validation may not fit an effective-parallelism, contention, or
   worker-count coefficient. Valgrind supplies work events, scheduler slices,
-  and DRD happens-before edges; native data validates the result but does not
-  alter it. Every frozen case must remain within 20% median speedup error.
+  and futex happens-before edges from one execution; native data validates the
+  result but does not alter it. Every frozen case must remain within 20% median
+  speedup error.
 - Renderer diagnostics may motivate a generic synthetic hypothesis, but they
   may not choose its formula, bounds, coefficients, fit cases, holdouts, or
   acceptance thresholds. Existing renderer cases used to motivate a hypothesis
@@ -271,7 +283,7 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   `0 <= dependency_excess_scale <= 1`:
 
   ```text
-  hard_cp = critical path excluding inferred DRD happens-before edges
+  hard_cp = critical path excluding inferred cross-thread release edges
   hard_lower = max(total_event_work / core_count, hard_cp)
   full_lower = max(hard_lower, full_dependency_critical_path)
   dependency_excess = full_lower - hard_lower
@@ -282,7 +294,7 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   ```
 
   Hard critical-path edges include per-thread program order and thread
-  lifecycle. The full path additionally includes inferred DRD vector-clock
+  lifecycle. The full path additionally includes inferred cross-thread release
   edges and the separately calibrated cross-thread release latency. Scale one
   must reproduce current FIFO replay exactly. Scale zero may remove only
   inferred dependency excess and must preserve hard task imbalance, program

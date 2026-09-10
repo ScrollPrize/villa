@@ -1,78 +1,50 @@
 #pragma once
 
-#include <QDebug>
-#include <QDir>
-#include <QFileInfo>
 #include <QString>
+
+#include <filesystem>
+
+#include "vc/core/util/RemoteCacheSettings.hpp"
 
 namespace vc3d {
 
-// Single source of truth for where downloaded remote-volume chunks land.
-//
-// Priority — first match wins:
-//   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
-//   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
-//   3. `suggestion` if non-empty
-//   4. ~/.VC3D/remote_cache
-//
-// If /volpkgs or /ephemeral exists, the cache is forced there and any
-// `suggestion` is ignored: these mounts are the whole point of the host
-// being provisioned, and a stale per-volpkg or per-user setting pointing
-// elsewhere silently fills the root disk.
-//
-// Fail-fast: if /volpkgs or /ephemeral exists but isn't writable by the
-// running user (typical: directory owned by root, mode 0755), we abort
-// rather than fall through — that masks the real problem.
-//
-// The chosen path is created on disk before return.
-inline QString remoteCachePath(const QString& suggestion = {})
+inline QString pathToQString(const std::filesystem::path& path)
 {
-    for (const QString& root : {QStringLiteral("/volpkgs"),
-                                QStringLiteral("/ephemeral")}) {
-        QFileInfo fi(root);
-        if (!fi.exists()) {
-            continue;
-        }
-        if (!fi.isDir()) {
-            qFatal("remoteCachePath: %s exists but is not a directory",
-                   qUtf8Printable(root));
-        }
-        // QFileInfo::isWritable() is unreliable on some FUSE/NFS mounts,
-        // so probe by trying to create the cache subtree.
-        const QString p = root + "/remote_cache";
-        if (!QDir().mkpath(p)) {
-            qFatal("remoteCachePath: %s exists but remote_cache/ cannot be "
-                   "created (check ownership/perms — must be writable by "
-                   "this user)",
-                   qUtf8Printable(root));
-        }
-        if (!QFileInfo(p).isWritable()) {
-            qFatal("remoteCachePath: %s is not writable by this user",
-                   qUtf8Printable(p));
-        }
-        return p;
-    }
-
-    QString p = suggestion.trimmed();
-    if (p.isEmpty()) {
-        p = QDir::homePath() + "/.VC3D/remote_cache";
-    }
-    QDir().mkpath(p);
-    return p;
+#ifdef _WIN32
+    return QString::fromStdWString(path.native());
+#else
+    const auto& native = path.native();
+    return QString::fromUtf8(native.data(), static_cast<qsizetype>(native.size()));
+#endif
 }
+
+inline constexpr auto kRemoteCacheDirectorySetting =
+    vc::settings::kRemoteCacheDirectory;
 
 inline QString settingsFilePath()
 {
-    // Settings must stay in the user's home — /ephemeral is lost on stop.
-    // Tests may redirect the otherwise fixed per-user directory without
-    // changing production behavior.
-    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
-    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
-    QDir dir;
-    if (!dir.exists(configDir)) {
-        dir.mkpath(configDir);
-    }
-    return configDir + "/VC3D.ini";
+    return pathToQString(vc::settings::settingsFilePath());
+}
+
+// Process-active root for downloaded remote-volume chunks. The value is fixed
+// on first use; settings changes take effect after VC3D restarts.
+//
+// Priority — first match wins:
+//   1. viewer/remote_cache_dir from the process-wide VC3D settings
+//   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
+//   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   4. ~/.VC3D/remote_cache
+//
+// Resolution and directory creation are implemented in shared core code so
+// GUI and command-line project loading cannot diverge.
+inline QString remoteCachePath()
+{
+    return pathToQString(vc::settings::remoteCachePath());
+}
+
+inline std::filesystem::path remoteCachePathFs()
+{
+    return vc::settings::remoteCachePath();
 }
 
 // =============================================================================
@@ -179,9 +151,9 @@ namespace viewer {
     constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
 
-    // Remote volume chunk cache directory. Resolved through
-    // vc3d::remoteCachePath() — see that function for the priority rules.
-    constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
+    // Process-wide remote volume cache directory. All VC3D consumers resolve
+    // it through vc3d::remoteCachePath().
+    constexpr auto REMOTE_CACHE_DIR = kRemoteCacheDirectorySetting;
 
     // Recent remote zarr URLs used to pre-fill attach dialog
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
@@ -236,20 +208,9 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true, raw chunks downloaded from remote volumes are stored in the
-    // persistent disk cache compressed at the configured quantization width.
-    // Reading understands both formats regardless of this flag; it only
-    // controls the write format. Requires restart.
-    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
-    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
-
-    // Quantization bin width for compressed disk-cache writes
-    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
-    // Only affects newly written chunks; reading is unaffected. Requires
-    // restart, except for the explicit "recompress existing cache" action.
-    // Default lossless: compression saves space without changing voxels.
-    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
-    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
+    // Startup-only persistent representation for remote-volume chunks.
+    constexpr auto REMOTE_CACHE_DELTA3D = "perf/remote_cache_delta3d";
+    constexpr bool REMOTE_CACHE_DELTA3D_DEFAULT = false;
 
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
@@ -269,16 +230,40 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable — it tracks
-    // std::thread::hardware_concurrency() at runtime.
+    // Process-wide remote source-download admission. Automatic mode adapts
+    // between 2 and the fixed worker capacity. Manual mode admits exactly the
+    // configured number of simultaneous downloads. Decode workers are managed
+    // separately.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
+        "perf/remote_download_automatic";
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
+        "perf/remote_download_parallelism";
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
+
+    // Reusable adaptive-download capacity model. Runtime probe phase and
+    // stability timing are reset on every launch.
+    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
+        "perf/remote_download_state/version";
+    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
+    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
+        "perf/remote_download_state/settled_admission";
+    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
+        "perf/remote_download_state/long_term_bytes_per_second";
+    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
+        "perf/remote_download_state/max_saturated_parallelism";
+    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
+        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
 
 }
 
 // -----------------------------------------------------------------------------
 // Viewer Cache Settings
 //
-// Each ViewerManager owns independent decoded-chunk and surface-tile caches, so
-// workspaces cannot evict one another. These settings apply without a restart.
+// Each ViewerManager owns independent derived surface-tile caches. Raw decoded
+// volume chunks use the application-wide cache. These settings apply without a
+// restart.
 // -----------------------------------------------------------------------------
 namespace viewer_cache {
     // Per-workspace budget for the flattened segmentation view's cache of
@@ -291,13 +276,6 @@ namespace viewer_cache {
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
     constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
-    // LRU cap for the private decoded-chunk pool behind a workspace's plane panes.
-    // A floor rather than a ceiling: it is raised automatically when it cannot
-    // hold one frame (otherwise a single render thrashes), and the status bar
-    // reports the effective value. The surface-tile filler gets a pool of the
-    // same size as an internal constant.
-    constexpr auto PLANE_CHUNK_CACHE_MB = "viewer_cache/plane_chunk_cache_mb";
-    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
 }
 
 // -----------------------------------------------------------------------------
@@ -319,17 +297,25 @@ namespace line_annotation {
     constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
     constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
+    // Maximum base-voxel polyline arclength for control-point extrapolation.
+    // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    // Cruise speed of the Left/Right arrow pan between control points, in line
-    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
-    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
-    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
+    // Cruise speed of the Left/Right arrow pan between control points, in base
+    // voxels of optimized-polyline arclength per second. Up/Down adjust it.
+    // "_vx" retires the line-positions-per-second key: its values would be 4x
+    // to 32x off in the new unit, so they are neither read nor migrated.
+    constexpr auto ARROW_PAN_SPEED_VX = "lineAnnotation/arrow_pan_speed_vx";
+    constexpr double ARROW_PAN_SPEED_VX_DEFAULT = 96.0;
     // "_v2" retires ratios saved before the fixed top strip / smaller bottom
     // strip layout; old values would override the new default proportions.
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    // Shared cursor cross across the four generated panes. Independent of the
+    // app-global "Sync cursor across views" toggle.
+    constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
+    constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
@@ -380,6 +366,8 @@ namespace aws {
 namespace tools {
     constexpr auto FLATBOI_PATH = "tools/flatboi_path";
     constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
+    constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
+    constexpr auto GROW_TRACK_VENV_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------

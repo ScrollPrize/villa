@@ -287,5 +287,65 @@ int main(int argc, char** argv)
     require(iterations->value() == 47,
             "Expert JSON changes did not update grouped controls");
 
+    const QString savedProfileText = QStringLiteral(
+        R"({"optimizer_learning_rate": 1.25})");
+    editor._profiles.push_back({QStringLiteral("saved-profile"),
+                                QStringLiteral("Saved Profile"),
+                                savedProfileText});
+    editor.rebuildCombo();
+    editor.selectProfile(QStringLiteral("saved-profile"), false);
+    editor.setSessionDefault(QJsonObject{
+        {QStringLiteral("optimizer_learning_rate"), 2.5},
+        {QStringLiteral("model_iterations"), 60},
+    });
+    require(editor.currentProfileId() == QStringLiteral("saved-profile")
+                && editor.currentText() == savedProfileText,
+            "Refreshing the session default changed the selected saved profile");
+
+    editor.selectProfile(QStringLiteral("custom"), false);
+    const QString customText = QStringLiteral(
+        R"({"optimizer_learning_rate": 3.75})");
+    editor.setCurrentText(customText);
+    editor.setSessionDefault(QJsonObject{
+        {QStringLiteral("optimizer_learning_rate"), 4.5},
+        {QStringLiteral("model_iterations"), 70},
+    });
+    require(editor.currentProfileId() == QStringLiteral("custom")
+                && editor.currentText() == customText,
+            "Refreshing the session default changed the custom configuration");
+
+    editor.selectProfile(QStringLiteral("default"), false);
+    const QJsonObject latestSessionDefault{
+        {QStringLiteral("optimizer_learning_rate"), 5.5},
+        {QStringLiteral("model_iterations"), 80},
+    };
+    editor.setSessionDefault(latestSessionDefault);
+    require(editor.currentProfileId() == QStringLiteral("default")
+                && QJsonDocument::fromJson(editor.currentText().toUtf8()).object()
+                    == latestSessionDefault,
+            "Refreshing the selected session default did not update its values");
+
+    editor.selectProfile(QStringLiteral("saved-profile"), false);
+    const QJsonObject checkpointConfig{
+        {QStringLiteral("optimizer_learning_rate"), 6.5},
+        {QStringLiteral("model_iterations"), 90},
+    };
+    editor.setSessionDefaultLabel(QStringLiteral("Checkpoint"));
+    editor.setSessionDefault(checkpointConfig);
+    editor.showSessionDefault();
+    require(editor.currentProfileId() == QStringLiteral("default"),
+            "A checkpoint session did not select its session configuration");
+    require(editor._profileCombo->currentText() == QStringLiteral("Checkpoint"),
+            "A checkpoint session did not label its session configuration");
+    require(QJsonDocument::fromJson(editor.currentText().toUtf8()).object()
+                == checkpointConfig,
+            "A checkpoint session did not display its checkpoint configuration");
+
+    editor.clearSessionDefault();
+    require(editor._profileCombo->itemText(
+                editor._profileCombo->findData(QStringLiteral("default")))
+                == QStringLiteral("Current Session"),
+            "Clearing the session did not restore the Current Session label");
+
     return 0;
 }

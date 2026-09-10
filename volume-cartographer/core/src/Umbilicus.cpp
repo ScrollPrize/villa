@@ -9,6 +9,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <string>
 
 #include "utils/Json.hpp"
@@ -45,7 +46,7 @@ namespace vc::core::util {
 
 Umbilicus Umbilicus::FromFile(const std::filesystem::path& path, const cv::Vec3i& volume_shape)
 {
-    return Umbilicus(LoadFile(path), volume_shape);
+    return Umbilicus(LoadFile(path).controlPoints, volume_shape);
 }
 
 Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv::Vec3i& volume_shape)
@@ -54,6 +55,11 @@ Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv:
 }
 
 std::vector<cv::Vec3f> Umbilicus::LoadControlPoints(const std::filesystem::path& path)
+{
+    return LoadFile(path).controlPoints;
+}
+
+UmbilicusFileInfo Umbilicus::LoadFileInfo(const std::filesystem::path& path)
 {
     return LoadFile(path);
 }
@@ -190,7 +196,7 @@ Umbilicus::Umbilicus(std::vector<cv::Vec3f> control_points, const cv::Vec3i& vol
     interpolate_centers();
 }
 
-std::vector<cv::Vec3f> Umbilicus::LoadFile(const std::filesystem::path& path)
+UmbilicusFileInfo Umbilicus::LoadFile(const std::filesystem::path& path)
 {
     const std::string extension = path.extension().string();
     std::string lowered_ext;
@@ -205,7 +211,9 @@ std::vector<cv::Vec3f> Umbilicus::LoadFile(const std::filesystem::path& path)
     if (!stream) {
         throw std::runtime_error("Failed to open umbilicus text file: " + path.string());
     }
-    return LoadTextFile(stream);
+    UmbilicusFileInfo info;
+    info.controlPoints = LoadTextFile(stream);
+    return info;
 }
 
 std::vector<cv::Vec3f> Umbilicus::LoadTextFile(std::istream& stream)
@@ -261,7 +269,7 @@ std::vector<cv::Vec3f> Umbilicus::LoadTextFile(std::istream& stream)
     return points;
 }
 
-std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path)
+UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
 {
     utils::Json document = utils::Json::parse_file(path);
 
@@ -285,7 +293,8 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
             "Umbilicus json root must be an array or contain a 'points' or 'control_points' array");
     }
 
-    std::vector<cv::Vec3f> points;
+    UmbilicusFileInfo info;
+    std::vector<cv::Vec3f>& points = info.controlPoints;
     points.reserve(array->size());
 
     for (std::size_t idx = 0; idx < array->size(); ++idx) {
@@ -319,7 +328,101 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
         throw std::runtime_error("Umbilicus json file contained no points");
     }
 
-    return points;
+    if (document.is_object() && document.contains("metadata")) {
+        const auto& metadata = document.at("metadata");
+        if (!metadata.is_object() && !metadata.is_null()) {
+            // Without this a wrong-typed block reads as a legacy file that never
+            // declared a frame, which is the same failure the per-field errors
+            // exist to prevent. Null stays legal: that is how a writer spells
+            // "no value", so it means the same as leaving the key out.
+            info.metadataErrors.push_back("metadata: expected an object, got " +
+                                          metadata.dump());
+        } else if (metadata.is_object()) {
+            // A present-but-invalid field is recorded so that consumers can
+            // tell a typo from a legacy file that never declared the field.
+            // Format is fixed: "<key>: <reason>, got <value-as-written>".
+            const auto reject = [&info](const char* key, const char* reason,
+                                        const utils::Json& value) {
+                info.metadataErrors.push_back(std::string(key) + ": " + reason +
+                                              ", got " + value.dump());
+            };
+            if (metadata.contains("voxelsize_um")) {
+                const auto& value = metadata.at("voxelsize_um");
+                const double voxelsize =
+                    value.is_number() ? value.get_double() : 0.0;
+                if (value.is_number() && std::isfinite(voxelsize) &&
+                    voxelsize > 0.0) {
+                    info.voxelsizeUm = voxelsize;
+                } else {
+                    reject("voxelsize_um", "expected a positive number", value);
+                }
+            }
+            if (metadata.contains("volume")) {
+                const auto& value = metadata.at("volume");
+                if (value.is_string() && !value.get_string().empty()) {
+                    info.volume = value.get_string();
+                } else {
+                    reject("volume", "expected a non-empty string", value);
+                }
+            }
+            bool dimensionRejected = false;
+            const auto readDimension =
+                [&metadata, &reject, &dimensionRejected](const char* key,
+                                                         std::optional<int>& out) {
+                    if (!metadata.contains(key)) {
+                        return;
+                    }
+                    dimensionRejected = dimensionRejected ||
+                                        !(metadata.at(key).is_number_integer() &&
+                                          metadata.at(key).get_int() > 0);
+                    const auto& value = metadata.at(key);
+                    if (value.is_number_integer() && value.get_int() > 0) {
+                        out = value.get_int();
+                    } else {
+                        reject(key, "expected a positive integer", value);
+                    }
+                };
+            readDimension("volume_width", info.volumeWidth);
+            readDimension("volume_height", info.volumeHeight);
+            readDimension("volume_slices", info.volumeSlices);
+
+            // A partial triplet is a malformed statement, not an absent one. Two of
+            // three dimensions cannot describe a grid, and letting the pair sit
+            // there unread would make a typo'd or dropped key indistinguishable
+            // from a legacy file -- the same fail-open as a mistyped value, which
+            // is rejected two lines up. Consumers would go on to a voxel size or an
+            // inferred scale without ever checking what the file did declare.
+            const int declaredDimensions =
+                (info.volumeWidth ? 1 : 0) + (info.volumeHeight ? 1 : 0) +
+                (info.volumeSlices ? 1 : 0);
+            // Skipped when a dimension key was present but rejected: that file is
+            // already refused, and naming the bad value is more use than also
+            // complaining that the triplet it broke is now incomplete.
+            if (!dimensionRejected && declaredDimensions > 0 &&
+                declaredDimensions < 3) {
+                std::string missing;
+                for (const auto& [key, present] :
+                     {std::pair<const char*, bool>{"volume_width",
+                                                   info.volumeWidth.has_value()},
+                      std::pair<const char*, bool>{"volume_height",
+                                                   info.volumeHeight.has_value()},
+                      std::pair<const char*, bool>{"volume_slices",
+                                                   info.volumeSlices.has_value()}}) {
+                    if (!present) {
+                        if (!missing.empty()) {
+                            missing += ", ";
+                        }
+                        missing += key;
+                    }
+                }
+                info.metadataErrors.push_back(
+                    "volume dimensions: an incomplete triplet declares nothing; "
+                    "missing " + missing);
+            }
+        }
+    }
+
+    return info;
 }
 
 void Umbilicus::interpolate_centers()

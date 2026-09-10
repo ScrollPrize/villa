@@ -27,13 +27,15 @@ public:
                         std::array<int, 3> level0Shape = {4, 4, 4},
                         std::array<int, 3> level1Shape = {2, 2, 2},
                         std::array<int, 3> level0ChunkShape = {0, 0, 0},
-                        std::array<int, 3> level1ChunkShape = {0, 0, 0})
+                        std::array<int, 3> level1ChunkShape = {0, 0, 0},
+                        std::array<double, 3> level1Scale = {0.5, 0.5, 0.5})
         : statuses_{level0Status, level1Status}
         , values_{level0Value, level1Value}
         , shapes_{level0Shape, level1Shape}
         , chunkShapes_{
               level0ChunkShape[0] > 0 ? level0ChunkShape : level0Shape,
               level1ChunkShape[0] > 0 ? level1ChunkShape : level1Shape}
+        , level1Scale_(level1Scale)
     {
     }
 
@@ -60,7 +62,7 @@ public:
     {
         LevelTransform transform;
         if (level == 1)
-            transform.scaleFromLevel0 = {0.5, 0.5, 0.5};
+            transform.scaleFromLevel0 = level1Scale_;
         return transform;
     }
 
@@ -124,6 +126,7 @@ private:
     std::array<uint8_t, 2> values_;
     std::array<std::array<int, 3>, 2> shapes_;
     std::array<std::array<int, 3>, 2> chunkShapes_;
+    std::array<double, 3> level1Scale_;
 };
 
 cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
@@ -134,6 +137,29 @@ cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
 }
 
 } // namespace
+
+TEST_CASE("ChunkedPlaneSampler selects one analytic source level from camera scale")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::Data, 1,
+                              vc::render::ChunkStatus::Data, 2);
+    CHECK(vc::render::ChunkedPlaneSampler::maximumBaseVoxelExtent(array, 0) ==
+          doctest::Approx(1.0));
+    CHECK(vc::render::ChunkedPlaneSampler::maximumBaseVoxelExtent(array, 1) ==
+          doctest::Approx(2.0));
+    CHECK(vc::render::ChunkedPlaneSampler::sourceLevelForView(array, 2.0f) == 0);
+    CHECK(vc::render::ChunkedPlaneSampler::sourceLevelForView(array, 1.0f) == 1);
+    CHECK(vc::render::ChunkedPlaneSampler::sourceLevelForView(array, 0.25f) == 1);
+
+    PyramidChunkedArray anisotropic(
+        vc::render::ChunkStatus::Data, 1,
+        vc::render::ChunkStatus::Data, 2,
+        {4, 4, 4}, {2, 2, 2}, {0, 0, 0}, {0, 0, 0},
+        {0.5, 0.25, 0.5});
+    CHECK(vc::render::ChunkedPlaneSampler::maximumBaseVoxelExtent(anisotropic, 1) ==
+          doctest::Approx(4.0));
+    CHECK(vc::render::ChunkedPlaneSampler::sourceLevelForView(anisotropic, 1.0f) == 0);
+    CHECK(vc::render::ChunkedPlaneSampler::sourceLevelForView(anisotropic, 0.5f) == 1);
+}
 
 TEST_CASE("ThreadPool indexed batch visits every index once")
 {

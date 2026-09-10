@@ -152,7 +152,7 @@ function normalizeRuntime(runtime = {}) {
     branch: assertNonEmptyString(runtime.branch, 'branch'),
     targetBranch: runtime.targetBranch ?? 'main',
     defaultTargetBranch: runtime.defaultTargetBranch ?? 'main',
-    smokeBranchPrefix: runtime.smokeBranchPrefix ?? 'codex/progress-prize-smoke-',
+    smokeBranchPrefix: runtime.smokeBranchPrefix ?? 'staging/progress-prize-',
     smokeDate: runtime.smokeDate,
   };
 

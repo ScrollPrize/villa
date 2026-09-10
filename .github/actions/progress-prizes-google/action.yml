@@ -6,7 +6,7 @@ inputs:
     description: validate, bootstrap, prepare, sync-responses, activate, reconcile-active, verify, or cleanup
     required: true
   environment:
-    description: staging or production
+    description: production
     required: true
   source-cycle:
     description: Source cycle in YYYY-MM form
@@ -17,15 +17,15 @@ inputs:
     required: false
     default: ""
   simulated-now:
-    description: Staging workflow_dispatch clock only
+    description: Retired staging control; unsupported
     required: false
     default: ""
   fault:
-    description: Staging workflow_dispatch fault point only
+    description: Retired staging control; unsupported
     required: false
     default: ""
   expect-fault:
-    description: Require the named staging fault to occur
+    description: Retired staging control; unsupported
     required: false
     default: "false"
   dry-run:
@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "false"
   allow-activation-rewind:
-    description: Explicit staging-only bootstrap recovery from the close-fault checkpoint
+    description: Retired staging control; unsupported
     required: false
     default: "false"
   verify-mode:
@@ -192,17 +192,7 @@ runs:
             test -z "$BASE_SHA"
           fi
         else
-          test "$AUTOMATION_ENVIRONMENT" = staging
-          test "$EVENT_NAME" = workflow_dispatch
-          test "$BRANCH" = codex/progress-prize-smoke-20260720
-          test "$TARGET_BRANCH" = codex/progress-prize-smoke-base-20260720
-          test -z "$BASE_SHA"
-          if test -n "$FAULT"; then
-            case "$FAULT" in
-              after-copy|after-close-source) ;;
-              *) exit 1 ;;
-            esac
-          fi
+          exit 1
         fi
         if test "$EXPECT_FAULT" = true; then
           test -n "$FAULT"
@@ -446,8 +436,6 @@ runs:
         PROGRESS_PRIZE_BRANCH: ${{ inputs.branch }}
         PROGRESS_PRIZE_TARGET_BRANCH: ${{ inputs['target-branch'] }}
         PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: main
-        PROGRESS_PRIZE_SMOKE_BRANCH_PREFIX: codex/progress-prize-smoke-
-        PROGRESS_PRIZE_SMOKE_DATE: ${{ inputs.environment == 'staging' && '2026-07-20' || '' }}
         PROGRESS_PRIZE_VERIFIED_SHA: ${{ inputs['head-sha'] }}
         PROGRESS_PRIZE_HEAD_SHA: ${{ inputs['head-sha'] }}
         GATED_HEAD_SHA: ${{ inputs['head-sha'] }}

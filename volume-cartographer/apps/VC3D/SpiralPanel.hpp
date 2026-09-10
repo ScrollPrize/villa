@@ -46,7 +46,10 @@ public:
 signals:
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
+    void windingTransitionsChanged(bool visible);
     void lossMapChanged(const QString& name, qreal opacity);
+    // Whether the next preview export should compute the loss overlays.
+    void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
@@ -100,6 +103,7 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     QComboBox* _lossMap = nullptr;
+    QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
@@ -110,9 +114,8 @@ private:
     // Read-only reports of what spiral-scroll.json specifies.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
-    // The checkpoint the resident fit was built from: reported, never typed,
-    // and carried back in a rebuild request unless the Checkpoint section
-    // replaces it.
+    // The checkpoint the resident fit was built from, reported by the service
+    // and carried back in later rebuild requests.
     QString _sessionCheckpoint;
     QLabel* _sessionCheckpointLabel = nullptr;
     QComboBox* _checkpointChoice = nullptr;

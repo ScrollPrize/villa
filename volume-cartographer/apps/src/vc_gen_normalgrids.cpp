@@ -36,6 +36,7 @@ inline uint32_t be32(uint32_t v) {
 
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -1158,6 +1159,16 @@ void run_generate(const po::variables_map& vm) {
     }
     const auto open_start = std::chrono::steady_clock::now();
     Volume input_volume{fs::path(input_path)};
+    if (!input_volume.hasScaleLevel(input_level)) {
+        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
+        // through one silently yields fill value instead of failing.
+        std::string levels;
+        for (int level : input_volume.presentScaleLevels())
+            levels += " " + std::to_string(level);
+        throw std::runtime_error("--level " + std::to_string(input_level) +
+                                 " is not present in this volume; present levels:" +
+                                 levels);
+    }
     auto* input_chunks = input_volume.chunkedCache();
     const auto level_shape = input_chunks->shape(input_level);
     const auto level_chunk_shape = input_chunks->chunkShape(input_level);
@@ -1306,7 +1317,8 @@ void run_generate(const po::variables_map& vm) {
 
     std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
               << " MiB" << std::endl;
-    input_volume.setCacheBudget(cache_budget_bytes);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        cache_budget_bytes);
 
     struct DirectionShardPlan {
         SliceDirection dir;

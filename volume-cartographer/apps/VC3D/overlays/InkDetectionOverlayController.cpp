@@ -6,6 +6,7 @@
 #include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -48,6 +49,22 @@ std::string detectionGroupKey(const vc3d::opendata::OpenDataInkDetectionEntry& e
     return "path:" + entry.localPath.parent_path().parent_path().string();
 }
 
+std::string canonicalSegmentKey(const QuadSurface& surface,
+                                const std::string& fallback)
+{
+    for (const char* key : {
+             "vc_open_data_segment_long_id",
+             "vc_open_data_catalog_segment_lineage_id",
+             "vc_open_data_segment_id",
+         }) {
+        const auto value = vc::json::string_or(surface.meta, key, std::string{});
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    return fallback;
+}
+
 std::vector<vc3d::opendata::OpenDataInkDetectionEntry> inkDetectionsForAttachedSegmentPath(
     const std::filesystem::path& segmentPath)
 {
@@ -59,18 +76,29 @@ std::vector<vc3d::opendata::OpenDataInkDetectionEntry> inkDetectionsForAttachedS
         return out;
     }
 
-    for (const auto& child : std::filesystem::directory_iterator(segmentPath, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!child.is_directory(ec) || ec) {
+    std::filesystem::recursive_directory_iterator it(segmentPath, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        if (!it->is_directory(ec) || ec) {
             ec.clear();
+            it.increment(ec);
             continue;
         }
-        auto childEntries = vc3d::opendata::cachedInkDetectionsForSegmentDirectory(child.path());
+
+        auto childEntries =
+            vc3d::opendata::cachedInkDetectionsForSegmentDirectory(it->path());
         out.insert(out.end(),
                    std::make_move_iterator(childEntries.begin()),
                    std::make_move_iterator(childEntries.end()));
+
+        // Catalog segment entries are aggregate volume roots whose concrete
+        // representations live at <kind>/<segment>. Conventional segment
+        // folders are shallower, so two levels covers both without walking
+        // arbitrary auxiliary trees within a materialized segment.
+        if (it.depth() >= 1) {
+            it.disable_recursion_pending();
+        }
+        it.increment(ec);
     }
     return out;
 }
@@ -466,9 +494,9 @@ std::string InkDetectionOverlayController::activeSegmentKey() const
     }
     if (auto active = _state->activeSurface().lock();
         active.get() == surface.get() && !_state->activeSurfaceId().empty()) {
-        return _state->activeSurfaceId();
+        return canonicalSegmentKey(*surface, _state->activeSurfaceId());
     }
-    return surface->id;
+    return canonicalSegmentKey(*surface, surface->id);
 }
 
 bool InkDetectionOverlayController::optionMatchesSegment(
@@ -580,5 +608,6 @@ bool InkDetectionOverlayController::imageMatchesSurface(const QuadSurface& surfa
             segmentKey = _state->findSurfaceId(const_cast<QuadSurface*>(&surface));
         }
     }
+    segmentKey = canonicalSegmentKey(surface, segmentKey);
     return optionMatchesSegment(*optionIt, segmentKey);
 }

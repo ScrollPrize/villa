@@ -1,0 +1,110 @@
+{
+  "description": "Frozen U-Net teacher checkpoint for the DINO-guided ink lineage (W&B 76ezvyks). Replace every /path/to placeholder with the corresponding historical local label root, raw CT volume, or output directory before running.",
+  "mode": "full_3d",
+  "model_type": "unet",
+  "model_config": {
+    "autoconfigure": true,
+    "z_projection_mode": "none"
+  },
+  "targets": {
+    "ink": {
+      "activation": "none",
+      "out_channels": 1,
+      "z_projection_mode": "none"
+    }
+  },
+  "in_channels": 1,
+  "patch_size": [256, 256, 256],
+  "patch_overlap": 0.5,
+  "patch_min_labeled_coverage": 0.02,
+  "patch_finding_scale": 4,
+  "full_3d": {
+    "projection_half_thickness": 3
+  },
+  "image_normalization": "percentile_minmax",
+  "loss": {
+    "terms": [
+      {
+        "name": "LabelSmoothedDCAndBCELoss",
+        "metric_name": "base",
+        "weight": 1.0,
+        "weight_ce": 1.0,
+        "weight_dice": 1.0,
+        "bce_label_smoothing": 0.1,
+        "dice_label_smoothing": 0.1
+      }
+    ]
+  },
+  "optimizer": "sgd",
+  "learning_rate": 0.01,
+  "weight_decay": 0.00003,
+  "optimizer_momentum": 0.99,
+  "optimizer_nesterov": true,
+  "scheduler": {"name": "diffusers_cosine_warmup"},
+  "warmup_steps": 5000,
+  "ema": {
+    "enabled": true,
+    "decay": 0.9995,
+    "start_step": 1000,
+    "update_every_steps": 1,
+    "validate": true,
+    "save_in_checkpoint": true
+  },
+  "mixed_precision": "bf16",
+  "batch_size": 2,
+  "num_iterations": 60001,
+  "max_steps": 250000,
+  "save_iterations": [60001],
+  "seed": 27,
+  "save_every": 5000,
+  "val_every": 1000,
+  "val_steps": 10,
+  "dataloader_workers": 4,
+  "prefetch_factor": 4,
+  "stitch_factor": 1,
+  "use_stitched_forward": false,
+  "stitched_gradient_checkpointing": true,
+  "out_dir": "/path/to/runs/dino-guided-teacher",
+  "datasets": [
+    {
+      "segments_path": "/path/to/ink-dataset/phercparis4",
+      "volume_path": "/path/to/volumes/phercparis4.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc0139",
+      "volume_path": "/path/to/volumes/pherc0139.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc0500p2",
+      "volume_path": "/path/to/volumes/pherc0500p2.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc0814",
+      "volume_path": "/path/to/volumes/pherc0814.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc0841",
+      "volume_path": "/path/to/volumes/pherc0841.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc1667",
+      "volume_path": "/path/to/volumes/pherc1667.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/phercman5",
+      "volume_path": "/path/to/volumes/phercman5.zarr",
+      "volume_scale": 0
+    },
+    {
+      "segments_path": "/path/to/ink-dataset/pherc0009b",
+      "volume_path": "/path/to/volumes/pherc0009b.zarr",
+      "volume_scale": 0
+    }
+  ]
+}

@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 29;
+    static constexpr int kApiVersion = 30;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -60,16 +60,17 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    // Rebuild the always-loaded session: the service holds one from
-    // startup, so this replaces it rather than creating it. It is also the
-    // only verb that may change the model domain or structural config.
+    // Create the first resident session. The service exposes dataset and
+    // checkpoint discovery before this without importing the fit runtime.
+    void initializeSession(QJsonObject request);
+    // Replace an initialized session. This is also the only later verb that
+    // may change the model domain or structural configuration.
     void rebuildSession(QJsonObject request);
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig,
-                       const QJsonObject& inputs = {});
+                       const QJsonObject& runConfig);
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& name);
@@ -92,6 +93,11 @@ public:
     // are no longer a side effect of pausing or of resuming a checkpoint, so
     // this is what keeps VC3D's "see the fit after it stops" behaviour.
     void requestPreview();
+    // Whether preview exports should also compute the loss overlays. They
+    // roughly double the cost of a preview and arrive as a second artifact
+    // after the surface, so this follows what the panel is displaying rather
+    // than being on by default.
+    void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
@@ -99,7 +105,7 @@ public:
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
-    // Only files declared by the currently installed preview artifact are
+    // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.
     void fetchPreviewFile(const QString& relativeName,
                           FetchPreviewFileCallback done);
@@ -119,6 +125,10 @@ signals:
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
+    // The loss overlays for an already-installed preview, published by the
+    // service as a second artifact once the surface was on its way.
+    void previewDiagnosticsAvailable(const QString& manifestPath,
+                                     qint64 generation);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -194,6 +204,8 @@ private:
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
     void sendRebuildRequest(QJsonObject request);
+    void sendInitializeRequest(QJsonObject request);
+    void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
     // Streams a client-local resume checkpoint into the service's
@@ -235,8 +247,12 @@ private:
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;
+    QString _installedDiagnosticsArtifact;
+    QString _fetchingDiagnosticsArtifact;
+    bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
+    QString _lastDiagnosticsLocalPath;
     QString _synchronizedSessionId;
 };

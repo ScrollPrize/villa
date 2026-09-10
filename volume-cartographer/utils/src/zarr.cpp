@@ -1,5 +1,6 @@
 #include "utils/zarr.hpp"
 
+#include <charconv>
 #include <cmath>
 
 #if !defined(_WIN32)
@@ -1732,6 +1733,103 @@ std::string ZarrArray::chunk_store_key(std::span<const std::size_t> chunk_indice
     if (array_key_.empty())
         return key;
     return array_key_ + "/" + key;
+}
+
+ZarrArray::StorageObjectLocation
+ZarrArray::storage_object_location(
+    std::span<const std::size_t> chunk_indices) const {
+    if (chunk_indices.size() != meta_.shape.size())
+        throw std::invalid_argument("zarr: storage-object index rank mismatch");
+
+    StorageObjectLocation result;
+    result.outer_indices.assign(chunk_indices.begin(), chunk_indices.end());
+    result.inner_indices.assign(chunk_indices.size(), 0);
+    result.inner_chunks_per_object.assign(chunk_indices.size(), 1);
+    if (meta_.shard_config) {
+        const auto& inner_shape = meta_.shard_config->sub_chunks;
+        if (inner_shape.size() != meta_.chunks.size())
+            throw std::runtime_error("zarr: invalid sharded chunk rank");
+        for (std::size_t axis = 0; axis < chunk_indices.size(); ++axis) {
+            if (inner_shape[axis] == 0 || meta_.chunks[axis] % inner_shape[axis] != 0)
+                throw std::runtime_error("zarr: invalid inner chunks per shard");
+            const std::size_t count = meta_.chunks[axis] / inner_shape[axis];
+            result.inner_chunks_per_object[axis] = count;
+            result.outer_indices[axis] = chunk_indices[axis] / count;
+            result.inner_indices[axis] = chunk_indices[axis] % count;
+        }
+    }
+    result.key = chunk_store_key(result.outer_indices);
+    return result;
+}
+
+std::optional<std::vector<std::byte>>
+ZarrArray::read_storage_object(
+    std::span<const std::size_t> chunk_indices) const {
+    const auto location = storage_object_location(chunk_indices);
+    return read_raw(chunk_key(location.outer_indices));
+}
+
+std::optional<std::vector<std::byte>>
+ZarrArray::decode_chunk_from_storage_object(
+    std::span<const std::size_t> chunk_indices,
+    std::span<const std::byte> object_bytes) const {
+    if (!is_sharded())
+        return decode_chunk_payload(object_bytes);
+
+    const auto location = storage_object_location(chunk_indices);
+    auto encoded = extract_inner_chunk(object_bytes, location.inner_indices);
+    if (!encoded)
+        return std::nullopt;
+    return decode_chunk_payload(*encoded);
+}
+
+std::optional<std::vector<std::size_t>>
+ZarrArray::logical_chunk_for_storage_object_key(std::string_view key) const {
+    std::string_view local = key;
+    if (!array_key_.empty()) {
+        if (local.size() <= array_key_.size() ||
+            local.substr(0, array_key_.size()) != array_key_ ||
+            local[array_key_.size()] != '/') {
+            return std::nullopt;
+        }
+        local.remove_prefix(array_key_.size() + 1);
+    }
+
+    const std::string separator = meta_.version == ZarrVersion::v3
+        ? meta_.v3_separator()
+        : meta_.dimension_separator;
+    if (separator.empty())
+        return std::nullopt;
+    if (meta_.version == ZarrVersion::v3) {
+        const std::string prefix = "c" + separator;
+        if (local.substr(0, prefix.size()) != prefix)
+            return std::nullopt;
+        local.remove_prefix(prefix.size());
+    }
+
+    std::vector<std::size_t> outer;
+    while (true) {
+        const auto next = local.find(separator);
+        const auto component = local.substr(0, next);
+        if (component.empty())
+            return std::nullopt;
+        std::size_t value = 0;
+        const auto parsed = std::from_chars(
+            component.data(), component.data() + component.size(), value);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != component.data() + component.size()) {
+            return std::nullopt;
+        }
+        outer.push_back(value);
+        if (next == std::string_view::npos)
+            break;
+        local.remove_prefix(next + separator.size());
+    }
+    if (outer.size() != meta_.shape.size())
+        return std::nullopt;
+    for (std::size_t axis = 0; axis < outer.size(); ++axis)
+        outer[axis] *= meta_.sub_chunks_per_shard(axis);
+    return outer;
 }
 
 bool ZarrArray::direct_chunk_payload_is_decoded_bytes() const noexcept {

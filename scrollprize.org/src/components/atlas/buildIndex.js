@@ -27,7 +27,7 @@ function uniqSortedNums(arr) {
   );
 }
 function uniqStrings(arr) {
-  return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))];
+  return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))].sort();
 }
 
 // Pull {px, energy, loc, name} out of a single scan record. The public
@@ -50,35 +50,50 @@ function deriveFacts(sample) {
   const volumes = sample.volumes || {};
   const segments = sample.segments || {};
 
-  const scanList = Object.entries(scans).map(([sid, scan]) => {
+  // Sort every metadata-object iteration deterministically so order is stable.
+  const scanList = Object.entries(scans).sort(([a], [b]) => a.localeCompare(b)).map(([sid, scan]) => {
     const f = scanFacts(scan);
-    // Link a scan to the OME-Zarr volume reconstructed from it (→ Neuroglancer).
-    const vol = Object.values(volumes).find((v) => v.scan_id === sid);
-    let volume = null;
-    if (vol) {
-      const z = (vol.data || []).find((d) => /zarr/i.test(d.type));
-      const o = z && (z.origins || [])[0];
-      if (o && o.path) volume = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
-    }
-    return { ...f, volume };
+    // Link a scan to ALL the volumes reconstructed from it (a scan can have
+    // several reconstructions), each with its id and zarr URL (→ Neuroglancer).
+    const scanVolumes = Object.entries(volumes)
+      .filter(([, v]) => v.scan_id === sid)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([vid, v]) => {
+        const z = (v.data || []).find((d) => /zarr/i.test(d.type));
+        const o = z && (z.origins || [])[0];
+        const zarr =
+          o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
+        return { id: vid, zarr };
+      });
+    // `volume` kept for backward compat (first reconstruction's zarr).
+    return { ...f, id: sid, volumes: scanVolumes, volume: (scanVolumes[0] || {}).zarr || null };
   });
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
   // Distinct data licenses across the item's volumes (varies: EduceLab vs
-  // CC BY-NC), plus the first OME-Zarr CT volume for a Neuroglancer link.
+  // CC BY-NC), plus the raw-CT OME-Zarr volumes for Neuroglancer links:
+  // `ctVolumes` lists every volume carrying a strict `ome-zarr` (the raw CT —
+  // NOT prediction/layers zarrs) with its id + resolution/energy, feeding the
+  // Data & access "CT in Neuroglancer" picker.
   const licenses = [];
   const seenLic = new Set();
-  let volumeZarr = null;
-  for (const v of Object.values(volumes)) {
+  const ctVolumes = [];
+  for (const [vid, v] of Object.entries(volumes).sort(([a], [b]) => a.localeCompare(b))) {
     const lic = v.properties && v.properties.license;
     if (lic && lic.url && !seenLic.has(lic.url)) {
       seenLic.add(lic.url);
       licenses.push({ name: lic.name || "License", url: lic.url });
     }
-    if (!volumeZarr) {
-      const z = (v.data || []).find((d) => /zarr/i.test(d.type));
-      const o = z && (z.origins || [])[0];
-      if (o && o.path) volumeZarr = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
+    const ct = (v.data || []).find((d) => d.type === "ome-zarr");
+    const co = ct && (ct.origins || [])[0];
+    if (co && co.path) {
+      const props = v.properties || {};
+      ctVolumes.push({
+        id: vid,
+        px: props.pixel_size_um ?? null,
+        energy: props.energy_keV ?? null,
+        zarr: `${((co.access_roots || [])[0] || {}).url || ""}/${co.path}`,
+      });
     }
   }
 
@@ -95,7 +110,7 @@ function deriveFacts(sample) {
     locations: uniqStrings(scanList.map((s) => s.loc)),
     scans: scanList,
     licenses,
-    volumeZarr,
+    ctVolumes,
   };
 }
 
@@ -281,7 +296,7 @@ function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   const segs = (sample && sample.segments) || {};
   const volumes = (sample && sample.volumes) || {};
   const out = [];
-  for (const key of Object.keys(segs)) {
+  for (const key of Object.keys(segs).sort()) {
     const seg = segs[key];
     const data = seg.data || [];
     const sid = seg.suffix || seg.long_id || key;
@@ -368,7 +383,8 @@ function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   return out;
 }
 
-// Volume-level model predictions for a sample (surface-prediction / 3D-ink) —
+// Volume-level model predictions for a sample (surface-prediction / 3D-ink /
+// lasagna) —
 // the "Predictions" table the old atlas exposed. A prediction lives in the same
 // volume object as the base CT ome-zarr, so the volume's properties give the
 // base resolution/energy and the volume map key IS the base-volume id. The raw
@@ -381,17 +397,21 @@ function extractPredictions(sample) {
     return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
   };
   const out = [];
-  for (const [volKey, v] of Object.entries(vols)) {
+  for (const [volKey, v] of Object.entries(vols).sort(([a], [b]) => a.localeCompare(b))) {
     const props = v.properties || {};
     // The raw CT this volume reconstructs (same volume object) — the base layer
     // the prediction is overlaid onto in Neuroglancer.
     const baseZarr = oneUrl((v.data || []).find((d) => d.type === "ome-zarr"));
     for (const d of v.data || []) {
-      if (d.type !== "surface-prediction-zarr" && d.type !== "ink-detection-3d-zarr")
+      if (
+        d.type !== "surface-prediction-zarr" &&
+        d.type !== "ink-detection-3d-zarr" &&
+        d.type !== "lasagna"
+      )
         continue;
       const p = d.parameters || {};
       out.push({
-        purpose: d.type.replace(/-zarr$/, ""), // surface-prediction | ink-detection-3d
+        purpose: d.type.replace(/-zarr$/, ""), // surface-prediction | ink-detection-3d | lasagna
         baseVolume: volKey,
         px: props.pixel_size_um ?? null,
         energy: props.energy_keV ?? null,
@@ -403,15 +423,18 @@ function extractPredictions(sample) {
       });
     }
   }
-  // 3D-ink first (the showcase), then surface predictions by finest pixel size,
-  // then model id — a stable, meaningful order for the table.
-  const rank = (x) => (x.purpose === "ink-detection-3d" ? 0 : 1);
+  // 3D-ink first (the showcase), then surface predictions, then lasagna, each
+  // by finest pixel size then model id — a stable, meaningful table order.
+  const rank = (x) =>
+    x.purpose === "ink-detection-3d" ? 0 : x.purpose === "lasagna" ? 2 : 1;
   out.sort((a, b) => {
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     const pa = a.px ?? 1e9;
     const pb = b.px ?? 1e9;
     if (pa !== pb) return pa - pb;
-    return String(a.model || "").localeCompare(String(b.model || ""));
+    const m = String(a.model || "").localeCompare(String(b.model || ""));
+    if (m !== 0) return m;
+    return String(a.baseVolume || "").localeCompare(String(b.baseVolume || ""));
   });
   // Defensive de-dup on the identifying tuple.
   const seen = new Set();
@@ -606,7 +629,7 @@ function buildIndex(samples, opts) {
       scans: facts ? facts.scans : [],
       hasS3: !!facts,
       licenses: facts ? facts.licenses : [],
-      volumeZarr: facts ? facts.volumeZarr : null,
+      ctVolumes: facts ? facts.ctVolumes : [],
       // curated (overlay)
       ...curated,
       // assets
@@ -623,14 +646,17 @@ function buildIndex(samples, opts) {
     };
   });
 
-  // Sort by furthest pipeline stage (text first), then progress.score desc.
+  // Sort by furthest pipeline stage (text first), then progress.score desc,
+  // then id — the id tiebreak keeps the order (and snapshot diffs) stable
+  // across regenerations regardless of the metadata's object order.
   scrolls.sort((a, b) => {
     const ra = stageRank(a);
     const rb = stageRank(b);
     if (ra !== rb) return rb - ra;
     const sa = (a.progress && typeof a.progress.score === "number" && a.progress.score) || 0;
     const sb = (b.progress && typeof b.progress.score === "number" && b.progress.score) || 0;
-    return sb - sa;
+    if (sa !== sb) return sb - sa;
+    return String(a.id).localeCompare(String(b.id));
   });
 
   return {

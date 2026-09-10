@@ -86,23 +86,23 @@ None of these individually needs to cover the scroll. Sparse, scattered evidence
 
 The output is **one `tifxyz` mesh per winding** of the scroll — a full set of surfaces that conform to the input constraints, covering the whole fitted region including places no patch ever reached. Two variants are written for each winding: `wNNN`, the pure fitted spiral surface, and `wNNN_spliced`, where the geometry of verified patches is spliced into the fitted surface wherever the fit and the patch agree — more locally accurate wherever trusted geometry exists.
 
-Since these are ordinary `tifxyz` meshes, everything downstream works as usual: you can load them in VC3D, flatten them, and [render surface volumes for ink detection](tutorial5). The repo also includes a tool ([`render_ink.py`](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/render_ink.py)) that concatenates the windings into fixed-width chunks, flattens them, and renders ink predictions as a series of horizontal strips — more on that [below](#rendering-ink).
+Since these are ordinary `tifxyz` meshes, everything downstream works as usual: you can load them in VC3D, flatten them, and [render surface volumes for ink detection](tutorial5). The repo also includes a tool ([`render_ink.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/render_ink.py)) that concatenates the windings into fixed-width chunks, flattens them, and renders ink predictions as a series of horizontal strips — more on that [below](#rendering-ink).
 
 Alongside the meshes, a fit writes a model checkpoint, overlay images showing the fitted windings drawn over scan slices, and *satisfaction metrics* — per-input-type statistics of how much of the evidence the final surface actually honors.
 
 ### How to run it
 
-The code lives in the villa repository under [`volume-cartographer/scripts/spiral`](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/scripts/spiral); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py). You'll need Python ≥ 3.14 and an NVIDIA GPU.
+The code lives in the villa repository under [`spiral-fitting`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py). You'll need Python ≥ 3.14 and an NVIDIA GPU.
 
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
-cd villa/volume-cartographer
+cd villa/spiral-fitting
+uv sync
 uv pip install torch torchvision   # pick the build matching your CUDA version
-uv pip install -e scripts/spiral   # the spiral scripts' Python dependencies
-uv pip install -e .                # volume-cartographer python bindings
+uv pip install -e ../volume-cartographer   # volume-cartographer python bindings
 ```
 
-The spiral scripts declare their dependencies in their own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/pyproject.toml) — only `torch` is left for you to install, so you can pick the right build for your CUDA version. The last line builds the volume-cartographer Python bindings, which the fit uses to link point annotations to patches; it compiles C++, so you'll need cmake and VC's build dependencies (see the [segmentation tutorial](segmentation#installation-instructions) if it fails).
+The spiral scripts declare their dependencies in their own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml) — only `torch` is left for you to install, so you can pick the right build for your CUDA version. The last line builds the volume-cartographer Python bindings, which the fit uses to link point annotations to patches; it compiles C++, so you'll need cmake and VC's build dependencies (see the [segmentation tutorial](segmentation#installation-instructions) if it fails).
 
 #### Get the dataset
 
@@ -206,7 +206,7 @@ $$
 \qquad \phi_0(x) = x,
 $$
 
-and the transformation is where the flow ends up after one unit of time: $T_{\text{flow}}(x) = \phi_1(x)$. Don't worry too much about the equation — the intuition is what matters: every point rides smoothly along the flow, so the whole spiral deforms smoothly into a new shape, and running the flow backwards gives the exact inverse. This is the same machinery used in diffeomorphic medical image registration; in the code, the ODE is integrated with a few Runge–Kutta steps ([`flow_fields.py`](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/flow_fields.py), [`transforms.py`](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/transforms.py)).
+and the transformation is where the flow ends up after one unit of time: $T_{\text{flow}}(x) = \phi_1(x)$. Don't worry too much about the equation — the intuition is what matters: every point rides smoothly along the flow, so the whole spiral deforms smoothly into a new shape, and running the flow backwards gives the exact inverse. This is the same machinery used in diffeomorphic medical image registration; in the code, the ODE is integrated with a few Runge–Kutta steps ([`flow_fields.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/flow_fields.py), [`transforms.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/transforms.py)).
 
 <div className="mb-4">
   <img src="/img/ash2text/image16.png" className="w-[100%]"/>

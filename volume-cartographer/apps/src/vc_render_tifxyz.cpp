@@ -460,6 +460,30 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
     return {};
 }
 
+// Sparse pyramids (e.g. lasagna prediction zarrs holding only their scaledown
+// level) keep absent levels as {0,0,0} placeholders, so a pure range check on
+// numLevels() passes and every read at such a level comes back as fill value.
+static bool chunkLevelPresent(const vc::render::IChunkedArray& cache, int level)
+{
+    if (level < 0 || level >= cache.numLevels())
+        return false;
+    const auto s = cache.shape(level);
+    return s[0] != 0 || s[1] != 0 || s[2] != 0;
+}
+
+static std::string presentChunkLevels(const vc::render::IChunkedArray& cache)
+{
+    std::ostringstream oss;
+    for (int level = 0; level < cache.numLevels(); ++level) {
+        if (!chunkLevelPresent(cache, level))
+            continue;
+        if (oss.tellp() > 0)
+            oss << " ";
+        oss << level;
+    }
+    return oss.str();
+}
+
 static bool pathsEquivalent(const std::filesystem::path& a, const std::filesystem::path& b)
 {
     std::error_code ecA, ecB;
@@ -1352,8 +1376,10 @@ int main(int argc, char *argv[])
                 vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
                 cache_bytes);
             chunk_cache = ownedChunkCache.get();
-            if (cacheLevel < 0 || cacheLevel >= chunk_cache->numLevels()) {
-                logPrintf(stderr, "Error: group index %d not available in remote zarr\n", group_idx);
+            if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
+                logPrintf(stderr,
+                          "Error: group index %d not available in remote zarr (present levels: %s)\n",
+                          group_idx, presentChunkLevels(*chunk_cache).c_str());
                 return EXIT_FAILURE;
             }
             logPrintf(stdout, "Remote zarr streaming: %s\n", remoteUrl.c_str());
@@ -1371,8 +1397,10 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
         chunk_cache = ownedChunkCache.get();
-        if (cacheLevel < 0 || cacheLevel >= chunk_cache->numLevels()) {
-            logPrintf(stderr, "Error: group index %d not available in local zarr\n", group_idx);
+        if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
+            logPrintf(stderr,
+                      "Error: group index %d not available in local zarr (present levels: %s)\n",
+                      group_idx, presentChunkLevels(*chunk_cache).c_str());
             return EXIT_FAILURE;
         }
     }

@@ -30,6 +30,7 @@ public:
 
     void setCurrentText(const QString& text);
     void setSessionDefault(const QJsonObject& config);
+    void setSessionDefaultLabel(const QString& label);
     void showSessionDefault();
     void clearSessionDefault();
     void setCatalog(const QJsonObject& catalog);
@@ -108,6 +109,7 @@ private:
 
     QVector<StoredProfile> _profiles;
     QString _currentProfileId = QStringLiteral("default");
+    QString _sessionDefaultLabel;
     QString _sessionDefaultText = QStringLiteral("{}");
     QString _customText = QStringLiteral("{}");
     QString _cleanText = QStringLiteral("{}");

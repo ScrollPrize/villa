@@ -23,6 +23,7 @@
 // bilinear resampling, matching the Python reference.
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "utils/Json.hpp"
 
@@ -127,7 +128,17 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
         Json b; b = (double)g.scale[1]; arr.push_back(b);
         meta["scale"] = arr;
     }
-    meta.erase("bbox");
+    // Recompute rather than erase: straightening moves every point, so the
+    // input's bbox is stale, but dropping the key entirely makes the output
+    // invisible to any tool gating on meta.contains("bbox") — e.g. three
+    // checks in vc_grow_seg_from_seed.cpp, and vc_seg_add_overlap.cpp's own
+    // directory discovery (is_tifxyz_dir requires it). See villa#1321.
+    Rect3D bb;
+    if (bbox_of_valid_points(P, bb)) {
+        meta["bbox"] = bbox_to_json(bb);
+    } else {
+        meta.erase("bbox");  // genuinely no valid points left; nothing to report
+    }
     std::ofstream out(outdir / "meta.json");
     out << meta.dump();
 }

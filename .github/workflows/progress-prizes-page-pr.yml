@@ -68,14 +68,9 @@ jobs:
             https://forms.gle/*|https://docs.google.com/forms/d/e/*/viewform) ;;
             *) exit 1 ;;
           esac
-          if test "$AUTOMATION_ENVIRONMENT" = staging; then
-            test "$HEAD_BRANCH" = codex/progress-prize-smoke-20260720
-            test "$BASE_BRANCH" = codex/progress-prize-smoke-base-20260720
-          else
-            test "$AUTOMATION_ENVIRONMENT" = production
-            test "$BASE_BRANCH" = main
-            test "$HEAD_BRANCH" = "codex/progress-prize-$TARGET_CYCLE"
-          fi
+          test "$AUTOMATION_ENVIRONMENT" = production
+          test "$BASE_BRANCH" = main
+          test "$HEAD_BRANCH" = "codex/progress-prize-$TARGET_CYCLE"
 
       - name: Check out the exact trusted trigger commit with push credentials
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -102,12 +97,6 @@ jobs:
           set -euo pipefail
           [[ "$TRIGGER_SHA" =~ ^[a-f0-9]{40}$ ]]
           git cat-file -e "$TRIGGER_SHA^{commit}"
-          if test "$AUTOMATION_ENVIRONMENT" = staging; then
-            if ! git ls-remote --exit-code --heads origin "refs/heads/$BASE_BRANCH" >/dev/null 2>&1; then
-              git push --force-with-lease="refs/heads/$BASE_BRANCH:" \
-                origin "$TRIGGER_SHA:refs/heads/$BASE_BRANCH"
-            fi
-          fi
           git fetch --no-tags origin \
             "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
           base_sha="$(git rev-parse "refs/remotes/origin/$BASE_BRANCH^{commit}")"

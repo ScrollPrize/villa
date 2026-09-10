@@ -238,6 +238,7 @@ public slots:
     // menu we receive exactly two segment IDs; from the top menu the list
     // is empty and the user picks both via the dialog combos.
     void onMergePatch(const QStringList& segmentIds);
+    void onGrowTrackPatches();
     void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);

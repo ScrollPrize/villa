@@ -66,7 +66,7 @@ TEST_CASE("CState batches surface catalog mutations into one notification")
     int changedCount = 0;
     int willDeleteCount = 0;
     std::string changedName;
-    CState state(0);
+    CState state;
     auto first = makeSurface("first");
     auto second = makeSurface("second");
 
@@ -127,10 +127,10 @@ TEST_CASE("ink detection options survive transformed segmentation previews with 
                 "local_file":"ink-detections/prediction.jpg"
               }])");
 
-    auto package = VolumePkg::newEmpty();
+    auto package = VolumePkg::newDetached();
     REQUIRE(package->addSegmentsEntry(segmentDir.string()));
 
-    CState state(0);
+    CState state;
     state.setVpkg(package);
 
     auto source = makeSurface(segmentLongId);
@@ -149,6 +149,50 @@ TEST_CASE("ink detection options survive transformed segmentation previews with 
     auto anonymousPreview = makeSurface({});
     state.setSurface("segmentation", anonymousPreview, false, false);
     CHECK(overlay.options().empty());
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("ink detection options match open-data representation metadata")
+{
+    const std::string segmentId = "20240304144031";
+    const std::string segmentLongId =
+        "20240304144031-w018_20240304144031_flatboi";
+    const std::string representationId =
+        segmentLongId + "-published-20231117161658-L0-1e9dae161d154013";
+
+    const fs::path root = tempRoot("catalog_representation_id");
+    const fs::path aggregateRoot = root / "20231117161658";
+    const fs::path segmentDir =
+        aggregateRoot / "published-L0" / representationId;
+    writeFile(segmentDir / "ink-detections" / "prediction.jpg", "not-empty");
+    writeFile(segmentDir / "ink-detections.json",
+              R"([{
+                "label":"model-a",
+                "sample_id":"PHerc1667",
+                "segment_id":")" + segmentId + R"(",
+                "segment_long_id":")" + segmentLongId + R"(",
+                "artifact_type":"ink_detection",
+                "resolved_http_url":"https://example.test/prediction.jpg",
+                "local_file":"ink-detections/prediction.jpg"
+              }])");
+
+    auto package = VolumePkg::newDetached();
+    REQUIRE(package->addSegmentsEntry(aggregateRoot.string()));
+
+    CState state;
+    state.setVpkg(package);
+
+    auto surface = makeSurface(representationId);
+    surface->meta["vc_open_data_segment_id"] = segmentId;
+    surface->meta["vc_open_data_segment_long_id"] = segmentLongId;
+    surface->meta["vc_open_data_catalog_segment_lineage_id"] = segmentLongId;
+    state.setActiveSurface(representationId, surface);
+    state.setSurface("segmentation", surface, false, false);
+
+    InkDetectionOverlayController overlay(&state);
+    REQUIRE(overlay.options().size() == 1);
+    CHECK(overlay.options().front().segmentLongId == segmentLongId);
 
     fs::remove_all(root);
 }
@@ -172,10 +216,10 @@ TEST_CASE("ink detection overlay flips the displayed image")
                 "local_file":"ink-detections/prediction.png"
               }])");
 
-    auto package = VolumePkg::newEmpty();
+    auto package = VolumePkg::newDetached();
     REQUIRE(package->addSegmentsEntry(segmentDir.string()));
 
-    CState state(0);
+    CState state;
     state.setVpkg(package);
 
     auto source = makeSurface(segmentLongId);

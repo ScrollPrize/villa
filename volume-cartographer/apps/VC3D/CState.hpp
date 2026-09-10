@@ -12,12 +12,13 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "vc/core/util/Rect3D.hpp"
+
 class VolumePkg;
 class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
-namespace vc::render { class DecodedChunkCacheBudget; }
 
 struct POI
 {
@@ -34,10 +35,8 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(
-        size_t cacheSizeBytes,
-        QObject* parent = nullptr,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {});
+    explicit CState(QObject* parent = nullptr,
+                    bool debugDownloadQueue = false);
     ~CState();
 
     // --- VolumePkg ---
@@ -50,6 +49,15 @@ public:
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
     void setCurrentVolume(std::shared_ptr<Volume> vol);
+
+    // --- Session focus bounds (base-volume XYZ) ---
+    std::optional<Rect3D> focusBounds() const;
+    std::optional<Rect3D> activeFocusBounds() const;
+    bool focusBoundsEnabled() const;
+    uint64_t focusBoundsRevision() const;
+    void setFocusBounds(const Rect3D& bounds);
+    void setFocusBoundsEnabled(bool enabled);
+    void clearFocusBounds();
 
     // --- Growth Volume ---
     std::string segmentationGrowthVolumeId() const;
@@ -64,9 +72,7 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
 
-    // --- Cache budget ---
-    size_t cacheSizeBytes() const;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
+    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
     // --- Teardown ---
     void closeAll();
@@ -96,9 +102,17 @@ public:
     std::vector<POI*> pois();
     std::vector<std::string> poiNames();
 
+    // Announces that the project's attached umbilicus changed. Nothing else
+    // reports it: setUmbilicus() only persists a project field, so a consumer
+    // holding geometry placed relative to the umbilicus has no way to hear about
+    // an attach or a detach.
+    void notifyUmbilicusChanged() { emit umbilicusChanged(); }
+
 signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
+    void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
+    void focusBoundsChanged();
     void surfacesLoaded();
     void volumeClosing();
 
@@ -108,20 +122,21 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
-    void applyCacheBudget(const std::shared_ptr<Volume>& vol) const;
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;
+    std::optional<Rect3D> _focusBounds;
+    bool _focusBoundsEnabled = false;
+    uint64_t _focusBoundsRevision = 0;
     std::string _segmentationGrowthVolumeId;
     std::weak_ptr<QuadSurface> _activeSurface;
     std::string _activeSurfaceId;
 
     VCCollection* _pointCollection;
 
-    size_t _cacheSizeBytes;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
+    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

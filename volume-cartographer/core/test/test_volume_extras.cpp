@@ -2,7 +2,7 @@
 // - uint16 dtype write/read
 // - writeMetadata / updateMetadata
 // - writeRootAttributes / updateRootAttributes
-// - setCacheBudget, setIOThreads
+// - process cache configuration
 // - sample (single-slice) on a seeded uint8 volume
 // - MissingScaleLevelPolicy::AllFill behaviour for a level that exists but is empty
 
@@ -175,17 +175,39 @@ TEST_CASE("Volume::writeRootAttributes / updateRootAttributes")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::setCacheBudget and setIOThreads")
+TEST_CASE("Volume uses the process chunk-cache service")
 {
     auto d = tmpDir("knobs");
     auto v = Volume::New(d, optsU8());
     REQUIRE(v);
-    v->setCacheBudget(1ULL << 20);
-    v->setIOThreads(2);
-    // No accessor — just verify no crash and chunkedCache works after.
-    auto* cache = v->chunkedCache();
-    CHECK(cache != nullptr);
+    auto service = vc::render::processChunkCacheService();
+    service->configureDecodedByteCapacity(1ULL << 20);
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    CHECK(cache->sourceId() != vc::render::VolumeSourceId{});
     fs::remove_all(d);
+}
+
+TEST_CASE("process chunk-cache configuration preserves the service")
+{
+    auto service = vc::render::processChunkCacheService();
+    const auto original = service->fetchConcurrency();
+
+    vc::render::ChunkCacheService::Options options;
+    options.decodedByteCapacity = 2ULL << 20;
+    options.fetchConcurrency.workerCapacity = original.workerCapacity;
+    options.fetchConcurrency.maxConcurrentReads = 2;
+    options.fetchConcurrency.adaptive = false;
+    auto configured = vc::render::configureProcessChunkCacheService(
+        std::move(options));
+
+    CHECK(configured == service);
+    CHECK(configured->decodedByteBudget()->maximumBytes() == 2ULL << 20);
+    CHECK(configured->fetchConcurrency().maxConcurrentReads == 2);
+    CHECK_FALSE(configured->fetchConcurrency().adaptive);
+
+    configured->configureFetchConcurrency(
+        original.maxConcurrentReads, original.adaptive);
 }
 
 TEST_CASE("Volume::invalidateCache")
@@ -199,14 +221,12 @@ TEST_CASE("Volume::invalidateCache")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::createChunkCache yields a non-null cache pointer")
+TEST_CASE("Volume::sharedChunkCache yields a non-null cache pointer")
 {
     auto d = tmpDir("createcache");
     auto v = Volume::New(d, optsU8());
     REQUIRE(v);
-    vc::render::ChunkCache::Options copts;
-    copts.decodedByteCapacity = 1ULL << 20;
-    auto c = v->createChunkCache(copts);
+    auto c = v->sharedChunkCache();
     CHECK(c != nullptr);
     CHECK(c->numLevels() == 1);
     fs::remove_all(d);

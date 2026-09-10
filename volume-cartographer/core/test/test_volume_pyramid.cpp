@@ -164,20 +164,6 @@ TEST_CASE("Volume: writeMetadata + updateMetadata work in-memory")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::createChunkCache with a persistent cache path")
-{
-    auto d = tmpDir("chunkcache");
-    auto persistDir = tmpDir("persist");
-    auto v = Volume::New(d, optsMultiLevel());
-    REQUIRE(v);
-    vc::render::ChunkCache::Options copts;
-    copts.persistentCachePath = persistDir;
-    auto c = v->createChunkCache(copts);
-    CHECK(c != nullptr);
-    fs::remove_all(d);
-    fs::remove_all(persistDir);
-}
-
 TEST_CASE("Volume::shape(level) for all levels matches numScales")
 {
     auto d = tmpDir("levels_shape");

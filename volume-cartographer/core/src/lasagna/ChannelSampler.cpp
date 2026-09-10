@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <future>
@@ -502,9 +503,7 @@ size_t LasagnaChannelChunkKeyHash::operator()(const LasagnaChannelChunkKey& key)
 
 class LasagnaChannelCornerSampler::Impl {
 public:
-    Impl(const LasagnaChannelBinding& binding,
-         size_t maxCachedBytes,
-         std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
+    explicit Impl(const LasagnaChannelBinding& binding)
         : spacing_(static_cast<float>(binding.spacing))
         , shapeZYX_{static_cast<int>(binding.shapeZYX[0]),
                     static_cast<int>(binding.shapeZYX[1]),
@@ -512,11 +511,27 @@ public:
     {
         if (!binding.array)
             throw std::runtime_error("VC3D corner-batch sampling requires an open Zarr array");
-        vc::render::ChunkCache::Options options;
-        options.decodedByteCapacity = std::max<size_t>(1, maxCachedBytes);
-        options.decodedByteBudget = std::move(sharedBudget);
-        options.maxConcurrentReads = 16;
-        cache_ = vc::render::createChunkCache(binding.array, std::move(options));
+        std::error_code ec;
+        auto sourcePath = std::filesystem::weakly_canonical(binding.path, ec);
+        if (ec)
+            sourcePath = std::filesystem::absolute(binding.path, ec);
+        if (ec)
+            sourcePath = binding.path;
+        vc::render::ChunkCacheOptions cacheOptions;
+        // A line solve streams whole-line chunk batches per iteration; those
+        // must never displace the viewer tiles the user is panning over in
+        // the shared decoded budget. Trade-off: while lasagna data occupies
+        // budget, lasagna is also the preferred victim - if a solve's
+        // working set ever exceeded the whole budget it would re-fetch its
+        // own evictions each iteration. A line's per-iteration footprint is
+        // orders of magnitude below typical budgets, so protecting the
+        // interactive tiles wins.
+        cacheOptions.decodedEvictionPreferSelf = true;
+        cache_ = vc::render::acquireProcessChunkCache(
+            "lasagna-channel|" + sourcePath.lexically_normal().string() +
+                "|channel=" + std::to_string(binding.channelIndex),
+            binding.array,
+            std::move(cacheOptions));
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(
@@ -602,15 +617,12 @@ public:
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
-    std::unique_ptr<vc::render::ChunkCache> cache_;
+    std::shared_ptr<vc::render::ChunkCache> cache_;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
-    const LasagnaChannelBinding& binding,
-    size_t maxCachedBytes,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
-    : impl_(std::make_unique<Impl>(
-          binding, maxCachedBytes, std::move(sharedBudget)))
+    const LasagnaChannelBinding& binding)
+    : impl_(std::make_unique<Impl>(binding))
 {
 }
 
@@ -892,6 +904,12 @@ std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
     }
 
     if (!ownsRequest) {
+        // Wait on the shared in-flight load without a deadline: a timed-out
+        // duplicate read fans out extra source fetches without actually
+        // bounding anything (the duplicate itself has no timeout). The
+        // owner's read carries the source layer's own deadlines, and its
+        // error is stored and rethrown here, so followers share its fate
+        // exactly once.
         std::unique_lock<std::mutex> lock(request->mutex);
         request->finished.wait(lock, [&]() { return request->done; });
         if (request->error) {

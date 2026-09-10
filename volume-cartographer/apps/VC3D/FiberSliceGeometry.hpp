@@ -85,6 +85,32 @@ double distanceScaledSize(double distanceToPlane,
                           double minVisibleViewportSpanVx,
                           double fullSize,
                           double minSize);
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3d>& linePoints);
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3f>& linePoints);
+double arclengthAtLinePosition(const std::vector<double>& cumulativeArclengths,
+                               double linePosition);
+double linePositionAtArclength(const std::vector<double>& cumulativeArclengths,
+                               double arclength);
+std::vector<size_t> linePositionIndicesWithinArclengthRadius(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& candidateLinePositions,
+    double radiusBaseVoxels);
+// Interior positions are unrestricted. Positions outside the outer controls
+// are limited by optimized-polyline arclength in base-volume voxels.
+bool linePositionWithinControlExtrapolationDistance(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistanceBaseVoxels);
+std::optional<double> controlExtrapolationBoundaryLinePosition(
+    const std::vector<double>& cumulativeArclengths,
+    const std::vector<double>& controlLinePositions,
+    int direction,
+    double lineEndPosition,
+    double maxDistanceBaseVoxels);
 ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
                                           double arclength);
 double linePositionAtArclength(const std::vector<cv::Vec3d>& linePoints,

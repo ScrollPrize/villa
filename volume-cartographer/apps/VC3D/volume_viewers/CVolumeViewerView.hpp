@@ -1,20 +1,20 @@
 #pragma once
 
+#include <array>
+
 #include <QGraphicsView>
 #include <QPointF>
 #include <QString>
+#include <QVector3D>
+
+#include <opencv2/core.hpp>
+#include "vc/core/util/PlaneSurface.hpp"
 
 class CVolumeViewerView : public QGraphicsView
 {
     Q_OBJECT
     
 public:
-    struct ScaleBarLabel {
-        double displayLength = 0.0;
-        QString unit;
-        QString text;
-    };
-
     CVolumeViewerView(QWidget* parent = 0);
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -37,10 +37,21 @@ public:
         m_physicalUnits = physical;
         update();
     }
-    static ScaleBarLabel formatScaleBarLength(double barUm);
+
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
     void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
+    
+    void showCoordinateFrame(bool visible);
+    void setCoordinateFrame(PlaneSurface* plane);
+
+    struct ScaleBarLabel {
+        double displayLength = 0.0;
+        QString unit;
+        QString text;
+    };
+    static ScaleBarLabel formatScaleBarLength(double barUm);
+    
     enum class TiltHandleMode {
         Hidden,
         Square,
@@ -98,7 +109,9 @@ private:
     QRectF tiltHandleRect() const;
     bool pointInTiltHandle(const QPointF& viewportPos) const;
     QPointF tiltFromHandlePos(const QPointF& viewportPos) const;
+    void drawCoordinateFrame(QPainter* painter) const;
     void drawTiltHandle(QPainter* painter) const;
+    void drawScaleBar(QPainter* painter) const;
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
@@ -113,7 +126,6 @@ private:
     mutable double _cachedBarPx = 0;
     mutable QString _cachedBarLabel;
     mutable double _cachedM11 = 0;
-    mutable double _cachedDpr = 0;
     mutable int _cachedVpW = 0;
     mutable int _cachedVpH = 0;
     mutable bool _cachedPhysicalUnits = true;
@@ -121,4 +133,7 @@ private:
 
     TiltHandleMode _tiltHandleMode = TiltHandleMode::Hidden;
     QPointF _tiltHandleValue{0.0, 0.0};
+    
+    bool _showFrame = false;
+    cv::Vec3f _frame[3];
 };

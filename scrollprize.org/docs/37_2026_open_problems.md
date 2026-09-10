@@ -400,7 +400,7 @@ Each of these sources of information provides a hard (verified) or soft (unverif
   caption="The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates."
 />
 
-One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
+One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
 
 A global prior can organize and regularize geometry, allowing a single consistent result to be produced from disconnected annotations, bridging small gaps and interpolating windings. But where annotations are sparse or the volume is highly ambiguous, spiral fitting is still under-constrained, and won't necessarily follow the true sheet surfaces.
 
@@ -573,7 +573,7 @@ In supervised learning, a model learns from direct supervision, which usually is
 
 An **embedding** is a vector representation learned by the model. If ink-like voxels form a recognizable cluster in embedding space, a small number of expert-selected examples may help generate many candidate labels.
 
-This is especially attractive for our data because the volumes are enormous and labels are scarce. The project's 3D DINO implementation, [dinovol](https://github.com/ScrollPrize/dinovol), is open-source, with two trained checkpoints released on Hugging Face: [dinovol\_v2\_ps8\_with\_paris4\_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) and [dinovol\_v2\_ps6\_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350).
+This is especially attractive for our data because the volumes are enormous and labels are scarce. The project's 3D DINO implementation, [dinovol](https://github.com/ScrollPrize/villa/tree/main/dinovol), is open-source, with two trained checkpoints released on Hugging Face: [dinovol\_v2\_ps8\_with\_paris4\_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) and [dinovol\_v2\_ps6\_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350).
 
 **DINO-guided segmentation targets**
 
@@ -740,9 +740,9 @@ High effective resolution matters here too: some ink information may live at ver
 * villa monorepository (VC3D / Volume Cartographer, lasagna, neural tracing): [https://github.com/ScrollPrize/villa](https://github.com/ScrollPrize/villa)
 * VC3D / Volume Cartographer app code: [https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src)
 * lasagna code: [https://github.com/ScrollPrize/villa/tree/main/lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna) · lasagna fiber tracer: [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py)
-* Spiral fit code: [fit_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py)
+* Spiral fit code: [fit_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py)
 * Ink detection inference code: [ink-detection/optimized_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
 * Neural tracing inference service (heatmap / dense-displacement / copy modes): [trace_service.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/trace_service.py)
 * Neural mesh autoregression (MVP): [neural_tracing/autoreg_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)
-* 3D DINO implementation: [https://github.com/ScrollPrize/dinovol](https://github.com/ScrollPrize/dinovol)
+* 3D DINO implementation: [https://github.com/ScrollPrize/villa/tree/main/dinovol](https://github.com/ScrollPrize/villa/tree/main/dinovol)
 * ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta_public](https://github.com/Hob3rMallow/scrollfiesta_public)

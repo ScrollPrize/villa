@@ -12,8 +12,6 @@ import {
 const OWNER = 'ScrollPrize';
 const REPO = 'villa';
 const API = 'https://api.github.com';
-const SMOKE_HEAD = 'codex/progress-prize-smoke-20260720';
-const SMOKE_BASE = 'codex/progress-prize-smoke-base-20260720';
 const PREVIEW_CONTEXT = 'progress-prizes/vercel-preview';
 const PREVIEW_DESCRIPTION = 'Exact Progress Prize preview verified';
 const PREVIEW_WORKFLOW_PATH = '.github/workflows/progress-prizes-vercel-preview.yml';
@@ -112,7 +110,6 @@ function assertCycle(value) {
 }
 
 export function assertAutomationBranch(head, base) {
-  if (head === SMOKE_HEAD && base === SMOKE_BASE) return { kind: 'smoke', head, base };
   if (/^codex\/progress-prize-\d{4}-(?:0[1-9]|1[0-2])$/.test(head) && base === 'main') {
     return { kind: 'production', head, base };
   }
@@ -537,34 +534,6 @@ async function gate(options) {
   }
 }
 
-async function waitPreview(options) {
-  const branch = required(options, 'branch');
-  if (branch !== SMOKE_BASE) fail('Post-merge preview is restricted to the fixed smoke base.');
-  const sha = assertSha(required(options, 'sha'));
-  const cycle = assertCycle(required(options, 'cycle'));
-  const timeoutSeconds = Number(options['timeout-seconds'] ?? '1800');
-  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 3600) {
-    fail('Preview timeout must be between zero and 3600 seconds.');
-  }
-  const deadline = Date.now() + timeoutSeconds * 1000;
-  while (true) {
-    const [ref, statuses, page] = await Promise.all([
-      github(`/repos/${OWNER}/${REPO}/git/ref/heads/${encodeURIComponent(branch)}`),
-      github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
-      readPageAt(sha),
-    ]);
-    if (ref?.object?.type !== 'commit' || ref.object.sha !== sha) {
-      fail('Fixed smoke base changed while waiting for its preview.');
-    }
-    if (page.cycle !== cycle) fail('Post-merge smoke base has the wrong page cycle.');
-    const preview = latestPreviewStatus(statuses);
-    const previewRun = await readPreviewRun(preview, sha);
-    if (previewRun) return { headSha: sha };
-    if (Date.now() >= deadline) fail('Timed out waiting for the post-merge smoke preview.');
-    await new Promise((resolve) => setTimeout(resolve, 15_000));
-  }
-}
-
 async function ensurePull(options) {
   const head = required(options, 'head');
   const base = required(options, 'base');
@@ -694,7 +663,6 @@ async function main(argv) {
   const { command, options } = parseArgs(argv);
   if (command === 'gate') return gate(options);
   if (command === 'activation-state') return activationState(options);
-  if (command === 'wait-preview') return waitPreview(options);
   if (command === 'ensure-pr') return ensurePull(options);
   if (command === 'merge') return merge(options);
   fail('Unknown trusted GitHub helper command.');

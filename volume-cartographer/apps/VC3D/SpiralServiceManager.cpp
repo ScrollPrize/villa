@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "SpiralArtifactCache.hpp"
+#include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
@@ -193,9 +194,10 @@ QString SpiralServiceManager::findService() const
     const QString app = QCoreApplication::applicationDirPath();
     const QStringList candidates{
         qEnvironmentVariable("SPIRAL_SERVICE_PATH"),
-        QDir::current().filePath(QStringLiteral("scripts/spiral/spiral_service.py")),
-        QDir(app).filePath(QStringLiteral("../../scripts/spiral/spiral_service.py")),
-        QDir(app).filePath(QStringLiteral("../../../scripts/spiral/spiral_service.py")),
+        QDir::current().filePath(QStringLiteral("spiral-fitting/spiral_service.py")),
+        QDir::current().filePath(QStringLiteral("../spiral-fitting/spiral_service.py")),
+        QDir(app).filePath(QStringLiteral("../../../spiral-fitting/spiral_service.py")),
+        QDir(app).filePath(QStringLiteral("../../../../spiral-fitting/spiral_service.py")),
         QDir(app).filePath(QStringLiteral("../share/volume-cartographer/spiral/spiral_service.py")),
     };
     for (const QString& candidate : candidates)
@@ -239,6 +241,10 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _installedPreviewArtifact.clear();
     _installedPreviewSession.clear();
     _fetchingPreviewArtifact.clear();
+    _installedDiagnosticsArtifact.clear();
+    _fetchingDiagnosticsArtifact.clear();
+    _lastPreviewLocalPath.clear();
+    _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
@@ -553,10 +559,21 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     return request;
 }
 
+void SpiralServiceManager::initializeSession(QJsonObject request)
+{
+    prepareSessionRequest(std::move(request), true);
+}
+
 void SpiralServiceManager::rebuildSession(QJsonObject request)
 {
-    // The service always owns its base inputs (it is launched with
-    // --dataset), so a rebuild request carries run
+    prepareSessionRequest(std::move(request), false);
+}
+
+void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
+                                                 bool initialize)
+{
+    // The service owns its base inputs (it is launched with --dataset), so a
+    // session construction request carries run
     // parameters plus the client-selectable checkpoint/tracks values only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
@@ -565,14 +582,16 @@ void SpiralServiceManager::rebuildSession(QJsonObject request)
     if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
 
-    auto finish = [this, request, selectable](const QString& checkpointHostPath) mutable {
+    auto finish = [this, request, selectable, initialize](
+                      const QString& checkpointHostPath) mutable {
         if (!checkpointHostPath.isEmpty())
             selectable[QStringLiteral("checkpoint")] = checkpointHostPath;
         QJsonObject load = request;
         if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
         else load[QStringLiteral("paths")] = selectable;
         load[QStringLiteral("command_id")] = commandId();
-        sendRebuildRequest(load);
+        if (initialize) sendInitializeRequest(load);
+        else sendRebuildRequest(load);
     };
 
     if (checkpoint.isEmpty()) {
@@ -620,6 +639,14 @@ void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 {
     postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
                   [this](const QJsonObject& response) {
+                      handleStatus(response);
+                  });
+}
+
+void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
+{
+    postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
+                  kMutationRetries, [this](const QJsonObject& response) {
                       handleStatus(response);
                   });
 }
@@ -736,22 +763,21 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig,
-                                         const QJsonObject& inputs)
+                                         const QJsonObject& runConfig)
 {
-    QJsonObject configuration = _configurationDefaults;
-    for (auto it = _appliedConfiguration.begin();
-         it != _appliedConfiguration.end(); ++it)
-        configuration[it.key()] = it.value();
-    for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
-        configuration[it.key()] = it.value();
+    const QJsonObject configuration =
+        vc3d::completeSpiralRunConfiguration(
+            _configurationDefaults, _appliedConfiguration, runConfig);
+    // Base inputs are owned and canonicalized by the service.  A Run changes
+    // neither their paths nor their contents, so restating the panel's
+    // necessarily partial path view here can only create a false mismatch
+    // (for example, winding_inference has no editable panel row).
     postWithRetry(
         QStringLiteral("/session/run"),
         {{QStringLiteral("command_id"), commandId()},
          {QStringLiteral("configuration"), configuration},
          {QStringLiteral("iterations"), iterations},
          {QStringLiteral("influence"), influenceConfig},
-         {QStringLiteral("inputs"), inputs},
          {QStringLiteral("expected_session_revision"), _sessionRevision}},
         Timeout::Command, kMutationRetries, {});
 }
@@ -787,9 +813,11 @@ void SpiralServiceManager::requestPreview()
     // The service accepts the export and returns; the work itself costs
     // minutes and is followed through the status snapshot this manager
     // already polls (preview_exporting, then preview_publish, then
-    // preview_artifact or preview_publish_error).
+    // preview_artifact or preview_publish_error, and for the overlays
+    // preview_diagnostics_artifact after that).
     postWithRetry(QStringLiteral("/session/export-preview"),
-                  {{QStringLiteral("command_id"), commandId()}},
+                  {{QStringLiteral("command_id"), commandId()},
+                   {QStringLiteral("diagnostics"), _previewDiagnosticsWanted}},
                   Timeout::Command, kMutationRetries,
                   [this](const QJsonObject& response) {
                       _previewRequestInFlight = false;
@@ -1298,9 +1326,8 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     if (!applied.isEmpty()) _appliedConfiguration = applied;
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
-    // The service always holds a session; there is no "no session" state to
-    // check for. A session identity is present from the moment the service
-    // starts building one.
+    // A session identity appears when explicit initialization starts. Until
+    // then the service remains connected for dataset/checkpoint discovery.
     const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;
@@ -1360,10 +1387,48 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
+                // A newly installed surface has no overlays until its own
+                // diagnostics artifact arrives; the previous generation's
+                // must not be drawn over it.
+                _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
                     sessionId, kPreviewCacheKept,
-                    {_lastPreviewLocalPath});
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+            });
+    }
+
+    // The overlays are published as a second artifact once the surface is on
+    // its way, so they are fetched separately and only reach the workspace
+    // when they belong to the preview it has installed.
+    const QString diagnosticsId =
+        status.value(QStringLiteral("preview_diagnostics_artifact")).toObject()
+            .value(QStringLiteral("id")).toString();
+    if (!diagnosticsId.isEmpty() && diagnosticsId != _installedDiagnosticsArtifact
+        && diagnosticsId != _fetchingDiagnosticsArtifact) {
+        _fetchingDiagnosticsArtifact = diagnosticsId;
+        const qint64 sequence = _previewSequence;
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, diagnosticsId,
+            [this, diagnosticsId, sequence, sessionId, generation](
+                const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                if (_fetchingDiagnosticsArtifact == diagnosticsId)
+                    _fetchingDiagnosticsArtifact.clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone) emit errorOccurred(error);
+                    return;
+                }
+                // The surface these overlays were mapped onto has already
+                // been replaced; the next generation publishes its own.
+                if (sequence < _previewSequence) return;
+                _installedDiagnosticsArtifact = diagnosticsId;
+                _lastDiagnosticsLocalPath = entryPath;
+                emit previewDiagnosticsAvailable(entryPath, sequence);
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept,
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
             });
     }
 }
@@ -1371,11 +1436,13 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
                                             FetchPreviewFileCallback done)
 {
-    if (_installedPreviewArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
-        done({}, tr("No Spiral preview artifact is installed"));
+    // Deferred preview files are the loss overlays, and those live in the
+    // diagnostics artifact the service publishes after the surface.
+    if (_installedDiagnosticsArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
+        done({}, tr("No Spiral preview diagnostics are installed"));
         return;
     }
-    const QString artifactId = _installedPreviewArtifact;
+    const QString artifactId = _installedDiagnosticsArtifact;
     const QString sessionId = _installedPreviewSession;
     const quint64 generation = _connectionGeneration;
     _artifactCache->fetchFile(
@@ -1383,7 +1450,7 @@ void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
         [this, artifactId, generation, done = std::move(done)](
             const QString& localPath, const QString& error, bool gone) {
             if (generation != _connectionGeneration
-                || artifactId != _installedPreviewArtifact)
+                || artifactId != _installedDiagnosticsArtifact)
                 return;
             done(localPath,
                  gone ? tr("The Spiral preview was pruned before the file was downloaded")

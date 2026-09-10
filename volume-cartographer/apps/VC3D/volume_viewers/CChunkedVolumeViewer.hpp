@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -27,14 +28,17 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
+#include "VolumetricCompositor.hpp"
 #include "annotation_tools/SameWrapAnnotationTool.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
+class CameraGizmoWidget;
 class QEvent;
 class QGraphicsEllipseItem;
 class QGraphicsItem;
@@ -117,8 +121,13 @@ public:
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { if (_closing) return; _compositeSettings = s; submitRender("setCompositeRenderSettings"); }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override;
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
+    // Set by CWindow for the axis-aligned slice views: their volumetric-camera
+    // azimuth is folded into the slice plane's basis by
+    // AxisAlignedSliceController, so the render/mapping paths here must treat
+    // the compositor azimuth as 0 (the gizmo still owns the value).
+    void setVolumetricAzimuthInSurface(bool on) { _volumetricAzimuthInSurface = on; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
@@ -133,6 +142,7 @@ public:
     bool isShowDirectionHints() const override { return _showDirectionHints; }
     void setShowSurfaceNormals(bool on) override { if (_closing) return; _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
+    void setShowCoordinateFrame(bool show);
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
     void setNormalArrowLengthScale(float scale) override { if (_closing) return; _normalArrowLengthScale = scale; emit overlaysUpdated(); }
@@ -161,6 +171,11 @@ public:
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
+    // Moves every item registered under `key` by `delta` scene units; false
+    // when no group is registered under that key. Overlay scene coordinates
+    // are affine in the camera pointer at a fixed zoom, so a pan can shift a
+    // group in place instead of rebuilding it.
+    bool translateOverlayGroup(const std::string& key, const QPointF& delta);
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
@@ -242,6 +257,13 @@ public:
     // views" toggle (used by the line annotation window's pane group, whose
     // mirroring is dialog-local).
     void setLinkedCursorAlwaysEnabled(bool enabled) { _linkedCursorAlwaysEnabled = enabled; }
+    // Reject linked-cursor points outright, overriding both of the above. The
+    // line annotation window needs this to keep mirrored crosses out of its
+    // panes while the global toggle is on.
+    void setLinkedCursorMirroringSuppressed(bool suppressed)
+    {
+        _linkedCursorMirroringSuppressed = suppressed;
+    }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -249,9 +271,7 @@ public:
         QObject* receiver, const std::function<void()>& callback) override {
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
-
     void reloadPerfSettings() override;
-    void refreshChunkSource() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
 
 protected:
@@ -261,6 +281,8 @@ protected:
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
+    // Thin guard around onSurfaceChangedImpl; see the definition for why the
+    // lazy surface load has to be contained before it reaches Qt.
     void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
     void onSurfaceWillBeDeleted(const std::string& name, const std::shared_ptr<Surface>& surf);
     void onVolumeClosing();
@@ -316,6 +338,9 @@ signals:
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
     void sharedCacheStatsChanged(const QStringList& items);
+    // Volumetric camera edited from inside the viewer (gizmo drag), so
+    // external panels can refresh their yaw/pitch/perspective readouts.
+    void compositeCameraChanged();
 
 private:
     void quiesceForClose();
@@ -327,19 +352,15 @@ private:
     void notifyNormalOffsetChanged();
     void setZOffset(float value);
     void rebuildChunkArray();
+    void refreshDownloadQueueDebugOverlay();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
-    // Chunks one frame of this view touches, used to raise the private pool's
-    // floor so a single render cannot thrash its own cap.
-    std::size_t estimatedFrameChunkFootprintBytes() const;
-    // Chunks one round of concurrent surface-tile fills touches, for the
-    // filler's own pool.
-    std::size_t estimatedSurfaceTileChunkFootprintBytes() const;
-    void noteChunkCacheFootprint();
+    // Push the displayed plane's basis to the view's coordinate frame gizmo.
+    void updateCoordinateFrame();
     // Build/drop the base and overlay SurfaceCache to match the current
     // (volume, surface, geometry epoch) identity and the configured budgets.
     void ensureSurfaceCaches();
@@ -354,11 +375,13 @@ private:
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();
-    QPointF surfaceToScene(float surfX, float surfY) const;
+    QPointF surfaceToScene(float surfX, float surfY, float wPx = 0.0f) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
+        vc::render::ChunkRequestContext chunkRequest;
+        std::array<float, 2> renderFocus{};
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -392,6 +415,9 @@ private:
         std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
         std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
         std::uint64_t surfaceCacheEpoch = 0;
+        // Effective launch-time bounds. Null for disabled bounds and for view
+        // types outside the supported plane/annotation scope.
+        std::optional<Rect3D> focusBoundsBase;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;
@@ -405,7 +431,6 @@ private:
         int fbW,
         int fbH,
         std::chrono::steady_clock::time_point submittedAt);
-    void requestSurfaceViewForJob(const PendingRenderJob& job);
     void startRenderJob(PendingRenderJob job);
     void submitPendingRenderJobIfNeeded();
     void updateDisplayedFramebufferMapping();
@@ -422,9 +447,35 @@ private:
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
+    void markChunkRequestViewActive();
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
+    // Sync the volumetric camera gizmo's visibility/state with the current
+    // composite settings and surface type.
+    void updateCameraGizmo();
+    // True when the volumetric composite is what renderFrame will draw for
+    // the current surface (enabled + method volumetric + non-plane surface).
+    bool volumetricCameraActive() const;
+    // Screen-direction -> surface-UV-direction mapping of the volumetric
+    // camera at w = 0 (identity when the mode is inactive):
+    // M = Rz(-azimuth) * diag(1, 1/cos(tilt)). Pan/zoom deltas arrive in
+    // screen space and must cross this to move the UV view center correctly.
+    cv::Matx22f volumetricScreenToSurface() const;
+    // Azimuth the compositor (and the w=0 screen<->surface mapping) should
+    // apply: 0 when the slice-plane owner folds it into the plane basis
+    // instead, the per-view camera azimuth otherwise.
+    float volumetricEffectiveAzimuthDeg() const;
+    // Exact w=0 screen<->surface mapping of the volumetric camera, including
+    // perspective (a plane-to-screen homography; identity when the mode is
+    // inactive). Both sides are in framebuffer pixels relative to the view
+    // center / the surface pointer.
+    // wPx = slab height above the (offset) surface, in screen pixels
+    // (w layers * scale * wScale); 0 = the anchor plane the render pivots on.
+    cv::Vec2f volumetricScreenPxToSurfacePx(const cv::Vec2f& screenRel, float wPx = 0.0f) const;
+    cv::Vec2f volumetricSurfacePxToScreenPx(const cv::Vec2f& surfRel, float wPx = 0.0f) const;
+    vc3d::volumetric::CameraParams volumetricPointMapCamera() const;
+    float volumetricHalfSpan() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
     // projected=true draws the greyed-out variant used when a linked cursor
@@ -434,6 +485,7 @@ private:
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void refreshMeasurementOverlay();
+    void onSurfaceChangedImpl(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate);
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
@@ -451,6 +503,14 @@ private:
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
     ViewerStatsBar* _statsBarRight = nullptr;
+    // Shared cache/scheduler statistics are refreshed at most every 250 ms:
+    // updateStatusLabel runs per mouse move and ChunkCache::stats() takes the
+    // cache-state and scheduler mutexes that every fetch/decode worker hammers
+    // while a solve streams chunks - polling them at input rate stalls the GUI
+    // thread and the workers alike.
+    QElapsedTimer _sharedCacheStatsThrottle;
+    QStringList _cachedSharedCacheItems;
+    CameraGizmoWidget* _cameraGizmo = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.
     bool _closing = false;
@@ -473,12 +533,27 @@ private:
     std::string _pendingIntersectionReason;
     std::string _pendingIntersectionCaller;
 
+    bool _volumetricAzimuthInSurface = false;
+    // Last-seen frame of a displayed PlaneSurface: when the plane is rotated
+    // in place (azimuth folding / up realignment) the world view center is
+    // re-projected so the view spins about the screen center instead of the
+    // plane origin.
+    struct PlaneFrameSnapshot {
+        bool valid = false;
+        cv::Vec3f origin{0, 0, 0};
+        cv::Vec3f normal{0, 0, 0};
+        cv::Vec3f vx{0, 0, 0};
+        cv::Vec3f vy{0, 0, 0};
+    };
+    PlaneFrameSnapshot _planeFrame;
+
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
     std::shared_ptr<Surface> _defaultSurface;
     std::string _surfName;
     std::shared_ptr<vc::render::ChunkCache> _chunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
+    std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
@@ -491,6 +566,8 @@ private:
     std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
+    std::uint64_t _chunkViewId = 0;
+    bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
@@ -514,7 +591,6 @@ private:
     std::uint64_t _surfaceCacheGeometryEpoch = 0;
     Volume* _overlaySurfaceCacheVolume = nullptr;
     std::uint64_t _surfaceCacheEpoch = 0;
-    std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
     // Last frame fell outside the stored band and used the legacy path, so the
@@ -537,10 +613,9 @@ private:
     std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
-    // The final viewer lease invalidates the overlay cache even if an
-    // obsolete render job still holds the cache object.
-    std::shared_ptr<void> _overlayChunkCacheOwner;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
+    std::uint64_t _overlayRemoteFetchCbId = 0;
+    std::atomic<std::uint64_t> _overlayGeneration{1};
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
@@ -560,6 +635,7 @@ private:
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
+    bool _showCoordinateFrame = true;
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
     bool _surfaceOverlayEnabled = false;
@@ -612,6 +688,11 @@ private:
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
         int segNormalOffsetQ = 0;
+        // Slab bound offsets (quantized) when the flattened viewer composites;
+        // INT_MIN when compositing is off so the modes never alias.
+        int segSlabFrontQ = std::numeric_limits<int>::min();
+        int segSlabBehindQ = std::numeric_limits<int>::min();
+        bool segSlabVolumetric = false;
         size_t flattenedPlanesHash = 0;
         size_t cameraHash = 0;
         bool valid = false;
@@ -691,6 +772,7 @@ private:
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
     bool _linkedCursorAlwaysEnabled = false;
+    bool _linkedCursorMirroringSuppressed = false;
 
     struct MeasurementPoint {
         cv::Vec2f surface{0.0f, 0.0f};

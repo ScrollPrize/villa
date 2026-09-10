@@ -1,0 +1,135 @@
+{
+  "output_dir": "./dinovol_2/runs/finetune_ink_emb",
+  "resume": false,
+  "auto_resume": false,
+  "lr": 1.25e-5,
+  "min_lr": 1.25e-5,
+  "weight_decay": 0.04,
+  "weight_decay_end": 0.04,
+  "patch_embed_lr_mult": 0.2,
+  "freeze_last_layer_steps": 0,
+  "momentum_teacher": 0.999,
+  "final_momentum_teacher": 0.999,
+  "warmup_teacher_temp": 0.07,
+  "teacher_temp": 0.07,
+  "warmup_teacher_temp_steps": 0,
+  "clip_grad": 3.0,
+  "ibot_masked_loss_chunk_size": 4096,
+  "max_iterations": 10000,
+  "save_every_n": 1000,
+  "batch_size": 1,
+  "use_amp": true,
+  "model": {
+    "input_channels": 1,
+    "global_crops_size": [
+      128,
+      128,
+      128
+    ],
+    "local_crops_size": [
+      64,
+      64,
+      64
+    ],
+    "embed_dim": 864,
+    "patch_size": [
+      8,
+      8,
+      8
+    ],
+    "embedding_type": "default",
+    "deeper_embed_patch_chunk_size": null,
+    "deeper_embed_batch_chunk_size": 1,
+    "depth": 24,
+    "num_heads": 16,
+    "qkv_bias": true,
+    "qkv_fused": true,
+    "mlp_ratio": 2.6666666666666665,
+    "swiglu_mlp": true,
+    "scale_mlp": true,
+    "scale_attn_inner": false,
+    "proj_drop_rate": 0.0,
+    "attn_drop_rate": 0.0,
+    "drop_path_rate": 0.2,
+    "drop_path_uniform": false,
+    "init_values": null,
+    "use_abs_pos_emb": false,
+    "use_rot_pos_emb": true,
+    "num_reg_tokens": 4,
+    "grad_checkpointing": false,
+    "block_chunks": 0,
+    "rope_type": "mixed",
+    "rope_kwargs": {
+      "base": 100.0,
+      "normalize_coords": "separate",
+      "shift_coords": 0.05,
+      "jitter_coords": 1.05,
+      "rescale_coords": 2.0
+    },
+    "model_type": "v2",
+    "pretrained_weights": "./checkpoints/checkpoint_step_352500_paris4.pt",
+    "pretrained_backbone_only": false
+  },
+  "dataset": {
+    "global_crop_size": [
+      128,
+      128,
+      128
+    ],
+    "local_crop_size": [
+      64,
+      64,
+      64
+    ],
+    "datasets": [
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20260309142202-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 0
+      }
+    ]
+  }
+}

@@ -407,19 +407,34 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const float xScale = static_cast<float>(points.cols) / static_cast<float>(newSize.width);
     const float yScale = static_cast<float>(points.rows) / static_cast<float>(newSize.height);
 
+    // The source-x sample (x0,x1,fx) depends only on dstX, not dstY, so compute
+    // it once per column instead of once per pixel. Bit-identical to the
+    // per-pixel form (same float ops, same order); filled single-threaded before
+    // the parallel row loop, which then only reads these shared arrays.
+    std::vector<int> x0v(newSize.width), x1v(newSize.width);
+    std::vector<float> fxv(newSize.width);
+    for (int dstX = 0; dstX < newSize.width; ++dstX) {
+        float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
+        srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
+        const int x0 = static_cast<int>(std::floor(srcX));
+        x0v[dstX] = x0;
+        x1v[dstX] = std::min(x0 + 1, points.cols - 1);
+        fxv[dstX] = srcX - static_cast<float>(x0);
+    }
+
+    #pragma omp parallel for schedule(static)
     for (int dstY = 0; dstY < newSize.height; ++dstY) {
         float srcY = (static_cast<float>(dstY) + 0.5f) * yScale - 0.5f;
         srcY = std::clamp(srcY, 0.0f, static_cast<float>(points.rows - 1));
         const int y0 = static_cast<int>(std::floor(srcY));
         const int y1 = std::min(y0 + 1, points.rows - 1);
         const float fy = srcY - static_cast<float>(y0);
+        cv::Vec3f* dstRow = resampled[dstY];
 
         for (int dstX = 0; dstX < newSize.width; ++dstX) {
-            float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
-            srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
-            const int x0 = static_cast<int>(std::floor(srcX));
-            const int x1 = std::min(x0 + 1, points.cols - 1);
-            const float fx = srcX - static_cast<float>(x0);
+            const int x0 = x0v[dstX];
+            const int x1 = x1v[dstX];
+            const float fx = fxv[dstX];
 
             const cv::Vec3f& p00 = points(y0, x0);
             const cv::Vec3f& p01 = points(y0, x1);
@@ -432,7 +447,7 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
 
             const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
             const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            resampled(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
         }
     }
 
@@ -453,15 +468,27 @@ cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
     cv::Mat dstToSrc;
     cv::invertAffineTransform(srcToDst, dstToSrc);
 
+    // Hoist the six affine coefficients out of the per-pixel loop. The Mat is
+    // loop-invariant, but the compiler cannot prove dstToSrc.at<double>() does
+    // not alias the warped store, so it reloads all six entries every pixel.
+    // Reading them into locals is bit-identical and lets each row run
+    // independently under OpenMP. (The mapping is NOT x-separable here — srcX
+    // depends on both dstX and dstY — so only the coefficient hoist applies,
+    // and the explicit m*dstX form is kept to preserve float rounding.)
+    const double m00 = dstToSrc.at<double>(0, 0);
+    const double m01 = dstToSrc.at<double>(0, 1);
+    const double m02 = dstToSrc.at<double>(0, 2);
+    const double m10 = dstToSrc.at<double>(1, 0);
+    const double m11 = dstToSrc.at<double>(1, 1);
+    const double m12 = dstToSrc.at<double>(1, 2);
+
     constexpr double kBoundsEpsilon = 1e-5;
+    #pragma omp parallel for schedule(static)
     for (int dstY = 0; dstY < dstSize.height; ++dstY) {
+        cv::Vec3f* dstRow = warped[dstY];
         for (int dstX = 0; dstX < dstSize.width; ++dstX) {
-            double srcX = dstToSrc.at<double>(0, 0) * dstX
-                        + dstToSrc.at<double>(0, 1) * dstY
-                        + dstToSrc.at<double>(0, 2);
-            double srcY = dstToSrc.at<double>(1, 0) * dstX
-                        + dstToSrc.at<double>(1, 1) * dstY
-                        + dstToSrc.at<double>(1, 2);
+            double srcX = m00 * dstX + m01 * dstY + m02;
+            double srcY = m10 * dstX + m11 * dstY + m12;
 
             if (srcX < -kBoundsEpsilon || srcY < -kBoundsEpsilon
                 || srcX > static_cast<double>(points.cols - 1) + kBoundsEpsilon
@@ -489,7 +516,7 @@ cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
 
             const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
             const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            warped(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
         }
     }
 
@@ -529,6 +556,20 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // The mapping is separable: the source x sample (x0,x1,wx) depends only on
+    // dx, not dy. Precompute the x axis once per call instead of recomputing it
+    // for every one of the dh rows. Bit-identical to the per-pixel form (same
+    // float ops, same order). Filled single-threaded before the parallel row
+    // loop, which then only reads these (shared) arrays.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -536,19 +577,16 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);                  // floor since fy >= 0
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         cv::Vec3f* orow = dst[dy];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx], x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
@@ -565,6 +603,11 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once, instead
+    // of an std::lround per pixel (dw lrounds vs dw*dh). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -575,7 +618,7 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
         }
         const uint8_t* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -634,6 +677,11 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once (dw
+    // lrounds vs dw*dh per-pixel). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -644,7 +692,7 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         }
         const cv::Vec3f* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -668,6 +716,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // Separable: precompute the x axis once per call (x0=-1 marks an
+    // out-of-range column -> border). Bit-identical to the per-pixel form.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -679,21 +738,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            if (fx < 0.0f || fx > sxmax) {
-                orow[dx] = border;
-                continue;
-            }
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx];
+            if (x0 < 0) { orow[dx] = border; continue; }
+            const int x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
@@ -897,6 +952,18 @@ cv::Vec2d QuadSurface::surfaceToGrid(const cv::Vec2d& surface) const
         (surface[1] + static_cast<double>(_center[1]))
             * static_cast<double>(_scale[1]),
     };
+}
+
+void QuadSurface::shiftSurfaceOrigin(const cv::Vec2d& delta)
+{
+    // ensureLoaded() first: lazy loading overwrites _center, which would
+    // silently drop a shift applied before the points materialize.
+    ensureLoaded();
+    if (!std::isfinite(delta[0]) || !std::isfinite(delta[1])) {
+        return;
+    }
+    _center[0] += static_cast<float>(delta[0]);
+    _center[1] += static_cast<float>(delta[1]);
 }
 
 cv::Vec2d QuadSurface::gridToSurface(const cv::Vec2d& grid) const
@@ -2585,6 +2652,44 @@ Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)
     return res;
 }
 
+utils::Json bbox_to_json(const Rect3D& bbox)
+{
+    auto lo = utils::Json::array();
+    lo.push_back(bbox.low[0]);
+    lo.push_back(bbox.low[1]);
+    lo.push_back(bbox.low[2]);
+    auto hi = utils::Json::array();
+    hi.push_back(bbox.high[0]);
+    hi.push_back(bbox.high[1]);
+    hi.push_back(bbox.high[2]);
+    auto arr = utils::Json::array();
+    arr.push_back(std::move(lo));
+    arr.push_back(std::move(hi));
+
+    return arr;
+}
+
+bool bbox_of_valid_points(const cv::Mat_<cv::Vec3f>& points, Rect3D& out)
+{
+    bool any = false;
+    Rect3D res;
+    for (int j = 0; j < points.rows; j++)
+        for (int i = 0; i < points.cols; i++) {
+            const cv::Vec3f& p = points(j, i);
+            if (p[0] == -1)
+                continue;
+            if (!any) {
+                res = {p, p};
+                any = true;
+            } else
+                res = expand_rect(res, p);
+        }
+
+    if (any)
+        out = res;
+
+    return any;
+}
 
 bool intersect(const Rect3D &a, const Rect3D &b)
 {

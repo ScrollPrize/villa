@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from dtypes import numpy_float_hi
 import tifffile
 import torch
 
@@ -300,11 +301,11 @@ def _mark_segment_vertices(
 	rmax = min(mask.shape[0] - 1, int(math.ceil(max(r0, r1) + eps)))
 	cmin = max(0, int(math.floor(min(c0, c1) - eps)))
 	cmax = min(mask.shape[1] - 1, int(math.ceil(max(c0, c1) + eps)))
-	seg = np.asarray([r1 - r0, c1 - c0], dtype=np.float64)
+	seg = np.asarray([r1 - r0, c1 - c0], dtype=numpy_float_hi)
 	seg_len2 = float(np.dot(seg, seg))
 	for r in range(rmin, rmax + 1):
 		for c in range(cmin, cmax + 1):
-			v = np.asarray([float(r) - r0, float(c) - c0], dtype=np.float64)
+			v = np.asarray([float(r) - r0, float(c) - c0], dtype=numpy_float_hi)
 			if seg_len2 <= eps:
 				dist2 = float(np.dot(v, v))
 			else:
@@ -384,7 +385,7 @@ def _mask_bbox(mask: np.ndarray) -> list[int] | None:
 def _points_bbox(points: list[tuple[float, float]]) -> list[float] | None:
 	if not points:
 		return None
-	arr = np.asarray(points, dtype=np.float64)
+	arr = np.asarray(points, dtype=numpy_float_hi)
 	return [
 		round(float(np.min(arr[:, 0])), 3),
 		round(float(np.max(arr[:, 0])), 3),

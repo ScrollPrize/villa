@@ -3,7 +3,12 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
+#include <filesystem>
+#include <system_error>
+
 static const std::filesystem::path METADATA_FILE = "meta.json";
+static constexpr const char* OPEN_DATA_LAZY_PLACEHOLDER_KEY =
+    "vc_open_data_lazy_placeholder";
 
 Segmentation::Segmentation(std::filesystem::path path)
     : path_(std::move(path))
@@ -99,8 +104,35 @@ bool Segmentation::isSurfaceLoaded() const
 
 bool Segmentation::canLoadSurface() const
 {
-    return metadata_.contains("format") &&
-           metadata_["format"].get_string() == "tifxyz";
+    if (!metadata_.contains("format") || metadata_["format"].get_string() != "tifxyz") {
+        return false;
+    }
+
+    // Catalog placeholders intentionally contain only metadata until the user
+    // selects one. QuadSurface can construct their lightweight tree-row model
+    // from scale/tiff_dimensions without touching the absent TIFF payload.
+    if (metadata_.contains(OPEN_DATA_LAZY_PLACEHOLDER_KEY) &&
+        metadata_[OPEN_DATA_LAZY_PLACEHOLDER_KEY].is_boolean() &&
+        metadata_[OPEN_DATA_LAZY_PLACEHOLDER_KEY].get_bool()) {
+        return true;
+    }
+
+    // loadSurface() only reads meta.json; the x/y/z.tif payload is read lazily
+    // by QuadSurface::ensureLoaded() on first geometry access. That access
+    // typically happens deep inside a Qt slot (focus marker, intersections,
+    // ...) where nothing catches, so a directory carrying meta.json but no
+    // payload — a partial Open Data download, an interrupted save, a segment
+    // still being written — would register as a usable surface and abort the
+    // app much later, far from the real problem. Checking the payload here
+    // keeps the failure at registration time, where loadSurface() already
+    // reports nullptr and every caller handles it.
+    for (const auto* band : {"x.tif", "y.tif", "z.tif"}) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path_ / band, ec) || ec) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::shared_ptr<QuadSurface> Segmentation::loadSurface()

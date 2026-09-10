@@ -113,8 +113,23 @@ public:
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
         const CChunkedVolumeViewer::CameraState& camera,
         const std::map<std::string, GeneratedOverlay>& overlays = {});
-    bool setGeneratedLineViews(const GeneratedViews& views,
+    // Takes the views by value: the caller hands its (large - all line
+    // points, normals, branch polylines, strip map) struct over instead of
+    // this dialog copying it a second time.
+    bool setGeneratedLineViews(GeneratedViews views,
                                const CChunkedVolumeViewer::CameraState& camera);
+    // Shift freshly rebuilt strip surfaces so the fiber spot under the live
+    // strip cameras keeps its surface coordinate across the update. The
+    // controller calls this BEFORE re-registering the surfaces: the strip
+    // viewers keep their raw camera coordinates when they adopt replacements,
+    // so anchoring the new parameterization instead of moving the cameras
+    // keeps every frame — old, new, and the held overlays in between —
+    // pixel-stable through the swap. No-op without live strip views.
+    void anchorGeneratedStripSurfacesForUpdate(
+        QuadSurface* newLineSurface,
+        QuadSurface* newLineSideSlice,
+        const vc::lasagna::LineStripPositionMap& newPositionMap,
+        const std::vector<cv::Vec3f>& newLinePoints) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
@@ -128,7 +143,7 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
     int extrapolationDistanceVx() const;
-    int maxControlPointDistanceVx() const;
+    int maxControlPointExtrapolationDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setLasagnaDatasetOptions(
@@ -157,8 +172,15 @@ public:
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
-    void setOptimizationBusy(bool busy);
+    // blockInput=true covers the panes with the input-swallowing overlay
+    // (initial seed solves: there is no line to edit yet). blockInput=false
+    // shows a passive top-center badge instead and leaves the panes
+    // interactive, so control points can keep being placed while a
+    // re-optimization runs (edits coalesce in the controller).
+    void setOptimizationBusy(bool busy, bool blockInput = true);
     void setOptimizationStatus(bool optimized);
+    // Empty retracts the notice; see updateUmbilicusNotice().
+    void setUmbilicusNotice(const QString& notice);
     void setFiberDisplayName(const QString& name);
     // "H"/"V" (or empty) shown next to the fiber name in the top-right label.
     void setFiberHvTag(const QString& tag);
@@ -177,9 +199,13 @@ public:
 signals:
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
+    // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
+    // controller can resolve the position on its own (possibly renumbered)
+    // line without consulting the clicked point.
     void generatedControlPointRequested(const std::string& surfaceName,
                                         cv::Vec3f volumePoint,
-                                        double linePosition);
+                                        double linePosition,
+                                        cv::Vec3f lineAnchor);
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
@@ -260,6 +286,11 @@ private:
     // projection + crosshair update per non-hovered pane per tick.
     void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
                                    const std::optional<cv::Vec3f>& point);
+    // Pushes the "Mirror cursor across panes" state onto the panes. The block
+    // has to sit on the receiving side: the panes belong to the same
+    // ViewerManager as the main window, so the global cursor sync would keep
+    // feeding them even with this dialog's own broadcast silenced.
+    void applyLinkedCursorMirroringToPanes();
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -287,8 +318,8 @@ private:
     // next one after the key comes up, and the opposite arrow reverses mid-pan.
     void startArrowPan(int direction);
     // Control-point line positions plus (when there is room) one boundary
-    // target beyond each outer control point: Max CP distance or the
-    // extrapolated line end, whichever is shorter.
+    // target beyond each outer control point: the maximum base-voxel
+    // arclength extrapolation distance or the line end, whichever is shorter.
     std::vector<double> arrowPanTargetPositions() const;
     void releaseArrowPanKey(int direction);
     void updateArrowPanStopTarget();
@@ -334,7 +365,14 @@ private:
     bool controlPointPlacementAllowedAt(double linePosition) const;
     vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
+    // Cumulative base-voxel arclengths of the displayed line (one per point),
+    // or an empty vector when no usable map exists; along-line motion (wheel,
+    // arrow pan, Space snap) is measured in these units.
+    const std::vector<double>& currentLineArclengths() const;
     void rebuildGeneratedStaticStripOverlays();
+    // Arrow-pan tick: shift the static strip overlays with the camera (exact
+    // while the zoom is unchanged), rebuilding only when it is not.
+    void updateStaticStripOverlaysForPan();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
                                          bool updateSpanLabels = true);
     void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
@@ -344,11 +382,13 @@ private:
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
     bool toggleCurrentCutFollowFromKeyboard();
+    bool placeControlPointAtCurrentLinePosition();
     bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
     void restoreInitialGeneratedViewerCameras();
-    void applyOverlayForViewer(const std::string& overlayKey,
+    // Returns the viewer overlay-group key the items were registered under.
+    std::string applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
@@ -394,6 +434,10 @@ private:
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
     void updateOptimizationStatusIndicator();
+    // Red notice at the bottom strip's top-left when the package's umbilicus
+    // could not be used, so that falling back to the volume centre is visible
+    // rather than only logged.
+    void updateUmbilicusNotice();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void rebuildDatasetMenus();
@@ -421,15 +465,23 @@ private:
     // uncommitted edits until then (and revert when the menu reopens).
     int _appliedInitialCenterlineLengthVx = 0;
     int _appliedExtrapolationDistanceVx = 0;
-    QSpinBox* _maxControlPointDistanceSpin = nullptr;
+    QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
+    // The overlay only blocks the mouse, so keyboard-driven edits have to test
+    // this themselves before they queue any deferred state.
+    // True only while the blocking overlay is up (busy && blockInput):
+    // passive-badge solves keep editing live, and key handlers must match
+    // what a mouse click can reach.
+    bool _optimizationInputBlocked = false;
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
+    QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
+    QPointer<QWidget> _optimizationBadge;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
@@ -456,6 +508,18 @@ private:
     std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
+    // Per strip viewer: the viewer group the current static overlay was
+    // registered under (the key registration returned, used verbatim for the
+    // pan-time translation) and the camera it was built for.
+    struct StaticStripOverlayPlacement {
+        std::string groupKey;
+        vc3d::line_annotation::GeneratedOverlayCameraBaseline camera;
+    };
+    std::vector<StaticStripOverlayPlacement> _staticStripOverlayPlacements;
+    // A missing group during a pan means a registration/lookup mismatch, not a
+    // legitimate rebuild reason; warn once per pan so it cannot hide behind
+    // the rebuild fallback.
+    bool _staticStripOverlayPanFallbackWarned = false;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
@@ -471,15 +535,13 @@ private:
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
     std::vector<bool> _stripOverlaySwapPending;
-    // Volume point of the most recent control-point placement click; the next
-    // in-place update moves the current line position onto the control point
-    // nearest to it, so the marker lands on the new point with the new image.
-    std::optional<cv::Vec3f> _pendingPlacementFocus;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
+    QPointer<QLabel> _umbilicusNoticeLabel;
+    QString _umbilicusNotice;
     GeneratedViews _generatedViews;
     // Sign applied to the displayed line tangent so the current cut's screen
     // left/right and the side cut's vertical do not depend on the arbitrary
@@ -531,6 +593,9 @@ private:
     // (space, edits): only a landed pan may hand back to a still-held key.
     bool _arrowPanEndedByLanding = false;
     double _arrowPanVelocity = 0.0;
+    // Unit the running pan's velocity is in (true: base-voxel arclength,
+    // false: line positions); a change mid-gesture cancels the pan.
+    std::optional<bool> _arrowPanArclengthUnits;
     std::optional<double> _arrowPanStopTarget;
     double _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
     double _arrowPanCruiseSpeed =

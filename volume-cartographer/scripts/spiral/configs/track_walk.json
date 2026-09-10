@@ -1,6 +1,0 @@
-{
-  "track_crossing_mode": "track_walk",
-  "sample_count_track_points_per_step": 192,
-  "track_min_walks_per_track": 2,
-  "track_max_walks_per_track": 5
-}

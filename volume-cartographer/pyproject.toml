@@ -14,6 +14,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy",
     "numcodecs>=0.15.1,<0.17",
+    "vc-delta3d>=0.1.0,<0.2",
 ]
 license = { file = "LICENSE" }
 
@@ -30,8 +31,3 @@ VC_BUILD_APPS = "OFF"
 VC_BUILD_UI_TRACER = "OFF"
 VC_BUILD_FLATBOI = "OFF"
 VC_TESTING = "OFF"
-
-[tool.uv.workspace]
-members = [
-    "scripts/spiral",
-]

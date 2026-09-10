@@ -1599,7 +1599,11 @@ int main(int argc, char** argv)
             ? std::string("projected_tifxyz_") + now_id()
             : cfg.output.filename().string();
         auto out = std::make_unique<QuadSurface>(finalPoints, src->scale());
-        Json meta;
+        // Start from the source segment's own metadata (scroll_source,
+        // target_volume, seed, and anything carried from earlier pipeline
+        // stages) and overlay this run's parameters on top, instead of
+        // replacing it wholesale — see villa#1321.
+        Json meta = src->meta;
         meta["source"] = "vc_project_tifxyz";
         meta["source_tifxyz"] = cfg.source.string();
         meta["umbilicus"] = cfg.umbilicus.string();

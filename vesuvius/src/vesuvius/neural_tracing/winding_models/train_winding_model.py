@@ -7,7 +7,7 @@ column at its transverse column stride — a monotone relative winding phase
 when the optional heads are configured, a per-sample log-variance for those
 increments and a crossing heatmap: the dense observations consumed by
 fit_spiral's winding losses
-(volume-cartographer/scripts/spiral/fit_spiral.py). Phase is supervised
+(spiral-fitting/fit_spiral.py). Phase is supervised
 shift-invariantly with a single free offset per slab (winding indices are
 globally consistent across a slab's columns) and canonicalized to increase
 along the ray axis; the consumer applies each ray's known winding

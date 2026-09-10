@@ -332,6 +332,25 @@ from inference prefetch with, for example, `--download-workers 256`. Interrupted
 or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
 with a warning and rewritten atomically rather than aborting inference.
 
+For full-volume inference when one selected input scale is too large to keep,
+enable the shared rolling disk cache:
+
+```bash
+lasagna-preprocess predict3d ... --input /cache/volume.zarr/0 --live-fetch
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
+  --input /cache/volume.zarr/0 --live-fetch
+```
+
+The local OME root must contain `_download` S3 metadata. The defaults are a
+10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
+descriptors (`--live-fetch-ahead-tiles 10000`); this disk window is separate
+from TensorStore's much smaller `--prefetch-tiles-per-gpu` array window. Only
+whole input Z-chunk planes safely behind a fully committed model row are
+removed. Cache pressure may temporarily exceed the target when no obsolete
+plane is safe. Live mode is intentionally full-volume only, conflicts with
+`--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
+Interrupted runs retain atomically completed chunks and can be rerun directly.
+
 ### Multi-axis processing
 
 The `--axis` flag controls which dimension is sliced through:

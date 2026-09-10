@@ -53,6 +53,48 @@ NATIVE_CROP_TRANSLATION_KEEP_FRACTION = 1.0 / 3.0
 NATIVE_CROP_TRANSLATION_MAX_AXES = 2
 NATIVE_CROP_TRANSLATION_MAX_ATTEMPTS = 24
 
+_GEOMETRIC_TRANSFORM_KEYWORDS = (
+    "Rot90",
+    "Mirror",
+    "Spatial",
+    "Affine",
+    "Elastic",
+    "CropPad",
+    "Resize",
+    "Transpose",
+)
+
+
+def _is_geometric_transform(transform) -> bool:
+    """Return whether a possibly wrapped transform changes only geometry."""
+
+    if any(
+        keyword in type(transform).__name__
+        for keyword in _GEOMETRIC_TRANSFORM_KEYWORDS
+    ):
+        return True
+    inner = getattr(transform, "transform", None)
+    if inner is not None:
+        return _is_geometric_transform(inner)
+    alternatives = getattr(transform, "list_of_transforms", None)
+    if alternatives:
+        return all(_is_geometric_transform(item) for item in alternatives)
+    return False
+
+
+def split_augmentations_by_geometry(
+    compose: ComposeTransforms,
+) -> tuple[ComposeTransforms, ComposeTransforms]:
+    """Split one preset around the clean pseudo-label image boundary."""
+
+    geometric = []
+    photometric = []
+    for transform in compose.transforms:
+        (geometric if _is_geometric_transform(transform) else photometric).append(
+            transform
+        )
+    return ComposeTransforms(geometric), ComposeTransforms(photometric)
+
 
 def _mirror_axes(dimension: int) -> tuple[int, ...]:
     if dimension == 2:

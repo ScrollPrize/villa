@@ -20,7 +20,6 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -168,38 +167,6 @@ using TraceClock = std::chrono::steady_clock;
     if (length(ref) > kEpsilon && out.dot(ref) < 0.0)
         out *= -1.0;
     return out;
-}
-
-[[nodiscard]] bool endsWith(std::string_view value, std::string_view suffix)
-{
-    return value.size() >= suffix.size() &&
-           value.substr(value.size() - suffix.size()) == suffix;
-}
-
-[[nodiscard]] std::vector<std::string> fiberPredictionPrefixes(
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
-{
-    std::vector<std::string> prefixes;
-    if (manifest.groupForChannel("presence") != nullptr &&
-        manifest.groupForChannel("nx") != nullptr &&
-        manifest.groupForChannel("ny") != nullptr) {
-        prefixes.push_back({});
-    }
-    for (const auto& group : manifest.groups) {
-        for (const auto& channel : group.channels) {
-            constexpr std::string_view suffix = "_presence";
-            if (!endsWith(channel, suffix))
-                continue;
-            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
-            if (manifest.groupForChannel(prefix + "_nx") != nullptr &&
-                manifest.groupForChannel(prefix + "_ny") != nullptr) {
-                prefixes.push_back(prefix);
-            }
-        }
-    }
-    std::sort(prefixes.begin(), prefixes.end());
-    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
-    return prefixes;
 }
 
 [[nodiscard]] std::array<std::string, 3> predictionChannelNames(
@@ -3398,7 +3365,7 @@ FiberPredictionTraceScales resolveFiberPredictionTraceScales(
             "fiber inference manifest source_to_base must be positive and finite");
     }
 
-    const auto prefixes = fiberPredictionPrefixes(manifest);
+    const auto prefixes = manifest.fiberPredictionPrefixes();
     if (prefixes.empty()) {
         throw std::runtime_error(
             "fiber inference dataset must contain presence/nx/ny channels");
@@ -3493,13 +3460,11 @@ public:
         : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
         const auto& manifest = dataset.manifest();
-        const auto prefixes = fiberPredictionPrefixes(manifest);
+        const auto prefixes = manifest.fiberPredictionPrefixes();
         if (prefixes.empty())
             throw std::runtime_error(
                 "fiber inference dataset must contain presence/nx/ny channels");
 
-        cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(
-            maxCachedBytes);
         options_.reserve(prefixes.size());
         for (const auto& prefix : prefixes) {
             const auto channels = predictionChannelNames(prefix);
@@ -3514,13 +3479,13 @@ public:
             if (cornerCompatible) {
                 option.presenceCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.presence, maxCachedBytes, cornerBudget_);
+                        option.presence);
                 option.nxCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.nx, maxCachedBytes, cornerBudget_);
+                        option.nx);
                 option.nyCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.ny, maxCachedBytes, cornerBudget_);
+                        option.ny);
             } else {
                 cornerSamplingAvailable_ = false;
             }
@@ -4452,7 +4417,6 @@ private:
     std::vector<Option> options_;
     std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
     bool cornerSamplingAvailable_ = true;
 };
 
@@ -4727,6 +4691,10 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
     request.budgetSpanVoxels = distanceVoxels;
+    // No target planes and no endpoint acceptance here: an open-tail
+    // extrapolation has a synthetic target at the requested distance, nothing
+    // to "reach", so the span-bounded endpoint threshold of traceFiberSegment
+    // deliberately does not apply.
     request.config = config;
     return traceOneWayCore(
         predictions,
@@ -4735,6 +4703,16 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         progress,
         "extrapolation",
         distanceVoxels);
+}
+
+double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,
+                                                  double spanLengthBaseVoxels)
+{
+    if (!std::isfinite(spanLengthBaseVoxels) || spanLengthBaseVoxels < 0.0) {
+        return config.endpointAcceptThresholdBaseVoxels;
+    }
+    return std::min(config.endpointAcceptThresholdBaseVoxels,
+                    kEndpointAcceptSpanFraction * spanLengthBaseVoxels);
 }
 
 FiberTraceSegmentResult traceFiberSegment(
@@ -4757,7 +4735,17 @@ FiberTraceSegmentResult traceFiberSegment(
     FiberTraceSegmentResult result;
     const cv::Vec3d start = request.referenceLine[request.startIndex];
     const cv::Vec3d target = request.referenceLine[request.targetIndex];
+    // The reference line, start, target and span are in trace voxels; the
+    // acceptance threshold is configured in base voxels.
     const double span = length(target - start);
+    // One effective config for this segment: the endpoint acceptance is
+    // bounded by the span (see effectiveEndpointAcceptThresholdBaseVoxels), and
+    // the same value drives both one-way target-plane acceptances (through
+    // targetPlaneAcceptThresholdVoxels; traceOneWayCore does not read the
+    // config threshold itself) and the meeting fusion below.
+    FiberTraceConfig config = request.config;
+    config.endpointAcceptThresholdBaseVoxels = effectiveEndpointAcceptThresholdBaseVoxels(
+        request.config, span * request.config.traceToBaseScale);
     FiberTraceOneWayRequest forwardOneWay;
     forwardOneWay.startPoint = start;
     forwardOneWay.targetPoint = target;
@@ -4770,11 +4758,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.startIndex,
         target);
     forwardOneWay.targetPlaneAcceptThresholdVoxels =
-        request.config.endpointAcceptThresholdBaseVoxels /
-        request.config.traceToBaseScale;
+        config.endpointAcceptThresholdBaseVoxels / config.traceToBaseScale;
     forwardOneWay.snapTraceToSelectedCrossing = false;
     forwardOneWay.budgetSpanVoxels = span;
-    forwardOneWay.config = request.config;
+    forwardOneWay.config = config;
     FiberTraceOneWayRequest reverseOneWay;
     reverseOneWay.startPoint = target;
     reverseOneWay.targetPoint = start;
@@ -4787,11 +4774,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.targetIndex,
         start);
     reverseOneWay.targetPlaneAcceptThresholdVoxels =
-        request.config.endpointAcceptThresholdBaseVoxels /
-        request.config.traceToBaseScale;
+        config.endpointAcceptThresholdBaseVoxels / config.traceToBaseScale;
     reverseOneWay.snapTraceToSelectedCrossing = false;
     reverseOneWay.budgetSpanVoxels = span;
-    reverseOneWay.config = request.config;
+    reverseOneWay.config = config;
 
     result.forward = traceOneWayCore(
         predictions, forwardOneWay, normalSampler, progress, "forward");
@@ -4799,7 +4785,7 @@ FiberTraceSegmentResult traceFiberSegment(
         predictions, reverseOneWay, normalSampler, progress, "reverse");
 
     const TraceMeetingFusion fusion =
-        fuseTraceMeetings(result.forward, result.reverse, request.config);
+        fuseTraceMeetings(result.forward, result.reverse, config);
     result.fusedLine = fusion.fusedLine;
     if (!result.fusedLine.empty()) {
         result.fusedLine.front() = request.referenceLine[request.startIndex];

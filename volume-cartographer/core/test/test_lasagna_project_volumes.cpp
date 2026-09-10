@@ -158,6 +158,26 @@ TEST_CASE("Lasagna project preparation deduplicates shared source zarrs")
     fs::remove_all(dir);
 }
 
+TEST_CASE("Lasagna project volume tags preserve anonymous remote authentication")
+{
+    vc::lasagna::LasagnaChannelGroup group;
+    group.name = "pred";
+    group.remoteZarrBaseUrl =
+        "https://bucket.s3.us-east-1.amazonaws.com/artifact/pred.zarr";
+    group.discoverAwsCredentials = false;
+
+    const auto tags = vc::lasagna::lasagnaProjectVolumeTags(
+        group, "s3://bucket/artifact/dataset.lasagna.json");
+    CHECK(std::find(tags.begin(), tags.end(),
+                    vc::project::kAnonymousRemoteAuthTag) != tags.end());
+
+    group.discoverAwsCredentials = true;
+    const auto signedTags = vc::lasagna::lasagnaProjectVolumeTags(
+        group, "s3://bucket/artifact/dataset.lasagna.json");
+    CHECK(std::find(signedTags.begin(), signedTags.end(),
+                    vc::project::kAnonymousRemoteAuthTag) == signedTags.end());
+}
+
 TEST_CASE("Lasagna project preparation keeps numeric scale group ids unique")
 {
     const auto dir = temporaryDirectory();

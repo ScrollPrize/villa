@@ -20,6 +20,10 @@ constexpr int kManifestTimeoutMs = 30000;
 constexpr int kFileTimeoutMs = 60 * 60 * 1000; // bounded by transfer, effectively
 constexpr qint64 kMaxDeclaredTotalBytes = 64LL * 1024 * 1024 * 1024;
 constexpr int kMaxFiles = 4096;
+// Artifact files are transferred concurrently: the preview's coordinate
+// rasters are large and independent, and a strictly serial chain left the
+// link idle for a whole round trip between them.
+constexpr int kMaxConcurrentFiles = 4;
 const QString kManifestCopyName = QStringLiteral(".artifact-manifest.json");
 
 bool isSafeRelativeName(const QString& name)
@@ -57,8 +61,15 @@ struct SpiralArtifactCache::FetchJob
     QList<QJsonObject> pendingFiles;
     int totalFiles = 0;
     int filesComplete = 0;
+    int inFlight = 0;
     qint64 totalBytes = 0;
     qint64 bytesComplete = 0;
+    // Bytes held by transfers that have not been verified yet, so progress
+    // stays monotonic while several files are in flight.
+    qint64 bytesInFlight = 0;
+    // Set by the first outcome, success or failure: with concurrent
+    // transfers several callbacks can still arrive after the job is over.
+    bool settled = false;
     QString partialDir;
     QString finalDir;
     FetchCallback done;
@@ -195,8 +206,12 @@ void SpiralArtifactCache::fetchArtifact(const QString& sessionId, const QString&
         if (!validateManifest(manifest, &error)) { finishJob(job, error); return; }
         job->manifest = manifest;
         job->entryPoint = manifest.value(QStringLiteral("entry_point")).toString();
-        const bool preview =
-            manifest.value(QStringLiteral("kind")).toString() == QStringLiteral("spiral-preview");
+        // Both preview artifacts defer the same files: the surface never
+        // carries overlays, and the diagnostics artifact is almost entirely
+        // overlays, which are fetched only when one is actually displayed.
+        const QString kind = manifest.value(QStringLiteral("kind")).toString();
+        const bool preview = kind == QStringLiteral("spiral-preview")
+            || kind == QStringLiteral("spiral-preview-diagnostics");
         for (const QJsonValue& value : manifest.value(QStringLiteral("files")).toArray()) {
             const QJsonObject entry = value.toObject();
             if (preview
@@ -212,7 +227,7 @@ void SpiralArtifactCache::fetchArtifact(const QString& sessionId, const QString&
             finishJob(job, tr("Could not create the artifact cache directory"));
             return;
         }
-        startNextFile(job);
+        pumpFiles(job);
     });
 }
 
@@ -339,34 +354,48 @@ void SpiralArtifactCache::fetchFile(const QString& sessionId, const QString& art
     });
 }
 
-void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
+void SpiralArtifactCache::pumpFiles(const std::shared_ptr<FetchJob>& job)
 {
-    if (job->generation != _generation) return;
-    if (job->pendingFiles.isEmpty()) {
-        // Publish atomically: write the manifest copy, then rename the
-        // completed directory into place.
-        QFile manifestFile(QDir(job->partialDir).filePath(kManifestCopyName));
-        if (!manifestFile.open(QIODevice::WriteOnly)
-            || manifestFile.write(QJsonDocument(job->manifest).toJson(QJsonDocument::Compact)) < 0) {
-            finishJob(job, tr("Could not write the artifact manifest copy"));
-            return;
-        }
-        manifestFile.close();
-        QDir().mkpath(QFileInfo(job->finalDir).absolutePath());
-        QDir dir;
-        if (QFileInfo::exists(job->finalDir)) QDir(job->finalDir).removeRecursively();
-        if (!dir.rename(job->partialDir, job->finalDir)) {
-            finishJob(job, tr("Could not publish the artifact cache directory"));
-            return;
-        }
-        emit fetchProgress(job->artifactId, QStringLiteral("finished"), QString(),
-                           job->filesComplete, job->totalFiles,
-                           job->bytesComplete, job->totalBytes);
-        job->done(QDir(job->finalDir).filePath(job->entryPoint), {}, false);
+    if (job->generation != _generation || job->settled) return;
+    while (job->inFlight < kMaxConcurrentFiles && !job->pendingFiles.isEmpty()) {
+        const QJsonObject entry = job->pendingFiles.takeFirst();
+        ++job->inFlight;
+        startFile(job, entry);
+        // A local failure (an unopenable cache file) settles the job inside
+        // startFile; nothing further belongs in flight.
+        if (job->settled || job->generation != _generation) return;
+    }
+    if (job->inFlight == 0 && job->pendingFiles.isEmpty()) publishJob(job);
+}
+
+void SpiralArtifactCache::publishJob(const std::shared_ptr<FetchJob>& job)
+{
+    // Publish atomically: write the manifest copy, then rename the
+    // completed directory into place.
+    QFile manifestFile(QDir(job->partialDir).filePath(kManifestCopyName));
+    if (!manifestFile.open(QIODevice::WriteOnly)
+        || manifestFile.write(QJsonDocument(job->manifest).toJson(QJsonDocument::Compact)) < 0) {
+        finishJob(job, tr("Could not write the artifact manifest copy"));
         return;
     }
+    manifestFile.close();
+    QDir().mkpath(QFileInfo(job->finalDir).absolutePath());
+    QDir dir;
+    if (QFileInfo::exists(job->finalDir)) QDir(job->finalDir).removeRecursively();
+    if (!dir.rename(job->partialDir, job->finalDir)) {
+        finishJob(job, tr("Could not publish the artifact cache directory"));
+        return;
+    }
+    job->settled = true;
+    emit fetchProgress(job->artifactId, QStringLiteral("finished"), QString(),
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete, job->totalBytes);
+    job->done(QDir(job->finalDir).filePath(job->entryPoint), {}, false);
+}
 
-    const QJsonObject entry = job->pendingFiles.takeFirst();
+void SpiralArtifactCache::startFile(const std::shared_ptr<FetchJob>& job,
+                                    const QJsonObject& entry)
+{
     const QString name = entry.value(QStringLiteral("name")).toString();
     const qint64 declaredSize = entry.value(QStringLiteral("size")).toInteger();
     const QString declaredSha = entry.value(QStringLiteral("sha256")).toString().toLower();
@@ -384,9 +413,10 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
             existing = 0;
         }
     }
+    job->bytesInFlight += existing;
     emit fetchProgress(job->artifactId, QStringLiteral("downloading"), name,
                        job->filesComplete, job->totalFiles,
-                       job->bytesComplete + existing, job->totalBytes);
+                       job->bytesComplete + job->bytesInFlight, job->totalBytes);
 
     auto file = std::make_shared<QFile>(targetPath);
     if (!file->open(existing > 0 ? (QIODevice::WriteOnly | QIODevice::Append)
@@ -401,25 +431,31 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
         request.setRawHeader("Range", QStringLiteral("bytes=%1-").arg(existing).toUtf8());
     QNetworkReply* reply = existing == declaredSize ? nullptr : _network->get(request);
 
+    // Bytes this transfer has already contributed to the in-flight total.
+    auto reported = std::make_shared<qint64>(existing);
     auto streamedDigest = std::make_shared<QString>();
     auto verifyAndContinue = [this, job, name, declaredSize, declaredSha,
-                              targetPath, streamedDigest]() {
+                              targetPath, streamedDigest, reported]() {
         emit fetchProgress(job->artifactId, QStringLiteral("verifying"), name,
                            job->filesComplete, job->totalFiles,
-                           job->bytesComplete + declaredSize, job->totalBytes);
+                           job->bytesComplete + job->bytesInFlight,
+                           job->totalBytes);
         auto* watcher = new QFutureWatcher<QString>(this);
         connect(watcher, &QFutureWatcher<QString>::finished, this,
-                [this, watcher, job, name, declaredSize]() {
+                [this, watcher, job, name, declaredSize, reported]() {
             const QString error = watcher->result();
             watcher->deleteLater();
-            if (job->generation != _generation) return;
+            if (job->generation != _generation || job->settled) return;
+            --job->inFlight;
+            job->bytesInFlight -= *reported;
             if (!error.isEmpty()) { finishJob(job, error); return; }
             ++job->filesComplete;
             job->bytesComplete += declaredSize;
             emit fetchProgress(job->artifactId, QStringLiteral("downloaded"), name,
                                job->filesComplete, job->totalFiles,
-                               job->bytesComplete, job->totalBytes);
-            startNextFile(job);
+                               job->bytesComplete + job->bytesInFlight,
+                               job->totalBytes);
+            pumpFiles(job);
         });
         watcher->setFuture(QtConcurrent::run(
             [name, declaredSize, declaredSha, targetPath,
@@ -449,16 +485,18 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
         file->write(bytes);
     });
     connect(reply, &QNetworkReply::downloadProgress, this,
-            [this, job, name, existing](qint64 received, qint64) {
+            [this, job, name, existing, reported](qint64 received, qint64) {
+                const qint64 total = existing + qMax<qint64>(0, received);
+                job->bytesInFlight += total - *reported;
+                *reported = total;
                 emit fetchProgress(
                     job->artifactId, QStringLiteral("downloading"), name,
                     job->filesComplete, job->totalFiles,
-                    job->bytesComplete + existing + qMax<qint64>(0, received),
-                    job->totalBytes);
+                    job->bytesComplete + job->bytesInFlight, job->totalBytes);
             });
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, file, job, name, verifyAndContinue,
-             streamHash, streamedDigest]() {
+             streamHash, streamedDigest, reported]() {
                 const QByteArray bytes = reply->readAll();
                 if (streamHash) streamHash->addData(bytes);
                 file->write(bytes);
@@ -469,7 +507,11 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
                 const QString errorText = reply->errorString();
                 const bool gone = http == 410;
                 reply->deleteLater();
-                if (job->generation != _generation) return;
+                if (job->generation != _generation || job->settled) return;
+                if (gone || !ok) {
+                    --job->inFlight;
+                    job->bytesInFlight -= *reported;
+                }
                 if (gone) { finishJob(job, tr("Artifact was pruned by the service"), true); return; }
                 if (!ok) {
                     finishJob(job, tr("Downloading artifact file %1 failed: %2").arg(name, errorText));
@@ -485,6 +527,10 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
 void SpiralArtifactCache::finishJob(const std::shared_ptr<FetchJob>& job,
                                     const QString& error, bool gone)
 {
+    // Concurrent transfers can fail together; only the first outcome is the
+    // job's outcome, and the caller is told once.
+    if (job->settled) return;
+    job->settled = true;
     // Keep the partial directory: verified complete files resume a later fetch.
     emit fetchProgress(job->artifactId, QStringLiteral("failed"), QString(),
                        job->filesComplete, job->totalFiles,

@@ -1,10 +1,13 @@
 # Native Thread-Synchronization Replay
 
-Passive Valgrind trace collection and DRD dependency extraction remain in
-the standard-library Python coordinator and shared `scripts/thread_sync_trace.py`
-parser. Event-feature calculation, profile-cost evaluation, event-graph
-scheduling, and critical-path playback run in the portable C++
-`bench_thread_sync_replay` executable.
+The regular rendering estimate is native C++ end to end after Valgrind writes
+its raw files. `bench_thread_sync_replay evaluate-render` parses periodic
+separate-thread Callgrind profiles and the scheduler stream from that same run,
+locates the measured DRD window from the benchmark's existing clock calls,
+reconstructs vector-clock dependencies, evaluates all logical-worker
+assignments supported by both scheduler traces, attributes chronological costs,
+and replays the graph conservatively. Python remains only in offline
+calibration and compatibility tooling.
 
 Python starts one persistent process and exchanges one JSON object per line.
 Every request and response uses `schema_version: 2` and an ordered
@@ -29,9 +32,9 @@ Callers locate the executable in this order: explicit `--replay-engine`,
 `VC_THREAD_SYNC_REPLAY_BIN`, beside the benchmark executable, then `PATH`.
 There is no Python fallback.
 
-The rendering CI coordinator is intentionally importable with `python3 -S` and
-does not require NumPy. NumPy remains part of offline model fitting and parity
-analysis, not production gate execution.
+The rendering CMake/Ninja graph invokes Valgrind and the native evaluator
+directly. NumPy and the standard-library Python compatibility client are not
+part of production gate execution.
 
 Build and run the compatibility tests:
 

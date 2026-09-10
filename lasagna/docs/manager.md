@@ -127,6 +127,23 @@ local source descriptor, and leaves the backend's crop-aware on-demand
 downloading enabled during inference. `--download-workers` applies to either
 mode. An explicit backend `--no-download` after `--` still wins. Arguments
 after `--` are passed unchanged to the selected backend.
+
+For a full volume that cannot remain entirely in the cache, replace the bulk
+prefetch phase with the shared rolling selected-scale cache:
+
+```bash
+las_manager inference run fiber3d/my-run/best.pt \
+  PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 0 \
+  --live-fetch --download-workers 512
+```
+
+This initializes only the remote source descriptor, then launches inference
+immediately. Defaults are `--live-cache-gib 10240` and
+`--live-fetch-ahead-tiles 10000`. Completed selected-scale chunks count toward
+the target; only complete old Z-chunk planes behind the committed inference
+frontier may be removed. The settings and final cache counters are copied from
+portable inference provenance into manager run metadata. `--live-fetch` is
+full-volume only and rejects backend/configured `--no-download`.
 This includes output-format overrides such as `--ome-compressor none`; newly
 created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays
 always retain their persisted compressor, and `inference.json` inventories the

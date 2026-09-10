@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -47,6 +48,7 @@ public:
         // -1 preserves the general-purpose "all levels" behavior, while 0
         // makes every fallback lookup resident-only.
         int queuedFallbackLevels;
+        ChunkRequestContext request;
     };
 
     struct Stats {
@@ -69,6 +71,14 @@ public:
         uint64_t cornerMaxCandidatesPerCube = 0;
         std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
         std::vector<uint64_t> cornerDependencyIds;
+    };
+
+    struct ChunkPixelLookupLevel {
+        int level = 0;
+        // Pixel IDs are one-based indices into this table; zero is invalid.
+        std::vector<ChunkKey> chunks;
+        cv::Mat_<uint16_t> pixelIds;
+        bool overflowed = false;
     };
 
     // Queue chunk dependencies for pixels not already covered. The viewer can
@@ -100,6 +110,56 @@ public:
                                                            const cv::Mat_<cv::Vec3f>& coords,
                                                            const cv::Mat_<uint8_t>& coverage,
                                                            const Options& options = Options());
+
+    // Collect candidate chunk occurrences for sparse logical-level-0 XYZ
+    // samples. `viewportPositions` uses framebuffer pixel coordinates and must
+    // match `coords`. No cache state is read or changed; the atomic demand
+    // publisher filters chunks that resolved while this local traversal ran.
+    // Nearby occurrences of one chunk are deduplicated using that level's
+    // declared projected chunk footprint, independently of sparse prepass
+    // sample spacing.
+    static std::vector<ChunkViewportSample> collectViewportDependencies(
+        IChunkedArray& array,
+        int startLevel,
+        const std::vector<cv::Vec3f>& coords,
+        const std::vector<std::array<float, 2>>& viewportPositions,
+        float pixelsPerLevel0VolumeVoxel,
+        const Options& options = Options());
+
+    // Build a debug/diagnostic mapping without reading or queueing cache data.
+    // Each pixel names the containing chunk at every included level through a
+    // compact level-local uint16 ID. Coordinates are logical level-0 XYZ.
+    static std::vector<ChunkPixelLookupLevel> buildChunkPixelLookup(
+        IChunkedArray& array,
+        VolumeSourceId sourceId,
+        int startLevel,
+        int fallbackLevels,
+        const cv::Mat_<cv::Vec3f>& coords,
+        vc::Sampling sampling = vc::Sampling::Nearest,
+        bool zeroIsSentinel = true);
+
+    // Select one source Zarr level for a complete view. `pixelsPerBaseVoxel`
+    // is framebuffer pixels per level-0/base-volume voxel for every renderable
+    // surface. The coarsest level whose largest source-voxel extent satisfies
+    // the quality threshold is selected; no generated coordinates are probed.
+    static int sourceLevelForView(IChunkedArray& array,
+                                  float pixelsPerBaseVoxel,
+                                  float qualityBias = 0.5f);
+    static double maximumBaseVoxelExtent(IChunkedArray& array, int level);
+    static double representativeChunkExtentBaseVoxels(
+        IChunkedArray& array, int level);
+
+    // Selects how far a GUI viewport should queue coarse fallback data. Stops
+    // once one average source chunk spans the larger viewport edge in declared
+    // level-0/base-volume units. Plane and parameterized surfaces use the same
+    // explicit pixels-per-base-voxel contract.
+    static int fallbackLevelCountForViewport(
+        IChunkedArray& array,
+        int startLevel,
+        int viewportWidth,
+        int viewportHeight,
+        std::optional<float> pixelsPerLevel0VolumeVoxel,
+        int maximumFallbackLevels = 5);
 
     // Samples one pyramid level into `out` for pixels not already marked in
     // `coverage`. Coordinates are logical level-0 XYZ voxel coordinates.

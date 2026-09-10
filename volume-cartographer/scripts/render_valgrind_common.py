@@ -160,33 +160,3 @@ def callgrind_command(
         ]
     )
     return command
-
-
-def drd_command(
-    benchmark: Path,
-    scenario: str,
-    metadata: Path,
-    trace: Path,
-    repetitions: int,
-    quantum: int,
-) -> list[str]:
-    return [
-        "valgrind",
-        "--tool=drd",
-        "--trace-segment=yes",
-        "--trace-csw=yes",
-        "--fair-sched=yes",
-        "--time-stamp=yes",
-        f"--scheduling-quantum={quantum}",
-        "--trace-sched=yes",
-        "--trace-syscalls=yes",
-        f"--log-file={trace}",
-        *renderer_command(
-            benchmark,
-            "parallel",
-            scenario,
-            metadata,
-            repetitions,
-            callgrind=False,
-        ),
-    ]

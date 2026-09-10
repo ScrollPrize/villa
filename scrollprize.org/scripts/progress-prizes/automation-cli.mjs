@@ -210,7 +210,7 @@ function buildRuntime(options, env) {
     targetBranch: optionalEnv(env, AUTOMATION_ENV.TARGET_BRANCH) ?? 'main',
     defaultTargetBranch: optionalEnv(env, AUTOMATION_ENV.DEFAULT_TARGET_BRANCH) ?? 'main',
     smokeBranchPrefix: optionalEnv(env, AUTOMATION_ENV.SMOKE_BRANCH_PREFIX)
-      ?? 'codex/progress-prize-smoke-',
+      ?? 'staging/progress-prize-',
     smokeDate: optionalEnv(env, AUTOMATION_ENV.SMOKE_DATE),
     simulatedNow: options['simulated-now'],
   };

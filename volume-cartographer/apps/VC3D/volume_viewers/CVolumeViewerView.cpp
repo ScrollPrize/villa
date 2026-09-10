@@ -6,11 +6,20 @@
 #include <QKeyEvent>
 #include <QPainter>
 #include <QPaintEvent>
+#include <QPolygonF>
 #include <QScrollBar>
 #include <cmath>
 #include <algorithm>
+#include "vc/core/util/PlaneSurface.hpp"
 
 
+CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
+{
+    setMouseTracking(true);
+    if (viewport()) {
+        viewport()->setMouseTracking(true);
+    }
+};
 
 double CVolumeViewerView::chooseNiceLength(double nominal) const
 {
@@ -44,67 +53,106 @@ CVolumeViewerView::ScaleBarLabel CVolumeViewerView::formatScaleBarLength(double 
     return label;
 }
 
+void CVolumeViewerView::setCoordinateFrame(PlaneSurface* plane)
+{
+    if (!plane) {
+        return;
+    }
+    _showFrame = true;
+    cv::Matx33d M = plane->frame();
+    _frame[0] = cv::Vec3f(M(0,0), M(1,0), M(2,0));
+    _frame[1] = cv::Vec3f(M(0,1), M(1,1), M(2,1));
+    _frame[2] = cv::Vec3f(M(0,2), M(1,2), M(2,2));
+    update();
+}
+
+void CVolumeViewerView::showCoordinateFrame(bool visible)
+{
+    _showFrame = visible;
+    update();
+}
+
 void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 {
     QGraphicsView::drawForeground(p, sceneRect);
-    if (property("vc_hide_scalebar").toBool()) {
-        drawTiltHandle(p);
+    drawCoordinateFrame(p);
+    drawTiltHandle(p);
+    drawScaleBar(p);
+}
+
+void CVolumeViewerView::drawCoordinateFrame(QPainter* p) const
+{
+    if (!_showFrame) {
         return;
     }
-    const double dpr = devicePixelRatioF();
-    const double m11 = transform().m11();
-    const int vpW = viewport()->width();
-    const int vpH = viewport()->height();
 
-    // Recompute cached scalebar only when inputs change
-    if (_cachedM11 != m11 || _cachedDpr != dpr || _cachedVpW != vpW ||
-        _cachedVpH != vpH || _cachedVx != m_vx ||
-        _cachedPhysicalUnits != m_physicalUnits || _scalebarCacheDirty) {
-        _cachedM11 = m11;
-        _cachedDpr = dpr;
-        _cachedVpW = vpW;
-        _cachedVpH = vpH;
-        _cachedVx = m_vx;
-        _cachedPhysicalUnits = m_physicalUnits;
-        _scalebarCacheDirty = false;
+    const double radius = 40.0;
+    const double head = 10.0;
+    const double margin = 10.0;
+    const QColor colors[3] = {QColor(230, 30, 30), QColor(30, 230, 30), QColor(30, 40, 220)};
+    const QString labels[3] = {QStringLiteral("X"), QStringLiteral("Y"), QStringLiteral("Z")};
+    
+    const QPointF center(viewport()->width() - margin - radius, margin + radius);
 
-        _cachedFont = p->font();
-        _cachedFont.setPointSizeF(12 * dpr);
-
-        double pxPerScene = m11 * dpr;
-        double pxPerUm = pxPerScene / m_vx;
-        double wPx = vpW * dpr;
-        double wUm = wPx / pxPerUm;
-        double barUm = chooseNiceLength(wUm / 4.0);
-        _cachedBarPx = barUm * pxPerUm;
-
-        _cachedBarLabel = m_physicalUnits
-            ? formatScaleBarLength(barUm).text
-            : QString::number(barUm) + QStringLiteral(" vx");
-    }
+    // Sort by depth, furthest first. Higher z coord = further into the screen.
+    std::array<int, 3> order{0, 1, 2};
+    std::sort(order.begin(), order.end(), [this](int a, int b) {
+        return _frame[a][2] > _frame[b][2];
+    });
 
     p->save();
     p->resetTransform();
     p->setRenderHint(QPainter::Antialiasing);
-    p->setPen(QPen(Qt::red, 2));
-    p->setFont(_cachedFont);
 
-    constexpr int M = 10;
-    int bottom = static_cast<int>(vpH * dpr) - M;
-    p->drawLine(M, bottom, static_cast<int>(M + _cachedBarPx), bottom);
-    p->drawText(M, bottom - 5, _cachedBarLabel);
-    p->restore();
+    for (int i : order) {
+        const QPointF dir = QPointF(_frame[i][0], _frame[i][1]);
+        const QPointF tip(center.x() + dir.x() * radius, center.y() + dir.y() * radius);
+        const double length = std::hypot(tip.x() - center.x(), tip.y() - center.y());
+        const QColor& color = colors[i];
 
-    drawTiltHandle(p);
-}
+        if (length < 2.0) {
+            if (_frame[i][2] > 0.5) {
+                // into the screen
+                p->setPen(QPen(color, 1.0));
+                p->setBrush(Qt::NoBrush);
+            } else {
+                // out of the screen
+                p->setPen(Qt::NoPen);
+                p->setBrush(color);
+            }
+            p->drawEllipse(center, head/2, head/2);
+            p->setPen(color);
+            p->drawText(QPointF(center.x() + 5.0, center.y() - 5.0), labels[i]);
+            continue;
+        }
 
-CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
-{
-    setMouseTracking(true);
-    if (viewport()) {
-        viewport()->setMouseTracking(true);
+        const double ux = (tip.x() - center.x()) / length;
+        const double uy = (tip.y() - center.y()) / length;
+
+        p->setPen(QPen(color, 1.6, Qt::SolidLine, Qt::RoundCap));
+        p->setBrush(Qt::NoBrush);
+        p->drawLine(center, tip);
+
+        QPolygonF arrow;
+        arrow << tip
+              << QPointF(tip.x() - ux * head - uy * head * 0.45,
+                         tip.y() - uy * head + ux * head * 0.45)
+              << QPointF(tip.x() - ux * head + uy * head * 0.45,
+                         tip.y() - uy * head - ux * head * 0.45);
+        if (_frame[i][2] > 0.01) {
+            // into the screen
+            p->setPen(QPen(color, 1.0));
+            p->setBrush(Qt::NoBrush);
+        } else {
+            // out of the screen
+            p->setPen(Qt::NoPen);
+            p->setBrush(color);
+        }
+        p->drawPolygon(arrow);
     }
-};
+
+    p->restore();
+}
 
 void CVolumeViewerView::setTiltHandle(TiltHandleMode mode, QPointF tilt)
 {
@@ -217,6 +265,55 @@ void CVolumeViewerView::drawTiltHandle(QPainter* p) const
     p->restore();
 }
 
+void CVolumeViewerView::drawScaleBar(QPainter* p) const
+{
+    if (property("vc_hide_scalebar").toBool()) {
+        return;
+    }
+    const double m11 = transform().m11();
+    const int vpW = viewport()->width();
+    const int vpH = viewport()->height();
+
+    // Recompute cached scalebar only when inputs change
+    if (_cachedM11 != m11 || _cachedVpW != vpW ||
+        _cachedVpH != vpH || _cachedVx != m_vx ||
+        _cachedPhysicalUnits != m_physicalUnits || _scalebarCacheDirty) {
+        _cachedM11 = m11;
+        _cachedVpW = vpW;
+        _cachedVpH = vpH;
+        _cachedVx = m_vx;
+        _cachedPhysicalUnits = m_physicalUnits;
+        _scalebarCacheDirty = false;
+
+        _cachedFont = p->font();
+        _cachedFont.setPointSizeF(12);
+
+        // Logical pixels, to match the painter after resetTransform().
+        double pxPerScene = m11;
+        double pxPerUm = pxPerScene / m_vx;
+        double wPx = vpW;
+        double wUm = wPx / pxPerUm;
+        double barUm = chooseNiceLength(wUm / 4.0);
+        _cachedBarPx = barUm * pxPerUm;
+
+        _cachedBarLabel = m_physicalUnits
+            ? formatScaleBarLength(barUm).text
+            : QString::number(barUm) + QStringLiteral(" vx");
+    }
+
+    p->save();
+    p->resetTransform();
+    p->setRenderHint(QPainter::Antialiasing);
+    p->setPen(QPen(Qt::red, 2));
+    p->setFont(_cachedFont);
+
+    constexpr int M = 10;
+    int bottom = vpH - M;
+    p->drawLine(M, bottom, static_cast<int>(M + _cachedBarPx), bottom);
+    p->drawText(M, bottom - 5, _cachedBarLabel);
+    p->restore();
+}
+
 void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
 {
     painter->resetTransform();
@@ -249,7 +346,15 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
         return;
     }
 
-    _wheelAccum += event->angleDelta().y();
+    // macOS turns Shift+scroll into a horizontal scroll gesture at the system
+    // level, so the delta arrives on the x axis with y left at zero.
+    const QPoint angleDelta = event->angleDelta();
+    int delta = angleDelta.y();
+    if (delta == 0 && event->modifiers().testFlag(Qt::ShiftModifier)) {
+        delta = angleDelta.x();
+    }
+
+    _wheelAccum += delta;
     constexpr int kStepThreshold = 120;  // one notch = one step
     int steps = _wheelAccum / kStepThreshold;
     if (steps == 0) {

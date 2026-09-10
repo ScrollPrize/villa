@@ -260,7 +260,10 @@ private:
     MatPtr _points;
 };
 
-//quads based surface class with a pointer implementing a nominal scale of 1 voxel
+// Quad-grid surface. Renderable surface coordinates are level-0/base-volume
+// voxel units. `scale()` is grid samples per surface unit (x=column, y=row),
+// so a grid spaced 50 base voxels apart declares scale 1/50. This is
+// parameterization metadata; the source Zarr level is the renderer's only LOD.
 class QuadSurface : public Surface
 {
 public:
@@ -314,10 +317,22 @@ public:
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;
+    // Grid samples per level-0/base-volume voxel in each parameter direction.
     [[nodiscard]] cv::Vec2f scale() const;
     [[nodiscard]] cv::Vec3f center() const;
     [[nodiscard]] cv::Vec2d surfaceToGrid(const cv::Vec2d& surface) const;
     [[nodiscard]] cv::Vec2d gridToSurface(const cv::Vec2d& grid) const;
+    // Shift the surface/ptr-space origin (i.e. _center): content previously
+    // addressed by surface coordinate s is afterwards addressed by s - delta.
+    // Lets a regenerated derived surface (e.g. a line-annotation strip, whose
+    // arc-length parameterization shifts with every re-optimization) stay
+    // addressable by camera coordinates that survive the surface swap. Call
+    // only on a surface no viewer is rendering yet — the shift is not
+    // synchronized against concurrent readers. Session-local by design: the
+    // shift is not persisted by save() and a lazy surface's cache
+    // invalidation recomputes _center, so use it only on in-memory derived
+    // surfaces, never on disk-backed ones.
+    void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
 
     // The legacy renderer treats native vertex validity as pixel coverage.
@@ -514,6 +529,10 @@ private:
     // the same thread without self-deadlock.
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
+
+// Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
+// QuadSurface::save() writes for its own bbox key.
+utils::Json bbox_to_json(const Rect3D& bbox);
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(

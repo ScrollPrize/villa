@@ -109,6 +109,11 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
         }
     };
 
+    // Every origin admitted by the Open Data manifest is public-read. Persist
+    // the transport policy with the entry so cached catalog projects and
+    // deferred resolution never consult ambient AWS credentials.
+    addUnique(std::string(vc::project::kAnonymousRemoteAuthTag));
+
     if (jsonStringEqualsInsensitive(artifact.properties, "representation", "normal3d") ||
         jsonStringEqualsInsensitive(volume.properties, "representation", "normal3d") ||
         containsInsensitive(artifact.type, "normal3d") ||
@@ -366,7 +371,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     if (!cachedProjectPath.empty() && isNonEmptyFile(cachedProjectPath)) {
         try {
             vc::project::LoadOptions opts;
-            opts.remoteCacheRoot = remoteCacheRoot;
             opts.deferResolution = true;
             pkg = VolumePkg::load(
                 cachedProjectPath,
@@ -384,15 +388,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
     if (!pkg) {
         vc::project::LoadOptions opts;
-        opts.remoteCacheRoot = remoteCacheRoot;
         opts.deferResolution = true;
         pkg = VolumePkg::newEmpty(opts);
     }
     pkg->setName(sample.id.empty() ? "Open Data Sample" : sample.id);
-    if (!remoteCacheRoot.empty()) {
-        pkg->setRemoteCacheRoot(remoteCacheRoot);
-    }
-
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
@@ -743,6 +742,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
         auto tags = coordinateTags(
             sample, volume, level, effectiveVoxelSize, candidate.sourceUrl);
+        tags.push_back(std::string(vc::project::kAnonymousRemoteAuthTag));
         tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
         tags.push_back("vc-open-data-volume-id:" + volume.id);
         const auto lasagna = lasagnaArtifacts(sample.id, volume);

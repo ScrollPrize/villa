@@ -1,12 +1,14 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
 #include <utils/zarr.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -15,11 +17,13 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace vc::render {
@@ -33,8 +37,10 @@ namespace {
 
 class HttpStatusError final : public std::runtime_error {
 public:
-    HttpStatusError(long status, const std::string& key)
-        : std::runtime_error("HTTP " + std::to_string(status) + " fetching " + key)
+    HttpStatusError(long status, const std::string& key, std::string detail = {})
+        : std::runtime_error(
+              "HTTP " + std::to_string(status) + " fetching " + key +
+              (detail.empty() ? std::string{} : ": " + std::move(detail)))
         , status_(status)
     {
     }
@@ -51,10 +57,46 @@ bool hasSuffix(std::string_view value, std::string_view suffix)
            value.substr(value.size() - suffix.size()) == suffix;
 }
 
-bool isOptionalMetadataProbe(const std::string& key)
+bool isOptionalMetadataProbe(std::string_view key)
 {
-    return key == "zarr.json" || key == ".zattrs" ||
-           hasSuffix(key, "/zarr.json") || hasSuffix(key, "/.zattrs");
+    return key == ".zgroup" || key == ".zarray" || key == ".zattrs" ||
+           key == ".zmetadata" || key == "zarr.json" ||
+           hasSuffix(key, "/.zgroup") || hasSuffix(key, "/.zarray") ||
+           hasSuffix(key, "/.zattrs") || hasSuffix(key, "/zarr.json");
+}
+
+std::string responseErrorDetail(const utils::HttpResponse& response)
+{
+    if (!response.error_message.empty())
+        return response.error_message;
+    constexpr std::size_t kMaxDetailLength = 1024;
+    const auto body = response.body_string();
+    return std::string(body.substr(0, kMaxDetailLength));
+}
+
+bool isZarrMetadataKey(std::string_view key)
+{
+    return key == ".zgroup" || key == ".zarray" || key == ".zattrs" ||
+           key == ".zmetadata" || key == "zarr.json" ||
+           hasSuffix(key, "/.zgroup") ||
+           hasSuffix(key, "/.zarray") || hasSuffix(key, "/.zattrs") ||
+           hasSuffix(key, "/zarr.json");
+}
+
+bool isRemoteAuthError(const std::exception& error)
+{
+    const std::string message = error.what();
+    return vc::hasExplicitAwsCredentialError(message) ||
+           message.find("AWS credentials") != std::string::npos ||
+           message.find("Access denied") != std::string::npos ||
+           message.find("HTTP 401") != std::string::npos ||
+           message.find("HTTP 403") != std::string::npos;
+}
+
+bool isMissingZarrMetadataError(const std::exception& error)
+{
+    return std::string_view(error.what()).find("zarr: no metadata found") !=
+           std::string_view::npos;
 }
 
 class ClassifyingHttpStore final : public utils::Store {
@@ -72,9 +114,13 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string())) {
+            sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return false;
-        throw HttpStatusError(response.status_code, key);
+        }
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::vector<std::byte> get(const std::string& key) const override
@@ -88,13 +134,19 @@ public:
     std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override
     {
         auto response = client_.get(makeUrl(key));
-        if (response.ok())
+        if (response.ok()) {
+            rememberMetadata(key, response.body);
             return std::move(response.body);
+        }
         if (response.not_found())
             return std::nullopt;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string())) {
+            sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key);
+        }
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::optional<std::vector<std::byte>>
@@ -105,7 +157,8 @@ public:
             return std::move(response.body);
         if (response.not_found())
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key);
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -116,6 +169,24 @@ public:
     void erase(const std::string&) override
     {
         throw std::runtime_error("HTTP zarr store is read-only");
+    }
+
+    std::vector<PersistentCacheMetadataObject> metadataObjects() const
+    {
+        std::lock_guard lock(metadataMutex_);
+        std::vector<PersistentCacheMetadataObject> result;
+        result.reserve(metadata_.size());
+        for (const auto& [key, bytes] : metadata_)
+            result.push_back({key, bytes});
+        std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.key < rhs.key;
+        });
+        return result;
+    }
+
+    bool sawForbiddenMetadataMiss() const noexcept
+    {
+        return sawForbiddenMetadataMiss_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -139,19 +210,34 @@ private:
         return utils::HttpClient(std::move(config));
     }
 
+    void rememberMetadata(const std::string& key,
+                          const std::vector<std::byte>& bytes) const
+    {
+        if (!isZarrMetadataKey(key))
+            return;
+        std::lock_guard lock(metadataMutex_);
+        metadata_[key] = bytes;
+    }
+
     std::string baseUrl_;
     utils::HttpClient client_;
+    mutable std::atomic<bool> sawForbiddenMetadataMiss_{false};
+    mutable std::mutex metadataMutex_;
+    mutable std::unordered_map<std::string, std::vector<std::byte>> metadata_;
 };
 
 class ZarrChunkFetcher final : public IChunkFetcher {
 public:
-    explicit ZarrChunkFetcher(utils::ZarrArray array)
-        : ZarrChunkFetcher(std::make_shared<utils::ZarrArray>(std::move(array)))
+    explicit ZarrChunkFetcher(utils::ZarrArray array, bool remoteHttp = false)
+        : ZarrChunkFetcher(
+              std::make_shared<utils::ZarrArray>(std::move(array)), remoteHttp)
     {
     }
 
-    explicit ZarrChunkFetcher(std::shared_ptr<utils::ZarrArray> array)
+    explicit ZarrChunkFetcher(std::shared_ptr<utils::ZarrArray> array,
+                              bool remoteHttp = false)
         : array_(std::move(array))
+        , remoteHttp_(remoteHttp)
     {
         if (!array_)
             throw std::invalid_argument("streaming zarr fetcher requires an array");
@@ -159,11 +245,38 @@ public:
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
             persistEncodedExtension_ = ".c3d";
-        else if (array_->stores_chunks_with_codec(vc::kVcz1CodecName))
+        else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
+                 array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
     ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        return decodeFetched(key, fetchEncoded(key));
+    }
+
+    [[nodiscard]] bool measuresRemoteTransfer() const noexcept override
+    {
+        return remoteHttp_;
+    }
+
+    ChunkFetchResult fetchEncoded(const ChunkKey& key) override
+    {
+        return fetchEncodedImpl(key);
+    }
+
+    ChunkFetchResult fetchEncoded(
+        const ChunkKey& key,
+        const DownloadProgressCallback& progress) override
+    {
+        if (!remoteHttp_)
+            return fetchEncodedImpl(key);
+        utils::HttpClient::ScopedDownloadObserver observer(progress);
+        return fetchEncodedImpl(key);
+    }
+
+private:
+    ChunkFetchResult fetchEncodedImpl(const ChunkKey& key)
     {
         ChunkFetchResult result;
         const std::array<std::size_t, 3> indices{
@@ -172,28 +285,13 @@ public:
             static_cast<std::size_t>(key.ix)};
 
         try {
-            if (!persistEncodedExtension_.empty()) {
-                auto encoded = array_->read_chunk_encoded(indices);
-                if (!encoded) {
-                    result.status = ChunkFetchStatus::Missing;
-                    return result;
-                }
-                result.status = ChunkFetchStatus::Found;
-                result.persistentBytes = std::move(*encoded);
-                result.hasPersistentBytes = true;
-                result.bytes = array_->decode_chunk_payload(
-                    std::span<const std::byte>(result.persistentBytes.data(),
-                                               result.persistentBytes.size()));
-                return result;
-            }
-
-            auto bytes = array_->read_chunk(indices);
-            if (!bytes) {
+            auto encoded = array_->read_chunk_encoded(indices);
+            if (!encoded) {
                 result.status = ChunkFetchStatus::Missing;
                 return result;
             }
             result.status = ChunkFetchStatus::Found;
-            result.bytes = std::move(*bytes);
+            result.bytes = std::move(*encoded);
             return result;
         } catch (const HttpStatusError& e) {
             result.status = ChunkFetchStatus::HttpError;
@@ -202,6 +300,32 @@ public:
         } catch (const std::filesystem::filesystem_error& e) {
             result.status = ChunkFetchStatus::IoError;
             result.message = e.what();
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
+public:
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&,
+        ChunkFetchResult fetched) const override
+    {
+        if (fetched.status != ChunkFetchStatus::Found)
+            return fetched;
+
+        ChunkFetchResult result;
+        try {
+            auto encoded = std::move(fetched.bytes);
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = array_->decode_chunk_payload(
+                std::span<const std::byte>(encoded.data(), encoded.size()));
+            if (!persistEncodedExtension_.empty()) {
+                result.persistentBytes = std::move(encoded);
+                result.hasPersistentBytes = true;
+            }
         } catch (const std::exception& e) {
             result.status = ChunkFetchStatus::DecodeError;
             result.message = e.what();
@@ -223,9 +347,128 @@ public:
         return array_->chunk_store_key(indices);
     }
 
+    std::optional<ChunkStorageObject>
+    storageObject(const ChunkKey& key) const override
+    {
+        const std::array<std::size_t, 3> indices{
+            static_cast<std::size_t>(key.iz),
+            static_cast<std::size_t>(key.iy),
+            static_cast<std::size_t>(key.ix)};
+        const auto location = array_->storage_object_location(indices);
+        ChunkStorageObject result;
+        result.representativeKey = key;
+        result.outerZ = static_cast<int>(location.outer_indices[0]);
+        result.outerY = static_cast<int>(location.outer_indices[1]);
+        result.outerX = static_cast<int>(location.outer_indices[2]);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            result.innerIndices[axis] = static_cast<int>(location.inner_indices[axis]);
+            result.innerChunksPerObject[axis] =
+                static_cast<int>(location.inner_chunks_per_object[axis]);
+        }
+        result.sourceKey = location.key;
+        return result;
+    }
+
+    ChunkFetchResult fetchStorageObject(
+        const ChunkStorageObject& object,
+        const DownloadProgressCallback& progress) override
+    {
+        ChunkFetchResult result;
+        const auto& key = object.representativeKey;
+        const std::array<std::size_t, 3> indices{
+            static_cast<std::size_t>(key.iz),
+            static_cast<std::size_t>(key.iy),
+            static_cast<std::size_t>(key.ix)};
+        try {
+            std::optional<std::vector<std::byte>> encoded;
+            if (remoteHttp_) {
+                utils::HttpClient::ScopedDownloadObserver observer(progress);
+                encoded = array_->read_storage_object(indices);
+            } else {
+                encoded = array_->read_storage_object(indices);
+            }
+            if (!encoded) {
+                result.status = ChunkFetchStatus::Missing;
+                return result;
+            }
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = std::move(*encoded);
+        } catch (const HttpStatusError& e) {
+            result.status = ChunkFetchStatus::HttpError;
+            result.httpStatus = static_cast<int>(e.status());
+            result.message = e.what();
+        } catch (const std::filesystem::filesystem_error& e) {
+            result.status = ChunkFetchStatus::IoError;
+            result.message = e.what();
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
+    ChunkFetchResult decodeStorageObject(
+        const ChunkKey& key,
+        std::span<const std::byte> objectBytes) const override
+    {
+        ChunkFetchResult result;
+        const std::array<std::size_t, 3> indices{
+            static_cast<std::size_t>(key.iz),
+            static_cast<std::size_t>(key.iy),
+            static_cast<std::size_t>(key.ix)};
+        try {
+            auto decoded = array_->decode_chunk_from_storage_object(indices, objectBytes);
+            if (!decoded) {
+                result.status = ChunkFetchStatus::Missing;
+                return result;
+            }
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = std::move(*decoded);
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
+    std::optional<ChunkKey> logicalRepresentativeForStorageKey(
+        int level,
+        std::string_view sourceKey) const override
+    {
+        const auto indices = array_->logical_chunk_for_storage_object_key(sourceKey);
+        if (!indices || indices->size() != 3)
+            return std::nullopt;
+        return ChunkKey{
+            level,
+            static_cast<int>((*indices)[0]),
+            static_cast<int>((*indices)[1]),
+            static_cast<int>((*indices)[2])};
+    }
+
     bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const override
     {
         return persistEncodedExtension_.empty() && array_->direct_chunk_payload_is_decoded_bytes();
+    }
+
+    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
+    {
+        return true;
+    }
+
+    ChunkFetchResult decodeSourcePayload(
+        const ChunkKey&,
+        std::vector<std::byte> bytes) const override
+    {
+        ChunkFetchResult result;
+        try {
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = array_->decode_chunk_payload(
+                std::span<const std::byte>(bytes.data(), bytes.size()));
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
     }
 
     ChunkFetchResult decodePersistentBytes(
@@ -254,6 +497,7 @@ public:
 private:
     std::shared_ptr<utils::ZarrArray> array_;
     std::string persistEncodedExtension_;
+    bool remoteHttp_ = false;
 };
 
 std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* name)
@@ -266,7 +510,9 @@ std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* 
         static_cast<int>(values[2])};
 }
 
-void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
+void addLevel(OpenedChunkedZarr& opened,
+              utils::ZarrArray array,
+              bool remoteHttp = false)
 {
     const auto& meta = array.metadata();
     ChunkDtype dtype = ChunkDtype::UInt8;
@@ -292,11 +538,15 @@ void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
     opened.transforms.push_back(transform);
     opened.fillValue = meta.fill_value.value_or(0.0);
     opened.dtype = dtype;
-    opened.fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    opened.fetchers.push_back(
+        std::make_shared<ZarrChunkFetcher>(std::move(array), remoteHttp));
     opened.fillValues.push_back(meta.fill_value.value_or(0.0));
 }
 
-void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrArray array)
+void addPhysicalLevel(OpenedChunkedZarr& opened,
+                      int physicalLevel,
+                      utils::ZarrArray array,
+                      bool remoteHttp = false)
 {
     if (physicalLevel < 0)
         throw std::runtime_error("zarr physical level must be non-negative");
@@ -315,7 +565,7 @@ void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrA
         throw std::runtime_error("duplicate zarr physical level " + std::to_string(physicalLevel));
 
     OpenedChunkedZarr single;
-    addLevel(single, std::move(array));
+    addLevel(single, std::move(array), remoteHttp);
     const bool hasExistingLevel = std::any_of(
         opened.fetchers.begin(),
         opened.fetchers.end(),
@@ -550,13 +800,31 @@ void addRemoteLevelFromKey(
     const std::string& key,
     int physicalLevel)
 {
+    std::size_t separator = 0;
+    while ((separator = key.find('/', separator)) != std::string::npos) {
+        const auto parent = key.substr(0, separator);
+        (void)store->get_if_exists(parent + "/.zgroup");
+        (void)store->get_if_exists(parent + "/.zattrs");
+        (void)store->get_if_exists(parent + "/zarr.json");
+        ++separator;
+    }
+    (void)store->get_if_exists(key + "/.zattrs");
     auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
     if (array.metadata().dtype == utils::ZarrDtype::uint16)
         array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
-    addPhysicalLevel(opened, physicalLevel, std::move(array));
+    addPhysicalLevel(opened, physicalLevel, std::move(array), true);
 }
 
 } // namespace
+
+bool isOptionalRemoteMetadataMiss(
+    long status,
+    std::string_view key,
+    std::string_view responseBody)
+{
+    return status == 403 && isOptionalMetadataProbe(key) &&
+           !vc::hasExplicitAwsCredentialError(responseBody);
+}
 
 std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,
@@ -589,8 +857,13 @@ std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
             path.erase(path.begin());
         while (!path.empty() && path.back() == '/')
             path.pop_back();
-        if (!path.empty())
+        if (!path.empty()) {
+            if (!isSafeZarrStoreKey(path)) {
+                throw std::runtime_error(
+                    "OME multiscales contains an unsafe dataset path: " + path);
+            }
             keys.emplace_back(datasetIndex, std::move(path));
+        }
         ++datasetIndex;
     }
 
@@ -703,6 +976,20 @@ OpenedChunkedZarr validateAndRebaseVcPyramid(
 OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
 {
     OpenedChunkedZarr opened;
+    auto store = std::make_shared<utils::FileSystemStore>(root);
+    const auto advertised = remoteLevelKeysFromZattrs(store, 0);
+    if (!advertised.empty()) {
+        for (const auto& [physicalLevel, key] : advertised) {
+            auto array = utils::ZarrArray::open(
+                root / key, vc::buildZarrCodecRegistry(1));
+            if (array.metadata().dtype == utils::ZarrDtype::uint16) {
+                array = utils::ZarrArray::open(
+                    root / key, vc::buildZarrCodecRegistry(2));
+            }
+            addPhysicalLevel(opened, physicalLevel, std::move(array));
+        }
+        return opened;
+    }
     for (int level : localLevelNumbers(root)) {
         auto array = utils::ZarrArray::open(root / std::to_string(level),
                                             vc::buildZarrCodecRegistry(1));
@@ -734,7 +1021,15 @@ OpenedChunkedZarr openHttpZarrPyramid(
     }
     const int baseScaleLevel = explicitBaseScaleLevel.value_or(spec.baseScaleLevel);
     auto store = std::make_shared<ClassifyingHttpStore>(spec.sourceUrl, auth);
+    (void)store->get_if_exists(".zgroup");
+    (void)store->get_if_exists(".zattrs");
+    (void)store->get_if_exists(".zmetadata");
+    (void)store->get_if_exists("zarr.json");
     OpenedChunkedZarr opened;
+    const auto finishOpen = [&store](OpenedChunkedZarr result) {
+        result.zarrMirrorMetadata = store->metadataObjects();
+        return result;
+    };
     const bool strictRebasedOpen = baseScaleLevel > 0 || explicitBaseScaleLevel.has_value();
 
     if (strictRebasedOpen) {
@@ -765,7 +1060,13 @@ OpenedChunkedZarr openHttpZarrPyramid(
                 addRemoteLevelFromKey(opened, store, key, physicalLevel);
             }
         }
-        return validateAndRebaseVcPyramid(std::move(opened), baseScaleLevel);
+        if (opened.fetchers.empty() && store->sawForbiddenMetadataMiss()) {
+            throw HttpStatusError(
+                403, spec.sourceUrl,
+                "access denied while discovering required array metadata");
+        }
+        return finishOpen(validateAndRebaseVcPyramid(
+            std::move(opened), baseScaleLevel));
     }
 
     const int firstPhysicalLevel = 0;
@@ -775,7 +1076,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
         for (const auto& [physicalLevel, key] : zattrsLevelKeys) {
             addRemoteLevelFromKey(opened, store, key, physicalLevel);
         }
-        return opened;
+        return finishOpen(std::move(opened));
     }
 
     for (int physicalLevel = firstPhysicalLevel; physicalLevel < kMaxProbedRemoteLevels; ++physicalLevel) {
@@ -787,24 +1088,74 @@ OpenedChunkedZarr openHttpZarrPyramid(
                 (e.status() == 403 && (!opened.fetchers.empty() || firstPhysicalLevel == 0)))
                 break;
             throw;
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (physicalLevel == firstPhysicalLevel &&
+                store->sawForbiddenMetadataMiss() &&
+                isMissingZarrMetadataError(error)) {
+                break;
+            }
             if (physicalLevel == firstPhysicalLevel)
                 throw;
             break;
         }
     }
     if (opened.fetchers.empty() && firstPhysicalLevel == 0) {
-        auto array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1));
-        if (array.metadata().dtype == utils::ZarrDtype::uint16)
-            array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(2));
-        addPhysicalLevel(opened, 0, std::move(array));
+        try {
+            auto array = utils::ZarrArray::open(
+                store, "", vc::buildZarrCodecRegistry(1));
+            if (array.metadata().dtype == utils::ZarrDtype::uint16) {
+                array = utils::ZarrArray::open(
+                    store, "", vc::buildZarrCodecRegistry(2));
+            }
+            addPhysicalLevel(opened, 0, std::move(array), true);
+        } catch (const std::exception& error) {
+            if (store->sawForbiddenMetadataMiss() &&
+                isMissingZarrMetadataError(error)) {
+                throw HttpStatusError(
+                    403, spec.sourceUrl,
+                    "access denied while discovering required array metadata");
+            }
+            throw;
+        }
     }
-    return opened;
+    return finishOpen(std::move(opened));
 }
 
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url)
 {
     return openHttpZarrPyramid(url, vc::HttpAuth{}, std::nullopt);
+}
+
+OpenedRemoteChunkedZarr openRemoteZarrPyramid(
+    const std::string& url,
+    RemoteZarrOpenOptions options)
+{
+    auto spec = vc::parseRemoteVolumeSpec(url);
+    auto auth = std::move(options.auth);
+    if (spec.useAwsSigv4 && auth.empty() && options.discoverAwsCredentials) {
+        auth = vc::loadAwsCredentials();
+        if (auth.region.empty())
+            auth.region = spec.awsRegion;
+        if (auth.access_key.empty() || auth.secret_key.empty())
+            auth = {};
+    } else if (spec.useAwsSigv4 && !auth.empty() && auth.region.empty()) {
+        auth.region = spec.awsRegion;
+    }
+
+    OpenedChunkedZarr opened;
+    if (!spec.useAwsSigv4 || auth.empty()) {
+        opened = openHttpZarrPyramid(spec.portableLocator, auth);
+    } else {
+        try {
+            opened = openHttpZarrPyramid(spec.portableLocator, {});
+            auth = {};
+        } catch (const std::exception& error) {
+            if (!isRemoteAuthError(error))
+                throw;
+            opened = openHttpZarrPyramid(spec.portableLocator, auth);
+        }
+    }
+    return {std::move(opened), std::move(auth), std::move(spec)};
 }
 
 std::unique_ptr<ChunkCache> createChunkCache(
@@ -819,19 +1170,32 @@ std::unique_ptr<ChunkCache> createChunkCache(
     }
 
     ChunkCache::Options options;
-    options.decodedByteCapacity = decodedByteCapacity;
-    options.maxConcurrentReads = maxConcurrentReads;
+    options.zarrMirrorMetadata = std::move(opened.zarrMirrorMetadata);
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = decodedByteCapacity;
+    serviceOptions.fetchConcurrency.workerCapacity = maxConcurrentReads;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = maxConcurrentReads;
     return std::make_unique<ChunkCache>(
         std::move(levels),
         std::move(opened.fetchers),
         opened.fillValue,
         opened.dtype,
-        std::move(options));
+        std::move(options), std::move(serviceOptions));
 }
 
 std::unique_ptr<ChunkCache> createChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options)
+{
+    return createChunkCache(
+        std::move(array), std::move(options),
+        ChunkCacheService::Options{});
+}
+
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options,
+    ChunkCacheService::Options serviceOptions)
 {
     if (!array)
         throw std::invalid_argument("cannot create a chunk cache for a null Zarr array");
@@ -859,7 +1223,40 @@ std::unique_ptr<ChunkCache> createChunkCache(
         std::move(fetchers),
         meta.fill_value.value_or(0.0),
         dtype,
-        std::move(options));
+        std::move(options), std::move(serviceOptions));
+}
+
+std::shared_ptr<ChunkCache> acquireProcessChunkCache(
+    std::string sourceIdentity,
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options)
+{
+    if (sourceIdentity.empty())
+        throw std::invalid_argument("process chunk-cache source identity is empty");
+    if (!array)
+        throw std::invalid_argument("cannot acquire a chunk cache for a null Zarr array");
+
+    const auto& meta = array->metadata();
+    ChunkDtype dtype = ChunkDtype::UInt8;
+    if (meta.dtype == utils::ZarrDtype::uint16) {
+        dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype != utils::ZarrDtype::uint8) {
+        throw std::runtime_error(
+            "streaming zarr cache currently supports uint8 and uint16 only");
+    }
+
+    std::vector<std::size_t> chunkShape = meta.chunks;
+    if (meta.shard_config)
+        chunkShape = meta.shard_config->sub_chunks;
+    std::vector<ChunkCache::LevelInfo> levels{
+        {toArray3(meta.shape, "shape"),
+         toArray3(chunkShape, "chunk shape"),
+         IChunkedArray::LevelTransform{}}};
+    std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
+    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    return processChunkCacheService()->acquireSource(
+        std::move(sourceIdentity), std::move(levels), std::move(fetchers),
+        meta.fill_value.value_or(0.0), dtype, std::move(options));
 }
 
 } // namespace vc::render
