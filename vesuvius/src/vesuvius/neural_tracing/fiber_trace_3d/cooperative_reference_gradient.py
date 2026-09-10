@@ -15,7 +15,7 @@ class GradientProbeFactory(ProbeFactory):
     def __call__(self, rank, grant, state):
         import torch
         from . import train
-        from .gradient_accumulation import ComponentGradientAccumulator, COMPONENTS
+        from .gradient_accumulation import ComponentGradientAccumulator
         from .loss_statistics import LossStatistics
 
         current = []
@@ -68,7 +68,7 @@ class GradientProbeFactory(ProbeFactory):
                 # bound for either one rank or two groups of 64 plus reduction.
                 gamma = 128 * epsilon / (1 - 128 * epsilon)
                 reports = []
-                for ci, name in enumerate(COMPONENTS):
+                for ci, name in enumerate(self.components):
                     for pi, parameter_name in enumerate(self.names):
                         actual = self.banks[ci][pi].double()
                         expected = self.shadow_views[ci][pi]

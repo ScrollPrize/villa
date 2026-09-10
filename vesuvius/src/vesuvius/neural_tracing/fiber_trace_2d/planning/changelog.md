@@ -1,3 +1,12 @@
+## 2026-09-10 — Local Fiber3D embeddings
+
+- Added opt-in 16-channel embeddings, balanced within-patch cosine supervision,
+  detached-presence negative sampling, and base-coordinate 20/80 Lasagna-normal
+  exclusion. Extended shared-slot transport, ordinary/cooperative sufficient
+  statistics, checkpoint handling and scalar logging. CPU geometry, real local
+  manifest and distributed-gradient tests cover the feature; GPU performance and
+  learning quality remain unmeasured.
+
 ## 2026-09-10 — Cooperative GPU management and elastic Fiber3D training
 
 - Added standalone cooperative CPU/GPU/VRAM manager and opt-in Fiber supervisor,

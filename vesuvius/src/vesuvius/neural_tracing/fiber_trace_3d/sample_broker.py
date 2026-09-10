@@ -47,6 +47,7 @@ class CanonicalSampleBroker:
         if slot_count < effective_batch_size:
             raise ValueError("sample slots must fit the whole effective batch")
         transport = FiberTrace3DSharedTensorSlots(
+            embedding_stride=loader_config.embedding.output_stride if loader_config.embedding.enabled else 0,
             start_index=start, slot_count=slot_count,
             patch_shape_zyx=loader_config.patch_shape_zyx,
             stream_index_map=IdentitySampleIndex(),

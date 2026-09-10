@@ -90,7 +90,9 @@ def _config_from_checkpoint(
     weight = state.get("net.decoder.final_seg_layer.weight")
     if not isinstance(weight, torch.Tensor):
         return config
-    output_channels = int(weight.shape[0])
+    from .embedding import EmbeddingConfig
+    embedding = EmbeddingConfig.from_mapping(config)
+    output_channels = int(weight.shape[0]) - (embedding.channels if embedding.enabled else 0)
     if output_channels <= 0 or output_channels % 7 != 0:
         return config
     has_conditioned_decoder = any(str(key).startswith("conditioned_decoder.") for key in state)

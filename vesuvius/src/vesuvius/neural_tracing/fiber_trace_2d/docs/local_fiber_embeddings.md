@@ -1,0 +1,110 @@
+# Local Fiber3D metric embeddings
+
+Add this to an existing **unconditioned** Fiber3D training config:
+
+```json
+"embedding": {
+  "enabled": true,
+  "channels": 16,
+  "pairs_at_128": 65536,
+  "weight": 1.0
+}
+```
+
+Each train/test dataset must also have `lasagna_manifest_path` pointing to its
+matching normals manifest (grad_mag/nx/ny, with original base shape). Existing
+dataset transforms and selected input scale continue to apply. Missing or invalid
+normals are errors, not spherical/uniform fallbacks. Relative paths resolve against
+the training config. No normals download convention or cache format was added:
+the existing Lasagna channel loader opens and caches these channels.
+
+Run with the existing training command and the modified config, for example:
+
+```bash
+/home/hendrik/.venv_las/bin/python -m torch.distributed.run --nproc-per-node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train /path/to/training-config.json
+```
+
+Choose available GPUs explicitly as usual. This command was **not** run as part
+of CPU validation. Cooperative training still requires a fresh matching memory
+calibration: the extra output channels, pair graph and two extra FP32 gradient
+banks change its memory footprint. Existing checkpoints without an embedding head
+cannot be strictly resumed into the new head; ordinary legacy configs still work.
+The two added banks alone require `8 * trainable_parameter_count` bytes. An
+eligibility slot needs one byte per output voxel (32 KiB for a 128 input patch
+with stride 4). Pair/autograd storage is additional. Bounded training performs
+two additional component VJPs; its GPU training cost must be measured rather than
+assumed to match the old three-component backward.
+
+## Objective and geometry
+
+- 32,768 positive and 32,768 negative pairs at input width 128. Total pair count
+  grows linearly with maximum input dimension, not output voxel count.
+- Positive endpoints are sampled independently by arc length along the patch's
+  annotated trace; presence does not affect them. Sampling is with replacement.
+- Negative endpoints are output-grid voxels sampled proportional to **detached**
+  presence after exclusion. For multiple branches, use maximum branch presence.
+  Probability 1 has ten times the sampling weight of 0.1; zero is never chosen.
+- Map output coordinates through the existing inverse augmentation into base
+  coordinates; find the nearest continuous GT segment point and sample its
+  Lasagna surface normal. Exclude the inclusive ellipsoid with radii **20 base
+  voxels normal / 80 base voxels tangential**. Annotation transforms, nonzero
+  source scale, native output stride and nonlinear augmentation are included.
+- The added loss is `weight * (mean(1-cos_positive) + mean(relu(cos_negative)))/2`.
+  Means use separate actual pair counts across the effective batch. No negative
+  support contributes zero negative loss; the positive coefficient stays 1/2.
+  No nonzero GT segment is an error. Pairs never cross samples.
+
+The eligibility grid is built by CPU loader workers in blocks, then travels in
+bounded shared slots and the existing pinned/CUDA preparation path. A conservative
+midpoint spatial index accelerates exact nearest-segment projection; unresolved
+cases use the bounded scan, not an approximate nearest-vertex assignment. Pair
+sampling, embedding lookup, FP32 cosine arithmetic and gradients run on the model
+device. U-Net AMP policy is unchanged. Stream-seeded sampling is stable under
+microbatch/rank repartition for identical predictions; floating-point changes to
+presence can still change stochastic choices near a sampling boundary.
+
+Training/test output includes `loss_embedding` and negative pair support.
+TensorBoard includes `train/embedding`, `train/embedding_positive`,
+`train/embedding_negative`, `train/embedding_negative_pairs` and their `test/`
+counterparts. The component scalars already include the overall embedding weight.
+
+## Extracting embeddings
+
+```python
+result = model(volume, return_embeddings=True)
+prediction = result["prediction"]  # existing sigmoid 7*K channels
+embeddings = result["embeddings"]  # signed, B,E,D,H,W
+embeddings = torch.nn.functional.normalize(embeddings.float(), dim=1)
+```
+
+Default `model(volume)` and ordinary volume inference still return the established
+direction/presence predictions. This change does not add embedding Zarr export or
+Atlas publication. Conditioned-decoder embeddings are explicitly rejected.
+
+## Validation (CPU only)
+
+From the Villa root, using the existing venv:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 /home/hendrik/.venv_las/bin/python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_embeddings.py
+```
+
+The suite includes real local Zarr/manifest loading (input level 1, normals level
+2), annotation translation plus actual rotation/warp, geometry boundary and exact
+projection checks, detached sampling ratios, zero support, shared-slot transport,
+checkpoint reconstruction, ordinary-versus-bounded gradients, and a three-process
+Gloo reduction with a zero-work rank. It requires local sockets, but no GPUs.
+
+The small synthetic benchmark uses one CPU thread, 128 input width, native
+quarter-resolution output, 16 channels, 65,536 pairs, one pair-loss warmup and
+three measured repeats. The midpoint-index change reduced exclusion median from
+0.363 s to 0.161 s (min/median/max 0.161/0.161/0.162 s); pair forward+backward
+was 0.123/0.128/0.131 s. These are CPU wall seconds **per patch on one CPU
+thread**, not GPU times or aggregate worker throughput. Constant normals exclude
+disk I/O in that timing. Existing release NumPy/SciPy/PyTorch wheels were used.
+
+GPU overhead, real-dataset end-to-end throughput and embedding quality have not
+been measured. Do not infer a negligible training cost from the CPU tests.
+The vectorized training ellipse is a separate NumPy implementation of the native
+replay formula; shared normal interpolation is reused directly. Analytic/parity
+geometry tests cover the formula, but no new native binding was built.

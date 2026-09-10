@@ -9,7 +9,9 @@ import math
 import os
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
+from types import SimpleNamespace
+from .embedding import EmbeddingConfig, EmbeddingGeometry, build_eligibility
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
     load_fiber_file,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
+    FiberStrip2DLoader,
+    _open_manifest_channels,
     _download_prefetch_request,
     _empty_marker_path,
     _existing_data_path,
@@ -55,6 +59,7 @@ _FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 @dataclass(frozen=True)
 class FiberTrace3DConfig:
     datasets: tuple[dict[str, Any], ...]
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     batch_size: int = 1
     patch_shape_zyx: tuple[int, int, int] = (192, 192, 192)
     seed: int = 1
@@ -205,6 +210,7 @@ class FiberTrace3DSample:
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
     profile_timings_ms: dict[str, float] | None = None
+    embedding_geometry: EmbeddingGeometry | None = None
 
 
 @dataclass(frozen=True)
@@ -236,14 +242,21 @@ class FiberTrace3DSharedTensorSlots:
         patch_shape_zyx: tuple[int, int, int],
         stream_index_map: Any = None,
         volume_dtype: torch.dtype = torch.float32,
+        embedding_stride: int = 0,
     ) -> None:
         if int(slot_count) <= 0:
             raise ValueError("slot_count must be positive")
+        if type(embedding_stride) is not int or embedding_stride < 0:
+            raise ValueError("embedding_stride must be a nonnegative integer")
         self.start_index = int(start_index)
         self.slot_count = int(slot_count)
         self.stream_index_map = stream_index_map
         shape = (self.slot_count, 1, *(int(v) for v in patch_shape_zyx))
         self.volumes = torch.empty(shape, dtype=volume_dtype).share_memory_()
+        self.embedding_eligibility = None
+        if embedding_stride:
+            embedding_shape = (self.slot_count, *((int(v) + embedding_stride - 1) // embedding_stride for v in patch_shape_zyx))
+            self.embedding_eligibility = torch.empty(embedding_shape, dtype=torch.bool).share_memory_()
         self.generations = torch.full(
             (self.slot_count,), -1, dtype=torch.int64
         ).share_memory_()
@@ -272,6 +285,14 @@ class FiberTrace3DSharedTensorSlots:
         if int(sample.stream_index) != expected_stream_index:
             raise RuntimeError("shared-slot sample/index mismatch")
         self.volumes[slot].copy_(sample.volume)
+        embedding_geometry = sample.embedding_geometry
+        if embedding_geometry is not None:
+            if self.embedding_eligibility is None:
+                raise ValueError("embedding samples require an embedding-enabled shared-slot bank")
+            if embedding_geometry.eligible is None or embedding_geometry.eligible.shape != self.embedding_eligibility[slot].shape:
+                raise ValueError("embedding eligibility does not match the shared-slot shape")
+            self.embedding_eligibility[slot].copy_(embedding_geometry.eligible)
+            embedding_geometry = replace(embedding_geometry, eligible=None)
         self.generations[slot] = generation
         tensor_metadata = {
             name: np.asarray(getattr(sample, name).detach().cpu().numpy())
@@ -287,6 +308,7 @@ class FiberTrace3DSharedTensorSlots:
         }
         metadata_sample = replace(
             sample,
+            embedding_geometry=embedding_geometry,
             volume=None,
             valid_mask=None,
             **tensor_metadata,
@@ -319,6 +341,8 @@ class FiberTrace3DSharedTensorSlots:
             )
         value = payload.value
         sample = value.sample if isinstance(value, FiberTrace3DRawSample) else value
+        if sample.embedding_geometry is not None and self.embedding_eligibility is None:
+            raise ValueError("embedding descriptor requires an embedding-enabled shared-slot bank")
         tensor_metadata = {
             name: torch.from_numpy(np.asarray(getattr(sample, name)))
             for name in (
@@ -333,6 +357,8 @@ class FiberTrace3DSharedTensorSlots:
         }
         restored = replace(
             sample,
+            embedding_geometry=None if sample.embedding_geometry is None else replace(
+                sample.embedding_geometry, eligible=self.embedding_eligibility[slot]),
             volume=self.volumes[slot],
             valid_mask=None,
             **tensor_metadata,
@@ -398,6 +424,7 @@ class FiberTrace3DBatch:
     deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
+    embedding_geometry: tuple[EmbeddingGeometry | None, ...] | None = None
 
     def to(
         self,
@@ -406,6 +433,9 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            embedding_geometry=None if self.embedding_geometry is None else tuple(
+                None if item is None else replace(item, eligible=item.eligible.to(device, non_blocking=non_blocking))
+                for item in self.embedding_geometry),
             volume=self.volume.to(device, non_blocking=non_blocking),
             valid_mask=None
             if self.valid_mask is None
@@ -477,6 +507,9 @@ class FiberTrace3DBatch:
 
         return replace(
             self,
+            embedding_geometry=None if self.embedding_geometry is None else tuple(
+                None if item is None else replace(item, eligible=pin(item.eligible))
+                for item in self.embedding_geometry),
             volume=pin(self.volume),
             valid_mask=pin(self.valid_mask),
             cp_local_zyx=pin(self.cp_local_zyx),
@@ -505,6 +538,9 @@ class FiberTrace3DBatch:
         for value in vars(self).values():
             if isinstance(value, torch.Tensor) and value.device.type == "cuda":
                 value.record_stream(stream)
+        for item in self.embedding_geometry or ():
+            if item is not None and item.eligible.device.type == "cuda":
+                item.eligible.record_stream(stream)
 
 
 def collate_fiber_trace_3d_samples(
@@ -562,6 +598,7 @@ def collate_fiber_trace_3d_samples(
     if deferred_augmentation_params is not None and len(deferred_augmentation_params) != len(samples):
         raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
+        embedding_geometry=tuple(sample.embedding_geometry for sample in samples),
         volume=volume_batch,
         valid_mask=None,
         cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples]),
@@ -726,7 +763,8 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
                 "3D skew/ringing semantics must be specified explicitly"
             )
     return FiberTrace3DConfig(
-        datasets=tuple(dict(entry) for entry in datasets),
+       datasets=tuple(dict(entry) for entry in datasets),
+        embedding=EmbeddingConfig.from_mapping(raw),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(
             raw.get("patch_shape_zyx", raw.get("crop_size", [192, 192, 192])),
@@ -1981,6 +2019,9 @@ class FiberTrace3DLoader:
         if config.augment_anisotropic_blur_orientation not in {"fiber", "random", "axis", "z", "y", "x"}:
             raise ValueError("unsupported augment_anisotropic_blur_orientation")
         self.config = config
+        if config.embedding.enabled and any(not d.get("lasagna_manifest_path") for d in config.datasets):
+            raise ValueError("embedding training requires lasagna_manifest_path for every dataset")
+        self._embedding_normal_records = {}
         self.records = self._load_records()
         self._flat_offsets: list[int] = []
         flat_total = 0
@@ -2931,6 +2972,33 @@ class FiberTrace3DLoader:
             self._target_tangent_output_zyx(record, cp_index, params),
         )
 
+    def _build_embedding_geometry(self, record, record_index, params):
+        cfg = self.config.embedding
+        if not cfg.enabled:
+            return None
+        if record_index not in self._embedding_normal_records:
+            channels = _open_manifest_channels(record.dataset_config, self.config,
+                                               volume=record.volume, volume_path=record.volume_path)
+            _, grad, grad_spacing, nx, ny, nx_spacing, ny_spacing = channels
+            self._embedding_normal_records[record_index] = SimpleNamespace(
+                **vars(record), grad_mag=grad, grad_mag_spacing_base=grad_spacing,
+                nx=nx, ny=ny, nx_spacing_base=nx_spacing, ny_spacing_base=ny_spacing)
+        normal_record = self._embedding_normal_records[record_index]
+
+        def sample_normals(points):
+            normals, valid, errors = FiberStrip2DLoader.sample_lasagna_normals_at_zyx_batch(
+                normal_record, points, line_indices=np.arange(len(points)))
+            if not valid.all():
+                raise ValueError("embedding exclusion: " + next(iter(errors.values())))
+            return normals[:, ::-1]  # shared sampler returns XYZ; geometry is ZYX
+
+        eligible = build_eligibility(
+            self.config.patch_shape_zyx, cfg.output_stride,
+            lambda points: self._output_points_to_source_volume_np(points, params) * record.volume_spacing_base,
+            record.fiber.line_points_zyx, sample_normals, record.base_shape_zyx)
+        return EmbeddingGeometry(eligible, _stable_seed(self.config.seed, params.stream_index, "embedding"),
+                                 cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight)
+
     def load_raw_sample(
         self,
         sample_index: int,
@@ -2992,12 +3060,17 @@ class FiberTrace3DLoader:
         )
         if timings is not None:
             timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
+        embedding_start = time.perf_counter()
+        embedding_geometry = self._build_embedding_geometry(record, record_index, params)
+        if timings is not None:
+            timings["embedding_geometry_ms"] = (time.perf_counter() - embedding_start) * 1000.0
         load_wall_ms = (time.perf_counter() - total_start) * 1000.0
         load_cpu_ms = (time.process_time() - cpu_total_start) * 1000.0
         if timings is not None:
             timings["raw_sample_total_ms"] = load_wall_ms
             timings["raw_sample_cpu_ms"] = load_cpu_ms
         sample = FiberTrace3DSample(
+            embedding_geometry=embedding_geometry,
             stream_index=stream_index,
             data_index=int(data_index),
             record_index=int(record_index),
@@ -3494,7 +3567,8 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
     if raw.get("_array_records") is not None and datasets is None:
         datasets = [{"array_records": True}]
     cfg = FiberTrace3DConfig(
-        datasets=tuple(dict(entry) for entry in datasets),
+       datasets=tuple(dict(entry) for entry in datasets),
+        embedding=EmbeddingConfig.from_mapping(raw),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [192, 192, 192]), key="patch_shape_zyx"),
         seed=int(raw.get("seed", 1)),

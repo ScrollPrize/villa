@@ -391,6 +391,47 @@
 
 ## 3D CP-Centered Fiber Model Variant
 
+- Local metric embeddings are opt-in through top-level `embedding.enabled`.
+  Existing models and forward callers retain the `7*K` direction/presence tensor.
+  Enabled unconditioned U-Nets add a signed embedding head in the same final
+  projection and expose it separately with `return_embeddings=True`. Defaults:
+  16 channels, 65,536 pairs at input patch width 128, overall weight 1. Pair count
+  is `2*max(1,round(pairs_at_128*max(patch_shape_zyx)/128/2))`.
+- Each patch supplies half GT/GT and half GT/off-fiber pairs with replacement.
+  GT endpoints are independently uniform in arc length over nonzero trace
+  segments clipped to the supported output lattice, independent of presence.
+  Embeddings are interpolated at GT coordinates and L2-normalized for cosine.
+  Positive loss is `1-cos`; negative is `relu(cos)`. The objective adds one half
+  of each globally count-normalized component, times `embedding.weight`.
+- Negative output-grid points are sampled proportional to detached predicted
+  presence (maximum branch presence for multiple direction branches), after
+  exclusion. Zero weights are never sampled. No eligible positive weight means
+  zero negative count/loss, without uniform fallback or doubling positive weight.
+  Empty nonzero GT support is an error. Sampling uses per-stream seeded RNG,
+  independent of rank and microbatch placement, without cross-patch pairs.
+- Embedding training requires each dataset's `lasagna_manifest_path` with valid
+  grad_mag/nx/ny data. Input/output scale, annotation transforms, rotation, scale,
+  and nonlinear augmentation use the existing coordinate maps. Output lattice
+  coordinates `k*output_stride` map back into original-volume coordinates. Match
+  the Euclidean-nearest continuous annotated segment point, sample the shared
+  principal-axis normal there, and exclude when `dn^2 + dt^2/16 <= 20^2`.
+  The tangent is the full surface tangent plane, not learned fiber direction.
+  Unlike replay's invalid-normal spherical fallback, training errors on invalid
+  required normals. The NumPy threshold backend implements the native replay
+  formula; it is not a call to the C++ evaluator.
+- Eligibility is prepared in bounded blocks by loader workers and transported
+  in the existing fixed shared-slot bank; IPC carries only its descriptor.
+  Pinned transfer and CUDA stream ownership cover eligibility as well as input.
+  Normals and exclusion do not run in the model forward. Pair loss uses FP32
+  arithmetic on the model's device while model autocast policy remains unchanged.
+- Bounded accumulation allocates two additional FP32 numerator-gradient banks
+  only for embedding-enabled models. Embedding counts/gradients reduce at the
+  effective-update boundary, including zero-work ranks; ordinary training uses
+  the same sufficient statistics. Checkpoint configs retain embedding settings.
+  Enabling embeddings invalidates an old cooperative memory calibration.
+  Conditioned-decoder embeddings and embedding Zarr publication are not provided
+  by this training feature; default inference products remain unchanged.
+
 - `training.bounded_gradient_accumulation` is opt-in and defaults false. The
   experimental fixed-cohort path rejects batch-dependent normalization and
   uses three FP32 numerator-gradient banks with end-update SUM reduction and
