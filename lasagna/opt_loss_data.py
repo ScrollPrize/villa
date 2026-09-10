@@ -30,7 +30,8 @@ def _sample_cos_diff(res: fit_model.FitResult3D) -> torch.Tensor:
 	# Dense mode: direct kernel call (cos channel only, more efficient)
 	dev = res.xyz_hr.device
 	offset = torch.tensor(res.data.origin_fullres, dtype=torch.float32, device=dev)
-	inv_scale = torch.tensor([1.0 / s for s in res.data.spacing], dtype=torch.float32, device=dev)
+	spacing = res.data._spacing_for("cos")
+	inv_scale = torch.tensor([1.0 / s for s in spacing], dtype=torch.float32, device=dev)
 	vol = res.data.cos.squeeze(0)  # (1, Z, Y, X) uint8
 	sampled_raw = grid_sample_3d_u8_diff(vol, res.xyz_hr, offset, inv_scale)  # (1, D, He, We)
 	return (sampled_raw / 255.0).permute(1, 0, 2, 3)  # (D, 1, He, We)
