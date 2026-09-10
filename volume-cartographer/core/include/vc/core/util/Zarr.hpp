@@ -10,6 +10,12 @@
 
 namespace vc { class VcDataset; }
 
+// Pyramid downsampling geometry. PreserveZ halves only Y/X, so every level keeps the
+// full slice stack and levels above 0 are anisotropic. Isotropic halves Z as well,
+// keeping the voxel cubic at every level - which only holds if level 0 is itself cubic
+// (in-plane baseVoxelSize/pixelsPerVoxel == through-plane baseVoxelSize*sliceStep).
+enum class PyramidMode { PreserveZ, Isotropic };
+
 // Map a tile index through rotation + flip (pure integer tile coordinate transform).
 // Used by both zarr and tif writers.
 inline void mapTileIndex(int tx, int ty, int tilesX, int tilesY,
@@ -67,11 +73,20 @@ void downsampleTileIntoPreserveZ(const T* src, size_t srcZ, size_t srcY, size_t 
                                 size_t srcActualZ, size_t srcActualY, size_t srcActualX,
                                 size_t dstOffY, size_t dstOffX);
 
+// Dispatch to downsampleTileInto (Isotropic) or downsampleTileIntoPreserveZ (PreserveZ);
+// the two kernels share this signature.
+template <typename T>
+void downsampleTileIntoMode(PyramidMode mode,
+                            const T* src, size_t srcZ, size_t srcY, size_t srcX,
+                            T* dst, size_t dstZ, size_t dstY, size_t dstX,
+                            size_t srcActualZ, size_t srcActualY, size_t srcActualX,
+                            size_t dstOffY, size_t dstOffX);
+
 // Build one pyramid level (2x mean downsample) via readChunk/writeChunk + OMP.
 // numParts/partId partition the output tile-rows across VMs (1/0 = no partitioning).
 template <typename T>
 void buildPyramidLevel(const std::filesystem::path& outFile, int level,
-                       size_t CH, size_t CW,
+                       size_t CH, size_t CW, PyramidMode mode,
                        int numParts = 1, int partId = 0);
 
 // Create pyramid level datasets L1-L5 (metadata only, no data).
@@ -80,19 +95,21 @@ void buildPyramidLevel(const std::filesystem::path& outFile, int level,
 // createZarrDataset so the pyramid matches L0.
 void createPyramidDatasets(const std::filesystem::path& outFile,
                            const std::vector<size_t>& shape0,
-                           size_t CH, size_t CW, bool isU16,
+                           size_t CH, size_t CW, bool isU16, PyramidMode mode,
                            const std::string& compressor = "blosc",
                            int compressionLevel = -1,
                            const std::string& dimensionSeparator = ".");
 
-// Write OME-Zarr .zattrs multiscales JSON. The declared scale is per-axis:
+// Write OME-Zarr .zattrs multiscales JSON. The declared level-0 scale is per-axis:
 // Z = baseVoxelSize * sliceStep, Y/X = baseVoxelSize / pixelsPerVoxel
-// (baseVoxelSize describes one source voxel at the rendered level).
+// (baseVoxelSize describes one source voxel at the rendered level). Each pyramid level
+// doubles Y/X, and doubles Z as well when mode is Isotropic.
 void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    PyramidMode mode,
                     double baseVoxelSize = 1.0,
                     const std::string& voxelUnit = "",
                     double pixelsPerVoxel = 1.0);

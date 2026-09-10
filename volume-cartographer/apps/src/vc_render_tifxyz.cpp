@@ -751,6 +751,7 @@ static void renderTiles(
     size_t tilesXSrc, size_t tilesYSrc,
     // Pyramid datasets L1-L5 (empty = no inline pyramid)
     const std::vector<vc::VcDataset*>& pyramidDs,
+    PyramidMode pyramidMode,
     // TIF output (optional)
     std::vector<TiffWriter>* tifWriters, uint32_t tiffTileH,
     bool quickTif,
@@ -843,7 +844,8 @@ static void renderTiles(
                         size_t offX = (size_t(tx) & 1) * halfCW;
                         auto& pa = pyrAccum[0];
                         if (l1cx < pa.bufs.size()) {
-                            downsampleTileIntoPreserveZ(
+                            downsampleTileIntoMode(
+                                pyramidMode,
                                 existingBuf.data(), chunkZ, chunkY, chunkX,
                                 pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                                 numZ, dy_actual, dx_actual,
@@ -936,7 +938,8 @@ static void renderTiles(
                     size_t offX = (size_t(tx) & 1) * halfCW;
                     auto& pa = pyrAccum[0];
                     if (l1cx < pa.bufs.size()) {
-                        downsampleTileIntoPreserveZ(
+                        downsampleTileIntoMode(
+                            pyramidMode,
                             chunkBuf.data(), chunkZ, chunkY, chunkX,
                             pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                             numZ, dy_actual, dx_actual,
@@ -1011,7 +1014,8 @@ static void renderTiles(
                         size_t offY = (pyrChunkRow & 1) * halfY;
                         size_t offX = (cx & 1) * halfX;
                         if (nextCx < nextPa.bufs.size()) {
-                            downsampleTileIntoPreserveZ(
+                            downsampleTileIntoMode(
+                                pyramidMode,
                                 pa.bufs[cx].data(), pa.chZ, pa.chY, pa.chX,
                                 nextPa.bufs[nextCx].data(), nextPa.chZ, nextPa.chY, nextPa.chX,
                                 pa.chZ, pa.chY, pa.chX,
@@ -1071,6 +1075,18 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
     if (auto v = tryFile(volPath / "metadata.json", "scan")) return v;
     if (auto v = tryFile(volPath / "metadata.json", nullptr)) return v;
     return std::nullopt;
+}
+
+// Pyramid geometry recorded in an existing store. Stores written before the attribute
+// existed are preserve-z, which is what the renderer used to always produce.
+static std::optional<PyramidMode> readStorePyramidMode(const std::filesystem::path& storePath)
+{
+    const auto attrs = storePath / ".zattrs";
+    if (!std::filesystem::exists(attrs)) return std::nullopt;
+    Json j = Json::parse_file(attrs.string());
+    if (!j.is_object() || !j.contains("pyramid_mode")) return PyramidMode::PreserveZ;
+    return j["pyramid_mode"].get_string() == "isotropic" ? PyramidMode::Isotropic
+                                                         : PyramidMode::PreserveZ;
 }
 
 // ============================================================
@@ -1149,6 +1165,9 @@ int main(int argc, char *argv[])
         ("part-id", po::value<int>()->default_value(0), "Part ID (0-indexed)")
         ("merge-tiff-parts", po::bool_switch()->default_value(false), "Merge partial TIFFs from multi-VM render")
         ("pyramid", po::value<bool>()->default_value(true), "Build pyramid levels L1-L5 (default: true)")
+        ("pyramid-mode", po::value<std::string>()->default_value("isotropic"),
+            "Pyramid downsampling: isotropic (default; 2x2x2, so a cubic level 0 stays cubic at "
+            "every level) or preserve-z (2x2x1, every level keeps the full slice stack)")
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
@@ -1249,6 +1268,22 @@ int main(int argc, char *argv[])
     int num_slices = parsed["num-slices"].as<int>();
     double slice_step = parsed["slice-step"].as<float>();
     if (!std::isfinite(slice_step) || slice_step <= 0) { logPrintf(stderr, "Error: --slice-step must be positive\n"); return EXIT_FAILURE; }
+
+    const std::string pyramid_mode_str = parsed["pyramid-mode"].as<std::string>();
+    PyramidMode pyramid_mode;
+    if (pyramid_mode_str == "preserve-z")      pyramid_mode = PyramidMode::PreserveZ;
+    else if (pyramid_mode_str == "isotropic")  pyramid_mode = PyramidMode::Isotropic;
+    else { logPrintf(stderr, "Error: --pyramid-mode must be preserve-z or isotropic\n"); return EXIT_FAILURE; }
+    // Halving all three axes preserves whatever aspect level 0 has, and the .zattrs scale is
+    // declared per axis either way, so this is a naming caveat rather than an error: level 0 is
+    // only cubic when the in-plane spacing (1/--scale level-g voxels per pixel) equals the
+    // through-plane spacing (--slice-step).
+    if (pyramid_mode == PyramidMode::Isotropic
+        && std::abs(double(tgt_scale) * slice_step - 1.0) > 1e-6) {
+        logPrintf(stderr, "Warning: level 0 is not cubic (--slice-step %g vs 1/--scale %g), so the "
+                          "isotropic pyramid preserves that aspect rather than making it cubic\n",
+                  slice_step, 1.0 / double(tgt_scale));
+    }
 
     double accum_step = parsed["accum"].as<float>();
     if (!std::isfinite(accum_step) || accum_step < 0) { logPrintf(stderr, "Error: --accum must be non-negative\n"); return EXIT_FAILURE; }
@@ -1621,6 +1656,15 @@ int main(int argc, char *argv[])
             size_t baseY = zarrXY.height, baseX = zarrXY.width;
 
             outFilePath = zarrOutputArg;
+            // Level shapes and chunk contents differ between the two geometries, so writing
+            // into a store built with the other one would silently mix them.
+            if (auto recorded = readStorePyramidMode(outFilePath);
+                recorded && *recorded != pyramid_mode) {
+                logPrintf(stderr, "Error: %s was built with --pyramid-mode %s; delete it or pass "
+                                  "that mode\n", outFilePath.c_str(),
+                          *recorded == PyramidMode::Isotropic ? "isotropic" : "preserve-z");
+                return false;
+            }
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
             auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
@@ -1632,13 +1676,14 @@ int main(int argc, char *argv[])
                                       zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16, pyramid_mode,
                                           zarrCompressor, zarrCompressionLevel, zarrSeparator);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               pyramid_mode,
                                render_level_voxel_size, voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
@@ -1712,7 +1757,7 @@ int main(int argc, char *argv[])
                 cv::Size zarrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
                 std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16, pyramid_mode,
                                       zarrCompressor, zarrCompressionLevel, zarrSeparator);
             }
             if (inlinePyramid) {
@@ -1772,7 +1817,7 @@ int main(int argc, char *argv[])
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
-                        pyramidDs,
+                        pyramidDs, pyramid_mode,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
                 else
@@ -1782,7 +1827,7 @@ int main(int argc, char *argv[])
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
-                        pyramidDs,
+                        pyramidDs, pyramid_mode,
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
             } else {
@@ -1830,8 +1875,8 @@ int main(int argc, char *argv[])
             if (wantPyramid && hasRotFlip) {
                 logPrintf(stdout, "[pyramid] building from L0...\n");
                 for (int level = 1; level <= 5; level++) {
-                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, CH, CW, numParts, partId);
-                    else        buildPyramidLevel<uint8_t>(outFilePath, level, CH, CW, numParts, partId);
+                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, CH, CW, pyramid_mode, numParts, partId);
+                    else        buildPyramidLevel<uint8_t>(outFilePath, level, CH, CW, pyramid_mode, numParts, partId);
                 }
             }
 
@@ -1841,6 +1886,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               pyramid_mode,
                                render_level_voxel_size, voxel_unit, tgt_scale);
             }
         }

@@ -106,7 +106,8 @@ TEST_CASE("createPyramidDatasets writes L1..L5 metadata directories")
         /*shape=*/{64, 64, 64}, /*chunks=*/{32, 32, 32},
         vc::VcDtype::uint8, /*compressor=*/"none");
     createPyramidDatasets(d, /*shape0=*/{64, 64, 64},
-                          /*CH=*/32, /*CW=*/32, /*isU16=*/false);
+                          /*CH=*/32, /*CW=*/32, /*isU16=*/false,
+                          PyramidMode::PreserveZ);
     for (int lvl = 1; lvl <= 5; ++lvl) {
         CHECK(fs::exists(d / std::to_string(lvl) / ".zarray"));
     }
@@ -122,6 +123,7 @@ TEST_CASE("writeZarrAttrs writes a parseable .zattrs at the volume path")
                    /*accumTypeStr=*/"mean", /*accumSamples=*/1,
                    /*canvasSize=*/cv::Size(64, 64),
                    /*CZ=*/32, /*CH=*/32, /*CW=*/32,
+                   PyramidMode::PreserveZ,
                    /*baseVoxelSize=*/7.91, /*voxelUnit=*/"um");
     CHECK(fs::exists(d / ".zattrs"));
     auto j = utils::Json::parse_file(d / ".zattrs");
@@ -139,6 +141,7 @@ TEST_CASE("writeZarrAttrs derives per-axis scale from slice step and pixel densi
                    /*accumTypeStr=*/"max", /*accumSamples=*/0,
                    /*canvasSize=*/cv::Size(32, 32),
                    /*CZ=*/8, /*CH=*/16, /*CW=*/16,
+                   PyramidMode::PreserveZ,
                    /*baseVoxelSize=*/8.0, /*voxelUnit=*/"um",
                    /*pixelsPerVoxel=*/2.0);
     auto j = utils::Json::parse_file(d / ".zattrs");
@@ -213,8 +216,8 @@ TEST_CASE("buildPyramidLevel: builds L1 from L0")
     l0->writeChunk(0, 0, 0, payload.data(), payload.size());
 
     // createPyramidDatasets writes L1..L5 metadata.
-    createPyramidDatasets(d, {16, 16, 16}, 8, 8, /*isU16=*/false);
-    buildPyramidLevel<uint8_t>(d, /*level=*/1, /*CH=*/8, /*CW=*/8);
+    createPyramidDatasets(d, {16, 16, 16}, 8, 8, /*isU16=*/false, PyramidMode::PreserveZ);
+    buildPyramidLevel<uint8_t>(d, /*level=*/1, /*CH=*/8, /*CW=*/8, PyramidMode::PreserveZ);
 
     // L1 chunk (0,0,0) should have the downsampled constant.
     vc::VcDataset l1(d / "1");
@@ -224,5 +227,120 @@ TEST_CASE("buildPyramidLevel: builds L1 from L0")
         // L0 was constant 60 — L1 should also be 60 in the downsampled region.
         CHECK(int(out[0]) == 60);
     }
+    fs::remove_all(d);
+}
+
+// The existing downsampleTileInto / ...PreserveZ cases above use constant input, which
+// cannot tell the two kernels apart. This one varies along Z so the results diverge.
+TEST_CASE("downsampleTileIntoMode: isotropic averages across Z, preserve-z does not")
+{
+    // src 2x2x2: z=0 plane all 0, z=1 plane all 100.
+    std::vector<uint8_t> src(2 * 2 * 2, 0);
+    for (size_t i = 4; i < 8; ++i) src[i] = 100;
+
+    std::vector<uint8_t> iso(2 * 1 * 1, 0);
+    downsampleTileIntoMode<uint8_t>(PyramidMode::Isotropic,
+                                    src.data(), 2, 2, 2,
+                                    iso.data(), /*dstZ=*/2, /*dstY=*/1, /*dstX=*/1,
+                                    /*actual=*/2, 2, 2, /*dstOffY=*/0, /*dstOffX=*/0);
+    // One output layer, the mean of all 8 voxels; the second layer is never written.
+    CHECK(int(iso[0]) == 50);
+    CHECK(int(iso[1]) == 0);
+
+    std::vector<uint8_t> pz(2 * 1 * 1, 0);
+    downsampleTileIntoMode<uint8_t>(PyramidMode::PreserveZ,
+                                    src.data(), 2, 2, 2,
+                                    pz.data(), /*dstZ=*/2, /*dstY=*/1, /*dstX=*/1,
+                                    /*actual=*/2, 2, 2, /*dstOffY=*/0, /*dstOffX=*/0);
+    // Both input layers survive, each averaged only in-plane.
+    CHECK(int(pz[0]) == 0);
+    CHECK(int(pz[1]) == 100);
+}
+
+TEST_CASE("createPyramidDatasets: isotropic halves Z per level, preserve-z keeps it")
+{
+    auto d = tmpDir("pyr_iso_shape");
+    vc::createZarrDataset(d, "0", {64, 64, 64}, {64, 32, 32},
+                          vc::VcDtype::uint8, "none");
+    createPyramidDatasets(d, {64, 64, 64}, 32, 32, /*isU16=*/false,
+                          PyramidMode::Isotropic);
+    for (int lvl = 1; lvl <= 5; ++lvl) {
+        const size_t want = size_t(64) >> lvl;
+        vc::VcDataset ds(d / std::to_string(lvl));
+        CHECK(ds.shape()[0] == want);
+        CHECK(ds.shape()[1] == want);
+        CHECK(ds.shape()[2] == want);
+        // One chunk spans the level's whole Z extent, as at level 0.
+        CHECK(ds.defaultChunkShape()[0] == want);
+    }
+    fs::remove_all(d);
+
+    auto e = tmpDir("pyr_pz_shape");
+    vc::createZarrDataset(e, "0", {64, 64, 64}, {64, 32, 32},
+                          vc::VcDtype::uint8, "none");
+    createPyramidDatasets(e, {64, 64, 64}, 32, 32, /*isU16=*/false,
+                          PyramidMode::PreserveZ);
+    for (int lvl = 1; lvl <= 5; ++lvl) {
+        vc::VcDataset ds(e / std::to_string(lvl));
+        CHECK(ds.shape()[0] == 64);
+        CHECK(ds.shape()[1] == size_t(64) >> lvl);
+    }
+    fs::remove_all(e);
+}
+
+TEST_CASE("writeZarrAttrs: isotropic scales Z with the level, keeping voxels cubic")
+{
+    auto d = tmpDir("attrs_iso");
+    // slice step 0.5 x 2 pixels-per-voxel == 1, so level 0 is cubic: 8/2 == 8*0.5 == 4.
+    writeZarrAttrs(/*outDir=*/d, /*volPath=*/d,
+                   /*groupIdx=*/0, /*baseZ=*/8,
+                   /*sliceStep=*/0.5, /*accumStep=*/0.0,
+                   /*accumTypeStr=*/"max", /*accumSamples=*/0,
+                   /*canvasSize=*/cv::Size(32, 32),
+                   /*CZ=*/8, /*CH=*/16, /*CW=*/16,
+                   PyramidMode::Isotropic,
+                   /*baseVoxelSize=*/8.0, /*voxelUnit=*/"um",
+                   /*pixelsPerVoxel=*/2.0);
+    auto j = utils::Json::parse_file(d / ".zattrs");
+    CHECK(j["pyramid_mode"].get_string() == "isotropic");
+    auto scaleAt = [&](size_t level) {
+        return j["multiscales"][size_t(0)]["datasets"][level]
+                ["coordinateTransformations"][size_t(0)]["scale"]
+                .get_double_array();
+    };
+    for (size_t lvl = 0; lvl <= 5; ++lvl) {
+        auto sc = scaleAt(lvl);
+        REQUIRE(sc.size() == 3);
+        const double want = 4.0 * double(size_t(1) << lvl);
+        CHECK(sc[0] == doctest::Approx(want));
+        CHECK(sc[1] == doctest::Approx(want));
+        CHECK(sc[2] == doctest::Approx(want));
+    }
+    fs::remove_all(d);
+}
+
+TEST_CASE("buildPyramidLevel: isotropic L1 halves the Z extent")
+{
+    auto d = tmpDir("buildpyr_iso");
+    // Single chunk in Z, as every render output has.
+    auto l0 = vc::createZarrDataset(d, "0", {8, 16, 16}, {8, 8, 8},
+                                    vc::VcDtype::uint8, "none");
+    REQUIRE(l0);
+    std::vector<uint8_t> payload(8 * 8 * 8, 60);
+    l0->writeChunk(0, 0, 0, payload.data(), payload.size());
+
+    createPyramidDatasets(d, {8, 16, 16}, 8, 8, /*isU16=*/false, PyramidMode::Isotropic);
+    buildPyramidLevel<uint8_t>(d, /*level=*/1, /*CH=*/8, /*CW=*/8, PyramidMode::Isotropic);
+
+    vc::VcDataset l1(d / "1");
+    CHECK(l1.shape()[0] == 4);
+    CHECK(l1.shape()[1] == 8);
+    REQUIRE(l1.chunkExists(0, 0, 0));
+    std::vector<uint8_t> out(l1.defaultChunkSize(), 0);
+    REQUIRE(l1.readChunk(0, 0, 0, out.data()));
+    const size_t cy = l1.defaultChunkShape()[1], cx = l1.defaultChunkShape()[2];
+    // The filled L0 chunk covers the first 4x4x4 of L1; constant in, constant out.
+    CHECK(int(out[0]) == 60);
+    CHECK(int(out[3 * cy * cx]) == 60);
     fs::remove_all(d);
 }

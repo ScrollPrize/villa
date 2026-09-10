@@ -234,13 +234,33 @@ template void downsampleTileIntoPreserveZ<uint8_t>(const uint8_t*, size_t, size_
 template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, size_t, size_t,
     uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
 
+template <typename T>
+void downsampleTileIntoMode(PyramidMode mode,
+                            const T* src, size_t srcZ, size_t srcY, size_t srcX,
+                            T* dst, size_t dstZ, size_t dstY, size_t dstX,
+                            size_t srcActualZ, size_t srcActualY, size_t srcActualX,
+                            size_t dstOffY, size_t dstOffX)
+{
+    if (mode == PyramidMode::Isotropic)
+        downsampleTileInto(src, srcZ, srcY, srcX, dst, dstZ, dstY, dstX,
+                           srcActualZ, srcActualY, srcActualX, dstOffY, dstOffX);
+    else
+        downsampleTileIntoPreserveZ(src, srcZ, srcY, srcX, dst, dstZ, dstY, dstX,
+                                    srcActualZ, srcActualY, srcActualX, dstOffY, dstOffX);
+}
+
+template void downsampleTileIntoMode<uint8_t>(PyramidMode, const uint8_t*, size_t, size_t, size_t,
+    uint8_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
+template void downsampleTileIntoMode<uint16_t>(PyramidMode, const uint16_t*, size_t, size_t, size_t,
+    uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
+
 // ============================================================
 // buildPyramidLevel
 // ============================================================
 
 template <typename T>
 void buildPyramidLevel(const std::filesystem::path& outDir, int level,
-                       size_t CH, size_t CW,
+                       size_t CH, size_t CW, PyramidMode mode,
                        int numParts, int partId)
 {
     auto src = std::make_unique<vc::VcDataset>(outDir / std::to_string(level - 1));
@@ -289,7 +309,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
                 size_t offY = sy * halfY;
                 size_t offX = sx * halfX;
 
-                downsampleTileIntoPreserveZ(
+                downsampleTileIntoMode(
+                    mode,
                     srcBuf.data(), sc[0], sc[1], sc[2],
                     dstBuf.data(), dc[0], dc[1], dc[2],
                     saZ, saY, saX, offY, offX);
@@ -307,8 +328,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
     if (myTiles > 0) std::cout << std::endl;
 }
 
-template void buildPyramidLevel<uint8_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
-template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint8_t>(const std::filesystem::path&, int, size_t, size_t, PyramidMode, int, int);
+template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, size_t, size_t, PyramidMode, int, int);
 
 // ============================================================
 // createPyramidDatasets
@@ -316,7 +337,7 @@ template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, siz
 
 void createPyramidDatasets(const std::filesystem::path& outDir,
                            const std::vector<size_t>& shape0,
-                           size_t CH, size_t CW, bool isU16,
+                           size_t CH, size_t CW, bool isU16, PyramidMode mode,
                            const std::string& compressor,
                            int compressionLevel,
                            const std::string& dimensionSeparator)
@@ -325,10 +346,11 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        // Keep Z fixed and halve only Y/X at each level (anisotropic scaling).
-        std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
-        size_t chZ = std::min(shape[0], shape0[0]);
-        std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
+        // Y/X halve at every level; Z halves only in Isotropic mode.
+        const size_t z = mode == PyramidMode::Isotropic ? (prevShape[0]+1)/2 : prevShape[0];
+        std::vector<size_t> shape = {z, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        // One chunk spans the level's whole Z extent, as at level 0.
+        std::vector<size_t> chunks = {shape[0], std::min(CH, shape[1]), std::min(CW, shape[2])};
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype,
                               compressor, dimensionSeparator, 0, compressionLevel);
         prevShape = shape;
@@ -344,6 +366,7 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    PyramidMode mode,
                     double baseVoxelSize, const std::string& voxelUnit,
                     double pixelsPerVoxel)
 {
@@ -366,6 +389,7 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
         attrs["chunk_size"] = std::move(ck);
     }
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
+    attrs["pyramid_mode"] = mode == PyramidMode::Isotropic ? "isotropic" : "preserve-z";
 
     Json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
@@ -382,14 +406,17 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     ms["datasets"] = Json::array();
     // The two axes scale independently of each other: in-plane, one output
     // pixel spans 1/pixelsPerVoxel base voxels; through-plane, adjacent output
-    // layers sit sliceStep base voxels apart. Pyramid levels halve only YX.
+    // layers sit sliceStep base voxels apart. Pyramid levels halve YX, and Z
+    // as well in Isotropic mode.
     const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
         ? pixelsPerVoxel : 1.0;
     const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
         ? sliceStep : 1.0;
     for (int l = 0; l <= 5; l++) {
-        const double sYX = baseVoxelSize / px * std::pow(2.0, l);
-        const double sZ = baseVoxelSize * step;
+        const double levelFactor = std::pow(2.0, l);
+        const double sYX = baseVoxelSize / px * levelFactor;
+        const double sZ = baseVoxelSize * step
+            * (mode == PyramidMode::Isotropic ? levelFactor : 1.0);
         Json scale_arr = Json::array();
         scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
         Json trans_arr = Json::array();
