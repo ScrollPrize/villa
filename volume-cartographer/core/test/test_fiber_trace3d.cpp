@@ -2,14 +2,60 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "utils/zarr.hpp"
 
 #include <cmath>
 #include <limits>
+#include <filesystem>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
+
+TEST_CASE("live field gates float visitor boundary chunks before any cache read")
+{
+    namespace fs = std::filesystem;
+    struct TemporaryDirectory {
+        fs::path path;
+        ~TemporaryDirectory() { std::error_code error; fs::remove_all(path, error); }
+    } directory{fs::temp_directory_path() / ("vc_live_gate_" + std::to_string(std::mt19937_64(std::random_device{}())()))};
+    REQUIRE(fs::create_directory(directory.path));
+    nlohmann::json groups;
+    for (const auto* name : {"presence", "nx", "ny"}) {
+        const auto path = directory.path / (std::string(name) + ".zarr");
+        utils::ZarrMetadata metadata;
+        metadata.version = utils::ZarrVersion::v2;
+        metadata.shape = {128, 128, 128};
+        metadata.chunks = {64, 64, 64};
+        metadata.dtype = utils::ZarrDtype::uint8;
+        metadata.compressor_id.clear();
+        (void)utils::ZarrArray::create(path, metadata); // no prediction data exists
+        groups[name] = {{"zarr", path.string()}, {"scaledown", 0}, {"channels", {name}}};
+    }
+    const nlohmann::json json{{"version", 2}, {"source_to_base", 0.01}, {"groups", groups}};
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(json.dump(), directory.path / "manifest.json");
+    vc::fiber_tracer::FiberPredictionField field{vc::lasagna::LasagnaDataset(std::move(manifest)), 1024};
+    int calls = 0;
+    field.setReadinessGate([&](const auto& dependencies) {
+        ++calls;
+        // float(.63) / float(.01) == 63, whereas double(float(.63)) /
+        // double(.01) < 63. The optimized visitor requires corner x=64 too.
+        for (const auto* name : {"presence", "nx", "ny"}) {
+            CHECK(std::any_of(dependencies.begin(), dependencies.end(), [&](const auto& key) {
+                return key.arrayPath.string().find(name) != std::string::npos && key.indexZYX == std::array<uint32_t, 3>{0, 0, 1};
+            }));
+        }
+        throw std::runtime_error("synthetic not-ready");
+    });
+    std::vector<vc::fiber_tracer::FiberPredictionSample> samples;
+    CHECK_THROWS_WITH_AS(field.sampleBatch(std::vector<cv::Vec3f>{{0.63f, 0.1f, 0.1f}},
+        std::vector<cv::Vec3f>{{1, 0, 0}}, 1, samples, nullptr), doctest::Contains("synthetic not-ready"), std::runtime_error);
+    CHECK(calls == 1);
+}
 
 namespace
 {
@@ -1512,6 +1558,115 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
             CHECK(segment.matches[index].matchedReferenceArcBase >= segment.matches[index - 1].matchedReferenceArcBase);
             CHECK(segment.matches[index].matchedReferenceArcBase <= segment.matches[index].searchEndArcBase);
         }
+    }
+}
+
+TEST_CASE("beam replay checks intermediate lookahead points and preserves greedy single-route failures")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {{0, 0, 0}, {40, 0, 0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.errorThresholdBaseVoxels = 0.15;
+    request.config.stepVoxels = 4;
+    request.config.coneAngleDegrees = 0;
+    request.config.beamWidth = 1;
+    request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessWeight = 0;
+    request.config.smoothnessNormalWeight = 0;
+    request.config.cumulativeSmoothnessTangentWeight = 0;
+    const auto control = vc::fiber_tracer::traceFiberReplay(predictions, request, normals, 1);
+    request.config.beamWidth = 8;
+    request.config.beamLookaheadSteps = 4;
+    const auto beam = vc::fiber_tracer::traceFiberReplay(predictions, request, normals, 1);
+    const auto document = vc::fiber_tracer::fiberReplayTraceJson(beam, request.errorThresholdBaseVoxels);
+    const auto restored = vc::fiber_tracer::fiberReplayTraceFromJson(document);
+    CHECK(vc::fiber_tracer::fiberReplayTraceJson(restored, request.errorThresholdBaseVoxels) == document);
+    auto corrupt = document;
+    corrupt["segments"][0]["trace_cumulative_losses"] = nlohmann::json::array();
+    CHECK_THROWS(vc::fiber_tracer::fiberReplayTraceFromJson(corrupt));
+    for (const auto* field : {"completed_reference_arc_base", "reference_end_arc_base"}) {
+        corrupt = document;
+        corrupt[field] = -1;
+        CHECK_THROWS(vc::fiber_tracer::fiberReplayTraceFromJson(corrupt));
+    }
+    corrupt = document;
+    corrupt["segments"][0]["end_reference_arc_base"] = -1;
+    CHECK_THROWS(vc::fiber_tracer::fiberReplayTraceFromJson(corrupt));
+    corrupt = document;
+    corrupt["segments"][0]["matches"][0]["search_end_arc_base"] = -1;
+    CHECK_THROWS(vc::fiber_tracer::fiberReplayTraceFromJson(corrupt));
+    REQUIRE_FALSE(beam.failures.empty());
+    corrupt = document;
+    corrupt["failures"][0]["segment_index"] = beam.segments.size();
+    corrupt["failures"][0]["reason"] = "invalid_initial_prediction";
+    CHECK_THROWS(vc::fiber_tracer::fiberReplayTraceFromJson(corrupt));
+    CHECK(beam.completedReferenceArcBase == control.completedReferenceArcBase);
+    REQUIRE(beam.failures.size() == control.failures.size());
+    REQUIRE(beam.segments.size() == control.segments.size());
+    for (size_t i = 0; i < beam.segments.size(); ++i) {
+        CHECK(beam.segments[i].tracePointsBase == control.segments[i].tracePointsBase);
+        CHECK(beam.segments[i].cumulativeLosses == control.segments[i].cumulativeLosses);
+        CHECK(beam.segments[i].endReferenceArcBase == control.segments[i].endReferenceArcBase);
+    }
+    for (size_t i = 0; i < beam.failures.size(); ++i) {
+        CHECK(beam.failures[i].referenceArcBase == control.failures[i].referenceArcBase);
+        CHECK(beam.failures[i].reason == control.failures[i].reason);
+    }
+}
+
+TEST_CASE("beam replay validates a final fallback path without dropping its points")
+{
+    PositiveEdgePrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {{0, 0, 0}, {20, 0, 0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.config.stepVoxels = 2;
+    request.config.beamWidth = 8;
+    request.config.beamLookaheadSteps = 4;
+    request.config.coneAngleDegrees = 0;
+    request.config.smoothnessWeight = 0;
+    request.config.smoothnessNormalWeight = 0;
+    const auto result = vc::fiber_tracer::traceFiberReplay(predictions, request, normals, 1);
+    REQUIRE(!result.segments.empty());
+    CHECK(result.completedReferenceArcBase == 20);
+    CHECK(!result.failures.empty());
+    for (const auto& segment : result.segments) {
+        CHECK(segment.tracePointsBase.size() == segment.matches.size() + 1);
+        CHECK(segment.tracePointsBase.size() == segment.cumulativeLosses.size());
+        for (size_t i = 1; i < segment.tracePointsBase.size(); ++i)
+            CHECK(cv::norm(segment.tracePointsBase[i] - segment.tracePointsBase[i - 1]) == doctest::Approx(2));
+    }
+}
+
+TEST_CASE("branching beam online commitment matches returned-path oracle")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {{0, 0, 0}, {40, 0, 0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.errorThresholdBaseVoxels = 0.15;
+    request.config.stepVoxels = 2;
+    request.config.coneAngleDegrees = 15;
+    request.config.coneAngleStepDegrees = 10;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 2;
+    request.config.beamPruneDistanceVoxels = 0.01;
+    request.config.smoothnessWeight = 0;
+    request.config.smoothnessNormalWeight = 0;
+    request.config.cumulativeSmoothnessTangentWeight = 0;
+    for (bool lazy : {false, true}) {
+        request.config.lazyLookahead = lazy;
+        const auto online = vc::fiber_tracer::traceFiberReplay(predictions, request, normals, 1);
+        const auto oracle = vc::fiber_tracer::testing::traceFiberReplaySelectedPathOracle(predictions, request, normals, 1);
+        CHECK(vc::fiber_tracer::fiberReplayTraceJson(online, request.errorThresholdBaseVoxels) ==
+              vc::fiber_tracer::fiberReplayTraceJson(oracle, request.errorThresholdBaseVoxels));
     }
 }
 

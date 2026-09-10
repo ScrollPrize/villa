@@ -297,6 +297,17 @@ public:
     [[nodiscard]] virtual FiberPredictionSample sample(const cv::Vec3d& volumePoint, const cv::Vec3d& referenceDirection) const = 0;
 };
 
+struct FiberPredictionChunkDependency {
+    std::filesystem::path arrayPath;
+    std::array<uint32_t, 3> indexZYX{};
+    bool operator==(const FiberPredictionChunkDependency&) const = default;
+};
+
+// Called on complete sampling batches before any prediction-cache read/lock.
+// Return only after every requested chunk's coherent product is published;
+// throw on cancellation/infrastructure failure (never substitute fill zeros).
+using FiberPredictionReadinessGate = std::function<void(const std::vector<FiberPredictionChunkDependency>&)>;
+
 class FiberPredictionField final : public FiberPredictionSource
 {
 public:
@@ -305,6 +316,9 @@ public:
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL,
         FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions);
     ~FiberPredictionField() override;
+
+    // Configure once, before concurrent sampling. Empty retains offline behavior.
+    void setReadinessGate(FiberPredictionReadinessGate gate);
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
     [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(const std::vector<cv::Vec3d>& volumePoints) const override;
@@ -527,6 +541,10 @@ using FiberTraceWholeFiberProgressCallback = std::function<void(const FiberTrace
 #ifdef VC_TESTING
 namespace testing
 {
+
+[[nodiscard]] FiberReplayTraceResult traceFiberReplaySelectedPathOracle(
+    const FiberPredictionSource& predictions, const FiberReplayTraceRequest& request,
+    const vc::lasagna::NormalSampler& normalSampler, double normalWorkingToBaseScale);
 
 struct BeamDebugState {
     double loss = 0.0;

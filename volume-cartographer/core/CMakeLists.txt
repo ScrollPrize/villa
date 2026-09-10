@@ -229,7 +229,11 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletStorage.cpp
     src/fiber_tracer/LasagnaNormalAlignment.cpp
 )
-target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE highs::highs Eigen3::Eigen Ceres::ceres)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
+if(VC_HAVE_HIGHS)
+    target_link_libraries(vc_fiber_tracer PRIVATE highs::highs)
+    target_compile_definitions(vc_fiber_tracer PRIVATE VC_HAVE_HIGHS=1)
+endif()
 if(VC_TESTING)
     target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
 endif()

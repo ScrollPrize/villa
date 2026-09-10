@@ -2459,8 +2459,13 @@ TEST_CASE("Trace constraint strength pruning is mutual and deterministic")
     labelingConfig.relaxIntegrality = true;
     labelingConfig.parallelThreads = 1;
     labelingConfig.brokenCostPerConstraint = 100.0;
+#ifdef VC_HAVE_HIGHS
     const auto labeling = solveFiberTraceLabels(solverInput, labelingConfig);
     CHECK(labeling.retainedConstraints == pruned.constraints.size());
+#else
+    CHECK_THROWS_WITH_AS(solveFiberTraceLabels(solverInput, labelingConfig),
+        doctest::Contains("requires HiGHS"), std::runtime_error);
+#endif
     std::vector<FiberletCropTraceLine> traces(input.inputTraces);
     for (std::size_t trace = 0; trace < traces.size(); ++trace) {
         traces[trace].pointsBaseXYZ = {
@@ -2690,6 +2695,7 @@ TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
     CHECK(invalid.rejectedWindingCutoff == 0);
 }
 
+#ifdef VC_HAVE_HIGHS
 TEST_CASE("Trace labeling minimizes orientation winding and broken costs")
 {
     const auto makeReport = [](double parallel, double winding) {
@@ -2778,6 +2784,7 @@ TEST_CASE("Trace labeling minimizes orientation winding and broken costs")
     CHECK_THROWS_AS(solveFiberTraceLabels(isolated, config), std::invalid_argument);
 }
 
+#endif
 TEST_CASE("Trace labeling writes five stable piece OBJ classes")
 {
     const TemporaryDirectory directory("trace_label_objs");
@@ -2814,6 +2821,7 @@ TEST_CASE("Trace labeling writes five stable piece OBJ classes")
     CHECK(text.str().find("o piece_3_trace_13_part_3\n") != std::string::npos);
 }
 
+#ifdef VC_HAVE_HIGHS
 TEST_CASE("Trace labeling exposes a continuous LP relaxation")
 {
     FiberTraceConstraintReport constraints;
@@ -2945,6 +2953,7 @@ TEST_CASE("Trace labeling rejects LP backend controls outside relaxation mode")
         std::invalid_argument);
 }
 
+#endif
 TEST_CASE("Direction label comparison aligns components and reports errors")
 {
     FiberTraceConstraintReport constraints;
@@ -3136,6 +3145,7 @@ TEST_CASE("Continuous H/V labeling thresholds to discrete defects")
         std::invalid_argument);
 }
 
+#ifdef VC_HAVE_HIGHS
 TEST_CASE("Trace labeling can exclude measured parallel separate winding links")
 {
     FiberTraceConstraintReport constraints;
@@ -3222,6 +3232,7 @@ TEST_CASE("Trace labeling can retain only measured perpendicular links")
         std::invalid_argument);
 }
 
+#endif
 TEST_CASE("Trace post-filter confidence uses the configured support width")
 {
     CHECK(fiberTracePostFilterConfidence(0.5, 1.0) ==
@@ -3394,6 +3405,7 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
     CHECK(read(statePaths.tie).find("fiber_000003") != std::string::npos);
 }
 
+#ifdef VC_HAVE_HIGHS
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")
 {
     FiberTraceConstraintReport constraints;
@@ -3594,6 +3606,7 @@ TEST_CASE("Trace labeling exact perpendicular MILP derives loss from continuous 
         std::invalid_argument);
 }
 
+#endif
 TEST_CASE("Trace consensus grows original fibers by stable active evidence")
 {
     std::vector<FiberletCropTraceLine> traces(5);

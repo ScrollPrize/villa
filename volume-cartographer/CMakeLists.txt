@@ -533,7 +533,16 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(highs CONFIG REQUIRED)
+option(VC_ENABLE_HIGHS "Enable HiGHS fiber-trace LP/MILP labeling when available" ON)
+if(VC_ENABLE_HIGHS)
+    find_package(highs CONFIG QUIET)
+endif()
+if(VC_ENABLE_HIGHS AND TARGET highs::highs)
+    set(VC_HAVE_HIGHS ON)
+else()
+    set(VC_HAVE_HIGHS OFF)
+    message(STATUS "HiGHS unavailable or disabled: fiber-trace LP/MILP labeling disabled")
+endif()
 # OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
 # Rodrigues (calib) and estimateAffine3D (geometry), so select both new
 # modules there while retaining the OpenCV 4 module name elsewhere.

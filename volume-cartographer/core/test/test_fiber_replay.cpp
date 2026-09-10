@@ -474,7 +474,7 @@ TEST_CASE("replay strip meshes keep reset components and sample normals in worki
     CHECK(strips.greedy[0].sourceSegmentIndex == 0);
     CHECK(strips.greedy[1].sourceSegmentIndex == 1);
     REQUIRE(strips.reference[0].lineSurface);
-    CHECK(strips.reference[0].lineSurface->rawPointsPtr()->rows == 21);
+    CHECK(strips.reference[0].lineSurface->rawPointsPtr()->rows == vc::lasagna::kLineViewCrossSampleCount);
     CHECK(strips.reference[0].lineSurface->rawPointsPtr()->cols == 2);
     REQUIRE_FALSE(normals.points.empty());
     CHECK(normals.points.back()[0] <= 4.0);
@@ -483,6 +483,25 @@ TEST_CASE("replay strip meshes keep reset components and sample normals in worki
 TEST_CASE("replay strip CT rendering uses the existing surface renderer for uint8")
 {
     checkReplayStripCtRendering();
+}
+
+TEST_CASE("replay strip validation retains the shared long-span resampling map")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {64, 64, 64};
+    grid.predictionToBaseScale = 1;
+    const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+        {{0, 0, 0}, {32, 0, 0}}, 16, 16, 2, grid, 2);
+    vc::fiber_tracer::FiberReplayTraceResult greedy;
+    vc::fiber_tracer::FiberletGraphReplayResult fiberlet;
+    RecordingNormalSampler normals;
+    const auto strips = vc::fiber_tracer::makeFiberReplayStripSurfaces(tube, greedy, fiberlet, normals, 1, 1);
+    REQUIRE(strips.reference.size() == 1);
+    const auto& component = strips.reference.front();
+    REQUIRE(component.lineSurface);
+    CHECK(component.centerlineBaseXYZ.size() == 2);
+    CHECK(component.lineSurface->rawPointsPtr()->cols == 5);
+    CHECK(component.stripPositionMap.originalPositionToStripGridColumn(1) == doctest::Approx(4));
 }
 
 TEST_CASE("replay strip CT rendering rejects unsupported uint16 volumes")
@@ -505,6 +524,69 @@ TEST_CASE("replay strip CT rendering rejects unsupported uint16 volumes")
         doctest::Contains("must use uint8"), std::invalid_argument);
     volume.reset();
     std::filesystem::remove_all(directory.parent_path());
+}
+
+TEST_CASE("long-span overview maps overlays and endpoint markers to resampled columns")
+{
+    const auto directory = temporaryDirectory();
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {64, 64, 64};
+    options.chunkShapeZYX = {16, 16, 16};
+    options.dtype = vc::render::ChunkDtype::UInt8;
+    options.numLevels = 1;
+    options.compressor = "none";
+    auto volume = Volume::New(directory / "ct", options);
+    volume.reset();
+    const auto ct = (directory / "ct/0").string();
+    volume = Volume::New(ct);
+    const std::vector<cv::Vec3d> reference{{8, 32, 32}, {40, 32, 32}};
+    vc::fiber_tracer::FiberReplayTraceResult greedy;
+    greedy.referenceEndArcBase = 32;
+    vc::fiber_tracer::FiberReplayTraceSegment segment;
+    segment.tracePointsBase = {{8, 36, 32}, {40, 36, 32}};
+    segment.matches.push_back({1, 32, 32, reference.back(), 0, 32, 4, 0});
+    greedy.segments.push_back(segment);
+    vc::fiber_tracer::FiberletGraphReplayResult fiberlet;
+    fiberlet.referenceEndArcBase = 32;
+    vc::fiber_tracer::FiberletGraphReplaySegment route;
+    route.routePointsBaseXYZ = {{8, 32, 36}, {40, 32, 36}};
+    route.matches = {{0, 0, 0, reference.front()}, {1, 32, 32, reference.back()}};
+    fiberlet.segments.push_back(route);
+    vc::fiber_tracer::FiberReplayFailure failure;
+    failure.reason = "distance_above_threshold";
+    failure.referenceArcBase = 32;
+    failure.referenceArcFraction = 1;
+    failure.referencePointBase = reference.back();
+    fiberlet.failures.push_back(failure);
+    RecordingNormalSampler normals;
+    const auto overview = vc::fiber_tracer::renderFiberReplayOverview(reference, greedy, fiberlet, normals, 1, 1, *volume, ct);
+    REQUIRE(overview.pages.size() == 1);
+    const auto& page = overview.pages.front();
+    REQUIRE(page.panels.size() == 1);
+    const auto& panel = page.panels.front();
+    for (const auto& rows : {panel.referenceTopRows, panel.referenceSideRows,
+                             panel.fiberletTopRows, panel.fiberletSideRows}) {
+        // All strips have the same 32vx extent: 2 source vertices become
+        // 5 ribbon columns. Endpoint markers belong at100%, not at25%.
+        const int right = overview.referenceTopShapeYX[1] - 1;
+        CHECK(page.image(rows[0] + 4, right) == cv::Vec3b(255, 255, 0));
+        CHECK_FALSE(cyanDominant(page.image(rows[0] + 4, right / 4)));
+    }
+    const int column = (overview.referenceTopShapeYX[1] - 1) * 3 / 4;
+    size_t referenceRed = 0, traceRed = 0, traceYellow = 0;
+    for (int y = panel.referenceTopRows[0]; y < panel.referenceTopRows[1]; ++y)
+        referenceRed += redDominant(page.image(y, column));
+    for (int y = panel.fiberletTopRows[0]; y < panel.fiberletTopRows[1]; ++y)
+        traceRed += redDominant(page.image(y, column));
+    for (int y = panel.fiberletSideRows[0]; y < panel.fiberletSideRows[1]; ++y) {
+        const auto pixel = page.image(y, column);
+        traceYellow += pixel[1] > 180 && pixel[2] > 180 && pixel[0] < 80;
+    }
+    CHECK(referenceRed > 0); // native trace projected into reference strip
+    CHECK(traceRed > 0); // other trace projected into resampled trace frame
+    CHECK(traceYellow > 0); // reference projected into resampled trace frame
+    volume.reset();
+    std::filesystem::remove_all(directory);
 }
 
 TEST_CASE("full replay overview renders selected top and side strips with disconnected trace overlays")
@@ -616,10 +698,12 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     CHECK(overview.markerWidthPixels == 3);
     CHECK(overview.textureSource.scaleFromBaseXYZ ==
           std::array<double, 3>{0.5, 0.5, 0.5});
-    CHECK(overview.referenceTopShapeYX == std::array<int, 2>{328, 72});
-    CHECK(overview.referenceSideShapeYX == std::array<int, 2>{328, 72});
-    CHECK(overview.fiberletTopShapeYX[0] >= 648);
-    CHECK(overview.fiberletSideShapeYX[0] >= 648);
+    const int expectedHeight = static_cast<int>((vc::lasagna::kLineViewCrossSampleCount - 1) *
+        vc::lasagna::kLineViewCrossRowSpacingBaseVoxels * 0.5 + 1) * overview.renderScale;
+    CHECK(overview.referenceTopShapeYX == std::array<int, 2>{expectedHeight, 72});
+    CHECK(overview.referenceSideShapeYX == std::array<int, 2>{expectedHeight, 72});
+    CHECK(overview.fiberletTopShapeYX[0] >= expectedHeight);
+    CHECK(overview.fiberletSideShapeYX[0] >= expectedHeight);
     REQUIRE(overview.fiberletComponents.size() == 2);
     CHECK(overview.fiberletComponents[0].sourceSegmentIndex == 0);
     CHECK(overview.fiberletComponents[0].referenceArcBeginBase == 10.0);
@@ -1007,7 +1091,7 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(local.at("artifacts").at("replay/reference.obj").at("path").get<std::string>().starts_with("runs/"));
     CHECK(local.at("trace_strips").at("geometry_builder") ==
           "buildLineViewSurfaces_default");
-    CHECK(local.at("trace_strips").at("cross_samples") == 21);
+    CHECK(local.at("trace_strips").at("cross_samples") == vc::lasagna::kLineViewCrossSampleCount);
     CHECK(local.at("failure").at("euclidean_error_base_voxels") ==
           doctest::Approx(1.0));
     CHECK(local.at("failure").at("threshold_error_base_voxels") ==

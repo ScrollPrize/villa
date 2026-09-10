@@ -28,6 +28,7 @@
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/GlobalCacheRoot.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -1639,6 +1640,8 @@ nb::list collectBBoxDependencies(
 NB_MODULE(volume, m)
 {
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
+    m.def("global_cache_root", [] { return vc::core::util::globalCacheRoot().string(); },
+          "Resolve the shared VC3D cache root without creating it.");
 
     m.def("set_chunk_cache_budget",
           [](std::size_t bytes) {
