@@ -291,7 +291,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         const QString& location,
         std::vector<std::string> tags = {},
-        const QString& remoteCacheRoot = {},
         const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
