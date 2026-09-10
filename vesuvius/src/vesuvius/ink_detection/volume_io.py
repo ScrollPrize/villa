@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import aiohttp
 import numpy as np
@@ -244,3 +244,240 @@ def read_bbox_with_padding(
     )
     output[destination] = crop
     return output, destination
+
+
+# `prepare_9um_isotropic_input` stamps `format`, `source` and `source_level` on every
+# input it writes, unconditionally: the tag names the recipe, and `source`/`source_level`
+# say which store the input came from and at which pyramid level. Nothing downstream
+# currently reads any of it.
+#
+# The tag does not name a single scale. The shipped recipe is trained on two documented
+# representation families: 2.399 um renders pooled at level 2, and native 9.362 um
+# renders used at level 0. Both are legitimate inputs, so both are accepted.
+FLAT_INPUT_RECIPES = {
+    # format tag -> (in-plane micrometres the recipe trains at, level the tag names)
+    "level2-zmean4-21slice-v1": ((9.596, 9.362), "2"),
+}
+FLAT_INPUT_SCALE_TOLERANCE = 0.02
+
+
+class InputScaleRefused(ValueError):
+    """Raised by `check_flat_input_scale(strict=True)`; a folder run skips and records it."""
+
+# Mirrors the order `Volume::normalize()` uses when a store records its scale outside
+# OME metadata: a numeric `voxelsize`, then the alternative spellings, then the beamline
+# `samplePixelSize`, which is recorded in millimetres.
+_VOXEL_SIZE_KEYS = (
+    "voxelsize",
+    "voxel_size_um",
+    "voxelSizeUm",
+    "pixel_size_um",
+    "pixelSizeUm",
+    "resolution_um",
+)
+_NESTED_METADATA_KEYS = ("scan", "volume", "properties", "metadata")
+_SAMPLE_PIXEL_SIZE_PATH = ("scan", "tomo", "acquisition", "detector")
+
+
+def _positive_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def _number_from_object(obj, keys):
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        found = _positive_number(obj.get(key))
+        if found is not None:
+            return found
+    return None
+
+
+def inplane_um_from_ome(attrs, level):
+    """In-plane micrometres for one pyramid level of an OME-Zarr store.
+
+    Rendered surface volumes record this directly - axes in micrometre and a scale per
+    dataset - so the level an input was built from names its own in-plane sampling.
+    """
+
+    multiscales = attrs.get("multiscales")
+    if not isinstance(multiscales, list) or not multiscales:
+        return None
+    entry = multiscales[0]
+    if not isinstance(entry, dict):
+        return None
+    axes = entry.get("axes")
+    if not isinstance(axes, list):
+        return None
+    names = [str(axis.get("name")) for axis in axes if isinstance(axis, dict)]
+    units = {
+        str(axis.get("name")): str(axis.get("unit", ""))
+        for axis in axes
+        if isinstance(axis, dict)
+    }
+    if any(units.get(name) not in ("micrometer", "micrometre") for name in ("y", "x")):
+        return None
+    for dataset in entry.get("datasets") or ():
+        if not isinstance(dataset, dict) or str(dataset.get("path")) != str(level):
+            continue
+        for transform in dataset.get("coordinateTransformations") or ():
+            if not isinstance(transform, dict) or transform.get("type") != "scale":
+                continue
+            scale = transform.get("scale")
+            if not isinstance(scale, list) or len(scale) != len(names):
+                continue
+            values = [
+                _positive_number(scale[index])
+                for index, name in enumerate(names)
+                if name in ("y", "x")
+            ]
+            if len(values) == 2 and all(values) and values[0] == values[1]:
+                return values[0]
+    return None
+
+
+def voxel_size_um_from_document(document):
+    """Scale from a store's metadata document, in the order `Volume::normalize()` uses."""
+
+    if not isinstance(document, dict):
+        return None
+    merged = dict(document)
+    scan = merged.get("scan")
+    if isinstance(scan, dict):
+        merged.update(scan)
+    found = _number_from_object(merged, _VOXEL_SIZE_KEYS)
+    if found is not None:
+        return found
+    for key in _NESTED_METADATA_KEYS:
+        found = _number_from_object(merged.get(key), _VOXEL_SIZE_KEYS)
+        if found is not None:
+            return found
+    current = document
+    for key in _SAMPLE_PIXEL_SIZE_PATH:
+        if not isinstance(current, dict) or key not in current:
+            current = None
+            break
+        current = current[key]
+    millimetres = _number_from_object(current, ("samplePixelSize",))
+    return None if millimetres is None else millimetres * 1000.0
+
+
+def resolve_source_inplane_um(source, level, *, attrs_reader=None):
+    """In-plane micrometres of `source` at `level`, with the reason when unknown.
+
+    Only the store's metadata is read, never its arrays. "unreachable" is kept distinct
+    from "records no scale" so a source that cannot be opened is never reported as a
+    scale error.
+    """
+
+    if not source:
+        return None, "no source recorded"
+    reader = attrs_reader
+    if reader is None:
+
+        def reader(path):
+            return dict(zarr.open(path, mode="r").attrs)
+
+    try:
+        attrs = reader(source)
+    except Exception as exc:  # unreachable source, stale path, no permission
+        return None, f"source unreachable ({type(exc).__name__})"
+    if not isinstance(attrs, Mapping):
+        return None, "source metadata unreadable"
+    found = inplane_um_from_ome(attrs, level)
+    if found is None:
+        found = voxel_size_um_from_document(dict(attrs))
+        if found is not None and str(level).isdigit():
+            found *= 2 ** int(level)
+    if found is None:
+        return None, "source records no scale"
+    return found, "ok"
+
+
+def describe_flat_input_scale_mismatch(root, *, source, attrs_reader=None):
+    """Compare a prepared input's actual in-plane scale with what its recipe trains at.
+
+    Returns a description, or None when the input is consistent or carries no recipe tag
+    to check. Inputs without a known `format` tag - published surface volumes, or inputs
+    prepared by other means - are left alone.
+    """
+
+    attrs = getattr(root, "attrs", None)
+    if attrs is None:
+        return None
+    try:
+        recorded = dict(attrs)
+    except Exception:
+        return None
+
+    tag = recorded.get("format")
+    recipe = None if tag is None else FLAT_INPUT_RECIPES.get(str(tag))
+    if recipe is None:
+        return None
+    trained_scales, expected_level = recipe
+
+    source_level = recorded.get("source_level")
+    if source_level is None:
+        return (
+            f"{source}: input declares format {str(tag)!r}, which is prepared from "
+            f"pyramid level {expected_level}, but records no source_level, so the scale "
+            "it was built at cannot be checked"
+        )
+    recorded_level = str(source_level)
+    recorded_source = str(recorded.get("source") or "")
+    actual_um, reason = resolve_source_inplane_um(
+        recorded_source, recorded_level, attrs_reader=attrs_reader
+    )
+    if actual_um is not None:
+        nearest = min(trained_scales, key=lambda um: abs(actual_um - um) / um)
+        if abs(actual_um - nearest) / nearest <= FLAT_INPUT_SCALE_TOLERANCE:
+            return None
+        trained = " or ".join(f"{um:g}" for um in trained_scales)
+        return (
+            f"{source}: input is {actual_um:g} um in-plane; this recipe trains at "
+            f"{trained} um (nearest {nearest:g}, factor {actual_um / nearest:.3g}). "
+            f"Prepared from {recorded_source} at level {recorded_level}."
+        )
+
+    # The source could not be consulted. The tag and the recorded level still have to
+    # agree with each other, and that comparison needs nothing but the input itself.
+    if recorded_level == expected_level:
+        return None
+    message = (
+        f"{source}: input declares format {str(tag)!r}, which is prepared from pyramid "
+        f"level {expected_level}, but records source_level {recorded_level!r}"
+    )
+    if recorded_level.isdigit():
+        ratio = 2.0 ** (int(expected_level) - int(recorded_level))
+        message += (
+            f"; its in-plane sampling is {ratio:g}x finer than that format implies"
+            if ratio > 1
+            else f"; its in-plane sampling is {1 / ratio:g}x coarser than that format implies"
+        )
+    return (
+        f"{message} (absolute scale not checked: {reason}; a native "
+        f"{min(trained_scales):g} um render prepared at level 0 is legitimate and would "
+        "be reported here)"
+    )
+
+
+def check_flat_input_scale(root, *, source, strict=False, attrs_reader=None):
+    """Report a prepared input whose scale does not match its recipe.
+
+    Reporting rather than refusing is the default: an input prepared by other means is a
+    legitimate thing to hand this code, and a message carrying the numbers is enough to
+    act on. `strict` turns the same finding into a refusal.
+    """
+
+    message = describe_flat_input_scale_mismatch(
+        root, source=source, attrs_reader=attrs_reader
+    )
+    if message is not None and strict:
+        raise InputScaleRefused(
+            message
+            + " Re-prepare the input at the level this recipe expects, or drop "
+            "--strict-input-scale to continue with a warning."
+        )
+    return message

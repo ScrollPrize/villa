@@ -38,6 +38,8 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
+    InputScaleRefused,
+    check_flat_input_scale,
     open_volume,
     open_volume_root,
     select_volume_level,
@@ -1147,6 +1149,23 @@ def resolve_run_directions(direction: str) -> tuple[str, ...]:
     return ("forward", "reverse") if direction == "both" else (direction,)
 
 
+def report_input_scale(args, input_zarr) -> None:
+    """Compare a prepared input's recorded scale with its recipe's, once per input.
+
+    Called before the direction loop rather than inside `infer_single_zarr`, which runs
+    once per direction: the finding describes the input, not the traversal, and
+    `--direction both` would otherwise report it twice.
+    """
+
+    mismatch = check_flat_input_scale(
+        open_volume_root(input_zarr),
+        source=str(input_zarr),
+        strict=bool(getattr(args, "strict_input_scale", False)),
+    )
+    if mismatch is not None:
+        LOGGER.warning("%s", mismatch)
+
+
 def resolve_single_output_path(
     output_tiff: Path,
     *,
@@ -1220,6 +1239,7 @@ def infer_folder(
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
             skipped_count += 1
             continue
+        scale_reported = False
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
                 f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
@@ -1239,6 +1259,19 @@ def infer_folder(
                 )
                 skipped_count += 1
                 continue
+            if not scale_reported:
+                # Once per input rather than once per direction, and only once some
+                # direction is actually going to run: a segment whose predictions all
+                # exist is skipped without opening its store at all. On a refusal the
+                # whole segment is skipped and recorded, which is the level the
+                # missing-input case above uses.
+                try:
+                    report_input_scale(args, input_zarr)
+                except InputScaleRefused as exc:
+                    LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+                    skipped_count += 1
+                    break
+                scale_reported = True
             infer_single_zarr(
                 args=args,
                 input_zarr=input_zarr,
@@ -1337,6 +1370,14 @@ def parse_args(argv: Sequence[str] | None = None):
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
     )
+    parser.add_argument(
+        "--strict-input-scale",
+        action="store_true",
+        help=(
+            "refuse to run when a prepared input's scale does not match what its "
+            "recipe trains at, instead of reporting it and continuing"
+        ),
+    )
     parser.add_argument("--tta-mirror", action="store_true")
     parser.add_argument("--tta-batch-size", type=int)
     parser.add_argument("--gpus")
@@ -1380,6 +1421,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
+        try:
+            report_input_scale(args, args.input_zarr)
+        except InputScaleRefused as exc:
+            LOGGER.error("%s", exc)
+            return 1
         for direction in resolve_run_directions(args.direction):
             infer_single_zarr(
                 args=args,
