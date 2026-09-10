@@ -25,7 +25,10 @@ SUPPORTED_LABEL_EXTENSIONS = {".tif", ".png", ".jpg"}
 RESERVED_IMAGE_FILENAMES = {"x.tif", "y.tif", "z.tif", "mask.tif"}
 
 
-_BBOX_UNRESOLVED = object()
+# A module-level object() is not pickle-stable: unpickling builds a NEW object, so an identity
+# check against it fails and a restored instance looks resolved, returning the sentinel itself
+# instead of a bbox. That breaks multiprocessing queues and ProcessPoolExecutor (raised in review
+# of #1731). A plain boolean survives pickling, so use one.
 
 
 @dataclass(init=False)
@@ -45,7 +48,9 @@ class TifxyzInfo:
     scale: Tuple[float, float]
     uuid: str
     stored_bbox: Optional[Tuple[float, float, float, float, float, float]] = None
-    _bbox: Any = field(default=_BBOX_UNRESOLVED, init=False, repr=False, compare=False)
+    _bbox: Optional[Tuple[float, float, float, float, float, float]] = field(
+        default=None, init=False, repr=False, compare=False)
+    _bbox_resolved: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -67,14 +72,15 @@ class TifxyzInfo:
         self.scale = scale
         self.uuid = uuid
         self.stored_bbox = bbox if bbox is not None else stored_bbox
-        self._bbox = _BBOX_UNRESOLVED
+        self._bbox = None
+        self._bbox_resolved = False
 
     @property
     def bbox(self) -> Optional[Tuple[float, float, float, float, float, float]]:
         """The bounding box, recomputed from valid points only if the stored one
         carries the ``-1`` marker. Resolved once, then cached. ``None`` means the
         segment has no usable bbox (no stored bbox, or no valid points)."""
-        if self._bbox is _BBOX_UNRESOLVED:
+        if not self._bbox_resolved:
             if self.stored_bbox is not None and _bbox_carries_missing_marker(self.stored_bbox):
                 self._bbox = _bbox_from_valid_points(TifxyzReader(self.path))
                 if self._bbox is not None:
@@ -85,6 +91,7 @@ class TifxyzInfo:
                     )
             else:
                 self._bbox = self.stored_bbox
+            self._bbox_resolved = True
         return self._bbox
 
     @property

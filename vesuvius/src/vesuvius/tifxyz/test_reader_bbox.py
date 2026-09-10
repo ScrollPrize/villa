@@ -103,3 +103,33 @@ def test_tifxyzinfo_keeps_its_original_constructor_signature():
 
     # and a segment with no bbox stays None rather than raising
     assert TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), uuid="u").bbox is None
+
+
+def test_tifxyzinfo_survives_a_pickle_round_trip_while_unresolved():
+    """An UNRESOLVED info must still resolve correctly after pickling (review of #1731).
+
+    The lazy bbox was gated on ``self._bbox is _BBOX_UNRESOLVED``, a module-level ``object()``.
+    Unpickling constructs a different object, so the identity check failed, the restored instance
+    looked resolved, and ``bbox`` returned the sentinel itself: ``z_min`` then raised TypeError on
+    a plain object. Anything crossing a process boundary hit this, so a boolean is used instead.
+    """
+    import pickle
+    from pathlib import Path
+    from vesuvius.tifxyz.reader import TifxyzInfo
+
+    bbox = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+
+    info = TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), bbox, "uuid-pickle")
+    restored = pickle.loads(pickle.dumps(info))          # never touched .bbox first
+    assert restored.bbox == bbox
+    assert restored.z_min == 3.0 and restored.z_max == 6.0
+
+    # and once resolved, the resolved value survives too
+    info2 = TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), bbox, "uuid-pickle-2")
+    _ = info2.bbox
+    assert pickle.loads(pickle.dumps(info2)).bbox == bbox
+
+    # a segment with no bbox stays None across the round trip rather than becoming a sentinel
+    empty = pickle.loads(pickle.dumps(TifxyzInfo(Path("/nonexistent"), (1.0, 1.0), uuid="u")))
+    assert empty.bbox is None
+    assert empty.z_min is None
