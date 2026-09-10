@@ -339,3 +339,107 @@ def test_partial_control_frame_does_not_block_polling():
     finally:
         sender.close()
         channel.close()
+
+
+class FailingGlooAdapter:
+    """Exercise real worker exceptions and a peer blocked in a CPU collective."""
+
+    def __init__(self, rank, grant, state, *, rendezvous, stage):
+        from datetime import timedelta
+        import torch
+        import torch.distributed as dist
+        assert not torch.cuda.is_initialized()
+        dist.init_process_group("gloo", init_method=f"file://{rendezvous}",
+                                rank=rank, world_size=len(grant["gpus"]),
+                                timeout=timedelta(seconds=20))
+        self.rank, self.stage = rank, stage
+        self.model = torch.nn.Linear(2, 1)
+
+    def run_unit(self):
+        import torch
+        import torch.distributed as dist
+        loss = self.model(torch.ones(1, 2)).sum()
+        if self.rank == 0 and self.stage == "forward":
+            raise RuntimeError("injected forward failure")
+        loss.backward()
+        if self.rank == 0 and self.stage == "reduction":
+            raise RuntimeError("injected reduction failure")
+        # In both failure cases the other rank may already be waiting here.
+        dist.all_reduce(self.model.weight.grad)
+        return 1
+
+    def capture(self):
+        if self.rank == 0 and self.stage == "handoff":
+            raise RuntimeError("injected handoff failure")
+        return "same", {"step": 1}
+
+    def close(self):
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if self.rank == 0 and self.stage == "release":
+            raise RuntimeError("injected release failure")
+
+
+@pytest.mark.parametrize("stage", ["forward", "reduction", "handoff", "release"])
+def test_real_cohort_failure_aborts_peers_before_releasing(stage, tmp_path):
+    from functools import partial
+    from multiprocessing.shared_memory import SharedMemory
+    client = LocalClient()
+    cohorts = []
+    completed = []
+
+    def factory(grant, state):
+        cohort = ProcessCohort(partial(FailingGlooAdapter,
+            rendezvous=str(tmp_path / "gloo"), stage=stage), grant, state,
+            on_unit=lambda rows: completed.append(rows) or True,
+            startup_timeout=30, unit_timeout=30, drain_timeout=30)
+        cohorts.append(cohort)
+        return cohort
+
+    original_report = client.report
+    def checked_report(phase, held, **kwargs):
+        if phase == "failed":
+            assert held == empty()
+            assert all(c.closed and not c.processes for c in cohorts)
+            assert all(p.exitcode is not None and not p.is_alive()
+                       for c in cohorts for p in c._children)
+        return original_report(phase, held, **kwargs)
+    client.report = checked_report
+    supervisor = Supervisor(client, label="failure", request=REQUEST,
+                            cohort_factory=factory, poll_interval=.01)
+    try:
+        deadline = time.monotonic() + 40
+        while not supervisor.finished:
+            supervisor.tick()
+            if time.monotonic() > deadline:
+                pytest.fail(f"{stage} failure did not terminate the cohort")
+            time.sleep(.005)
+        assert supervisor.error is not None
+        assert "cohort worker" in str(supervisor.error)
+        assert supervisor.state is None  # Never adopt a partially captured state.
+        assert len(cohorts) == 1  # No silent retry of the failed update/cohort.
+        assert completed == ([] if stage in ("forward", "reduction") else [[1, 1]])
+        assert client.task["terminal"] and client.task["granted"] == empty()
+        assert any(phase == "failed" for phase, _ in client.reports)
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=cohorts[0]._state_name)
+    finally:
+        for cohort in cohorts:
+            cohort.abort()
+
+
+def test_abort_failure_keeps_reservation_and_does_not_acknowledge_release():
+    client, supervisor, tick = setup()
+    cohort = supervisor.cohort
+    def broken_poll():
+        raise RuntimeError("injected work failure")
+    def unjoined_abort():
+        raise RuntimeError("injected join failure")
+    cohort.poll = broken_poll
+    cohort.abort = unjoined_abort
+    with pytest.raises(RuntimeError, match="join failure"):
+        tick()
+    assert supervisor.cohort is cohort and not cohort.closed
+    assert client.task["granted"] == GRANT and not client.task["terminal"]
+    assert not any(phase in ("failed", "released") for phase, _ in client.reports)
