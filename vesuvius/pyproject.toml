@@ -33,6 +33,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional monorepo-only cooperative scheduler. Install alongside the training
+# dependencies; ordinary volume/inference installs do not acquire a manager.
+cooperative = ["villa-gpu-manager"]
 # Minimal install explicitly named
 volume-only = [
     "numpy>=2.0.2",
@@ -258,6 +261,7 @@ name = "nvidia"
 url = "https://pypi.nvidia.com"
 
 [tool.uv.sources]
+villa-gpu-manager = { path = "../gpu_manager", editable = true }
 volume-cartographer = { path = "../volume-cartographer", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }

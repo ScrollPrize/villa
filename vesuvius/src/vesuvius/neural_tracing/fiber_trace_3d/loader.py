@@ -343,12 +343,14 @@ class FiberTrace3DSharedTensorSlots:
             else restored
         )
 
-    def batch_tensors(self, indices: list[int]) -> torch.Tensor:
+    def batch_tensors(self, indices: list[int], *, allow_wrap: bool = False) -> torch.Tensor:
         if not indices:
             raise ValueError("shared-slot batch must not be empty")
         locations = [self._location(index) for index in indices]
         slots = [slot for slot, _generation in locations]
-        if slots != list(range(slots[0], slots[0] + len(slots))):
+        expected = list(range(slots[0], slots[0] + len(slots)))
+        wrapped = allow_wrap and len(slots) <= self.slot_count and slots == [i % self.slot_count for i in expected]
+        if slots != expected and not wrapped:
             raise RuntimeError("shared-slot batch crosses or is not contiguous")
         for index, (slot, generation) in zip(indices, locations, strict=True):
             observed = int(self.generations[slot].item())
@@ -358,6 +360,10 @@ class FiberTrace3DSharedTensorSlots:
                     f"expected {generation}, observed {observed}"
                 )
         end = slots[0] + len(slots)
+        if end > self.slot_count:
+            # Only partial/variable batches can straddle the ring. The common
+            # aligned path stays zero-copy; never read another sample's slot.
+            return torch.cat((self.volumes[slots[0]:], self.volumes[:end - self.slot_count]), dim=0)
         return self.volumes[slots[0] : end]
 
 

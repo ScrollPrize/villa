@@ -64,16 +64,20 @@ class _CompletedItem:
     stage1_finished_ns: int
 
 
-def _set_native_thread_limits() -> None:
-    for name in (
+def native_thread_environment() -> dict[str, str]:
+    """Use before spawning as well as inside native-compute workers."""
+    return {name: "1" for name in (
         "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
         "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
         "VECLIB_MAXIMUM_THREADS",
         "BLIS_NUM_THREADS",
-    ):
-        os.environ[name] = "1"
+    )}
+
+
+def _set_native_thread_limits() -> None:
+    os.environ.update(native_thread_environment())
     try:
         import torch
 
@@ -275,6 +279,9 @@ def _shared_worker_main(
     stage1_counts: Any,
     stage2_counts: Any,
     shared_worker_count: int,
+    active_workers: Any,
+    worker_busy: Any,
+    elastic_workers: bool,
 ) -> None:
     """Claim eligible work without a coordinator round trip."""
 
@@ -283,10 +290,10 @@ def _shared_worker_main(
     index = -1
     try:
         stage1_operation = (
-            stage1_factory() if worker_id < int(stage1_affinity_workers) else None
+            stage1_factory() if not elastic_workers and worker_id < int(stage1_affinity_workers) else None
         )
         stage2_operation = (
-            None if worker_id < int(stage1_affinity_workers) else stage2_factory()
+            None if elastic_workers or worker_id < int(stage1_affinity_workers) else stage2_factory()
         )
         _send_control(control, "ready", "shared", worker_id, os.getpid())
         while not start_event.wait(timeout=0.1):
@@ -355,6 +362,18 @@ def _shared_worker_main(
 
         home_load = worker_id < int(stage1_affinity_workers)
         while not stop_event.is_set():
+            if elastic_workers:
+                with claim_lock:
+                    active = int(active_workers.value)
+                    enabled = worker_id < active
+                    worker_busy[worker_id] = int(enabled)
+                if not enabled:
+                    stop_event.wait(0.01)
+                    continue
+                # Even a one-core grant must be able to execute both stages.
+                # Never park every augmenter behind occupied raw/credit slots.
+                affinity = max(1, min(int(stage1_affinity_workers), active - 1))
+                home_load = worker_id < affinity
             candidate = claim_load() if home_load else None
             if candidate is not None:
                 stage = "load"
@@ -381,20 +400,23 @@ def _shared_worker_main(
                     target_frontier.value = min(
                         int(end_index), int(target_frontier.value) + 2
                     )
-                try:
-                    raw_queue.put(item, timeout=0.001)
-                except queue.Full:
-                    # The worker is shared: when augmentation is persistently
-                    # behind and its bounded queue is full, consume this ready
-                    # sample directly instead of blocking a CPU on publication.
+                if int(shared_worker_count) == 1 or elastic_workers and active == 1:
+                    # Do not publish and then assume we can get our own item
+                    # back: a pre-shrink consumer may still take it. Keeping
+                    # ownership avoids a blocking get with no remaining loader.
                     run_augment(item)
-                if int(shared_worker_count) == 1 and stage != "augment":
-                    run_augment(raw_queue.get())
+                else:
+                    try:
+                        raw_queue.put(item, timeout=0.001)
+                    except queue.Full:
+                        # Consume ready work directly instead of blocking a
+                        # shared worker on publication into a full raw queue.
+                        run_augment(item)
             else:
                 if home_load:
                     with claim_lock:
                         loads_fully_dispatched = int(next_index.value) >= int(end_index)
-                    if not loads_fully_dispatched:
+                    if not loads_fully_dispatched and not elastic_workers:
                         time.sleep(0.001)
                         continue
                 try:
@@ -449,6 +471,8 @@ class OrderedTwoStageSamplePipeline:
         shared_workers: int = 0,
         initial_in_flight: int | None = None,
         shared_stage1_affinity_workers: int | None = None,
+        elastic_workers: bool = False,
+        initial_active_workers: int | None = None,
     ) -> None:
         for name, value in (
             ("item_count", item_count),
@@ -466,6 +490,10 @@ class OrderedTwoStageSamplePipeline:
             if int(value) < 0:
                 raise ValueError(f"{name} must be >= 0")
         self.shared_pool = int(shared_workers) > 0
+        if elastic_workers and not self.shared_pool:
+            raise ValueError("elastic workers require the shared pool")
+        if initial_active_workers is not None and not elastic_workers:
+            raise ValueError("initial_active_workers requires elastic_workers")
         if self.shared_pool:
             if int(stage1_workers) != 0 or int(stage2_workers) != 0:
                 raise ValueError(
@@ -523,6 +551,12 @@ class OrderedTwoStageSamplePipeline:
         self.stop_event = self.context.Event()
         self.next_index = self.context.Value("q", self.start_index)
         self.claim_lock = self.context.Lock()
+        self.elastic_workers = bool(elastic_workers)
+        initial_active = int(shared_workers) if initial_active_workers is None else initial_active_workers
+        if type(initial_active) is not int or not 0 <= initial_active <= int(shared_workers):
+            raise ValueError("initial active workers exceeds shared pool")
+        self._active_workers = self.context.Value("q", initial_active)
+        self._worker_busy = self.context.Array("b", [0] * max(1, int(shared_workers)), lock=False)
         self.credits = self.context.BoundedSemaphore(int(max_in_flight))
         self.processes: list[Any] = []
         self.controls: list[Connection] = []
@@ -599,6 +633,9 @@ class OrderedTwoStageSamplePipeline:
                             self._shared_stage1_count_array,
                             self._shared_stage2_count_array,
                             self.shared_workers,
+                            self._active_workers,
+                            self._worker_busy,
+                            self.elastic_workers,
                         ),
                         name=f"ordered-sample-shared-{worker_id}",
                     )
@@ -752,16 +789,64 @@ class OrderedTwoStageSamplePipeline:
                 ).get(timeout=min(0.1, remaining))
             except queue.Empty:
                 continue
-            received_ns = time.perf_counter_ns()
-            index = int(completed.index)
-            if index < self.next_expected or index in self.reorder:
-                raise RuntimeError(f"duplicate pipeline completion for sample {index}")
-            if not (self.start_index <= index < self.end_index):
-                raise RuntimeError(f"out-of-range pipeline completion for sample {index}")
-            self.reorder[index] = completed
-            self.received_ns[index] = received_ns
-            self.received += 1
-            self.reorder_highwater = max(self.reorder_highwater, len(self.reorder))
+            self._record_completed(completed)
+        return self._deliver_next(release_credit=release_credit)
+
+    def _record_completed(self, completed: Any) -> None:
+        index = int(completed.index)
+        if index < self.next_expected or index in self.reorder:
+            raise RuntimeError(f"duplicate pipeline completion for sample {index}")
+        if not (self.start_index <= index < self.end_index):
+            raise RuntimeError(f"out-of-range pipeline completion for sample {index}")
+        self.reorder[index] = completed
+        self.received_ns[index] = time.perf_counter_ns()
+        self.received += 1
+        self.reorder_highwater = max(self.reorder_highwater, len(self.reorder))
+
+    def poll_ready(self, *, limit: int = 64) -> int:
+        """Drain completions without waiting for the next canonical sample.
+
+        Also call while shrinking/paused: completed workers must not remain
+        blocked publishing into a full result queue. Credits still bound RAM.
+        """
+        if self.closed:
+            raise RuntimeError("pipeline is closed")
+        self._check_processes()
+        received = 0
+        for _ in range(limit):
+            try:
+                completed = (self.result_queue if self.has_stage2 else self.raw_queue).get_nowait()
+            except queue.Empty:
+                break
+            self._record_completed(completed)
+            received += 1
+        return received
+
+    def try_next_ordered(self, *, release_credit: bool = True) -> OrderedPipelineResult | None:
+        if self.delivered >= self.item_count:
+            raise StopIteration
+        self.poll_ready()
+        if self.next_expected not in self.reorder:
+            return None
+        return self._deliver_next(release_credit=release_credit)
+
+    def set_worker_limit(self, count: int) -> None:
+        """Cooperative shrink: current jobs finish, surplus workers then park."""
+        if not self.elastic_workers or self.closed:
+            raise RuntimeError("worker limit requires an open elastic pool")
+        if type(count) is not int or not 0 <= count <= self.shared_workers:
+            raise ValueError("worker count exceeds the persistent shared pool")
+        with self.claim_lock:
+            self._active_workers.value = count
+
+    def workers_within_limit(self) -> bool:
+        """True only when every surplus worker has finished its current job."""
+        if not self.elastic_workers:
+            raise RuntimeError("worker limit requires an elastic pool")
+        with self.claim_lock:
+            return not any(self._worker_busy[int(self._active_workers.value):])
+
+    def _deliver_next(self, *, release_credit: bool) -> OrderedPipelineResult:
         completed = self.reorder.pop(self.next_expected)
         received_ns = self.received_ns.pop(self.next_expected)
         delivered_ns = time.perf_counter_ns()

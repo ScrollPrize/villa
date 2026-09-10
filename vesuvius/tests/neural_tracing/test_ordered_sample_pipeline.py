@@ -101,6 +101,48 @@ def _pipeline(**overrides: object) -> OrderedTwoStageSamplePipeline:
     return OrderedTwoStageSamplePipeline(**args)  # type: ignore[arg-type]
 
 
+def test_elastic_shared_pool_parks_resumes_and_one_worker_finishes_both_stages():
+    with _pipeline(stage1_workers=0, stage2_workers=0, shared_workers=4,
+                   shared_stage1_affinity_workers=3, elastic_workers=True,
+                   initial_active_workers=0, item_count=30) as pipeline:
+        pids = [p.pid for p in pipeline.processes]
+        assert pipeline.workers_within_limit()
+        assert pipeline.try_next_ordered() is None
+        pipeline.set_worker_limit(4)
+        first = pipeline.next_ordered()
+        assert first.index == 0
+        pipeline.set_worker_limit(0)
+        deadline = time.monotonic() + 10
+        while not pipeline.workers_within_limit():
+            pipeline.poll_ready()
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        frontier = int(pipeline.next_index.value)
+        time.sleep(0.05)
+        assert int(pipeline.next_index.value) == frontier
+        assert pipeline.received <= pipeline.max_in_flight + 1
+        pipeline.set_worker_limit(1)
+        results = [first] + [pipeline.next_ordered() for _ in range(29)]
+        assert [r.index for r in results] == list(range(30))
+        assert [r.value for r in results] == [(i + 10) * 2 for i in range(30)]
+        assert [p.pid for p in pipeline.processes] == pids
+
+
+def test_try_next_ordered_keeps_pending_samples_and_lease_credit():
+    with _pipeline(stage1_factory=_StageOneFactory(slow_first=True),
+                   stage1_workers=0, stage2_workers=0, shared_workers=2,
+                   elastic_workers=True, shared_stage1_affinity_workers=1) as pipeline:
+        result = None
+        deadline = time.monotonic() + 10
+        while result is None:
+            result = pipeline.try_next_ordered(release_credit=False)
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert result.index == 0 and pipeline.leased == {0}
+        pipeline.release(0)
+        assert [pipeline.next_ordered().index for _ in range(11)] == list(range(1, 12))
+
+
 def _shared_pipeline(**overrides: object) -> OrderedTwoStageSamplePipeline:
     args: dict[str, object] = {
         "stage1_factory": _StageOneFactory(),

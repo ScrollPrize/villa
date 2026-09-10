@@ -702,6 +702,50 @@ def test_loss_statistics_are_invariant_to_uneven_sparse_sample_partition() -> No
         assert torch.allclose(whole_losses[key], split_losses[key], atol=1.0e-6)
 
 
+@pytest.mark.parametrize("branches", [1, 2])
+def test_bounded_gradients_match_actual_fiber_loss(branches) -> None:
+    import copy
+    from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import ComponentGradientAccumulator
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    torch.manual_seed(19)
+    model = torch.nn.Sequential(torch.nn.Conv3d(1, 7 * branches, 1), torch.nn.Sigmoid())
+    oracle = copy.deepcopy(model)
+    compute_losses(oracle(batch.volume), batch, direction_weight=2, presence_weight=3,
+                   branch_selection_mode="train_offset_grid_min_fraction")["total"].backward()
+    accumulator = ComponentGradientAccumulator(model)
+    for i in range(2):
+        part = _slice_batch(batch, i, i + 1)
+        accumulator.add(compute_losses(model(part.volume), part, direction_weight=2, presence_weight=3,
+                                      branch_selection_mode="train_offset_grid_min_fraction", _return_statistics=True))
+    accumulator.reduce_and_assign(direction_weight=2, presence_weight=3)
+    for actual, expected in zip(model.parameters(), oracle.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=3e-6, rtol=3e-5)
+
+
+def test_bounded_gradients_match_actual_conditioned_loss() -> None:
+    import copy
+    from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import ComponentGradientAccumulator
+    batch = _load_materialized_batch(_loader(augment_enabled=False), 0)
+    torch.manual_seed(31)
+    model = FiberTrace3DNet(FiberTrace3DModelConfig(
+        conditioned_decoder_enabled=True, conditioned_latent_channels=8,
+        conditioned_decoder_hidden_channels=8, conditioned_decoder_layers=2,
+        features_per_stage=(4, 8), strides=((1, 1, 1), (2, 2, 2)), normalization="group"))
+    oracle = copy.deepcopy(model)
+    compute_conditioned_losses(oracle, batch, direction_weight=2, presence_weight=3)["total"].backward()
+    accumulator = ComponentGradientAccumulator(model)
+    for i in range(2):
+        accumulator.add(compute_conditioned_losses(model, _slice_batch(batch, i, i + 1),
+                        direction_weight=2, presence_weight=3, _return_statistics=True))
+    accumulator.reduce_and_assign(direction_weight=2, presence_weight=3)
+    for actual, expected in zip(model.parameters(), oracle.parameters()):
+        if expected.grad is None:
+            assert actual.grad is None
+        else:
+            torch.testing.assert_close(actual.grad, expected.grad, atol=1e-5, rtol=1e-4)
+
+
 def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):
     normal = np.asarray(normal_zyx, dtype=np.float32)
 

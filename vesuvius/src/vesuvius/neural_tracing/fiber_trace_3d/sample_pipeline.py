@@ -136,6 +136,7 @@ class FiberTrace3DLoadFactory:
     sample_mode: str
     index_map: Callable[[int], int] = IdentitySampleIndex()
     profile: bool = True
+    single_core: bool = False
 
     def __call__(self) -> FiberTrace3DLoadOperation:
         warnings.filterwarnings(
@@ -143,8 +144,13 @@ class FiberTrace3DLoadFactory:
             message=r"skipping NML fiber component with branch node:.*",
             category=RuntimeWarning,
         )
+        config = load_config(self.config_path)
+        if self.single_core:
+            from .cooperative_resources import initialize_worker_volume_cache
+            initialize_worker_volume_cache({"volume_cache_memory_mib": config.volume_cache_memory_mib})
+            config = replace(config, volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
         return FiberTrace3DLoadOperation(
-            FiberTrace3DLoader(load_config(self.config_path)),
+            FiberTrace3DLoader(config),
             self.sample_index_limit,
             self.sample_mode,
             self.index_map,
@@ -228,6 +234,44 @@ class FiberTrace3DAugmentFactory:
         )
 
 
+def collate_pipeline_results(results, volumes, *, defer_cuda_value_augmentation=None,
+                             profile=False, total_start=None, cpu_start=None, wall_start_ns=None):
+    """Shared collation for rank-local and persistent canonical sample owners."""
+    samples = []
+    deferred_kernels, deferred_params = [], []
+    for result in results:
+        value = result.value
+        if defer_cuda_value_augmentation is not None:
+            if not isinstance(value, FiberTrace3DRawSample):
+                raise RuntimeError("training sample pipeline lost deferred augmentation")
+            sample = value.sample
+            deferred_kernels.append(value.blur_kernels)
+            deferred_params.append(value.augmentation)
+        else:
+            if not isinstance(value, FiberTrace3DSample):
+                raise RuntimeError("training sample pipeline returned an invalid sample")
+            sample = value
+        if profile:
+            timings = dict(sample.profile_timings_ms or {})
+            timings.update(
+                pipeline_stage1_service_ms=float(result.stage1_service_ms),
+                pipeline_stage1_cpu_ms=float(result.stage1_cpu_ms),
+                pipeline_raw_queue_ms=float(result.raw_queue_ms),
+                pipeline_stage2_service_ms=float(result.stage2_service_ms),
+                pipeline_stage2_cpu_ms=float(result.stage2_cpu_ms),
+                pipeline_result_queue_ms=float(result.result_queue_ms),
+                pipeline_reorder_wait_ms=float(result.reorder_wait_ms),
+            )
+            sample = replace(sample, profile_timings_ms=timings)
+        samples.append(sample)
+    return collate_fiber_trace_3d_samples(
+        samples, volume_batch=volumes,
+        deferred_augmentation_params=tuple(deferred_params) if defer_cuda_value_augmentation is not None else None,
+        deferred_blur_kernels=tuple(deferred_kernels) if defer_cuda_value_augmentation is not None else None,
+        profile=profile, total_start=total_start, cpu_total_start=cpu_start, wall_start_ns=wall_start_ns,
+    )
+
+
 class FiberTrace3DTrainingBatchPipeline:
     """Present deterministic batches backed by the bounded per-sample pipeline."""
 
@@ -247,6 +291,8 @@ class FiberTrace3DTrainingBatchPipeline:
         sample_mode: str,
         profile: bool,
         defer_cuda_value_augmentation: str | None = None,
+        batch_sizes: tuple[int, ...] | None = None,
+        single_core_load: bool = False,
     ) -> None:
         if int(batch_count) <= 0:
             raise ValueError("batch_count must be positive")
@@ -255,6 +301,13 @@ class FiberTrace3DTrainingBatchPipeline:
         if int(initial_in_flight) < int(batch_size):
             raise ValueError("initial_in_flight must be at least one batch")
         self.batch_size = int(batch_size)
+        self.batch_sizes = (self.batch_size,) if batch_sizes is None else tuple(batch_sizes)
+        if not self.batch_sizes or any(type(size) is not int or not 0 < size <= self.batch_size for size in self.batch_sizes):
+            raise ValueError("batch_sizes must be a nonempty pattern within batch_size")
+        if int(batch_count) % len(self.batch_sizes):
+            raise ValueError("batch_count must cover whole batch-size patterns")
+        self._batch_count, self._batch_ordinal = int(batch_count), 0
+        self._variable_batches = batch_sizes is not None
         self.profile = bool(profile)
         self.defer_cuda_value_augmentation = defer_cuda_value_augmentation
         self._leased: list[int] = []
@@ -276,6 +329,7 @@ class FiberTrace3DTrainingBatchPipeline:
                 sample_mode,
                 index_map=index_map,
                 profile=profile,
+                single_core=single_core_load,
             ),
             stage2_factory=FiberTrace3DAugmentFactory(
                 config_path,
@@ -283,7 +337,7 @@ class FiberTrace3DTrainingBatchPipeline:
                 defer_cuda_suffix=self.defer_cuda_value_augmentation,
             ),
             start_index=0,
-            item_count=int(batch_count) * self.batch_size,
+            item_count=(int(batch_count) // len(self.batch_sizes)) * sum(self.batch_sizes),
             stage1_workers=0,
             stage2_workers=0,
             raw_queue_capacity=max(self.batch_size, min(int(slot_count), int(workers))),
@@ -302,62 +356,24 @@ class FiberTrace3DTrainingBatchPipeline:
     def __next__(self) -> FiberTrace3DBatch:
         if self._leased:
             raise RuntimeError("previous Fiber3D pipeline batch was not released")
+        if self._batch_ordinal >= self._batch_count:
+            raise StopIteration
+        take = self.batch_sizes[self._batch_ordinal % len(self.batch_sizes)]
         total_start = time.perf_counter()
         cpu_start = time.process_time()
         wall_start_ns = time.time_ns()
         results = [
             self.pipeline.next_ordered(release_credit=False)
-            for _ in range(self.batch_size)
+            for _ in range(take)
         ]
         indices = [int(result.index) for result in results]
-        volumes = self.transport.batch_tensors(indices)
-        samples: list[FiberTrace3DSample] = []
-        deferred_kernels: list[Any] = []
-        deferred_params: list[Any] = []
-        for result in results:
-            value = result.value
-            if self.defer_cuda_value_augmentation is not None:
-                if not isinstance(value, FiberTrace3DRawSample):
-                    raise RuntimeError("training sample pipeline lost deferred augmentation")
-                sample = value.sample
-                deferred_kernels.append(value.blur_kernels)
-                deferred_params.append(value.augmentation)
-            else:
-                if not isinstance(value, FiberTrace3DSample):
-                    raise RuntimeError("training sample pipeline returned an invalid sample")
-                sample = value
-            if self.profile:
-                timings = dict(sample.profile_timings_ms or {})
-                timings.update(
-                    pipeline_stage1_service_ms=float(result.stage1_service_ms),
-                    pipeline_stage1_cpu_ms=float(result.stage1_cpu_ms),
-                    pipeline_raw_queue_ms=float(result.raw_queue_ms),
-                    pipeline_stage2_service_ms=float(result.stage2_service_ms),
-                    pipeline_stage2_cpu_ms=float(result.stage2_cpu_ms),
-                    pipeline_result_queue_ms=float(result.result_queue_ms),
-                    pipeline_reorder_wait_ms=float(result.reorder_wait_ms),
-                )
-                sample = replace(sample, profile_timings_ms=timings)
-            samples.append(sample)
-        batch = collate_fiber_trace_3d_samples(
-            samples,
-            volume_batch=volumes,
-            deferred_augmentation_params=(
-                tuple(deferred_params)
-                if self.defer_cuda_value_augmentation is not None
-                else None
-            ),
-            deferred_blur_kernels=(
-                tuple(deferred_kernels)
-                if self.defer_cuda_value_augmentation is not None
-                else None
-            ),
-            profile=self.profile,
-            total_start=total_start,
-            cpu_total_start=cpu_start,
-            wall_start_ns=wall_start_ns,
+        volumes = self.transport.batch_tensors(indices, allow_wrap=self._variable_batches)
+        batch = collate_pipeline_results(
+            results, volumes, defer_cuda_value_augmentation=self.defer_cuda_value_augmentation,
+            profile=self.profile, total_start=total_start, cpu_start=cpu_start, wall_start_ns=wall_start_ns,
         )
         self._leased = indices
+        self._batch_ordinal += 1
         return batch
 
     def release_current(self) -> None:
@@ -419,11 +435,15 @@ class FiberTrace3DCudaBatchPipeline:
             raise ValueError("CUDA batch preparation depth must be positive")
         self.source = source
         self.config = config
-        self.device = device
+        # Resolve the caller's current device before starting the preparation
+        # thread: CUDA's current device is thread-local, and set_device rejects
+        # an index-less torch.device('cuda').
+        self.device = (torch.device("cuda", torch.cuda.current_device())
+                       if device.index is None else device)
         self.output_stride = int(output_stride)
         self.depth = int(depth)
         self.value_augmentation_suffix = value_augmentation_suffix
-        self.stream = torch.cuda.Stream(device=device)
+        self.stream = torch.cuda.Stream(device=self.device)
         self._results: queue.Queue[object] = queue.Queue()
         self._available = threading.Semaphore(self.depth)
         self._stop = threading.Event()
