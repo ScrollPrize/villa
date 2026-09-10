@@ -265,7 +265,7 @@ QString segmentsEntryLocationForPath(const QString& outputDir, const QString& vo
 std::optional<QString> openDataPatchesRootForVolume(const VolumePkg& pkg,
                                                      const QString& loadedVolumeId)
 {
-    if (loadedVolumeId.isEmpty() || !pkg.hasRemoteCacheRoot()) {
+    if (loadedVolumeId.isEmpty()) {
         return std::nullopt;
     }
 
@@ -273,9 +273,9 @@ std::optional<QString> openDataPatchesRootForVolume(const VolumePkg& pkg,
     for (const auto& tag : tags) {
         if (tag.rfind(vc3d::opendata::kOpenDataSampleIdTagPrefix, 0) == 0) {
             const auto path = vc3d::opendata::openDataPatchesRoot(
-                pkg.remoteCacheRootOrEmpty(),
+                vc3d::remoteCachePathFs(),
                 tag.substr(vc3d::opendata::kOpenDataSampleIdTagPrefix.size()));
-            return QString::fromStdString(path.string());
+            return vc3d::pathToQString(path);
         }
     }
     return std::nullopt;
@@ -1027,9 +1027,10 @@ private:
 
     // Compute area_vx2 from the freshly-written tifxyz at 'dir' and write
     // both area_vx2 and area_cm2 into its meta.json. voxelSize is in micrometers
-    // per voxel (same units as Volume::voxelSize()); area_cm2 = vx2 * vs^2 / 1e8
-    // matches SurfaceAreaCalculator's convention. Returns true on success;
-    // failures are non-fatal — caller may continue without updated area.
+    // per voxel (same units as Volume::voxelSize()); area_cm2 is derived by
+    // vc::surface::areaCm2FromVox2, and omitted when the voxel size is unknown,
+    // the same way SurfaceAreaCalculator and the tracers record it. Returns true
+    // on success; failures are non-fatal — caller may continue without updated area.
     static bool updateAreaInMeta_(const QString& dir, double voxelSize) {
         std::unique_ptr<QuadSurface> qs;
         try {
@@ -1042,10 +1043,7 @@ private:
         const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*qs);
         if (!std::isfinite(area_vx2) || area_vx2 <= 0.0) return false;
 
-        double area_cm2 = std::numeric_limits<double>::quiet_NaN();
-        if (std::isfinite(voxelSize) && voxelSize > 0.0) {
-            area_cm2 = area_vx2 * voxelSize * voxelSize / 1e8;
-        }
+        const auto area_cm2 = vc::surface::areaCm2FromVox2(area_vx2, voxelSize);
 
         const QString metaPath = QDir(dir).filePath(QStringLiteral("meta.json"));
         QJsonObject root;
@@ -1058,8 +1056,14 @@ private:
             }
         }
         root.insert(QStringLiteral("area_vx2"), area_vx2);
-        if (std::isfinite(area_cm2)) {
-            root.insert(QStringLiteral("area_cm2"), area_cm2);
+        if (area_cm2) {
+            root.insert(QStringLiteral("area_cm2"), *area_cm2);
+        } else {
+            // The geometry just changed. Leaving the previous area_cm2 beside
+            // the new area_vx2 would describe neither: consumers that recover
+            // a voxel size from the pair would read it scaled by the ratio of
+            // the two geometries.
+            root.remove(QStringLiteral("area_cm2"));
         }
 
         QFile out(metaPath);
@@ -2050,10 +2054,20 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
         return;
     }
 
+    // Trim once: the dialog enables its Zarr options on the trimmed path, so the
+    // command builder has to use the same value or the two disagree on a pattern
+    // with trailing whitespace.
+    const QString chosenOutputPattern = dlg.outputPattern().trimmed();
     _cmdRunner->setSegmentPath(dlg.segmentPath());
-    _cmdRunner->setOutputPattern(dlg.outputPattern());
-    // Interactive renders always start from the TIFF-stack default.
-    _cmdRunner->setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
+    _cmdRunner->setOutputPattern(chosenOutputPattern);
+    // Interactive renders default to a TIFF stack; a .zarr output path is how
+    // the dialog asks for the zarr store instead. That same suffix is what
+    // enables its "Also write TIFF slices (Zarr)" checkbox, so the two have to
+    // agree or the checkbox has nothing to attach to.
+    _cmdRunner->setRenderOutputFormat(
+        chosenOutputPattern.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)
+            ? CommandLineToolRunner::RenderOutputFormat::Zarr
+            : CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setRenderVoxelSize(
         renderVolume ? renderVolume->voxelSize() : 0.0,
@@ -3299,6 +3313,19 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     double selectedVoxelSize = 0.0;
     if (auto selectedVolume = _state->vpkg()->volume(selectedVolumeId.toStdString())) {
         selectedVoxelSize = selectedVolume->voxelSize();
+    }
+    // vc_grow_seg_from_seed refuses a physical min_area_cm without a voxel
+    // size. Say so here, where the message reaches the user and the fix is
+    // one field away, instead of surfacing only as "exit code 1" along with
+    // a hint naming a params file this dialog has already deleted.
+    if (minAreaCm > 0.0 && !(std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0)) {
+        return fail(tr("Volume '%1' reports no voxel size, so the minimum patch area of %2 cm² "
+                       "cannot be evaluated. Set the minimum area to 0 to grow without a "
+                       "size threshold, or add \"voxelsize\" (µm per voxel) to the volume's "
+                       "metadata.")
+                        .arg(selectedVolumeId)
+                        .arg(minAreaCm),
+                    CommandLaunchError::InvalidState);
     }
 
     const QString segmentsEntry = segmentsEntryLocationForPath(outputDirPath, volpkgRoot);

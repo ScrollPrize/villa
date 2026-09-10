@@ -1,13 +1,22 @@
-# Standalone unit test for SeedingBatchTracker (apps/VC3D/SeedingBatchTracker.*),
-# the honest run/expand batch-outcome aggregation extracted from SeedingWidget.
-# Deterministic, no process launch, no volume data — safe for the default ctest
-# run. Built only under VC_TESTING (wired from the top-level testing block).
-#
-# The tracker is a small QObject-free class using only QString/QStringList/QSet,
-# so we compile its source straight into the test and link just Qt6::Core (for
-# QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
-# in, keeping the test fast and self-contained.
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+
+add_executable(test_vc_settings
+    test_vc_settings.cpp)
+
+set_target_properties(test_vc_settings PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_vc_settings PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_vc_settings PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME vc_settings COMMAND test_vc_settings)
+vc_register_test_target(test_vc_settings)
+vc_register_ctest(vc_settings test_vc_settings)
 
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
@@ -133,7 +142,9 @@ vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
 
 set_target_properties(test_fiber_network_layout PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -164,6 +175,8 @@ set_target_properties(test_command_line_tool_runner PROPERTIES
 
 target_include_directories(test_command_line_tool_runner PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_compile_definitions(test_command_line_tool_runner PRIVATE VC_TESTING)
 
 target_link_libraries(test_command_line_tool_runner PRIVATE
     Qt6::Core
@@ -214,3 +227,82 @@ target_link_libraries(test_fiber_map_staleness PRIVATE
 add_test(NAME fiber_map_staleness COMMAND test_fiber_map_staleness)
 vc_register_test_target(test_fiber_map_staleness)
 vc_register_ctest(fiber_map_staleness test_fiber_map_staleness)
+
+add_executable(test_fiber_winding_solver
+    test_fiber_winding_solver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_winding_solver PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_winding_solver PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_winding_solver PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_winding_solver COMMAND test_fiber_winding_solver)
+vc_register_test_target(test_fiber_winding_solver)
+vc_register_ctest(fiber_winding_solver test_fiber_winding_solver)
+
+add_executable(test_fiber_global_layout
+    test_fiber_global_layout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_global_layout PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_global_layout PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_global_layout PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_global_layout COMMAND test_fiber_global_layout)
+vc_register_test_target(test_fiber_global_layout)
+vc_register_ctest(fiber_global_layout test_fiber_global_layout)
+
+add_executable(test_fiber_map_rebuild_queue
+    test_fiber_map_rebuild_queue.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapRebuildQueue.hpp)
+
+set_target_properties(test_fiber_map_rebuild_queue PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_rebuild_queue PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_rebuild_queue PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_rebuild_queue COMMAND test_fiber_map_rebuild_queue)
+vc_register_test_target(test_fiber_map_rebuild_queue)
+vc_register_ctest(fiber_map_rebuild_queue test_fiber_map_rebuild_queue)
+
+add_executable(test_line_annotation_optimization_queue
+    test_line_annotation_optimization_queue.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationOptimizationQueue.hpp)
+
+set_target_properties(test_line_annotation_optimization_queue PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_line_annotation_optimization_queue PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_line_annotation_optimization_queue PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME line_annotation_optimization_queue
+    COMMAND test_line_annotation_optimization_queue)
+vc_register_test_target(test_line_annotation_optimization_queue)
+vc_register_ctest(line_annotation_optimization_queue
+    test_line_annotation_optimization_queue)

@@ -153,6 +153,10 @@ public:
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
+#ifdef VC_TESTING
+    QStringList argumentsForTesting(Tool tool) { return buildArguments(tool); }
+#endif
+
     // Valid while toolFinished is being delivered for the completed process.
     bool currentExecutionIsSilent() const
     {

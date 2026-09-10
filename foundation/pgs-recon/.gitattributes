@@ -1,0 +1,3 @@
+** whitespace=-trailing-space,-space-before-tab
+*.ai binary
+*.png binary

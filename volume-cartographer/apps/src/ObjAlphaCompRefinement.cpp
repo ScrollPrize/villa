@@ -401,6 +401,16 @@ int main(int argc, char *argv[])
 
     const int level = std::stoi(cfg.dataset_group);
     Volume volume(vol_path);
+    if (!volume.hasScaleLevel(level)) {
+        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
+        // through one silently yields fill value instead of failing.
+        std::cerr << "Error: dataset group " << cfg.dataset_group
+                  << " is not present in this volume; present levels:";
+        for (int presentLevel : volume.presentScaleLevels())
+            std::cerr << " " << presentLevel;
+        std::cerr << std::endl;
+        return EXIT_FAILURE;
+    }
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         cfg.cache_bytes);
     auto* chunk_cache = volume.chunkedCache();

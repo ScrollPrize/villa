@@ -12,6 +12,8 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "vc/core/util/Rect3D.hpp"
+
 class VolumePkg;
 class Volume;
 class QuadSurface;
@@ -47,6 +49,15 @@ public:
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
     void setCurrentVolume(std::shared_ptr<Volume> vol);
+
+    // --- Session focus bounds (base-volume XYZ) ---
+    std::optional<Rect3D> focusBounds() const;
+    std::optional<Rect3D> activeFocusBounds() const;
+    bool focusBoundsEnabled() const;
+    uint64_t focusBoundsRevision() const;
+    void setFocusBounds(const Rect3D& bounds);
+    void setFocusBoundsEnabled(bool enabled);
+    void clearFocusBounds();
 
     // --- Growth Volume ---
     std::string segmentationGrowthVolumeId() const;
@@ -101,6 +112,7 @@ signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
     void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
+    void focusBoundsChanged();
     void surfacesLoaded();
     void volumeClosing();
 
@@ -115,6 +127,9 @@ private:
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;
+    std::optional<Rect3D> _focusBounds;
+    bool _focusBoundsEnabled = false;
+    uint64_t _focusBoundsRevision = 0;
     std::string _segmentationGrowthVolumeId;
     std::weak_ptr<QuadSurface> _activeSurface;
     std::string _activeSurfaceId;

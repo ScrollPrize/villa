@@ -1,5 +1,7 @@
 #include "LineAnnotationDialog.hpp"
 
+
+
 #include "FiberNameDisplay.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
@@ -7,6 +9,7 @@
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -56,6 +59,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -71,6 +75,14 @@ namespace {
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
+
+// Index of a link state in the per-state fast overlay item arrays.
+constexpr size_t linkStateIndex(bool pending, bool sameHv)
+{
+    return (pending ? 1u : 0u) | (sameHv ? 2u : 0u);
+}
+constexpr bool linkStatePending(size_t state) { return (state & 1u) != 0; }
+constexpr bool linkStateSameHv(size_t state) { return (state & 2u) != 0; }
 constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
@@ -178,6 +190,35 @@ std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewe
         {gridColumn, static_cast<double>(points->rows / 2)});
     return cv::Vec2f{static_cast<float>(surfacePoint[0]),
                      static_cast<float>(surfacePoint[1])};
+}
+
+// Inverse of generatedStripSurfaceCenter for a camera: maps a strip camera's
+// surface coordinates back to the fractional line position under the view
+// center, through the given strip quad and position map (which must describe
+// the SAME line generation the camera coordinates were panned on). NaN when
+// unavailable.
+double stripCameraLinePosition(const CChunkedVolumeViewer::CameraState& camera,
+                               QuadSurface* quad,
+                               const vc::lasagna::LineStripPositionMap& positionMap)
+{
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    if (!quad || !std::isfinite(camera.surfacePtrX) || !std::isfinite(camera.surfacePtrY)) {
+        return kNaN;
+    }
+    const auto* points = quad->rawPointsPtr();
+    if (!points || points->empty()) {
+        return kNaN;
+    }
+    const cv::Vec2d gridPoint = quad->surfaceToGrid(
+        {static_cast<double>(camera.surfacePtrX), static_cast<double>(camera.surfacePtrY)});
+    if (!std::isfinite(gridPoint[0])) {
+        return kNaN;
+    }
+    const double gridColumn = std::clamp(gridPoint[0], 0.0,
+                                         static_cast<double>(points->cols - 1));
+    return positionMap.valid()
+        ? positionMap.stripGridColumnToOriginalPosition(gridColumn)
+        : gridColumn;
 }
 
 std::optional<float> generatedStripScaleForLinePositionRange(
@@ -793,8 +834,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const double savedArrowPanSpeed =
-            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED,
-                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_DEFAULT)
+            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX,
+                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX_DEFAULT)
                 .toDouble();
         _arrowPanCruiseSpeed =
             (std::isfinite(savedArrowPanSpeed) && savedArrowPanSpeed > 0.0)
@@ -1042,6 +1083,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     rebuildGeneratedOverlays(requestSideStripIntersections);
 }
 
+
 void LineAnnotationDialog::setGeneratedFiberIntersectionMarkers(
     std::vector<GeneratedOverlay::FiberIntersectionMarker> markers)
 {
@@ -1131,9 +1173,9 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
     updateGeneratedDynamicOverlaysFast(false, true);
 }
 
-void LineAnnotationDialog::setOptimizationBusy(bool busy)
+void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
 {
-    _optimizationBusy = busy;
+    _optimizationInputBlocked = busy && blockInput;
     if (_fiberOptimizationCombo) {
         _fiberOptimizationCombo->setEnabled(!busy);
     }
@@ -1161,10 +1203,31 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy)
         overlay->hide();
         _optimizationOverlay = overlay;
     }
+    if (!_optimizationBadge) {
+        // Passive counterpart of the overlay: a top-center pill that never
+        // takes input, for solves the user may keep editing through.
+        auto* badge = new QLabel(tr("Optimizing…"), content);
+        badge->setObjectName(QStringLiteral("lineAnnotationOptimizationBadge"));
+        badge->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        badge->setAttribute(Qt::WA_StyledBackground, true);
+        badge->setAlignment(Qt::AlignCenter);
+        badge->setStyleSheet(QStringLiteral(
+            "#lineAnnotationOptimizationBadge {"
+            " background-color: rgba(32, 32, 32, 190); color: white;"
+            " font-weight: 600; border-radius: 4px; padding: 3px 12px; }"));
+        badge->hide();
+        _optimizationBadge = badge;
+    }
     updateOptimizationOverlayGeometry();
-    _optimizationOverlay->setVisible(busy);
-    if (busy) {
+    const bool showOverlay = busy && blockInput;
+    const bool showBadge = busy && !blockInput;
+    _optimizationOverlay->setVisible(showOverlay);
+    _optimizationBadge->setVisible(showBadge);
+    if (showOverlay) {
         _optimizationOverlay->raise();
+    }
+    if (showBadge) {
+        _optimizationBadge->raise();
     }
 }
 
@@ -1347,7 +1410,6 @@ bool LineAnnotationDialog::setGeneratedRows(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending.clear();
-    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1362,6 +1424,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
@@ -1475,13 +1538,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 if (_arrowPanDirection != 0) {
-                    // During a keyboard pan every tick already rebuilds the
-                    // dynamic overlays (via setCurrentLinePosition), so only
-                    // the static strip overlays need to track the scrolling
-                    // camera here. The side-strip intersection request (which
-                    // clones geometry and snapshots+hashes every fiber per
-                    // call) waits for the landing's full refresh.
-                    rebuildGeneratedStaticStripOverlays();
+                    // During a keyboard pan every tick rebuilds the dynamic
+                    // overlays and shifts the static strip overlays with the
+                    // camera right after the camera move (tickArrowPan), so a
+                    // rebuild here would only re-place the control-point dots
+                    // at an arbitrary phase relative to the ticks. The
+                    // side-strip intersection request (which clones geometry
+                    // and snapshots+hashes every fiber per call) waits for the
+                    // landing's full refresh.
                     return;
                 }
                 rebuildGeneratedOverlays();
@@ -1608,8 +1672,76 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
+    QuadSurface* newLineSurface,
+    QuadSurface* newLineSideSlice,
+    const vc::lasagna::LineStripPositionMap& newPositionMap,
+    const std::vector<cv::Vec3f>& newLinePoints) const
+{
+    if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
+        return;
+    }
+    const std::array<QuadSurface*, 2> oldQuads{
+        _generatedViews.lineSurface.get(),
+        _generatedViews.lineSideSlice.get()};
+    const std::array<QuadSurface*, 2> newQuads{newLineSurface, newLineSideSlice};
+    for (size_t i = 0; i < oldQuads.size(); ++i) {
+        auto* stripViewer = _stripViewers[i].data();
+        QuadSurface* newQuad = newQuads[i];
+        if (!stripViewer || !newQuad) {
+            continue;
+        }
+        // Which fiber spot is under this strip camera's center right now, on
+        // the still-registered old surface?
+        const auto camera = stripViewer->cameraState();
+        const double oldPosition = stripCameraLinePosition(
+            camera, oldQuads[i], _generatedViews.stripPositionMap);
+        if (!std::isfinite(oldPosition)) {
+            continue;
+        }
+        // The same fiber spot's position on the new line, and its surface X
+        // under the new strip's (un-shifted) parameterization.
+        const double newPosition =
+            vc3d::line_annotation::remappedGeneratedLinePosition(
+                _generatedViews.linePoints, newLinePoints, oldPosition);
+        const auto* points = newQuad->rawPointsPtr();
+        if (!points || points->empty()) {
+            continue;
+        }
+        const double gridColumn = newPositionMap.valid()
+            ? newPositionMap.originalPositionToStripGridColumn(newPosition)
+            : newPosition;
+        if (!std::isfinite(gridColumn)) {
+            continue;
+        }
+        const double clampedColumn = std::clamp(
+            gridColumn, 0.0, static_cast<double>(points->cols - 1));
+        const double newSurfaceX = newQuad->gridToSurface(
+            {clampedColumn, static_cast<double>(points->rows / 2)})[0];
+        if (!std::isfinite(newSurfaceX)) {
+            continue;
+        }
+        const double delta = newSurfaceX - static_cast<double>(camera.surfacePtrX);
+        if (delta == 0.0) {
+            return;
+        }
+        // One shared shift for both strips: their cameras are X-linked, so a
+        // per-strip delta would tear the link apart. Both strips are built
+        // from the same line at the same along-spacing, so the first usable
+        // strip's delta is the right one for both. Y is left alone -- the
+        // cross-strip parameterization is stable and vertical pan is the
+        // user's.
+        for (QuadSurface* quad : newQuads) {
+            if (quad) {
+                quad->shiftSurfaceOrigin({delta, 0.0});
+            }
+        }
+        return;
+    }
+}
+
 bool LineAnnotationDialog::setGeneratedLineViews(
-    const GeneratedViews& views,
+    GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
@@ -1645,9 +1777,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
-        const std::optional<cv::Vec3f> previousPendingPlacementFocus =
-            _pendingPlacementFocus;
-        _generatedViews = views;
+        _generatedViews = std::move(views);
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
             _generatedViews.lineNormals);
@@ -1656,22 +1786,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 _generatedViews.controlPoints);
         const double maxLinePosition =
             static_cast<double>(_generatedViews.linePoints.size() - 1);
-        // After a control-point placement, land the current position on the
-        // control point that resulted from the click (positions renumber when
-        // the line is re-optimized, so the old numeric position is ambiguous).
-        double targetLinePosition = previousLinePosition;
-        if (_pendingPlacementFocus) {
-            if (const auto nearest =
-                    vc3d::line_annotation::nearestGeneratedControlPointIndex(
-                        _generatedViews.controlPoints, *_pendingPlacementFocus)) {
-                const double controlPosition =
-                    _generatedViews.controlPoints[*nearest].linePosition;
-                if (std::isfinite(controlPosition)) {
-                    targetLinePosition = controlPosition;
-                }
-            }
-            _pendingPlacementFocus.reset();
-        }
+        // Land the current position on the same fiber spot: positions renumber
+        // when the line is re-optimized, so the old numeric position is
+        // remapped through its 3D point instead of reused. Deliberately never
+        // recentered on a just-placed control point -- an update must not move
+        // the view (the cameras belong to the user, who may be mid-pan).
+        const double targetLinePosition =
+            vc3d::line_annotation::remappedGeneratedLinePosition(
+                _heldGeneratedViews.linePoints,
+                _generatedViews.linePoints,
+                previousLinePosition);
         _currentLinePosition =
             std::clamp(targetLinePosition, 0.0, maxLinePosition);
         // The one step of the in-place update that can fail, validated before
@@ -1688,7 +1812,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             _generatedControlIndex = _heldControlIndex;
             _currentLinePosition = previousLinePosition;
             _displayTangentSign = previousDisplayTangentSign;
-            _pendingPlacementFocus = previousPendingPlacementFocus;
             return false;
         }
         // The re-optimized views renumber line positions, so an in-flight
@@ -1701,6 +1824,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending.assign(_stripViewers.size(), true);
         _currentCutNormalOffsetVx = 0.0;
+        _currentCutStraightAheadActive = false;
         _sideCutNormalOffsetVx = 0.0;
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -1861,7 +1985,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending.clear();
-    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1891,6 +2014,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = views.initialCurrentCutFollowsStripMouse;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
@@ -1948,8 +2072,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
     currentViewer->setShiftScrollOverride(
-        [this](int steps, QPointF, Qt::KeyboardModifiers) {
-            // Always step along the line; the cut plane never leaves it.
+        [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
+            // Ctrl+Shift slides the plane straight ahead (off the model line);
+            // plain Shift steps along the line and the cut plane never leaves it.
+            if (modifiers.testFlag(Qt::ControlModifier)) {
+                return shiftCurrentCutStraightAheadByScrollSteps(steps);
+            }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
     bindPaneInteractions(views.currentCutName, currentViewer, false);
@@ -1972,10 +2100,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
-                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(currentViewer);
@@ -2032,10 +2160,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
-                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
-                                                        _currentLinePosition);
+                                                        _currentLinePosition,
+                                                        interpolatedLinePoint(_currentLinePosition));
                 }
             });
     topSplitter->addWidget(sideViewer);
@@ -2150,8 +2278,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
-                            _pendingPlacementFocus = volumePoint;
-                            emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                            emit generatedControlPointRequested(surfaceName,
+                                                                volumePoint,
+                                                                position,
+                                                                interpolatedLinePoint(position));
                         }
                     }
                 });
@@ -2218,7 +2348,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
     const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState)
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState,
+    std::function<QString(uint64_t)> fiberDisplayNameForId)
 {
     if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
         _generatedViews.linePoints.empty()) {
@@ -2291,6 +2423,8 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.splitFromCandidateEnabled = splitCandidateState.enabled;
     options.splitFromCandidateLabel = splitCandidateState.label;
     options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
+    options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
+    options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
@@ -2298,15 +2432,11 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                   selectedLinePosition,
                                                   selectedPoint);
     };
-    options.addBranch = [this, surfaceName](size_t controlPointIndex,
-                                            cv::Vec3f linkedControlPoint,
-                                            bool openAfterCreate,
-                                            cv::Vec3f linkDirection) {
-        emit generatedControlPointBranchRequested(surfaceName,
-                                                  controlPointIndex,
-                                                  linkedControlPoint,
-                                                  openAfterCreate,
-                                                  linkDirection);
+    options.newLineAnnotationLinkedToCandidate = [this, surfaceName](cv::Vec3f volumePoint,
+                                                                     cv::Vec3f linkDirection) {
+        emit generatedNewLineAnnotationLinkedToCandidateRequested(surfaceName,
+                                                                  volumePoint,
+                                                                  linkDirection);
     };
     options.openBranch = [this](uint64_t branchFiberId, int branchControlPointIndex) {
         emit generatedControlPointBranchOpenRequested(branchFiberId, branchControlPointIndex);
@@ -2390,14 +2520,14 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
-void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
-                                                 CChunkedVolumeViewer* viewer,
-                                                 const GeneratedOverlay& overlay)
+std::string LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
+                                                        CChunkedVolumeViewer* viewer,
+                                                        const GeneratedOverlay& overlay)
 {
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
-        return;
+        return {};
     }
-    vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
+    return vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
 }
 
 void LineAnnotationDialog::clearControlPointContextPreview(const std::string& surfaceName,
@@ -2452,13 +2582,18 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         return;
     }
     position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
+    // A straight-ahead (Ctrl+Shift+wheel) displacement counts as a change even
+    // at an unchanged position: every along-line navigation snaps the cut plane
+    // back onto the model line.
     const bool currentChanged =
-        forceApply || std::abs(position - _currentLinePosition) >= 1.0e-3;
+        forceApply || std::abs(position - _currentLinePosition) >= 1.0e-3 ||
+        _currentCutStraightAheadActive;
     if (!currentChanged) {
         return;
     }
     if (currentChanged && _generatedViews.currentCutSurface) {
         _currentCutNormalOffsetVx = 0.0;
+        _currentCutStraightAheadActive = false;
         if (_currentCutViewer) {
             _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         }
@@ -2505,16 +2640,83 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
-    const double position = vc3d::line_annotation::shiftedLinePosition(
+    // Arclength units: one notch is one strip column of base voxels wherever
+    // the dense line's vertex spacing happens to be (see LineAnnotationShiftScroll.hpp).
+    const double position = vc3d::line_annotation::shiftedLinePositionByArclength(
         _currentLinePosition,
         steps,
         sliceStepSize,
-        static_cast<int>(_generatedViews.linePoints.size()));
-    _currentCutNormalOffsetVx = 0.0;
-    if (_currentCutViewer) {
-        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
-    }
+        currentLineArclengths());
+    // setCurrentLinePosition re-poses the plane on the line (and sees a pending
+    // straight-ahead displacement as a change), so no offset reset is needed here.
     setCurrentLinePosition(position);
+    return true;
+}
+
+bool LineAnnotationDialog::shiftCurrentCutStraightAheadByScrollSteps(int steps)
+{
+    PlaneSurface* plane = _generatedViews.currentCutSurface.get();
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || !plane || steps == 0) {
+        return true;
+    }
+    // Like the along-line scroll, the notch supersedes a running keyboard pan
+    // and any coalesced hover-follow flush still in the timer, whether or not
+    // it ends up moving anything: either would otherwise re-pose the plane a
+    // few ms later.
+    cancelArrowPan();
+    _lineUpdatePending = false;
+    if (_lineUpdateTimer) {
+        _lineUpdateTimer->stop();
+    }
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
+    // The geometry is computed and validated before any of it is applied, so a
+    // degenerate plane cannot leave the marker advanced with the plane in place.
+    const auto& arclengths = currentLineArclengths();
+    const double newPosition = vc3d::line_annotation::shiftedLinePositionByArclength(
+        _currentLinePosition,
+        steps,
+        sliceStepSize,
+        arclengths);
+    const double distanceVx = vc3d::line_annotation::straightAheadDistanceForShiftScroll(
+        _currentLinePosition, newPosition, arclengths);
+    if (std::abs(newPosition - _currentLinePosition) < 1.0e-9 ||
+        !std::isfinite(distanceVx) || std::abs(distanceVx) <= 1.0e-6) {
+        // Marker clamped at a line end (or no usable arclength map): stop with
+        // it, as plain Shift+wheel does.
+        return true;
+    }
+    const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    // Undo the display sign to get the true "ahead" direction (see
+    // interpolatedLineTangent) and slide the plane along its normal into that
+    // half-space; the sign is fixed for the whole gesture (straightAheadDirection).
+    const cv::Vec3f ahead = interpolatedLineTangent(_currentLinePosition) * _displayTangentSign;
+    if (!finitePoint(normal) || cv::norm(normal) <= 1.0e-6f || !finitePoint(ahead)) {
+        return true;
+    }
+    const double direction = vc3d::line_annotation::straightAheadDirection(
+        normal, ahead, _currentCutStraightAheadActive, _currentCutStraightAheadDirection);
+    const cv::Vec3f shiftedOrigin = vc3d::line_annotation::planeOriginShiftedAlongNormal(
+        plane->origin(), normal, direction * distanceVx);
+    if (!finitePoint(shiftedOrigin)) {
+        return true;
+    }
+
+    // Commit.
+    _currentLinePosition = newPosition;
+    // Pure translation: normal and in-plane basis are kept (decision: fixed
+    // orientation during the gesture). Deliberately no updatePlaneSurface /
+    // updateSidePlaneSurface and no side or strip recentering: only the marker
+    // follows the model line; the side cut catches up on the next snap-back.
+    plane->setFromNormalAndUp(shiftedOrigin, normal, plane->basisY());
+    _currentCutStraightAheadActive = true;
+    _currentCutStraightAheadDirection = direction;
+    if (_currentCutViewer) {
+        _currentCutViewer->markSurfaceGeometryChanged();
+        _currentCutViewer->renderVisible(true, "line annotation current cut straight ahead");
+    }
+    rebuildGeneratedDynamicOverlays();
     return true;
 }
 
@@ -2561,6 +2763,11 @@ void LineAnnotationDialog::startArrowPan(int direction)
         // Nothing that way: a fresh press does nothing, a reversal just stops.
         if (_arrowPanDirection != 0) {
             cancelArrowPan();
+        }
+        if (_currentCutStraightAheadActive) {
+            // Still an along-line navigation: snap a straight-ahead displaced
+            // plane back onto the line even though there is nowhere to go.
+            setCurrentLinePosition(_currentLinePosition, true, true);
         }
         return;
     }
@@ -2721,28 +2928,63 @@ void LineAnnotationDialog::tickArrowPan()
     }
     const double acceleration =
         _arrowPanCruiseSpeed / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
-    const auto step = vc3d::line_annotation::generatedArrowPanStep(_currentLinePosition,
-                                                                   _arrowPanVelocity,
-                                                                   _arrowPanDirection,
-                                                                   _arrowPanCruiseSpeed,
-                                                                   acceleration,
-                                                                   dtSeconds,
-                                                                   _arrowPanStopTarget);
-    _arrowPanVelocity = step.velocity;
-    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
-    const double position = std::clamp(step.position, 0.0, maxPosition);
-    const bool hitLineEnd = (position != step.position);
-    if (step.landed) {
-        finishArrowPan(position);
+    // The integrator runs in base-voxel arclength (speed is vx/s); positions
+    // and the stop target are converted through the current position map each
+    // tick, so an edit that renumbered the line between ticks cannot desync
+    // them. Without a usable map the line positions stand in for arclength.
+    const auto& arclengths = currentLineArclengths();
+    const bool arclengthUnits = !arclengths.empty();
+    // The map only changes with the line geometry, whose in-place update
+    // cancels the pan, so the unit cannot flip mid-gesture; if it ever did the
+    // velocity would be in the wrong unit, so stop rather than lurch.
+    if (_arrowPanArclengthUnits.has_value() && *_arrowPanArclengthUnits != arclengthUnits) {
+        cancelArrowPan();
         return;
     }
+    _arrowPanArclengthUnits = arclengthUnits;
+    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double maxCoordinate = arclengthUnits ? arclengths.back() : maxPosition;
+    const auto toCoordinate = [&](double linePosition) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::arclengthAtLinePosition(arclengths, linePosition)
+            : linePosition;
+    };
+    const auto toLinePosition = [&](double coordinate) {
+        return arclengthUnits
+            ? vc3d::fiber_slice::linePositionAtArclength(arclengths, coordinate)
+            : coordinate;
+    };
+    std::optional<double> stopTargetCoordinate;
+    if (_arrowPanStopTarget) {
+        stopTargetCoordinate = toCoordinate(*_arrowPanStopTarget);
+    }
+    const auto step = vc3d::line_annotation::generatedArrowPanStep(
+        toCoordinate(_currentLinePosition),
+        _arrowPanVelocity,
+        _arrowPanDirection,
+        _arrowPanCruiseSpeed,
+        acceleration,
+        dtSeconds,
+        stopTargetCoordinate);
+    _arrowPanVelocity = step.velocity;
+    const double coordinate = std::clamp(step.position, 0.0, maxCoordinate);
+    const bool hitLineEnd = (coordinate != step.position);
+    if (step.landed) {
+        // Land on the target's own line position: the round trip through
+        // arclength would otherwise leave a rounding residue on the control.
+        finishArrowPan(_arrowPanStopTarget
+                           ? std::clamp(*_arrowPanStopTarget, 0.0, maxPosition)
+                           : std::clamp(toLinePosition(coordinate), 0.0, maxPosition));
+        return;
+    }
+    const double position = std::clamp(toLinePosition(coordinate), 0.0, maxPosition);
     if (hitLineEnd) {
         // Only stop at the line end while the travel still points out of it. A
         // reversal pressed near the end is still shedding outward velocity, so
         // pin the position to the edge and keep integrating until the velocity
         // crosses zero and carries it back inside.
         const bool reversingBackInside =
-            (step.position > maxPosition && _arrowPanDirection < 0) ||
+            (step.position > maxCoordinate && _arrowPanDirection < 0) ||
             (step.position < 0.0 && _arrowPanDirection > 0);
         if (!reversingBackInside) {
             finishArrowPan(position);
@@ -2756,6 +2998,13 @@ void LineAnnotationDialog::tickArrowPan()
     // centered right after - a ~60 Hz flicker that reads as two green lines.
     centerStripsOnLinePosition(position, false);
     setCurrentLinePosition(position, false);
+    // The static strip overlays (control-point dots) bake the camera in too.
+    // Left to the coalesced post-render refresh they trail the camera by up to
+    // one tick and then snap - a jiggle that grows with the pan speed. Their
+    // scene placement is affine in the camera pointer at a fixed zoom, so the
+    // tick shifts the existing items by the camera delta (no item churn) and
+    // rebuilds only when the zoom changed; the landing does the full rebuild.
+    updateStaticStripOverlaysForPan();
 }
 
 void LineAnnotationDialog::finishArrowPan(double position)
@@ -2787,6 +3036,8 @@ void LineAnnotationDialog::cancelArrowPan()
     _arrowPanVelocity = 0.0;
     _arrowPanStopTarget.reset();
     _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    _arrowPanArclengthUnits.reset();
+    _staticStripOverlayPanFallbackWarned = false;
     _arrowPanEndedByLanding = false;
 }
 
@@ -2801,7 +3052,7 @@ void LineAnnotationDialog::adjustArrowPanCruiseSpeed(double factor)
     if (updated != _arrowPanCruiseSpeed) {
         _arrowPanCruiseSpeed = updated;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED, updated);
+        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED_VX, updated);
     }
     // Flash the badge even when the value clamped, so the key press is answered.
     updateArrowPanSpeedIndicator();
@@ -2843,7 +3094,7 @@ void LineAnnotationDialog::updateArrowPanSpeedIndicator()
         _arrowPanSpeedLabel = label;
     }
     _arrowPanSpeedLabel->setText(
-        tr("pan speed %1 /s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
+        tr("pan speed %1 vx/s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
     _arrowPanSpeedLabel->adjustSize();
     // Top-center of the top strip; the pause badge sits on the bottom strip.
     _arrowPanSpeedLabel->move(
@@ -3033,9 +3284,15 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
     }
 
     bool changed = false;
-    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
-    const bool sideHadOffset = normalOffsetActive(_sideCutNormalOffsetVx);
+    const bool currentHadOffset =
+        normalOffsetActive(_currentCutNormalOffsetVx) || _currentCutStraightAheadActive;
+    // A straight-ahead advance left the side cut frozen at the position where
+    // the gesture began, so it has to catch up with the marker as well.
+    const bool sideHadOffset =
+        normalOffsetActive(_sideCutNormalOffsetVx) || _currentCutStraightAheadActive;
+    const bool recenterSide = _currentCutStraightAheadActive;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     if (_currentCutViewer) {
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -3060,6 +3317,12 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
             changed = true;
             if (_sideCutViewer) {
                 _sideCutViewer->markSurfaceGeometryChanged();
+                if (recenterSide) {
+                    const cv::Vec3f sidePoint = interpolatedLinePoint(_currentLinePosition);
+                    if (finitePoint(sidePoint)) {
+                        _sideCutViewer->centerOnVolumePoint(sidePoint, false);
+                    }
+                }
                 if (forceRender) {
                     _sideCutViewer->renderVisible(true, "line annotation side cut offset reset");
                 }
@@ -3339,6 +3602,11 @@ bool LineAnnotationDialog::rotateCurrentCut(vc3d::line_annotation::GeneratedCutR
     if (!_hasGeneratedViews || !_generatedViews.currentCutSurface || !_currentCutViewer) {
         return false;
     }
+    if (_currentCutStraightAheadActive) {
+        // The rotation below re-poses the plane on the model line anyway; do it
+        // through the setter so the frozen side cut catches up as well.
+        setCurrentLinePosition(_currentLinePosition, true, true);
+    }
     const cv::Vec3f centerVolumePoint = currentCutViewerCenterVolumePoint();
     _currentCutManualRotation =
         vc3d::line_annotation::accumulatedGeneratedCutRotation(_currentCutManualRotation,
@@ -3410,6 +3678,7 @@ void LineAnnotationDialog::resetGeneratedViews()
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     _currentCutFollowsStripMouse = true;
 
@@ -3454,7 +3723,19 @@ double LineAnnotationDialog::snappedControlPointPosition(double position) const
     for (const auto& control : _generatedViews.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    return vc3d::line_annotation::snappedControlPointLinePosition(position, controlLinePositions);
+    return vc3d::line_annotation::snappedControlPointLinePositionByArclength(
+        position, controlLinePositions, currentLineArclengths());
+}
+
+const std::vector<double>& LineAnnotationDialog::currentLineArclengths() const
+{
+    // The position map's cumulative arclengths, one per displayed line point;
+    // empty (callers fall back to index units) while no usable map exists.
+    static const std::vector<double> kNone;
+    const auto& arclengths = _generatedViews.stripPositionMap.originalArclengths;
+    return vc3d::line_annotation::lineArclengthsUsable(arclengths, _generatedViews.linePoints.size())
+        ? arclengths
+        : kNone;
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
@@ -3488,6 +3769,7 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         return;
     }
 
+    _staticStripOverlayPlacements.assign(_stripViewers.size(), StaticStripOverlayPlacement{});
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
         auto* viewer = _stripViewers[i].data();
         if (!viewer) {
@@ -3508,15 +3790,68 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (sideStrip) {
             strip.fiberIntersections = stripViews.fiberIntersections;
         }
-        applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        auto& placement = _staticStripOverlayPlacements[i];
+        placement.groupKey = applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
+        // The camera these items were placed against; a pan tick shifts them
+        // from here instead of rebuilding (updateStaticStripOverlaysForPan).
+        placement.camera.referenceScene = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        placement.camera.scale = static_cast<double>(viewer->cameraState().scale);
     }
 
+}
+
+void LineAnnotationDialog::updateStaticStripOverlaysForPan()
+{
+    if (!kGeneratedLineAnnotationOverlaysEnabled) {
+        return;
+    }
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    if (_staticStripOverlayPlacements.size() != _stripViewers.size()) {
+        rebuildGeneratedStaticStripOverlays();
+        return;
+    }
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        auto* viewer = _stripViewers[i].data();
+        if (!viewer) {
+            continue;
+        }
+        auto& placement = _staticStripOverlayPlacements[i];
+        const QPointF reference = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+        const auto delta = vc3d::line_annotation::generatedOverlayPanTranslation(
+            placement.camera, reference, static_cast<double>(viewer->cameraState().scale));
+        if (!delta) {
+            // The zoom changed under the pan: one ordinary rebuild re-records
+            // every placement.
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        if (placement.groupKey.empty() ||
+            !viewer->translateOverlayGroup(placement.groupKey, *delta)) {
+            // No group under the key registration returned. Legitimate only
+            // when the viewer dropped its groups (surface swap); anything else
+            // is a bookkeeping bug that would otherwise hide behind this
+            // rebuild, so say so once per pan.
+            if (!_staticStripOverlayPanFallbackWarned) {
+                _staticStripOverlayPanFallbackWarned = true;
+                Logger()->warn(
+                    "Line annotation: static strip overlay group '{}' missing during arrow pan; "
+                    "rebuilding instead of translating",
+                    placement.groupKey);
+            }
+            rebuildGeneratedStaticStripOverlays();
+            return;
+        }
+        placement.camera.referenceScene = reference;
+    }
 }
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
 {
     _fastStripOverlayItems.clear();
     _fastCurrentCutOverlayItems = {};
+    _staticStripOverlayPlacements.clear();
 }
 
 void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
@@ -3839,6 +4174,42 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                                      _sideCutViewer,
                                                      sideViews.sideCutSurface.get());
         sideOverlay.linePoints = sideViews.linePoints;
+        // Only the stretch within half a wrap of the current position. The
+        // side cut's plane contains the sheet normal, so for a fiber annotated
+        // across several wraps EVERY wrap of this stretch lies (nearly) in the
+        // plane, and projecting the whole line drew them all on top of each
+        // other. Out-of-window points are blanked rather than erased so the
+        // point indices the tail detection keys on stay meaningful, and the
+        // tail range is taken from the plane-near controls BEFORE the window
+        // trims them, so interior spans do not turn into tails.
+        {
+            const auto window = vc3d::line_annotation::generatedLineIndexRangeWithinWinding(
+                sideViews.lineWindingAngles,
+                sideViews.linePoints.size(),
+                sidePosition,
+                vc3d::line_annotation::kGeneratedSideCutHalfWrapAngle);
+            const size_t pointCount = sideOverlay.linePoints.size();
+            if (pointCount > 0 && (window.first > 0 || window.second + 1 < pointCount)) {
+                constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+                const cv::Vec3f blank{kNanF, kNanF, kNanF};
+                for (size_t i = 0; i < window.first; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                for (size_t i = window.second + 1; i < pointCount; ++i) {
+                    sideOverlay.linePoints[i] = blank;
+                }
+                sideOverlay.lineTailControlRange =
+                    vc3d::line_annotation::generatedControlLinePositionRange(
+                        sideOverlay.controlPoints);
+                const double lowPosition = static_cast<double>(window.first) - 0.5;
+                const double highPosition = static_cast<double>(window.second) + 0.5;
+                std::erase_if(sideOverlay.controlPoints, [&](const auto& control) {
+                    return std::isfinite(control.linePosition) &&
+                           (control.linePosition < lowPosition ||
+                            control.linePosition > highPosition);
+                });
+            }
+        }
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
         // position so the highlight tracks the cursor as it moves along the line. Use the
@@ -3871,9 +4242,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
-        !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors ||
+        std::any_of(_fastCurrentCutOverlayItems.branchLinkFiberIntersections.begin(),
+                    _fastCurrentCutOverlayItems.branchLinkFiberIntersections.end(),
+                    [](const QGraphicsPathItem* item) { return !item; }) ||
+        std::any_of(_fastCurrentCutOverlayItems.fiberIntersectionConnectors.begin(),
+                    _fastCurrentCutOverlayItems.fiberIntersectionConnectors.end(),
+                    [](const QGraphicsPathItem* item) { return !item; }) ||
         !_fastCurrentCutOverlayItems.ghostControlPointPrev ||
         !_fastCurrentCutOverlayItems.ghostControlPointNext) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
@@ -3971,32 +4345,31 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setZValue(168.5);
 
-        QPen branchLinkFiberIntersectionPen(QColor(210, 95, 255, 245));
-        branchLinkFiberIntersectionPen.setWidthF(1.75);
-        branchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPen(
-            branchLinkFiberIntersectionPen);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setZValue(168.25);
+        // Linked-fiber X markers and their connectors, one item per link
+        // state so each wears its control point's colour.
+        for (size_t state = 0; state < FastCurrentCutOverlayItems::kLinkStateCount; ++state) {
+            const bool pending = linkStatePending(state);
+            const bool sameHv = linkStateSameHv(state);
+            QPen branchLinkFiberIntersectionPen(
+                vc3d::line_annotation::generatedLinkStateColor(pending, sameHv, 245));
+            branchLinkFiberIntersectionPen.setWidthF(1.75);
+            branchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+            auto* xItem = new QGraphicsPathItem();
+            xItem->setPen(branchLinkFiberIntersectionPen);
+            xItem->setBrush(Qt::NoBrush);
+            // Pending glyphs keep drawing over approved ones where they overlap.
+            xItem->setZValue(pending ? 168.3 : 168.25);
+            _fastCurrentCutOverlayItems.branchLinkFiberIntersections[state] = xItem;
 
-        QPen pendingBranchLinkFiberIntersectionPen(QColor(80, 150, 255, 245));
-        pendingBranchLinkFiberIntersectionPen.setWidthF(1.75);
-        pendingBranchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections =
-            new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPen(
-            pendingBranchLinkFiberIntersectionPen);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setZValue(168.3);
-
-        QPen fiberIntersectionConnectorPen(QColor(255, 60, 180, 225));
-        fiberIntersectionConnectorPen.setWidthF(1.4);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors = new QGraphicsPathItem();
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPen(
-            fiberIntersectionConnectorPen);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setBrush(Qt::NoBrush);
-        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setZValue(164.0);
+            QPen fiberIntersectionConnectorPen(
+                vc3d::line_annotation::generatedLinkStateColor(pending, sameHv, 225));
+            fiberIntersectionConnectorPen.setWidthF(1.4);
+            auto* connectorItem = new QGraphicsPathItem();
+            connectorItem->setPen(fiberIntersectionConnectorPen);
+            connectorItem->setBrush(Qt::NoBrush);
+            connectorItem->setZValue(164.0);
+            _fastCurrentCutOverlayItems.fiberIntersectionConnectors[state] = connectorItem;
+        }
 
         // Hollow dashed rings, deliberately unlike the solid control markers:
         // they sit at a fictional, parallax-shifted spot until they land.
@@ -4013,23 +4386,27 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.ghostControlPointNext->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.ghostControlPointNext->setZValue(155.0);
 
-        viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
-                                {_fastCurrentCutOverlayItems.centerPoint,
-                                 _fastCurrentCutOverlayItems.controlPoints,
-                                 _fastCurrentCutOverlayItems.seedPoints,
-                                 _fastCurrentCutOverlayItems.linkCandidatePoints,
-                                 _fastCurrentCutOverlayItems.splitCandidatePoints,
-                                 _fastCurrentCutOverlayItems.branchControlPoints,
-                                 _fastCurrentCutOverlayItems.pendingBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
-                                 _fastCurrentCutOverlayItems.fiberIntersections,
-                                 _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
-                                 _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors,
-                                 _fastCurrentCutOverlayItems.ghostControlPointPrev,
-                                 _fastCurrentCutOverlayItems.ghostControlPointNext});
+        std::vector<QGraphicsItem*> groupItems{
+            _fastCurrentCutOverlayItems.centerPoint,
+            _fastCurrentCutOverlayItems.controlPoints,
+            _fastCurrentCutOverlayItems.seedPoints,
+            _fastCurrentCutOverlayItems.linkCandidatePoints,
+            _fastCurrentCutOverlayItems.splitCandidatePoints,
+            _fastCurrentCutOverlayItems.branchControlPoints,
+            _fastCurrentCutOverlayItems.pendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.fiberIntersections,
+            _fastCurrentCutOverlayItems.linkCandidateFiberIntersections};
+        for (auto* item : _fastCurrentCutOverlayItems.branchLinkFiberIntersections) {
+            groupItems.push_back(item);
+        }
+        for (auto* item : _fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
+            groupItems.push_back(item);
+        }
+        groupItems.push_back(_fastCurrentCutOverlayItems.ghostControlPointPrev);
+        groupItems.push_back(_fastCurrentCutOverlayItems.ghostControlPointNext);
+        viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey, std::move(groupItems));
     }
 
     // During an in-place update, draw from the held pre-update views until this
@@ -4042,7 +4419,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _currentCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
 
     QPointF centerScenePoint;
-    if (normalOffsetActive(_currentCutNormalOffsetVx)) {
+    if (_currentCutStraightAheadActive) {
         centerScenePoint = viewer->volumeToScene(
             vc3d::line_annotation::interpolatedGeneratedLinePoint(
                 cutViews.linePoints, cutPosition));
@@ -4181,9 +4558,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
-    QPainterPath branchLinkFiberIntersectionPath;
-    QPainterPath pendingBranchLinkFiberIntersectionPath;
-    QPainterPath fiberIntersectionConnectorPath;
+    std::array<QPainterPath, FastCurrentCutOverlayItems::kLinkStateCount> branchLinkFiberIntersectionPaths;
+    std::array<QPainterPath, FastCurrentCutOverlayItems::kLinkStateCount> fiberIntersectionConnectorPaths;
     auto* currentCutPlane = cutViews.currentCutSurface.get();
     const std::optional<float> intersectionThreshold =
         (currentCutPlane && !cutViews.fiberIntersections.empty())
@@ -4203,20 +4579,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
                 continue;
             }
+            const size_t linkState = linkStateIndex(intersection.pendingBranchLink,
+                                                    intersection.sameHvBranchLink);
             if (intersection.connectorStart && finitePoint(*intersection.connectorStart)) {
                 const QPointF connectorScene =
                     viewer->volumeToScene(*intersection.connectorStart);
                 if (std::isfinite(connectorScene.x()) && std::isfinite(connectorScene.y())) {
-                    fiberIntersectionConnectorPath.moveTo(connectorScene);
-                    fiberIntersectionConnectorPath.lineTo(scenePoint);
+                    fiberIntersectionConnectorPaths[linkState].moveTo(connectorScene);
+                    fiberIntersectionConnectorPaths[linkState].lineTo(scenePoint);
                 }
             }
+            // The link candidate's green keeps precedence on the X.
             QPainterPath& path = intersection.isLinkCandidateFiber
                 ? linkCandidateFiberIntersectionPath
                 : (intersection.projectedBranchLink
-                       ? (intersection.pendingBranchLink
-                              ? pendingBranchLinkFiberIntersectionPath
-                              : branchLinkFiberIntersectionPath)
+                       ? branchLinkFiberIntersectionPaths[linkState]
                        : fiberIntersectionPath);
             path.moveTo(scenePoint + QPointF(-kIntersectionArm, -kIntersectionArm));
             path.lineTo(scenePoint + QPointF(kIntersectionArm, kIntersectionArm));
@@ -4227,12 +4604,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.fiberIntersections->setPath(fiberIntersectionPath);
     _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setPath(
         linkCandidateFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPath(
-        branchLinkFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPath(
-        pendingBranchLinkFiberIntersectionPath);
-    _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPath(
-        fiberIntersectionConnectorPath);
+    for (size_t state = 0; state < FastCurrentCutOverlayItems::kLinkStateCount; ++state) {
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections[state]->setPath(
+            branchLinkFiberIntersectionPaths[state]);
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors[state]->setPath(
+            fiberIntersectionConnectorPaths[state]);
+    }
 }
 
 void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay,
@@ -4531,11 +4908,11 @@ bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
 
 bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
 {
-    // A click cannot reach a busy dialog because the optimization overlay
-    // covers the panes, but the keys still arrive; the controller would reject
-    // the request and leave _pendingPlacementFocus behind for the running
-    // optimization to land on.
-    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationBusy ||
+    // During a blocking (overlay) solve a click cannot reach the panes, but
+    // the keys still arrive, so refuse them to match. A passive-badge solve
+    // deliberately keeps editing live: the key must place exactly like a
+    // click would, so plain busy does not refuse.
+    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationInputBlocked ||
         !controlPointPlacementAllowedAt(_currentLinePosition)) {
         return false;
     }
@@ -4549,10 +4926,11 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     // paused -- so, like the shift-click snap, it has to stop the pan itself:
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
-    _pendingPlacementFocus = volumePoint;
+    // The key places ON the line, so its point is also the position's anchor.
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
-                                        _currentLinePosition);
+                                        _currentLinePosition,
+                                        volumePoint);
     return true;
 }
 
@@ -4858,12 +5236,26 @@ void LineAnnotationDialog::syncLinkedStripCamera(CChunkedVolumeViewer* source)
 
 void LineAnnotationDialog::updateOptimizationOverlayGeometry()
 {
-    if (!_optimizationOverlay || !centralWidget()) {
+    if (!centralWidget()) {
         return;
     }
-    _optimizationOverlay->setGeometry(centralWidget()->rect());
-    if (_optimizationOverlay->isVisible()) {
-        _optimizationOverlay->raise();
+    if (_optimizationOverlay) {
+        _optimizationOverlay->setGeometry(centralWidget()->rect());
+        if (_optimizationOverlay->isVisible()) {
+            _optimizationOverlay->raise();
+        }
+    }
+    if (_optimizationBadge) {
+        const QSize badgeSize = _optimizationBadge->sizeHint();
+        const QRect content = centralWidget()->rect();
+        _optimizationBadge->setGeometry(
+            content.center().x() - badgeSize.width() / 2,
+            content.top() + 8,
+            badgeSize.width(),
+            badgeSize.height());
+        if (_optimizationBadge->isVisible()) {
+            _optimizationBadge->raise();
+        }
     }
 }
 
