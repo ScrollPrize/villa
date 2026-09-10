@@ -1,5 +1,120 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Native live reference evaluation (standalone first)
+
+- Workload configuration owns collection-to-scroll/scan/CT/normal bindings,
+  checkpoint paths/digests, devices and inference parameters. Executable runners
+  must not contain scroll-specific confirmation arguments or normal-source
+  branches. Original split membership/hashes and prepared config/normal hashes
+  remain validated. Optional isolated profiling reuses shared model/store/worker
+  implementations, reports warmup separately and cannot claim trace completion.
+- `vc_fiber_trace_metric replay-set` evaluates explicit whole fibers in both
+  directions using the same VC3D native beam/greedy search and shared ellipsoid
+  failure/forward-match/reset metrics. Beam checking observes irrevocable common
+  prefixes and selected terminal/fallback paths, not speculative reference-based
+  pruning. Preserve the existing positional CLI and greedy defaults.
+- Optional `--render` on native batch replay and live coordinator (or config
+  `render: true`) renders each completed in-memory replay directly, default off,
+  into `cases/<index>/rendered/`. Share overview/image-writing behavior with the
+  post-hoc API; never reload saved traces for inline rendering. Preflight every
+  source's local concrete uint8 CT metadata before tracing. Rendering failures
+  result in incomplete evaluation; enabling it must not change trace geometry.
+- Persist every completed case's segmented replay/reference JSON/OBJ, failures,
+  reset discontinuities and provenance. `render-replay` consumes saved artifacts
+  and local CT/sheet normals to produce reference/traced top/side strips without
+  inference or retracing. Fiber directions never substitute for sheet normals.
+- Replay strip validation/metadata follows shared LineViewBuilder cross-row
+  constants and its retained LineStripPositionMap; do not assume one ribbon
+  column per input point or historical21-row geometry. Source geometry and
+  generated surface sampling remain unchanged. Overview overlays and failure
+  markers also convert original point positions through the builder's map in
+  both reference and traced strip frames; long-span markers must not shift.
+- `fiber_trace_3d.live_evaluate` coordinates a frozen snapshot and explicit CUDA
+  devices with native replay. Readiness gates precede scalar, batch, corner and
+  prefetch reads. Missing data means waiting, not Zarr fill or geometric failure.
+- First version preserves each case stack in one OS thread (default max256),
+  bounded active CPU permits released while waiting, nested candidate threads1.
+  Control-only authenticated localhost messages bridge Python and C++; no
+  per-voxel Python callback and no copied tracer. Persistent/stackless trace
+  sessions, training hook and live GUI integration are later work.
+- `lasagna.demand_predict3d` is an alternative scheduler/scratch backend around
+  the SAME tiled geometry/model worker/normalization/blend/filter/accumulation/
+  finalization helpers used by sequential inference. Circular-Z/TensorStore/
+  monotone Z-band admission rules below apply to the sequential mode. Demand
+  mode uses native fast-loader sampling and full-logical-shape sparse file-backed
+  mmap inside output Zarr `.live_tmp/session-*`; no dense zero initialization.
+- Optional `inference.accumulator_layout` is `flat` (default) or `chunk-major`.
+  Chunk-major scratch stores output-chunk grid ZYX followed by local brick ZYX,
+  in the same per-channel files. Edge bricks are padded; descriptors retain the
+  logical volume shape, and scratch budgeting charges whole touched bricks.
+  Shared accumulator/finalizer helpers translate regions, preserving per-add
+  arithmetic. Output Zarr geometry and chunk ownership/tasks do not change.
+  No prefaulting, eager allocation, advice or extra sync accompanies layout alone.
+  Layout participates in cache identity. `profile.accumulator_layout` overrides
+  it only for isolated benchmarks; sequential circular-Z storage stays unchanged.
+- Optional `inference.accumulator_prefault` defaults false and requires
+  chunk-major plus Linux MADV_POPULATE_WRITE support. Each owner advises each
+  channel's full touched brick once, before its first addition; writable advice
+  cost is included in task timings. Root-relative ranges are page-aligned and
+  clipped to mapping size. Failed advice raises and is not marked successful;
+  no read-prefault fallback or advice during finalizer reads. The kernel can
+  allocate sparse backing/page-cache memory, but no explicit zero writes or
+  scratch sync are added. This flag is cache-identified and has a profile-only
+  override. Unsupported platforms/kernels fail explicitly when enabled.
+- Native stride, tile/stride/border alignment and numerical precision remain
+  unchanged. Demand accumulation follows GPU result arrival order, explicitly
+  allowing order-dependent f16/f32 rounding; sequential inference retains its
+  canonical order. Results stay in bounded shared RAM, with NO NPZ staging,
+  scratch zero reservation or scratch fsync. Shared accumulator processes own
+  output chunks (hash chunk-grid indices, not voxel coordinates), apply weight
+  and all raw channels together, and acknowledge before releasing result slots.
+  Input slots release independently after H2D. All touched consumers accumulate, but unrequested
+  partial neighbors MUST NOT schedule their missing contributors. Late requests
+  reuse partial accumulation; each contribution is applied once per session.
+- Optional `inference.result_slots` sizes the result-RAM pool independently of
+  input slots (`devices * slots_per_gpu`); unset preserves the existing count.
+  Profile-only `profile.result_slots` can override it without changing production.
+  Profile reports received versus fully accumulated tiles and beginning/ending
+  backlogs, not GPU throughput alone. Optional Linux accumulator OS profiling
+  reads faults/CPU/storage counters and samples main-thread wait states; missing
+  permissions/platform counters are explicitly absent, not presumed zero.
+- Demand is coalesced and prioritized by approximate remaining length, above
+  reference-segment-intersection prefetch. Prefetch is drained before coordinator
+  completion. First-version priorities are monotone promotions without aging.
+- Cache lives under the shared global root's `live_inference/<source>/<model>`.
+  Source identity includes locator/revision/metadata/lattice; inference identity
+  includes frozen checkpoint SHA256, effective parameters, relevant code hashes
+  and runtime versions. Require an updated revision for mutable input content.
+- Single-writer SQLite tracks tiles, chunks and scratch. Coordinator memory
+  tracks pending/applied contribution sets; no canonical ordinal or durable
+  scratch-edge table. Bounded background publication uses the shared finalizer
+  after every contributor acknowledges; only the coordinator commits ready rows.
+  Only coherently published sibling Zarr chunks plus verified integrity constitute
+  completion, not queued/partial ledger rows. Explicit all-zero chunks are stored.
+  Restart validates ready files, deletes only validated owned scratch and rebuilds
+  incomplete work. Active ready files are immutable. No done-marker replacement.
+- Per-source scratch and active shared slots have budgets. Fresh sparse mmap
+  holes read as zeros; logical touched-byte and periodic allocated/free-space
+  checks are advisory, not guaranteed preallocation. Concurrent disk exhaustion
+  can still cause a worker SIGBUS; worker death aborts instead of marking ready.
+  No silent partial-output eviction. Stuck underlying
+  input-read cancellation is explicitly deferred by the user (not an observed
+  stuck condition or current blocker). Global queued-descriptor bounds and
+  stress/performance validation remain future hardening, not guarantees.
+- Initial inputs are explicit zero-translation isotropic ZYX OME power-of-two
+  lattices. No arbitrary crop/affine mapping or coarser pyramid generation yet.
+  Partial manifests require live readiness awareness; ordinary viewers cannot
+  distinguish uncomputed fill. Native summary alone does not establish inference
+  completion; also require coordinator summary and absence of incomplete markers.
+- Shared global root uses explicit `VC3D_CONFIG_DIR/cache.json` (default
+  `~/.VC3D/cache.json`) before legacy mount/suggestion fallback. `vc_cache_root`
+  prints/sets it with writability checking. GUI/native/Python source share this
+  resolver; no automatic migration/deletion of existing caches.
+- HiGHS is optional via `VC_ENABLE_HIGHS` (ON auto-detect, OFF disabled). Without
+  it, LP/MILP labeling throws an explicit availability error. Other tracing,
+  preprocessing and volume access remain usable. The evaluator is available
+  in the headless `VC_BUILD_FIBERLETS` build as well as the GUI apps build.
+
 ## Managed whole-volume Fiberlet inputs
 
 - `las_manager fiberlet run <completed-fiber-run>` resolves the unique regular
@@ -23,8 +138,9 @@
 
 ## Shared 3D Tiled Inference
 
-- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled
-  inference runner used by both Lasagna predict3d and Fiber 3D inference. It owns:
+- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the authoritative sequential
+  inference runner used by both Lasagna predict3d and Fiber 3D inference; live
+  demand reuses its numerical worker/geometry/finalization helpers. It owns:
   canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
   from `_download` metadata, circular Z scratch, output-chunk-only resume,
   temp cleanup, progress formatting, and atomic Zarr chunk writes.

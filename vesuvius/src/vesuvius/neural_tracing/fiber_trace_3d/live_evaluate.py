@@ -1,0 +1,477 @@
+"""Standalone native beam replay coordinated with on-demand GPU inference.
+
+Only control descriptors cross the localhost socket. Published predictions use
+the ordinary Lasagna/OME-Zarr format and the existing model/tiled finalizers.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import ExitStack
+import hashlib
+import itertools
+import importlib
+import json
+import math
+import os
+from pathlib import Path
+import secrets
+import select
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+from urllib.parse import urlsplit
+from urllib.request import urlopen
+
+import numpy as np
+import torch
+
+from lasagna import tiled_predict3d as tiled
+from lasagna import demand_predict3d as demand
+from lasagna.inference_provenance import atomic_write, json_digest, sha256_file
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
+from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
+from vesuvius.neural_tracing.fiber_trace_3d import inference_adapter
+from vesuvius.neural_tracing.fiber_trace_3d.infer import _checkpoint_config_for_inference, _resolve_inference_precision
+
+
+def location(base, value):
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("use an unsigned source locator and ambient credentials; URLs are persisted as source identity")
+        return value.rstrip("/")
+    return str((base / value).resolve())
+
+
+def freeze_checkpoint(path, cache_root):
+    digest = sha256_file(path)
+    destination = cache_root / "live_inference" / "_models" / digest / "snapshot.pt"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file():
+        if sha256_file(destination) != digest:
+            raise ValueError("cached frozen checkpoint is corrupt")
+        return destination, digest
+    descriptor, name = tempfile.mkstemp(prefix=".snapshot-", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as target, Path(path).open("rb") as source:
+            shutil.copyfileobj(source, target, length=8 << 20)
+            target.flush()
+            os.fsync(target.fileno())
+        if sha256_file(name) != digest:
+            raise ValueError("checkpoint changed while freezing; use an immutable completed snapshot")
+        os.replace(name, destination)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    return destination, digest
+
+
+def reference_chunks(points_base, factor, shape, chunk):
+    """Exact segment crossings of interpolation-support chunk boundaries.
+
+    Both a chunk boundary and its preceding voxel can change the corner-chunk
+    set. Visit each interval's midpoint and endpoints, not just annotations.
+    """
+    points = np.asarray(points_base, dtype=np.float64) / factor
+    result = set()
+    for left, right in zip(points[:-1], points[1:]):
+        delta = right - left
+        breaks = {0.0, 1.0}
+        for xyz in range(3):
+            if delta[xyz] == 0:
+                continue
+            lo, hi = sorted((left[xyz], right[xyz]))
+            # Clip traversal ranges to the actual array, not out-of-volume
+            # annotation extents. Shape is ZYX; points are XYZ.
+            n = shape[2 - xyz]
+            for boundary in (0, n - 1):
+                t = (boundary - left[xyz]) / delta[xyz]
+                if 0 < t < 1:
+                    breaks.add(float(t))
+            for k in range(max(0, math.floor(lo / chunk)), min(math.ceil(hi / chunk) + 2, math.ceil(n / chunk) + 1)):
+                for boundary in (k * chunk, k * chunk - 1):
+                    t = (boundary - left[xyz]) / delta[xyz]
+                    if 0 < t < 1:
+                        breaks.add(float(t))
+        ordered = sorted(breaks)
+        samples = ordered + [(a + b) * 0.5 for a, b in zip(ordered[:-1], ordered[1:])]
+        for t in samples:
+            p = (left + t * delta)[::-1]
+            if np.any(p < 0) or np.any(p > np.asarray(shape) - 1):
+                continue
+            floor = np.floor(p).astype(np.int64)
+            for corner in itertools.product((0, 1), repeat=3):
+                index = np.minimum(floor + corner, np.asarray(shape) - 1) // chunk
+                result.add(tuple(int(v) for v in index))
+    return result
+
+
+def input_root_attributes(volume):
+    """Read OME metadata without calling the local-only native root_attrs API.
+
+    Native remote_url is the canonical HTTP group root used for chunk reads.
+    This requests metadata only; all voxel loading remains native.
+    """
+    remote = getattr(volume, "remote_url", "")
+    if not remote:
+        return volume.root_attrs
+    with urlopen(str(remote).rstrip("/") + "/.zattrs", timeout=30) as response:
+        attrs = json.load(response)
+    if not isinstance(attrs, dict):
+        raise ValueError("input OME root attributes must be an object")
+    return attrs
+
+
+def validate_input_lattice(attrs, level):
+    """Only zero-offset, isotropic OME ZYX pyramids are supported initially.
+
+    Geometry is expressed in level-zero voxel coordinates. Physical units may
+    differ across sources, but the relative sampling transform must be exact.
+    Reject unsupported affine metadata rather than silently ignoring it.
+    """
+    if level < 0 or level > 30:
+        raise ValueError("invalid input level")
+    multiscales = attrs.get("multiscales", [])
+    if len(multiscales) != 1:
+        raise ValueError("input requires one explicit OME multiscale lattice")
+    metadata = multiscales[0]
+    if [a if isinstance(a, str) else a.get("name") for a in metadata.get("axes", [])] != ["z", "y", "x"]:
+        raise ValueError("input must have exactly ZYX spatial axes")
+
+    def scale(transforms):
+        result = np.ones(3, dtype=np.float64)
+        for transform in transforms:
+            kind = transform.get("type")
+            if kind == "scale":
+                value = np.asarray(transform["scale"], dtype=np.float64)
+                if value.shape != (3,) or not np.isfinite(value).all() or np.any(value <= 0):
+                    raise ValueError("invalid input scale transform")
+                result *= value
+            elif kind == "translation":
+                value = np.asarray(transform["translation"], dtype=np.float64)
+                if value.shape != (3,) or np.any(value != 0):
+                    raise ValueError("translated input lattices are not supported")
+            else:
+                raise ValueError("unsupported input coordinate transform")
+        return result
+
+    shared = scale(metadata.get("coordinateTransformations", []))
+    datasets = {str(d["path"]).strip("/"): d for d in metadata.get("datasets", [])}
+    if "0" not in datasets or str(level) not in datasets:
+        raise ValueError("input metadata must bind level 0 and the selected numeric level")
+    base_scale = shared * scale(datasets["0"].get("coordinateTransformations", []))
+    selected_scale = shared * scale(datasets[str(level)].get("coordinateTransformations", []))
+    if not np.allclose(base_scale, base_scale[0], rtol=1e-8, atol=0):
+        raise ValueError("anisotropic input base voxels are not supported")
+    if not np.allclose(selected_scale / base_scale, 1 << level, rtol=1e-8, atol=0):
+        raise ValueError("input transform is not the expected isotropic power-of-two lattice")
+
+
+def implementation_identity():
+    modules = ["lasagna.tiled_predict3d", "lasagna.demand_predict3d", "lasagna.normal_encoding",
+               "vesuvius.neural_tracing.fiber_trace_3d.inference_adapter",
+               "vesuvius.neural_tracing.fiber_trace_3d.infer",
+               "vesuvius.neural_tracing.fiber_trace_3d.model",
+               "vesuvius.neural_tracing.fiber_trace_3d.direction",
+               "vesuvius.neural_tracing.fiber_trace_3d.prediction",
+               "vesuvius.neural_tracing.fiber_trace.model"]
+    files = {name: sha256_file(importlib.import_module(name).__file__) for name in modules}
+    # Include shared network components, not only the adapter's caller.
+    nets = Path(importlib.import_module("vesuvius.neural_tracing.nets").__file__).parent
+    files.update({"nets/" + str(p.relative_to(nets)): sha256_file(p) for p in sorted(nets.rglob("*.py"))})
+    files["runner"] = sha256_file(__file__)
+    files["runtime"] = {"torch": str(torch.__version__), "numpy": np.__version__, "cuda": torch.version.cuda}
+    return files
+
+
+class NativeTileReader:
+    """Reuse fast training's strict selected-level native block sampler."""
+    def __init__(self, sampler, geometry, dtype):
+        self.sampler, self.geometry, self.dtype = sampler, geometry, np.dtype(dtype)
+
+    def __call__(self, tile):
+        spec = tiled._tile_read_spec(self.geometry.shape, (0, 0, 0), *tile,
+                                     self.geometry.tile, self.geometry.border)
+        if spec.slices_zyx is None:
+            return tiled._finalize_tile_read(None, spec)
+        start = np.array([s.start for s in spec.slices_zyx], dtype=np.int64)
+        shape = tuple(s.stop - s.start for s in spec.slices_zyx)
+        sampled = self.sampler.sample_block_zyx(start, shape)
+        # Native uint8/uint16 samples are exactly representable in float32.
+        # Return original integer values; shared inference owns conversion and
+        # normalization (including the historical uint16 // 257 convention).
+        raw = sampled.image.astype(self.dtype)
+        return tiled._finalize_tile_read(raw, spec)
+
+
+def create_demand_store(cache, source_identity, model_identity, geometry, effective, snapshot, level, settings):
+    """Shared numerical/output setup for live tracing and isolated profiling."""
+    power = int(math.log2(geometry.scale))
+    adapter = inference_adapter.FiberTrace3DPredictAdapter(effective, checkpoint=snapshot,
+        level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
+        chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber")
+    # Construction restores checkpoint config; reapply the resolved precision.
+    adapter.config["training"] = {**adapter.config.get("training", {}),
+        "mixed_precision": effective["training"]["mixed_precision"]}
+    products = adapter.output_products
+    output = tiled.OmeZarrOutputAdapter(products=products, n_levels=level + power + 1)
+    def prepare_output():
+        tiled.create_product_omezarr_groups(products=products, base_shape_zyx=source_identity["base_shape"],
+            n_levels=level + power + 1, ome_chunk=geometry.chunk, ome_compressor=settings.get("compressor", "blosc-zstd"))
+        tiled.write_lasagna_product_manifest(output_path=cache / "inference.lasagna.json", products=products,
+            base_shape_zyx=source_identity["base_shape"], provenance_json="inference.json")
+        atomic_write(cache / "inference.json", {"source": source_identity, "model": model_identity,
+            "coverage": "partial; live.sqlite is required for readiness", "coarser_pyramids": "not generated"})
+    return demand.DemandStore(cache, {"source": source_identity, "model": model_identity},
+        geometry, adapter, output, accumulator_dtype=settings.get("accumulator_dtype", "float16"),
+        accumulator_layout=settings.get("accumulator_layout", "flat"),
+        accumulator_prefault=settings.get("accumulator_prefault", False),
+        scratch_budget_bytes=int(settings.get("scratch_budget_bytes_per_source", 64 << 30)),
+        prepare_output=prepare_output)
+
+
+def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False):
+    config_path = Path(config_path).resolve()
+    config = json.loads(config_path.read_text())
+    base = config_path.parent
+    if config.get("version") != 1 or not config.get("sources"):
+        raise ValueError("evaluation config requires version1 and explicit sources")
+    binary = Path(shutil.which(str(native_binary)) or native_binary).resolve()
+    resolver = binary.with_name("vc_cache_root")
+    cache_root = Path(subprocess.check_output([str(resolver)], text=True).strip())
+    snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
+    effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
+    settings = dict(config.get("inference", {}))
+    device_list = tuple(torch.device(f"cuda:{int(v)}") for v in devices.split(","))
+    if not device_list or len(set(device_list)) != len(device_list):
+        raise ValueError("select a nonempty distinct comma-separated CUDA device list")
+    precision, _ = _resolve_inference_precision(settings.get("precision", "auto"), checkpoint=snapshot, devices=device_list)
+    effective = dict(effective)
+    effective["training"] = {**effective.get("training", {}), "mixed_precision": precision}
+    tile, overlap, border = (int(settings.get(k, default)) for k, default in
+                             (("tile_size", 192), ("overlap", 64), ("border", 16)))
+    power = int(settings.get("scaledown_power", 2))
+    if not 0 <= power <= 8:
+        raise ValueError("invalid inference scaledown power")
+    scale, chunk = 1 << power, int(settings.get("chunk_size", 32))
+    dtype = settings.get("accumulator_dtype", "float16")
+    implementation = implementation_identity()
+    model_identity = {"schema": 1, "checkpoint_sha256": checkpoint_digest, "config": effective,
+                      "precision": precision, "tile": tile, "overlap": overlap, "border": border,
+                      "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
+                      "compressor": settings.get("compressor", "blosc-zstd"), "implementation": implementation}
+    model_key = json_digest(model_identity)
+    evaluation = dict(config)
+    if not isinstance(config.get("render", False), bool):
+        raise ValueError("render must be a boolean")
+    evaluation["render"] = render or config.get("render", False)
+    evaluation["output"] = location(base, config["output"])
+    if Path(evaluation["output"]).exists():
+        raise ValueError("evaluation output already exists")
+    evaluation["sources"] = []
+    source_to_store, stores, readers, channel_indices, backgrounds = {}, {}, {}, {}, {}
+    started = time.monotonic()
+    native = None
+    connection = None
+    pool = None
+    with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
+        for source in config["sources"]:
+            source_id = source["id"]
+            if source_id in source_to_store:
+                raise ValueError("duplicate source ID")
+            input_path = location(base, source["input_volume"])
+            level = int(source.get("input_level", 0))
+            if not 0 <= level <= 30:
+                raise ValueError("invalid input level")
+            sampler = Vc3dCoordinateSampler(input_path, level=level, cache_root=str(cache_root),
+                cache_budget_bytes=int(settings.get("input_cache_bytes", 4 << 30)),
+                io_threads=int(settings.get("input_io_threads", 16)),
+                decode_threads=int(settings.get("input_decode_threads", 8)), sample_threads=1)
+            volume_shape = tuple(int(v) for v in sampler.volume.shape_at(level))
+            base_shape = tuple(int(v) for v in sampler.volume.shape_at(0))
+            root_attrs = input_root_attributes(sampler.volume)
+            validate_input_lattice(root_attrs, level)
+            if volume_shape != tuple((n + (1 << level) - 1) // (1 << level) for n in base_shape):
+                raise ValueError("selected input level is not the expected isotropic power-of-two lattice")
+            geometry = demand.DemandGeometry(volume_shape, tile, overlap, border, scale, chunk)
+            source_identity = {"locator": input_path, "level": level, "shape": volume_shape,
+                "base_shape": base_shape, "metadata": root_attrs,
+                "revision": source.get("source_revision"), "base_voxel_size_um": source["base_voxel_size_um"],
+                "coordinate_space": source.get("coordinate_space")}
+            source_key = json_digest(source_identity)
+            source_to_store[source_id] = source_key
+            cache = cache_root / "live_inference" / source_key / model_key
+            if source_key not in stores:
+                store = cleanup.enter_context(create_demand_store(cache, source_identity, model_identity,
+                    geometry, effective, snapshot, level, settings))
+                products = store.products
+                stores[source_key] = store
+                readers[source_key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
+                channel_indices[source_key] = {str((Path(c.relative_path) / str(p.level)).resolve()): geometry
+                    for p in products for c in p.channels}
+                backgrounds[source_key] = set()
+            entry = dict(source)
+            entry["fiber_manifest"] = str(cache / "inference.lasagna.json")
+            entry["normal_manifest"] = location(base, source["normal_manifest"])
+            entry["inference_scaledown_power"] = power
+            entry["input_volume"] = input_path
+            if "ct_volume" in source:
+                entry["ct_volume"] = location(base, source["ct_volume"])
+            entry["fibers"] = [location(base, f) for f in source["fibers"]]
+            evaluation["sources"].append(entry)
+            for path in entry["fibers"]:
+                loaded = load_fiber_file(Path(path))
+                if len(loaded) != 1:
+                    raise ValueError("each explicit fiber path must contain one annotation")
+                backgrounds[source_key].update(reference_chunks(loaded[0].line_points_xyz,
+                    (1 << level) * scale, geometry.output_shape, chunk))
+        listener = cleanup.enter_context(socket.socket())
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(120)
+        token = secrets.token_hex(32)
+        evaluation["live_endpoint"] = {"port": listener.getsockname()[1], "token": token,
+                                       "timeout_seconds": int(settings.get("request_timeout_seconds", 600))}
+        runtime_config = Path(control) / "evaluation.json"
+        atomic_write(runtime_config, evaluation)
+        log = cleanup.enter_context((Path(control) / "native.log").open("w+"))
+        native = subprocess.Popen([str(binary), "replay-set", "--config", str(runtime_config)], stdout=log, stderr=subprocess.STDOUT)
+        try:
+            # Observe startup failure instead of waiting the whole accept timeout.
+            listener.settimeout(0.1)
+            deadline = time.monotonic() + 120
+            while connection is None:
+                if native.poll() not in (None, 0):
+                    raise RuntimeError("native evaluator failed during source validation (see native.log)")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("native evaluator did not connect")
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    pass
+            connection.settimeout(1)
+            pending = b""
+            authenticated = False
+            waiters = {}
+            last_report = time.monotonic()
+            while not authenticated or native.poll() is None or waiters or (pool is not None and pool.busy):
+                if select.select([connection], [], [], 0.005)[0]:
+                    received = connection.recv(65536)
+                    if not received:
+                        if not authenticated:
+                            raise RuntimeError("native evaluator disconnected before authentication")
+                        if waiters:
+                            raise RuntimeError("native evaluator disconnected with outstanding requests")
+                        break
+                    pending += received
+                    if len(pending) > (16 << 20):
+                        raise ValueError("oversized native demand message")
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        message = json.loads(line)
+                        if message.get("version") != 1:
+                            raise ValueError("unsupported native protocol")
+                        if not authenticated:
+                            if message.get("type") != "hello" or not secrets.compare_digest(message.get("token", ""), token):
+                                raise ValueError("invalid native control authentication")
+                            authenticated = True
+                            # Hello is sent only after native source/annotation
+                            # validation. Prefetch is required even for a case
+                            # that terminates without issuing a sample demand.
+                            for background_key, indices in backgrounds.items():
+                                for index in sorted(indices):
+                                    stores[background_key].request(index, background=True)
+                            continue
+                        if message.get("type") != "demand" or message["request_id"] in waiters:
+                            raise ValueError("invalid/duplicate native request")
+                        key = source_to_store[message["source"]]
+                        targets = set()
+                        for item in message["chunks"]:
+                            array = str(Path(item["array"]).resolve())
+                            if array not in channel_indices[key]:
+                                raise ValueError("native request escapes its inference cache")
+                            origin = stores[key].request(item["index_zyx"], remaining=float(message["remaining_base_voxels"]))
+                            targets.add((key, origin))
+                        waiters[message["request_id"]] = targets
+                queued = any(any(t not in s.tiles for t in s.priorities) for s in stores.values())
+                if pool is None and queued:
+                    pool = demand.DemandWorkerPool(stores, readers, device_list,
+                        slots_per_gpu=int(settings.get("slots_per_gpu", 2)), input_workers=int(settings.get("input_workers", 8)),
+                        result_slots=settings.get("result_slots"),
+                        accumulator_workers=settings.get("accumulator_workers"),
+                        flush_workers=int(settings.get("flush_workers", 4)))
+                if pool is not None:
+                    pool.pump()
+                for request_id, targets in list(waiters.items()):
+                    if all(stores[key].ready(origin) for key, origin in targets):
+                        connection.sendall((json.dumps({"version": 1, "type": "ready", "request_id": request_id}) + "\n").encode())
+                        del waiters[request_id]
+                if time.monotonic() - last_report > 5:
+                    print(f"live-eval elapsed={time.monotonic()-started:.1f}s waiting={len(waiters)} "
+                          f"tiles={sum(s.stats['inferred_tiles'] for s in stores.values())} "
+                          f"published={sum(s.stats['published_chunks'] for s in stores.values())}", flush=True)
+                    last_report = time.monotonic()
+            if native.wait(timeout=10) != 0:
+                raise RuntimeError("native evaluation failed (see native.log)")
+            # Reference-intersection work is explicitly drained even if traces
+            # finished before lower-priority prefetch did.
+            if pool is not None:
+                while pool.busy:
+                    pool.pump()
+                    time.sleep(0.005)
+            atomic_write(Path(evaluation["output"]) / "inference_summary.json", {
+                "wall_seconds": time.monotonic() - started, "worker_pool": pool.stats if pool else None,
+                "sources": {key: store.stats for key, store in stores.items()},
+                "cache_roots": {key: str(store.root) for key, store in stores.items()},
+                "reference_prefetch_chunks": {key: len(v) for key, v in backgrounds.items()}})
+        except BaseException as error:
+            destination = Path(evaluation["output"])
+            destination.mkdir(parents=True, exist_ok=True)
+            atomic_write(destination / "inference_incomplete.json", {"error": str(error),
+                "sources": {key: store.stats for key, store in stores.items()}})
+            if connection is not None:
+                try:
+                    connection.sendall((json.dumps({"version": 1, "type": "error", "message": str(error)}) + "\n").encode())
+                except OSError:
+                    pass
+            if native.poll() is None:
+                try:
+                    native.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    native.terminate()
+                    try:
+                        native.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        native.kill()
+                        native.wait()
+            raise
+        finally:
+            if pool is not None:
+                pool.close()
+            if connection is not None:
+                connection.close()
+            log.flush()
+            log.seek(0)
+            text = log.read()
+            destination = Path(evaluation["output"])
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "native.log").write_text(text)
+            print(text, end="", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model-config", help="legacy checkpoint configuration only")
+    parser.add_argument("--devices", required=True, help="explicit CUDA indices, e.g. 0,1; no CPU production inference")
+    parser.add_argument("--native-binary", default="vc_fiber_trace_metric")
+    parser.add_argument("--render", action="store_true", help="render reference/traced strips directly after each completed case")
+    args = parser.parse_args()
+    run(args.config, args.checkpoint, args.devices, args.native_binary, args.model_config, render=args.render)
+
+
+if __name__ == "__main__":
+    main()

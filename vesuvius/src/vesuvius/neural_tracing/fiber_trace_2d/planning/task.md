@@ -1,3 +1,3 @@
-# Task: eight-GPU S1a retraining configuration
+# Task: request concurrency visibility
 
-Make Fiber3D console and TensorBoard progress use cumulative globally processed training samples by default, so runs with different batch sizes have comparable axes. Preserve internal optimizer-update scheduling, and preserve cumulative counts on checkpoint resume, including changed batch size. Do not launch training.
+Confirm the fast loader is used. Track outstanding trace requests, requested chunks, queued tiles and in-flight reads/GPU work over time. Explain why100+ independent traces do not imply100+ active reads. Preserve scheduling and capacities while measuring.

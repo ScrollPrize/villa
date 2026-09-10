@@ -1,12 +1,17 @@
-# Task log: sample-based Fiber3D progress
+# Request concurrency instrumentation — 2026-09-10
 
-- User requested cumulative global samples as default progress so batch-size comparisons are meaningful.
-- Independent plan review approved sample-axis writer conversion, persisted resume offset, explicit legacy override, and unchanged update-based scheduling. Updated specs to describe the new default.
-- Implemented one TensorBoard boundary adapter for all scalar/image events; metadata text stays at zero. Training, dense-test, Trace2CP and test-timing console metrics show samples and update.
-- All four training snapshot paths save samples_seen and effective optimizer_global_batch_size. Resume applies subsequent updates at the new batch size; old snapshots infer only a known global batch or require training.resume_samples_seen.
-- Updated profile_experiment console parsing to recognize both historical step and new samples/update formats while retaining update units in tuning reports.
-- Real TensorBoard event tests verify train/test/timing/image axes and text at zero; checkpoint tests cover repeated batch changes and legacy ambiguity.
-- Independent implementation review approved; no blockers. Scheduling, numerical computation, data sampling and diagnostic/profile JSON units are unchanged. Historical event files remain unchanged and require separate conversion for overlay; no training process was launched or restarted.
-- Focused validation completed: 10 passed, 276 deselected in 3.08 seconds. git diff --check passed.
-- Broad suite invocation (same environment below, both test files, no -k) stalled after partial progress and was interrupted; do not claim a completed full-suite result. Focused validation uses:
-  PYTHONPATH=/home/hendrik/villa2/vesuvius/src:/home/hendrik/villa2/vesuvius:/home/hendrik/villa2 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 /home/hendrik/.venv_las/bin/python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d_sample_progress.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'sample_progress or snapshot or test_timing or linear_warmup or scalar_metrics_due'
+- Prior layout/prefault findings retained in docs/live_inference_chunk_major_20260910.md and changelog.
+- User asks whether fast loader is used and requests in-flight visibility. No concurrency increase yet.
+- NativeTileReader calls Vc3dCoordinateSampler.sample_block_zyx. Reads reserve input slots before submission; current8devices×1slot=8inputs,8executor threads.128result slots do not increase input capacity.
+- Existing short profile prequeues1599 reference-intersecting chunks, not100 actual native trace directions. Distinguish RPCs/chunks/tiles/reads.
+- Independent plan review approved. Implemented metadata-only shared snapshot,
+  formatter and profile250ms sampled series/distributions. Added synthetic
+  accounting/read-state regression. No scheduling or capacity change.
+- PAUSED by user request before live JSONL integration and before running the
+  new instrumented profile. Those pieces remain unfinished; no new throughput
+  result claimed. User requests commit current work, then merge
+  fiber-training-manager and integrate high-priority exclusive GPU acquisition.
+- Pre-commit validation:51 tests pass in22.30s (demand, profile/config and split
+  fixtures); git diff --check passes. Earlier native/layout suites are recorded
+  in the layout report. Root playbook's named volume-cartographer dependency
+  script is absent in this checkout; no setup/install attempted.

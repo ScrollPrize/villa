@@ -1,10 +1,8 @@
-# Status: eight-GPU S1a retraining
+# Request concurrency status
 
-- [x] Preserve compression work and create correct branch.
-- [x] Inspect baseline and LR recommendation.
-- [x] Independent plan review.
-- [x] Create configs and guide.
-- [x] Validate and hand off.
-- [x] Change console/TensorBoard progress to cumulative global samples.
-- [x] Preserve checkpoint resume counts across batch-size changes.
-- [x] Review implementation and pass 10 focused logging/resume tests.
+- [x] Inspect fast loader and capacities.
+- [x] Independent review.
+- [x] Shared snapshot and profile time series implemented.
+- [ ] Live time series — paused by user.
+- [ ] Instrumented short profile — paused by user, not run.
+- [ ] Findings/specs/docs/changelog.

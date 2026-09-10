@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Read-only build reuse; creates only pytest's temporary synthetic fixtures.
+set -euo pipefail
+if (( $# < 1 || $# > 2 )); then
+    echo "usage: bash $0 /path/to/native-build [python]" >&2
+    exit 2
+fi
+build_dir=$(cd "$1" && pwd)
+python_bin=${2:-python3}
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+find_binary() {
+    local name=$1 candidate
+    for candidate in "$build_dir/$name" "$build_dir/bin/$name" "$build_dir/core/test/$name" "$build_dir/apps/$name"; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "missing rebuilt executable: $name in $build_dir" >&2
+    return 1
+}
+trace_test=$(find_binary test_fiber_trace3d)
+cache_test=$(find_binary test_global_cache_root)
+replay_binary=$(find_binary vc_fiber_trace_metric)
+cache_binary=$(find_binary vc_cache_root)
+"$trace_test"
+"$cache_test"
+cd "$repo_dir"
+VC_REPLAY_TEST_BINARY="$replay_binary" VC_CACHE_ROOT_BINARY="$cache_binary" \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+    "$python_bin" -m pytest --noconftest -q vesuvius/tests/neural_tracing/test_native_replay_evaluation.py \
+        lasagna/tests/test_demand_predict3d.py lasagna/tests/test_live_tiled_predict3d.py

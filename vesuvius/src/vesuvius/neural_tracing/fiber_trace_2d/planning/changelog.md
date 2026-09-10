@@ -1,3 +1,89 @@
+## 2026-09-10 — Queue visibility checkpoint (paused)
+
+- Shared queue snapshot and short-profile sampled time series added;51 relevant
+  tests pass. Confirmed native block sampler but8 input slots/read threads,
+  independent of128 result slots. No changed scheduling or measured new result.
+- User paused before live JSONL integration and new profile run to commit and
+  merge GPU manager. See docs/live_inference_concurrency_20260910.md.
+
+## 2026-09-10 — Chunk-major accumulator and writable-prefault trial
+
+- Added opt-in contiguous per-output-chunk scratch inside existing channel mmap
+  files, using shared descriptor/read/add helpers and unchanged native arithmetic.
+  Same128 buffers/eight GPUs:113.589→322.899 equivalent128³ input tiles/s (2.84×);
+  mean accumulation task36.392→2.730ms, kernelCPU289.17→43.56s per40s window.
+- Follow-up first-touch MADV_POPULATE_WRITE trial reached336.960 equivalent
+  tiles/s but mean task2.797ms, kernelCPU47.84s and more unfinished publication.
+  No convincing prefault gain; option retained disabled. Profile uses chunk-major,
+  production default remains flat. No full evaluation restart or new syncs.
+- Tests, exact commands, component counters and single-window limitations:
+  docs/live_inference_chunk_major_20260910.md. Existing unrelated changes retained.
+
+## 2026-09-10 — Result-buffer trial and accumulator fault profiling
+
+- Added independent result-slot capacity, retained input counts and production
+  defaults.128 buffers yielded112–114 equivalent128cubed tiles/s, unchanged from
+  8 buffers; extra GPU results accumulated as unfinished backlog.
+- Optional OS profile found289s kernel versus9s user CPU across8 accumulators
+  in40s,19.29million minor faults; native AVX-512 active. Indicates kernel/page
+  fault overhead, not predominantly storage-read waits. No layout fix yet.
+  See docs/live_inference_buffer_experiment_20260910.md for counters, caveats,
+  synchronization audit and reproducible command. No full evaluation restart.
+
+## 2026-09-10 — Demand accumulation simplification
+
+- Removed NPZ staging, canonical-arrival waiting, scratch zero reservation and
+  scratch fsync. Reuse shared chunk-owner accumulation processes directly from
+  RAM, release input slots independently, publish Zarr in background. Demand
+  float addition order may vary as explicitly authorized; sequential unchanged.
+- Corrected owner mapping to hash chunk indices, not voxel coordinates. Final
+  eight-GPU profile:71 tiles/40.003s (1.775/s) versus9/41.485s (0.217/s), observed
+  8.18x with warmer input-cache caveat; mean result queue wait8.132s→0.072s.
+  Tests/review and remaining mmap stalls documented in
+  docs/live_inference_accumulation_fix_20260910.md. No full trace restart.
+- Prior profile/config cleanup is documented in docs/live_inference_profile_20260910.md.
+  Dataset/normal bindings now reside in workload JSON, not scroll-specific CLI flags.
+
+## 2026-09-10 — Native multi-fiber evaluation and on-demand inference
+
+- Classic best91_5k real-checkpoint PHerc0139 pilot completed both directions:
+  0 forward/2 reverse failures,143.65s cold wall,18 inferred tiles,26 ready chunks.
+  User confirmed PHerc1229/1299 identity and Paris4 local normal source;
+  full50-fiber/100-direction cohort launched on eight GPUs, then failed at the
+  600s request timeout (2/100 cases completed); no valid full metrics.
+  Added reproducible preparation/provenance checks, fixed local-only
+  metadata access for remote CT inputs; native fast voxel loading unchanged.
+  See docs/classic_fiber_evaluation_20260910.md; previous implementation validation
+  log preserved in docs/live_inference_implementation_validation_20260910.md.
+
+- Continuation: batch/live `--render` generates strips directly from completed
+  replay objects, default off, retaining the post-hoc API. Ported scoped HiGHS
+  optionality from villa and enabled the evaluator in headless builds. Restored
+  missing registered annotation test and fixed stale replay strip validation to
+  use the shared seven-row/resampled-column geometry. Overlay and failure-marker
+  projection now uses that same position map, tested on long resampled spans. Current-source GCC13
+  CMake build and five native suites pass; 24 Python smoke tests pass. No stuck
+  input cancellation work, as explicitly deferred by the user.
+
+- Added same-core VC3D beam/greedy bidirectional reference replay, stable case
+  artifacts, disconnected exports and post-hoc reference/traced CT strips.
+- Added native batched readiness/control bridge and standalone GPU coordinator,
+  using shared tiled inference with canonical sparse mmap accumulation, durable
+  sibling Zarr publication and source/snapshot-keyed SQLite live cache.
+- Added shared global cache override; host points to
+  `/ephemeral/hendrik/vc3d_cache`, without migrating/deleting old caches.
+- Synthetic offline/live and cold/warm tests pass, including exact scale1/2
+  sequential f16/f32 output parity. Headless native targets now build from source;
+  real-model GPU/perf validation remains pending; concurrency/resource limits are
+  explicit in docs/live_inference_trace_evaluation.md and planning/task_log.md.
+
+## 2026-09-10 — Per-source fiber-length train/test split
+
+- Published reproducible six-source 95/5 split with whole-fiber upward rounding:
+  946 train / 50 test files. Added reusable splitter, source checksums, membership
+  and geometry/branch audit, documentation and seven passing tests. Originals
+  remain unchanged; split directories contain relative symlinks.
+
 ## 2026-09-09 — Sample-based training progress
 
 - Fiber3D TensorBoard scalars/images and console metrics now use cumulative
@@ -2160,6 +2246,12 @@
   to 88% while retaining 451 traces.
 - Added a raw-count-derived pre-pruning exact-reference progress plot alongside
   the existing replay and crop-constraint plots.
+
+## 2026-09-10 - Live-inference reference evaluation plan
+
+- Planned a standalone multi-source, bidirectional evaluator around the existing VC3D beam tracer, using shared reference failure/reset metrics, dynamic inference requests and temporary file-backed accumulation under a model/source-keyed live_inference cache.
+- Planned durable geometry for every trace with optional post-hoc JSON/OBJ/CT-strip inspection, without retracing. Training invocation is a later hook; no GUI live integration.
+- Identified required extensions: current greedy-only replay wrapper, asynchronous trace sessions, shared inference demand mode, coherent chunk/dependency ledger and an explicit global cache-root override. Current forced-mount resolver prevents a host config-only relocation; functional implementation/configuration and GPU validation are not yet complete.
 
 ## 2026-09-03 - Optional ambiguity-stopping crop tracing
 
