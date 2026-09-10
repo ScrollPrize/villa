@@ -2,7 +2,9 @@
 
 #include "vc/core/io/PolylineObj.hpp"
 
+#ifdef VC_HAVE_HIGHS
 #include <Highs.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +55,7 @@ FiberTracePieceLabel makeLabel(bool vertical, bool odd)
     return odd ? FiberTracePieceLabel::HOdd : FiberTracePieceLabel::HEven;
 }
 
+#ifdef VC_HAVE_HIGHS
 void requireOk(HighsStatus status, const char* operation)
 {
     if (status != HighsStatus::kOk)
@@ -98,6 +101,8 @@ struct RowBuilder {
         starts.push_back(checkedHighsInt(indices.size(), "MILP nonzero count"));
     }
 };
+
+#endif
 
 struct NeighborEdge {
     std::size_t neighbor = 0;
@@ -292,6 +297,11 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config)
 {
+#ifndef VC_HAVE_HIGHS
+    throw std::runtime_error(
+        "Fiber-trace LP/MILP labeling requires HiGHS; rebuild with HiGHS "
+        "available and VC_ENABLE_HIGHS=ON");
+#else
     if (!std::isfinite(config.brokenCostPerConstraint) ||
         config.brokenCostPerConstraint < 0.0) {
         throw std::invalid_argument(
@@ -736,6 +746,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     report.mipNodes = highs.getInfo().mip_node_count;
     report.mipGap = highs.getInfo().mip_gap;
     return report;
+#endif
 }
 
 FiberTraceLabelingReport thresholdFiberTraceLabeling(

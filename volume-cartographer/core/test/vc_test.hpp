@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -137,6 +138,8 @@ inline void runCase(const Runner::Case& c) {
 inline int runAll() {
     auto& r = Runner::get();
     for (auto& c : r.cases) {
+        if (std::getenv("VC_TEST_TRACE"))
+            std::cerr << "[test] " << c.name << std::endl;
         runCase(c);
     }
     if (r.failures) {

@@ -105,6 +105,8 @@ public:
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
+        std::size_t probeWorkerCapacity = 32;
+        std::size_t decodeWorkerCapacity = 8;
         std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
         // Startup-only selection for remote-volume persistent caches. Sources
         // acquired from this service cannot change representation in place.
@@ -142,6 +144,8 @@ public:
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
     std::size_t decodeConcurrency() const;
+    std::size_t probeWorkerCapacity() const;
+    std::size_t decodeWorkerCapacity() const;
     PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
