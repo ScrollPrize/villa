@@ -18,7 +18,7 @@ from typing import List, Tuple
 import numpy as np
 import zarr
 
-from vesuvius.data.utils import open_zarr
+from vesuvius.data.utils import _ZARR_V3, open_zarr
 from numcodecs import Blosc
 from tqdm import tqdm
 
@@ -89,7 +89,9 @@ def create_level_dataset(
     compressor,
     overwrite: bool = True,
 ) -> zarr.Array:
-    """Create a dataset using NestedDirectoryStore for nested chunk directories.
+    """Create a zarr v2 level with nested chunk directories (``dimension_separator="/"``).
+
+    Works on both zarr 2 and zarr 3.
 
     Args:
         root_group_path: Path to the root zarr group
@@ -122,6 +124,9 @@ def create_level_dataset(
     # the argument only on zarr 3 (zarr 2 has none and warns when given one). That is
     # exactly what a numcodecs `compressor=` requires, and its docstring gives the same
     # reason. Using it here keeps one copy of that rule in the codebase instead of two.
+    # write_empty_chunks=False keeps chunks holding only the fill value off disk. zarr 3 still takes
+    # it as an argument but deprecates that in favour of config=, which zarr 2 does not have.
+    empty_chunks = {"config": {"write_empty_chunks": False}} if _ZARR_V3 else {"write_empty_chunks": False}
     return open_zarr(
         path=str(level_path),
         mode="w",
@@ -130,8 +135,8 @@ def create_level_dataset(
         dtype=dtype,
         compressor=compressor,
         dimension_separator="/",
-        write_empty_chunks=False,
         fill_value=0,
+        **empty_chunks,
     )
 
 
