@@ -1217,6 +1217,59 @@ class FitContext:
             if pcl_input_enabled(config, spec.role, spec.path)
         ]
 
+        # An input that is present on disk but switched off is almost always a
+        # surprise: the dataset ships the file, so the operator expects it to
+        # be used. Patches already announce their own absence below; nothing
+        # else did, which is what let a fit run with no evidence at all and
+        # still look normal. Only files that exist are reported, because
+        # conventional_input_paths() invents a path for every catalogued input
+        # whether or not it is there.
+        discarded = [
+            (name, flag)
+            for name, declared, resolved, flag in (
+                ('tracks_dbm', paths.tracks_dbm, self.tracks_dbm_path,
+                 'input_use_tracks'),
+                ('normal_x', paths.normal_x, self.normal_nx_zarr_path,
+                 'input_use_normals'),
+                ('fibers', paths.fibers, self.fibers_path,
+                 'input_use_fibers'),
+                ('fiber_directions', paths.fiber_directions,
+                 self.fiber_directions_path, 'input_use_fiber_directions'),
+                ('verified_patches', paths.verified_patches,
+                 self.verified_patches_path, 'input_use_verified_patches'),
+                ('unverified_patches', paths.unverified_patches,
+                 self.unverified_patches_path, 'input_use_unverified_patches'),
+                ('outer_shell', paths.outer_shell, self.shell_path,
+                 'input_use_outer_shell'),
+                ('gradient_magnitude', paths.gradient_magnitude,
+                 self.grad_mag_zarr_path, 'input_use_gradient_magnitude'),
+            )
+            if declared and resolved is None and os.path.exists(declared)
+        ]
+        for name, flag in discarded:
+            print(f'WARNING: {name} exists in this dataset but is discarded '
+                  f'because {flag} is false; it will not constrain the fit')
+
+        # Normals give the sheet's orientation, not which winding a point is
+        # on: two adjacent windings have parallel normals. Only tracks and
+        # patches place a point on a winding. Saying so is worth one line: a
+        # run with neither still converges and writes a normal-looking
+        # checkpoint.
+        # Existence again, not just the resolved string: with the toggle on,
+        # verified_patches_path is set to the conventional directory whether or
+        # not that directory is there, so testing the path alone would make
+        # this branch unreachable.
+        placing_inputs = [
+            path for path in (self.tracks_dbm_path,
+                              self.verified_patches_path,
+                              self.unverified_patches_path)
+            if path and os.path.exists(path)]
+        if not placing_inputs:
+            print('WARNING: no winding-placing input is active (tracks and '
+                  'patches are all off or absent). Normals and fibers supply '
+                  'orientation only, so the winding assignment will rest on '
+                  'the umbilicus and the regularisers alone.')
+
         # Deployment/presentation values.
         self.cache_path = cache_dir if cache_dir is not None else (paths.cache_directory or None)
         self.lasagna_storage_backend = storage_backend
@@ -2525,6 +2578,34 @@ class FitContext:
                 pieces.append(points[in_roi])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
+    def _umbilicus_clearance(self, patch):
+        """Smallest distance from a patch vertex to the umbilicus curve, and its z.
+
+        The theta potential is the polar angle about the umbilicus, so a cycle
+        of the patch grid picks up a non-zero winding residual exactly when the
+        umbilicus curve passes through the patch. A rejection therefore says as
+        much about the axis as about the patch, and the operator cannot tell
+        which without this number.
+
+        Returns (clearance_voxels, z) or None when it cannot be computed.
+        """
+        umbilicus = getattr(self, 'umbilicus', None)
+        if umbilicus is None:
+            return None
+        try:
+            zyxs = np.asarray(patch.zyxs, dtype=np.float64).reshape(-1, 3)
+            # tifxyz marks invalid vertices -1 on every axis, not NaN and not 0.
+            zyxs = zyxs[(zyxs > -0.5).all(axis=1)]
+            if zyxs.shape[0] == 0:
+                return None
+            centre_yx = np.asarray(umbilicus(zyxs[:, 0]), dtype=np.float64)
+            radii = np.linalg.norm(zyxs[:, 1:] - centre_yx.reshape(-1, 2), axis=1)
+            i = int(np.argmin(radii))
+            return float(radii[i]), float(zyxs[i, 0])
+        except Exception:
+            # A diagnostic must never be the reason a fit fails.
+            return None
+
     def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
         """Remove inconsistent patches from every active patch sampling pool."""
         warnings = []
@@ -2538,6 +2619,14 @@ class FitContext:
             warning = (
                 f'non-liftable patch {path!r} has theta cycle inconsistencies; '
                 'excluding it from this fit')
+            clearance = self._umbilicus_clearance(patch)
+            if clearance is not None:
+                warning += (
+                    f'. Its closest vertex is {clearance[0]:.1f} voxels from the '
+                    f'umbilicus curve at z={clearance[1]:.0f}; theta is the polar '
+                    'angle about that curve, so an axis running through or near a '
+                    'patch produces this rejection on its own. Check the umbilicus '
+                    'before treating this as a defect of the patch')
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.verified_patches[patch_id]
@@ -2550,6 +2639,14 @@ class FitContext:
             warning = (
                 f'non-liftable patch {path!r} has theta cycle inconsistencies; '
                 'excluding it from this fit')
+            clearance = self._umbilicus_clearance(patch)
+            if clearance is not None:
+                warning += (
+                    f'. Its closest vertex is {clearance[0]:.1f} voxels from the '
+                    f'umbilicus curve at z={clearance[1]:.0f}; theta is the polar '
+                    'angle about that curve, so an axis running through or near a '
+                    'patch produces this rejection on its own. Check the umbilicus '
+                    'before treating this as a defect of the patch')
             print(f'WARNING: {warning}')
             warnings.append(warning)
             del self.unverified_patches[patch_id]
