@@ -1697,9 +1697,9 @@ int main(int argc, char *argv[])
                 return p;
             };
 
-            // Skip if all exist
+            // Skip existing TIFFs only when explicitly resuming.
             bool tifSkip = false;
-            if (numParts <= 1) {
+            if (resumeFlag && numParts <= 1) {
                 bool all = true;
                 for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
                 if (all) {

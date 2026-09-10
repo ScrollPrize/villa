@@ -26,6 +26,15 @@ prunes entries for files gone from both sides) and never hides a pending
 difference. 'reset' stamps the current state as the synced baseline, which
 discards pending differences — it asks for confirmation.
 
+Conflict resolution: a conflict whose content cannot be merged three-way is
+put to the user first ([l]ocal / [r]emote / [s]kip). Auto-merges of linked
+fibers are then planned against the decided world, so a decided root
+un-blocks its dependents in the same run and only skipped files cascade to
+the files that depend on them. A dropped link to a peer that will not exist
+after the sync (deleted on both sides, or pending local deletion) needs no
+reciprocal fix and no longer forces manual resolution. --dry-run previews
+content-merge eligibility only; link consistency is assessed in a real run.
+
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
     python s3_sync.py status <directory> [--verbose] [--sync-backups]
@@ -101,6 +110,7 @@ import tempfile
 import traceback
 import subprocess
 from datetime import datetime, timezone
+from collections import namedtuple
 from enum import Enum
 from contextlib import contextmanager
 
@@ -175,6 +185,10 @@ class SyncAction(Enum):
     SKIP = "skip"
     DELETE_LOCAL = "delete_local"
     DELETE_REMOTE = "delete_remote"
+
+
+PlanResult = namedtuple('PlanResult',
+                        'pending peer_fixes manual resolved stats')
 
 
 def is_backup_file(filename):
@@ -741,23 +755,28 @@ class S3SyncManager:
         {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
         to apply with _apply_pending_merges() AFTER the user confirms the
         sync (or discard with _discard_pending_merges() on cancellation).
-        Returns a preview string in dry-run mode, or None when the file is
-        not eligible, no base is available, or the merge has genuine
-        conflicts (all three versions are stashed in that case and the
-        caller falls back to the interactive prompt).
+        Returns None when the file is not eligible, no base is available,
+        or the merge has genuine conflicts (all three versions are stashed
+        in that case and the caller falls back to the interactive prompt).
+        In dry-run mode nothing is stashed and the return is a dict:
+        {'summary', 'merged_doc', 'base_doc', 'peer_files'} for a clean
+        content merge (link consistency is NOT assessed), or {'reason'}.
         """
+        def fail(reason):
+            return {'reason': reason} if dry_run else None
+
         if fiber_merge is None or not local_info or not s3_info:
-            return None
+            return fail("merge support unavailable")
         if not self._should_hash(path, local_info.get('local_size')):
-            return None
+            return fail("not an annotation-sized file")
         local_path = os.path.join(self.local_dir, path)
         try:
             with open(local_path) as f:
                 local_doc = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return None
+            return fail("local file unreadable")
         if not fiber_merge.is_fiber_doc(local_doc):
-            return None
+            return fail("not a fiber document")
 
         with self._get_db() as conn:
             row = conn.execute('SELECT * FROM files WHERE path = ?',
@@ -767,7 +786,7 @@ class S3SyncManager:
         if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
             if not dry_run:
                 print(f"  (no merge base available for {path})")
-            return None
+            return fail("no merge base")
 
         remote_doc, remote_tmp = self._fetch_remote_json(path)
         if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
@@ -776,7 +795,7 @@ class S3SyncManager:
                     os.remove(remote_tmp)
                 except OSError:
                     pass
-            return None
+            return fail("remote copy unreadable")
 
         keep_remote_tmp = False
         try:
@@ -788,10 +807,14 @@ class S3SyncManager:
                 print(f"  ⚠️  merge failed for {path} "
                       f"({ex}{_exception_location(ex)}); manual resolution")
                 _print_debug_traceback()
-                return None
+                return fail("merger error")
             summary = fiber_merge.summarize(result)
             if dry_run:
-                return f"would auto-merge ({summary})" if result['ok'] else None
+                if not result['ok']:
+                    return fail("content conflict: " + '; '.join(result['conflicts']))
+                return {'summary': summary, 'merged_doc': result['merged'],
+                        'base_doc': base_doc,
+                        'peer_files': result.get('peer_files', [])}
 
             if not result['ok']:
                 print(f"  ✗ cannot auto-merge {path}:")
@@ -891,7 +914,20 @@ class S3SyncManager:
             f.write('\n')
         plan['merged_doc'] = doc
 
-    def _plan_link_consistency(self, pending_merges, download_paths):
+    def _absent_locally(self, path):
+        """True only when the path provably does not exist in the sync
+        dir. Unreadable/inaccessible ("cannot tell") is NOT absent: the
+        caller then reads it and demotes on failure, as before."""
+        try:
+            os.lstat(os.path.join(self.local_dir, path))
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _plan_link_consistency(self, pending_merges, download_paths,
+                               vanishing_paths=frozenset(), remote_paths=None):
         """Mirror each auto-merged fiber's link decisions into its peer
         files (fiber_merge.refresh_pair_links) so VC3D's index-exact
         cross-file reciprocity holds on the post-sync state.
@@ -899,18 +935,32 @@ class S3SyncManager:
         Pure planning over the files' FUTURE content (pending merge
         results, remote content for scheduled downloads, local content
         otherwise); nothing on disk is touched. Returns (peer_fixes,
-        demoted): peer_fixes maps non-merge peer paths to their fixed
-        docs (to write after downloads and upload), demoted lists
-        (path, reason) merges that must fall back to manual resolution.
+        demoted, notes): peer_fixes maps non-merge peer paths to their
+        fixed docs (to write after downloads and upload), demoted lists
+        (path, reason) merges that must fall back to manual resolution,
+        notes lists (path, peer_name) going-away peers that were skipped.
         Pending files of merges whose far-side fields were refreshed are
         rewritten in place (they are plan artifacts, not user files).
+
+        A peer that will not exist after this sync — pending local
+        deletion (`vanishing_paths`), or absent locally AND absent from
+        the remote inventory (`remote_paths`) AND not being downloaded —
+        has nothing to reciprocate, so a merged doc that dropped its link
+        to it is not a dangling link (it used to demote as "missing").
+        Such a peer is never read: reading a file pending deletion would
+        let refresh_pair_links strip its stale reciprocal and schedule an
+        upload of a file being deleted. A merged doc that STILL links a
+        going-away peer is dangling and demotes. Without a remote
+        inventory (`remote_paths=None`) absence cannot be established and
+        a locally missing peer demotes, as before.
         """
         if fiber_merge is None:
-            return {}, []
+            return {}, [], []
         plans = dict(pending_merges)
         future_docs = {path: plan['merged_doc'] for path, plan in pending_merges}
         changed = set()
         demoted = []
+        notes = []
 
         def future_doc(path):
             if path in future_docs:
@@ -969,9 +1019,34 @@ class S3SyncManager:
                 # POSIX join: sync paths are '/'-keyed everywhere (scans,
                 # download_paths), regardless of host OS.
                 peer_path = f"{a_dir}/{peer_name}" if a_dir else peer_name
+                if peer_path not in future_docs:
+                    # Going-away peers are decided before any read. A
+                    # pending merge is served from future_docs first: the
+                    # action sets (conflict / delete-local / download) are
+                    # disjoint per path in analyze_changes, so a pending
+                    # peer can never be going away.
+                    remote_absent = (remote_paths is not None and
+                                     peer_path not in remote_paths)
+                    going_away = (peer_path in vanishing_paths or
+                                  (remote_absent and
+                                   peer_path not in download_paths and
+                                   self._absent_locally(peer_path)))
+                    if going_away:
+                        if fiber_merge.links_to(a_doc, peer_name):
+                            failure = (f"linked fiber {peer_name} is pending "
+                                       f"deletion or missing")
+                            break
+                        notes.append((path, peer_name))
+                        continue
                 b_doc = future_doc(peer_path)
                 if b_doc is None or not fiber_merge.is_fiber_doc(b_doc):
                     failure = f"linked fiber {peer_name} is missing or unreadable"
+                    if (remote_paths is not None and peer_path in remote_paths
+                            and peer_path not in download_paths
+                            and self._absent_locally(peer_path)):
+                        failure += (" (peer is absent locally but still present "
+                                    f"on {self.REMOTE_NAME}; resolve this file "
+                                    "manually)")
                     break
                 # A refresh bug on malformed input must demote this merge,
                 # never abort the whole sync mid-planning.
@@ -1009,13 +1084,13 @@ class S3SyncManager:
                 changed.add(path)
 
         if demoted:
-            return {}, demoted
+            return {}, demoted, notes
 
         for path in changed & set(plans):
             self._rewrite_pending(plans[path], future_docs[path])
         peer_fixes = {path: future_docs[path]
                       for path in changed if path not in plans}
-        return peer_fixes, demoted
+        return peer_fixes, demoted, notes
 
     def _apply_peer_fixes(self, peer_fixes):
         """Write link-consistency fixes into peer files, stashing the prior
@@ -1044,29 +1119,68 @@ class S3SyncManager:
 
     def _plan_conflict_resolutions(self, conflicts, local_files, s3_files,
                                    download_paths, delete_local_paths,
-                                   auto_merge):
-        """Split conflicts into planned auto-merges (with their peer fixes)
-        and manual conflicts.
+                                   auto_merge, resolve=None):
+        """Split conflicts into planned auto-merges (with their peer fixes),
+        user decisions, and skipped conflicts.
 
-        ONE fixpoint drives both demotion causes — peers that are manual
-        conflicts or pending local deletion, and peers the link-consistency
-        planner cannot resolve — so a demotion from either stage re-runs
-        the other. This is what guarantees a peer fix is never computed
-        for (or applied over) a file whose fate the user later decides at
-        the interactive prompt.
+        Each conflict is content-merged exactly once. Conflicts that cannot
+        be merged, and merges demoted later by either stage, are put to the
+        user through `resolve(path, reason) -> SyncAction` BEFORE any link
+        planning depends on them, so a peer fix is never computed for (or
+        applied over) a file whose fate is undecided or skipped, while a
+        decided file ([l]ocal / [r]emote) is a known source the planner can
+        plan against. Only skipped files block their dependents; a decided
+        root un-blocks them in the same run (the 2026-09-08 reconciliation
+        needed three runs for what this does in one).
 
-        Returns (pending_merges, peer_fixes, manual_conflicts).
+        Loop: prompt everything awaiting a decision; stage 1 demotes merges
+        whose peers are skipped (or pending local deletion while still
+        linked); if anything new awaits, prompt again; otherwise stage 2
+        plans cross-file link consistency over an all-decided world and
+        its demotions feed back the same way. 2*len(pending)+len(awaiting)
+        strictly decreases on every prompt and every demotion, so this
+        terminates without a round cap. No path is prompted twice.
+
+        With resolve=None (legacy callers, --no-auto-merge paths, tests)
+        every demotion is recorded as a manual conflict immediately and
+        acts as a blocker from that moment — today's eager fixpoint, with
+        identical membership, order and reasons.
+
+        Returns PlanResult(pending, peer_fixes, manual, resolved, stats):
+        pending [(path, plan)], peer_fixes {path: doc}, manual
+        [(path, reason)] skipped decisions in prompt order (all demotions
+        when resolve is None), resolved [(path, UPLOAD|DOWNLOAD)] in prompt
+        order, stats {merged, content_conflicts, blocked_by_skip,
+        blocked_by_delete, link_state, decisions: {l, r, s}} — demotion
+        classes counted once per merge (skip wins over delete); with
+        resolve=None every manual conflict counts as 's'. Every
+        prompted path is in exactly one of manual/resolved.
+        `download_paths` is not modified.
         """
         pending_merges = []
+        awaiting = []            # (path, reason) to put to the user next
         manual_conflicts = []
+        resolved = []
+        blockers = set()         # skipped paths (and, legacy, all demotions)
+        prompted = set()
+        effective_downloads = set(download_paths)
+        delete_local_paths = set(delete_local_paths)
+        remote_paths = set(s3_files)
+        printed_notes = set()
+        stats = {'merged': 0, 'content_conflicts': 0, 'blocked_by_skip': 0,
+                 'blocked_by_delete': 0, 'link_state': 0,
+                 'decisions': {'l': 0, 'r': 0, 's': 0}}
+
         for path, reason in conflicts:
+            plan = None
             if auto_merge:
                 plan = self._attempt_auto_merge(path, local_files.get(path),
                                                 s3_files.get(path))
-                if isinstance(plan, dict):
-                    pending_merges.append((path, plan))
-                    continue
-            manual_conflicts.append((path, reason))
+            if isinstance(plan, dict):
+                pending_merges.append((path, plan))
+            else:
+                awaiting.append((path, reason))
+        stats['content_conflicts'] = len(awaiting)
 
         def peer_paths(path, plan):
             directory = os.path.dirname(path)
@@ -1074,45 +1188,91 @@ class S3SyncManager:
                     for name in plan.get('peer_files') or []
                     if name != os.path.basename(path)]
 
+        def blocks(plan, peer_path):
+            # A skipped peer always blocks. A peer pending local deletion
+            # blocks only while the merged doc still links it (a dangling
+            # link); a dropped link to a going-away peer needs no
+            # reciprocal fix, and stage 2 skips that peer without reading it.
+            if peer_path in blockers:
+                return True
+            return (peer_path in delete_local_paths and
+                    bool(fiber_merge.links_to(plan['merged_doc'],
+                                              os.path.basename(peer_path))))
+
         def demote(path, plan, reason):
             self._demote_merge(path, plan, reason)
             # Keep the real reason ("Both ..." prefix preserved for the
             # prompt's both-modified warning).
-            manual_conflicts.append(
+            awaiting.append(
                 (path, f"Both local and {self.REMOTE_NAME} modified since "
                        f"last sync; auto-merge failed: {reason}"))
-            manual_paths.add(path)
+            if resolve is None:
+                # Legacy: a demotion is manual at once, so later entries in
+                # the same stage-1 scan already see it (today's ordering).
+                blockers.add(path)
 
-        manual_paths = {p for p, _ in manual_conflicts} | set(delete_local_paths)
+        def drain():
+            nonlocal awaiting
+            batch, awaiting = awaiting, []
+            for path, reason in batch:
+                if path in prompted:
+                    raise RuntimeError(f"BUG: conflict prompted twice: {path}")
+                prompted.add(path)
+                if resolve is None:
+                    manual_conflicts.append((path, reason))
+                    blockers.add(path)
+                    stats['decisions']['s'] += 1
+                    continue
+                action = resolve(path, reason)
+                if action in (SyncAction.UPLOAD, SyncAction.DOWNLOAD):
+                    resolved.append((path, action))
+                    if action == SyncAction.DOWNLOAD:
+                        effective_downloads.add(path)
+                    stats['decisions']['r' if action == SyncAction.DOWNLOAD
+                                       else 'l'] += 1
+                else:
+                    manual_conflicts.append((path, reason))
+                    blockers.add(path)
+                    stats['decisions']['s'] += 1
+
         peer_fixes = {}
-        while True:
-            # Stage 1: cascade blocked-peer demotions to a fixpoint.
-            progressed = True
-            while progressed:
-                progressed = False
-                still_pending = []
-                for path, plan in pending_merges:
-                    blocked = sorted(os.path.basename(p)
-                                     for p in peer_paths(path, plan)
-                                     if p in manual_paths)
-                    if blocked:
-                        demote(path, plan,
-                               "linked fiber(s) with unresolved conflicts "
-                               "or pending deletion: " + ", ".join(blocked))
-                        progressed = True
-                    else:
-                        still_pending.append((path, plan))
-                pending_merges = still_pending
+        while pending_merges or awaiting:
+            drain()
+            # Stage 1: demote merges whose peers are skipped (or pending
+            # deletion while still linked). One pass; anything demoted
+            # awaits a decision, and the loop re-enters stage 1 after it.
+            still_pending = []
+            for path, plan in pending_merges:
+                blocking = [p for p in peer_paths(path, plan) if blocks(plan, p)]
+                blocked = sorted(os.path.basename(p) for p in blocking)
+                if blocked:
+                    stats['blocked_by_skip' if any(p in blockers for p in blocking)
+                          else 'blocked_by_delete'] += 1
+                    demote(path, plan,
+                           "linked fiber(s) with unresolved conflicts "
+                           "or pending deletion: " + ", ".join(blocked))
+                else:
+                    still_pending.append((path, plan))
+            pending_merges = still_pending
+            if awaiting:
+                continue        # never run stage 2 with undecided paths
             if not pending_merges:
                 peer_fixes = {}
                 break
-            # Stage 2: plan the cross-file link consistency; its demotions
-            # feed back into stage 1 on the next iteration.
-            peer_fixes, demoted = self._plan_link_consistency(
-                pending_merges, download_paths)
+            # Stage 2: plan the cross-file link consistency over an
+            # all-decided world; its demotions feed back into stage 1.
+            peer_fixes, demoted, notes = self._plan_link_consistency(
+                pending_merges, effective_downloads,
+                vanishing_paths=delete_local_paths, remote_paths=remote_paths)
+            for note in notes:
+                if note not in printed_notes:
+                    printed_notes.add(note)
+                    print(f"  (peer {note[1]} of {note[0]} is going away and the "
+                          "merge dropped its link; no reciprocal fix needed)")
             if not demoted:
                 break
             demoted_reasons = dict(demoted)
+            stats['link_state'] += len(demoted_reasons)
             still_pending = []
             for path, plan in pending_merges:
                 if path in demoted_reasons:
@@ -1121,7 +1281,9 @@ class S3SyncManager:
                     still_pending.append((path, plan))
             pending_merges = still_pending
 
-        return pending_merges, peer_fixes, manual_conflicts
+        stats['merged'] = len(pending_merges)
+        return PlanResult(pending_merges, peer_fixes, manual_conflicts, resolved,
+                          stats)
 
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
@@ -2122,27 +2284,57 @@ class S3SyncManager:
                 for path, problem in invalid_uploads:
                     print(f"  {path}: {problem}")
             if conflicts and auto_merge and fiber_merge is not None:
-                print("\nMerge preview for conflicts (fetches remote copies "
-                      "to test-merge; local files are not touched):")
+                print("\nDry-run conflict preview (fetches remote copies to "
+                      "test-merge; local files are not touched; link "
+                      "consistency between fibers is only assessed in a real run):")
+                mergeable = 0
                 for path, reason in conflicts:
                     probe = self._attempt_auto_merge(path,
                                                      local_files.get(path),
                                                      s3_files.get(path),
                                                      dry_run=True)
-                    print(f"  {path}: {probe or 'manual resolution required'}")
+                    if 'summary' in probe:
+                        mergeable += 1
+                        print(f"  {path}: content merge possible ({probe['summary']})")
+                    else:
+                        print(f"  {path}: manual resolution required "
+                              f"({probe['reason']})")
+                print(f"  {mergeable} of {len(conflicts)} conflict(s) are "
+                      "content-merge candidates")
             self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
                                      "Conflicts", len(conflicts))
             print("\n--dry-run mode: No changes will be made")
             return
 
-        # Process conflicts first: plan auto-merges (and their cross-file
-        # link-consistency fixes) for what we safely can, prompt for the
-        # rest. Merges are only applied after confirmation.
-        pending_merges, peer_fixes, manual_conflicts = \
-            self._plan_conflict_resolutions(conflicts, local_files, s3_files,
-                                            {p for p, _ in downloads},
-                                            {p for p, _ in deletes_local},
-                                            auto_merge)
+        # Process conflicts first: content conflicts are put to the user,
+        # then auto-merges (and their cross-file link-consistency fixes)
+        # are planned against the decided world; merges whose peers were
+        # skipped are prompted too. Merges are only applied after
+        # confirmation.
+        plan = self._plan_conflict_resolutions(
+            conflicts, local_files, s3_files,
+            {p for p, _ in downloads}, {p for p, _ in deletes_local},
+            auto_merge,
+            resolve=lambda path, reason: self.resolve_conflict(
+                path, reason, local_files.get(path), s3_files.get(path)))
+        pending_merges, peer_fixes = plan.pending, plan.peer_fixes
+        if conflicts:
+            st, dec = plan.stats, plan.stats['decisions']
+            print(f"\nConflicts: {st['merged']} auto-merged, "
+                  f"{st['content_conflicts']} needed a decision, "
+                  f"{st['blocked_by_skip']} blocked by skipped peers, "
+                  f"{st['blocked_by_delete']} blocked by pending deletions, "
+                  f"{st['link_state']} with unresolvable link state; "
+                  f"decisions: {dec['l']} local, {dec['r']} remote, {dec['s']} skipped")
+
+        # A decided root that received a reciprocal correction is written
+        # and uploaded once as a peer fix: the fix doc embodies the chosen
+        # source (local or remote) plus the correction.
+        decisions = dict(plan.resolved)
+        resolved_actions = [(p, a) for p, a in plan.resolved
+                            if p not in peer_fixes]
+        resolved_download_paths = {p for p, a in resolved_actions
+                                   if a == SyncAction.DOWNLOAD}
 
         for path, _ in pending_merges:
             uploads.append((path, "Auto-merged local + remote changes"))
@@ -2153,16 +2345,12 @@ class S3SyncManager:
             downloads = [(p, r) for p, r in downloads if p not in peer_fixes]
         for path in sorted(peer_fixes):
             if all(existing != path for existing, _ in uploads):
-                uploads.append((path, "Link consistency for merged fiber"))
-
-        resolved_actions = []
-        for path, reason in manual_conflicts:
-            action = self.resolve_conflict(path, reason, local_files.get(path),
-                                           s3_files.get(path))
-            if action != SyncAction.SKIP:
-                resolved_actions.append((path, action))
-        resolved_download_paths = {p for p, a in resolved_actions
-                                   if a == SyncAction.DOWNLOAD}
+                reason = "Link consistency for merged fiber"
+                if path in decisions:
+                    reason += (" (resolved: keep local)"
+                               if decisions[path] == SyncAction.UPLOAD
+                               else " (resolved: take remote)")
+                uploads.append((path, reason))
 
         merged_count = len(pending_merges)
         if merged_count:
@@ -2171,17 +2359,23 @@ class S3SyncManager:
         if peer_fixes:
             print(f"✓ {len(peer_fixes)} linked fiber file(s) will receive "
                   f"reciprocal link fixes and be uploaded")
+            for path in sorted(peer_fixes):
+                if path in decisions:
+                    chosen = ("local" if decisions[path] == SyncAction.UPLOAD
+                              else self.REMOTE_NAME)
+                    print(f"    {path}: your choice ({chosen}) is applied together "
+                          "with a reciprocal link fix and uploaded once")
 
         # Let the user decide what to do with suspect upload candidates
         invalid_uploads += self._validate_upload_candidates(
             [p for p, a in resolved_actions if a == SyncAction.UPLOAD])
 
+        skip_paths = set()
         if invalid_uploads:
             print(f"\n⚠️  {len(invalid_uploads)} upload candidate(s) look invalid:")
             for path, problem in invalid_uploads:
                 print(f"  {path}: {problem}")
 
-            skip_paths = set()
             for path, problem in invalid_uploads:
                 response = prompt_choice(
                     f"\n{path} ({problem}) — [u]pload anyway, [s]kip? ", ('u', 's'))
@@ -2207,9 +2401,17 @@ class S3SyncManager:
 
         # The summary sits right next to the confirmation prompt: with a long
         # file list above, this is what makes the decision readable
+        unresolved = len(plan.manual) + len(skip_paths & set(decisions))
         self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
-                                 "Conflicts skipped",
-                                 len(conflicts) - len(resolved_actions) - merged_count)
+                                 "Conflicts unresolved", unresolved)
+
+        # A going-away peer is never read by the planner, so it can never
+        # be scheduled for upload; make that impossible to regress silently.
+        clash = {p for p, _ in uploads} & {p for p, _ in deletes_local}
+        if clash:
+            self._discard_pending_merges(pending_merges)
+            raise RuntimeError("BUG: upload scheduled for a file pending local "
+                               f"deletion: {', '.join(sorted(clash))}")
 
         total_operations = (len(uploads) + len(downloads) +
                             len(deletes_local) + len(deletes_remote))

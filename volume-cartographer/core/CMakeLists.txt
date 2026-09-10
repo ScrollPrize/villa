@@ -28,6 +28,7 @@ add_library(vc_core
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp
+        src/RemoteCacheSettings.cpp
         src/HttpFetch.cpp
         src/S3AuthFallback.cpp
         src/PostProcess.cpp

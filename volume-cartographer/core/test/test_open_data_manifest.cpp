@@ -6,6 +6,7 @@
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
+#include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -15,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <utility>
+
+#include <QSettings>
 
 using namespace vc3d::opendata;
 
@@ -455,8 +458,15 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     const auto cached = vc::lasagna::LasagnaDataset::openLocation(
         location, openOptions);
 
+    const QByteArray previousConfigDir = qgetenv("VC3D_CONFIG_DIR");
+    qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString((root / "settings").string()));
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(
+        vc3d::settings::viewer::REMOTE_CACHE_DIR,
+        QString::fromStdString(root.string()));
+    settings.sync();
+
     auto pkg = VolumePkg::newEmpty();
-    pkg->setRemoteCacheRoot(root);
     REQUIRE(pkg->addLasagnaDatasetEntry(location));
     pkg->setSelectedLasagnaDataset(location);
     const auto resolved = resolveLasagnaForCoordinateTags(*pkg, {});
@@ -464,6 +474,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     CHECK(resolved->manifestPath == cached.manifest().manifestPath);
     CHECK(resolved->sourceManifestLocation == location);
     CHECK(fetches == 1);
+    qputenv("VC3D_CONFIG_DIR", previousConfigDir);
     std::filesystem::remove_all(root);
 }
 
