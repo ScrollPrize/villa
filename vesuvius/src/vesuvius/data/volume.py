@@ -735,7 +735,10 @@ class Volume:
             
             if self.verbose:
                 print(f"Successfully opened zarr store: {data}")
-                print(f"Shape: {data.shape}, Dtype: {data.dtype}")
+                if isinstance(data, zarr.Array):
+                    print(f"Shape: {data.shape}, Dtype: {data.dtype}")
+                else:
+                    print(f"Multiscale group levels: {list(data.array_keys())}")
                 
             return data
         except Exception as e:
@@ -980,7 +983,12 @@ class Volume:
         # Add temporary channel dim for 3D data (Z, Y, X) -> (1, Z, Y, X) for consistent logic
         original_ndim = data_slice.ndim
         has_channel_dim = original_ndim > 3  # Heuristic: assume >3D means channels exist at dim 0
-        if not has_channel_dim and original_ndim == 3:  # Add channel dim for 3D volumes
+        # Only the instance schemes iterate over channels. Give them a single
+        # pseudo-channel when the read has no channel axis of its own, so a 1D
+        # or 2D read is normalized as one unit rather than per spatial row.
+        needs_channel_axis = not has_channel_dim and self.normalization_scheme in (
+            'instance_zscore', 'instance_minmax')
+        if needs_channel_axis:
             data_slice = data_slice[np.newaxis, ...]
             if self.verbose: print(f"  Added temporary channel dim for normalization: {data_slice.shape}")
 
@@ -1036,7 +1044,7 @@ class Volume:
             raise ValueError(f"Internal Error: Unknown normalization scheme '{self.normalization_scheme}' encountered.")
 
         # Remove temporary channel dimension if it was added
-        if not has_channel_dim and original_ndim == 3 and data_slice.ndim == 4:
+        if needs_channel_axis and data_slice.ndim == original_ndim + 1:
             data_slice = data_slice[0, ...]
             if self.verbose: print(f"  Removed temporary channel dim: {data_slice.shape}")
 
