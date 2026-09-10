@@ -962,6 +962,8 @@ vc_add_test(NAME test_zarr_more)
 
 vc_add_test(NAME test_vcdataset_compressors)
 
+vc_add_test(NAME test_vcdataset_volcomp)
+
 vc_add_test(NAME test_volume_static_read)
 
 vc_add_test(NAME test_volume_pyramid)

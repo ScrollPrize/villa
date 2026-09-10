@@ -72,7 +72,7 @@ bool isUnsignedNumber(const std::string& value)
 bool isVolumeChunk(const fs::path& path, const fs::path& root)
 {
     const auto ext = path.extension().string();
-    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" &&
+    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" && ext != ".volcomp" &&
         ext != kPersistentSourcePayloadExtension && ext != ".empty")
         return false;
     auto y = path.parent_path();
