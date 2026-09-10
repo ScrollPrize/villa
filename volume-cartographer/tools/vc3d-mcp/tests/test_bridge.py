@@ -234,6 +234,16 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertNotIn("state", result)
 
+    async def test_vc3d_lasagna_start_optimization_forwards_init_shell_dir(self) -> None:
+        await vc3d_lasagna_start_optimization(
+            mode="new_model",
+            init_shell_dir="/service/pherc0332/init_shells",
+        )
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"]["initShellDir"],
+            "/service/pherc0332/init_shells",
+        )
+
     async def test_vc3d_lasagna_start_optimization_wait_returns_terminal_status(self) -> None:
         result = await vc3d_lasagna_start_optimization(mode="reoptimize", wait=True)
         self.assertEqual(result["jobId"], "job-2")

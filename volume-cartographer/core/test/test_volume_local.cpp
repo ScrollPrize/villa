@@ -8,6 +8,7 @@
 #include <algorithm>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/util/LoadJson.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -49,6 +51,13 @@ Volume::ZarrCreateOptions makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
     // test runs regardless of whether libblosc was linked.
     opts.compressor = "none";
     return opts;
+}
+
+void writeTextFile(const fs::path& path, const std::string& text)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out << text;
 }
 
 } // namespace
@@ -378,5 +387,54 @@ TEST_CASE("Volume: shape() / sliceWidth() / sliceHeight() / numSlices() agree")
     CHECK(sh[0] == v->numSlices());
     CHECK(sh[1] == v->sliceHeight());
     CHECK(sh[2] == v->sliceWidth());
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
+{
+    // voxelSize() promises 0 for "unknown". A document may state the key as
+    // null, as text, or not at all, and each of those used to make the
+    // accessor throw from deep inside whatever asked for a physical area.
+    auto d = tmpDir("unusable_voxelsize");
+    auto opts = makeOpts({32, 32, 32}, {16, 16, 16}, 1);
+    Volume::New(d, opts);
+    const auto meta = vc::json::load_json_file(d / "meta.json");
+    const auto metaWithVoxelSize = [&](const std::string& voxelsizeJson) {
+        std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get_string() +
+                           R"(", "width": 32, "height": 32, "slices": 32)";
+        if (!voxelsizeJson.empty()) {
+            text += R"(, "voxelsize": )" + voxelsizeJson;
+        }
+        return text + "}";
+    };
+
+    SUBCASE("meta.json without a voxelsize key")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize(""));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
+    SUBCASE("meta.json with a null voxelsize")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize("null"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
+    SUBCASE("meta.json with a non-positive voxelsize")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize("-1"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
+    SUBCASE("meta.json with voxelsize as unknown text")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize(R"("unknown")"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
     fs::remove_all(d);
 }
