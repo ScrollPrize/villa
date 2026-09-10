@@ -1,15 +1,16 @@
-# Cooperative GPU manager (development)
+# Cooperative GPU manager
 
 `villa-gpu-manager` coordinates **promised** CPU/GPU/VRAM budgets on one host.
 It neither kills processes nor enforces resource usage. It has no Torch, VC3D
 or Lasagna dependency. Clients must unload GPU workers before acknowledging
 release; closing a socket does not release anything.
 
-**Implementation status:** standalone service/client and ownership tests exist.
-The Fiber supervisor is connected and CPU integration-tested, including a
-two-process to one-process training restart. The protocol is a draft; calibration
-and reference CUDA validation are not complete. Do not use this yet to coordinate
-production training. See the [protocol](docs/protocol-v1.md).
+**Protocol v1 is locked (2026-09-10).** Standalone service/client, ownership and
+failure/recovery tests pass. Fiber integration was validated on two H100 GPUs
+with real S1A data, including GPU-free pause, partial VRAM and resize. This is
+cooperative accounting, not isolation or enforcement. Other training/device
+configurations require their own calibration. See the [protocol](docs/protocol-v1.md)
+and [validation report](../vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/cooperative_validation.md).
 
 ## Local development
 

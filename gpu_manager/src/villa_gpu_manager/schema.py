@@ -1,8 +1,8 @@
-"""Draft JSON Schema. State/authorization constraints additionally live in Engine."""
+"""Locked v1 JSON Schema. State/authorization constraints additionally live in Engine."""
 
 SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "Villa cooperative GPU manager protocol 1 (draft) envelope",
+    "title": "Villa cooperative GPU manager protocol 1 envelope",
     "$defs": {
         "allocation": {
             "type": "object", "additionalProperties": False,
@@ -90,7 +90,7 @@ SCHEMA["$defs"]["task"] = {"type": "object", "additionalProperties": False,
 
 
 def response_schema(op):
-    """Draft response schema for one known pending request operation."""
+    """Response schema for one known pending request operation."""
     if op not in FIELDS:
         raise ValueError("unknown operation")
     if op == "hello":

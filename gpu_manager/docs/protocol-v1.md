@@ -1,8 +1,10 @@
-# Protocol 1 — DRAFT, not locked
+# Protocol 1 — LOCKED, 2026-09-10
 
-This version is undergoing implementation/validation. Locking requires the full
-Fiber reference integration tests in the approved task plan. After locking,
-changes to wire shapes **or semantics**, even additive ones, require explicit
+Validated by the manager conformance/recovery suite and real Fiber S1A reference
+lifecycle, calibration and gradient checks. The user replaced the extended
+repeated timing gate with short tests; one full timing/lifecycle comparison had
+already completed. See the [validation report](../../vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/cooperative_validation.md).
+Changes to wire shapes **or semantics**, even additive ones, require explicit
 user authorization. A version bump is not a substitute for that authorization.
 
 ## Transport and types
