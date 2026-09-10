@@ -7,6 +7,7 @@
 #include <QAction>
 #include <QColor>
 #include <QDockWidget>
+#include <QElapsedTimer>
 #include <QEvent>
 #include <QFont>
 #include <QFontMetricsF>
@@ -26,8 +27,9 @@
 #include <QPalette>
 #include <QPen>
 #include <QPushButton>
+#include <QScopeGuard>
 #include <QScrollBar>
-#include <QSpinBox>
+#include <QtConcurrent/QtConcurrent>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
 #include <QToolBar>
@@ -39,7 +41,9 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <memory>
 #include <limits>
 #include <utility>
 
@@ -135,7 +139,13 @@ constexpr qreal kTracedWidth = 2.2;
 constexpr qreal kInterpolatedWidth = 1.4;
 constexpr qreal kTracedHighlightWidth = 3.6;
 constexpr qreal kInterpolatedHighlightWidth = 2.4;
+// The selected fiber's linked network: a gentle semi-transparent glow behind
+// each member's unchanged lines - visible next to the crowd, clearly
+// subordinate to the selection itself.
+constexpr qreal kNetworkGlowWidthPx = 20.0;
+constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
+constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
 // Dots (control points, link crossings, suspect-link rings) are drawn in scene
@@ -162,6 +172,11 @@ constexpr qreal kSuspectRingBoundsCm = 0.6;
 // panels away from the edge, in cm; it is the floor under the quarter-of-the-width
 // margin, so it only decides maps narrower than 12 cm.
 constexpr qreal kMinSceneMarginCm = 3.0;
+// Label chips hide once a whole winding maps to fewer screen pixels than
+// this: chips are ~40 px wide and ignore the view transform, so as windings
+// compress the labels collide across them and bury the geometry instead of
+// annotating it.
+constexpr double kMinChipPixelsPerWinding = 180.0;
 constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
 constexpr int kClickSlopPx = 4;
@@ -441,6 +456,7 @@ void FiberMapView::wheelEvent(QWheelEvent* event)
     }
     const double factor = std::pow(1.15, steps);
     scale(factor, factor);
+    emit zoomed();
     event->accept();
 }
 
@@ -520,34 +536,33 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* toolBar = addToolBar(tr("Fiber Map"));
     toolBar->setObjectName(QStringLiteral("fiberMapToolBar"));
     toolBar->setMovable(false);
-    toolBar->addWidget(new QLabel(tr("Top networks"), toolBar));
-    _topNetworkSpin = new QSpinBox(toolBar);
-    _topNetworkSpin->setRange(1, 20);
-    _topNetworkSpin->setValue(3);
-    toolBar->addWidget(_topNetworkSpin);
-    toolBar->addSeparator();
-    toolBar->addWidget(new QLabel(tr("Min fibers"), toolBar));
-    _minFiberSpin = new QSpinBox(toolBar);
-    _minFiberSpin->setRange(2, 99);
-    _minFiberSpin->setValue(3);
-    toolBar->addWidget(_minFiberSpin);
-    toolBar->addSeparator();
-    auto* rebuildButton = new QPushButton(tr("Rebuild layout"), toolBar);
-    toolBar->addWidget(rebuildButton);
+    _updateButton = new QPushButton(tr("Update"), toolBar);
+    _updateButton->setToolTip(
+        tr("Rebuild the map, reusing cached work for unchanged fibers.\n"
+           "Identical result to Full rebuild, much faster."));
+    toolBar->addWidget(_updateButton);
+    _fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
+    _fullRebuildButton->setToolTip(
+        tr("Recompute everything from scratch. When an Update preceded it\n"
+           "on unchanged inputs, also verify the memoized result.\n"
+           "Use if the map ever looks wrong."));
+    toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
     _statusLabel =
-        new QLabel(tr("press Rebuild layout"), toolBar);
+        new QLabel(tr("press Update"), toolBar);
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
-    _tree->setColumnCount(3);
-    _tree->setHeaderLabels({tr("Fiber"), tr("H/V"), tr("Annotation")});
+    _tree->setColumnCount(5);
+    _tree->setHeaderLabels(
+        {tr("Fiber"), tr("H/V"), tr("Winding"), tr("Anchor"), tr("Annotation")});
     _tree->setUniformRowHeights(true);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
-    // The short label and H/V take only what they need; the annotation name gets
-    // the rest of the dock.
-    _tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    _tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    // Everything but the annotation name takes only what it needs; the
+    // annotation name gets the rest of the dock.
+    for (int column = 0; column < 4; ++column) {
+        _tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    }
     _tree->header()->setStretchLastSection(true);
     _fiberDock = new QDockWidget(tr("Fibers"), this);
     _fiberDock->setObjectName(QStringLiteral("fiberMapFiberDock"));
@@ -572,14 +587,13 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         connect(_fiberDock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(rebuildButton, &QPushButton::clicked, this, &FiberMapWorkspace::rebuildLayout);
-    // Settings are dependencies (FiberMapDependencies), so the comparison, not
-    // a latch, decides staleness: refreshed eagerly here so the banner appears
-    // as the spinbox moves — and clears again if it moves back.
-    const auto settingsMoved = [this]() { refreshStaleState(); };
-    connect(_topNetworkSpin, &QSpinBox::valueChanged, this, settingsMoved);
-    connect(_minFiberSpin, &QSpinBox::valueChanged, this, settingsMoved);
+    connect(_updateButton, &QPushButton::clicked, this,
+            [this]() { requestRebuild(false); });
+    connect(_fullRebuildButton, &QPushButton::clicked, this,
+            [this]() { requestRebuild(true); });
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
+    connect(_view, &FiberMapView::zoomed, this,
+            &FiberMapWorkspace::updateLabelChipVisibility);
     connect(_view, &FiberMapView::controlPointMenuRequested,
             this, &FiberMapWorkspace::handleControlPointMenu);
     connect(_tree, &QTreeWidget::currentItemChanged, this,
@@ -626,12 +640,74 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     // would have to either do the work or defer it anyway.
     //
     // Instead the controller keeps counters that are cheap to bump, and this
-    // compares them at the moments it matters: on show, on rebuild, and before
-    // acting on a click or a fiber-list selection. The cost of that is deferred
-    // detection — a tab already visible when the volume or umbilicus changes keeps
-    // its picture until the user does something — which is the accepted trade.
+    // compares them at the moments it matters: on show, on rebuild, before
+    // acting on a click or a fiber-list selection — and, while the tab is
+    // visible, on a light poll, so the automatic update notices changes even
+    // when the user is not touching the map. A hidden tab costs nothing: the
+    // poll stops with hideEvent and showEvent's refresh covers the gap.
+    _stalePollTimer = new QTimer(this);
+    _stalePollTimer->setInterval(1000);
+    connect(_stalePollTimer, &QTimer::timeout, this, [this]() {
+        if (_rebuildQueue.state() !=
+                vc3d::fiber_map::FiberMapRebuildQueue::State::Idle ||
+            !_layoutBuilt) {
+            return;
+        }
+        refreshStaleState();
+    });
 
-    rebuildScene(tr("press Rebuild layout"));
+    // The rebuild worker: a private one-thread pool (no starvation from the
+    // global pool's other users, bounded teardown) and a watcher that hands
+    // the finished job back on the GUI thread. The watcher is parented, so
+    // its connection dies with the workspace.
+    _rebuildPool.setMaxThreadCount(1);
+    _rebuildWatcher =
+        new QFutureWatcher<std::shared_ptr<RebuildJobResult>>(this);
+    connect(_rebuildWatcher,
+            &QFutureWatcher<std::shared_ptr<RebuildJobResult>>::finished, this,
+            [this]() {
+                // result() rethrows an exception the future stored if one
+                // escaped the callable itself (runRebuildJob() catches
+                // everything, so this is the transport layer only). Letting
+                // it escape a slot is unsupported and would strand the queue
+                // in Running with the buttons disabled.
+                try {
+                    applyRebuild(_rebuildWatcher->result());
+                } catch (...) {
+                    Logger()->error(
+                        "Fiber map: rebuild result transport failed");
+                    markStale(tr("rebuild failed — press Update"));
+                    _rebuildQueue.beginApply();
+                    finishRebuild();
+                }
+            });
+    _progressMarquee = new QTimer(this);
+    _progressMarquee->setInterval(30);
+    connect(_progressMarquee, &QTimer::timeout, this,
+            [this]() { tickRebuildProgress(); });
+
+    rebuildScene(tr("press Update"));
+}
+
+FiberMapWorkspace::~FiberMapWorkspace()
+{
+    // No new starts, pending dropped, and any in-flight publication refused
+    // by the epoch; the wait is only for the private pool's clean teardown -
+    // the worker owns its own data. The wait is bounded by one solve (a few
+    // seconds at worst): buildGlobalLayout() has no cancellation point, and
+    // the alternative - detaching the pool - would trade a bounded pause on
+    // close for an unowned thread outliving the application's teardown.
+    _rebuildQueue.shutdown();
+    if (_stalePollTimer) {
+        _stalePollTimer->stop();
+    }
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
+    if (_rebuildWatcher) {
+        _rebuildWatcher->disconnect(this);
+    }
+    _rebuildPool.waitForDone();
 }
 
 double FiberMapWorkspace::sceneVxPerCm() const
@@ -695,9 +771,12 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutUmbilicusFingerprint.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
-    _layoutMaxNetworks = 0;
-    _layoutMinFibers = 0;
     _layoutBuilt = false;
+    _layoutCache.clear();
+    _haveLastDigests = false;
+    // An in-flight build started in a world this clear just removed; the
+    // epoch bump refuses its publication.
+    _rebuildQueue.invalidate();
     _voxelSizeUm.reset();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
@@ -714,6 +793,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
         _tree->clear();
     }
     rebuildScene(reason);
+    _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
     if (_statusLabel) {
         _statusLabel->setText(_freshStatus);
@@ -732,8 +812,6 @@ FiberMapWorkspace::currentDependencies() const
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
     deps.frame = _controller->annotationFrame();
-    deps.maxNetworks = _topNetworkSpin ? _topNetworkSpin->value() : 0;
-    deps.minFibers = _minFiberSpin ? _minFiberSpin->value() : 0;
     return deps;
 }
 
@@ -746,8 +824,6 @@ FiberMapWorkspace::layoutDependencies() const
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
     deps.frame = _layoutFrame;
-    deps.maxNetworks = _layoutMaxNetworks;
-    deps.minFibers = _layoutMinFibers;
     return deps;
 }
 
@@ -774,7 +850,18 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
         // carries the cached umbilicus suffix, and a fingerprint change under an
         // unchanged higher-priority reason must still refresh what that suffix
         // names. showStale() is idempotent when nothing moved.
-        showStale(verdict.reason);
+        if ((verdict.cause == StaleVerdict::Cause::Fibers ||
+             verdict.cause == StaleVerdict::Cause::Umbilicus) &&
+            isVisible()) {
+            scheduleAutoUpdate();
+            // The banner reflects that no user action is needed: the update
+            // is already on its way.
+            QString reason = verdict.reason;
+            reason.replace(tr("press Update"), tr("updating…"));
+            showStale(reason);
+        } else {
+            showStale(verdict.reason);
+        }
         return true;
     case StaleVerdict::Action::Fresh:
         // Derived staleness whose cause reverted — a setting moved back, one
@@ -797,10 +884,218 @@ bool FiberMapWorkspace::refreshStaleState()
     return applyStaleVerdict(evaluateDependencies());
 }
 
+namespace
+{
+constexpr const char* kRebuildProgressOverlayName = "fiberMapRebuildProgress";
+} // namespace
+
+void FiberMapWorkspace::startRebuildProgress(QPushButton* button)
+{
+    _progressButton = button;
+    _progressPhase = 0;
+    if (_progressMarquee) {
+        _progressMarquee->start();
+    }
+    tickRebuildProgress();
+}
+
+void FiberMapWorkspace::tickRebuildProgress()
+{
+    QPushButton* button = _progressButton;
+    if (button == nullptr) {
+        return;
+    }
+    auto* overlay =
+        button->findChild<QWidget*>(QLatin1String(kRebuildProgressOverlayName),
+                                    Qt::FindDirectChildrenOnly);
+    if (overlay == nullptr) {
+        overlay = new QWidget(button);
+        overlay->setObjectName(QLatin1String(kRebuildProgressOverlayName));
+        // Purely decorative: never intercept the click it reports on.
+        overlay->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        overlay->setStyleSheet(QStringLiteral(
+            "background-color: rgba(80, 150, 255, 110); border-radius: 2px;"));
+    }
+    // A marquee: a bar one third of the button wide, sweeping left to right
+    // and wrapping. The event loop is live while the worker runs, so this is
+    // a real animation - no forced synchronous paints needed any more.
+    constexpr qint64 kSweepMs = 1100;
+    const double phase =
+        static_cast<double>(_progressPhase % kSweepMs) / kSweepMs;
+    _progressPhase += _progressMarquee ? _progressMarquee->interval() : 30;
+    const int barWidth = std::max(8, button->width() / 3);
+    const int travel = button->width() + barWidth;
+    const int x = static_cast<int>(std::lround(phase * travel)) - barWidth;
+    overlay->setGeometry(x, 0, barWidth, button->height());
+    overlay->show();
+    overlay->raise();
+}
+
+void FiberMapWorkspace::clearRebuildProgress()
+{
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
+    _progressButton = nullptr;
+    for (QPushButton* button : {_updateButton, _fullRebuildButton}) {
+        if (button == nullptr) {
+            continue;
+        }
+        if (auto* overlay = button->findChild<QWidget*>(
+                QLatin1String(kRebuildProgressOverlayName),
+                Qt::FindDirectChildrenOnly)) {
+            overlay->hide();
+        }
+        button->update();
+    }
+}
+
+void FiberMapWorkspace::scheduleAutoUpdate()
+{
+    if (!isVisible()) {
+        return;
+    }
+    // A build in flight: fold the request into the pending slot directly -
+    // the running build's epilogue dispatches it, and a timer here could
+    // only race that dispatch.
+    if (_rebuildQueue.state() !=
+        vc3d::fiber_map::FiberMapRebuildQueue::State::Idle) {
+        (void)_rebuildQueue.request(false);
+        return;
+    }
+    if (_autoUpdateScheduled) {
+        return;
+    }
+    _autoUpdateScheduled = true;
+    // Queued and debounced: the gates run inside click and selection
+    // handlers whose scene items a publication would replace, and the
+    // verdict is re-evaluated when the shot fires - anything can change in
+    // between, including the staleness resolving itself.
+    QTimer::singleShot(150, this, [this]() {
+        _autoUpdateScheduled = false;
+        if (!isVisible() || !_layoutBuilt) {
+            return;
+        }
+        const StaleVerdict verdict = evaluateDependencies();
+        if (verdict.action == StaleVerdict::Action::MarkStale &&
+            (verdict.cause == StaleVerdict::Cause::Fibers ||
+             verdict.cause == StaleVerdict::Cause::Umbilicus)) {
+            // requestRebuild coalesces if a build started in the meantime.
+            requestRebuild(false);
+        }
+    });
+}
+
+// Everything a rebuild consumes and produces, owned by the job so the two
+// threads share no mutable state: the worker gets the snapshot, params, and
+// the memoization cache (moved out of the workspace for the flight); the
+// apply step takes the products back only after validating that the world
+// the job started in still exists.
+struct FiberMapWorkspace::RebuildJobResult {
+    bool fullRebuild = false;
+    uint64_t epoch = 0;
+    // The world as of the start, for apply-time validation.
+    QString preReadUmbilicusFingerprint;
+    uint64_t builtPackageGeneration = 0;
+    uint64_t builtUmbilicusGeneration = 0;
+    // Inputs (snapshot fibers are consumed by the worker's conversion).
+    LineAnnotationController::FiberMapSnapshot snapshot;
+    vc3d::fiber_map::GlobalLayoutParams params;
+    bool hadFibers = false;
+    bool hadUmbilicus = false;
+    // The workspace's memoization cache, exclusive to the job in flight.
+    vc3d::fiber_map::GlobalLayoutCache cache;
+    // Products.
+    vc3d::fiber_map::GlobalResult layout;
+    vc3d::fiber_map::ContentDigest inputsDigest;
+    vc3d::fiber_map::ContentDigest outputDigest;
+    vc3d::fiber_map::GlobalLayoutCache::Stats stats;
+    QString error;
+    qint64 snapshotMs = 0;
+    qint64 convertMs = 0;
+    qint64 layoutMs = 0;
+};
+
+namespace
+{
+
+// The worker: conversion, input digest, layout, output digest - everything
+// that does not need the GUI thread. Exceptions become the job's error;
+// nothing escapes into Qt.
+void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& job)
+{
+    try {
+        const auto convertBegin = std::chrono::steady_clock::now();
+        std::vector<vc3d::fiber_map::InputFiber> inputs;
+        inputs.reserve(job->snapshot.fibers.size());
+        for (auto& fiber : job->snapshot.fibers) {
+            vc3d::fiber_map::InputFiber input;
+            input.id = fiber.id;
+            input.fileName = fiber.fileName;
+            input.label = fiber.label;
+            input.hvTag = fiber.hvTag;
+            input.controlPoints = std::move(fiber.controlPoints);
+            input.linePoints = std::move(fiber.linePoints);
+            input.tracedSegments = std::move(fiber.tracedSegments);
+            input.links.reserve(fiber.links.size());
+            for (const auto& link : fiber.links) {
+                input.links.push_back(
+                    vc3d::fiber_map::InputLink{link.controlPointIndex,
+                                               link.branchFiberId,
+                                               link.branchControlPointIndex,
+                                               link.pending});
+            }
+            inputs.push_back(std::move(input));
+        }
+        job->inputsDigest = vc3d::fiber_map::digestGlobalInputs(
+            inputs, job->snapshot.umbilicusCenters, job->params);
+        const auto layoutBegin = std::chrono::steady_clock::now();
+        job->convertMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             layoutBegin - convertBegin)
+                             .count();
+        job->layout = vc3d::fiber_map::buildGlobalLayout(
+            inputs, job->snapshot.umbilicusCenters, job->params, &job->cache);
+        job->layoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - layoutBegin)
+                            .count();
+        job->outputDigest = vc3d::fiber_map::digestGlobalResult(job->layout);
+        job->stats = job->cache.lastStats();
+    } catch (const std::exception& ex) {
+        job->error = QString::fromUtf8(ex.what());
+    } catch (...) {
+        job->error = QStringLiteral("unknown rebuild error");
+    }
+}
+
+} // namespace
+
+void FiberMapWorkspace::hideEvent(QHideEvent* event)
+{
+    QMainWindow::hideEvent(event);
+    if (_stalePollTimer) {
+        _stalePollTimer->stop();
+    }
+    // The marquee is a paint effect on a hidden button: 33 wakeups a second
+    // for nobody. The build itself keeps running; showEvent() resumes the
+    // animation if it is still in flight.
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
+}
 
 void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
+    if (_stalePollTimer) {
+        _stalePollTimer->start();
+    }
+    // A build still in flight: resume the marquee hideEvent() paused
+    // (_progressButton is non-null exactly while progress UI is active).
+    if (_progressMarquee && _progressButton &&
+        _rebuildQueue.state() !=
+            vc3d::fiber_map::FiberMapRebuildQueue::State::Idle) {
+        _progressMarquee->start();
+    }
     // Becoming visible is the first of the three moments a stale layout has to
     // be caught; the others are a rebuild and any attempt to act on the map.
     if (refreshStaleState()) {
@@ -814,111 +1109,328 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
     // that is where the umbilicus state gets looked up, so a package that will
     // not unroll says so before the user presses Rebuild.
     if (!_layoutBuilt && _statusLabel) {
-        _statusLabel->setText(
-            _freshStatus.isEmpty()
-                ? withCachedUmbilicusStatus(tr("press Rebuild layout"))
-                : _freshStatus);
+        // Recomposed rather than replayed: _freshStatus froze its umbilicus
+        // suffix when the layout was cleared, and the package may have
+        // changed since (nothing is built, so no dependency comparison will
+        // ever say so). The cache re-resolves when the fingerprint moved.
+        _statusLabel->setText(withCachedUmbilicusStatus(
+            _restingReason.isEmpty() ? tr("press Update")
+                                     : _restingReason));
     }
 }
 
-void FiberMapWorkspace::rebuildLayout()
+void FiberMapWorkspace::requestRebuild(bool fullRebuild)
 {
     if (!_controller) {
         return;
     }
-    // Read before the snapshot: fiberMapSnapshot() parses the umbilicus, so a
-    // rewrite during that parse that moves the file's size or mtime — the
-    // token's contract; a same-size rewrite inside one timestamp tick is
-    // beyond it — leaves the recorded token disagreeing with the disk, and the
-    // refresh at the end of this function raises the banner. Recording a
-    // post-read token instead would tag geometry of indeterminate vintage as
-    // current even in the cases the token can see.
-    _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
-    LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
-    _layoutGeneration = snapshot.generation;
-    // Everything the snapshot was derived from, so a later check compares against
-    // what this build actually used rather than against whatever is current. The
-    // frame comes from the snapshot rather than a second derivation for that
-    // reason; only the umbilicus token has to be read separately.
-    _layoutFrame = snapshot.frame;
-    _layoutPackageGeneration = _controller->packageGeneration();
-    _layoutUmbilicusGeneration = _controller->umbilicusGeneration();
-    // Set before the build so an empty result still counts as built: it was
-    // derived from these dependencies and goes out of date with them.
+    switch (_rebuildQueue.request(fullRebuild)) {
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Refused:
+        return;
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Coalesced:
+        // Folded into the pending slot; the running build's epilogue
+        // dispatches it.
+        return;
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Start:
+        startRebuild(fullRebuild);
+        return;
+    }
+}
+
+void FiberMapWorkspace::startRebuild(bool fullRebuild)
+{
+    // The queue granted a Start: every exit either launches the worker or
+    // runs the epilogue so the queue returns to Idle.
+    // A package switch makes every cached artifact and the displayed scene
+    // meaningless, and asynchrony exposes the interval - so it gets the FULL
+    // clear (scene, tree, watermarks, cache, epoch), not the cache-only
+    // reset that sufficed while rebuilds were synchronous. Grid changes stay
+    // reversible MarkStale and never clear.
+    if (_layoutBuilt) {
+        const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+            layoutDependencies(), currentDependencies(),
+            /*layoutBuilt=*/true, QString());
+        if (verdict.action == StaleVerdict::Action::ClearLayout) {
+            clearLayout(verdict.reason);
+        }
+    }
+    if (fullRebuild || _memoizationDisabled) {
+        _layoutCache.clear();
+    }
+
+    // One rollback for the whole launch: the queue is already Running, so
+    // any throw between here and a successfully created future must run the
+    // epilogue itself or every later request would merely coalesce forever.
+    // The future creation stays inside the guarded region; once it exists,
+    // the watcher's finished path owns cleanup.
+    std::shared_ptr<RebuildJobResult> job;
+    bool cacheMoved = false;
+    QFuture<std::shared_ptr<RebuildJobResult>> future;
+    try {
+        job = std::make_shared<RebuildJobResult>();
+        job->fullRebuild = fullRebuild;
+        // Captured after the pre-check: a clear above advanced the epoch, and
+        // this job publishes into the world as it stands now.
+        job->epoch = _rebuildQueue.epoch();
+        // Read before the snapshot: fiberMapSnapshot() parses the umbilicus,
+        // so a rewrite during that parse that moves the file's size or mtime
+        // — the token's contract; a same-size rewrite inside one timestamp
+        // tick is beyond it — leaves the recorded token disagreeing with the
+        // disk, and the publish-time refresh raises the banner.
+        job->preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
+        QElapsedTimer snapshotTimer;
+        snapshotTimer.start();
+        job->snapshot = _controller->fiberMapSnapshot();
+        job->snapshotMs = snapshotTimer.elapsed();
+        job->builtPackageGeneration = _controller->packageGeneration();
+        job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
+        job->hadFibers = !job->snapshot.fibers.empty();
+        job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
+
+        // The layout and solver are unit-free, so the physical intents behind
+        // their tuning lengths are converted here — once the voxel size is
+        // known, exactly as documented on GlobalLayoutParams and SolverParams.
+        // Left alone when it is not, so the defaults (the same intents at
+        // 2.4 µm) stand in and the map still lays out sensibly.
+        if (job->snapshot.voxelSizeUm) {
+            const double vxPerCm = kUmPerCm / *job->snapshot.voxelSizeUm;
+            job->params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
+            job->params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
+            job->params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
+            job->params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
+            job->params.solver.tieBandVx = 0.03 * vxPerCm;           // sheet-thickness scale
+            job->params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm; // angular conditioning
+            job->params.solver.zMergeVx = 0.2 * vxPerCm;             // crossing dedup span
+            job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
+            job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
+        }
+
+        // The cache travels WITH the job: the worker is its only toucher
+        // while the build is in flight, by construction rather than by
+        // discipline. Any GUI path that "clears the cache" mid-flight clears
+        // this empty stand-in, and the epoch such paths also bump refuses
+        // the job's publication.
+        job->cache = std::move(_layoutCache);
+        _layoutCache = vc3d::fiber_map::GlobalLayoutCache{};
+        cacheMoved = true;
+
+        _updateButton->setEnabled(false);
+        _fullRebuildButton->setEnabled(false);
+        startRebuildProgress(fullRebuild ? _fullRebuildButton : _updateButton);
+
+        future = QtConcurrent::run(&_rebuildPool, [job]() {
+            runRebuildJob(job);
+            return job;
+        });
+    } catch (const std::exception& ex) {
+        Logger()->error("Fiber map: rebuild start failed: {}", ex.what());
+        if (job && cacheMoved) {
+            // The worker never launched (the future is created last), so the
+            // cache is safe to take back.
+            _layoutCache = std::move(job->cache);
+        }
+        markStale(tr("rebuild failed — press Update"));
+        _rebuildQueue.beginApply();
+        finishRebuild();
+        return;
+    } catch (...) {
+        Logger()->error("Fiber map: rebuild start failed (unknown)");
+        if (job && cacheMoved) {
+            _layoutCache = std::move(job->cache);
+        }
+        markStale(tr("rebuild failed — press Update"));
+        _rebuildQueue.beginApply();
+        finishRebuild();
+        return;
+    }
+    // Effectively non-throwing: stores the future and wires signals. Kept
+    // outside the rollback because once run() has returned the worker may
+    // already be touching job->cache — taking it back would race.
+    _rebuildWatcher->setFuture(future);
+}
+
+void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& job)
+{
+    // Publication is allowed only into the epoch the job started in, while
+    // the queue still expects this build; checked before beginApply flips
+    // the state.
+    const bool expected = job != nullptr && _rebuildQueue.mayPublish(job->epoch);
+    _rebuildQueue.beginApply();
+    const auto epilogue = qScopeGuard([this]() { finishRebuild(); });
+    // Declared after the epilogue so it runs first (guards unwind in reverse):
+    // the watcher's future keeps the job's shared_ptr alive until the next
+    // setFuture(), so "drop" on a discard or error means clearing the job's
+    // heavy members here - otherwise a rejected 452-fiber layout, its
+    // snapshot, and its cache would stay resident in an idle workspace.
+    const auto release = qScopeGuard([&job]() {
+        if (job) {
+            job->snapshot = {};
+            job->layout = {};
+            job->cache = {};
+        }
+    });
+
+    if (!expected || !_controller) {
+        // A package switch, explicit clear, memoization-policy change, or
+        // shutdown happened mid-flight: the job's world is gone. Its cache
+        // is dropped with it - the events that bump the epoch are exactly
+        // the ones that invalidate content - and the gates already show the
+        // right state.
+        return;
+    }
+    if (!job->error.isEmpty()) {
+        Logger()->error("Fiber map: rebuild failed: {}",
+                        job->error.toStdString());
+        markStale(tr("rebuild failed — press Update"));
+        return;
+    }
+    // A package switch no gate happened to observe mid-flight: the epoch
+    // could not catch it, so it is validated directly. The result and its
+    // cache, built from the old package's content, are discarded. With a
+    // layout built, the verdict machinery produces the proper ClearLayout;
+    // before a first build it has nothing to compare (verdict Fresh), yet
+    // the status still names the old package's umbilicus - so the clear
+    // that recomposes it runs directly.
+    if (_controller->packageGeneration() != job->builtPackageGeneration) {
+        if (!refreshStaleState()) {
+            clearLayout(tr("project changed — press Update"));
+        }
+        return;
+    }
+    // The full frame, not just the grid: parameters were converted through
+    // the snapshot's voxel size, so a same-grid volume with a different
+    // recorded voxel size (the reversible VoxelSize stale cause) would make
+    // this result stale on arrival - publishing it would destroy a layout
+    // that is still valid for the volume the user switched back to. The
+    // cache IS kept: its slots are content-keyed (params included), so
+    // switching back to the built frame re-warms.
+    if (!vc3d::annotation::sameAnnotationFrame(_controller->annotationFrame(),
+                                               job->snapshot.frame)) {
+        _layoutCache = std::move(job->cache);
+        if (!refreshStaleState()) {
+            showStale(tr(
+                "viewing another volume's grid — switch back, or press Update"));
+        }
+        return;
+    }
+    // Fibers or the umbilicus changed mid-flight: publishing a result
+    // already known stale would put a wrong picture on screen, so the
+    // reviewer's rule is followed literally - discard and re-run. The job's
+    // cache IS kept: its slots are content-keyed digests, exact across
+    // edits, so the immediate re-run stays warm and cheap.
+    if (_controller->fiberDataGeneration() != job->snapshot.generation ||
+        _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
+        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint) {
+        _layoutCache = std::move(job->cache);
+        if (isVisible()) {
+            (void)_rebuildQueue.request(job->fullRebuild);
+            showStale(tr("changed during update — updating…"));
+        } else {
+            // The visible-only contract: edits made while the workspace is
+            // hidden must not chain background rebuilds. The gates re-arm
+            // the automatic update on the next show.
+            showStale(tr("changed during update — press Update"));
+        }
+        return;
+    }
+
+    try {
+        publishRebuild(*job);
+    } catch (const std::exception& ex) {
+        // A throw from scene or tree construction can leave the scene and
+        // watermarks disagreeing; the latch refuses interaction until a
+        // rebuild succeeds.
+        Logger()->error("Fiber map: rebuild publication failed: {}", ex.what());
+        markStale(tr("rebuild failed — press Update"));
+    } catch (...) {
+        Logger()->error("Fiber map: rebuild publication failed (unknown)");
+        markStale(tr("rebuild failed — press Update"));
+    }
+}
+
+void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
+{
+    QElapsedTimer publishTimer;
+    publishTimer.start();
+    // The job's cache and layout become the workspace's, and every
+    // dependency watermark commits together.
+    _layoutCache = std::move(job.cache);
+    _layout = std::move(job.layout);
+    _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
+    _layoutGeneration = job.snapshot.generation;
+    _layoutFrame = job.snapshot.frame;
+    _layoutPackageGeneration = job.builtPackageGeneration;
+    _layoutUmbilicusGeneration = job.builtUmbilicusGeneration;
     _layoutBuilt = true;
     _staleReason.clear();
     _latchedReason.clear();
+    _restingReason.clear();
+    _voxelSizeUm = job.snapshot.voxelSizeUm;
 
-    // The snapshot's geometry is handed straight to the layout; every fiber of
-    // the package is in it, so a second copy is worth avoiding.
-    std::vector<vc3d::fiber_map::InputFiber> inputs;
-    inputs.reserve(snapshot.fibers.size());
-    for (auto& fiber : snapshot.fibers) {
-        vc3d::fiber_map::InputFiber input;
-        input.id = fiber.id;
-        input.fileName = fiber.fileName;
-        input.label = fiber.label;
-        input.hvTag = fiber.hvTag;
-        input.controlPoints = std::move(fiber.controlPoints);
-        input.linePoints = std::move(fiber.linePoints);
-        input.tracedSegments = std::move(fiber.tracedSegments);
-        input.links.reserve(fiber.links.size());
-        for (const auto& link : fiber.links) {
-            input.links.push_back(vc3d::fiber_map::InputLink{link.controlPointIndex,
-                                                             link.branchFiberId,
-                                                             link.branchControlPointIndex,
-                                                             link.pending});
+    // Full rebuild doubles as the memoization check: when nothing the layout
+    // consumes changed since the last memoized Update, the from-scratch
+    // output must digest identically. Digest bookkeeping happens ONLY here,
+    // inside a successful publication - discarded and failed builds leave it
+    // untouched.
+    QString verificationNote;
+    if (job.fullRebuild) {
+        if (_haveLastDigests && job.inputsDigest == _lastInputsDigest) {
+            if (job.outputDigest == _lastOutputDigest) {
+                verificationNote = tr(" · cache verified");
+            } else {
+                verificationNote = tr(" · CACHE MISMATCH — memoization disabled");
+                _memoizationDisabled = true;
+                _layoutCache.clear();
+                _rebuildQueue.invalidate();
+                Logger()->error(
+                    "Fiber map: full rebuild output differs from the memoized "
+                    "build on identical inputs; memoization disabled");
+            }
         }
-        inputs.push_back(std::move(input));
+        _haveLastDigests = false;
+    } else {
+        const bool reusedSomething =
+            job.stats.used &&
+            (job.stats.fibersReused > 0 || job.stats.pairsReused > 0);
+        if (reusedSomething && !_memoizationDisabled) {
+            _lastInputsDigest = job.inputsDigest;
+            _lastOutputDigest = job.outputDigest;
+            _haveLastDigests = true;
+        } else {
+            _haveLastDigests = false;
+        }
     }
 
-    _voxelSizeUm = snapshot.voxelSizeUm;
-
-    vc3d::fiber_map::LayoutParams params;
-    params.minFibers = _minFiberSpin->value();
-    params.maxNetworks = _topNetworkSpin->value();
-    // Recorded as built dependencies beside the counters above: a later spinbox
-    // move compares unequal and marks the map out of date, and moving it back
-    // compares equal again.
-    _layoutMinFibers = params.minFibers;
-    _layoutMaxNetworks = params.maxNetworks;
-    // The layout is unit-free, so the physical intents behind its tuning lengths
-    // are converted here — once the voxel size is known, exactly as documented on
-    // LayoutParams. Left alone when it is not, so the defaults (the same intents
-    // at 2.4 µm) stand in and the map still lays out sensibly.
-    if (_voxelSizeUm) {
-        const double vxPerCm = sceneVxPerCm();
-        params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
-        params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
-        params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
-        params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
-        params.panelTickVx = 5.0 * vxPerCm;       // 5 cm winding-label grid
-        params.minGapVx = 1.0 * vxPerCm;          // 1 cm minimum panel gap
-    }
-    _layout = vc3d::fiber_map::buildLayout(inputs, snapshot.umbilicusCenters, params);
-    // Scene space is voxels and the slice count already is one, so the scroll
-    // extent needs no voxel size at all.
-    _scrollZMaxVx = snapshot.annotationZSlices > 0
-        ? static_cast<double>(snapshot.annotationZSlices)
+    // Scene space is voxels and the slice count already is one, so the
+    // scroll extent needs no voxel size at all.
+    _scrollZMaxVx = job.snapshot.annotationZSlices > 0
+        ? static_cast<double>(job.snapshot.annotationZSlices)
         : 0.0;
 
     QString emptyMessage;
-    if (snapshot.fibers.empty()) {
+    if (!job.hadFibers) {
         emptyMessage = tr("no fibers");
-    } else if (snapshot.umbilicusCenters.empty()) {
+    } else if (!job.hadUmbilicus) {
         // The resolver's own words when it has any; they name the file it
         // rejected or the candidates it could not choose between.
-        emptyMessage = snapshot.umbilicusMessage.isEmpty()
+        emptyMessage = job.snapshot.umbilicusMessage.isEmpty()
             ? tr("no umbilicus found — cannot unroll")
-            : snapshot.umbilicusMessage;
+            : job.snapshot.umbilicusMessage;
         // Whatever the resolver's complaint was, the way out is the same.
         emptyMessage += QLatin1Char('\n');
         emptyMessage += tr("Attach one via File > Attach Umbilicus…");
-    } else if (_layout.networks.empty()) {
-        emptyMessage = tr("no networks with ≥ %1 linked fibers").arg(params.minFibers);
+    } else if (_layout.fibers.empty()) {
+        emptyMessage = tr("no placeable fibers");
     }
     rebuildScene(emptyMessage);
     rebuildTree();
+    const qint64 publishMs = publishTimer.elapsed();
+    Logger()->info(
+        "fiber map rebuild: GUI stalls snapshot {} ms + publish {} ms · "
+        "worker convert {} ms · layout {} ms (prep {:.0f}, detect {:.0f}, "
+        "solve {:.0f}, geometry {:.0f})",
+        job.snapshotMs, publishMs, job.convertMs, job.layoutMs,
+        _layout.prepMs, _layout.detectMs, _layout.solveMs, _layout.geometryMs);
 
     // Default the dock to a width that shows every column of the first real
     // tree; afterwards the width is the user's to manage.
@@ -935,39 +1447,96 @@ void FiberMapWorkspace::rebuildLayout()
         _fiberDockSized = true;
     }
 
-    int placedFibers = 0;
-    for (const auto& network : _layout.networks) {
-        placedFibers += static_cast<int>(network.fibers.size());
-    }
-    QString status = tr("%1 fibers · %2 networks · %3 suspect links")
-                         .arg(placedFibers)
-                         .arg(_layout.networks.size())
+    QString status = tr("%1 fibers · %2 windings · %3 islands · %4 suspect links")
+                         .arg(_layout.fibers.size())
+                         .arg(_layout.windings.size())
+                         .arg(_layout.islandCount)
                          .arg(_layout.suspectLinkCount);
+    if (!_layout.unplaced.empty()) {
+        status += tr(" · %1 unplaceable").arg(_layout.unplaced.size());
+    }
+    if (_layout.unresolvedCount > 0) {
+        status += tr(" · %1 unresolved").arg(_layout.unresolvedCount);
+    }
+    if (_layout.droppedCrossingCount > 0) {
+        status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
+    }
+    const qint64 totalMs =
+        job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
+    if (job.stats.used && !job.fullRebuild) {
+        status += tr(" · %1 ms, %2/%3 pairs reused")
+                      .arg(totalMs)
+                      .arg(job.stats.pairsReused)
+                      .arg(job.stats.pairsReused + job.stats.pairsRecomputed);
+    } else {
+        status += tr(" · %1 ms").arg(totalMs);
+    }
+    status += verificationNote;
+    if (_layout.gatedSegmentCount > 0 || _layout.tangentialCount > 0) {
+        // Gate-hit tallies, not a geometry proportion (one segment can be
+        // counted once per branch and translate it was tried against): a
+        // nonzero value says the map may be underconstrained for reasons the
+        // drawn fibers cannot show.
+        status += tr(" · %1 solver gate hits")
+                      .arg(_layout.gatedSegmentCount + _layout.tangentialCount);
+    }
     if (!_voxelSizeUm) {
-        // No physical figure on the map means anything, so say why once rather
-        // than leave the voxel counts looking like an odd choice of unit.
+        // No physical figure on the map means anything, so say why once
+        // rather than leave the voxel counts looking like an odd unit.
         status += tr(" · voxel size unknown — lengths in vx");
     }
-    if (!snapshot.umbilicusCenters.empty() && !snapshot.umbilicusLabel.isEmpty()) {
+    if (job.hadUmbilicus && !job.snapshot.umbilicusLabel.isEmpty()) {
         // The controller composes this: which grid the umbilicus indexes,
         // whether that came from the file's own metadata or from the z-span
         // guess, and any frame inconsistency it noticed on the way.
-        status += QStringLiteral(" · ") + snapshot.umbilicusLabel;
+        status += QStringLiteral(" · ") + job.snapshot.umbilicusLabel;
     }
     _freshStatus = status;
     _statusLabel->setText(status);
 
-    if (!_viewFitted && !_layout.networks.empty()) {
+    if (!_viewFitted && !_layout.fibers.empty()) {
         _view->fitInView(_contentRect, Qt::KeepAspectRatio);
         _viewFitted = true;
     }
+    // fitInView changes the scale without a wheel event.
+    updateLabelChipVisibility();
 
     // The one moment every dependency is re-examined against what this build
-    // just recorded. An umbilicus file rewritten while the snapshot was being
-    // read differs from the pre-read token recorded above, so the banner goes
-    // up here — after the summary assignment, which must never be what a stale
-    // map is left saying.
+    // just recorded. An umbilicus file rewritten while the snapshot was
+    // being read differs from the pre-read token recorded above, so the
+    // banner goes up here — after the summary assignment, which must never
+    // be what a stale map is left saying. If it schedules an automatic
+    // update, that coalesces into the pending slot the epilogue dispatches.
     refreshStaleState();
+}
+
+void FiberMapWorkspace::finishRebuild()
+{
+    clearRebuildProgress();
+    if (_updateButton) {
+        _updateButton->setEnabled(true);
+    }
+    if (_fullRebuildButton) {
+        _fullRebuildButton->setEnabled(true);
+    }
+    const auto pending = _rebuildQueue.finishApply();
+    if (pending == vc3d::fiber_map::FiberMapRebuildQueue::Pending::None) {
+        return;
+    }
+    const bool full =
+        pending == vc3d::fiber_map::FiberMapRebuildQueue::Pending::Full;
+    // A pending Update was armed by a gate that compared against the OLD
+    // build's watermarks mid-flight; when the build that just published
+    // already covers the change, the verdict here is Fresh and the update
+    // would recompute a digest-identical map. A latched failure or genuine
+    // staleness still dispatches, and a pending Full always does - it is
+    // the user's explicit escape hatch.
+    if (!full && _layoutBuilt &&
+        evaluateDependencies().action ==
+            vc3d::fiber_map::StaleVerdict::Action::Fresh) {
+        return;
+    }
+    requestRebuild(full);
 }
 
 void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
@@ -975,6 +1544,9 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _entries.clear();
     clearControlPointDots();
     _highlightedFiber = 0;
+    _networkEmphasized.clear();
+    _labelChips.clear();
+    _chipHideScale = 0.0;
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -984,7 +1556,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const FiberMapPalette& theme = activePalette();
     _scene->setBackgroundBrush(theme.surface);
 
-    if (_layout.networks.empty()) {
+    if (_layout.fibers.empty()) {
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
@@ -996,7 +1568,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // scroll axis reading upward without ever mirroring text.
     const double topY = -_layout.yMaxVx;
     const double bottomY = -_layout.yMinVx;
-    const double sceneWidth = std::max(_layout.widthVx, 1e-6);
+    const double sceneWidth = std::max(_layout.x1Vx - _layout.x0Vx, 1e-6);
     // The one conversion of this rebuild. Every scene-space size below that was
     // chosen as a physical length goes through it, and nothing else does.
     const double vxPerCm = sceneVxPerCm();
@@ -1006,189 +1578,212 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const qreal suspectRingBounds = kSuspectRingBoundsCm * vxPerCm;
     QFont labelFont = font();
     labelFont.setPointSizeF(8.0);
-    QFont headerFont = font();
-    headerFont.setPointSizeF(10.5);
 
-    // The scroll floor and ceiling, so the networks read against the volume's
-    // own z extent instead of floating on their own; the winding gridlines and
-    // the panel grounds span the same range. Without that extent the layout's
-    // own y range has to do.
+    // The scroll floor and ceiling, so the map reads against the volume's own
+    // z extent instead of floating on its own; the winding gridlines and the
+    // ground span the same range. Without that extent the layout's own y
+    // range has to do.
     const bool scrollExtentKnown = _scrollZMaxVx > 0.0;
     const double extentBottomY = scrollExtentKnown ? 0.0 : bottomY;
     const double extentTopY = scrollExtentKnown ? -_scrollZMaxVx : topY;
     const double sceneTopY = std::min(extentTopY, topY);
     const double sceneBottomY = std::max(extentBottomY, bottomY);
 
-    // Link endpoints always live in the same network as the link, and each
-    // network registers its fibers before its links are drawn, so the entries
-    // built so far always cover both ends.
+    // Each link's endpoints were registered as fibers before the links are
+    // drawn, so the entries always cover both ends.
     const auto hvTagOf = [this](uint64_t fiberId) {
         const auto entry = _entries.constFind(fiberId);
         return entry == _entries.constEnd() ? '?' : entry->fiber.hvTag;
     };
 
-    for (const vc3d::fiber_map::PlacedNetwork& network : _layout.networks) {
-        // A hair-lighter ground per panel, spanning exactly the scroll extent:
-        // with no break line between panels, the gap between the grounds is
-        // what says where one network ends and the next begins, and their
-        // top/bottom edges are the scroll ceiling and floor.
-        auto* panel = _scene->addRect(
-            QRectF(QPointF(network.x0Vx, extentTopY), QPointF(network.x1Vx, extentBottomY)),
-            QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
-        panel->setZValue(kPanelZ);
+    // One ground for the whole map, spanning the scroll's own z extent.
+    auto* ground = _scene->addRect(
+        QRectF(QPointF(_layout.x0Vx, extentTopY), QPointF(_layout.x1Vx, extentBottomY)),
+        QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
+    ground->setZValue(kPanelZ);
 
-        for (const vc3d::fiber_map::WindingMark& mark : network.windings) {
-            auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
-            QPen pen(theme.winding);
-            pen.setWidthF(0.8);
-            pen.setCosmetic(true);
-            pen.setStyle(Qt::DotLine);
-            line->setPen(pen);
-            line->setZValue(0.0);
-        }
-
-        // The reference radius belongs to the fiber tree's network rows; the map
-        // only needs to say which panel this is.
-        auto* header = _scene->addSimpleText(
-            tr("network %1").arg(network.networkIndex + 1), headerFont);
-        header->setBrush(theme.inkSoft);
-        pinText(header, QPointF(0.5 * (network.x0Vx + network.x1Vx), topY), 0.0, -36.0, true);
-
-        for (const vc3d::fiber_map::PlacedFiber& placed : network.fibers) {
-            FiberEntry entry;
-            entry.fiber = placed;
-            for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
-                for (QPointF& point : run.points) {
-                    point.setY(-point.y());
-                }
-            }
-            for (QPointF& point : entry.fiber.controlPoints) {
-                point.setY(-point.y());
-            }
-
-            // The path items only carry geometry: clicks resolve through
-            // fiberAt()'s proximity search, never through the items themselves.
-            const QColor color = fiberColor(entry.fiber.hvTag, theme);
-            const QPainterPath tracedPath = pathForRuns(entry.fiber, true);
-            if (!tracedPath.isEmpty()) {
-                entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
-                entry.tracedItem->setZValue(kFiberZ);
-            }
-            const QPainterPath interpolatedPath = pathForRuns(entry.fiber, false);
-            if (!interpolatedPath.isEmpty()) {
-                entry.interpolatedItem = _scene->addPath(
-                    interpolatedPath,
-                    interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
-                entry.interpolatedItem->setZValue(kFiberZ);
-            }
-
-            // Label chip at whichever fiber end sits nearest its panel edge
-            // (H fibers: left vs right, V fibers: bottom vs top).
-            const QRectF bounds = fiberBounds(entry.fiber);
-            if (!bounds.isNull()) {
-                QPointF anchor;
-                qreal offsetX = 0.0;
-                qreal offsetY = 0.0;
-                bool anchorRight = false;
-                const auto endpoint = [&entry](bool minimizeX, bool useX) {
-                    QPointF best;
-                    double bestValue = minimizeX ? std::numeric_limits<double>::infinity()
-                                                 : -std::numeric_limits<double>::infinity();
-                    for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
-                        for (const QPointF& point : run.points) {
-                            const double value = useX ? point.x() : point.y();
-                            if (minimizeX ? value < bestValue : value > bestValue) {
-                                bestValue = value;
-                                best = point;
-                            }
-                        }
-                    }
-                    return best;
-                };
-                if (entry.fiber.hvTag == 'V') {
-                    // Scene y is inverted, so the smaller y is the top end.
-                    const QPointF top = endpoint(true, false);
-                    const QPointF low = endpoint(false, false);
-                    const bool atTop = (top.y() - topY) < (bottomY - low.y());
-                    anchor = atTop ? top : low;
-                    offsetX = 8.0;
-                    offsetY = atTop ? -10.0 : 10.0;
-                } else {
-                    const QPointF left = endpoint(true, true);
-                    const QPointF right = endpoint(false, true);
-                    const bool atRight = (network.x1Vx - right.x()) < (left.x() - network.x0Vx);
-                    anchor = atRight ? right : left;
-                    offsetX = atRight ? 10.0 : -10.0;
-                    anchorRight = !atRight;
-                }
-                auto* chip = new FiberLabelChip(
-                    entry.fiber.label,
-                    entry.fiber.hvTag == 'V' ? theme.chipVertical : theme.chipHorizontal,
-                    theme.chipInk, labelFont);
-                chip->setData(0, QVariant::fromValue<qulonglong>(entry.fiber.id));
-                chip->setZValue(6.0);
-                chip->setPos(anchor);
-                chip->setTransform(QTransform::fromTranslate(
-                    anchorRight ? offsetX - chip->width() : offsetX, offsetY));
-                _scene->addItem(chip);
-            }
-
-            const uint64_t fiberId = entry.fiber.id;
-            _entries.insert(fiberId, std::move(entry));
-        }
-
-        for (const vc3d::fiber_map::PlacedLink& link : network.links) {
-            const QPointF a(link.a.x(), -link.a.y());
-            const QPointF b(link.b.x(), -link.b.y());
-            const QPointF middle = 0.5 * (a + b);
-            if (!link.suspect) {
-                // A winding-suspect link keeps its own red treatment below;
-                // everything else takes the annotation's branch-link colours.
-                const LinkPalette& palette =
-                    linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
-                auto* dot = new ScaledDot(QBrush(palette.brush),
-                                          cosmeticPen(palette.pen, 1.0),
-                                          crossingDotRadius,
-                                          kMinCrossingDotPx, crossingDotBounds);
-                _scene->addItem(dot);
-                dot->setPos(middle);
-                dot->setZValue(4.0);
-                continue;
-            }
-            QPen suspectPen(kSuspect);
-            suspectPen.setWidthF(1.0);
-            suspectPen.setCosmetic(true);
-            suspectPen.setStyle(Qt::DashLine);
-            auto* line = _scene->addLine(QLineF(a, b));
-            line->setPen(suspectPen);
-            line->setZValue(4.0);
-            for (const QPointF& endpoint : {a, b}) {
-                auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
-                                           suspectRingRadius, kMinSuspectRingPx,
-                                           suspectRingBounds);
-                _scene->addItem(ring);
-                ring->setPos(endpoint);
-                ring->setZValue(5.0);
-            }
-            auto* label = _scene->addSimpleText(
-                tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
-            label->setBrush(kSuspect);
-            pinText(label, middle, 0.0, -14.0, true);
-            label->setZValue(5.0);
-        }
+    // The winding grid, one numbered line per integer winding: the number IS
+    // the winding coordinate, innermost anchored winding zero.
+    for (const vc3d::fiber_map::WindingMark& mark : _layout.windings) {
+        auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
+        QPen pen(theme.winding);
+        pen.setWidthF(0.8);
+        pen.setCosmetic(true);
+        pen.setStyle(Qt::DotLine);
+        line->setPen(pen);
+        line->setZValue(0.0);
+        auto* number = _scene->addSimpleText(QString::number(mark.number), labelFont);
+        number->setBrush(theme.winding);
+        pinText(number, QPointF(mark.xVx, extentTopY), 0.0, -16.0, true);
     }
 
-    // The panel headers hang above the top edge in device pixels, so the scene
-    // keeps a slice of room for them above the layout. The scroll extent, when
-    // known, is part of what the first-build fit shows.
+    for (const vc3d::fiber_map::GlobalPlacedFiber& placed : _layout.fibers) {
+        FiberEntry entry;
+        entry.fiber = placed.fiber;
+        entry.networkId = placed.meta.networkId;
+        for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
+            for (QPointF& point : run.points) {
+                point.setY(-point.y());
+            }
+        }
+        for (QPointF& point : entry.fiber.controlPoints) {
+            point.setY(-point.y());
+        }
+
+        // The path items only carry geometry: clicks resolve through
+        // fiberAt()'s proximity search, never through the items themselves.
+        const QColor color = fiberColor(entry.fiber.hvTag, theme);
+        const QPainterPath tracedPath = pathForRuns(entry.fiber, true);
+        if (!tracedPath.isEmpty()) {
+            entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
+            entry.tracedItem->setZValue(kFiberZ);
+        }
+        const QPainterPath interpolatedPath = pathForRuns(entry.fiber, false);
+        if (!interpolatedPath.isEmpty()) {
+            entry.interpolatedItem = _scene->addPath(
+                interpolatedPath,
+                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            entry.interpolatedItem->setZValue(kFiberZ);
+        }
+
+        // Label chip at whichever fiber end sits nearest a map edge
+        // (H fibers: left vs right, V fibers: bottom vs top).
+        const QRectF bounds = fiberBounds(entry.fiber);
+        if (!bounds.isNull()) {
+            QPointF anchor;
+            qreal offsetX = 0.0;
+            qreal offsetY = 0.0;
+            bool anchorRight = false;
+            const auto endpoint = [&entry](bool minimizeX, bool useX) {
+                QPointF best;
+                double bestValue = minimizeX ? std::numeric_limits<double>::infinity()
+                                             : -std::numeric_limits<double>::infinity();
+                for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
+                    for (const QPointF& point : run.points) {
+                        const double value = useX ? point.x() : point.y();
+                        if (minimizeX ? value < bestValue : value > bestValue) {
+                            bestValue = value;
+                            best = point;
+                        }
+                    }
+                }
+                return best;
+            };
+            if (entry.fiber.hvTag == 'V') {
+                // Scene y is inverted, so the smaller y is the top end.
+                const QPointF top = endpoint(true, false);
+                const QPointF low = endpoint(false, false);
+                const bool atTop = (top.y() - topY) < (bottomY - low.y());
+                anchor = atTop ? top : low;
+                offsetX = 8.0;
+                offsetY = atTop ? -10.0 : 10.0;
+            } else {
+                const QPointF left = endpoint(true, true);
+                const QPointF right = endpoint(false, true);
+                const bool atRight =
+                    (_layout.x1Vx - right.x()) < (left.x() - _layout.x0Vx);
+                anchor = atRight ? right : left;
+                offsetX = atRight ? 10.0 : -10.0;
+                anchorRight = !atRight;
+            }
+            auto* chip = new FiberLabelChip(
+                entry.fiber.label,
+                entry.fiber.hvTag == 'V' ? theme.chipVertical : theme.chipHorizontal,
+                theme.chipInk, labelFont);
+            chip->setData(0, QVariant::fromValue<qulonglong>(entry.fiber.id));
+            chip->setZValue(6.0);
+            chip->setPos(anchor);
+            chip->setTransform(QTransform::fromTranslate(
+                anchorRight ? offsetX - chip->width() : offsetX, offsetY));
+            _scene->addItem(chip);
+            _labelChips.push_back(chip);
+        }
+
+        const uint64_t fiberId = entry.fiber.id;
+        _entries.insert(fiberId, std::move(entry));
+    }
+
+    for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+        const QPointF a(link.a.x(), -link.a.y());
+        const QPointF b(link.b.x(), -link.b.y());
+        const QPointF middle = 0.5 * (a + b);
+        if (!link.suspect) {
+            // A winding-suspect link keeps its own red treatment below;
+            // everything else takes the annotation's branch-link colours.
+            const LinkPalette& palette =
+                linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
+            auto* dot = new ScaledDot(QBrush(palette.brush),
+                                      cosmeticPen(palette.pen, 1.0),
+                                      crossingDotRadius,
+                                      kMinCrossingDotPx, crossingDotBounds);
+            _scene->addItem(dot);
+            dot->setPos(middle);
+            dot->setZValue(4.0);
+            continue;
+        }
+        QPen suspectPen(kSuspect);
+        suspectPen.setWidthF(1.0);
+        suspectPen.setCosmetic(true);
+        suspectPen.setStyle(Qt::DashLine);
+        auto* line = _scene->addLine(QLineF(a, b));
+        line->setPen(suspectPen);
+        line->setZValue(4.0);
+        for (const QPointF& endpoint : {a, b}) {
+            auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
+                                       suspectRingRadius, kMinSuspectRingPx,
+                                       suspectRingBounds);
+            _scene->addItem(ring);
+            ring->setPos(endpoint);
+            ring->setZValue(5.0);
+        }
+        auto* label = _scene->addSimpleText(
+            tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
+        label->setBrush(kSuspect);
+        pinText(label, middle, 0.0, -14.0, true);
+        label->setZValue(5.0);
+    }
+
+    // Crossings the winding repair had to drop: contradicted evidence, marked
+    // where the H fiber made the pass.
+    for (const vc3d::fiber_map::CrossingMark& mark : _layout.suspectCrossings) {
+        auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
+                                   suspectRingRadius, kMinSuspectRingPx,
+                                   suspectRingBounds);
+        _scene->addItem(ring);
+        ring->setPos(QPointF(mark.posVx.x(), -mark.posVx.y()));
+        ring->setZValue(5.0);
+    }
+
+    // The winding numbers hang above the top edge in device pixels, so the
+    // scene keeps a slice of room for them above the layout. The scroll
+    // extent, when known, is part of what the first-build fit shows.
     const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect = QRectF(0.0, sceneTopY - 0.10 * height, sceneWidth, 1.12 * height);
+    _contentRect =
+        QRectF(_layout.x0Vx, sceneTopY - 0.10 * height, sceneWidth, 1.12 * height);
 
     // Panning stops at the scene rect, so the rect runs wider than the content:
-    // zoomed in, the outermost panels can be dragged away from the edge instead
-    // of being pinned to it.
+    // zoomed in, the map's edges can be dragged away from the viewport edge
+    // instead of being pinned to it.
     const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
     _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
+
+    if (_layout.rRefVx > 0.0) {
+        _chipHideScale =
+            kMinChipPixelsPerWinding / (2.0 * M_PI * _layout.rRefVx);
+    }
+    updateLabelChipVisibility();
+}
+
+void FiberMapWorkspace::updateLabelChipVisibility()
+{
+    if (!_view || _labelChips.empty()) {
+        return;
+    }
+    const bool visible =
+        std::abs(_view->transform().m11()) >= _chipHideScale;
+    for (QGraphicsItem* chip : _labelChips) {
+        chip->setVisible(visible);
+    }
 }
 
 void FiberMapWorkspace::rebuildTree()
@@ -1199,35 +1794,114 @@ void FiberMapWorkspace::rebuildTree()
     // The rows carry the map's own colours, so they follow the theme with it;
     // everything else about the tree is the widget palette's business.
     const FiberMapPalette& theme = activePalette();
-    for (const vc3d::fiber_map::PlacedNetwork& network : _layout.networks) {
-        const int suspectCount = static_cast<int>(
-            std::count_if(network.links.begin(), network.links.end(),
-                          [](const vc3d::fiber_map::PlacedLink& link) { return link.suspect; }));
-        QString title = tr("Network %1 — %2 fibers · r ≈ %3")
-                            .arg(network.networkIndex + 1)
-                            .arg(network.fibers.size())
-                            .arg(formatMapLength(network.rRefVx));
-        if (suspectCount > 0) {
-            title += tr(" · %1 winding-suspect").arg(suspectCount);
+
+    // Grouped by linked network, largest first (the layout numbers network
+    // ids by size), then every unlinked fiber flat; inner -> outer within
+    // each group.
+    std::map<int, std::vector<const vc3d::fiber_map::GlobalPlacedFiber*>> networks;
+    std::vector<const vc3d::fiber_map::GlobalPlacedFiber*> individual;
+    for (const vc3d::fiber_map::GlobalPlacedFiber& fiber : _layout.fibers) {
+        if (fiber.meta.networkId >= 0) {
+            networks[fiber.meta.networkId].push_back(&fiber);
+        } else {
+            individual.push_back(&fiber);
         }
-        auto* networkItem = new QTreeWidgetItem(_tree, {title});
+    }
+    const auto innerToOuter = [](const vc3d::fiber_map::GlobalPlacedFiber* a,
+                                 const vc3d::fiber_map::GlobalPlacedFiber* b) {
+        if (a->meta.windingLo != b->meta.windingLo) {
+            return a->meta.windingLo < b->meta.windingLo;
+        }
+        if (a->fiber.label != b->fiber.label) {
+            return a->fiber.label < b->fiber.label;
+        }
+        return a->fiber.id < b->fiber.id;
+    };
+    for (auto& [id, members] : networks) {
+        std::sort(members.begin(), members.end(), innerToOuter);
+    }
+    std::sort(individual.begin(), individual.end(), innerToOuter);
+
+    // A multi-turn H fiber has no single winding, so the column shows the
+    // range it spans.
+    const auto windingText = [](const vc3d::fiber_map::GlobalFiberMeta& meta) {
+        const auto lo = static_cast<long long>(std::floor(meta.windingLo));
+        const auto hi = static_cast<long long>(std::floor(meta.windingHi));
+        if (lo == hi) {
+            return QString::number(lo);
+        }
+        return QStringLiteral("%1–%2").arg(lo).arg(hi);
+    };
+    // How the fiber's component got its absolute winding — the UI must not
+    // imply winding knowledge the solve does not have.
+    const auto anchorText = [this](const vc3d::fiber_map::GlobalFiberMeta& meta) {
+        QString text;
+        switch (meta.anchor) {
+        case vc3d::fiber_map::GlobalAnchor::Primary:
+            text = tr("crossings");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::Radius:
+            text = tr("radius");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::AmbiguousRadius:
+            text = tr("radius?");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::Unresolved:
+            text = tr("unresolved");
+            break;
+        }
+        if (meta.sheetDriftSuspect) {
+            text += tr(" · drift?");
+        }
+        return text;
+    };
+    const auto addFiberRow = [&](QTreeWidgetItem* parent,
+                                 const vc3d::fiber_map::GlobalPlacedFiber* row) {
+        const QString annotationName =
+            _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
+        auto* item = parent != nullptr
+            ? new QTreeWidgetItem(
+                  parent, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                           windingText(row->meta), anchorText(row->meta),
+                           annotationName})
+            : new QTreeWidgetItem(
+                  _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                          windingText(row->meta), anchorText(row->meta),
+                          annotationName});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(row->fiber.id));
+        const QColor color = fiberColor(row->fiber.hvTag, theme);
+        for (int column = 0; column < _tree->columnCount(); ++column) {
+            item->setForeground(column, color);
+        }
+        item->setForeground(3, theme.inkSoft);
+    };
+
+    for (const auto& [id, members] : networks) {
+        auto* networkItem = new QTreeWidgetItem(
+            _tree, {tr("Network %1 — %2 fibers")
+                        .arg(id + 1)
+                        .arg(members.size())});
         networkItem->setForeground(0, theme.inkSoft);
-        // The network line is a header, not a cell of the label column: it runs
-        // across the whole row so the columns can stay narrow.
+        // A header across the whole row, so the columns stay narrow.
         networkItem->setFirstColumnSpanned(true);
-        for (const vc3d::fiber_map::PlacedFiber& fiber : network.fibers) {
-            const QString annotationName =
-                _controller ? _controller->fiberDisplayName(fiber.id) : QString();
-            auto* fiberItem = new QTreeWidgetItem(
-                networkItem,
-                {fiber.label, QString(QLatin1Char(fiber.hvTag)), annotationName});
-            fiberItem->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(fiber.id));
-            const QColor color = fiberColor(fiber.hvTag, theme);
-            for (int column = 0; column < 3; ++column) {
-                fiberItem->setForeground(column, color);
-            }
+        for (const vc3d::fiber_map::GlobalPlacedFiber* row : members) {
+            addFiberRow(networkItem, row);
         }
         networkItem->setExpanded(true);
+    }
+    for (const vc3d::fiber_map::GlobalPlacedFiber* row : individual) {
+        addFiberRow(nullptr, row);
+    }
+    for (const vc3d::fiber_map::UnplacedFiber& unplaced : _layout.unplaced) {
+        const QString annotationName =
+            _controller ? _controller->fiberDisplayName(unplaced.id) : QString();
+        auto* item = new QTreeWidgetItem(
+            _tree, {unplaced.label, QString(QLatin1Char(unplaced.hvTag)),
+                    QStringLiteral("—"), tr("unplaceable"), annotationName});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced.id));
+        for (int column = 0; column < _tree->columnCount(); ++column) {
+            item->setForeground(column, theme.inkSoft);
+        }
     }
     _syncingSelection = guard;
 }
@@ -1283,7 +1957,7 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
     const QList<QGraphicsItem*> under = _scene->items(
         scenePos, Qt::IntersectsItemShape, Qt::DescendingOrder, _view->transform());
     for (const QGraphicsItem* item : under) {
-        if (item->type() != kChipItemType) {
+        if (item->type() != kChipItemType || !item->isVisible()) {
             continue;
         }
         const uint64_t fiberId = item->data(0).toULongLong();
@@ -1336,16 +2010,21 @@ void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
 {
     const bool guard = _syncingSelection;
     _syncingSelection = true;
-    for (int networkRow = 0; networkRow < _tree->topLevelItemCount(); ++networkRow) {
-        QTreeWidgetItem* networkItem = _tree->topLevelItem(networkRow);
-        for (int fiberRow = 0; fiberRow < networkItem->childCount(); ++fiberRow) {
-            QTreeWidgetItem* fiberItem = networkItem->child(fiberRow);
-            if (fiberItem->data(0, Qt::UserRole).toULongLong() == fiberId) {
-                _tree->setCurrentItem(fiberItem);
-                _tree->scrollToItem(fiberItem);
-                _syncingSelection = guard;
-                return;
+    const auto matches = [fiberId](QTreeWidgetItem* item) {
+        return item->data(0, Qt::UserRole).toULongLong() == fiberId;
+    };
+    for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
+        QTreeWidgetItem* item = _tree->topLevelItem(row);
+        QTreeWidgetItem* hit = matches(item) ? item : nullptr;
+        for (int child = 0; hit == nullptr && child < item->childCount(); ++child) {
+            if (matches(item->child(child))) {
+                hit = item->child(child);
             }
+        }
+        if (hit != nullptr) {
+            _tree->setCurrentItem(hit);
+            _tree->scrollToItem(hit);
+            break;
         }
     }
     _syncingSelection = guard;
@@ -1360,42 +2039,88 @@ void FiberMapWorkspace::clearControlPointDots()
     _controlPointDots.clear();
 }
 
+void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
+                                           FiberEmphasis emphasis)
+{
+    const FiberMapPalette& theme = activePalette();
+    const QColor color = fiberColor(entry.fiber.hvTag, theme);
+    const bool selected = emphasis == FiberEmphasis::Selected;
+    if (entry.tracedItem) {
+        entry.tracedItem->setPen(cosmeticPen(
+            color, selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.tracedItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
+    if (entry.interpolatedItem) {
+        entry.interpolatedItem->setPen(interpolatedPen(
+            tint(color, theme.surface, 0.45),
+            selected ? kInterpolatedHighlightWidth : kInterpolatedWidth));
+        entry.interpolatedItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
+    // The network role adds a halo behind the unchanged lines; every other
+    // role removes it. The halo strokes the fiber's whole geometry (traced
+    // and interpolated runs alike) in one soft ribbon.
+    if (emphasis == FiberEmphasis::Network) {
+        if (entry.glowItem == nullptr) {
+            QPainterPath path;
+            for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
+                if (run.points.size() < 2) {
+                    continue;
+                }
+                path.moveTo(run.points.front());
+                for (std::size_t i = 1; i < run.points.size(); ++i) {
+                    path.lineTo(run.points[i]);
+                }
+            }
+            QColor glow = color;
+            glow.setAlpha(kNetworkGlowAlpha);
+            entry.glowItem =
+                _scene->addPath(path, cosmeticPen(glow, kNetworkGlowWidthPx));
+            entry.glowItem->setZValue(kNetworkGlowZ);
+        }
+    } else if (entry.glowItem != nullptr) {
+        _scene->removeItem(entry.glowItem);
+        delete entry.glowItem;
+        entry.glowItem = nullptr;
+    }
+}
+
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 {
     if (_highlightedFiber == fiberId) {
         return;
     }
-    const FiberMapPalette& theme = activePalette();
-    if (const auto previous = _entries.constFind(_highlightedFiber);
-        previous != _entries.constEnd()) {
-        const QColor color = fiberColor(previous->fiber.hvTag, theme);
-        if (previous->tracedItem) {
-            previous->tracedItem->setPen(cosmeticPen(color, kTracedWidth));
-            previous->tracedItem->setZValue(kFiberZ);
-        }
-        if (previous->interpolatedItem) {
-            previous->interpolatedItem->setPen(
-                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
-            previous->interpolatedItem->setZValue(kFiberZ);
+    // Restore the previous selection and its network's glow.
+    if (const auto previous = _entries.find(_highlightedFiber);
+        previous != _entries.end()) {
+        paintFiberEmphasis(*previous, FiberEmphasis::Plain);
+    }
+    for (const uint64_t member : _networkEmphasized) {
+        if (const auto entry = _entries.find(member); entry != _entries.end()) {
+            paintFiberEmphasis(*entry, FiberEmphasis::Plain);
         }
     }
+    _networkEmphasized.clear();
     clearControlPointDots();
     _highlightedFiber = fiberId;
 
-    const auto entry = _entries.constFind(fiberId);
-    if (entry == _entries.constEnd()) {
+    const auto entry = _entries.find(fiberId);
+    if (entry == _entries.end()) {
         return;
     }
+    // The whole linked network glows; the selected fiber itself gets the
+    // full treatment instead.
+    if (entry->networkId >= 0) {
+        for (auto other = _entries.begin(); other != _entries.end(); ++other) {
+            if (other->networkId == entry->networkId &&
+                other.key() != fiberId) {
+                paintFiberEmphasis(*other, FiberEmphasis::Network);
+                _networkEmphasized.push_back(other.key());
+            }
+        }
+    }
+    paintFiberEmphasis(*entry, FiberEmphasis::Selected);
+    const FiberMapPalette& theme = activePalette();
     const QColor color = fiberColor(entry->fiber.hvTag, theme);
-    if (entry->tracedItem) {
-        entry->tracedItem->setPen(cosmeticPen(color, kTracedHighlightWidth));
-        entry->tracedItem->setZValue(kHighlightZ);
-    }
-    if (entry->interpolatedItem) {
-        entry->interpolatedItem->setPen(
-            interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedHighlightWidth));
-        entry->interpolatedItem->setZValue(kHighlightZ);
-    }
     const double vxPerCm = sceneVxPerCm();
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         auto* dot = new ScaledDot(QBrush(color), cosmeticPen(theme.chipInk, 1.0),
@@ -1476,6 +2201,15 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     /*layoutBuilt=*/true, QString());
                 if (verdict.action != StaleVerdict::Action::Fresh) {
                     showStale(verdict.reason);
+                    // The destructive half (a clear, or scheduling the
+                    // automatic update) runs on the next event-loop turn,
+                    // after menu.exec()'s nested loop has unwound - exactly
+                    // like the tree handler's deferral, and for the same
+                    // reason: applying a verdict here can tear down scene
+                    // items mid-delivery.
+                    QMetaObject::invokeMethod(
+                        this, [this]() { refreshStaleState(); },
+                        Qt::QueuedConnection);
                     Logger()->warn(
                         "Fiber map: dependencies changed while the menu was open; "
                         "not navigating to control point {} in {}",
@@ -1489,7 +2223,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 // it is rebuilt — the one staleness that latches.
                 const uint64_t target = _controller->fiberIdForFileName(fileName);
                 if (target == 0) {
-                    markStale(tr("Fibers changed — press Rebuild layout"));
+                    markStale(tr("Fibers changed — press Update"));
                     Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
                                    fileName);
                     return;

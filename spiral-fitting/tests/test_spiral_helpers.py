@@ -203,7 +203,8 @@ class ResolveOuterWindingIdxWiringTests(unittest.TestCase):
 
     def _cfg(self, idx, gap=200):
         return {'shell_outer_winding_idx': idx,
-                'model_gap_expander_num_windings': gap}
+                'model_gap_expander_num_windings': gap,
+                'model_gap_expander_capacity_windings': gap}
 
     def test_configured_index_survives_a_shell_less_run(self):
         idx, notes = resolve_outer_winding_idx_and_notes(
@@ -234,12 +235,19 @@ class ResolveOuterWindingIdxWiringTests(unittest.TestCase):
         self.assertTrue(any('using configured' in n for n in notes))
 
     def test_gap_expander_control_also_runs_without_a_shell(self):
+        with self.assertRaisesRegex(
+                ValueError,
+                'model_gap_expander_capacity_windings >= 133'):
+            resolve_outer_winding_idx_and_notes(
+                self._cfg(130, gap=130), shell_active=False,
+                infer_outer_winding_idx=self.fail)
+
+    def test_active_outer_winding_can_change_within_fixed_capacity(self):
+        cfg = self._cfg(130, gap=144)
         idx, notes = resolve_outer_winding_idx_and_notes(
-            self._cfg(130, gap=130), shell_active=False,
-            infer_outer_winding_idx=self.fail)
+            cfg, shell_active=False, infer_outer_winding_idx=self.fail)
         self.assertEqual(idx, 130)
-        self.assertTrue(any('model_gap_expander_num_windings >= 133' in n
-                            for n in notes))
+        self.assertFalse(any('capacity' in note for note in notes))
 
 
 if __name__ == "__main__":

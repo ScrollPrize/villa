@@ -117,8 +117,14 @@ int main(int argc, char** argv)
             "Fiber tree row should not show the JSON extension");
     require(!treeView->model()->index(1, 0).data().toString().startsWith(QStringLiteral("2 ")),
             "Fiber tree row should not show the runtime fiber ID");
+    // Span children are lazy: a collapsed fiber carries one placeholder
+    // child (so the expand arrow shows) and the real span rows are built on
+    // first expansion.
+    require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 1,
+            "Collapsed fiber row should carry exactly one placeholder child");
+    treeView->expand(treeView->model()->index(1, 0));
     require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 2,
-            "Fiber tree row did not expose span children");
+            "Fiber tree row did not expose span children after expansion");
     require(treeView->model()->index(1, 2).data().toString() == QStringLiteral("2"),
             "Fiber tree link column did not show the linked fiber count");
     require(treeView->model()->index(1, 3).data().toString() == QStringLiteral("1"),
@@ -539,6 +545,7 @@ int main(int argc, char** argv)
                 QStringLiteral("mixed"),
             "Mixed fiber should show 'mixed'");
     const QModelIndex tracedParent = treeView->model()->index(rowOfFiber(12), 0);
+    treeView->expand(tracedParent);  // span rows are built lazily on expansion
     require(treeView->model()->index(0, 8, tracedParent).data().toString() ==
                 QStringLiteral("T"),
             "Traced span row should show its 'T' producer marker");

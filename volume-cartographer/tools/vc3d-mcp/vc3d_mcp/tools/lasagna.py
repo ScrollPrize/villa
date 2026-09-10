@@ -84,6 +84,7 @@ async def vc3d_lasagna_start_optimization(
     config_path: Optional[str] = None,
     seed: Optional[_Vec3] = None,
     atlas_path: Optional[str] = None,
+    init_shell_dir: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -99,6 +100,9 @@ async def vc3d_lasagna_start_optimization(
     integers.
     atlas_path: required for mode "atlas" unless the panel already has an atlas
     selected; missing fails -32007 (data.kind:"atlas"). Ignored for other modes.
+    init_shell_dir: shell directory visible to the fit-service host. For
+    new_model shell-dir-crop initialization this overrides init_shell_dir in
+    the input manifest.
     wait: if true (MCP-server-side only, not part of the underlying RPC), block
     until the job finishes (30-minute cap) and return the terminal job.status
     inline instead of just the jobId; on timeout the jobId is returned with an
@@ -119,6 +123,7 @@ async def vc3d_lasagna_start_optimization(
                 "configPath": config_path,
                 "seed": seed,
                 "atlasPath": atlas_path,
+                "initShellDir": init_shell_dir,
             }
         ),
     )

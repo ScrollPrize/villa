@@ -922,6 +922,18 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
                 "ChunkCache source was registered with incompatible metadata: " +
                 sourceIdentity);
         }
+        if (options.decodedEvictionPreferSelf !=
+            state->options_.decodedEvictionPreferSelf) {
+            // Eviction preference is a per-source policy captured by the
+            // FIRST acquisition's budget registration; it is deliberately not
+            // part of metadataCompatible (it describes no data), but a
+            // differing later request must not be ignored silently.
+            Logger()->warn(
+                "ChunkCache source {} already registered with "
+                "decodedEvictionPreferSelf={}; ignoring differing request",
+                sourceIdentity,
+                state->options_.decodedEvictionPreferSelf);
+        }
         ChunkCache::validateRefreshedFetchers(*state, fetchers);
         serviceLock.unlock();
         ChunkCache::refreshFetchers(state, std::move(fetchers));
@@ -1113,6 +1125,7 @@ void ChunkCache::registerStateBudget(const std::shared_ptr<State>& state)
                 auto locked = weakState.lock();
                 return locked ? evictOldestDecoded(locked) : 0;
             },
+            state->options_.decodedEvictionPreferSelf,
         });
 }
 
@@ -1194,9 +1207,9 @@ void ChunkCache::refreshFetchers(
         }
         state->storageObjectTransfers_.clear();
         restartUnresolvedLocked(state);
-        for (auto& [key, operation] : state->persistenceOperations_) {
-            if (operation->writeQueued.load(std::memory_order_acquire))
-                continue;
+        auto requeueOperation =
+            [&](const ChunkKey& key,
+                const std::shared_ptr<PersistenceOperation>& operation) {
             operation->probeTaskId = 0;
             operation->sourceTaskId = 0;
             FetchContext context{
@@ -1210,16 +1223,16 @@ void ChunkCache::refreshFetchers(
             if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
                 (void)joinStorageObjectTransferLocked(
                     state, key, std::move(context), false, operation);
-                continue;
+                return;
             }
             if (operation->refresh) {
                 joinSourceTransferLocked(
                     state, key, std::move(context), false, operation);
-                continue;
+                return;
             }
             auto scheduler = state->probeScheduler_.lock();
             if (!scheduler)
-                continue;
+                return;
             const auto taskId = state->nextTaskId_->fetch_add(
                 1, std::memory_order_relaxed);
             operation->probeTaskId = taskId;
@@ -1233,10 +1246,44 @@ void ChunkCache::refreshFetchers(
                         probePersistenceAndDispatch(
                             lockedState, key, operation);
                 });
+        };
+        for (auto it = state->persistenceOperations_.begin();
+             it != state->persistenceOperations_.end();) {
+            if (it->second->writeQueued.load(std::memory_order_acquire)) {
+                ++it;
+                continue;
+            }
+            try {
+                requeueOperation(it->first, it->second);
+                ++it;
+            } catch (...) {
+                // A fetcher that throws during the requeue must not escape
+                // before the cv notify below wakes parked blocking readers,
+                // and this operation's own waiters must fail rather than
+                // hang on a request nothing will run.
+                auto operation = it->second;
+                {
+                    std::lock_guard operationLock(operation->mutex);
+                    if (!operation->completed) {
+                        operation->result = {
+                            PersistentRequestStatus::Error,
+                            "persistent request restart failed"};
+                        operation->completed = true;
+                    }
+                }
+                operation->cv.notify_all();
+                Logger()->warn(
+                    "[ChunkCache] persistent request restart failed for "
+                    "({}, {}, {}, {}); request failed",
+                    it->first.level, it->first.iz, it->first.iy,
+                    it->first.ix);
+                it = state->persistenceOperations_.erase(it);
+            }
         }
     });
     for (const auto& key : stoppedRemoteActivity)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     state->cv_.notify_all();
 }
 
@@ -1280,7 +1327,19 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
     });
     for (const auto& [serial, key] : retry) {
         (void)serial;
-        (void)queueFetchLocked(state, key, state->generation_, 0);
+        try {
+            (void)queueFetchLocked(state, key, state->generation_, 0);
+        } catch (...) {
+            // A fetcher that throws during queue setup must not orphan an
+            // InFlight entry (parked blocking readers would wait forever;
+            // the caller's cv notify wakes them to retry) or starve the
+            // remaining keys' restarts.
+            eraseUnresolvedEntryLocked(*state, key);
+            Logger()->warn(
+                "[ChunkCache] fetch restart failed for ({}, {}, {}, {}); "
+                "entry dropped for refetch on demand",
+                key.level, key.iz, key.iy, key.ix);
+        }
     }
 }
 
@@ -1645,22 +1704,123 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
 
-    auto [it, inserted] = state->entries_.emplace(key, Entry{});
-    it->second.backgroundDemand = true;
-    const bool notifyRemoteStart = inserted && queueFetchLocked(
-        state, key, state->generation_, 0);
-    if (notifyRemoteStart) {
+    // A caller of this method is parked until the chunk resolves, so its
+    // request must order ahead of the speculative prefetch backlog in the
+    // background queue (smaller backgroundPriority runs first; prefetches
+    // sit at >= 0). Without this, a blocking read issued while a solve
+    // streams chunks waits FIFO behind every chunk the solve enqueued -
+    // on remote sources that parked the caller (GUI thread included) for
+    // the whole backlog's round trips.
+    constexpr int kBlockingFetchPriorityOffset = -1024;
+    constexpr int kLostEntryRetryLimit = 5;
+    // Register this reader on the key before any entry work. The count -
+    // not the entry - carries the eviction protection: both evictors and
+    // the budget's victim probe skip keys with parked blocking readers
+    // (hasParkedBlockingReaderLocked), so a resolved chunk cannot be erased
+    // before its reader wakes, and a successor entry created after an
+    // invalidation is protected from the moment it exists no matter which
+    // thread created it. Being reader-owned, the registration survives any
+    // entry lifecycle event and is released exactly once on every exit.
+    // Only deliberate invalidation (and demand withdrawal of a successor
+    // this reader never observed) can still remove the entry; the chunk
+    // stays perfectly refetchable then, so the loop retries instead of
+    // failing.
+    ++state->blockingReadersByKey_[key];
+    bool readerReleased = false;
+    auto releaseReaderLocked = [&] {
+        if (readerReleased)
+            return;
+        readerReleased = true;
+        auto parked = state->blockingReadersByKey_.find(key);
+        if (parked != state->blockingReadersByKey_.end() &&
+            --parked->second == 0)
+            state->blockingReadersByKey_.erase(parked);
+    };
+    // Exits release the reader registration, then re-run both limits: while
+    // the registration protected the entry, enforcement may have given up
+    // over budget. The entry-count capacity runs under the lock, the shared
+    // byte budget outside it (it calls back into evictOldestDecoded, which
+    // takes the lock).
+    auto finishLocked = [&](ChunkResult result) {
+        releaseReaderLocked();
+        enforceCapacityLocked(state);
         lock.unlock();
-        notifyRemoteFetchListeners(state, key, true);
-        lock.lock();
+        enforceSharedBudget(state);
+        return result;
+    };
+    try {
+        for (int attempt = 0;; ++attempt) {
+            auto [it, inserted] = state->entries_.emplace(key, Entry{});
+            it->second.backgroundDemand = true;
+            bool notifyRemoteStart = false;
+            if (inserted) {
+                try {
+                    notifyRemoteStart = queueFetchLocked(
+                        state, key, state->generation_,
+                        kBlockingFetchPriorityOffset);
+                } catch (...) {
+                    // Queue setup failed before any task was installed:
+                    // erase the entry this reader created, or later readers
+                    // would wait forever on an InFlight entry that nothing
+                    // resolves.
+                    eraseUnresolvedEntryLocked(*state, key);
+                    throw;
+                }
+            } else if (it->second.status == EntryStatus::InFlight) {
+                const int boosted =
+                    fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
+                if (boosted < it->second.basePriority) {
+                    it->second.basePriority = boosted;
+                    reprioritizeEntryLocked(*state, key, it->second);
+                }
+            }
+            if (notifyRemoteStart) {
+                lock.unlock();
+                notifyRemoteFetchListeners(state, key, true);
+                lock.lock();
+            }
+            // Wait keyed by chunk key. Marking demand on whatever entry sits
+            // at the key (a mutex-protected side effect of the predicate)
+            // keeps demand pruning from erasing a successor this reader has
+            // observed; one it never observed can only vanish while the
+            // reader's own wake is still pending, which lands in the retry
+            // below.
+            state->cv_.wait(lock, [&] {
+                auto entry = state->entries_.find(key);
+                if (entry == state->entries_.end())
+                    return true;
+                entry->second.backgroundDemand = true;
+                return entry->second.status != EntryStatus::InFlight;
+            });
+            it = state->entries_.find(key);
+            if (it != state->entries_.end())
+                return finishLocked(
+                    resultFromEntryLocked(*state, key, it->second));
+            if (attempt >= kLostEntryRetryLimit)
+                return finishLocked(ChunkResult{
+                    ChunkStatus::Error, state->dtype_,
+                    state->levels_[level].chunkShape, {},
+                    "chunk entry removed before blocking reader woke "
+                    "(retries exhausted)"});
+            Logger()->warn(
+                "[ChunkCache] blocking read lost chunk ({}, {}, {}, {}) "
+                "mid-wait (invalidation, refresh, or demand withdrawal); "
+                "refetching (attempt {}/{})",
+                level, iz, iy, ix, attempt + 1, kLostEntryRetryLimit);
+        }
+    } catch (...) {
+        if (!lock.owns_lock())
+            lock.lock();
+        releaseReaderLocked();
+        try {
+            enforceCapacityLocked(state);
+            lock.unlock();
+            enforceSharedBudget(state);
+        } catch (...) {
+            // Best-effort cleanup: keep the original exception.
+        }
+        throw;
     }
-    waitForResolvedLocked(*state, lock, key);
-    it = state->entries_.find(key);
-    if (it == state->entries_.end())
-        return ChunkResult{
-            ChunkStatus::Error, state->dtype_,
-            state->levels_[level].chunkShape, {}, "chunk invalidated"};
-    return resultFromEntryLocked(*state, key, it->second);
 }
 
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset)
@@ -1939,6 +2099,10 @@ ChunkCache::Stats ChunkCache::stats() const
         if (auto scheduler = state->decodeScheduler_.lock())
             result.pendingDecodeTasks = scheduler->pending();
         result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
+        for (const auto& [key, parked] : state->blockingReadersByKey_) {
+            (void)key;
+            result.blockingReaders += parked;
+        }
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
         result.persistentCacheWarning = state->persistentCacheWarning_;
     }
@@ -2201,8 +2365,13 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->decodeScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
+    // Per-listener exception isolation: a throwing listener must not skip
+    // other listeners' stop events, the remaining keys, or the cv notify
+    // below - parked blocking readers whose entries were just cleared
+    // depend on that wake.
     for (const auto& key : activeRemoteFetches)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
     for (const auto& operation : cancelledPersistence) {
         {
             std::lock_guard lock(operation->mutex);
@@ -2701,6 +2870,15 @@ bool ChunkCache::hasDemandLocked(const Entry& entry)
     return entry.backgroundDemand || !entry.viewDemands.empty();
 }
 
+bool ChunkCache::hasParkedBlockingReaderLocked(const State& state,
+                                               const ChunkKey& key)
+{
+    if (state.blockingReadersByKey_.empty())
+        return false;
+    return state.blockingReadersByKey_.find(key) !=
+           state.blockingReadersByKey_.end();
+}
+
 bool ChunkCache::cancelUndemandedEntryLocked(State& state,
                                              const ChunkKey& key,
                                              Entry& entry)
@@ -2981,7 +3159,8 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
         }
     });
     if (remoteStart)
-        notifyRemoteFetchListeners(state, key, true);
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
     if (pruned || waitingForPersistence)
         state->cv_.notify_all();
 }
@@ -3187,7 +3366,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
                 ++state->remoteFetchesInFlight_;
                 state->activeRemoteFetches_[key].insert(transferSerial);
             }
-            notifyRemoteFetchListeners(state, key, true);
+            notifyRemoteFetchListeners(state, key, true,
+                                       /*isolateCallbackExceptions=*/true);
         }
         fetch = sourceTransfer.fetcher->fetchEncoded(
             fetcherKey(key), observeProgress);
@@ -3235,7 +3415,8 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
         }
     }
     if (remoteActivityEnded)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     bool decodeRequested = false;
     std::shared_ptr<PersistenceOperation> persistence;
@@ -3649,7 +3830,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : activityKeys)
-        notifyRemoteFetchListeners(state, key, true);
+        notifyRemoteFetchListeners(state, key, true,
+                                   /*isolateCallbackExceptions=*/true);
 
     ChunkFetchResult fetch;
     const auto started = std::chrono::steady_clock::now();
@@ -3699,7 +3881,8 @@ void ChunkCache::runStorageObjectFetch(
         }
     }
     for (const auto& key : stopped)
-        notifyRemoteFetchListeners(state, key, false);
+        notifyRemoteFetchListeners(state, key, false,
+                                   /*isolateCallbackExceptions=*/true);
 
     dispatchStorageObjectResult(
         state, objectKey, transferSerial, std::move(fetch), false);
@@ -5274,16 +5457,21 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
     if (!overBudget())
         return;
 
-    while (overBudget() && !state->lru_.empty()) {
-        auto victimIt = std::prev(state->lru_.end());
-        auto entryIt = state->entries_.find(*victimIt);
+    for (auto it = state->lru_.end();
+         overBudget() && it != state->lru_.begin();) {
+        --it;
+        auto entryIt = state->entries_.find(*it);
         if (entryIt == state->entries_.end()) {
-            state->lru_.erase(victimIt);
+            it = state->lru_.erase(it);
             continue;
         }
         Entry& entry = entryIt->second;
-        const ChunkKey victim = *victimIt;
-        state->lru_.erase(victimIt);
+        // Entries whose key has a parked blocking reader must survive until
+        // that reader wakes; capacity overshoots by at most that count.
+        if (hasParkedBlockingReaderLocked(*state, *it))
+            continue;
+        const ChunkKey victim = *it;
+        it = state->lru_.erase(it);
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
             if (entry.bytes && !entry.persisted && !entry.persistentWriteQueued)
@@ -5302,7 +5490,11 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
     for (auto it = state->lru_.rbegin(); it != state->lru_.rend(); ++it) {
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
-            entry->second.status == EntryStatus::Data) {
+            entry->second.status == EntryStatus::Data &&
+            !hasParkedBlockingReaderLocked(*state, *it)) {
+            // Must mirror evictOldestDecodedLocked's reader skip: reporting
+            // a protected entry's touch would make the budget's enforce()
+            // loop keep selecting a victim whose eviction then refuses.
             return entry->second.budgetTouch;
         }
     }
@@ -5326,6 +5518,8 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         }
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
+            continue;
+        if (hasParkedBlockingReaderLocked(*state, *it))
             continue;
 
         const ChunkKey victim = *it;
@@ -5443,7 +5637,8 @@ void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
 
 void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                             const ChunkKey& key,
-                                            bool active)
+                                            bool active,
+                                            bool isolateCallbackExceptions)
 {
     std::vector<RemoteFetchActivityCallback> callbacks;
     {
@@ -5455,17 +5650,23 @@ void ChunkCache::notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
         }
     }
     for (auto& cb : callbacks) {
-        if (cb)
+        if (!cb)
+            continue;
+        if (!isolateCallbackExceptions) {
             cb(key, active);
+            continue;
+        }
+        try {
+            cb(key, active);
+        } catch (...) {
+            // Isolation is requested by scheduler worker threads (an escape
+            // would std::terminate the jthread) and by invalidation/refresh
+            // paths (stop events must reach every listener, and the cv
+            // notify that parked readers depend on must not be skipped).
+            Logger()->warn(
+                "[ChunkCache] remote-fetch listener threw; continuing");
+        }
     }
-}
-
-void ChunkCache::waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key)
-{
-    state.cv_.wait(lock, [&] {
-        auto it = state.entries_.find(key);
-        return it == state.entries_.end() || it->second.status != EntryStatus::InFlight;
-    });
 }
 
 } // namespace vc::render

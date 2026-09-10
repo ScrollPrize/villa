@@ -220,6 +220,11 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    // Coalesced entry point: fiberSaved fires once per saved fiber and a
+    // single edit saves the session plus its linked peers, so refreshes fold
+    // into one dock rebuild per burst instead of one per signal.
+    void scheduleAtlasSearchDockRefresh();
+    bool _atlasSearchDockRefreshQueued = false;
     void remapCurrentAtlas();
     // Starts atlas remapping without dialogs. The interactive caller can add
     // its completion UI through onFinished.
@@ -286,7 +291,6 @@ private:
         const std::shared_ptr<Volume>& volume,
         const QString& location,
         std::vector<std::string> tags = {},
-        const QString& remoteCacheRoot = {},
         const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
@@ -314,6 +318,8 @@ private slots:
     void onEditMaskPressed(const QString& segmentId);
     void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
+    void onFocusBoundsEdited();
+    void onFocusBoundsToggled(bool enabled);
     void onZoomIn();
     void onZoomOut();
     void onCopyCoordinates();
@@ -326,6 +332,7 @@ private slots:
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
+    void refreshFocusBoundsUi();
 
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;

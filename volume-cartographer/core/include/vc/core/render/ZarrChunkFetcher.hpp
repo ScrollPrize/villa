@@ -58,16 +58,17 @@ OpenedChunkedZarr openHttpZarrPyramid(
     std::optional<int> baseScaleLevel = std::nullopt);
 
 // Production remote-volume open policy shared by VC3D and standalone tools:
-// resolve the locator, discover credentials when requested, and retry public
-// S3 data anonymously when stale credentials cause an authentication error.
+// resolve the locator, try recognized S3 sources anonymously, then retry with
+// discovered credentials only when anonymous access is denied.
 OpenedRemoteChunkedZarr openRemoteZarrPyramid(
     const std::string& url,
     RemoteZarrOpenOptions options = {});
 
 // S3 deliberately returns AccessDenied rather than NotFound for a missing key
 // when the caller lacks ListBucket. Optional discovery probes must therefore
-// accept a generic 403 while preserving explicit credential failures so the
-// anonymous retry policy can still run. Exposed for deterministic tests.
+// accept a generic 403 while preserving explicit credential failures. The
+// opener remembers suppressed denials and retries authenticated if no required
+// array metadata can ultimately be found.
 bool isOptionalRemoteMetadataMiss(
     long status,
     std::string_view key,

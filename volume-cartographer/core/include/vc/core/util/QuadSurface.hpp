@@ -322,6 +322,17 @@ public:
     [[nodiscard]] cv::Vec3f center() const;
     [[nodiscard]] cv::Vec2d surfaceToGrid(const cv::Vec2d& surface) const;
     [[nodiscard]] cv::Vec2d gridToSurface(const cv::Vec2d& grid) const;
+    // Shift the surface/ptr-space origin (i.e. _center): content previously
+    // addressed by surface coordinate s is afterwards addressed by s - delta.
+    // Lets a regenerated derived surface (e.g. a line-annotation strip, whose
+    // arc-length parameterization shifts with every re-optimization) stay
+    // addressable by camera coordinates that survive the surface swap. Call
+    // only on a surface no viewer is rendering yet — the shift is not
+    // synchronized against concurrent readers. Session-local by design: the
+    // shift is not persisted by save() and a lazy surface's cache
+    // invalidation recomputes _center, so use it only on in-memory derived
+    // surfaces, never on disk-backed ones.
+    void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
 
     // The legacy renderer treats native vertex validity as pixel coverage.

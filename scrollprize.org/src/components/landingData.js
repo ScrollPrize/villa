@@ -653,7 +653,7 @@ export const team = {
     },
     {
       name: "Michael McOsker",
-      title: "Researcher, University College London",
+      title: "Researcher, University of Oxford",
       href: "https://profiles.ucl.ac.uk/97051-michael-mcosker",
     },
     {
