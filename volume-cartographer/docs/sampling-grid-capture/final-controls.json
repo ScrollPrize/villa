@@ -1,0 +1,14 @@
+{
+  "checks": {
+    "existing-directory": "PASS",
+    "oversized-area": "PASS",
+    "too-many-offsets": "PASS",
+    "invalid-rays": {
+      "status": "PASS",
+      "invalid_pixels_preserved": 97,
+      "reader": "REFUSED_AS_REQUIRED"
+    }
+  },
+  "original_inputs_unchanged": true,
+  "source_patch_unchanged": true
+}

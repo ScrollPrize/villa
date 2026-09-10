@@ -1,0 +1,39 @@
+test_duplicate_keys_refused (test_capture.RendererCaptureTests.test_duplicate_keys_refused) ... ok
+test_empty_offsets (test_capture.RendererCaptureTests.test_empty_offsets) ... ok
+test_exact_offset_extrema_not_symmetric_recentering (test_capture.RendererCaptureTests.test_exact_offset_extrema_not_symmetric_recentering) ... ok
+test_float32_overflow (test_capture.RendererCaptureTests.test_float32_overflow) ... ok
+test_interior_failure_and_canvas_witness (test_capture.RendererCaptureTests.test_interior_failure_and_canvas_witness) ... ok
+test_invalid_crop_and_level (test_capture.RendererCaptureTests.test_invalid_crop_and_level) ... ok
+test_invalid_dimensions (test_capture.RendererCaptureTests.test_invalid_dimensions) ... ok
+test_invalid_pixels_not_masked (test_capture.RendererCaptureTests.test_invalid_pixels_not_masked) ... ok
+test_missing_rays (test_capture.RendererCaptureTests.test_missing_rays) ... ok
+test_no_anatomy_or_renderer_execution_attestation (test_capture.RendererCaptureTests.test_no_anatomy_or_renderer_execution_attestation) ... ok
+test_nonfinite_offsets (test_capture.RendererCaptureTests.test_nonfinite_offsets) ... ok
+test_normal_reversal_does_not_reverse_base_chart_reference (test_capture.RendererCaptureTests.test_normal_reversal_does_not_reverse_base_chart_reference) ... ok
+test_null_ray_despite_zero_counter (test_capture.RendererCaptureTests.test_null_ray_despite_zero_counter) ... ok
+test_one_layer_is_zero_width_interval (test_capture.RendererCaptureTests.test_one_layer_is_zero_width_interval) ... ok
+test_overlarge_offsets (test_capture.RendererCaptureTests.test_overlarge_offsets) ... ok
+test_roundtrip_original_float32 (test_capture.RendererCaptureTests.test_roundtrip_original_float32) ... ok
+test_signed_zero_bits_preserved (test_capture.RendererCaptureTests.test_signed_zero_bits_preserved) ... ok
+test_unsupported_metadata (test_capture.RendererCaptureTests.test_unsupported_metadata) ... ok
+test_existing_report_never_overwritten (test_cli.CliTests.test_existing_report_never_overwritten) ... ok
+test_input_bytes_unchanged (test_cli.CliTests.test_input_bytes_unchanged) ... ok
+test_invalid_capture_does_not_create_report (test_cli.CliTests.test_invalid_capture_does_not_create_report) ... ok
+test_module_entrypoint (test_cli.CliTests.test_module_entrypoint) ... ok
+test_provenance_hashes_actual_shared_files (test_cli.CliTests.test_provenance_hashes_actual_shared_files) ... ok
+test_script_runs_from_unrelated_directory (test_cli.CliTests.test_script_runs_from_unrelated_directory) ... ok
+test_wrong_chart_reference_refused (test_cli.CliTests.test_wrong_chart_reference_refused) ... ok
+test_constant_directions_nonunit (test_slab.SlabReportTests.test_constant_directions_nonunit) ... ok
+test_endpoint_double_root (test_slab.SlabReportTests.test_endpoint_double_root) ... ok
+test_global_normal_reversal_is_only_depth_sign (test_slab.SlabReportTests.test_global_normal_reversal_is_only_depth_sign) ... ok
+test_interior_double_root (test_slab.SlabReportTests.test_interior_double_root) ... ok
+test_interior_failure_missed_by_endpoints (test_slab.SlabReportTests.test_interior_failure_missed_by_endpoints) ... ok
+test_invalid_base_refused (test_slab.SlabReportTests.test_invalid_base_refused) ... ok
+test_local_pass_never_certifies_global_or_anatomy (test_slab.SlabReportTests.test_local_pass_never_certifies_global_or_anatomy) ... ok
+test_nonfinite_input_refused (test_slab.SlabReportTests.test_nonfinite_input_refused) ... ok
+test_unsupported_normalization_contract_refused (test_slab.SlabReportTests.test_unsupported_normalization_contract_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 34 tests in 0.765s
+
+OK

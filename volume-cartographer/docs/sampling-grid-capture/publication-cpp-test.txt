@@ -1,0 +1,1 @@
+Capture selftests passed: dimensions, coverage, band seams/order, duplicate rows, bounds, offsets, invalid preservation, stream failure
