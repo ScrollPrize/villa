@@ -128,6 +128,27 @@ def test_presence_sampling_linear_detached_and_zero_never_chosen(monkeypatch):
     assert embeddings.grad is not None and torch.isfinite(embeddings.grad).all()
 
 
+@pytest.mark.parametrize("stream_index", [0, 1, 127])
+def test_loader_seed_fits_torch_and_preserves_deterministic_pairs(stream_index):
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import _stable_seed
+    seed = _stable_seed(0, stream_index, "embedding")
+    assert seed > 2**64 - 1  # Exercise the production failure, not a small test seed.
+    batch = pair_batch(pairs=128)
+    original_geometry = batch.embedding_geometry[0]
+    source = torch.arange(48, dtype=torch.float32).reshape(1, 4, 2, 2, 3) / 48
+    presence = torch.full((1, 1, 2, 2, 3), 0.5)
+    results = []
+    for candidate in (seed, seed, seed % (2**63 - 1)):
+        batch.embedding_geometry = (replace(original_geometry, seed=candidate),)
+        embeddings = source.clone().requires_grad_()
+        stats = embedding_statistics(embeddings, presence, batch)
+        (stats[0] / stats[1] + stats[2] / stats[3]).backward()
+        results.append((torch.stack(stats).detach(), embeddings.grad))
+    for actual in results[1:]:
+        for value, expected in zip(actual, results[0]):
+            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+
 def test_zero_negative_support_retains_positive_term():
     embedding = torch.randn(1, 4, 2, 2, 3, requires_grad=True)
     batch = pair_batch(pairs=128)

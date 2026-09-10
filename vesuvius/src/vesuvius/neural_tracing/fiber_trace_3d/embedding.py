@@ -216,7 +216,9 @@ def embedding_statistics(embeddings, presence, batch):
     for i, geometry in enumerate(batch.embedding_geometry):
         if geometry is None or tuple(geometry.eligible.shape) != tuple(embeddings.shape[-3:]):
             raise ValueError("missing or mismatched embedding output-grid geometry")
-        rng = torch.Generator(device=embeddings.device).manual_seed(geometry.seed)
+        # Loader stream seeds are 128-bit hashes; PyTorch accepts 64-bit seeds.
+        # Match the existing value-augmentation seed conversion.
+        rng = torch.Generator(device=embeddings.device).manual_seed(geometry.seed % (2**63 - 1))
         half = geometry.pairs // 2
         offset, count = int(batch.target_segment_offsets[i]), int(batch.target_segment_counts[i])
         starts = batch.target_segment_starts_zyx[offset:offset + count].float() / geometry.stride
