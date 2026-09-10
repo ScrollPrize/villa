@@ -490,6 +490,8 @@ def main():
         help="exact sample count represented by one optimizer update",
     )
     parser.add_argument("--steps", type=int, default=120)
+    parser.add_argument("--bounded-accumulation", action="store_true",
+                        help="use memory-bounded component VJPs instead of retaining microbatch graphs")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--learning-rate-warmup-steps", type=int, default=0)
@@ -658,6 +660,7 @@ def main():
         else int(args.optimizer_global_batch_size)
     )
     training["optimizer_global_batch_size"] = optimizer_global_batch_size
+    training["bounded_gradient_accumulation"] = bool(args.bounded_accumulation)
     effective_steps = (
         int(args.lr_range_warmup_steps) + int(args.lr_range_steps)
         if lr_range_enabled

@@ -632,6 +632,23 @@ TEST_CASE("Delta3D cache mode permits sources without persistent caching")
           vc::render::PersistentCacheLayout::Legacy);
 }
 
+TEST_CASE("ChunkCacheService can initialize bounded physical worker pools")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.fetchConcurrency.workerCapacity = 1;
+    options.probeWorkerCapacity = 1;
+    options.decodeWorkerCapacity = 1;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    CHECK(service->fetchConcurrency().workerCapacity == 1);
+    CHECK(service->probeWorkerCapacity() == 1);
+    CHECK(service->decodeWorkerCapacity() == 1);
+    CHECK(service->decodeConcurrency() == 1);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    CHECK(makeServiceCache(service, "bounded-workers", fetcher));
+    options.decodeWorkerCapacity = 0;
+    CHECK_THROWS_AS(ChunkCacheService(options), std::invalid_argument);
+}
+
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
 {
     const ChunkCacheService::AdaptiveDownloadState initial{

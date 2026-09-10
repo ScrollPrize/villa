@@ -1,8 +1,8 @@
-# Request concurrency status
+# Manager integration status
 
-- [x] Inspect fast loader and capacities.
-- [x] Independent review.
-- [x] Shared snapshot and profile time series implemented.
-- [ ] Live time series — paused by user.
-- [ ] Instrumented short profile — paused by user, not run.
-- [ ] Findings/specs/docs/changelog.
+- [x] Pause queue work; checkpoint current code/results in three commits.
+- [ ] Resolve/review merge preserving sample progress and manager functionality.
+- [ ] Independent integration plan review.
+- [ ] Reusable exclusive launcher and tracing entrypoints.
+- [ ] Synthetic lifecycle and merge regression tests.
+- [ ] Merge/integration commits and docs/log.

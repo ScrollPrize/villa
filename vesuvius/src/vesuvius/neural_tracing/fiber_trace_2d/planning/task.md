@@ -1,3 +1,3 @@
-# Task: request concurrency visibility
+# Task: GPU-manager integration for parallel tracing
 
-Confirm the fast loader is used. Track outstanding trace requests, requested chunks, queued tiles and in-flight reads/GPU work over time. Explain why100+ independent traces do not imply100+ active reads. Preserve scheduling and capacities while measuring.
+Pause queue/profiling work and commit current changes. Merge fiber-training-manager into fiber-training-retrain, preserving both sides. Parallel live evaluation must request exclusive GPUs with high explicit priority, allowing cooperative training to pause and resume after evaluation.

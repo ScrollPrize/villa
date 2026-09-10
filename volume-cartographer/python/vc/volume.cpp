@@ -1643,6 +1643,21 @@ NB_MODULE(volume, m)
     m.def("global_cache_root", [] { return vc::core::util::globalCacheRoot().string(); },
           "Resolve the shared VC3D cache root without creating it.");
 
+    m.def("initialize_chunk_cache",
+          [](std::size_t bytes, std::size_t fetchWorkers,
+             std::size_t probeWorkers, std::size_t decodeWorkers) {
+              if (!bytes || !fetchWorkers || !probeWorkers || !decodeWorkers)
+                  throw std::invalid_argument("cache budget and worker capacities must be positive");
+              vc::render::ChunkCacheService::Options options;
+              options.decodedByteCapacity = bytes;
+              options.fetchConcurrency = {fetchWorkers, fetchWorkers, false};
+              options.probeWorkerCapacity = probeWorkers;
+              options.decodeWorkerCapacity = decodeWorkers;
+              vc::render::configureProcessChunkCacheService(std::move(options));
+          },
+          "bytes"_a, "fetch_workers"_a, "probe_workers"_a, "decode_workers"_a,
+          "Initialize bounded physical cache pools before opening volumes; repeated calls must retain capacities.");
+
     m.def("set_chunk_cache_budget",
           [](std::size_t bytes) {
               if (bytes == 0)

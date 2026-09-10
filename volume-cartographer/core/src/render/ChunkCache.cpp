@@ -38,8 +38,6 @@ namespace vc::render {
 namespace {
 
 constexpr std::size_t kPersistentWriteBacklogBytes = 1024ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kPersistentProbeWorkers = 32;
-constexpr std::size_t kDecodeWorkers = 8;
 constexpr int kTerminalLevelPriorityBonus = 100;
 constexpr std::string_view kDelta3dCacheMarkerName = ".vc_delta3d_cache";
 constexpr std::string_view kDelta3dCacheMarkerContents = "D3D1\n";
@@ -645,11 +643,19 @@ struct ChunkCacheService::Impl {
         , initialAdaptiveDownloadState(
               std::move(options.initialAdaptiveDownloadState))
         , persistentCacheEncoding(options.persistentCacheEncoding)
+        , probeScheduler(std::make_shared<ChunkRequestScheduler>(
+              options.probeWorkerCapacity, 7, schedulerSelectionGate))
+        , decodeScheduler(std::make_shared<ChunkRequestScheduler>(
+              options.decodeWorkerCapacity, 7, schedulerSelectionGate))
+        , activeDecodeWorkers(options.decodeWorkerCapacity)
         , activeFetchWorkers(options.fetchConcurrency.maxConcurrentReads)
         , activeFetchAdaptive(options.fetchConcurrency.adaptive)
     {
         const std::size_t workerCapacity =
             options.fetchConcurrency.workerCapacity;
+        if (!options.probeWorkerCapacity || !options.decodeWorkerCapacity) {
+            throw std::invalid_argument("ChunkCacheService probe/decode worker capacities must be positive");
+        }
         if (workerCapacity == 0 || activeFetchWorkers == 0 ||
             activeFetchWorkers > workerCapacity) {
             throw std::invalid_argument(
@@ -699,13 +705,9 @@ struct ChunkCacheService::Impl {
         std::make_shared<std::atomic<std::uint64_t>>(1);
     std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate =
         std::make_shared<ChunkRequestSelectionGate>();
-    std::shared_ptr<ChunkRequestScheduler> probeScheduler =
-        std::make_shared<ChunkRequestScheduler>(
-            kPersistentProbeWorkers, 7, schedulerSelectionGate);
-    std::shared_ptr<ChunkRequestScheduler> decodeScheduler =
-        std::make_shared<ChunkRequestScheduler>(
-            kDecodeWorkers, 7, schedulerSelectionGate);
-    std::size_t activeDecodeWorkers = kDecodeWorkers;
+    std::shared_ptr<ChunkRequestScheduler> probeScheduler;
+    std::shared_ptr<ChunkRequestScheduler> decodeScheduler;
+    std::size_t activeDecodeWorkers;
     std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
     std::size_t activeFetchWorkers = 0;
     bool activeFetchAdaptive = false;
@@ -794,6 +796,11 @@ std::shared_ptr<ChunkCacheService> configureProcessChunkCacheService(
     }
 
     const auto current = registry.service->fetchConcurrency();
+    if (options.probeWorkerCapacity != registry.service->probeWorkerCapacity() ||
+        options.decodeWorkerCapacity != registry.service->decodeWorkerCapacity()) {
+        throw std::invalid_argument(
+            "process ChunkCacheService probe/decode capacity is fixed after creation");
+    }
     if (options.persistentCacheEncoding !=
         registry.service->persistentCacheEncoding()) {
         throw std::invalid_argument(
@@ -1014,6 +1021,16 @@ std::size_t ChunkCacheService::decodeConcurrency() const
 {
     std::lock_guard lock(impl_->mutex);
     return impl_->activeDecodeWorkers;
+}
+
+std::size_t ChunkCacheService::probeWorkerCapacity() const
+{
+    return impl_->probeScheduler->workerCapacity();
+}
+
+std::size_t ChunkCacheService::decodeWorkerCapacity() const
+{
+    return impl_->decodeScheduler->workerCapacity();
 }
 
 PersistentCacheEncoding

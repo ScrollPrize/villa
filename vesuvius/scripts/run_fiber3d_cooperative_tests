@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if (( $# != 0 )); then
+    echo "Edit fiber3d_cooperative_tests.json; this launcher takes no arguments." >&2
+    exit 2
+fi
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec /home/hendrik/.venv_las/bin/python "${script_dir}/fiber3d_cooperative_test_runner.py"

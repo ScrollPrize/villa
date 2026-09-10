@@ -82,7 +82,10 @@ class TrainingProfile:
         scope = torch.profiler.record_function(name) if self.profiler else nullcontext()
         with scope:
             yield
-        self.row[name + "_wall_ms"] = (time.perf_counter() - start) * 1000
+        key = name + "_wall_ms"
+        # Accumulated updates enter each stage once per microbatch. Keep the
+        # whole update, not only the final microbatch's measurement.
+        self.row[key] = self.row.get(key, 0.0) + (time.perf_counter() - start) * 1000
 
     def end(self, **timings):
         if not self.enabled:

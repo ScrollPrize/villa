@@ -1,0 +1,252 @@
+"""Join the shared CPU broker to a replaceable GPU worker cohort.
+
+Internal integration adapter; the manager server remains framework-independent.
+CPU batches backed by shared slots cross the internal multiprocessing queues. Volume slot
+ownership stays with the broker until a complete optimizer update is reported.
+"""
+
+import multiprocessing as mp
+from contextlib import ExitStack
+import os
+from pathlib import Path
+import queue
+import tempfile
+import time
+
+from .cooperative_resources import EffectiveBatchSampleIndex
+from .cooperative_worker import FiberWorkerFactory
+from vesuvius.neural_tracing.ordered_sample_pipeline import native_thread_environment
+
+
+class FiberCohort:
+    def __init__(self, *, config_path, grant, state, broker, calibration,
+                 queue_depth=2, writer_factory=None, resume_checkpoint=None,
+                 drain_timeout=300.0, training_overrides=None, calibration_observations=()):
+        from villa_gpu_manager.cohort import ProcessCohort
+        if type(queue_depth) is not int or queue_depth < 1:
+            raise ValueError("GPU input queue depth must be positive")
+        self.broker = broker
+        self.grant = grant
+        self._draining = False
+        self._queues_closed = False
+        self._sent, self._drained = [], []
+        self._pending = {}
+        if drain_timeout <= 0:
+            raise ValueError("CPU drain timeout must be positive")
+        self._drain_timeout = float(drain_timeout)
+        self._drain_started = None
+        self._publication_errors = queue.SimpleQueue()
+        self._memory_monitor = None
+        self.gpu = None
+        self._authorized_at = None
+        self._gpu_pids = set()
+        self._temp = tempfile.TemporaryDirectory(prefix="fiber-cohort-")
+        context = mp.get_context("spawn")
+        devices = sorted(grant["gpus"])
+        sizes = tuple(calibration.microbatch_for(grant["gpus"][gpu]) for gpu in devices)
+        if not sizes or min(sizes) < 1:
+            self._temp.cleanup()
+            raise ValueError("grant cannot fit a calibrated microbatch")
+        self._queues, self._received, self._maps = [], [], []
+        self._ordinals = [0] * len(sizes)
+        self._samples = [0] * len(sizes)
+        start_step = broker.frontier // broker.effective_batch_size
+        try:
+            for rank in range(len(sizes)):
+                self._queues.append(context.Queue(maxsize=queue_depth))
+                # Queue.put returns before the feeder serializes the batch.
+                # Surface its actual exception instead of treating admission
+                # as successful delivery and waiting forever during release.
+                self._queues[-1]._on_queue_feeder_error = self._publication_failed
+                self._received.append(context.Value("q", 0))
+                self._sent.append(0)
+                self._drained.append(0)
+                self._maps.append(EffectiveBatchSampleIndex(broker.effective_batch_size, sizes, rank, start_step))
+            factory = FiberWorkerFactory(
+                str(config_path), sizes, tuple(self._queues), tuple(self._received), os.getpid(),
+                (Path(self._temp.name) / "rendezvous").as_uri(), start_step, broker.effective_batch_size,
+                writer_factory=writer_factory, resume_checkpoint=resume_checkpoint,
+                training_overrides=training_overrides,
+                reserve_bytes=calibration.reserve_bytes,
+                calibrated_gpu_names=tuple(sorted({row["gpu_name"] for row in calibration_observations})),
+                calibrated_torch_versions=tuple(sorted({row["torch_version"] for row in calibration_observations})),
+                calibrated_cuda_versions=tuple(sorted({row["cuda_version"] for row in calibration_observations})),
+            )
+            self.gpu = ProcessCohort(factory, grant, state, environment=native_thread_environment(),
+                                     on_unit=self._completed_unit)
+            self._gpu_pids = {row["pid"] for row in self.gpu.processes}
+            if calibration_observations:
+                from villa_gpu_manager.processes import NvidiaMonitor
+                self._memory_monitor = NvidiaMonitor(grant, 0, interval=1)
+        except BaseException:
+            # The supervisor cannot own a constructor that never returned.
+            # Reap even gated children before discarding their IPC resources.
+            with ExitStack() as cleanup:
+                cleanup.callback(self._temp.cleanup)
+                cleanup.callback(self._close_queues, abort=True)
+                if self._memory_monitor is not None:
+                    cleanup.callback(self._memory_monitor.close)
+                if self.gpu is not None:
+                    cleanup.callback(self.gpu.abort)
+            raise
+
+    def _completed_unit(self, rows):
+        if not rows or any(row != rows[0] for row in rows[1:]):
+            raise RuntimeError("GPU ranks disagree about completed training progress")
+        step = rows[0]["step"]
+        frontier = self.broker.frontier // self.broker.effective_batch_size
+        if step != frontier:
+            self.broker.commit(step)
+        elif rows[0].get("phase") not in ("test", "update"):
+            raise RuntimeError("invalid repeated training boundary")
+        return rows[0]["done"]
+
+    @property
+    def authorized(self):
+        return self.gpu.authorized
+
+    @property
+    def ready(self):
+        return self.gpu.ready
+
+    @property
+    def idle(self):
+        return self.gpu.idle
+
+    @property
+    def done(self):
+        return self.gpu.done
+
+    @property
+    def state(self):
+        return self.gpu.state
+
+    @property
+    def processes(self):
+        from villa_gpu_manager.processes import process_identity
+        return self.gpu.processes + [process_identity(p.pid) for p in self.broker.pipeline.processes if p.is_alive()]
+
+    @property
+    def closed(self):
+        return self.gpu.closed and self._queues_closed and (
+            self.broker.pipeline.closed or self.broker.workers_within_limit())
+
+    def authorize(self):
+        # GPU-host work is mostly launch/IO; reserve one core per GPU where
+        # possible, leaving at least one actual loading/augmentation worker.
+        budget = max(1, self.grant["cpu_cores"] - len(self._queues))
+        self.broker.set_worker_limit(min(budget, self.broker.pipeline.shared_workers))
+        self._authorized_at = time.monotonic()
+        self.gpu.authorize()
+
+    def start_unit(self):
+        self.gpu.start_unit()
+
+    def drain(self):
+        self._draining = True
+        self.gpu.drain()
+        # Do NOT park loaders yet: a running unit may still need its CPU inputs.
+
+    def poll(self):
+        self._check_publication()
+        self.broker.poll()
+        self.gpu.poll()
+        if self.gpu.closed:
+            if self._memory_monitor is not None:
+                self._memory_monitor.close()
+            if self._drain_started is None:
+                self._drain_started = time.monotonic()
+            self.broker.set_worker_limit(0)
+            self._drain_queues()
+            if not self.closed and time.monotonic() - self._drain_started > self._drain_timeout:
+                raise RuntimeError("CPU input queues/workers failed to drain after GPU cohort joined")
+            if self._queues_closed:
+                self._temp.cleanup()
+            return
+        if not self.authorized:
+            return
+        self._check_driver_memory()
+        for rank, mapping in enumerate(self._maps):
+            if not mapping.batch_sizes:
+                continue
+            take = mapping.batch_sizes[self._ordinals[rank] % len(mapping.batch_sizes)]
+            indices = tuple(mapping(self._samples[rank] + i) for i in range(take))
+            if indices[-1] >= self.broker.pipeline.end_index:
+                continue
+            if self._draining and indices[0] >= self.broker.frontier + self.broker.effective_batch_size:
+                continue
+            batch = self._pending.get(rank)
+            if batch is None:
+                batch = self.broker.batch(indices)
+            if batch is None:
+                continue
+            try:
+                self._queues[rank].put_nowait(batch)
+            except queue.Full:
+                self._pending[rank] = batch
+                continue
+            self._pending.pop(rank, None)
+            self._ordinals[rank] += 1
+            self._samples[rank] += take
+            self._sent[rank] += 1
+
+    def _publication_failed(self, error, _item):
+        self._publication_errors.put(f"{type(error).__name__}: {error}")
+
+    def _check_driver_memory(self):
+        monitor = self._memory_monitor
+        if monitor is None:
+            return
+        monitor.poll(self._gpu_pids)
+        if time.monotonic() - (monitor.last_snapshot_at or self._authorized_at) > 20:
+            raise RuntimeError("cannot verify task VRAM usage from the driver")
+        if monitor.last_snapshot is None:
+            return
+        for gpu, budget in self.grant["gpus"].items():
+            if gpu not in monitor.last_snapshot:
+                raise RuntimeError(f"allocated GPU {gpu} disappeared from driver inventory")
+            used = sum(size for pid, size in monitor.last_snapshot[gpu]["processes"].items()
+                       if pid in self._gpu_pids)
+            if used > budget:
+                raise RuntimeError(f"task exceeded VRAM grant on {gpu}: {used} > {budget} bytes")
+
+    def _check_publication(self):
+        try:
+            error = self._publication_errors.get_nowait()
+        except queue.Empty:
+            return
+        raise RuntimeError(f"CPU batch queue publication failed: {error}")
+
+    def _drain_queues(self):
+        if self._queues_closed:
+            return
+        for rank, batches in enumerate(self._queues):
+            remaining = self._sent[rank] - self._received[rank].value - self._drained[rank]
+            for _ in range(remaining):
+                try:
+                    batches.get_nowait()
+                except queue.Empty:
+                    break
+                self._drained[rank] += 1
+        if all(self._sent[i] == self._received[i].value + self._drained[i] for i in range(len(self._queues))):
+            self._close_queues()
+
+    def _close_queues(self, *, abort=False):
+        if self._queues_closed:
+            return
+        for batches in self._queues:
+            if abort:
+                batches.cancel_join_thread()
+            batches.close()
+            if not abort:
+                batches.join_thread()
+        self._pending.clear()
+        self._queues_closed = True
+
+    def abort(self):
+        self.gpu.abort()
+        if self._memory_monitor is not None:
+            self._memory_monitor.close()
+        self.broker.close()
+        self._close_queues(abort=True)
+        self._temp.cleanup()
