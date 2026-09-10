@@ -1275,7 +1275,8 @@
         ],
         "paramRenames": {
           "atlasPath": "atlas_path",
-          "configPath": "config_path"
+          "configPath": "config_path",
+          "initShellDir": "init_shell_dir"
         },
         "tool": "vc3d_lasagna_start_optimization"
       },
@@ -1285,6 +1286,9 @@
             "type": "string"
           },
           "configPath": {
+            "type": "string"
+          },
+          "initShellDir": {
             "type": "string"
           },
           "mode": {

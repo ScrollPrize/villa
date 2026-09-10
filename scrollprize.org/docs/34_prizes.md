@@ -23,12 +23,12 @@ prizes:
         amount: 50000
       - name: "4th"
         amount: 50000
-  - id: first-letters
+  - id: first-letters-2027
     title: "First Letters"
     amount: 500000
     cadence: "Max 10 scrolls · Deadline June 25th, 2027"
     href: "/prizes#first-letters-prizes"
-    hook: "$50,000 per scroll across the 2027 Grand Prize volumes: uncover 10 letters within a single 4 cm² area."
+    hook: "$50,000 per scroll across the eligible unread scroll volumes: uncover 10 letters within a single 4 cm² area."
   - id: first-title
     title: "PHerc. Paris 4's Title"
     amount: 50000
@@ -144,7 +144,7 @@ If you have a qualifying result, submit it for consideration by sending an email
   * Please create a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * Attach your code/video directly to the email, or include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate that the text is not hallucinated — for example by finding plausible text on held-out regions.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
@@ -197,7 +197,11 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 These prizes bridge ink detection on fragments to the much harder problem of reading intact scrolls: we want to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+
+Note the eligible set here is larger than the [2027 Grand Prize](#2027-grand-prize) set: it includes every Grand Prize volume plus several additional scrolls where no text has been read yet.
+
+<EligibleVolumes prize="first-letters-2027" />
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -216,7 +220,7 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate that the text is not hallucinated — for example by finding different, plausible letters on a held-out region.
   * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
@@ -228,9 +232,11 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 <details>
 <summary>How to get started</summary>
 
-Here's one way in. This is a suggested path, not a requirement — anything that produces a qualifying image counts.
+**Start here: [From CT Scan to Ancient Text: A First Letters Prize Workflow](https://scrollprize.substack.com/p/from-ct-scan-to-ancient-text-a-first)** — our step-by-step guide to going from a scroll's CT scan to an ink prediction.
 
-1. **Pick a scroll** from the [eligible list](#2027-grand-prize).
+The short version is below. This is a suggested path, not a requirement — anything that produces a qualifying image counts.
+
+1. **Pick a scroll** from the eligible volume list above.
 2. **Open it in VC3D** from the built-in open data catalog, and **grow a segment** on the scroll's recto surface prediction with `Create Segment (GrowPatch)`, refining it by hand where the automatic growth goes wrong. See the [VC3D unwrapping tutorial](/tutorial_VC3D) for opening the catalog and growing patches, and the [segmentation tutorial](/segmentation) for more on growing and manually refining meshes.
 3. **Render** the flattened segment and **run ink detection** on it, following the [ink detection tutorial](/tutorial5).
 4. **Repeat** on other regions (and other scrolls) until you find 10 legible letters within a single 4 cm² area.
@@ -275,7 +281,7 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate the letters and words are not hallucinated — for example by validating on a held-out region with known ground-truth.
   * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.

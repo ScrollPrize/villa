@@ -22,6 +22,7 @@
 
 class CChunkedVolumeViewer;
 class PlaneSurface;
+class QColor;
 class QuadSurface;
 class QWidget;
 
@@ -111,6 +112,9 @@ struct GeneratedOverlay {
         double distance = std::numeric_limits<double>::quiet_NaN();
         bool projectedBranchLink = false;
         bool pendingBranchLink = false;
+        // Set with projectedBranchLink when the local and linked fibers share
+        // an H/V classification (the orange warning palette).
+        bool sameHvBranchLink = false;
         bool isLinkCandidateFiber = false;
         std::optional<cv::Vec3f> connectorStart;
     };
@@ -1419,6 +1423,12 @@ struct GeneratedLinkCandidateMenuState {
     QString label;
 };
 
+// The link-state palette shared by linked control points, their connector
+// lines and the linked fiber's projected X marker: purple approved, blue
+// pending, orange same-H/V approved, light orange same-H/V pending.
+// Defined in the .cpp: this header is also compiled into QtCore-only tests.
+[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
+
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;
@@ -1441,8 +1451,14 @@ struct GeneratedControlPointContextMenuOptions {
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
+    // Shown only while a link candidate is designated (empty label = hidden).
+    QString newLinkedToCandidateLabel;
+    // Fiber file stem for menu labels, resolved when the menu opens.
+    std::function<QString(uint64_t)> fiberDisplayNameForId;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
-    std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
+    // (clicked volume point, link direction): start a new fiber seeded at the
+    // click whose seed control point is linked to the designated candidate.
+    std::function<void(cv::Vec3f, cv::Vec3f)> newLineAnnotationLinkedToCandidate;
     std::function<void(uint64_t, int)> openBranch;
     std::function<void(size_t, uint64_t, int)> unlinkBranch;
     // (controlIndex, linkedFiberId, linkedControlPointIndex, newPendingState)

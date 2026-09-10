@@ -96,8 +96,7 @@ std::shared_ptr<Volume> openRegularVolumeForGroup(
             ? group.remoteAuth
             : vc::HttpAuth{};
         return Volume::NewFromUrl(
-            location, group.remoteCacheRoot, auth, {},
-            group.discoverAwsCredentials);
+            location, auth, {}, group.discoverAwsCredentials);
     }
     return Volume::New(std::filesystem::path(location));
 }
