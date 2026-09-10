@@ -66,6 +66,9 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+# Final-ray capture is dependency-free; its test needs no vc_core/Qt linkage.
+vc_add_test(NAME test_sampling_grid_capture LIBS doctest::doctest)
+
 vc_add_test(NAME test_surface_area_units)
 
 vc_add_test(NAME test_voxel_size_metadata)

@@ -1,0 +1,52 @@
+{
+  "publication_base": "777cb16cf9208b35897b231843174f2440d9f1f1",
+  "full_renderer_tested_base": "18a2eb10470f06487d8fe2168830c219d19d9cae",
+  "source_selection": "The 17 prepared files, rebased without changing capture/diagnostic algorithms.",
+  "renderer_capture_hunks_reverse_to_current_upstream_exactly": true,
+  "cmake_only_adds_test_registration_to_current_upstream": true,
+  "normalized_empty_test_initializer": true,
+  "files_different_from_original_source_package": {
+    "volume-cartographer/scripts/vc_sampling_audit/tests/__init__.py": {
+      "frozen_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "published_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "volume-cartographer/apps/src/vc_render_tifxyz.cpp": {
+      "frozen_sha256": "4952964720889590ed04f351bddfcdad51db1b20bedc70b801346aac65b5e65a",
+      "published_sha256": "6e1a54cccb48eb15ac1d3ebc2a8f13a81473dd80884aaf05394d2766e4ce8782"
+    },
+    "volume-cartographer/core/test/CMakeLists.txt": {
+      "frozen_sha256": "a1180b6be00541d1ade7c87e55d70a8c056baa5b484a0c99caa089741016cf98",
+      "published_sha256": "3876bbfdff84feb0a1577ad5a12d4043f0d8a6ea02d9716676fd10e24069958a"
+    }
+  },
+  "publication_source_sha256": {
+    "volume-cartographer/apps/src/SamplingGridCapture.hpp": "7564b696e17cec3bacd15bac548e875aaa5b1727a5c02da099f45e83daa456d7",
+    "volume-cartographer/apps/src/vc_render_tifxyz.cpp": "6e1a54cccb48eb15ac1d3ebc2a8f13a81473dd80884aaf05394d2766e4ce8782",
+    "volume-cartographer/core/test/CMakeLists.txt": "3876bbfdff84feb0a1577ad5a12d4043f0d8a6ea02d9716676fd10e24069958a",
+    "volume-cartographer/core/test/test_sampling_grid_capture.cpp": "cfa7b31fad1ad33fd466890413c69a5561b7e08af3a881b71c2a10f66b7b9d72",
+    "volume-cartographer/scripts/vc_sampling_audit/README.md": "ddab9233b4b0634efdc5bcdd78c1f21fabe7842ed923cd204d9ebc57dc78a74f",
+    "volume-cartographer/scripts/vc_sampling_audit/__init__.py": "3c422d6829e0481d1353ea827c24e4c551d5ddbfbab239170eb4e3fc05d65404",
+    "volume-cartographer/scripts/vc_sampling_audit/__main__.py": "3129adff95e0f38b87ab34cddfc27082c7892bcaec267ff5d40f160fdf55b44a",
+    "volume-cartographer/scripts/vc_sampling_audit/capture.py": "b4cc27c97ecd79184513b025ff014dbb9b838e012afd066ab80f5bcc0ed43ec8",
+    "volume-cartographer/scripts/vc_sampling_audit/cli.py": "051f356788a9deb0b320a3bd58c7b75e7536cd5fd069581a0720edb206d035a4",
+    "volume-cartographer/scripts/vc_sampling_audit/geometry.py": "79b5d5f8059e71ab9c06f5a5a2e21865b76da2476ef4bb6072bcc15d341e8c32",
+    "volume-cartographer/scripts/vc_sampling_audit/provenance.py": "97e6fc6512daba4697e8d40b36c1f9b964ece4748e6e3b219e5ac66a7ef0e246",
+    "volume-cartographer/scripts/vc_sampling_audit/slab.py": "df834ee91d16c7c45cf8a81d8a7e515c0d16866a89511955abcdf9906cc63484",
+    "volume-cartographer/scripts/vc_sampling_audit/tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "volume-cartographer/scripts/vc_sampling_audit/tests/test_capture.py": "20f781037c18134770a30d9f0cd0a13297f355da4fad3692113ff2359af46ff4",
+    "volume-cartographer/scripts/vc_sampling_audit/tests/test_cli.py": "58679b82e63442eb47e3b20699e0bc52584da749bb99a9b3fba2a2d4c22d8e9a",
+    "volume-cartographer/scripts/vc_sampling_audit/tests/test_slab.py": "22fb0b241accc05f46543d45fb3dfab56891e96a5b7145077913a42a5f4f5f10",
+    "volume-cartographer/scripts/vc_sampling_grid_audit.py": "eeb9111792df781f2eabc9157602a6f0e523c71123c8628d5eca2a952e94e089"
+  },
+  "python_tests_passed": 34,
+  "publication_python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "cpp_component_test": "PASS_APPLE_CLANG_CXX17_O2_WALL_WEXTRA_WERROR_PEDANTIC",
+  "full_renderer_on_publication_base": "NOT_RUN",
+  "registered_CTest_on_publication_base": "NOT_RUN",
+  "CT_replay_on_publication_base": "NOT_RUN",
+  "upstream_CI": "NOT_RUN",
+  "personal_review": "NOT_ATTESTED",
+  "human_written_commentary": "PENDING",
+  "AI_assistance_disclosed": true,
+  "ink_or_letters_recovered": 0
+}
