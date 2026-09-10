@@ -48,7 +48,7 @@ set_paused may omit the token; the kernel-authenticated UID must have permission
 | Operation | Additional body fields | Result |
 | --- | --- | --- |
 | hello | versions: integer array; required_capabilities: string array | capabilities, inventory, peer_uid |
-| register | task_id, token, label, root, request, reconfigure_mode:"full_release" | task, token |
+| register | task_id, token, label, root, request, reconfigure_mode:"full_release"; optional pausable, adaptable (default true) | task, token |
 | poll | last_generation: integer | task |
 | set_request | request (complete replacement), expected_request_revision | task |
 | report | generation, phase, held, processes, detail | task |
@@ -111,6 +111,46 @@ automatic/exclusive policy but never unpause a task. An incompatible request or
 pause clears the split atomically. Exclusive demand reserves the whole pool;
 nonexclusive tasks first get one feasible minimum share, distinct GPUs preferred,
 then priority-ordered VRAM/GPU growth. Impossible minima wait rather than overcommit.
+
+## Authorized scheduling amendment (2026-09-10)
+
+The user explicitly authorized this amendment after the initial v1 lock.
+`task_scheduling` in hello capabilities identifies the amended semantics; the
+reference client requires it and fails closed against older servers. Upgrade
+client/server together: older strict response validators may reject new task
+fields. Omitted registration flags and older journal tasks default to true.
+No further protocol changes are authorized by this amendment.
+
+- Immutable boolean `pausable` and `adaptable` flags are returned in task state.
+  Non-pausable requires non-adaptable: full-release resizing necessarily pauses.
+- Non-pausable grants are protected from initialization onwards, including server
+  restart and graceful drain. Owner self-pause/release, failure recovery and
+  verified process-tree death can release them. Controller pause of a live
+  non-pausable task fails with `not_pausable`; pausing its startup is permitted.
+- Non-adaptable tasks retain their first exact CPU/GPU/VRAM allocation across
+  pauses, including GPU UUIDs. Incompatible request changes/overrides are rejected.
+  Overrides cannot revoke non-pausable live grants. Release before changing the
+  request's exclusivity. Explicit owner self-pause permits finishing/cancelling.
+- All candidates use descending explicit priority, then FIFO registration order.
+  Exclusivity has no priority bonus. Exclusive requests wait behind admitted
+  higher-priority ordinary work. A higher-priority exclusive pauses lower-priority
+  work only when non-pausable blockers are absent. While blocked, other pausable
+  work continues, but new lower-priority non-pausable jobs cannot prolong blockage.
+- Both entering and leaving exclusivity wait for outgoing release acknowledgements,
+  even if unused capacity exists. Manual splits retain policy precedence subject
+  to capability constraints.
+- Waiting reasons are refreshed on reconciliation:
+  `blocked_by_nonpausable_task:<comma-separated-task-UUIDs>`,
+  `blocked_by_higher_priority_task:<comma-separated-task-UUIDs>`,
+  `waiting_for_higher_priority_exclusive`, `insufficient_resources`,
+  `waiting_for_release`, `waiting_for_resources`, `inventory_unavailable`, `paused`.
+  Polling automatically observes admission after blockers leave.
+
+Non-pausable clients can keep working under their existing grant on server loss;
+reconnect/register/poll preserves its generation and phase. Never initialize a
+duplicate workload on reconnect or interpret disconnection as release. The
+reference `Supervisor` remains fully pausable/adaptable (as used by Fiber).
+Non-pausable workflows use the low-level `Client`.
 
 ## Retries, recovery and bounds
 

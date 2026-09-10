@@ -56,15 +56,31 @@ def fits(allocations, inventory):
                     for g, size in inventory["gpus"].items()))
 
 
-def targets(tasks, inventory, override=None):
+def targets(tasks, inventory, override=None, reasons=None):
+    reasons = {} if reasons is None else reasons
     result = {key: empty() for key in tasks}
     active = [key for key, t in tasks.items() if not t["terminal"] and not any(t["paused"].values())]
     active.sort(key=lambda key: (-tasks[key]["request"]["priority"], tasks[key]["order"]))
+    pinned = {key for key in active if not tasks[key].get("pausable", True)
+              and tasks[key]["granted"] != empty()}
+    for key in pinned:
+        result[key] = tasks[key]["granted"]
     if override is not None:
+        result = {key: empty() for key in tasks}
         for key, allocation in override["allocations"].items():
             require(key in active or allocation == empty(), "override conflicts with inactive task")
             validate_allocation(allocation, tasks[key]["request"], inventory)
             result[key] = allocation
+        for key in active:
+            require(key not in pinned or result[key] == tasks[key]["granted"],
+                    "override would change non-pausable allocation")
+            require(tasks[key].get("pausable", True) or not tasks[key]["request"]["exclusive"]
+                    or result[key] == empty()
+                    or all(a == empty() for k, a in result.items() if k != key),
+                    "override would share non-pausable exclusive allocation")
+            fixed = tasks[key].get("fixed_allocation")
+            require(not fixed or result[key] in (empty(), fixed),
+                    "override would resize non-adaptable allocation")
         require(fits(list(result.values()), inventory), "override overcommits inventory")
         return result
 
@@ -83,26 +99,53 @@ def targets(tasks, inventory, override=None):
             return True
         return False
 
-    exclusive = [key for key in active if tasks[key]["request"]["exclusive"]]
-    if exclusive:
-        # Skip impossible exclusive requests, not all other useful work.
-        for key in exclusive:
-            for gpu in options(key):
-                if assign(key, gpu, tasks[key]["request"]["min_vram_bytes_per_gpu"]):
-                    active = [key]
-                    break
-            else:
+    def minimum(key):
+        fixed = tasks[key].get("fixed_allocation")
+        if fixed:
+            if fits([a for k, a in result.items() if k != key] + [fixed], inventory):
+                result[key] = fixed
+                return True
+            return False
+        return any(assign(key, gpu, tasks[key]["request"]["min_vram_bytes_per_gpu"])
+                   for gpu in options(key))
+
+    # Existing non-preemptible exclusive work owns the entire pool, including
+    # unused capacity. Neither priority nor a new registration revokes it.
+    pinned_exclusive = [key for key in pinned if tasks[key]["request"]["exclusive"]]
+    if pinned_exclusive:
+        for key in active:
+            if key not in pinned:
+                reasons[key] = "blocked_by_nonpausable_task:" + ",".join(sorted(pinned_exclusive))
+        return result
+
+    admitted = []
+    pending_exclusive = False
+    for key in active:
+        if tasks[key]["request"]["exclusive"]:
+            blockers = sorted(pinned - {key})
+            if blockers:
+                reasons[key] = "blocked_by_nonpausable_task:" + ",".join(blockers)
+                pending_exclusive = True
                 continue
-            break
-        else:
-            active = [key for key in active if key not in exclusive]
-    for key in active:
-        if result[key]["gpus"]:
-            continue
-        for gpu in options(key):
-            if assign(key, gpu, tasks[key]["request"]["min_vram_bytes_per_gpu"]):
+            if admitted:
+                reasons[key] = "blocked_by_higher_priority_task:" + ",".join(admitted)
+                continue
+            if minimum(key):
+                admitted = [key]
                 break
-    for key in active:
+            reasons[key] = "insufficient_resources"
+            continue
+        # Do not start new non-preemptible work behind a blocked exclusive job.
+        if pending_exclusive and key not in pinned and not tasks[key].get("pausable", True):
+            reasons[key] = "waiting_for_higher_priority_exclusive"
+            continue
+        if key in pinned or minimum(key):
+            admitted.append(key)
+        else:
+            reasons[key] = "insufficient_resources"
+    for key in admitted:
+        if key in pinned or tasks[key].get("fixed_allocation"):
+            continue
         request = tasks[key]["request"]
         if not result[key]["gpus"]:
             continue

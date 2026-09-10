@@ -173,7 +173,7 @@ def test_exclusive_waits_for_entire_pool():
     e = engine()
     a = register(e, max_gpus=1)
     settle(e, [a])
-    b = register(e, exclusive=True)
+    b = register(e, exclusive=True, priority=1)
     assert e.tasks[b["task"]["task_id"]]["phase"] == "waiting"
     settle(e, [a, b])
     assert e.tasks[a["task"]["task_id"]]["granted"] == empty()

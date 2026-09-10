@@ -5,7 +5,7 @@ import hmac
 import time
 import uuid
 
-from .policy import empty, fits, targets, validate_inventory, validate_request
+from .policy import empty, fits, targets, validate_allocation, validate_inventory, validate_request
 from .protocol import CAPABILITIES, VERSION, ProtocolError, encode, fields, identity, integer, require
 from .processes import descendants, process_state
 
@@ -37,7 +37,13 @@ class Engine:
         self.state["dedup"] = {}
         if state is not None:
             for task in self.tasks.values():
+                task.setdefault("pausable", True)
+                task.setdefault("adaptable", True)
+                task.setdefault("fixed_allocation", None)
                 if task["terminal"]:
+                    continue
+                if not task["pausable"]:
+                    # Restart cannot revoke a non-preemptible ownership promise.
                     continue
                 task["generation"] += 1
                 task["phase"] = "release"
@@ -50,7 +56,7 @@ class Engine:
         return self.state["tasks"]
 
     def _public(self, task):
-        return {k: copy.deepcopy(v) for k, v in task.items() if k not in ("token", "last_report", "processes")}
+        return {k: copy.deepcopy(v) for k, v in task.items() if k not in ("token", "last_report", "processes", "fixed_allocation")}
 
     def _authorize(self, body, uid, *, controller=False):
         key = identity(body["task_id"])
@@ -62,12 +68,17 @@ class Engine:
         return task
 
     def _reconcile(self):
-        desired = ({key: empty() for key in self.tasks} if self.draining
-                   else targets(self.tasks, self.inventory, self.state["override"]))
+        reasons = {}
+        desired = ({key: (task["granted"] if not task["pausable"] and not any(task["paused"].values()) else empty())
+                    for key, task in self.tasks.items()} if self.draining
+                   else targets(self.tasks, self.inventory, self.state["override"], reasons))
         for key, task in self.tasks.items():
             task["target"] = copy.deepcopy(desired[key])
             if task["terminal"]:
                 continue
+            if task["phase"] == "waiting":
+                task["reason"] = reasons.get(key, "paused" if any(task["paused"].values())
+                                             else "waiting_for_resources")
             if task["phase"] in ("applied", "waiting") and task["granted"] != task["target"]:
                 if task["granted"] != empty():
                     task["generation"] += 1
@@ -82,13 +93,23 @@ class Engine:
                 task["reason"] = "inventory_unavailable"
                 continue
             others = [t["granted"] for k, t in self.tasks.items() if k != key]
-            if exclusive and any(a != empty() for a in others):
+            # Both directions need a release barrier: ordinary work may not
+            # enter while an outgoing exclusive owner is still draining.
+            old_exclusive = self.state["override"] is None and any(
+                t["request"]["exclusive"] and t["granted"] != empty()
+                for k, t in self.tasks.items() if k != key)
+            if (exclusive and any(a != empty() for a in others)) or old_exclusive:
+                task["reason"] = "waiting_for_release"
                 continue
             if fits(others + [task["target"]], self.inventory):
                 task["generation"] += 1
                 task["granted"] = copy.deepcopy(task["target"])
                 task["phase"] = "initialize"
                 task["reason"] = "grant_available"
+                if not task["adaptable"] and task["fixed_allocation"] is None:
+                    task["fixed_allocation"] = copy.deepcopy(task["granted"])
+            else:
+                task["reason"] = "waiting_for_release"
         assert fits([t["granted"] for t in self.tasks.values()], self.inventory)
 
     def _invalidate_override(self):
@@ -136,7 +157,11 @@ class Engine:
 
     def _operate(self, op, body, uid):
         if op == "register":
-            fields(body, ("task_id", "label", "root", "request", "reconfigure_mode", "token"))
+            fields(body, ("task_id", "label", "root", "request", "reconfigure_mode", "token"),
+                   ("pausable", "adaptable"))
+            pausable, adaptable = body.get("pausable", True), body.get("adaptable", True)
+            require(type(pausable) is bool and type(adaptable) is bool, "capabilities must be boolean")
+            require(pausable or not adaptable, "full_release adaptation requires pausable=true")
             key = identity(body["task_id"])
             require(type(body["token"]) is str and len(body["token"]) == 64
                     and all(c in "0123456789abcdef" for c in body["token"]), "registration requires client-generated 256-bit hex token")
@@ -148,6 +173,8 @@ class Engine:
             if key in self.tasks:
                 task = self._authorize(body, uid)
                 require(not task["terminal"], "task is terminal", "terminal")
+                require((pausable, adaptable) == (task["pausable"], task["adaptable"]),
+                        "registration capabilities are immutable", "conflict")
                 return {"task": self._public(task), "token": task["token"]}
             require(not self.draining, "manager is draining", "unavailable")
             require(sum(not t["terminal"] for t in self.tasks.values()) < self.max_tasks, "active task capacity reached", "capacity")
@@ -166,6 +193,7 @@ class Engine:
             task = {"task_id": key, "label": body["label"], "uid": uid,
                     "root": body["root"], "processes": members, "request": body["request"],
                     "token": body["token"], "request_revision": 0,
+                    "pausable": pausable, "adaptable": adaptable, "fixed_allocation": None,
                     "order": self.state["next_order"], "generation": 0,
                     "phase": "waiting", "reason": "registered", "paused": {"self": False, "controller": False},
                     "held": empty(), "granted": empty(), "target": empty(),
@@ -218,6 +246,11 @@ class Engine:
             integer(body["expected_request_revision"])
             require(body["expected_request_revision"] == task["request_revision"], "stale request revision", "conflict")
             validate_request(body["request"], self.inventory)
+            fixed = task["fixed_allocation"]
+            if fixed:
+                validate_allocation(fixed, body["request"], self.inventory)
+            require(task["granted"] == empty() or body["request"]["exclusive"] == task["request"]["exclusive"],
+                    "release before changing exclusivity", "conflict")
             task["request"] = body["request"]
             task["request_revision"] += 1
             self._invalidate_override()
@@ -225,6 +258,8 @@ class Engine:
             require(type(body["paused"]) is bool and body["scope"] in ("self", "controller"), "invalid pause")
             require(body["scope"] != "controller" or uid in self.controllers, "controller permission required", "forbidden")
             require(body["scope"] != "self" or uid == task["uid"], "only task owner may self-pause", "forbidden")
+            require(not body["paused"] or body["scope"] == "self" or task["pausable"]
+                    or task["granted"] == empty(), "task is non-pausable", "not_pausable")
             task["paused"][body["scope"]] = body["paused"]
             self._invalidate_override()
         elif op == "report":

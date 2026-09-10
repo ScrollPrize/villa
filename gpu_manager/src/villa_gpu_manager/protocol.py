@@ -6,7 +6,7 @@ import uuid
 
 VERSION = 1
 MAX_FRAME = 1024 * 1024
-CAPABILITIES = ["full_release", "vram_shares", "cpu_cores", "poll", "recovery"]
+CAPABILITIES = ["full_release", "vram_shares", "cpu_cores", "poll", "recovery", "task_scheduling"]
 
 
 class ProtocolError(ValueError):

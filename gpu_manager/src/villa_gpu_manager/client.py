@@ -16,13 +16,15 @@ class Client:
         self.task_id = None
         self.token = None
         self.task = None
+        self.capabilities = None
 
     def connect(self):
         self.close()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(self.timeout)
         self.socket.connect(self.path)
-        return self.call("hello", {"versions": [VERSION], "required_capabilities": ["full_release", "poll"]})
+        reply = self.call("hello", {"versions": [VERSION], "required_capabilities": ["full_release", "poll", "task_scheduling"]})
+        return reply
 
     def call(self, op, body, *, request_id=None):
         require(self.socket is not None, "client not connected")
@@ -52,13 +54,21 @@ class Client:
             self.close()
             raise
 
-    def register(self, label, request, *, task_id=None, root=None, token=None):
+    def register(self, label, request, *, task_id=None, root=None, token=None,
+                 pausable=None, adaptable=None):
+        if self.capabilities is None:
+            self.capabilities = {"pausable": True if pausable is None else pausable,
+                                 "adaptable": True if adaptable is None else adaptable}
+        else:
+            require(pausable is None or pausable == self.capabilities["pausable"], "capabilities are immutable")
+            require(adaptable is None or adaptable == self.capabilities["adaptable"], "capabilities are immutable")
         self.task_id = task_id or self.task_id or str(uuid.uuid4())
         # Retain the secret *before* sending, so losing the registration response
         # or restarting the manager cannot strand an allocated task.
         self.token = token or self.token or secrets.token_hex(32)
         body = {"task_id": self.task_id, "label": label, "root": root or process_identity(),
-                "request": request, "reconfigure_mode": "full_release", "token": self.token}
+                "request": request, "reconfigure_mode": "full_release", "token": self.token,
+                **self.capabilities}
         result = self.call("register", body)
         self.token, self.task = result["token"], result["task"]
         return self.task

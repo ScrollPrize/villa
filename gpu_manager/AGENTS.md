@@ -7,6 +7,8 @@ read-only startup/install policy and use the README for commands.
 ## Locked protocol
 
 Protocol v1 was locked on 2026-09-10 after conformance and Fiber reference tests.
+The user-authorized capability/priority scheduling amendment of the same date
+is part of that locked protocol; see its section in the protocol document.
 `docs/protocol-v1.md` and `src/villa_gpu_manager/schema.py` are authoritative.
 Do not change wire fields/types, units, operations, capabilities, framing,
 versioning, ownership/recovery rules or allocation semantics without explicit

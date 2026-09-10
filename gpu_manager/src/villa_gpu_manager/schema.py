@@ -47,7 +47,9 @@ FIELDS = {
               "required_capabilities": {"type": "array", "items": {"type": "string"}}},
     "register": {**TASK, "label": {"type": "string", "minLength": 1, "maxLength": 256},
                  "root": {"$ref": "#/$defs/process"}, "request": {"$ref": "#/$defs/request"},
-                 "reconfigure_mode": {"const": "full_release"}},
+                 "reconfigure_mode": {"const": "full_release"},
+                 "pausable": {"type": "boolean", "default": True},
+                 "adaptable": {"type": "boolean", "default": True}},
     "set_request": {**TASK, "request": {"$ref": "#/$defs/request"}, "expected_request_revision": INTEGER},
     "poll": {**TASK, "last_generation": INTEGER},
     "report": {**TASK, "generation": INTEGER, "phase": {"enum": ["applied", "released", "failed"]},
@@ -67,7 +69,7 @@ SCHEMA["allOf"] = [
     {"if": {"properties": {"op": {"const": op}}},
      "then": {"properties": {"body": {"type": "object", "additionalProperties": False,
                  "properties": properties,
-                 "required": [key for key in properties if not (op == "status" or key == "token" and op in ("set_request", "set_paused"))]}},
+                 "required": [key for key in properties if not (op == "status" or key == "token" and op in ("set_request", "set_paused") or op == "register" and key in ("pausable", "adaptable"))]}},
               **({"required": ["server_epoch"]} if op != "hello" else {})}}
     for op, properties in FIELDS.items()
 ]
@@ -80,6 +82,7 @@ TASK_PROPERTIES = {
     "request_revision": INTEGER, "order": INTEGER, "generation": INTEGER,
     "phase": {"enum": ["waiting", "initialize", "applied", "release", "finished"]},
     "reason": {"type": "string"},
+    "pausable": {"type": "boolean"}, "adaptable": {"type": "boolean"},
     "paused": {"type": "object", "additionalProperties": False, "required": ["self", "controller"],
                "properties": {key: {"type": "boolean"} for key in ("self", "controller")}},
     **{key: {"$ref": "#/$defs/allocation"} for key in ("held", "granted", "target")},
