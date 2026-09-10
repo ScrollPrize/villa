@@ -351,6 +351,12 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
+    // Ctrl+Shift+wheel in the current cut: slide the cut plane straight along
+    // its normal by the arclength the marker advances, WITHOUT re-posing it on
+    // the model line, so a point can be placed where the true fiber is when the
+    // model prediction has diverged. The side cut and strips stay where they
+    // are; any along-line navigation snaps the plane back.
+    bool shiftCurrentCutStraightAheadByScrollSteps(int steps);
     bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
     bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
                                                 CChunkedVolumeViewer* viewer,
@@ -360,9 +366,8 @@ private:
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
     // "B": zero every accumulated normal offset — the side cut plane's and
-    // both strips' surface offsets. The current cut cannot accumulate one
-    // (Shift-scroll steps along the line there) but is reset with the side
-    // cut for symmetry.
+    // both strips' surface offsets — and snap a straight-ahead displaced
+    // current cut (Ctrl+Shift-scroll) back onto the model line.
     void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
@@ -566,6 +571,12 @@ private:
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
     double _currentCutNormalOffsetVx = 0.0;
+    // Set while Ctrl+Shift+wheel has slid the current cut plane off the model
+    // line; cleared wherever the plane is re-posed from the line.
+    bool _currentCutStraightAheadActive = false;
+    // Translation sign along the plane normal, fixed at the gesture's first
+    // notch (see straightAheadDirection).
+    double _currentCutStraightAheadDirection = 1.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     // Generation-based deduplication of the coalesced overlay refresh: every

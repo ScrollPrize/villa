@@ -1424,6 +1424,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
@@ -1823,6 +1824,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending.assign(_stripViewers.size(), true);
         _currentCutNormalOffsetVx = 0.0;
+        _currentCutStraightAheadActive = false;
         _sideCutNormalOffsetVx = 0.0;
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -2012,6 +2014,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = views.initialCurrentCutFollowsStripMouse;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
@@ -2069,8 +2072,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
     currentViewer->setShiftScrollOverride(
-        [this](int steps, QPointF, Qt::KeyboardModifiers) {
-            // Always step along the line; the cut plane never leaves it.
+        [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
+            // Ctrl+Shift slides the plane straight ahead (off the model line);
+            // plain Shift steps along the line and the cut plane never leaves it.
+            if (modifiers.testFlag(Qt::ControlModifier)) {
+                return shiftCurrentCutStraightAheadByScrollSteps(steps);
+            }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
     bindPaneInteractions(views.currentCutName, currentViewer, false);
@@ -2575,13 +2582,18 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         return;
     }
     position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
+    // A straight-ahead (Ctrl+Shift+wheel) displacement counts as a change even
+    // at an unchanged position: every along-line navigation snaps the cut plane
+    // back onto the model line.
     const bool currentChanged =
-        forceApply || std::abs(position - _currentLinePosition) >= 1.0e-3;
+        forceApply || std::abs(position - _currentLinePosition) >= 1.0e-3 ||
+        _currentCutStraightAheadActive;
     if (!currentChanged) {
         return;
     }
     if (currentChanged && _generatedViews.currentCutSurface) {
         _currentCutNormalOffsetVx = 0.0;
+        _currentCutStraightAheadActive = false;
         if (_currentCutViewer) {
             _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         }
@@ -2635,11 +2647,76 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
         steps,
         sliceStepSize,
         currentLineArclengths());
-    _currentCutNormalOffsetVx = 0.0;
-    if (_currentCutViewer) {
-        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
-    }
+    // setCurrentLinePosition re-poses the plane on the line (and sees a pending
+    // straight-ahead displacement as a change), so no offset reset is needed here.
     setCurrentLinePosition(position);
+    return true;
+}
+
+bool LineAnnotationDialog::shiftCurrentCutStraightAheadByScrollSteps(int steps)
+{
+    PlaneSurface* plane = _generatedViews.currentCutSurface.get();
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || !plane || steps == 0) {
+        return true;
+    }
+    // Like the along-line scroll, the notch supersedes a running keyboard pan
+    // and any coalesced hover-follow flush still in the timer, whether or not
+    // it ends up moving anything: either would otherwise re-pose the plane a
+    // few ms later.
+    cancelArrowPan();
+    _lineUpdatePending = false;
+    if (_lineUpdateTimer) {
+        _lineUpdateTimer->stop();
+    }
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
+    // The geometry is computed and validated before any of it is applied, so a
+    // degenerate plane cannot leave the marker advanced with the plane in place.
+    const auto& arclengths = currentLineArclengths();
+    const double newPosition = vc3d::line_annotation::shiftedLinePositionByArclength(
+        _currentLinePosition,
+        steps,
+        sliceStepSize,
+        arclengths);
+    const double distanceVx = vc3d::line_annotation::straightAheadDistanceForShiftScroll(
+        _currentLinePosition, newPosition, arclengths);
+    if (std::abs(newPosition - _currentLinePosition) < 1.0e-9 ||
+        !std::isfinite(distanceVx) || std::abs(distanceVx) <= 1.0e-6) {
+        // Marker clamped at a line end (or no usable arclength map): stop with
+        // it, as plain Shift+wheel does.
+        return true;
+    }
+    const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    // Undo the display sign to get the true "ahead" direction (see
+    // interpolatedLineTangent) and slide the plane along its normal into that
+    // half-space; the sign is fixed for the whole gesture (straightAheadDirection).
+    const cv::Vec3f ahead = interpolatedLineTangent(_currentLinePosition) * _displayTangentSign;
+    if (!finitePoint(normal) || cv::norm(normal) <= 1.0e-6f || !finitePoint(ahead)) {
+        return true;
+    }
+    const double direction = vc3d::line_annotation::straightAheadDirection(
+        normal, ahead, _currentCutStraightAheadActive, _currentCutStraightAheadDirection);
+    const cv::Vec3f shiftedOrigin = vc3d::line_annotation::planeOriginShiftedAlongNormal(
+        plane->origin(), normal, direction * distanceVx);
+    if (!finitePoint(shiftedOrigin)) {
+        return true;
+    }
+
+    // Commit.
+    _currentLinePosition = newPosition;
+    // Pure translation: normal and in-plane basis are kept (decision: fixed
+    // orientation during the gesture). Deliberately no updatePlaneSurface /
+    // updateSidePlaneSurface and no side or strip recentering: only the marker
+    // follows the model line; the side cut catches up on the next snap-back.
+    plane->setFromNormalAndUp(shiftedOrigin, normal, plane->basisY());
+    _currentCutStraightAheadActive = true;
+    _currentCutStraightAheadDirection = direction;
+    if (_currentCutViewer) {
+        _currentCutViewer->markSurfaceGeometryChanged();
+        _currentCutViewer->renderVisible(true, "line annotation current cut straight ahead");
+    }
+    rebuildGeneratedDynamicOverlays();
     return true;
 }
 
@@ -2686,6 +2763,11 @@ void LineAnnotationDialog::startArrowPan(int direction)
         // Nothing that way: a fresh press does nothing, a reversal just stops.
         if (_arrowPanDirection != 0) {
             cancelArrowPan();
+        }
+        if (_currentCutStraightAheadActive) {
+            // Still an along-line navigation: snap a straight-ahead displaced
+            // plane back onto the line even though there is nowhere to go.
+            setCurrentLinePosition(_currentLinePosition, true, true);
         }
         return;
     }
@@ -3202,9 +3284,15 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
     }
 
     bool changed = false;
-    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
-    const bool sideHadOffset = normalOffsetActive(_sideCutNormalOffsetVx);
+    const bool currentHadOffset =
+        normalOffsetActive(_currentCutNormalOffsetVx) || _currentCutStraightAheadActive;
+    // A straight-ahead advance left the side cut frozen at the position where
+    // the gesture began, so it has to catch up with the marker as well.
+    const bool sideHadOffset =
+        normalOffsetActive(_sideCutNormalOffsetVx) || _currentCutStraightAheadActive;
+    const bool recenterSide = _currentCutStraightAheadActive;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     if (_currentCutViewer) {
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -3229,6 +3317,12 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
             changed = true;
             if (_sideCutViewer) {
                 _sideCutViewer->markSurfaceGeometryChanged();
+                if (recenterSide) {
+                    const cv::Vec3f sidePoint = interpolatedLinePoint(_currentLinePosition);
+                    if (finitePoint(sidePoint)) {
+                        _sideCutViewer->centerOnVolumePoint(sidePoint, false);
+                    }
+                }
                 if (forceRender) {
                     _sideCutViewer->renderVisible(true, "line annotation side cut offset reset");
                 }
@@ -3508,6 +3602,11 @@ bool LineAnnotationDialog::rotateCurrentCut(vc3d::line_annotation::GeneratedCutR
     if (!_hasGeneratedViews || !_generatedViews.currentCutSurface || !_currentCutViewer) {
         return false;
     }
+    if (_currentCutStraightAheadActive) {
+        // The rotation below re-poses the plane on the model line anyway; do it
+        // through the setter so the frozen side cut catches up as well.
+        setCurrentLinePosition(_currentLinePosition, true, true);
+    }
     const cv::Vec3f centerVolumePoint = currentCutViewerCenterVolumePoint();
     _currentCutManualRotation =
         vc3d::line_annotation::accumulatedGeneratedCutRotation(_currentCutManualRotation,
@@ -3579,6 +3678,7 @@ void LineAnnotationDialog::resetGeneratedViews()
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
     _currentCutNormalOffsetVx = 0.0;
+    _currentCutStraightAheadActive = false;
     _sideCutNormalOffsetVx = 0.0;
     _currentCutFollowsStripMouse = true;
 
@@ -4319,7 +4419,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _currentCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
 
     QPointF centerScenePoint;
-    if (normalOffsetActive(_currentCutNormalOffsetVx)) {
+    if (_currentCutStraightAheadActive) {
         centerScenePoint = viewer->volumeToScene(
             vc3d::line_annotation::interpolatedGeneratedLinePoint(
                 cutViews.linePoints, cutPosition));
