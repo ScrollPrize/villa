@@ -1,5 +1,29 @@
 # Local Fiber3D metric embeddings
 
+## S1a eight-GPU training
+
+Use `fiber_trace_3d/configs/train_s1a_nml_embedding_16x8.json` for a fresh run.
+It preserves the merged fast S1a baseline (8 NML files, one held-out JSON,
+Paris4 input level 1, 128³ patches, GroupNorm, stride 4, BF16, 16 samples/GPU,
+global batch 128). The only config changes are the run name, embedding settings,
+and the matching local Paris4 Lasagna normals manifest for train/test.
+The normals manifest selects level 4; coordinate mapping uses its base shape
+and scale independently of the level-1 input.
+
+LR warms to 0.01 over 100 updates. This was the prior short-run recommendation,
+not a retuned optimum for embedding loss. Do not resume a legacy non-embedding
+checkpoint. GPU memory and throughput with embeddings remain unmeasured.
+
+From any directory, after ensuring all eight GPUs are available:
+
+```bash
+PYTHONPATH=/home/hendrik/villa/vesuvius/src:/home/hendrik/villa/vesuvius:/home/hendrik/villa CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1 /home/hendrik/.venv_las/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_embedding_16x8.json
+```
+
+Output: `/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_embedding_128_sd1_16x8_<timestamp>`.
+The explicit PYTHONPATH selects this embedding checkout instead of another
+editable-install worktree. The config contains machine-local data paths.
+
 Add this to an existing **unconditioned** Fiber3D training config:
 
 ```json

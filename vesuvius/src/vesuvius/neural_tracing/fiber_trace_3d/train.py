@@ -1689,6 +1689,55 @@ def compute_conditioned_losses(
     )
 
 
+@dataclass(frozen=True)
+class _SampleProgress:
+    start_update: int
+    start_samples: int
+    global_batch_size: int
+
+    def at(self, update: int) -> int:
+        return self.start_samples + (int(update) - self.start_update) * self.global_batch_size
+
+
+class _SampleAxisWriter:
+    """Translate update-based logging calls at the TensorBoard boundary only."""
+
+    def __init__(self, writer: Any, progress: _SampleProgress):
+        self.writer = writer
+        self.progress = progress
+
+    def add_scalar(self, tag, value, global_step, **kwargs):
+        return self.writer.add_scalar(tag, value, self.progress.at(global_step), **kwargs)
+
+    def add_image(self, tag, value, global_step, **kwargs):
+        return self.writer.add_image(tag, value, self.progress.at(global_step), **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.writer, name)
+
+
+def _resume_sample_count(metadata: dict[str, Any], update: int, override: Any = None) -> int:
+    if override is not None:
+        count = int(override)
+    elif metadata.get("samples_seen") is not None:
+        count = int(metadata["samples_seen"])
+    elif int(update) == 0:
+        count = 0
+    else:
+        batch = metadata.get("optimizer_global_batch_size")
+        if batch is None:
+            batch = metadata.get("config", {}).get("training", {}).get("optimizer_global_batch_size")
+        if batch is None or int(batch) <= 0:
+            raise ValueError(
+                "Legacy checkpoint has no global sample count/batch size; set "
+                "training.resume_samples_seen to its cumulative training sample count"
+            )
+        count = int(update) * int(batch)
+    if count < 0:
+        raise ValueError("resumed sample count must be nonnegative")
+    return count
+
+
 def _save_snapshot(
     path: Path,
     *,
@@ -1699,6 +1748,7 @@ def _save_snapshot(
     config: dict[str, Any],
     metric: float | None,
     metric_name: str | None = None,
+    sample_progress: _SampleProgress | None = None,
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
@@ -1708,6 +1758,9 @@ def _save_snapshot(
         "metric": metric,
         "metric_name": metric_name,
     }
+    if sample_progress is not None:
+        payload["samples_seen"] = sample_progress.at(step)
+        payload["optimizer_global_batch_size"] = sample_progress.global_batch_size
     torch.save(payload, path)
 
 
@@ -1735,8 +1788,14 @@ def _load_snapshot(
     optimizer_hparams: dict[str, float] | None = None,
     grad_scaler: torch.amp.GradScaler | None = None,
     map_location: torch.device | str = "cpu",
+    progress_metadata: dict[str, Any] | None = None,
 ) -> int:
     payload = torch.load(path, map_location=map_location)
+    if progress_metadata is not None and isinstance(payload, dict):
+        progress_metadata.update({
+            key: payload[key] for key in ("samples_seen", "optimizer_global_batch_size", "config")
+            if key in payload
+        })
     restore_model_optimizer(payload, model=model, optimizer=optimizer, grad_scaler=grad_scaler)
     if optimizer is not None and isinstance(payload, dict) and "optimizer" in payload:
         if optimizer_hparams is not None:
@@ -2321,9 +2380,11 @@ def evaluate_dense_loss(
 
 def _report_test_timing(
     *, step: int, total_seconds: float, writer: Any | None,
+    samples_seen: int | None = None,
 ) -> None:
+    counter = f"step={int(step)}" if samples_seen is None else f"samples={samples_seen} update={step}"
     print(
-        f"test_timing step={int(step)} total_seconds={float(total_seconds):.3f}",
+        f"test_timing {counter} total_seconds={float(total_seconds):.3f}",
         flush=True,
     )
     if writer is not None:
@@ -2713,6 +2774,7 @@ def training_units(
         else training.get("resume") or raw_config.get("resume")
     )
     start_step = 0
+    progress_metadata: dict[str, Any] = {}
     handoff_progress = None
     if handoff is not None:
         if not bounded_accumulation:
@@ -2724,6 +2786,7 @@ def training_units(
         if handoff_progress.get("config_fingerprint") != source_fingerprint:
             raise ValueError("training config changed since the captured cohort state")
         start_step = int(handoff_progress["step"])
+        progress_metadata = dict(handoff_progress)
     elif resume:
         start_step = _load_snapshot(
             resume,
@@ -2732,6 +2795,7 @@ def training_units(
             optimizer_hparams=optimizer_hparams,
             grad_scaler=grad_scaler,
             map_location=device,
+            progress_metadata=progress_metadata,
         )
     optimizer_lr_group_scales = _optimizer_learning_rate_scales(optimizer)
 
@@ -2902,6 +2966,17 @@ def training_units(
             rank=distributed.rank,
             optimizer_global_batch_size=optimizer_global_batch_size,
         )
+    sample_progress = _SampleProgress(
+        start_update=start_step,
+        start_samples=_resume_sample_count(
+            progress_metadata, start_step,
+            training.get("resume_samples_seen") if resume and handoff_progress is None else None,
+        ),
+        global_batch_size=optimizer_global_batch_size,
+    )
+    if writer is not None:
+        writer = _SampleAxisWriter(writer, sample_progress)
+        writer.add_text("config/progress_axis", "Cumulative global training samples; schedules use optimizer updates.", 0)
     optimizer_microbatch_count = len(optimizer_microbatch_takes)
     manual_gradient_sync = bounded_accumulation or optimizer_virtual_world_size != distributed.world_size
     if manual_gradient_sync and ddp_broadcast_buffers:
@@ -3045,6 +3120,8 @@ def training_units(
             cuda_device=device if device.type == "cuda" else None,
             progress={"step": step, "effective_batch_size": optimizer_global_batch_size,
                       "sample_frontier": step * optimizer_global_batch_size,
+                      "samples_seen": sample_progress.at(step),
+                      "optimizer_global_batch_size": optimizer_global_batch_size,
                       "best_metric": best_metric, "run_datestr": str(run_datestr),
                       "pending_test": pending_test, "config_fingerprint": source_fingerprint},
         )
@@ -3066,7 +3143,7 @@ def training_units(
             if distributed.is_main:
                 _save_snapshot(path, model=raw_model, optimizer=optimizer, step=test_step,
                                config=raw_config, metric=metric, metric_name=metric_name,
-                               grad_scaler=grad_scaler)
+                               grad_scaler=grad_scaler, sample_progress=sample_progress)
             _distributed_barrier(distributed)
 
     if distributed.is_main:
@@ -3175,7 +3252,7 @@ def training_units(
                     metric_name = "test/loss_total"
                     if pending_test is None or not pending_test["dense_logged"]:
                         print(
-                            f"test step={step} loss_total={test_losses['total']:.6f} "
+                            f"test samples={sample_progress.at(step)} update={step} loss_total={test_losses['total']:.6f} "
                             f"loss_direction={test_losses['direction']:.6f} "
                             f"loss_presence={test_losses['presence']:.6f} "
                             f"{_embedding_log(test_losses, raw_model)}"
@@ -3265,7 +3342,7 @@ def training_units(
                 )
                 diagnostics.marker("test-trace2cp-end", step=step)
                 print(
-                    f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
+                    f"test_trace2cp samples={sample_progress.at(step)} update={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
                     f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
                     f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
                     flush=True,
@@ -3290,6 +3367,7 @@ def training_units(
                     step=step,
                     total_seconds=test_elapsed_seconds,
                     writer=writer,
+                    samples_seen=sample_progress.at(step),
                 )
             if writer is not None and metric is not None:
                 diagnostics.marker("test-tensorboard-flush-begin", step=step)
@@ -3754,7 +3832,7 @@ def training_units(
                     )
                 )
                 print(
-                    f"step={step} loss_total={losses['total']:.6f} "
+                    f"samples={sample_progress.at(step)} update={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
                     f"{_embedding_log(losses, raw_model)}"

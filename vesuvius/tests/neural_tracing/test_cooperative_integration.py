@@ -140,6 +140,8 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             state = cohort.state
             payload = state.load()
             assert payload["progress"]["step"] == target
+            assert payload["progress"]["samples_seen"] == target * 5
+            assert payload["progress"]["optimizer_global_batch_size"] == 5
             assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
         finally:
             if not cohort.closed:
@@ -174,7 +176,7 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             reference.state.close()
     hub.close()
     assert broker.commits == [1, 2, 3]
-    assert [event[1] for event in events if event[0] == "train/loss_total"] == [1, 2, 3]
+    assert [event[1] for event in events if event[0] == "train/loss_total"] == [5, 10, 15]
     assert events.count(("text", "config/json")) == 1
     assert events.count(("closed", None)) == 1
     assert not torch.cuda.is_initialized()

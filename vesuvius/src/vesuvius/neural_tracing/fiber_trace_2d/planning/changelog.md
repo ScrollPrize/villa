@@ -1,5 +1,9 @@
 ## 2026-09-10 — Local Fiber3D embeddings
 
+- Merged S1a retraining/sample-based progress into embedding training. Added
+  the local S1a 16x8 embedding config with LR 0.01 and matching Paris4 normals;
+  retained sample counts through cooperative handoff and shared checkpoints.
+
 - Added opt-in 16-channel embeddings, balanced within-patch cosine supervision,
   detached-presence negative sampling, and base-coordinate 20/80 Lasagna-normal
   exclusion. Extended shared-slot transport, ordinary/cooperative sufficient
@@ -18,6 +22,19 @@
 - Normal cooperative tests have a five-minute total cap; long repeated timing
   sweeps were cancelled at user request after one complete comparison. Native
   prerequisites support missing HiGHS and initialize bounded worker pools.
+
+## 2026-09-09 — Sample-based training progress
+
+- Fiber3D TensorBoard scalars/images and console metrics now use cumulative
+  global training samples, with optimizer updates kept explicit in console
+  output and unchanged for scheduling. Added checkpoint sample metadata and
+  changed-batch resume support; benchmark parsers accept both console formats.
+
+## 2026-09-09 — Eight-GPU S1a retraining configs
+
+- Added an opt-in fast-pipeline S1a NML reproduction config at
+  global batch 128 with the recorded LR 0.01 / 100-step warmup recommendation.
+  Added launch commands and historical comparison caveats.
 
 ## 2026-09-09 — Fiberlets/Fiber3D training integration
 

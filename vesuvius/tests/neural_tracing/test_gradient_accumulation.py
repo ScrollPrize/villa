@@ -88,7 +88,7 @@ def test_unused_parameters_remain_unused():
 def direction_only(output):
     value = output.float()
     zero = value.sum() * 0
-    values = {name: zero for name in LossStatistics.__dataclass_fields__}
+    values = {name: zero for name in LossStatistics.__dataclass_fields__ if "embedding" not in name}
     values.update(direction_sum=value.square().sum(), direction_count=value.new_tensor(value.numel()))
     return LossStatistics(**values)
 
