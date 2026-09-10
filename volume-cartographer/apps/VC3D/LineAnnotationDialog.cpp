@@ -192,6 +192,23 @@ std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewe
                      static_cast<float>(surfacePoint[1])};
 }
 
+// Surface Y of the strip's centre row (the fiber line runs along it), the
+// value the strip cameras are pinned to. Independent of the along-line
+// position, so it needs no position map.
+std::optional<float> generatedStripCenterlineSurfaceY(const QuadSurface* quad)
+{
+    const auto* points = quad ? quad->rawPointsPtr() : nullptr;
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+    const cv::Vec2d surfacePoint =
+        quad->gridToSurface({0.0, static_cast<double>(points->rows / 2)});
+    if (!std::isfinite(surfacePoint[1])) {
+        return std::nullopt;
+    }
+    return static_cast<float>(surfacePoint[1]);
+}
+
 // Inverse of generatedStripSurfaceCenter for a camera: maps a strip camera's
 // surface coordinates back to the fractional line position under the view
 // center, through the given strip quad and position map (which must describe
@@ -1685,6 +1702,13 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         _generatedViews.lineSurface.get(),
         _generatedViews.lineSideSlice.get()};
     const std::array<QuadSurface*, 2> newQuads{newLineSurface, newLineSideSlice};
+    // The new strips' centre row is where each camera stays pinned (the row
+    // layout is normally unchanged, so this is a no-op most of the time).
+    for (size_t i = 0; i < newQuads.size(); ++i) {
+        if (_stripViewers[i] && newQuads[i]) {
+            _stripViewers[i]->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(newQuads[i]));
+        }
+    }
     for (size_t i = 0; i < oldQuads.size(); ++i) {
         auto* stripViewer = _stripViewers[i].data();
         QuadSurface* newQuad = newQuads[i];
@@ -1729,8 +1753,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         // per-strip delta would tear the link apart. Both strips are built
         // from the same line at the same along-spacing, so the first usable
         // strip's delta is the right one for both. Y is left alone -- the
-        // cross-strip parameterization is stable and vertical pan is the
-        // user's.
+        // cameras are pinned to the centre row, which the cross-strip
+        // parameterization keeps stable.
         for (QuadSurface* quad : newQuads) {
             if (quad) {
                 quad->shiftSurfaceOrigin({delta, 0.0});
@@ -2242,6 +2266,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 stripCamera.scale = _savedStripZooms[stripIndex];
             }
         }
+        // The fiber line stays on the strip's vertical centre: pans move the
+        // strip along the line only and zooms are anchored on the centre row.
+        viewer->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(
+            dynamic_cast<QuadSurface*>(viewer->currentSurface())));
         viewer->applyCameraState(stripCamera, false);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
