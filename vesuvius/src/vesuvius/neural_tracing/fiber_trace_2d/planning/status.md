@@ -1,8 +1,6 @@
 # Status
 
-- [x] Identify retrain branch and inspect changes
-- [x] Independent plan review
-- [x] Resolve merge preserving both features
-- [x] Verify embedding config and local normals
-- [x] CPU regression tests: 49 passed, 13 GPU-dependent skips
-- [x] Finish merge resolution and document command
+- [x] Independent plan review, including expanded managed-default implementation
+- [x] Managed-by-default dispatch and shared default socket; explicit debug opt-out
+- [x] Replace unmanaged production examples
+- [x] Validate command/help and document prerequisites

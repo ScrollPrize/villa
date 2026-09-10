@@ -1,5 +1,9 @@
 # Two-GPU Fiber training profile, 2026-09-07
 
+Historical benchmark record, not production launch guidance. The isolated
+profiling harness explicitly opts out with `--unmanaged`; normal training now
+requires the [cooperative manager](cooperative_training.md#managed-launch).
+
 All three normal-training experiments completed with exit code 0.
 Compilation remains off by default. This is a throughput/tooling experiment,
 not validation of the one-hour convergence goal.

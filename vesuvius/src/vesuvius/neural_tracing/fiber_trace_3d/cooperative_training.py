@@ -1,4 +1,4 @@
-"""CPU supervisor entry point for opt-in cooperative Fiber training.
+"""Default CPU supervisor entry point for cooperative Fiber training.
 
 The manager grants metadata reservations; only gated child processes initialize
 CUDA. This module does not create a second training algorithm.
@@ -37,7 +37,9 @@ def launch_settings(raw, *, socket=None):
     unknown = set(settings) - {"socket", "request", "memory_calibration", "input_queue_depth"}
     if unknown:
         raise ValueError(f"unknown cooperative settings: {sorted(unknown)}")
-    socket = socket or settings.get("socket")
+    from villa_gpu_manager.paths import default_socket_path
+    if socket is None:
+        socket = settings["socket"] if "socket" in settings else default_socket_path()
     if not isinstance(socket, str) or not socket:
         raise ValueError("cooperative training requires a filesystem socket path")
     request = settings.get("request")

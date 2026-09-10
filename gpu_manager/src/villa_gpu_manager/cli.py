@@ -6,13 +6,14 @@ import os
 from pathlib import Path
 
 from .client import Client
+from .paths import default_socket_path
 from .processes import NvidiaMonitor, nvidia_inventory
 from .server import Server
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--socket", default=str(Path.home() / ".local/run/villa-gpu-manager/manager.sock"))
+    parser.add_argument("--socket", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve")
     serve.add_argument("--gpus", nargs="+", required=True, help="explicit managed NVIDIA GPU UUIDs")
@@ -33,6 +34,8 @@ def main(argv=None):
     setting.add_argument("--until-task")
     overrides.add_parser("clear")
     args = parser.parse_args(argv)
+    if args.socket is None:
+        args.socket = default_socket_path()
     if args.command == "serve":
         inventory = nvidia_inventory(args.cpu_cores, args.gpus, args.reserve_bytes)
         with Server(args.socket, inventory, allowed_uids=[os.getuid(), *args.allow_uid],

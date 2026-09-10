@@ -486,8 +486,9 @@ def _torchrun_world_size_from_env(env: dict[str, str] | None = None) -> int:
 def _require_single_process_cli_mode(mode_name: str) -> None:
     if _torchrun_world_size_from_env() > 1:
         raise SystemExit(
-            f"{mode_name} is single-process only. Run normal training under torchrun, "
-            "or run this subcommand without torchrun/WORLD_SIZE>1."
+            f"{mode_name} is single-process only. Launch without torchrun/WORLD_SIZE>1; "
+            "normal training's manager supervisor launches GPU workers. "
+            "Unmanaged distributed testing requires the explicit --unmanaged flag."
         )
 
 
@@ -2625,8 +2626,11 @@ def run_training(
     resume_checkpoint: str | Path | None = None,
     test_hang_diagnostics: bool = False,
     manager_socket: str | None = None,
+    unmanaged: bool = False,
 ) -> None:
-    if manager_socket is not None or _load_raw_config(config_path).get("training", {}).get("cooperative"):
+    if unmanaged and manager_socket is not None:
+        raise ValueError("--unmanaged cannot be combined with --manager-socket")
+    if not unmanaged:
         _require_single_process_cli_mode("cooperative training (do not use torchrun)")
         from .cooperative_training import run_cooperative_training
         return run_cooperative_training(config_path, socket=manager_socket,
@@ -6036,8 +6040,11 @@ def main() -> None:
     parser.add_argument("--trace2cp-step-px", type=float, default=None)
     parser.add_argument("--trace2cp-rf-margin-px", type=float, default=None)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--manager-socket", type=Path, default=None,
-                        help="opt in to cooperative GPU allocation; requires training.cooperative memory calibration/request")
+    launch_mode = parser.add_mutually_exclusive_group()
+    launch_mode.add_argument("--manager-socket", type=Path, default=None,
+                            help="override manager socket (default: available /run/villa-gpu-manager/manager.sock, otherwise ~/.local/run/villa-gpu-manager/manager.sock); training is managed by default")
+    launch_mode.add_argument("--unmanaged", action="store_true",
+                            help="explicit testing/debug only: bypass cooperative GPU management")
     parser.add_argument(
         "--test-hang-diagnostics",
         action="store_true",
@@ -6045,8 +6052,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     auxiliary_mode = args.prefetch or args.trace2cp_vis or args.benchmark
-    if args.manager_socket is not None and auxiliary_mode:
-        raise SystemExit("--manager-socket applies only to training")
+    if (args.manager_socket is not None or args.unmanaged) and auxiliary_mode:
+        raise SystemExit("--manager-socket and --unmanaged apply only to training")
     if args.test_hang_diagnostics and auxiliary_mode:
         raise SystemExit("--test-hang-diagnostics is supported only for normal training")
     if args.prefetch:
@@ -6081,7 +6088,8 @@ def main() -> None:
     else:
         run_training(args.config, resume_checkpoint=args.resume,
             test_hang_diagnostics=bool(args.test_hang_diagnostics),
-            manager_socket=str(args.manager_socket) if args.manager_socket is not None else None)
+            manager_socket=str(args.manager_socket) if args.manager_socket is not None else None,
+            unmanaged=bool(args.unmanaged))
 
 
 if __name__ == "__main__":

@@ -441,10 +441,14 @@
   than dense-volume count bounds. CUDA equivalence/performance validation is
   still required before production use. This option alone does not enable
   dynamic GPU reconfiguration.
-- `training.cooperative` or `--manager-socket` selects the opt-in CPU supervisor
-  with a measured config-matched memory calibration and complete resource request.
-  Protocol authority is `gpu_manager/docs/protocol-v1.md`; it remains draft until
-  reference CUDA validation. Ordinary unmanaged configs retain their defaults.
+- Fiber3D training defaults to the CPU supervisor with a measured config-matched
+  memory calibration and complete resource request. The shared default prefers
+  `/run/villa-gpu-manager/manager.sock` when its location is writable/searchable
+  or a listener is reachable; otherwise it uses the home path
+  `~/.local/run/villa-gpu-manager/manager.sock`. CLI override takes precedence over
+  the config socket. Only explicit `--unmanaged` permits testing/debug execution
+  without the manager. Missing setup or manager failure never causes fallback.
+  Protocol authority remains `gpu_manager/docs/protocol-v1.md`, unchanged here.
 - Managed updates own exactly the configured effective batch's canonical stream
   IDs, supporting unequal/partial physical microbatches and zero-work ranks. GPU
   allocations change only through full cohort exit/join and a fresh process group.

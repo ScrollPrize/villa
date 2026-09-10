@@ -1,3 +1,3 @@
-# Task: merge S1a retraining and prepare embedding launch
+# Task
 
-Merge fiber-training-retrain into fiber-training-embedding preserving both features. Provide a concrete S1a NML embedding config using the updated LR 0.01 baseline and matching local Lasagna normals, with a launch command. Do not launch training.
+Make Fiber3D training managed by default using the manager's default socket. Only an explicit testing/debug opt-out may train unmanaged. Update launch docs and provide the S1a embedding command; report missing calibration honestly, without launching training or inventing measurements.

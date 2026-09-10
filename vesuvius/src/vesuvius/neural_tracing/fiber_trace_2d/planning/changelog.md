@@ -1,5 +1,13 @@
 ## 2026-09-10 — Local Fiber3D embeddings
 
+- Production training now defaults to the cooperative supervisor and shared
+  default socket; only explicit --unmanaged permits debug/test bypass. Updated
+  S1a/embedding launch docs; calibration/request remain mandatory.
+
+- Fixed initial evaluation overflow from 128-bit loader seeds by applying the
+  existing PyTorch seed conversion at the embedding sampler boundary; tested
+  deterministic losses and gradients with real loader-generated seeds.
+
 - Merged S1a retraining/sample-based progress into embedding training. Added
   the local S1a 16x8 embedding config with LR 0.01 and matching Paris4 normals;
   retained sample counts through cooperative handoff and shared checkpoints.

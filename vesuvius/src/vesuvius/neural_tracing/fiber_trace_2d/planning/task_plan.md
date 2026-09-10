@@ -1,15 +1,22 @@
 # Plan
 
-1. Merge retrain commit, retaining sample-based console/TB/checkpoint progress and cooperative handoff plus embedding supervision.
-2. Keep both durable changelog/spec additions. Replace active task documents for this integration.
-3. Derive a separate embedding config from train_s1a_nml_8gpu_fast.json; change only run name, embedding settings and matching train/test normals paths. Verify local metadata and data globs.
-4. Run CPU embedding, sample-progress, accumulation and cooperative regression tests. Add sample-progress checkpoint coverage for shared snapshot helpers.
+Default run_training to cooperative mode; add explicit --unmanaged testing/debug opt-out and reject contradictory socket/auxiliary flags. Use one shared default socket helper in gpu_manager CLI and training settings; explicit CLI socket overrides config socket, which overrides the default. Keep errors fatal (no unmanaged fallback). Make the named profiling harness explicitly opt out. Update production docs to omit socket flags except for overrides. Include gpu_manager source in PYTHONPATH; report the current embedding config's missing request/calibration. No GPU runs.
 
 ## Spec update
-Preserve both merged contracts; cumulative sample counts also survive RAM handoff. No loss, scheduling or precision changes.
+Managed-by-default production entry point, explicit testing opt-out, shared default socket. No protocol or numerical changes.
 
 ## Docs updates
-Document exact embedding config/command and LR caveat. Keep retraining and embedding docs.
+Update local_fiber_embeddings, training_s1a_8gpu_retrain, cooperative_training, code_structure and historical profiling notice. Keep task log/status accurate.
+
+## Testing
+
+Global-path refinement: prefer /run/villa-gpu-manager/manager.sock if a bounded
+connect-only probe succeeds or the nearest existing parent is writable/searchable;
+otherwise choose the home path. Do not create directories during selection. Keep
+explicit socket overrides and never retry another manager after authorization or
+protocol failure. Retain server ownership/group protections. Test live sockets,
+stale/non-socket entries, writable global creation location and private fallback.
+CPU tests for default dispatch, explicit opt-out, invalid combinations, error propagation and socket precedence; existing cooperative and embedding tests. Check CLI help, snippets and diff whitespace.
 
 ## Changelog
-Record integration and tested launch config. No GPU benchmark or training run in this task.
+Document corrected manager-only production launch and outstanding embedding calibration.

@@ -1,9 +1,11 @@
-# Integration log
+# Manager-only launch documentation
 
-- Source branch is fiber-training-retrain, commit 32d92bb0a. Merge conflicts affect task documents and train.py progress/checkpoint paths. Retain shared checkpoint helpers and cooperative test/handoff handling; add sample-progress fields at their shared call sites.
-- LR 0.01 was the recorded short-run choice before global normalization and embedding supervision, not a proven embedding optimum. No GPU runs planned.
-- Independent review approved the plan and caught two integration edges: RAM handoff must not reapply a disk-resume sample override; the benchmark metric parser must accept embedding fields. Both corrected.
-- CPU embedding/sample-progress/accumulation tests: 43 passed, 12 GPU tests skipped. The legacy direction-only test fixture explicitly filled every new embedding field with a differentiable zero; corrected it to leave unused embedding fields at their defaults.
-- Local config parses; train/test globs resolve 8 NML files and 1 JSON. All three local normals arrays have shape (4737,2044,2044), base shape (75784,32693,32693). No data download or GPU training performed; real embedding GPU memory/performance remains unmeasured.
-- Cooperative test expectation changed from update steps [1,2,3] to sample steps [5,10,15]; added assertions for sample metadata across cohort handoff.
-- Final cooperative suite: 6 passed, 1 GPU-dependent skip. Total targeted validation: 49 passed, 13 skipped; git diff --check clean.
+The prior embedding command bypassed the manager. The supplied embedding config has no training.cooperative request or measured calibration. The manager CLI is not installed in the venv; its source module can run using PYTHONPATH. This task updates guidance without inventing memory estimates, launching GPU jobs, or changing internal test launchers.
+
+- User expanded scope: implemented managed-by-default run_training and explicit --unmanaged opt-out. Shared default socket helper preserves the existing path; config/CLI overrides remain. The explicit profiling harness now passes --unmanaged; internal cohort training primitives are unchanged.
+- Independent review approved the design; updated the stale torchrun recommendation in errors, retained fatal missing-calibration errors, and tested auxiliary prefetch dispatch.
+- CPU suite (managed launch, calibration, cooperative integration, embeddings): 47 passed, 1 GPU skip in 18.22s. After adding auxiliary dispatch coverage, focused launch/calibration tests: 15 passed in 1.69s (48 distinct passing tests total). CLI --help and git diff --check passed.
+- No GPU execution or service startup. The real embedding config still requires a complete request and configuration-matched measured calibration; this is documented, not replaced with invented values. Previous seed fix remains in this uncommitted worktree.
+
+- User refined socket policy: shared helper now prefers /run/villa-gpu-manager/manager.sock if a listener is reachable (100ms connect-only probe) or its creation location is writable/searchable; otherwise home path. No filesystem creation during selection, no task registration, no postselection fallback. Server group/UID/ownership checks unchanged.
+- Review caught inaccessible-parent OSError handling and eager CLI probing despite explicit overrides; both fixed and covered. Final socket/launch/calibration tests: 22 passed. No server startup or permission changes performed.

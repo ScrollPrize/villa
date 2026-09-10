@@ -46,8 +46,14 @@ villa-gpu-manager override set split.json --until-task TASK_UUID
 villa-gpu-manager override clear
 ```
 
-`--socket PATH` is a global option (before the command). Default:
-`~/.local/run/villa-gpu-manager/manager.sock`. Its directory must be private and
+`--socket PATH` is a global option (before the command). Server and training
+clients prefer `/run/villa-gpu-manager/manager.sock` when a listener is reachable
+there or its location is writable/searchable (including a writable ancestor from
+which the directory can be created). Otherwise they use
+`~/.local/run/villa-gpu-manager/manager.sock`. Selection creates no directories
+and makes at most a 100ms connect-only probe; the normal handshake still enforces
+protocol and UID authorization. Errors after selection do not cause fallback.
+Explicit paths override selection. Its directory must be private and
 owned by the server user. For explicit cross-user cooperation, preconfigure a
 shared group directory with sticky mode `1770` and use `--shared-group --allow-uid UID`; granting control
 over other clients additionally requires `--controller-uid UID`. No sudo is used.

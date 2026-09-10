@@ -14,10 +14,38 @@ LR warms to 0.01 over 100 updates. This was the prior short-run recommendation,
 not a retuned optimum for embedding loss. Do not resume a legacy non-embedding
 checkpoint. GPU memory and throughput with embeddings remain unmeasured.
 
-From any directory, after ensuring all eight GPUs are available:
+Production training must use the cooperative manager. Do not launch with
+`torchrun`: the CPU supervisor starts and reconfigures GPU workers itself.
+
+**Setup is not complete for this config:** add `training.cooperative.request`
+and a measured `training.cooperative.memory_calibration` following
+[managed setup and calibration](cooperative_training.md#managed-launch).
+The current JSON contains neither. Calibration must cover this embedding model
+and the requested GPU count; old non-embedding measurements cannot be reused.
+Start or connect to the manager controlling those GPUs. Default socket selection does
+not supply the missing request/calibration, and the launcher fails explicitly.
+
+Once those prerequisites are complete, run from any directory:
 
 ```bash
-PYTHONPATH=/home/hendrik/villa/vesuvius/src:/home/hendrik/villa/vesuvius:/home/hendrik/villa CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1 /home/hendrik/.venv_las/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_embedding_16x8.json
+export PYTHONPATH=/home/hendrik/villa/gpu_manager/src:/home/hendrik/villa/vesuvius/src:/home/hendrik/villa/vesuvius:/home/hendrik/villa
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
+
+/home/hendrik/.venv_las/bin/python -m vesuvius.neural_tracing.fiber_trace_3d.train \
+  /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_embedding_16x8.json
+```
+
+The manager chooses physical GPU UUIDs and measured microbatch sizes; global
+batch remains 128 through accumulation. Do not force a static eight-rank launch.
+The default socket is `/run/villa-gpu-manager/manager.sock` if its location is
+writable/searchable or a listener is reachable, otherwise
+`~/.local/run/villa-gpu-manager/manager.sock`;
+`--manager-socket` is only needed to override it. Only explicit `--unmanaged`
+may bypass the manager for testing/debug; it is not a production command.
+With the PYTHONPATH above, query the existing manager without installing anything:
+
+```bash
+/home/hendrik/.venv_las/bin/python -m villa_gpu_manager.cli status
 ```
 
 Output: `/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_embedding_128_sd1_16x8_<timestamp>`.
@@ -42,14 +70,8 @@ normals are errors, not spherical/uniform fallbacks. Relative paths resolve agai
 the training config. No normals download convention or cache format was added:
 the existing Lasagna channel loader opens and caches these channels.
 
-Run with the existing training command and the modified config, for example:
-
-```bash
-/home/hendrik/.venv_las/bin/python -m torch.distributed.run --nproc-per-node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train /path/to/training-config.json
-```
-
-Choose available GPUs explicitly as usual. This command was **not** run as part
-of CPU validation. Cooperative training still requires a fresh matching memory
+Use the managed launch above with the modified config. It was **not** run as part
+of CPU validation. Cooperative training requires a fresh matching memory
 calibration: the extra output channels, pair graph and two extra FP32 gradient
 banks change its memory footprint. Existing checkpoints without an embedding head
 cannot be strictly resumed into the new head; ordinary legacy configs still work.
@@ -83,7 +105,9 @@ bounded shared slots and the existing pinned/CUDA preparation path. A conservati
 midpoint spatial index accelerates exact nearest-segment projection; unresolved
 cases use the bounded scan, not an approximate nearest-vertex assignment. Pair
 sampling, embedding lookup, FP32 cosine arithmetic and gradients run on the model
-device. U-Net AMP policy is unchanged. Stream-seeded sampling is stable under
+device. U-Net AMP policy is unchanged. The loader's 128-bit stream seed is
+reduced modulo `2**63 - 1` at the PyTorch generator boundary, matching the
+existing augmentation convention. Stream-seeded sampling is stable under
 microbatch/rank repartition for identical predictions; floating-point changes to
 presence can still change stochastic choices near a sampling boundary.
 

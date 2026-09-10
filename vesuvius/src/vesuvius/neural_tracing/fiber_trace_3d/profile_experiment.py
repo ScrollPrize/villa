@@ -748,7 +748,7 @@ def main():
                TRITON_CACHE_DIR=str(args.output.resolve() / "triton_cache"))
     command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
                f"--nproc_per_node={world_size}", "-m", "vesuvius.neural_tracing.fiber_trace_3d.train",
-               str(config_path)]
+               str(config_path), "--unmanaged"]
     metadata = {"command": command, "start_unix": time.time(),
                 "cuda_visible_devices": env["CUDA_VISIBLE_DEVICES"],
                 "world_size": world_size,
