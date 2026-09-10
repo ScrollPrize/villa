@@ -6,6 +6,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import wraps
 import json
+import itertools
+import mmap
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
@@ -281,6 +283,21 @@ class _MmapBandDescriptor:
 	paths: tuple[str, ...]
 	shape_zyx: tuple[int, int, int]
 	dtype: str = "float32"
+	chunk_side: int = 0  # zero: existing circular-Z layout; positive: full-volume bricks
+	prefault: bool = False
+
+	def __post_init__(self):
+		if self.chunk_side < 0:
+			raise ValueError("negative mmap chunk side")
+		if self.prefault and not self.chunk_side:
+			raise ValueError("writable prefault requires chunk-major layout")
+
+	@property
+	def storage_shape(self) -> tuple[int, ...]:
+		if not self.chunk_side:
+			return self.shape_zyx
+		b = self.chunk_side
+		return tuple((n + b - 1) // b for n in self.shape_zyx) + (b, b, b)
 
 	@property
 	def ring_depth(self) -> int:
@@ -611,6 +628,23 @@ def _downscaled_tile_clip(local_pos: int, sd: int, tile_down: int, out_size: int
 	src0 = max(0, -start)
 	src1 = src0 + (dst1 - dst0)
 	return dst0, dst1, src0, src1
+
+
+def blend_ramp(length: int, border: int, overlap: int) -> np.ndarray:
+	"""Shared tile blend weights for sequential and arbitrary-demand admission."""
+	pad = max(0, int(border))
+	ramp = np.zeros(length, dtype=np.float32)
+	core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
+	core_len = core_end - core_start
+	if core_len <= 0:
+		return ramp
+	core = np.ones(core_len, dtype=np.float32)
+	ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
+	if ov:
+		edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
+		core[:ov], core[-ov:] = edges, edges[::-1]
+	ramp[core_start:core_end] = core
+	return ramp
 
 
 def _build_tile_positions(size: int, tile: int, stride: int) -> list[int]:
@@ -1009,7 +1043,10 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 		if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
 			shutil.copy2(zarray_src, zarray_dst)
 
-		tmp_arr = zarr.open(tmp_path, mode="r+")
+		# Persist computed fill chunks too: absence is not durable completion.
+		write_options = ({"config": {"write_empty_chunks": True}}
+			if int(zarr.__version__.split(".")[0]) >= 3 else {"write_empty_chunks": True})
+		tmp_arr = zarr.open(tmp_path, mode="r+", **write_options)
 		tmp_arr[z0:z1, y0:y1, x0:x1] = data
 
 		for cz in range(z0, z1, chunk_size):
@@ -2178,6 +2215,52 @@ def _limit_native_worker_threads():
 		return None
 
 
+def _mmap_populate_write_advice():
+	if not sys.platform.startswith("linux") or not hasattr(mmap.mmap, "madvise"):
+		raise RuntimeError("accumulator prefault requires Linux MADV_POPULATE_WRITE support")
+	# Linux UAPI value; Python builds against older headers may omit the name.
+	return getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+def _prefault_mmap_brick(array, view, descriptor):
+	"""Populate one whole writable brick once per owner mapping; timed with its add."""
+	brick_bytes = descriptor.chunk_side ** 3 * array.dtype.itemsize
+	offset = view.__array_interface__["data"][0] - array.__array_interface__["data"][0]
+	offset = offset // brick_bytes * brick_bytes
+	seen = getattr(array, "_demand_prefaulted_offsets", None)
+	if seen is None:
+		seen = array._demand_prefaulted_offsets = set()
+	if offset in seen:
+		return
+	start = offset // mmap.PAGESIZE * mmap.PAGESIZE
+	end = min(array.nbytes, ((offset + brick_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE)
+	# Full files use offset=0; the view can cover only a small part of the brick.
+	if array.offset != 0:
+		raise ValueError("prefault requires a zero-offset full-file mmap")
+	try:
+		array._mmap.madvise(_mmap_populate_write_advice(), start, end - start)
+	except OSError as error:
+		raise RuntimeError(f"MADV_POPULATE_WRITE failed for accumulator brick: {error}") from error
+	seen.add(offset)  # Failed/partial advice must not suppress a retry.
+
+
+def _chunk_major_views(array, descriptor, bounds):
+	"""Yield 3D brick views and matching region-relative slices, shared by read/add."""
+	b = descriptor.chunk_side
+	starts, stops = bounds[::2], bounds[1::2]
+	if b <= 0 or any(not 0 <= lo <= hi <= n for lo, hi, n in zip(starts, stops, descriptor.shape_zyx)):
+		raise ValueError("invalid chunk-major region")
+	if any(lo == hi for lo, hi in zip(starts, stops)):
+		return
+	for index in itertools.product(*(range(lo // b, (hi - 1) // b + 1) for lo, hi in zip(starts, stops))):
+		origin = tuple(i * b for i in index)
+		lo = tuple(max(a, o) for a, o in zip(starts, origin))
+		hi = tuple(min(a, o + b) for a, o in zip(stops, origin))
+		local = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, origin))
+		relative = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, starts))
+		yield array[index + local], relative
+
+
 def _read_mmap_band_chunk(
 	descriptor: _MmapBandDescriptor,
 	channel: int,
@@ -2189,10 +2272,14 @@ def _read_mmap_band_chunk(
 	if arr is None:
 		arr = np.memmap(
 			path, dtype=np.dtype(descriptor.dtype), mode="r",
-			shape=descriptor.shape_zyx,
+			shape=descriptor.storage_shape,
 		)
 		cache[path] = arr
 	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
+	if descriptor.chunk_side:
+		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
+			out[relative] = view
+		return out
 	offset = 0
 	logical = int(z0)
 	while logical < int(z1):
@@ -2221,7 +2308,12 @@ def _accumulator_native_module():
 def _add_accumulator_view(destination: np.ndarray, source: np.ndarray) -> str:
 	"""Add float32 source into an f16/f32 destination, using native code when installed."""
 	module = _accumulator_native_module()
-	if module:
+	if module and destination.strides[-1] == destination.dtype.itemsize:
+		# Pyramid downsampling can return a strided X view. The native kernel
+		# accepts strided Z/Y rows, but requires contiguous values within X.
+		# Copying the source preserves exact values and per-add f16 rounding.
+		if source.strides[-1] != source.dtype.itemsize:
+			source = np.ascontiguousarray(source)
 		module.add_inplace(destination, source)
 		return str(module.backend())
 	# NumPy is the portable no-extension fallback.  For float16 destinations it
@@ -2240,8 +2332,15 @@ def _add_mmap_band_chunk(
 	path = descriptor.paths[int(channel)]
 	arr = cache.get(path)
 	if arr is None:
-		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.shape_zyx)
+		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.storage_shape)
 		cache[path] = arr
+	if descriptor.chunk_side:
+		backend = "numpy"
+		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
+			if descriptor.prefault:
+				_prefault_mmap_brick(arr, view, descriptor)
+			backend = _add_accumulator_view(view, source[relative])
+		return backend
 	offset = 0
 	logical = int(z0)
 	backend = "numpy"
@@ -2264,6 +2363,31 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	return int(value % int(worker_count))
 
 
+def _execute_accumulate_process_task(task, shms, mmaps) -> str:
+	"""Shared task executor for whole-volume and demand accumulation workers."""
+	shm = shms.get(task.result_spec.shm_name)
+	if shm is None:
+		shm = _attach_shared_memory(task.result_spec.shm_name)
+		shms[task.result_spec.shm_name] = shm
+	layouts = {layout.name: layout for layout in task.result_spec.layouts}
+	lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
+	pz0, pz1, py0, py1, px0, px1 = task.source
+	weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+	backend = _add_mmap_band_chunk(
+		task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
+	)
+	accumulators = dict(task.accumulators)
+	for name in task.dirty_products:
+		product = _slot_array(shm, layouts[f"product:{name}"])
+		for channel in range(int(product.shape[0])):
+			backend = _add_mmap_band_chunk(
+				accumulators[name], channel,
+				lz0, lz1, ly0, ly1, lx0, lx1,
+				product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
+			)
+	return backend
+
+
 def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> None:
 	_native_limits = _limit_native_worker_threads()
 	shms: dict[str, shared_memory.SharedMemory] = {}
@@ -2275,26 +2399,7 @@ def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> Non
 				break
 			started = time.perf_counter()
 			try:
-				shm = shms.get(task.result_spec.shm_name)
-				if shm is None:
-					shm = _attach_shared_memory(task.result_spec.shm_name)
-					shms[task.result_spec.shm_name] = shm
-				layouts = {layout.name: layout for layout in task.result_spec.layouts}
-				lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
-				pz0, pz1, py0, py1, px0, px1 = task.source
-				weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
-				backend = _add_mmap_band_chunk(
-					task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
-				)
-				accumulators = dict(task.accumulators)
-				for name in task.dirty_products:
-					product = _slot_array(shm, layouts[f"product:{name}"])
-					for channel in range(int(product.shape[0])):
-						backend = _add_mmap_band_chunk(
-							accumulators[name], channel,
-							lz0, lz1, ly0, ly1, lx0, lx1,
-							product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
-						)
+				backend = _execute_accumulate_process_task(task, shms, mmaps)
 				result_queue.put((
 					"result", task.task_id, task.event_seq, worker_index, backend,
 					time.perf_counter() - started,
@@ -2438,11 +2543,20 @@ def _multi_gpu_worker_main(
 			task = work_queue.get()
 			if task is None:
 				break
-			seq, coord, input_slot, result_slot, needed_names = task
+			seq, coord, input_slot, result_slot, needed_names = task[:5]
 			started = time.perf_counter()
 			try:
 				profile = {} if profile_pipeline else None
 				input_layout = input_specs[input_slot].layouts[0]
+				if len(task) == 6:
+					# Demand mode can mix uint8/uint16 sources while retaining a
+					# single persistent model and descriptor-only work queue.
+					input_dtype = np.dtype(task[5])
+					if input_dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+						raise TypeError("unsupported demand tile dtype")
+					input_layout = replace(input_layout, dtype=input_dtype.str)
+					if input_layout.offset + input_layout.nbytes > input_specs[input_slot].nbytes:
+						raise ValueError("demand tile exceeds its shared slot")
 				tile_np = _slot_array(inputs[input_slot], input_layout)
 				cuda_events = {}
 				if profile is not None and device.type == "cuda":
@@ -2715,21 +2829,7 @@ def run_tiled_inference_3d(
 		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 
-	def _blend_ramp(length: int) -> np.ndarray:
-		ramp = np.zeros(length, dtype=np.float32)
-		core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
-		core_len = core_end - core_start
-		if core_len <= 0:
-			return ramp
-		core = np.ones(core_len, dtype=np.float32)
-		ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
-		if ov:
-			edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
-			core[:ov], core[-ov:] = edges, edges[::-1]
-		ramp[core_start:core_end] = core
-		return ramp
-
-	r = _blend_ramp(int(tile_size))
+	r = blend_ramp(int(tile_size), pad, int(overlap))
 	w_full = None
 	w_native = None
 	w_by_scale = None
