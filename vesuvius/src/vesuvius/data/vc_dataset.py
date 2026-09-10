@@ -46,6 +46,9 @@ class VCDataset(Dataset):
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
             read_retries: int = 4,  # Attempts per read, forwarded to Volume
+            cache: bool = False,  # In-memory chunk cache, forwarded to Volume
+            chunk_cache_dir: Optional[Union[str, os.PathLike]] = None,  # On-disk chunk cache
+            chunk_cache_max_gb: Optional[float] = None,  # Size cap for the disk cache
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -87,6 +90,13 @@ class VCDataset(Dataset):
             read_retries: Attempts per read, forwarded to Volume (default 4). Transient
                 remote failures are retried with exponential backoff so one dropped
                 connection does not abort a long streaming run. Pass 1 to disable.
+            cache: Keep an in-memory chunk cache for the life of the process.
+            chunk_cache_dir: Directory for an on-disk chunk cache, reused by later
+                runs and by other processes. Remote volumes only.
+            chunk_cache_max_gb: Size cap in GiB for the disk cache. Unbounded if
+                omitted. Eviction only sweeps a directory the cache created or that
+                carries its stamp file, so give the cache a directory of its own if
+                you want the cap enforced.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -233,6 +243,9 @@ class VCDataset(Dataset):
                 path=use_path,
                 anon=self.anon,
                 read_retries=read_retries,
+                cache=cache,
+                chunk_cache_dir=chunk_cache_dir,
+                chunk_cache_max_gb=chunk_cache_max_gb,
             )
 
             # Get shape and dtype from the primary resolution level (0)
