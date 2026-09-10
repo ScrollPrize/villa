@@ -43,9 +43,15 @@ public:
     }
 
     ~ThreadPool() {
-        // Request stop on all jthreads (auto-joined on destruction).
-        for (auto& w : workers_)
-            w.request_stop();
+        {
+            // Serialize the stop transition with the worker wait predicate.
+            // Otherwise notify_all() can land after a worker's predicate check
+            // but before it has entered the condition-variable wait, and the
+            // jthread join below never returns.
+            std::lock_guard lk(mu_);
+            for (auto& w : workers_)
+                w.request_stop();
+        }
         cv_.notify_all();
         // jthread destructors join here.
     }
@@ -229,8 +235,12 @@ public:
     }
 
     ~PriorityThreadPool() {
-        for (auto& w : workers_)
-            w.request_stop();
+        {
+            // Same lost-wakeup guard as ThreadPool::~ThreadPool().
+            std::lock_guard lk(mu_);
+            for (auto& w : workers_)
+                w.request_stop();
+        }
         cv_.notify_all();
     }
 
