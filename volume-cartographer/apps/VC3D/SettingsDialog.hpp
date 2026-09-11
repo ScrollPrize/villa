@@ -2,7 +2,6 @@
 
 #include "ui_VCSettings.h"
 #include <QStringList>
-#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -30,7 +29,6 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
         void setupCacheActionControls();
 
         std::shared_ptr<VolumePkg> _volumePackage;
-        std::filesystem::path _activeRemoteCacheRoot;
         QComboBox* _outputSegmentsCombo{nullptr};
         QCheckBox* _remoteCacheDelta3dCheckBox{nullptr};
         bool _outputSegmentsChanged{false};

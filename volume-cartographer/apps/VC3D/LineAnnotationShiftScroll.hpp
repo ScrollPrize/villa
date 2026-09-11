@@ -89,10 +89,12 @@ inline double shiftedLinePositionByArclength(double currentPosition,
                       maxLinePosition);
 }
 
-inline cv::Vec3f shiftedPlaneOriginAlongNormal(const cv::Vec3f& currentOrigin,
+// Translates a cut plane origin `distanceVx` voxels along `planeNormal`
+// (any length, sign preserved). Returns the origin unchanged on degenerate
+// input.
+inline cv::Vec3f planeOriginShiftedAlongNormal(const cv::Vec3f& currentOrigin,
                                                const cv::Vec3f& planeNormal,
-                                               int scrollSteps,
-                                               int viewerSliceStepSize)
+                                               double distanceVx)
 {
     const float n = cv::norm(planeNormal);
     if (!std::isfinite(currentOrigin[0]) ||
@@ -101,11 +103,63 @@ inline cv::Vec3f shiftedPlaneOriginAlongNormal(const cv::Vec3f& currentOrigin,
         !std::isfinite(planeNormal[0]) ||
         !std::isfinite(planeNormal[1]) ||
         !std::isfinite(planeNormal[2]) ||
+        !std::isfinite(distanceVx) ||
         n <= 1.0e-6f) {
         return currentOrigin;
     }
-    const float delta = static_cast<float>(scrollSteps * shiftScrollLineStepSize(viewerSliceStepSize));
-    return currentOrigin + planeNormal * (delta / n);
+    return currentOrigin + planeNormal * (static_cast<float>(distanceVx) / n);
+}
+
+// Side-cut Shift+wheel: one notch moves the plane one voxel (times the slice
+// step size) along its normal.
+inline cv::Vec3f shiftedPlaneOriginAlongNormal(const cv::Vec3f& currentOrigin,
+                                               const cv::Vec3f& planeNormal,
+                                               int scrollSteps,
+                                               int viewerSliceStepSize)
+{
+    return planeOriginShiftedAlongNormal(
+        currentOrigin,
+        planeNormal,
+        static_cast<double>(scrollSteps * shiftScrollLineStepSize(viewerSliceStepSize)));
+}
+
+// Sign of the straight-ahead translation along the current cut's plane normal.
+// The normal is the DISPLAY tangent (geometric tangent times the per-fiber
+// display sign) and may be manually rotated, so it can point toward decreasing
+// line position; `ahead` is the raw toward-increasing-position tangent at the
+// marker. Once a gesture is under way (`gestureActive`) the sign chosen at its
+// first notch is kept: the plane slides along a fixed normal while the marker
+// walks a model line that may curve past a quarter turn, and a sign recomputed
+// per wheel event would make the plane's travel depend on how the notches were
+// batched (two +1 events vs one +2) and reverse mid-gesture.
+inline double straightAheadDirection(const cv::Vec3f& planeNormal,
+                                     const cv::Vec3f& ahead,
+                                     bool gestureActive,
+                                     double lockedDirection)
+{
+    if (gestureActive && (lockedDirection == 1.0 || lockedDirection == -1.0)) {
+        return lockedDirection;
+    }
+    return planeNormal.dot(ahead) < 0.0f ? -1.0 : 1.0;
+}
+
+// Current-cut Ctrl+Shift+wheel ("straight ahead"): the plane travels the
+// arclength the current-position marker actually advanced between
+// `fromPosition` and `toPosition` (signed, so a notch clamped at a line end
+// moves the plane only as far as the marker got), which keeps the two
+// coincident on a straight stretch of a correct model. Without a usable
+// arclength map the marker does not move (the dialog passes an empty map and
+// shiftedLinePositionByArclength returns the position unchanged), and neither
+// does the plane: 0.
+inline double straightAheadDistanceForShiftScroll(double fromPosition,
+                                                  double toPosition,
+                                                  const std::vector<double>& cumulativeArclengths)
+{
+    if (!lineArclengthsUsable(cumulativeArclengths)) {
+        return 0.0;
+    }
+    return vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, toPosition) -
+           vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, fromPosition);
 }
 
 inline double bottomCrossSliceLinePosition(double centerPosition,

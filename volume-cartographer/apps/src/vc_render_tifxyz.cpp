@@ -26,6 +26,7 @@
 #include <set>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <thread>
 #include <optional>
@@ -43,7 +44,9 @@ using Json = utils::Json;
 static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
 static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
-static std::atomic<bool> g_logRunning{false};
+static bool g_logRunning = false;      // protected by g_logFlushMutex
+static std::mutex g_logFlushMutex;
+static std::condition_variable g_logFlushWake;
 static std::thread g_logFlushThread;
 
 // Log to file if active, otherwise to the given default stream.
@@ -68,10 +71,14 @@ static void logPrintf(FILE* defaultStream, const char* fmt, ...)
 static void startLogFlusher()
 {
     if (!g_logFile) return;
-    g_logRunning = true;
+    {
+        std::lock_guard<std::mutex> lock(g_logFlushMutex);
+        g_logRunning = true;
+    }
     g_logFlushThread = std::thread([] {
-        while (g_logRunning) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::unique_lock<std::mutex> lock(g_logFlushMutex);
+        while (!g_logFlushWake.wait_for(lock, std::chrono::seconds(5),
+                                       [] { return !g_logRunning; })) {
             if (g_logFile) std::fflush(g_logFile);
         }
     });
@@ -79,7 +86,13 @@ static void startLogFlusher()
 
 static void stopLogFlusher()
 {
-    g_logRunning = false;
+    {
+        // Change the predicate under the wait's mutex so a stop notification
+        // cannot be lost between checking the flag and entering the wait.
+        std::lock_guard<std::mutex> lock(g_logFlushMutex);
+        g_logRunning = false;
+    }
+    g_logFlushWake.notify_one();
     if (g_logFlushThread.joinable()) g_logFlushThread.join();
     if (g_logFile) { std::fflush(g_logFile); std::fclose(g_logFile); g_logFile = nullptr; }
 }
@@ -1199,6 +1212,10 @@ int main(int argc, char *argv[])
     }
 
     // --- Log path setup ---
+    // Join the flush thread and preserve buffered diagnostics on every return.
+    struct LogFlusherGuard {
+        ~LogFlusherGuard() { stopLogFlusher(); }
+    } logFlusherGuard;
     if (parsed.count("log-path")) {
         const auto& logPath = parsed["log-path"].as<std::string>();
         g_logFile = std::fopen(logPath.c_str(), "a");
@@ -1719,9 +1736,9 @@ int main(int argc, char *argv[])
                 return p;
             };
 
-            // Skip if all exist
+            // Skip existing TIFFs only when explicitly resuming.
             bool tifSkip = false;
-            if (numParts <= 1) {
+            if (resumeFlag && numParts <= 1) {
                 bool all = true;
                 for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
                 if (all) {
@@ -1894,6 +1911,5 @@ int main(int argc, char *argv[])
     if (useRemoteCache && ownedChunkCache && ownedChunkCache->stats().persistentCacheEnabled)
         ownedChunkCache->waitForPendingChunks();
 
-    stopLogFlusher();
     return EXIT_SUCCESS;
 }
