@@ -1048,6 +1048,56 @@ TEST_CASE("ChunkCacheService handle destruction removes only its listeners")
     CHECK(callbacks.load() == 0);
 }
 
+TEST_CASE("ChunkCache shutdown drain waits for queued requests and persisted bytes")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+                     ("vc_chunk_drain_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    {
+        auto service = makeService(1024 * 1024, 1);
+        auto fetcher = std::make_shared<MultiBlockingFetcher>();
+        auto cache = makePersistentServiceCache(service, "drain", fetcher, dir);
+        std::future<void> drained;
+        FetcherReleaseGuard releaseGuard(*fetcher);
+        std::vector<ChunkKey> keys;
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x)
+                    keys.push_back({0, z, y, x});
+        cache->prefetchChunks(keys, false);
+        REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds(2)));
+        drained = std::async(std::launch::async, [&] { cache->waitForPendingChunks(); });
+        CHECK(drained.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+        fetcher->release();
+        REQUIRE(drained.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        drained.get();
+        for (const auto& key : keys) {
+            CHECK(fetcher->calls(key) == 1);
+            const auto path = dir / "level_0" / std::to_string(key.iz) /
+                              std::to_string(key.iy) / (std::to_string(key.ix) + ".bin");
+            CHECK(readTestBytes(path) == makeBytes(64, std::byte{17}));
+        }
+        CHECK(cache->activeRemoteFetches().empty());
+        // A second drain is an immediate no-op once requests are complete.
+        cache->waitForPendingChunks();
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache shutdown drain accepts terminal fetch errors")
+{
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult failed;
+    failed.status = ChunkFetchStatus::HttpError;
+    failed.httpStatus = 500;
+    fetcher->setCanned({0, 0, 0, 0}, failed);
+    auto cache = makeCache(fetcher);
+    cache->prefetchChunks({{0, 0, 0, 0}}, false);
+    cache->waitForPendingChunks();
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Error);
+}
+
 TEST_CASE("ChunkCache reports source-qualified remote fetch start and stop")
 {
     std::mt19937_64 rng(std::random_device{}());

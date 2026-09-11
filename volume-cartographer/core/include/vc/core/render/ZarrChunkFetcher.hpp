@@ -90,10 +90,16 @@ std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,
     int firstLevel);
 
+// persistentCachePath mirrors fetched objects under that directory, exactly as
+// Volume::createChunkCacheConfigured does for VC3D. Callers that open a remote
+// pyramid directly rather than through Volume otherwise re-download every chunk
+// on each run.
+// The path must be absolute and specific to the source and its base scale.
 std::unique_ptr<ChunkCache> createChunkCache(
     OpenedChunkedZarr opened,
     std::size_t decodedByteCapacity,
-    std::size_t maxConcurrentReads = 16);
+    std::size_t maxConcurrentReads = 16,
+    std::optional<std::filesystem::path> persistentCachePath = std::nullopt);
 
 // Wrap an already-open scalar 3D Zarr array in the same decoded cache and
 // process-wide threaded reader used by VC3D volume rendering.
