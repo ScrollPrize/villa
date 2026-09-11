@@ -57,6 +57,7 @@ for path in sorted((root/'cases').glob('*/trace.json')):
 assert seen == set(case_lookup) and len(seen)==100
 def aggregate(rows):
     failed=[x for r in rows for x in r['failed_mm']]
+    percentiles=statistics.quantiles(failed, n=100, method='inclusive')
     physical=[x for r in rows for x in r['physical_failed_mm']]
     all_physical=[x for r in rows for x in r['physical_all_mm']]
     n=len(failed); length=sum(r['reference_mm'] for r in rows)
@@ -67,6 +68,8 @@ def aggregate(rows):
         directed_reference_mm=length, credited_mm=credit,
         failed_span_sum_mm=sum(failed), mean_before_restart_mm=statistics.mean(failed),
         median_before_restart_mm=statistics.median(failed),
+        p05_before_restart_mm=percentiles[4],
+        p95_before_restart_mm=percentiles[94],
         mean_all_attempts_including_terminal_and_zero_mm=credit/(n+len(rows)),
         mean_positive_seeded_span_mm=credit/sum(r['seeded'] for r in rows),
         corpus_reliability_mm=length/(n+1),

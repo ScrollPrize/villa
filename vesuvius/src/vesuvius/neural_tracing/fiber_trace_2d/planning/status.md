@@ -1,7 +1,11 @@
-# Saved-result analysis status
+# Collection snapshot evaluation status
 
-- [x] Commit completed native, inference and integration work.
-- [x] Read task/workflow and relevant specs; write analysis plan.
-- [x] Independent plan and metric review; all per-scroll/global means reproduced.
-- [x] Validate all 100 saved artifacts and aggregate without rerun.
-- [x] Record report, machine-readable results and read-only reproduction script.
+- [x] Read workflow/task and relevant output-stride specs.
+- [x] Locate best snapshot; user confirms full5scroll/50fiber/100direction cohort.
+- [x] Write plan.
+- [x] Independent plan review passed; missing batched native-stride coverage identified.
+- [x] Save classic percentile baseline and GT-heading follow-up; commit before running new evaluation.
+- [ ] Verify native stride4 batching and focused tests.
+- [ ] Prepare/validate fresh full workload through approved runner.
+- [ ] Complete exclusive8GPU full evaluation.
+- [ ] Analyze/log comparable results and completion.

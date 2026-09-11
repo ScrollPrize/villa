@@ -1,5 +1,14 @@
 # Native 3D Trace2CP Benchmarks
 
+## Current full five-scroll native/live benchmark
+
+- 2026-09-11: [classic full50fiber/100direction baseline, percentiles, committed implementation, data/checkpoint and exact command](benchmarks/classic_full_5scroll_20260911.md).
+  Mean before restart3.427927mm, median0.179913mm, P05/P95 0.001170/17.669912mm;
+  coordinator516.699s with8GPUs. Historical corpus-reliability score4.048877mm is a separate metric.
+  The older paul4 rows below use a different cohort/protocol and are not matched comparisons.
+
+## Historical benchmarks
+
 Wall time is the shell `time` real value. CPU time is `user + sys`. Error rates
 come from the final aggregate tracer output.
 
