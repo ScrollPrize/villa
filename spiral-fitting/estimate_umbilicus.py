@@ -2,11 +2,11 @@
 prediction: at N heights, take the largest connected component of the sheet mask, fill holes, and take the point of the
 distance-to-boundary plateau (within 0.9 of the maximum) that is nearest the centroid of the component, and use that as
 the core; write control points {x,y,z,score} at level 0. The plain argmax of the distance transform is an argmax over a
-wide, nearly flat plateau, so it jumps between lobes from slice to slice; measured against the three published umbilici
-the point of that plateau nearest the centroid is closer on all three scrolls. Pass core=argmax for the previous
-behaviour.
+wide, nearly flat plateau, so it jumps between lobes from slice to slice; measured against the published umbilici of
+PHerc0125, PHerc0211 and PHerc0826 the point of that plateau nearest the centroid is closer on all three. Pass
+core=argmax for the previous behaviour.
 Usage: estimate_umbilicus.py <scroll> <surf_zarr_rel_path/> <out.json> [n_z=12] [core=plateau|argmax]"""
-import sys, json, urllib.request, numpy as np, numcodecs
+import sys, json, urllib.request, urllib.error, numpy as np, numcodecs
 from scipy import ndimage as ndi
 B = "https://vesuvius-challenge-open-data.s3.amazonaws.com/"
 scroll, rel, out = sys.argv[1:4]; n_z = int(sys.argv[4]) if len(sys.argv) > 4 else 12
@@ -19,7 +19,9 @@ def read_slice(level, z):
     for iy in range((shape[1] + cy - 1) // cy):
         for ix in range((shape[2] + cx - 1) // cx):
             try: buf = urllib.request.urlopen(url + f'{level}/{iz}/{iy}/{ix}', timeout=60).read()
-            except Exception: continue
+            except urllib.error.HTTPError as e:
+                if e.code != 404: raise      # 404 is an all-zero chunk zarr never wrote; anything else is a real failure
+                continue
             arr = np.frombuffer(codec.decode(buf) if codec else buf, np.dtype(meta['dtype'])).reshape(chunks)
             y1, x1 = min(shape[1], (iy + 1) * cy), min(shape[2], (ix + 1) * cx)
             outp[iy * cy:y1, ix * cx:x1] = arr[z % cz, :y1 - iy * cy, :x1 - ix * cx]
