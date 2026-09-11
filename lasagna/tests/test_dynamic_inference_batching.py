@@ -26,9 +26,10 @@ def test_ready_batch_never_waits_and_consumes_only_one_sentinel():
 
 
 class BatchIdentityAdapter:
-    def __init__(self, bad_batch=False):
+    def __init__(self, bad_batch=False, native_stride=1):
         self.sizes = []
         self.bad_batch = bad_batch
+        self.native_output_stride = native_stride
 
     def load_model(self, *, device):
         return torch.nn.Identity()
@@ -40,7 +41,9 @@ class BatchIdentityAdapter:
 
     def run_tile_inference(self, model, tile, *, device):
         self.sizes.append(tile.shape[0])
-        return model(tile)[:1] if self.bad_batch else model(tile)
+        stride = self.native_output_stride
+        output = model(tile)[:, :, ::stride, ::stride, ::stride]
+        return output[:1] if self.bad_batch else output
 
     def product_tensors_from_output(self, output):
         return {"identity": output, "double": output * 2}
@@ -52,25 +55,38 @@ def test_batch_distinct_mixed_dtype_tiles_products_and_partial_tail(cap, profile
     _run_worker_fixture(cap, profile)
 
 
+@pytest.mark.parametrize("cap", [1, 3])
+@pytest.mark.parametrize("total_scale", [4, 8])
+@pytest.mark.parametrize("profile", [False, True])
+def test_native_stride4_batch_weight_lattice_and_remaining_downsample(cap, total_scale, profile):
+    _run_worker_fixture(cap, profile, native_stride=4, total_scale=total_scale)
+
+
 def test_bad_output_batch_aborts_without_result_publication():
     _run_worker_fixture(3, False, bad_batch=True)
 
 
-def _run_worker_fixture(cap, profile, bad_batch=False):
-    count, size = 5, 4
+def _run_worker_fixture(cap, profile, bad_batch=False, native_stride=1, total_scale=2):
+    count, size = 5, 2 * total_scale
+    output_size = size // total_scale
+    ramp = np.ones(size, np.float32) if native_stride == 1 else np.linspace(0.25, 1, size, dtype=np.float32)
+    weights = torch.from_numpy(ramp[:, None, None] * ramp[None, :, None] * ramp[None, None, :])
+    native_weights = tiled._pyrdown3d(weights.unsqueeze(0), factor=native_stride).squeeze(0) if native_stride > 1 else weights
+    remaining = total_scale // native_stride
+    expected_weights = tiled._pyrdown3d(native_weights.unsqueeze(0), factor=remaining).squeeze(0) if remaining > 1 else native_weights
     input_layouts, input_bytes = tiled._packed_layouts((("input", (size,) * 3, np.uint16),))
     result_layouts, result_bytes = tiled._packed_layouts((
-        ("weight:2", (2, 2, 2), np.float32),
-        ("product:identity", (1, 2, 2, 2), np.float32),
-        ("product:double", (1, 2, 2, 2), np.float32)))
+        (f"weight:{total_scale}", (output_size,) * 3, np.float32),
+        ("product:identity", (1, output_size, output_size, output_size), np.float32),
+        ("product:double", (1, output_size, output_size, output_size), np.float32)))
     inputs = tiled._create_shared_slots(count, input_bytes)
     results = tiled._create_shared_slots(count, result_bytes)
-    adapter, work, events = BatchIdentityAdapter(bad_batch), queue.Queue(), queue.Queue()
+    adapter, work, events = BatchIdentityAdapter(bad_batch, native_stride), queue.Queue(), queue.Queue()
     expected = []
     try:
         for index in range(count):
             dtype = np.uint8 if index % 2 else np.uint16
-            raw = (np.arange(64).reshape(4, 4, 4) * (index + 1) + 11).astype(dtype)
+            raw = (np.arange(size ** 3).reshape((size,) * 3) * (index + 1) + 11).astype(dtype)
             from dataclasses import replace
             layout = replace(input_layouts[0], dtype=np.dtype(dtype).str)
             tiled._slot_array(inputs[index], layout)[:] = raw
@@ -80,13 +96,14 @@ def _run_worker_fixture(cap, profile, bad_batch=False):
             work.put((index, (index, 0, 0), index, count - 1 - index, (name,), np.dtype(dtype).str))
             converted = tiled._input_tile_to_device(raw, torch.device("cpu"))
             normalized = converted - converted.mean(dim=(2, 3, 4), keepdim=True)
-            product = normalized[0] * (1 if name == "identity" else 2)
-            expected.append((name, tiled._pyrdown3d(product * torch.ones(4, 4, 4), factor=2).numpy()))
+            product = normalized[0, :, ::native_stride, ::native_stride, ::native_stride] * (1 if name == "identity" else 2)
+            weighted = product * native_weights
+            expected.append((name, (tiled._pyrdown3d(weighted, factor=remaining) if remaining > 1 else weighted).numpy()))
         work.put(None)
         input_specs = tuple(tiled._SharedSlotSpec(x.name, input_bytes, input_layouts) for x in inputs)
         result_specs = tuple(tiled._SharedSlotSpec(x.name, result_bytes, result_layouts) for x in results)
-        tiled._multi_gpu_worker_main(0, "cpu", adapter, None, 4, np.ones(4, np.float32),
-            {"identity": 2, "double": 2}, 1, input_specs, result_specs, work, events,
+        tiled._multi_gpu_worker_main(0, "cpu", adapter, None, size, ramp,
+            {"identity": total_scale, "double": total_scale}, native_stride, input_specs, result_specs, work, events,
             profile, cap, True)
         messages = []
         while not events.empty():
@@ -110,8 +127,8 @@ def _run_worker_fixture(cap, profile, bad_batch=False):
             assert returned[index][3] == count - 1 - index
             for layout in result_layouts:
                 output = tiled._slot_array(slot, layout)
-                if layout.name == "weight:2":
-                    np.testing.assert_array_equal(output, np.ones((2, 2, 2)))
+                if layout.name == f"weight:{total_scale}":
+                    np.testing.assert_array_equal(output, expected_weights.numpy())
                 elif layout.name == f"product:{name}":
                     np.testing.assert_array_equal(output, values)
                 else:
