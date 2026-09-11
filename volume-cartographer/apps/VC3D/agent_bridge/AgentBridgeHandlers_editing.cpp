@@ -341,6 +341,29 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         throw AgentBridgeError{-32007, "No active segmentation surface", data};
     }
 
+    if (enabled) {
+        auto surface = std::dynamic_pointer_cast<QuadSurface>(
+            state->surface("segmentation"));
+        if (!surface) {
+            surface = state->activeSurface().lock();
+        }
+        if (surface && !surface->path.empty() &&
+            vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
+            QJsonObject data;
+            data["kind"] = "segment";
+            data["id"] = QString::fromStdString(state->activeSurfaceId());
+            data["path"] = QString::fromStdString(surface->path.string());
+            data["action"] = "segments.create_editable_copy";
+            data["detail"] =
+                "catalog segments are immutable; create and activate an "
+                "editable copy first";
+            throw AgentBridgeError{
+                -32009,
+                "Cannot edit an immutable Open Data catalog segment",
+                data};
+        }
+    }
+
     widget->setEditingEnabled(enabled);
 
     // widget->setEditingEnabled() is silent (never emits editingModeChanged), so
