@@ -12,6 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace, field
 from types import SimpleNamespace
 from .embedding import EmbeddingConfig, EmbeddingGeometry, build_eligibility
+from .arc_sampling import FiberLocation, ScrollArcSampler
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,7 @@ class FiberTrace3DConfig:
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
     config_dir: Path | None = None
+    sampling_strategy: str = "control_points"
 
     @property
     def volume_cache_memory_bytes(self) -> int | None:
@@ -764,6 +766,7 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
             )
     return FiberTrace3DConfig(
        datasets=tuple(dict(entry) for entry in datasets),
+        sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(
@@ -1269,6 +1272,8 @@ def _clip_segment_to_aabb(
 
 
 def _uses_dense_fiber_supervision(record: _Record) -> bool:
+    if record.dataset_config.get("dense_supervision", False):
+        return True
     source_format = str(record.fiber.metadata.get("source_format", "")).lower()
     if source_format == "nml":
         return True
@@ -2023,6 +2028,16 @@ class FiberTrace3DLoader:
             raise ValueError("embedding training requires lasagna_manifest_path for every dataset")
         self._embedding_normal_records = {}
         self.records = self._load_records()
+        if config.sampling_strategy not in {"control_points", "scroll_balanced_arclength"}:
+            raise ValueError("sampling_strategy must be control_points or scroll_balanced_arclength")
+        for record in self.records:
+            if "dense_supervision" in record.dataset_config and type(record.dataset_config["dense_supervision"]) is not bool:
+                raise ValueError("dataset dense_supervision must be a boolean")
+        self._arc_sampler = None
+        if config.sampling_strategy == "scroll_balanced_arclength":
+            if any(not _uses_dense_fiber_supervision(r) for r in self.records):
+                raise ValueError("scroll_balanced_arclength requires dense supervision for every dataset")
+            self._arc_sampler = ScrollArcSampler(self.records)
         self._flat_offsets: list[int] = []
         flat_total = 0
         for record in self.records:
@@ -2170,8 +2185,10 @@ class FiberTrace3DLoader:
         sample_index: int,
         *,
         sample_mode: str = "random",
-    ) -> tuple[_Record, int, int]:
+    ) -> tuple[_Record, int, int | FiberLocation]:
         if sample_mode == "random":
+            if self._arc_sampler is not None:
+                return self._arc_sampler.sample(self._rng(sample_index, "scroll_arclength"))
             return self._descriptor_for_flat_index(self._random_flat_index(sample_index))
         if sample_mode == "flat":
             return self._descriptor_for_flat_index(int(sample_index) % int(self._flat_sample_count))
@@ -2180,19 +2197,24 @@ class FiberTrace3DLoader:
     def _rng(self, sample_index: int, purpose: str) -> np.random.Generator:
         return np.random.default_rng(_stable_seed(self.config.seed, purpose, int(sample_index)))
 
-    def _control_point_volume_zyx(self, record: _Record, cp_index: int) -> np.ndarray:
+    def _control_point_volume_zyx(self, record: _Record, cp_index: int | FiberLocation) -> np.ndarray:
+        if isinstance(cp_index, FiberLocation):
+            return np.asarray(cp_index.xyz[::-1], dtype=np.float64) / float(record.volume_spacing_base)
         cp_zyx_base = np.asarray(record.fiber.control_points_zyx[int(cp_index)], dtype=np.float64)
         return cp_zyx_base / float(record.volume_spacing_base)
 
-    def _line_tangent_volume_zyx(self, record: _Record, cp_index: int) -> np.ndarray:
+    def _line_tangent_volume_zyx(self, record: _Record, cp_index: int | FiberLocation) -> np.ndarray:
         line_points = np.asarray(record.fiber.line_points_zyx, dtype=np.float64) / float(
             record.volume_spacing_base
         )
         if line_points.shape[0] < 2:
             return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        line_index = control_point_line_index(record.fiber, int(cp_index))
-        prev_index = max(0, int(line_index) - 1)
-        next_index = min(int(line_points.shape[0]) - 1, int(line_index) + 1)
+        if isinstance(cp_index, FiberLocation):
+            prev_index, next_index = cp_index.segment_index, cp_index.segment_index + 1
+        else:
+            line_index = control_point_line_index(record.fiber, int(cp_index))
+            prev_index = max(0, int(line_index) - 1)
+            next_index = min(int(line_points.shape[0]) - 1, int(line_index) + 1)
         tangent = line_points[next_index] - line_points[prev_index]
         norm = float(np.linalg.norm(tangent))
         if not math.isfinite(norm) or norm <= 1.0e-12:
@@ -2278,7 +2300,7 @@ class FiberTrace3DLoader:
     def _anisotropic_axis_zyx(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         source_to_output_zyx: np.ndarray,
         rng: np.random.Generator,
     ) -> np.ndarray | None:
@@ -2324,7 +2346,7 @@ class FiberTrace3DLoader:
     def _sample_augment_params(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         sample_index: int,
     ) -> _Augment3DParams:
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.int64)
@@ -2463,7 +2485,7 @@ class FiberTrace3DLoader:
     def _prefetch_source_bbox(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
     ) -> tuple[np.ndarray, np.ndarray]:
         cp = self._control_point_volume_zyx(record, cp_index)
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.float64)
@@ -2497,7 +2519,7 @@ class FiberTrace3DLoader:
     def _prefetch_envelope_bbox_selected(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
     ) -> tuple[int, np.ndarray, np.ndarray]:
         start_selected, end_selected = self._prefetch_source_bbox(record, cp_index)
         selected_shape = np.asarray(
@@ -2776,15 +2798,20 @@ class FiberTrace3DLoader:
     def _line_window_for_labels(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
     ) -> tuple[np.ndarray, int]:
         line_points = np.asarray(record.fiber.line_points_zyx, dtype=np.float64) / float(
             record.volume_spacing_base
         )
-        line_index = control_point_line_index(record.fiber, int(cp_index))
+        line_index = (cp_index.segment_index if isinstance(cp_index, FiberLocation)
+                      else control_point_line_index(record.fiber, int(cp_index)))
         if line_points.shape[0] < 2:
             raise ValueError("fiber line must contain at least two points")
+        if record.dataset_config.get("dense_supervision", False) or isinstance(cp_index, FiberLocation):
+            # Later parts of the same fiber can re-enter the patch. Arc-window
+            # truncation would falsely label them negative.
+            return line_points, line_index
         cumulative = np.concatenate(
             [
                 np.zeros((1,), dtype=np.float64),
@@ -2809,7 +2836,7 @@ class FiberTrace3DLoader:
     def _cp_only_target_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         segment_starts: np.ndarray,
         segment_ends: np.ndarray,
@@ -2829,7 +2856,7 @@ class FiberTrace3DLoader:
     def _target_tangent_output_zyx(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
     ) -> np.ndarray:
         tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
@@ -2858,7 +2885,7 @@ class FiberTrace3DLoader:
     def _line_segment_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         *,
         patch_shape: tuple[int, int, int],
@@ -2882,6 +2909,17 @@ class FiberTrace3DLoader:
         segment_start = points_out[:-1].astype(np.float32)
         segment_end = points_out[1:].astype(np.float32)
         valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
+        if record.dataset_config.get("dense_supervision", False) or isinstance(cp_index, FiberLocation):
+            # Whole fibers can be long: reject disjoint segment boxes in NumPy
+            # before exact clipping. Keep source order and boundary-touching
+            # segments; this changes neither accepted segments nor target math.
+            valid_segments &= np.all(
+                np.maximum(segment_start, segment_end) >= np.full(3, -radius, dtype=np.float64), axis=1,
+            )
+            valid_segments &= np.all(
+                np.minimum(segment_start, segment_end)
+                <= np.asarray(patch_shape, dtype=np.float64) - 1.0 + radius, axis=1,
+            )
         segment_start = segment_start[valid_segments]
         segment_end = segment_end[valid_segments]
         if profile_timings_ms is not None:
@@ -2939,7 +2977,7 @@ class FiberTrace3DLoader:
     def _build_target_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         profile_timings_ms: dict[str, float] | None = None,
     ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -3075,7 +3113,7 @@ class FiberTrace3DLoader:
             data_index=int(data_index),
             record_index=int(record_index),
             fiber_path="" if record.fiber.path is None else str(record.fiber.path),
-            control_point_index=int(cp_index),
+            control_point_index=(-1 if isinstance(cp_index, FiberLocation) else int(cp_index)),
             volume=volume.view(1, *self.config.patch_shape_zyx),
             valid_mask=None,
             cp_local_zyx=torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=resolved_device),
@@ -3568,6 +3606,7 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         datasets = [{"array_records": True}]
     cfg = FiberTrace3DConfig(
        datasets=tuple(dict(entry) for entry in datasets),
+        sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
         embedding=EmbeddingConfig.from_mapping(raw),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [192, 192, 192]), key="patch_shape_zyx"),

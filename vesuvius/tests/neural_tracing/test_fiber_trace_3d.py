@@ -1074,6 +1074,7 @@ def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
     loader._flat_offsets = [0]
     loader._flat_sample_count = 1
     loader._random_pass_cache = {}
+    loader._arc_sampler = None
     return loader
 
 

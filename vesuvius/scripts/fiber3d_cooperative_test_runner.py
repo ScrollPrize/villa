@@ -36,6 +36,9 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "cuda-arc": ["tests/neural_tracing/test_arc_sampling.py", "-k", "cuda_dense", "-s"],
+    "arc-sampling": ["tests/neural_tracing/test_arc_sampling.py", "tests/neural_tracing/test_collection_training_config.py"],
+    "sampling-regression": ["tests/neural_tracing/test_fiber_trace_3d.py", "tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_fiber_embeddings.py"],
     "visualization": ["tests/neural_tracing/test_forward_visualization.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],
     "unified-loading": ["tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_training_state.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_gradient_accumulation.py"],
     "unified-managed": ["tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py", "../gpu_manager/tests/test_supervisor.py"],
@@ -71,7 +74,7 @@ def main():
         raise ValueError("gpu_devices must be a list of individual device IDs")
     if len(set(devices)) != len(devices):
         raise ValueError("duplicate GPU device")
-    if "cuda-amp" in suites and not devices or "cuda-cohort" in suites and len(devices) != 2:
+    if any(s in suites for s in ("cuda-amp", "cuda-arc")) and not devices or "cuda-cohort" in suites and len(devices) != 2:
         raise ValueError("CUDA oracle needs a device; cohort test needs exactly two")
     timeout = test_budget_seconds(control)
     output = Path(control["output_root"]).expanduser() / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -93,7 +96,7 @@ def main():
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')
             env["PYTHONPATH"] = f"{ROOT / 'vesuvius/scripts/cooperative_test_support'}:" + env["PYTHONPATH"]
-        if suite == "cuda-amp":
+        if suite in ("cuda-amp", "cuda-arc"):
             env.update(CUDA_VISIBLE_DEVICES=devices[0], FIBER_COOPERATIVE_CUDA_TEST="1")
         elif suite in ("cuda-cohort", "cuda-reference"):
             env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(devices)
@@ -128,7 +131,7 @@ def main():
         monitor = None
         peaks = {}
         if suite.startswith("cuda-"):
-            selected = devices[:1] if suite == "cuda-amp" else devices
+            selected = devices[:1] if suite in ("cuda-amp", "cuda-arc") else devices
             uuids = subprocess.check_output(["nvidia-smi", f"--id={','.join(selected)}",
                 "--query-gpu=uuid", "--format=csv,noheader"], text=True, timeout=10).splitlines()
             peaks = {uuid.strip(): 0 for uuid in uuids}
@@ -148,7 +151,7 @@ def main():
                 invocation_started += time.monotonic() - wait_started
                 started = time.monotonic()
                 env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
-                if suite == "cuda-amp":
+                if suite in ("cuda-amp", "cuda-arc"):
                     env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
                 managed_command = ExclusiveCommand(command, cwd=ROOT / "vesuvius", env=env,
                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)

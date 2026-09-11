@@ -1,3 +1,9 @@
+## 2026-09-11 — Dense, scroll-balanced collection training
+
+- Added per-dataset dense JSON supervision and deterministic continuous
+  scroll-uniform/arc-length-uniform sampling for train/test in the same loader.
+  Enabled the five-scroll collection; legacy CP defaults remain unchanged.
+
 ## 2026-09-11 — Unified training/evaluation loading and startup measurement
 
 - Train and dense evaluation use the same optimized bounded sample queue,

@@ -513,7 +513,7 @@
 - The 3D CP model lives in a sibling package,
   `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
   `fiber_trace_2d` configs, strip geometry, Trace2CP tooling, or 2D training.
-- 3D training samples ordinary CP-centered ZYX volume blocks from the selected
+- By default, 3D training samples ordinary CP-centered ZYX volume blocks from the selected
   base-volume Zarr level. It must not build fiber-aligned 3D strips or slices
   for input loading.
 - Dataset entries use `base_volume_path`, `base_volume_scale`, and
@@ -526,10 +526,25 @@
   `fiber_trace_2d.fiber_json` semantics.
 - `base_volume_scale` selects both the Zarr level read by the 3D loader and the
   voxel scale at which CP-centered patches are sampled.
-- The 3D sample stream is deterministic pseudo-random by configured `seed` and
+- The default `sampling_strategy=control_points` 3D sample stream is deterministic pseudo-random by configured `seed` and
   covers every configured control point once per pass before repeating. Changing
   batch size or step count may truncate/extend the consumed prefix, but must not
   reshuffle earlier samples.
+- Opt-in `sampling_strategy=scroll_balanced_arclength` chooses a scroll with
+  equal probability, then a continuous location uniformly over the total
+  selected fiber polyline length within that scroll. Dataset `scroll_id` is
+  explicit and groups multiple folders; lengths use base-volume coordinates
+  before augmentation and independent of input Zarr level. Positive finite
+  fiber length is required; zero-length individual segments have zero mass.
+  All datasets must provide dense supervision. Draws depend only on seed and
+  data index; augmentation still depends on stream index. Flat CP traversal
+  remains available for CP-based tooling. Continuous samples report CP index
+  -1 rather than pretending to be an original control point.
+- Dataset `dense_supervision: true` enables dense selected-polyline supervision
+  for JSON. False/absent preserves CP-only JSON behavior; NML stays dense.
+  Dense JSON uses every selected-fiber segment intersecting the patch, including
+  distant arc sections that re-enter it; other fibers do not become positive.
+  Crop, prefetch, augmentation tangent and targets share the continuous location.
 - 3D training uses a strict stream/data index split. `stream_index` is the
   unbounded deterministic stream position; `data_index` is the bounded
   dataset-selection index after applying `training.max_sample_index` /
@@ -795,11 +810,16 @@
 - Dense 3D test loaders do not inherit train augmentations by default.
   `training.test_augment_enabled: true` is the explicit opt-in for augmented
   dense tests.
-- Dense 3D tests default to evaluating every configured held-out CP once in the
+- With the default CP sampling strategy, dense 3D tests evaluate every configured held-out CP once in the
   deterministic pseudo-random test stream from sample index zero.
   `training.test_control_points: 0` is the explicit full-test sentinel with
   the same behavior. Positive values keep the fixed deterministic random test
   range beginning at `test_start_sample_index`.
+- Balanced arc-length testing uses the same sampling strategy with a fixed
+  seed and index range on every evaluation. The existing test_control_points
+  count is a continuous-location budget; zero retains the held-out CP count as
+  the budget, not exhaustive CP coverage. Changed supervision/distribution
+  makes collection test metrics incomparable to the earlier CP-only run.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
@@ -900,7 +920,7 @@
 - 3D DataLoader workers must not materialize full dense direction/presence
   target tensors. Worker batches carry images plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata plus
-  visualization-only transformed line segments, and NML dense-line samples carry
+  visualization-only transformed line segments, and dense-line samples carry
   transformed output-space line segments with precomputed patch bboxes for
   supervision. Dense `presence_target` is created by
   `fiber_trace_3d.targets.materialize_targets(...)` in the main training process
@@ -910,7 +930,7 @@
   `direction_weight_sparse`; normal training must gather predictions at those
   supervised line/CP voxels instead of creating full-patch dense six-channel
   direction targets.
-- For JSON/non-NML 3D samples, `target_segment_*` metadata is visualization
+- For JSON/non-NML 3D samples without dense_supervision, `target_segment_*` metadata is visualization
   context only. The materializer must filter dense line rasterization by
   `_TARGET_MODE_DENSE_LINE`, so CP-only JSON segments do not create dense
   presence or direction supervision. Their direction target is the transformed
@@ -918,10 +938,10 @@
   draw those visualization-only segments in the target/context presence panel,
   but that display-only raster must not be fed back into loss materialization.
 - The GPU target materializer must preserve the existing label semantics:
-  NML sources supervise direction/presence by drawing the overlapping clipped
+  NML and opted-in dense JSON sources supervise direction/presence by drawing the overlapping clipped
   fiber centerline voxels only, without a radius-expanded distance-to-segment
-  tube. Non-NML sources supervise only the sampled CP neighborhood using
-  `presence_radius_voxels`; that radius does not apply to NML centerline
+  tube. Other JSON sources supervise only the sampled CP neighborhood using
+  `presence_radius_voxels`; that radius does not apply to dense centerline
   targets. Every output voxel not covered by a positive target is a presence
   negative; there is no edge or validity loss mask. Lasagna 3x2 direction
   encoding uses the shared NumPy/torch-compatible helper semantics.

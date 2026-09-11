@@ -1,6 +1,7 @@
-# Existing-forward visualization
+# Status
 
-- [x] Inspection and plan.
-- [x] Independent review.
-- [x] Implementation.
-- [x] CPU tests and docs (20 passed, 2 GPU-only skipped via reusable launcher).
+- [x] Inspect implementation and record plan.
+- [x] Independent plan and implementation review.
+- [x] Implement sampler, dense switch and collection config.
+- [x] CPU regression tests and docs.
+- [x] Manager-exclusive CUDA dense-target integration, FP32/BF16 forward/backward/update/evaluation.

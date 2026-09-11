@@ -20,6 +20,10 @@ def test_collection_training_config():
     assert raw["training"]["learning_rate"] == 0.01
     assert raw["training"]["optimizer_global_batch_size"] == 128
     assert raw["batch_size"] == 16
+    assert raw.pop("sampling_strategy") == "scroll_balanced_arclength"
+    for split in ("datasets", "test_datasets"):
+        assert all(d["dense_supervision"] is True for d in raw[split])
+        assert len({d["scroll_id"] for d in raw[split]}) == 5
     for key in ("test_interval", "checkpoint_interval"):
         assert raw["training"][key] == 1000
         baseline["training"][key] = 1000

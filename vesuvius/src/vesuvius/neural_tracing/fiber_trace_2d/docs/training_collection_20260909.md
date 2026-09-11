@@ -1,7 +1,7 @@
 # Five-scroll JSON fiber training
 
 Config: `fiber_trace_3d/configs/train_collection_20260909_5scroll_16x8.json`.
-Based on `train_s1a_nml_8gpu_fast.json`; dataset lists, run name, explicit
+Based on `train_s1a_nml_8gpu_fast.json`; sampling strategy, dataset lists, run name, explicit
 `embedding.enabled=false` and test/checkpoint intervals (1000 instead of 100)
 differ. Initial evaluation remains enabled. LR 0.01, 100-step warmup, SD1 input (half
 resolution), 128³ patches, GroupNorm/BF16, stride-4 output, target 16 samples/GPU
@@ -28,8 +28,7 @@ transform is applied. No NML files or normal manifests are used.
 Preserves the supplied split exactly (946 train, 50 test), including both Paris4
 collections. It is a per-source fiber-length split, not spatially disjoint;
 74 branch references cross splits. The loader does not expand branch references.
-PHerc0332's test length is ~9.5%, because whole fibers are retained. Sampling
-remains the existing control-point-based scheme, not new equal-scroll weighting.
+PHerc0332's test length is ~9.5%, because whole fibers are retained.
 The source symlink targets must remain available. The copied SOURCES.md's old
 0/996 parser-compatibility report is obsolete: current parser accepts all 996.
 
@@ -41,13 +40,69 @@ CONFIG=/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/c
 python -m vesuvius.neural_tracing.fiber_trace_3d.train "$CONFIG"
 ```
 
-This is the managed entry point, not torchrun. A measured calibration matching
-this config is required first; none existed when the config was created. See
-[cooperative training](cooperative_training.md) for the exclusive calibration
-command and GPU UUID/budget arguments. Do not reuse or relabel an old config's
-calibration. Training auto-discovers the new report under the run root's
-`.memory-calibrations/`. The manager auto-start/report discovery improvements
-were present but still uncommitted when this config was created.
+This is the managed entry point, not torchrun. Startup measures memory with real
+training/evaluation under exclusive ownership when no matching calibration is
+available, then registers adaptive training. See
+[cooperative training](cooperative_training.md). Do not relabel an old config's
+calibration after changing supervision.
+
+## Dense supervision and balanced sampling (2026-09-11)
+
+The collection now uses `sampling_strategy: "scroll_balanced_arclength"`.
+Every train/test dataset has `dense_supervision: true` and an explicit
+`scroll_id`. Each scroll has probability 1/5, including Paris4's two folders
+combined. Within that scroll a continuous distance is uniform over the combined
+polyline lengths: a fiber twice as long is twice as likely. Control-point and
+dense-vertex counts do not determine probability. Lengths are in base-volume
+coordinates, independent of selected Zarr level and augmentation.
+
+The patch surrounds the interpolated location and uses the same geometric and
+value augmentation pipeline as before. Only its selected fiber supplies labels:
+all its line segments intersecting the patch (including later re-entry) produce
+dense centerline direction/presence supervision. Unselected fibers are not added
+to positives. Other output cells remain negative, as with NML training.
+This is not a radius-expanded positive tube.
+
+The same loader, queue and target materializer serve managed/unmanaged training,
+testing and prefetch. `arc_sampling.py` stores cumulative segment/fiber lengths;
+draws depend on seed and data index, not rank, batch size or worker scheduling.
+Augmentation retains its separate stream-index seeds. No global sample list is
+constructed. Segment AABBs are rejected in a vectorized pass before exact
+clipping, avoiding a Python clipping loop over the entire fiber.
+
+Testing disables augmentation and repeats the same fixed location range every
+time. `test_control_points: 0` retains the held-out CP count (1942) as its sample
+budget, but these are now 1942 continuous sampled locations, not exhaustive CP
+coverage. A positive count sets another fixed budget.
+
+Compatibility: other configs retain `sampling_strategy: "control_points"`.
+JSON `dense_supervision` defaults false; NML is always dense. Balanced mode
+requires dense labels, nonempty `scroll_id` and positive finite length for every
+fiber. Repeated vertices are harmless. Explicit `sample_mode="flat"` still
+selects CPs for CP-based tools. Continuous samples report `control_point_index=-1`.
+
+The already-running process is not changed. Restart to adopt these settings.
+Earlier CP-only test losses/best-checkpoint scores are **not comparable** with
+the new dense/balanced evaluation; use a separate run for a clean comparison.
+
+## Sampling regression tests
+
+Set `suites` to `["arc-sampling", "sampling-regression"]` in
+`vesuvius/scripts/fiber3d_cooperative_tests.json`, then run the fixed caller:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+These suites are CPU-only (CUDA hidden); no manager allocation or GPU job is
+started. The local collection parser audit skips if the data is unavailable.
+
+For focused GPU integration, select `suites: ["cuda-arc"]` and one GPU device
+in that same control file, then use the same launcher. It acquires exclusive
+manager ownership before launching tests and releases after exit. The test uses
+the collection U-Net with synthetic images/continuous fiber locations at 128^3,
+batch 1, stride 4, FP32/BF16: CPU/CUDA targets, backward/update and repeatable
+evaluation. Allocator memory is capped at 4 GiB. This is not a throughput test.
 
 ## Validation
 

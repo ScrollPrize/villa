@@ -1,4 +1,5 @@
 {
+  "sampling_strategy": "scroll_balanced_arclength",
   "augment_anisotropic_blur_orientation": "fiber",
   "augment_anisotropic_blur_probability": 0.5,
   "augment_anisotropic_blur_roll_degrees": 0,
@@ -39,32 +40,44 @@
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc0139/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc0139/*.json",
+      "scroll_id": "PHerc0139",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc0332/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc0332/*.json",
+      "scroll_id": "PHerc0332",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc1229/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc1229/*.json",
+      "scroll_id": "PHerc1299",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc1451/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHerc1451/*.json",
+      "scroll_id": "PHerc1451",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHercParis4_eval_fibers/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHercParis4_eval_fibers/*.json",
+      "scroll_id": "PHercParis4",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHercParis4_fibers/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/train/PHercParis4_fibers/*.json",
+      "scroll_id": "PHercParis4",
+      "dense_supervision": true
     }
   ],
   "image_normalization": "zscore",
@@ -94,32 +107,44 @@
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc0139/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc0139/*.json",
+      "scroll_id": "PHerc0139",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc0332/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc0332/*.json",
+      "scroll_id": "PHerc0332",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc1229/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc1229/*.json",
+      "scroll_id": "PHerc1299",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc1451/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHerc1451/*.json",
+      "scroll_id": "PHerc1451",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHercParis4_eval_fibers/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHercParis4_eval_fibers/*.json",
+      "scroll_id": "PHercParis4",
+      "dense_supervision": true
     },
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
       "base_volume_scale": 1,
-      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHercParis4_fibers/*.json"
+      "fiber_glob": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910/test/PHercParis4_fibers/*.json",
+      "scroll_id": "PHercParis4",
+      "dense_supervision": true
     }
   ],
   "training": {
