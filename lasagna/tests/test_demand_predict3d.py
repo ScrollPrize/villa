@@ -66,6 +66,70 @@ class IdentityAdapter:
         return {"value": np.clip(raw[0] * 255, 0, 255).astype(np.uint8)}
 
 
+def test_deep_input_window_starts_128_readers_and_preserves_exact_values(tmp_path):
+    import threading
+    geometry = DemandGeometry((24, 24, 24), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, geometry.chunk)
+    release = threading.Event()
+    lock = threading.Lock()
+    entered = set()
+    volume = np.full(geometry.shape, 85, np.uint8)
+    def reader(tile):
+        with lock:
+            entered.add(tile)
+        if not release.wait(20):
+            raise RuntimeError("concurrent-reader test timed out")
+        return np.full((4, 4, 4), 85, np.uint8)
+    with DemandStore(tmp_path, {"test": "deep-input"}, geometry, adapter, output,
+                     accumulator_layout="chunk-major") as store:
+        for index in itertools.product(range(6), repeat=3):
+            store.request(index, background=True)
+        with DemandWorkerPool({"test": store}, {"test": reader}, ["cpu"],
+                              input_slots=256, input_workers=128, result_slots=7) as pool:
+            try:
+                deadline = time.monotonic() + 15
+                while len(entered) < 128 and time.monotonic() < deadline:
+                    before = len(pool.loading)
+                    pool.pump()
+                    assert len(pool.loading) - before <= 16
+                    time.sleep(.005)
+                row = pool.queue_snapshot()
+                assert len(entered) == row["read_running"] == 128
+                assert row["reads_submitted"] == 128  # no deep hidden executor FIFO
+                assert row["input_slots_free"] == 128
+                assert row["tiles_queued_background"] == 88
+                assert row["result_slots_capacity"] == 7
+            finally:
+                release.set()
+            deadline = time.monotonic() + 30
+            while pool.busy and time.monotonic() < deadline:
+                pool.pump()
+                time.sleep(.005)
+            assert not pool.busy
+            assert pool.stats["tiles"] == 216
+            assert len(pool.free_inputs) == 256 and len(pool.free) == 7
+        # Compare with the existing numerical path, including its fp16 input
+        # conversion and truncating identity finalizer, not original integers.
+        control_root = tmp_path / "control"
+        control_adapter, control_output = outputs(control_root, geometry.shape, geometry.chunk)
+        with DemandStore(control_root, {"test": "serial"}, geometry, control_adapter, control_output) as control:
+            for index in itertools.product(range(6), repeat=3):
+                control.request(index)
+            drain_reverse(control, volume)
+        np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:],
+                                      zarr.open_array(str(control_root / "value.zarr/0"), mode="r")[:])
+
+
+@pytest.mark.parametrize("slots", [0, -1, 1.5, True])
+def test_invalid_explicit_input_slots(tmp_path, slots):
+    from types import SimpleNamespace
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, geometry.chunk)
+    store = SimpleNamespace(model_adapter=adapter, geometry=geometry, products=adapter.output_products)
+    with pytest.raises(ValueError, match="input_slots"):
+        DemandWorkerPool({"test": store}, {}, ["cpu"], input_slots=slots)
+
+
 def outputs(root, shape, chunk, scale=1):
     adapter = IdentityAdapter(root, chunk, scale)
     # The logical output here is already on its final lattice (level zero in
@@ -328,7 +392,11 @@ def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline):
             assert pool.stats["tiles"] > 0
             assert pool.worker_ids == {0}
             assert bool(pool.profile_samples) == profile_pipeline
+            assert bool(pool.stage_samples) == profile_pipeline
             if profile_pipeline:
+                stages = {row["stage"] for row in pool.stage_samples}
+                assert {"admit.global_priority_selection", "admit.store_state_update",
+                        "admit.executor_submit", "reader.shared_slot_copy"} <= stages
                 assert len(pool.profile_samples) == pool.stats["tiles"]
                 assert all(s["worker_total_wall_s"] >= 0 and s["coordinator_receive_delay_s"] >= 0
                            for s in pool.profile_samples)
@@ -361,6 +429,150 @@ def test_cache_writer_identity_and_corrupt_ready_recovery(tmp_path):
         assert drain_reverse(store, volume)
         assert store.ready(origin)
     assert np.all(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:] == 127)
+
+
+@pytest.mark.parametrize("shape,value", [((4, 4, 4), 0), ((5, 6, 7), 127)])
+def test_ram_only_state_reuses_published_chunks_without_sqlite(tmp_path, monkeypatch, shape, value):
+    import sqlite3
+    def forbidden(*args, **kwargs):
+        raise AssertionError("SQLite must never be opened")
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    geometry = DemandGeometry(shape, 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, shape, 4)
+    indices = list(itertools.product(*(range((n + 3) // 4) for n in shape)))
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        for index in indices:
+            store.request(index)
+        drain_reverse(store, np.full(shape, value, np.uint8))
+        assert not hasattr(store, "db")
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        assert not store.tiles and not store.chunks and not store.priorities
+        for index in indices:
+            assert store.ready(store.request(index))
+        assert store.next_tile() is None
+        assert store.stats["warm_chunks"] == len(indices)
+    assert not list(tmp_path.glob("*.sqlite*"))
+
+
+def test_legacy_database_is_not_opened_or_deleted(tmp_path):
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    legacy = tmp_path / "live.sqlite"
+    legacy.write_bytes(b"must remain untouched, not opened")
+    with pytest.raises(ValueError, match="legacy database-only"):
+        DemandStore(tmp_path, {}, geometry, adapter, output)
+    assert legacy.read_bytes() == b"must remain untouched, not opened"
+    assert not (tmp_path / "cache_identity.json").exists()
+
+
+def test_unidentified_payloads_are_not_adopted(tmp_path):
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    array = zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r+")
+    array[:] = 42
+    with pytest.raises(ValueError, match="unidentified cache payloads"):
+        DemandStore(tmp_path, {}, geometry, adapter, output)
+    assert not (tmp_path / "cache_identity.json").exists()
+    assert np.all(array[:] == 42)
+
+
+def test_publication_rejects_nested_external_symlink_before_any_unlink(tmp_path):
+    root = tmp_path / "cache"
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter = SiblingIdentityAdapter(root)
+    tiled.create_product_omezarr_groups(products=adapter.output_products,
+        base_shape_zyx=geometry.shape, n_levels=1, ome_chunk=4, ome_compressor="none")
+    output = tiled.OmeZarrOutputAdapter(products=adapter.output_products, n_levels=1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "0").write_bytes(b"preserve")
+    with DemandStore(root, {}, geometry, adapter, output) as store:
+        a = root / "a.zarr/0/0/0/0"
+        a.parent.mkdir(parents=True)
+        a.write_bytes(b"old sibling")
+        b_parent = root / "b.zarr/0/0"
+        b_parent.mkdir()
+        (b_parent / "0").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="outside cache"):
+            store._publish((0, 0, 0))
+        assert a.read_bytes() == b"old sibling"
+        assert (outside / "0").read_bytes() == b"preserve"
+
+
+def test_stale_scratch_cleanup_validates_all_before_deleting(tmp_path):
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    with DemandStore(tmp_path, {}, geometry, adapter, output):
+        pass
+    parent = tmp_path / "value.zarr/.live_tmp"
+    good, bad = parent / "session-good", parent / "session-bad"
+    good.mkdir()
+    bad.mkdir()
+    (good / "raw-0.mmap").write_bytes(b"temporary")
+    unrelated = bad / "not-scratch.txt"
+    unrelated.write_text("keep")
+    with pytest.raises(ValueError, match="unsafe stale scratch contents"):
+        DemandStore(tmp_path, {}, geometry, adapter, output)
+    assert (good / "raw-0.mmap").exists() and unrelated.read_text() == "keep"
+    unrelated.unlink()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = bad / "raw-0.mmap"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="unsafe stale scratch contents"):
+        DemandStore(tmp_path, {}, geometry, adapter, output)
+    assert good.exists() and outside.is_dir()
+    link.unlink()
+    with DemandStore(tmp_path, {}, geometry, adapter, output):
+        assert not good.exists() and not bad.exists()
+
+
+class SiblingIdentityAdapter(IdentityAdapter):
+    def __init__(self, root):
+        super().__init__(root, 4, 1)
+        from dataclasses import replace
+        self.output_products = (replace(self.output_products[0], channels=(
+            tiled.OutputChannelSpec("a", relative_path=str(root / "a.zarr")),
+            tiled.OutputChannelSpec("b", relative_path=str(root / "b.zarr")))),)
+
+    def finalize_product_slab(self, product, raw):
+        values = super().finalize_product_slab(product, raw)["value"]
+        return {"a": values, "b": values}
+
+
+def test_interrupted_sibling_replacement_cannot_reuse_old_generation(tmp_path, monkeypatch):
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter = SiblingIdentityAdapter(tmp_path)
+    tiled.create_product_omezarr_groups(products=adapter.output_products,
+        base_shape_zyx=geometry.shape, n_levels=1, ome_chunk=4, ome_compressor="none")
+    output = tiled.OmeZarrOutputAdapter(products=adapter.output_products, n_levels=1)
+    with DemandStore(tmp_path, {}, geometry, adapter, output):
+        pass
+    for name in ("a", "b"):
+        zarr.open_array(str(tmp_path / f"{name}.zarr/0"), mode="r+")[:] = 22
+    a = tmp_path / "a.zarr/0/0/0/0"
+    b = tmp_path / "b.zarr/0/0/0/0"
+    a.write_bytes(b"corrupt")
+    def interrupted(*args):
+        assert not a.exists() and not b.exists()
+        zarr.open_array(str(tmp_path / "a.zarr/0"), mode="r+")[:] = 77
+        raise RuntimeError("publication interrupted")
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        origin = store.request((0, 0, 0))
+        assert not store.ready(origin)
+        with monkeypatch.context() as patch:
+            patch.setattr(tiled, "_execute_flush_process_task", interrupted)
+            with pytest.raises(RuntimeError, match="publication interrupted"):
+                drain_reverse(store, np.full(geometry.shape, 127, np.uint8))
+        assert not store.ready(origin)
+    assert a.exists() and not b.exists()
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        origin = store.request((0, 0, 0))
+        assert not store.ready(origin)
+        drain_reverse(store, np.full(geometry.shape, 127, np.uint8))
+        assert store.ready(origin)
+    assert np.all(zarr.open_array(str(tmp_path / "a.zarr/0"), mode="r")[:] == 127)
+    assert np.all(zarr.open_array(str(tmp_path / "b.zarr/0"), mode="r")[:] == 127)
 
 
 def test_scratch_budget_rejects_without_reservation(tmp_path):

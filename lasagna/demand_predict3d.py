@@ -15,7 +15,6 @@ import math
 import os
 from pathlib import Path
 import shutil
-import sqlite3
 import tempfile
 import multiprocessing as mp
 import queue
@@ -24,7 +23,8 @@ import time
 import numpy as np
 
 from lasagna import tiled_predict3d as tiled
-from lasagna.inference_provenance import sha256_file
+from lasagna.inference_provenance import atomic_write
+from lasagna.inference_profiling import stage_timing
 
 
 @dataclass(frozen=True)
@@ -85,12 +85,8 @@ class DemandGeometry:
         return destination, source
 
 
-def _key(coords):
-    return ",".join(map(str, coords))
-
-
 class DemandStore:
-    """Sparse ledger plus full-logical-shape mmap accumulation for one source.
+    """RAM-only scheduling plus full-logical-shape mmap accumulation for a source.
 
     Each tile contributes once to every touched (including unrequested) chunk.
     Partial neighbors never schedule work. Only the coordinator changes metadata.
@@ -137,50 +133,70 @@ class DemandStore:
         self.publications = deque()
         self.stats = {"inferred_tiles": 0, "published_chunks": 0, "warm_chunks": 0}
         try:
-            self.db = sqlite3.connect(self.root / "live.sqlite")
-            self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.executescript("""
-                CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS chunks (key TEXT PRIMARY KEY, state TEXT NOT NULL, fingerprints TEXT);
-                CREATE TABLE IF NOT EXISTS tiles (key TEXT PRIMARY KEY, state TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS scratch (path TEXT PRIMARY KEY);
-            """)
-            encoded = json.dumps({"schema": 1, "identity": identity, "geometry": asdict(geometry),
+            encoded = json.loads(json.dumps({"schema": 2, "identity": identity, "geometry": asdict(geometry),
                                   "accumulator_dtype": str(self.dtype), "accumulation_order": "arrival",
                                   "accumulator_layout": self.layout, "accumulator_prefault": self.prefault},
-                                 sort_keys=True, separators=(",", ":"), allow_nan=False)
-            existing = self.db.execute("SELECT value FROM identity WHERE id=1").fetchone()
-            if existing and existing[0] != encoded:
+                                 sort_keys=True, allow_nan=False))
+            identity_path = self.root / "cache_identity.json"
+            if identity_path.is_symlink():
+                raise ValueError("unsafe cache identity symlink")
+            if not identity_path.exists() and (self.root / "live.sqlite").exists():
+                raise ValueError("legacy database-only inference cache; use a fresh cache root (old files untouched)")
+            if identity_path.exists() and json.loads(identity_path.read_text()) != encoded:
                 raise ValueError("cache inference identity mismatch")
-            self.db.execute("INSERT OR IGNORE INTO identity VALUES (1,?)", (encoded,))
             allowed = set()
             for product in self.products:
                 for channel in product.channels:
                     Path(channel.relative_path).resolve().relative_to(self.root.resolve())
-                allowed.add((Path(product.channels[0].relative_path) / ".live_tmp").resolve())
-            for (stored,) in self.db.execute("SELECT path FROM scratch").fetchall():
-                stale = Path(stored)
-                if stale.is_symlink() or stale.parent.resolve() not in allowed or not stale.name.startswith("session-"):
-                    raise ValueError("unsafe stale scratch path in live ledger")
-                if stale.exists():
-                    shutil.rmtree(stale)
-            self.db.execute("DELETE FROM scratch")
-            # Scratch from a previous process is not resumable truth. Durable
-            # output rows are validated lazily on request, without array scans.
-            self.db.execute("DELETE FROM tiles")
-            self.db.execute("DELETE FROM chunks WHERE state != 'ready'")
-            self.db.commit()
+                    if not identity_path.exists():
+                        level = Path(channel.relative_path) / str(product.level)
+                        # Never bless unidentified payloads with a new model's
+                        # provenance. Inspect this level only, not the volume.
+                        if level.is_symlink():
+                            raise ValueError("unsafe unidentified output level")
+                        if level.exists():
+                            with os.scandir(level) as entries:
+                                if any(e.name not in {".zarray", ".zattrs"} for e in entries):
+                                    raise ValueError("unidentified cache payloads; use a fresh cache root")
+                parent = Path(product.channels[0].relative_path) / ".live_tmp"
+                if parent.is_symlink():
+                    raise ValueError("unsafe scratch parent symlink")
+                allowed.add(parent)
+            stale_dirs = []
+            # Validate every candidate before deleting any. Only reserved,
+            # immediately contained session directories are scratch, not outputs.
+            for parent in allowed:
+                if not parent.exists():
+                    continue
+                for stale in parent.iterdir():
+                    if not stale.name.startswith("session-"):
+                        continue
+                    if stale.is_symlink() or not stale.is_dir():
+                        raise ValueError("unsafe stale scratch directory")
+                    for member in stale.iterdir():
+                        raw = member.name.removeprefix("raw-").removesuffix(".mmap")
+                        known = member.name == "weight.mmap" or (member.name == f"raw-{raw}.mmap" and raw.isdigit())
+                        if member.is_symlink() or not member.is_file() or not known:
+                            raise ValueError("unsafe stale scratch contents")
+                    stale_dirs.append(stale)
+            for stale in stale_dirs:
+                shutil.rmtree(stale)
+            if not identity_path.exists():
+                # Static provenance only: no tile/chunk/scratch state is saved.
+                atomic_write(identity_path, encoded)
             if prepare_output is not None:
                 # Metadata creation may replace an empty group directory, so
                 # it must run under writer ownership BEFORE creating mmap files.
                 prepare_output()
+            self._channel_metadata = tuple((channel, product,
+                tiled._omezarr_dim_sep(str(channel.relative_path), product.level))
+                for product in self.products for channel in product.channels)
+            self._read_arrays = {}
             for product in self.products:
                 parent = Path(product.channels[0].relative_path) / ".live_tmp"
                 parent.mkdir(parents=True, exist_ok=True)
                 directory = Path(tempfile.mkdtemp(prefix="session-", dir=parent))
                 self.scratch_dirs.append(directory)
-                self.db.execute("INSERT INTO scratch VALUES (?)", (str(directory.resolve()),))
-                self.db.commit()
                 self.accumulators[product.name] = tuple(self._mmap(directory / f"raw-{c}.mmap", self.dtype)
                                                         for c in range(product.raw_channel_count))
             self.weight = self._mmap(self.scratch_dirs[0] / "weight.mmap", np.dtype("float32"))
@@ -199,33 +215,57 @@ class DemandStore:
         self.arrays.append(array)
         return array
 
-    def _fingerprints(self, origin, *, sync=False):
-        files = []
-        for product in self.products:
-            for channel in product.channels:
-                path = str(channel.relative_path)
-                sep = tiled._omezarr_dim_sep(path, product.level)
-                index = tuple(v // product.chunk_size for v in origin)
-                member = Path(tiled._zarr_chunk_path(str(Path(path) / str(product.level)), sep, *index))
-                if not member.is_file():
-                    return None
-                if sync:
-                    with member.open("rb") as file:
-                        os.fsync(file.fileno())
-                    descriptor = os.open(member.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
-                files.append((str(member.relative_to(self.root)), member.stat().st_size, sha256_file(member)))
-        return json.dumps(files, separators=(",", ":"))
+    def _chunk_files(self, origin):
+        for channel, product, sep in self._channel_metadata:
+            index = tuple(v // product.chunk_size for v in origin)
+            yield Path(tiled._zarr_chunk_path(str(Path(channel.relative_path) / str(product.level)), sep, *index))
+
+    def _cached_chunk_complete(self, origin):
+        # Existing shared completeness checks require actual files, including
+        # explicit zero chunks. A missing sibling must never become Zarr fill.
+        if not all(self.output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
+                   for product in self.products):
+            return False
+        import zarr
+        region = tuple(slice(o, min(o + self.geometry.chunk, n)) for o, n in zip(origin, self.geometry.output_shape))
+        try:
+            for channel, product, _ in self._channel_metadata:
+                path = str(Path(channel.relative_path) / str(product.level))
+                if path not in self._read_arrays:
+                    self._read_arrays[path] = zarr.open_array(path, mode="r")
+                array = self._read_arrays[path]
+                if (tuple(array.shape) != self.geometry.output_shape or array.dtype != np.dtype(product.dtype)
+                        or tuple(array.chunks) != (self.geometry.chunk,) * 3):
+                    return False
+                # Decodes only the requested chunk (including its padded edge
+                # storage). No array scan or persistent checksum database.
+                values = np.asarray(array[region])
+                if values.shape != tuple(s.stop - s.start for s in region):
+                    return False
+        except MemoryError:
+            raise
+        except Exception:
+            return False
+        return True
+
+    def _sync_published(self, origin):
+        for member in self._chunk_files(origin):
+            if not member.is_file():
+                return False
+            with member.open("rb") as file:
+                os.fsync(file.fileno())
+            descriptor = os.open(member.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return True
 
     def ready(self, origin):
         entry = self.chunks.get(origin)
         if entry is not None:
             return entry["ready"]
-        row = self.db.execute("SELECT fingerprints FROM chunks WHERE key=? AND state='ready'", (_key(origin),)).fetchone()
-        if row and row[0] == self._fingerprints(origin):
+        if self._cached_chunk_complete(origin):
             self.chunks[origin] = {"ready": True}
             self.stats["warm_chunks"] += 1
             return True
@@ -239,7 +279,6 @@ class DemandStore:
             self.chunks[origin] = {"ready": False, "dependencies": dependencies,
                                    "applied": set(), "pending": set(), "requested": False,
                                    "allocated": False, "publishing": False}
-            self.db.execute("INSERT OR REPLACE INTO chunks VALUES (?, 'partial', NULL)", (_key(origin),))
 
     def request(self, index, *, remaining=0.0, background=False):
         origin = self.geometry.origin(index)
@@ -251,17 +290,17 @@ class DemandStore:
             for tile in entry["dependencies"]:
                 if tile not in self.tiles:
                     self.priorities[tile] = max(priority, self.priorities.get(tile, (-1, 0)))
-                    self.db.execute("INSERT OR IGNORE INTO tiles VALUES (?, 'queued')", (_key(tile),))
             self._queue_publication(origin)
         return origin
 
-    def next_tile(self):
-        candidates = [tile for tile in self.priorities if tile not in self.tiles]
-        if not candidates:
-            return None
-        tile = min(candidates, key=lambda t: (-self.priorities[t][0], -self.priorities[t][1], t))
-        self.tiles[tile] = {"state": "inflight"}
-        self.db.execute("UPDATE tiles SET state='inflight' WHERE key=?", (_key(tile),))
+    def next_tile(self, *, profile_samples=None):
+        with stage_timing(profile_samples, "admit.store_priority_selection"):
+            candidates = [tile for tile in self.priorities if tile not in self.tiles]
+            if not candidates:
+                return None
+            tile = min(candidates, key=lambda t: (-self.priorities[t][0], -self.priorities[t][1], t))
+        with stage_timing(profile_samples, "admit.store_state_update"):
+            self.tiles[tile] = {"state": "inflight"}
         return tile
 
     def _descriptor(self, arrays):
@@ -301,7 +340,6 @@ class DemandStore:
                 self._descriptor((self.weight,))))
             entry["pending"].add(tile)
         self.tiles[tile] = {"state": "accumulating", "remaining": len(tasks)}
-        self.db.execute("UPDATE tiles SET state='accumulating' WHERE key=?", (_key(tile),))
         self.stats["inferred_tiles"] += 1
         if not tasks:
             self._tile_consumed(tile)
@@ -320,7 +358,6 @@ class DemandStore:
 
     def _tile_consumed(self, tile):
         self.tiles[tile] = {"state": "consumed"}
-        self.db.execute("UPDATE tiles SET state='consumed' WHERE key=?", (_key(tile),))
 
     def _queue_publication(self, origin):
         entry = self.chunks[origin]
@@ -329,15 +366,13 @@ class DemandStore:
             entry["publishing"] = True
             self.publications.append(origin)
 
-    def publication_done(self, origin, fingerprints):
+    def publication_done(self, origin, published):
         # Called only by coordinator AFTER the background writer has finished.
-        if not fingerprints:
+        if not published:
             raise RuntimeError("inference finalization did not publish all coherent channel chunks")
         entry = self.chunks[origin]
         if entry["ready"] or not entry["publishing"]:
             raise ValueError("duplicate/unexpected publication acknowledgement")
-        self.db.execute("UPDATE chunks SET state='ready', fingerprints=? WHERE key=?", (fingerprints, _key(origin)))
-        self.db.commit()
         entry["ready"] = True
         self.stats["published_chunks"] += 1
 
@@ -380,6 +415,19 @@ class DemandStore:
             shm.unlink()
 
     def _publish(self, origin):
+        # Only incomplete, non-ready groups are submitted here. Clear all old
+        # siblings first so a process crash cannot leave a mixed-generation group
+        # that appears complete on restart. No completion journal/marker.
+        members = tuple(self._chunk_files(origin))
+        for member in members:
+            if member.is_symlink():
+                raise ValueError("unsafe published chunk symlink")
+            try:
+                member.resolve().relative_to(self.root.resolve())
+            except ValueError as error:
+                raise ValueError("unsafe published chunk path outside cache") from error
+        for member in members:
+            member.unlink(missing_ok=True)
         task = tiled._FlushProcessTask(0, 0, self.geometry.scale, origin,
             tuple(p.name for p in self.products), True, 0, self.geometry.chunk,
             (0, 0, 0, *self.geometry.output_shape), self.products,
@@ -390,7 +438,7 @@ class DemandStore:
         finally:
             for value in cache.values():
                 value._mmap.close()
-        return self._fingerprints(origin, sync=True)
+        return self._sync_published(origin)
 
     def close(self):
         for array in getattr(self, "arrays", ()):
@@ -399,12 +447,7 @@ class DemandStore:
         for directory in getattr(self, "scratch_dirs", ()):
             # Only this instance's mkdtemp-created scratch directory is removed.
             shutil.rmtree(directory)
-            if hasattr(self, "db"):
-                self.db.execute("DELETE FROM scratch WHERE path=?", (str(directory.resolve()),))
         self.scratch_dirs = []
-        if hasattr(self, "db"):
-            self.db.commit()
-            self.db.close()
         self.lock.close()
 
     def __enter__(self):
@@ -430,7 +473,7 @@ class DemandWorkerPool:
     canonical padded tile origin and returning unnormalized uint8/uint16. No
     geometry or tensor payload passes through the native control transport.
     """
-    def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8,
+    def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8, input_slots=None,
                  result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False):
         if not stores or not devices or slots_per_gpu < 1 or input_workers < 1:
             raise ValueError("nonempty stores/devices and positive worker budgets required")
@@ -451,7 +494,9 @@ class DemandWorkerPool:
                     or getattr(adapter, "config", None) != getattr(self.adapter, "config", None)
                     or getattr(adapter, "native_output_stride", 1) != getattr(self.adapter, "native_output_stride", 1)):
                 raise ValueError("one worker pool cannot mix different models/preprocessing")
-        count = len(devices) * int(slots_per_gpu)
+        count = len(devices) * int(slots_per_gpu) if input_slots is None else input_slots
+        if type(count) is not int or count < 1:
+            raise ValueError("input_slots must be a positive integer")
         result_count = count if result_slots is None else int(result_slots)
         if result_count < 1:
             raise ValueError("result_slots must be positive")
@@ -477,6 +522,8 @@ class DemandWorkerPool:
         self.flush_workers = int(flush_workers)
         self.sequence = 0
         self.profile_pipeline = profile_pipeline
+        self.stage_samples = [] if profile_pipeline else None
+        self.input_workers = int(input_workers)
         self.profile_samples = []
         self.accumulator_samples = []
         self.accumulator_queue_samples = []
@@ -484,7 +531,10 @@ class DemandWorkerPool:
         self.accumulator_backends = {}
         self.worker_ids = set()
         self.stats = {"tiles": 0, "worker_seconds": 0.0, "load_seconds": 0.0,
-                      "input_slots": count, "result_slots": result_count,
+                      "input_copy_seconds": 0.0, "pump_admit_seconds": 0.0,
+                      "pump_dispatch_seconds": 0.0, "pump_events_seconds": 0.0,
+                      "pump_background_seconds": 0.0,
+                      "input_slots": count, "input_workers": input_workers, "result_slots": result_count,
                       "input_slot_bytes": input_bytes, "result_slot_bytes": result_bytes,
                       "shared_slot_bytes": count * input_bytes + result_count * result_bytes}
         self.executor = ThreadPoolExecutor(max_workers=input_workers, thread_name_prefix="inference-input")
@@ -599,42 +649,79 @@ class DemandWorkerPool:
                 origin = store.publications.popleft()
                 self.publishing[name, origin] = self.publisher.submit(store._publish, origin)
 
+    def _read_into_slot(self, name, tile, slot):
+        # The input slot was reserved by the coordinator and remains owned
+        # until H2D completes. Populate it in the reader thread, not in the
+        # control loop: many large copies/page faults must not stop GPU dispatch
+        # or accumulation acknowledgements. Return metadata, not a second array.
+        raw = np.asarray(self.readers[name](tile))
+        if raw.shape != self.input_layouts[0].shape or raw.dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+            raise ValueError("inference input reader returned invalid raw tile")
+        started = time.perf_counter()
+        layout = replace(self.input_layouts[0], dtype=raw.dtype.str)
+        with stage_timing(self.stage_samples, "reader.shared_slot_copy"):
+            tiled._slot_array(self.inputs[slot], layout)[:] = raw
+        return raw.dtype.str, time.perf_counter() - started
+
     def pump(self):
         for process in self.processes + self.accumulator_processes:
             if process.exitcode is not None:
                 raise RuntimeError(f"inference/accumulator worker {process.name} exited unexpectedly: {process.exitcode}")
+        phase_started = time.perf_counter()
         self._pump_accumulators()
         self._pump_publications()
-        while self.free_inputs:
-            choices = []
-            for name, store in self.stores.items():
-                for tile, priority in store.priorities.items():
-                    if tile not in store.tiles:
-                        choices.append((-priority[0], -priority[1], name, tile))
-            if not choices:
-                break
-            _, _, name, _ = min(choices)
-            tile = self.stores[name].next_tile()
-            slot, sequence = self.free_inputs.popleft(), self.sequence
-            self.sequence += 1
-            started = time.perf_counter()
-            future = self.executor.submit(self.readers[name], tile)
-            self.loading[sequence] = (name, tile, slot, future, started)
+        self.stats["pump_background_seconds"] += time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        # Bound coordinator work: a deep input window must not prevent RPC
+        # priority updates or completed GPU/accumulation events being drained.
+        admitted = 0
+        # Keep the executor's admitted window at most reader-sized. The deeper
+        # priority queue stays in stores, where new foreground demands can
+        # overtake background work not yet submitted to a non-preemptible read.
+        while self.free_inputs and admitted < 16 and len(self.loading) < self.input_workers:
+            with stage_timing(self.stage_samples, "admit.global_priority_selection"):
+                choices = []
+                for name, store in self.stores.items():
+                    for tile, priority in store.priorities.items():
+                        if tile not in store.tiles:
+                            choices.append((-priority[0], -priority[1], name, tile))
+                if not choices:
+                    break
+                _, _, name, _ = min(choices)
+            tile = self.stores[name].next_tile(profile_samples=self.stage_samples)
+            with stage_timing(self.stage_samples, "admit.reserve_input_slot"):
+                slot, sequence = self.free_inputs.popleft(), self.sequence
+                self.sequence += 1
+                started = time.perf_counter()
+            with stage_timing(self.stage_samples, "admit.executor_submit") as details:
+                if details is not None:
+                    details["executor_threads_before"] = len(getattr(self.executor, "_threads", ()))
+                future = self.executor.submit(self._read_into_slot, name, tile, slot)
+                if details is not None:
+                    details["executor_threads_after"] = len(getattr(self.executor, "_threads", ()))
+            with stage_timing(self.stage_samples, "admit.register_future"):
+                self.loading[sequence] = (name, tile, slot, future, started)
+            admitted += 1
+        self.stats["pump_admit_seconds"] += time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        dispatched = 0
         for sequence, (name, tile, slot, future, started) in list(self.loading.items()):
+            if dispatched >= 8:
+                break
             if not future.done() or not self.free:
                 continue
-            raw = np.asarray(future.result())
-            if raw.shape != self.input_layouts[0].shape or raw.dtype not in (np.dtype("uint8"), np.dtype("uint16")):
-                raise ValueError("inference input reader returned invalid raw tile")
-            layout = replace(self.input_layouts[0], dtype=raw.dtype.str)
-            tiled._slot_array(self.inputs[slot], layout)[:] = raw
+            raw_dtype, copy_seconds = future.result()
+            self.stats["input_copy_seconds"] += copy_seconds
             names = tuple(p.name for p in self.stores[name].products)
             result_slot = self.free.popleft()
-            self.work.put_nowait((sequence, tile, slot, result_slot, names, raw.dtype.str))
+            self.work.put_nowait((sequence, tile, slot, result_slot, names, raw_dtype))
             self.input_owners[sequence] = slot
             self.active[sequence] = (name, tile, result_slot)
             del self.loading[sequence]
             self.stats["load_seconds"] += time.perf_counter() - started
+            dispatched += 1
+        self.stats["pump_dispatch_seconds"] += time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         while True:
             try:
                 event = self.events.get_nowait()
@@ -669,8 +756,11 @@ class DemandWorkerPool:
             if not tasks:
                 self._release_result(event[1])
             self.stats["worker_seconds"] += event[6]
+        self.stats["pump_events_seconds"] += time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         self._pump_accumulators()
         self._pump_publications()
+        self.stats["pump_background_seconds"] += time.perf_counter() - phase_started
 
     def close(self):
         # Cancel work on failure/exit; never block on a full data queue to send
