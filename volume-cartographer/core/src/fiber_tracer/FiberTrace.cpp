@@ -906,30 +906,6 @@ void decodePredictionAndNormalCornerPoint(
     return candidateLossFromCornerValues(pointCorners, corners.fractionsXYZ[pointIndex], corners.valid[pointIndex] != 0, optionCount, beam, candidateDirection, config);
 }
 
-[[nodiscard]] CandidateScore candidateLoss(
-    const FiberPredictionSource& predictions,
-    const vc::lasagna::NormalSampler* normalSampler,
-    const BeamState& beam,
-    const TraceVec& candidateDirection,
-    const TraceVec& candidatePoint,
-    const FiberTraceConfig& config)
-{
-    const auto candidateSample = predictions.sample(toVec3d(candidatePoint), toVec3d(candidateDirection));
-    vc::lasagna::NormalSample normalSample;
-    const vc::lasagna::NormalSample* normal = nullptr;
-    if (normalAwareSmoothnessEnabled(config) && normalSampler != nullptr) {
-        normalSample = normalSampler->sampleNormal(toVec3d(candidatePoint));
-        normal = &normalSample;
-    }
-    vc::lasagna::LasagnaNormalSampler::FloatNormalSample floatNormal;
-    const vc::lasagna::LasagnaNormalSampler::FloatNormalSample* traceNormal = nullptr;
-    if (normal != nullptr) {
-        floatNormal = {toTraceVec(normal->normal), normal->valid};
-        traceNormal = &floatNormal;
-    }
-    return candidateLossFromSample(candidateSample, beam, candidateDirection, config, traceNormal);
-}
-
 [[nodiscard]] int traceWorkerCount(const FiberPredictionSource& predictions, const vc::lasagna::NormalSampler* normalSampler, const FiberTraceConfig& config, size_t taskCount)
 {
     if (taskCount < 2 || !predictions.supportsConcurrentSampling())
@@ -1017,18 +993,6 @@ void sampleCandidateNormals(
     }
 
     const int workers = traceWorkerCount(predictions, normalSampler, config, tasks.size());
-    if (workers <= 1) {
-        const auto scoreStart = TraceClock::now();
-        for (size_t index = 0; index < tasks.size(); ++index) {
-            const auto& task = tasks[index];
-            scores[index] = candidateLoss(predictions, normalSampler, beams[task.beamIndex], task.direction, candidatePoints[index], config);
-            storeScoredFrontierCandidate(frontierOutput, beams, task, candidatePoints[index], scores[index], index);
-        }
-        if (profile != nullptr)
-            profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
-        return scores;
-    }
-
     auto& referenceDirections = scratch.referenceDirections;
     referenceDirections.clear();
     auto& predictionSamples = scratch.predictionSamples;
@@ -1105,7 +1069,7 @@ void sampleCandidateNormals(
 
 #ifdef _OPENMP
     const auto count = static_cast<std::ptrdiff_t>(tasks.size());
-#pragma omp parallel for schedule(dynamic, 64) num_threads(workers)
+#pragma omp parallel for schedule(dynamic, 64) num_threads(workers) if(workers > 1)
     for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
         if (failed.load(std::memory_order_relaxed))
             continue;
@@ -2670,17 +2634,16 @@ public:
     };
 
     struct OptionChunkMaps {
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap presence;
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap nx;
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap ny;
+        vc::lasagna::LasagnaResolvedChunks presence;
+        vc::lasagna::LasagnaResolvedChunks nx;
+        vc::lasagna::LasagnaResolvedChunks ny;
     };
 
     struct OptionSamplingGrid {
         bool sharedPresenceNxNy = false;
     };
 
-    Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes, FiberPredictionFieldBindingMode bindingMode)
-        : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
+    Impl(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode)
     {
         const auto& manifest = dataset.manifest();
         sourceScaleExplicit_ = manifest.raw.empty() || (manifest.raw.contains("source_to_base") && manifest.raw.at("source_to_base").is_number());
@@ -2743,7 +2706,7 @@ public:
 
     [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(const std::vector<cv::Vec3d>& volumePoints) const
     {
-        std::vector<vc::lasagna::LasagnaChannelChunkCache::PrefetchRequest> requests;
+        std::vector<vc::lasagna::LasagnaPrefetchRequest> requests;
         requests.reserve(volumePoints.size() * options_.size() * 24);
         std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
         keys.reserve(volumePoints.size() * 8);
@@ -2763,10 +2726,32 @@ public:
                     requests.emplace_back(&option.ny, key);
             }
         }
-        return cache_->prefetchInterleaved(requests);
+        return vc::lasagna::prefetchLasagnaChunks(requests);
     }
 
-    void setReadinessGate(FiberPredictionReadinessGate gate) { readinessGate_ = std::move(gate); }
+    void setReadinessGate(FiberPredictionReadinessGate gate)
+    {
+        readinessGroups_.clear();
+        if (gate) {
+            for (const auto& option : options_) {
+                for (const auto* binding : {&option.presence, &option.nx, &option.ny}) {
+                    auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
+                        // Exact equality: readiness must not merge near-but-different grids.
+                        return candidate.binding.spacing == binding->spacing &&
+                            candidate.binding.shapeZYX == binding->shapeZYX && candidate.binding.chunksZYX == binding->chunksZYX;
+                    });
+                    if (group == readinessGroups_.end()) {
+                        ReadinessGroup entry{*binding, *binding, {binding->path}};
+                        entry.levelBinding.spacing = 1.0;
+                        readinessGroups_.push_back(std::move(entry));
+                    } else {
+                        group->paths.push_back(binding->path);
+                    }
+                }
+            }
+        }
+        readinessGate_ = std::move(gate);
+    }
 
     void awaitPoint(const cv::Vec3d& point) const
     {
@@ -2774,34 +2759,38 @@ public:
     }
 
     template <typename Point>
-    void awaitPoints(const std::vector<Point>& points) const
+    void awaitPoints(const std::vector<Point>& points, FiberTraceProfile* profile = nullptr) const
     {
         if (!readinessGate_ || points.empty()) return;
+        const auto planStart = profile ? TraceClock::now() : TraceClock::time_point{};
         std::vector<FiberPredictionChunkDependency> dependencies;
         std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
-        for (const auto& option : options_) {
-            for (const auto* binding : {&option.presence, &option.nx, &option.ny}) {
-                keys.clear();
-                auto levelBinding = *binding;
-                levelBinding.spacing = 1.0;
-                for (const auto& p : points) {
-                    vc::lasagna::appendLasagnaInterpolationChunkKeys(*binding, cv::Vec3d(p[0], p[1], p[2]), keys);
-                    // The optimized visitor divides float points by FLOAT
-                    // spacing. Plan that exact coordinate too, using the same
-                    // existing cube planner in level space. Promoting the
-                    // original point to double alone misses boundary corners.
-                    const cv::Vec3f levelPoint = cv::Vec3f(p[0], p[1], p[2]) / static_cast<float>(binding->spacing);
-                    vc::lasagna::appendLasagnaInterpolationChunkKeys(levelBinding,
-                        cv::Vec3d(levelPoint[0], levelPoint[1], levelPoint[2]), keys);
-                }
-                for (const auto& key : keys)
-                    dependencies.push_back({binding->path, {key.z, key.y, key.x}});
+        for (const auto& group : readinessGroups_) {
+            keys.clear();
+            for (const auto& p : points) {
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(group.binding, cv::Vec3d(p[0], p[1], p[2]), keys);
+                // The optimized visitor divides float points by FLOAT
+                // spacing. Plan that exact coordinate too, using the same
+                // existing cube planner in level space. Promoting the
+                // original point to double alone misses boundary corners.
+                const cv::Vec3f levelPoint = cv::Vec3f(p[0], p[1], p[2]) / static_cast<float>(group.binding.spacing);
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(group.levelBinding,
+                    cv::Vec3d(levelPoint[0], levelPoint[1], levelPoint[2]), keys);
             }
+            vc::lasagna::deduplicateLasagnaChunkKeysInPlace(keys);
+            for (const auto& path : group.paths)
+                for (const auto& key : keys)
+                    dependencies.push_back({path, {key.z, key.y, key.x}});
         }
         std::sort(dependencies.begin(), dependencies.end(), [](const auto& a, const auto& b) {
             return a.arrayPath != b.arrayPath ? a.arrayPath < b.arrayPath : a.indexZYX < b.indexZYX;
         });
         dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
+        if (profile) {
+            profile->readinessPlanSeconds += elapsedSeconds(planStart);
+            profile->readinessPlanPoints += points.size();
+            profile->readinessPlanDependencies += dependencies.size();
+        }
         if (!dependencies.empty()) readinessGate_(dependencies);
     }
 
@@ -2927,7 +2916,9 @@ public:
             samplers.push_back(option.nyCorners.get());
         }
         samplers.insert(samplers.end(), normalSamplers.begin(), normalSamplers.end());
-        return true;
+        return std::all_of(samplers.begin(), samplers.end(), [&](const auto* sampler) {
+            return samplers.front()->sharesSamplingGrid(*sampler);
+        });
     }
 
     static void recordCornerReport(const vc::lasagna::NormalPrefetchReport& cornerReport, double cornerSeconds, int lookaheadDepth, FiberTraceProfile* profile)
@@ -2993,6 +2984,7 @@ public:
         std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
         if (!groupedCornerSamplersWithNormals(normalSampler, samplers))
             return false;
+        awaitPoints(volumePoints, profile);
         const auto cornerStart = TraceClock::now();
         vc::lasagna::NormalPrefetchReport cornerReport;
         try {
@@ -3016,6 +3008,7 @@ public:
         std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
         if (!groupedCornerSamplersWithNormals(normalSampler, samplers))
             return false;
+        awaitPoints(volumePoints, profile);
         const auto cornerStart = TraceClock::now();
         vc::lasagna::NormalPrefetchReport cornerReport;
         try {
@@ -3212,7 +3205,7 @@ public:
             std::vector<vc::lasagna::LasagnaLocalChunkResolver> resolvers;
             resolvers.reserve(optionCount);
             for (const auto& option : options_)
-                resolvers.emplace_back(bindingSelector(option), *cache_);
+                resolvers.emplace_back(bindingSelector(option));
             return resolvers;
         };
 
@@ -3378,22 +3371,20 @@ public:
 
         const auto prefetchStart = TraceClock::now();
         std::vector<OptionChunkMaps> chunks(optionCount);
-        const size_t readWorkers = vc::lasagna::lasagnaReadWorkersPerChannel();
         std::vector<std::future<vc::lasagna::NormalPrefetchReport>> prefetches;
         prefetches.reserve(optionCount * 3);
         for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_
-                    ->prefetchResolved(option.presence, *option.presence.array, presenceKeys[optionIndex], readWorkers, chunks[optionIndex].presence);
+                return vc::lasagna::resolveLasagnaChunks(option.presence, presenceKeys[optionIndex], chunks[optionIndex].presence);
             }));
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_->prefetchResolved(option.nx, *option.nx.array, nxKeys[optionIndex], readWorkers, chunks[optionIndex].nx);
+                return vc::lasagna::resolveLasagnaChunks(option.nx, nxKeys[optionIndex], chunks[optionIndex].nx);
             }));
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_->prefetchResolved(option.ny, *option.ny.array, nyKeys[optionIndex], readWorkers, chunks[optionIndex].ny);
+                return vc::lasagna::resolveLasagnaChunks(option.ny, nyKeys[optionIndex], chunks[optionIndex].ny);
             }));
         }
         for (auto& future : prefetches)
@@ -3485,9 +3476,9 @@ public:
                 nxRequest = vc::lasagna::prepareLasagnaCubeRequest(option.nx, volumePoint);
                 nyRequest = vc::lasagna::prepareLasagnaCubeRequest(option.ny, volumePoint);
             }
-            vc::lasagna::LasagnaLocalChunkResolver presenceResolver(option.presence, *cache_);
-            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx, *cache_);
-            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny, *cache_);
+            vc::lasagna::LasagnaLocalChunkResolver presenceResolver(option.presence);
+            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx);
+            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny);
             presenceResolver.resolve(presenceRequest);
             nxResolver.resolve(nxRequest);
             nyResolver.resolve(nyRequest);
@@ -3669,9 +3660,9 @@ public:
         };
         const auto makeResolvers = [&]() {
             return std::array{
-                vc::lasagna::LasagnaLocalChunkResolver(option.presence, *cache_),
-                vc::lasagna::LasagnaLocalChunkResolver(option.nx, *cache_),
-                vc::lasagna::LasagnaLocalChunkResolver(option.ny, *cache_),
+                vc::lasagna::LasagnaLocalChunkResolver(option.presence),
+                vc::lasagna::LasagnaLocalChunkResolver(option.nx),
+                vc::lasagna::LasagnaLocalChunkResolver(option.ny),
             };
         };
         sampleStoredIndices(indicesZYX.size(), parallelThreads, makeResolvers, sampleOne);
@@ -3690,23 +3681,27 @@ public:
             if (rawPresence.has_value())
                 samples[index] = {clamp01(*rawPresence / 255.0), true};
         };
-        const auto makeResolver = [&]() { return vc::lasagna::LasagnaLocalChunkResolver(option.presence, *cache_); };
+        const auto makeResolver = [&]() { return vc::lasagna::LasagnaLocalChunkResolver(option.presence); };
         sampleStoredIndices(indicesZYX.size(), parallelThreads, makeResolver, sampleOne);
     }
 
 private:
+    struct ReadinessGroup {
+        vc::lasagna::LasagnaChannelBinding binding, levelBinding;
+        std::vector<std::filesystem::path> paths;
+    };
+    std::vector<ReadinessGroup> readinessGroups_;
     std::vector<Option> options_;
     FiberPredictionReadinessGate readinessGate_;
     std::vector<OptionSamplingGrid> optionGrids_;
-    std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
     bool cornerSamplingAvailable_ = true;
     bool sourceScaleExplicit_ = false;
     std::optional<size_t> canonicalOptionIndex_;
     FiberPredictionGridInfo canonicalGridInfo_;
 };
 
-FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes, FiberPredictionFieldBindingMode bindingMode)
-    : impl_(std::make_unique<Impl>(dataset, maxCachedBytes, bindingMode))
+FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode)
+    : impl_(std::make_unique<Impl>(dataset, bindingMode))
 {
 }
 
@@ -3737,7 +3732,7 @@ void FiberPredictionField::sampleBatch(
     std::vector<FiberPredictionSample>& samples,
     FiberTraceProfile* profile) const
 {
-    impl_->awaitPoints(volumePoints);
+    impl_->awaitPoints(volumePoints, profile);
     impl_->sampleBatch(volumePoints, referenceDirections, parallelThreads, samples, profile);
 }
 
@@ -3748,7 +3743,7 @@ void FiberPredictionField::sampleBatch(
     std::vector<FiberPredictionSample>& samples,
     FiberTraceProfile* profile) const
 {
-    impl_->awaitPoints(volumePoints);
+    impl_->awaitPoints(volumePoints, profile);
     impl_->sampleBatch(volumePoints, referenceDirections, parallelThreads, samples, profile);
 }
 
@@ -3759,7 +3754,6 @@ bool FiberPredictionField::sampleCornerBatchWithNormals(
     vc::lasagna::LasagnaCornerBatch* cornerScratch,
     FiberTraceProfile* profile) const
 {
-    impl_->awaitPoints(volumePoints);
     return impl_->sampleCornerBatchWithNormals(normalSampler, volumePoints, parallelThreads, cornerScratch, profile);
 }
 
@@ -3772,7 +3766,6 @@ bool FiberPredictionField::visitCornerBatchWithNormals(
     int lookaheadDepth,
     FiberTraceProfile* profile) const
 {
-    impl_->awaitPoints(volumePoints);
     return impl_->visitCornerBatchWithNormals(normalSampler, volumePoints, parallelThreads, visitorContext, visitor, lookaheadDepth, profile);
 }
 

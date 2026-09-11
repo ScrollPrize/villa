@@ -173,6 +173,7 @@ int main(int argc, char** argv)
 {
     try {
         const auto options = parse(argc, argv);
+        vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.cacheBytes);
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
         openOptions.workingToBaseScale = 1.0;
         openOptions.remoteCacheRoot = options.remoteCacheDirectory;
@@ -191,7 +192,7 @@ int main(int argc, char** argv)
             }
         }
 
-        const vc::lasagna::LasagnaNormalSampler sampler(dataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+        const vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const auto field = vc::fiber_tracer::sampleAndAlignLasagnaNormalLattice(
             sampler,
             options.minimumBaseXYZ,

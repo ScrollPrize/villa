@@ -56,6 +56,9 @@ struct FiberTraceProfile {
     double startSampleSeconds = 0.0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
+    double readinessPlanSeconds = 0.0;
+    size_t readinessPlanPoints = 0;
+    size_t readinessPlanDependencies = 0;
     double predictionPrepareSeconds = 0.0;
     double predictionPrefetchSeconds = 0.0;
     double predictionAssignSeconds = 0.0;
@@ -313,7 +316,6 @@ class FiberPredictionField final : public FiberPredictionSource
 public:
     explicit FiberPredictionField(
         const vc::lasagna::LasagnaDataset& dataset,
-        size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL,
         FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions);
     ~FiberPredictionField() override;
 

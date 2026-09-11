@@ -2523,7 +2523,7 @@ TEST_CASE("fiber stored-grid sampling binds only canonical prediction channels")
       }
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    const vc::fiber_tracer::FiberPredictionField field(dataset, 16 * 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+    const vc::fiber_tracer::FiberPredictionField field(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
     CHECK(field.optionCount() == 1);
     const auto grid = field.storedGridInfo();
     CHECK(grid.shapeZYX == std::array<size_t, 3>{4, 4, 4});
@@ -2563,7 +2563,7 @@ TEST_CASE("fiber stored-grid metadata rejects missing explicit source scale")
       }
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    const vc::fiber_tracer::FiberPredictionField field(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+    const vc::fiber_tracer::FiberPredictionField field(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
     CHECK_THROWS_WITH_AS(field.storedGridInfo(), doctest::Contains("explicit numeric source_to_base"), std::runtime_error);
     std::filesystem::remove_all(directory);
 }
@@ -2598,7 +2598,7 @@ TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty ch
       }
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    const vc::fiber_tracer::FiberPredictionField field(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+    const vc::fiber_tracer::FiberPredictionField field(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
     const auto report = field.scanStoredPresenceChunks(3);
     CHECK(report.shapeZYX == std::array<size_t, 3>{2, 2, 6});
     CHECK(report.chunksZYX == std::array<size_t, 3>{2, 2, 2});
@@ -2626,7 +2626,7 @@ TEST_CASE("fiber stored-grid metadata rejects mismatched canonical shapes")
       }
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::FiberPredictionField(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid), doctest::Contains("must share shape and spacing"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::FiberPredictionField(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid), doctest::Contains("must share shape and spacing"), std::runtime_error);
     std::filesystem::remove_all(directory);
 }
 
@@ -2647,7 +2647,7 @@ TEST_CASE("fiber stored-grid metadata does not substitute a prefixed triplet")
       }
     })");
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::FiberPredictionField(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid), doctest::Contains("canonical presence/nx/ny"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::FiberPredictionField(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid), doctest::Contains("canonical presence/nx/ny"), std::runtime_error);
     std::filesystem::remove_all(directory);
 }
 

@@ -7391,7 +7391,7 @@ std::string formatGraphMemoryProfile(
     double elapsedSeconds,
     const vc::fiber_tracer::FiberletGraphMaterializationDiagnostics& diagnostics,
     const vc::fiber_tracer::FiberletStoredReplayCacheStats& caches,
-    const vc::lasagna::LasagnaChannelChunkCache::Stats& normalCache,
+    const vc::render::DecodedChunkCacheBudget::Stats& normalCache,
     const ProcessMemoryStats& memory)
 {
     constexpr double bytesPerGiB = 1024.0 * 1024.0 * 1024.0;
@@ -7417,13 +7417,13 @@ std::string formatGraphMemoryProfile(
            << '/' << gib(caches.anchorDecodedByteCapacity)
            << " path=" << gib(caches.pathDecodedBytes)
            << '/' << gib(caches.pathDecodedByteCapacity)
-           << " normal=" << gib(normalCache.cachedBytes)
-           << '/' << gib(normalCache.capacityBytes)
+           << " shared_decoded=" << gib(normalCache.decodedBytes)
+           << '/' << gib(normalCache.maximumBytes)
            << " pending anchor="
            << caches.anchorPendingDecodes + caches.anchorUnresolvedFetches
            << " path="
            << caches.pathPendingDecodes + caches.pathUnresolvedFetches
-           << " normal=" << normalCache.loadsInFlight << '\n'
+           << '\n'
            << "  chunks seed="
            << diagnostics.seedChunksLoaded.load(std::memory_order_relaxed)
            << '/'
@@ -7476,6 +7476,7 @@ int main(int argc, char** argv)
 {
     try {
         const auto options = parse(argc, argv);
+        vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.cacheBytes);
         if (options.mode == Mode::Constraints ||
             options.mode == Mode::Consensus ||
             options.mode == Mode::DirectionDiagnostic ||
@@ -7498,8 +7499,7 @@ int main(int argc, char** argv)
                 artifact.metadata.sources.at("normal_manifest") ==
                 normalDataset.manifest().raw;
             const vc::lasagna::LasagnaNormalSampler normals(
-                normalDataset,
-                vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+                normalDataset);
             std::optional<vc::fiber_tracer::LasagnaNormalAlignmentField>
                 alignedNormalField;
             if (options.mode == Mode::DirectionAblation &&
@@ -10641,7 +10641,7 @@ int main(int argc, char** argv)
                 auto manifest = opened.manifest();
                 manifest.workingToBaseScale = scales->traceToBaseScale;
                 fiberDataset.emplace(std::move(manifest));
-                predictions.emplace(*fiberDataset, options.cacheBytes);
+                predictions.emplace(*fiberDataset);
                 normalOptions.workingToBaseScale = scales->traceToBaseScale;
             } else {
                 normalOptions.workingToBaseScale = 1.0;
@@ -10650,8 +10650,7 @@ int main(int argc, char** argv)
                 vc::lasagna::LasagnaDataset::openLocation(
                     options.normalManifest, normalOptions);
             const vc::lasagna::LasagnaNormalSampler normals(
-                normalDataset,
-                vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+                normalDataset);
 
             std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome>
                 outcomes(cases.size());
@@ -10985,13 +10984,12 @@ int main(int argc, char** argv)
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, normalOptions);
         vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(dataset->metadata(), normalDataset);
-        const vc::lasagna::LasagnaNormalSampler normals(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+        const vc::lasagna::LasagnaNormalSampler normals(normalDataset);
 
         vc::fiber_tracer::FiberletGraphMaterializationDiagnostics
             graphDiagnostics;
         const auto normalChunkCache =
-            vc::lasagna::sharedLasagnaChannelChunkCache(
-                options.cacheBytes);
+            vc::render::processChunkCacheService()->decodedByteBudget();
         const auto profileStarted = std::chrono::steady_clock::now();
         std::jthread profileThread;
         if (options.profileMemory) {

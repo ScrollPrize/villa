@@ -7,6 +7,14 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__unix__)
+#include <unistd.h>
+#endif
+#include <limits>
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +31,37 @@
 namespace {
 using namespace vc::fiber_tracer;
 using Json = nlohmann::json;
+
+// One budget for all native sources and sampling paths, configured before binding.
+size_t configureEvaluationCache(const Json& settings)
+{
+    if (settings.contains("cache_bytes_per_channel"))
+        throw std::invalid_argument("cache_bytes_per_channel was removed; use one decoded_cache_bytes budget");
+    uint64_t bytes = 0;
+    if (settings.contains("decoded_cache_bytes")) {
+        const auto& value = settings.at("decoded_cache_bytes");
+        if (!value.is_number_integer() || value.get<int64_t>() <= 0)
+            throw std::invalid_argument("decoded_cache_bytes must be a positive integer");
+        bytes = value.get<uint64_t>();
+    } else {
+#if defined(__APPLE__)
+        uint64_t total = 0;
+        size_t size = sizeof(total);
+        if (sysctlbyname("hw.memsize", &total, &size, nullptr, 0) == 0)
+            bytes = total / 10;
+#elif defined(__unix__) && defined(_SC_PHYS_PAGES)
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long pageSize = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && pageSize > 0 && uint64_t(pages) <= UINT64_MAX / uint64_t(pageSize))
+            bytes = uint64_t(pages) * uint64_t(pageSize) / 10;
+#endif
+    }
+    if (!bytes || bytes > std::numeric_limits<size_t>::max())
+        throw std::invalid_argument("cannot determine decoded cache budget; set decoded_cache_bytes explicitly");
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(size_t(bytes));
+    std::cout << "Shared decoded cache budget: " << bytes << " bytes" << std::endl;
+    return size_t(bytes);
+}
 
 Json readJson(const std::filesystem::path& path)
 {
@@ -59,6 +98,30 @@ FiberTraceConfig traceOptions(const Json& values)
     if (config.lookaheadRetryParentCap != 0)
         throw std::invalid_argument("replay-set does not implement CP-segment retry; use --lookahead-retry-parent-cap 0");
     return config;
+}
+
+Json caseProfileJson(size_t index, double elapsed, const FiberReadinessProfile& ready, const FiberTraceProfile& trace)
+{
+    return {{"case", index}, {"elapsed_seconds", elapsed},
+        {"readiness", {{"calls", ready.calls}, {"local_hits", ready.localHits},
+            {"bridge_calls", ready.bridgeCalls}, {"submitted_dependencies", ready.submittedDependencies},
+            {"cache_clears", ready.cacheClears}, {"local_lookup_seconds", ready.localLookupSeconds},
+            {"bridge_and_permit_seconds", ready.bridgeSeconds}, {"bridge_lock_seconds", ready.bridgeLockSeconds},
+            {"ready_wait_seconds", ready.readyWaitSeconds}}},
+        {"trace", {{"generations", trace.generations}, {"candidates", trace.candidateTasks},
+            {"candidate_score_seconds_inclusive", trace.candidateScoreSeconds},
+            {"prediction_batch_seconds_inclusive", trace.predictionBatchSeconds},
+            {"readiness_plan_seconds", trace.readinessPlanSeconds},
+            {"readiness_plan_points", trace.readinessPlanPoints},
+            {"readiness_plan_dependencies", trace.readinessPlanDependencies},
+            {"corner_prepare_seconds", trace.predictionCornerPrepareSeconds},
+            {"corner_layout_seconds", trace.predictionCornerLayoutSeconds},
+            {"corner_pin_seconds", trace.predictionCornerPinSeconds},
+            {"corner_gather_seconds", trace.predictionCornerGatherSeconds},
+            {"corner_points", trace.cornerPointCount},
+            {"normal_batch_seconds_inclusive", trace.normalBatchSeconds},
+            {"frontier_seconds", trace.frontierSeconds}, {"prune_seconds", trace.pruneSeconds},
+            {"lookahead_decision_seconds", trace.lookaheadDecisionSeconds}}}};
 }
 
 struct Source {
@@ -104,6 +167,7 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (document.at("format") != "vc_native_replay_artifact" || document.at("version") != 1)
         throw std::invalid_argument("unsupported replay artifact");
     const auto settings = readJson(settingsPath);
+    configureEvaluationCache(settings);
     const auto replay = fiberReplayTraceFromJson(document.at("replay"));
     std::vector<cv::Vec3d> reference;
     for (const auto& point : document.at("reference_points_base_xyz")) {
@@ -121,8 +185,7 @@ void renderArtifact(const std::filesystem::path& artifact, const std::filesystem
     if (normalOptions.workingToBaseScale != document.at("provenance").at("trace_to_base").get<double>())
         throw std::invalid_argument("render normal scale differs from evaluation");
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(normalLocation, normalOptions);
-    const vc::lasagna::LasagnaNormalSampler normals(dataset,
-        vc::lasagna::LasagnaNormalSamplerOptions{settings.value("cache_bytes", size_t{256} << 20)});
+    const vc::lasagna::LasagnaNormalSampler normals(dataset);
     const auto ct = sourceLocation(settingsPath.parent_path(), settings.at("ct_volume").get<std::string>());
     if (!document.at("provenance").contains("ct_volume") ||
         ct != document.at("provenance").at("ct_volume").get<std::string>())
@@ -160,7 +223,11 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     if (config.at("version") != 1) throw std::invalid_argument("unsupported replay-set version");
     const auto trace = traceOptions(config.value("trace_args", Json::array()));
     const bool live = config.contains("live_endpoint");
+    const bool profileTracing = config.value("profile_tracing", false);
+    const auto readinessEntries = config.value("readiness_cache_entries", int64_t{4096});
+    if (readinessEntries < 0) throw std::invalid_argument("readiness_cache_entries must be nonnegative");
     auto persistedConfig = config;
+    persistedConfig["decoded_cache_bytes"] = configureEvaluationCache(config);
     const bool render = config.value("render", false) || renderFlag;
     persistedConfig["render"] = render;
     if (live) persistedConfig["live_endpoint"].erase("token");
@@ -193,8 +260,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         auto manifest = dataset.manifest();
         manifest.workingToBaseScale = source.traceScale;
         source.predictionManifest = manifest;
-        source.predictions = std::make_unique<FiberPredictionField>(vc::lasagna::LasagnaDataset(std::move(manifest)),
-            config.value("cache_bytes_per_channel", size_t{256} << 20));
+        source.predictions = std::make_unique<FiberPredictionField>(vc::lasagna::LasagnaDataset(std::move(manifest)));
         options.workingToBaseScale = source.traceScale;
         const auto normals = vc::lasagna::LasagnaDataset::openLocation(normalLocation, options);
         if (!normals.manifest().fiberPredictionPrefixes().empty() ||
@@ -208,8 +274,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             if ((a > b ? a - b : b - a) > 1)
                 throw std::invalid_argument("prediction and normal base shapes disagree");
         }
-        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normals,
-            vc::lasagna::LasagnaNormalSamplerOptions{config.value("cache_bytes_per_channel", size_t{256} << 20)});
+        source.normals = std::make_unique<vc::lasagna::LasagnaNormalSampler>(normals);
         source.provenance = entry;
         source.provenance["fiber_manifest"] = fiberLocation;
         source.provenance["normal_manifest"] = normalLocation;
@@ -285,13 +350,20 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 FiberCaseCpuPermit permit(cpuPermits);
                 if (failed.load()) break;
                 std::atomic<double> remaining{item.length};
+                FiberReadinessProfile readinessProfile;
+                FiberTraceProfile traceProfile;
+                FiberCaseReadiness readiness(static_cast<size_t>(readinessEntries), profileTracing ? &readinessProfile : nullptr);
+                const auto caseStart = std::chrono::steady_clock::now();
+                auto nextProfile = caseStart + std::chrono::seconds(10);
                 std::unique_ptr<FiberPredictionField> livePredictions;
                 if (bridge) {
                     livePredictions = std::make_unique<FiberPredictionField>(
-                        vc::lasagna::LasagnaDataset(source.predictionManifest),
-                        config.value("cache_bytes_per_channel", size_t{256} << 20));
+                        vc::lasagna::LasagnaDataset(source.predictionManifest));
                     livePredictions->setReadinessGate([&](const auto& dependencies) {
-                        permit.suspend([&] { bridge->await(source.id, index, remaining.load(), dependencies); });
+                        readiness.await(dependencies, [&](const auto& missing) {
+                            permit.suspend([&] { bridge->await(source.id, index, remaining.load(), missing,
+                                profileTracing ? &readinessProfile : nullptr); });
+                        }, [&] { bridge->checkActive(); });
                     });
                 }
                 FiberReplayTraceRequest request;
@@ -302,6 +374,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 request.errorThresholdBaseVoxels = threshold;
                 request.matchRefineSteps = refine;
                 request.config = trace;
+                request.config.profile = profileTracing ? &traceProfile : nullptr;
                 request.config.traceToBaseScale = source.traceScale;
                 request.config.baseVoxelSizeUm = source.voxelSizeUm;
                 const auto replay = traceFiberReplay(livePredictions ? *livePredictions : *source.predictions,
@@ -309,6 +382,13 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     [&](const FiberTraceProgress& progress) {
                         if (progress.referenceArcFraction)
                             remaining.store(item.length * (1 - std::clamp(*progress.referenceArcFraction, 0.0, 1.0)));
+                        if (profileTracing && std::chrono::steady_clock::now() >= nextProfile) {
+                            const auto now = std::chrono::steady_clock::now();
+                            nextProfile = now + std::chrono::seconds(10);
+                            auto profile = caseProfileJson(index, std::chrono::duration<double>(now - caseStart).count(), readinessProfile, traceProfile);
+                            profile["remaining_base_voxels"] = remaining.load();
+                            std::osyncstream(std::cout) << "trace-profile " << profile.dump() << std::endl;
+                        }
                     });
                 auto provenance = source.provenance;
                 provenance["source_id"] = source.id;
@@ -316,6 +396,10 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 provenance["reverse"] = item.reverse;
                 provenance["case_index"] = index;
                 writeFiberReplayTraceArtifacts(output / "cases" / std::to_string(index), item.points, replay, threshold, provenance);
+                if (profileTracing)
+                    vc::core::util::atomicWriteString(output / "cases" / std::to_string(index) / "profile.json",
+                        caseProfileJson(index, std::chrono::duration<double>(std::chrono::steady_clock::now() - caseStart).count(),
+                            readinessProfile, traceProfile).dump(2) + "\n");
                 if (render) {
                     // Render directly from this completed replay, never reload
                     // trace.json. Bound concurrent textures per source and keep

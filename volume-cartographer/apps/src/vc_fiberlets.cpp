@@ -2215,9 +2215,7 @@ int runChunkRouteStats(
     const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(
         options.normalManifestLocation, normalOptions);
     auto normalSampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(
-        normalDataset,
-        vc::lasagna::LasagnaNormalSamplerOptions{
-            options.decodedCacheBytes});
+        normalDataset);
 
     const auto evaluation = defaultFiberletReplayQuantization(
         options.storageChunkSideBaseVoxels);
@@ -4563,7 +4561,7 @@ int runWholeVolumePreprocessing(
     normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
     const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
     auto normalSampler =
-        std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+        std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset);
 
     auto anchorMetadata = replayDatasetMetadata(
         FiberletDatasetKind::Anchors,
@@ -4969,6 +4967,7 @@ int main(int argc, char** argv)
 {
     try {
         CliOptions options = parseArgs(argc, argv);
+        vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.decodedCacheBytes);
         std::shared_ptr<Volume> replayCtVolume;
         std::string replayCtLocator;
         if (options.writeReplayVisualizations) {
@@ -4986,7 +4985,7 @@ int main(int argc, char** argv)
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
         openOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
-        const vc::fiber_tracer::FiberPredictionField field(dataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+        const vc::fiber_tracer::FiberPredictionField field(dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
         const auto grid = field.storedGridInfo();
 
         if (isChunkRouteStatsCommand(options.command))
@@ -5071,7 +5070,7 @@ int main(int argc, char** argv)
             normalOptions.workingToBaseScale = grid.predictionToBaseScale;
             normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
             const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
-            const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+            const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset);
             const auto totalStart = std::chrono::steady_clock::now();
             const double totalCpuStart = processCpuSeconds();
             const auto extraction =
@@ -5151,7 +5150,7 @@ int main(int argc, char** argv)
             normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
             const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
             auto normalSampler =
-                std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset);
             options.graphReplay.errorThresholdBaseVoxels = options.failureThresholdBaseVoxels;
             options.graphReplay.matchRefineSteps = options.matchRefineSteps;
             options.graphReplay.minimumResetAdvanceBaseVoxels = options.paths.longitudinalStepPredictionVoxels * grid.predictionToBaseScale;
@@ -5344,13 +5343,13 @@ int main(int argc, char** argv)
             auto traceManifest = dataset.manifest();
             traceManifest.workingToBaseScale = scales.traceToBaseScale;
             const vc::lasagna::LasagnaDataset traceDataset(std::move(traceManifest));
-            const vc::fiber_tracer::FiberPredictionField traceField(traceDataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions);
+            const vc::fiber_tracer::FiberPredictionField traceField(traceDataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions);
 
             vc::lasagna::LasagnaDatasetOpenOptions traceNormalOptions;
             traceNormalOptions.workingToBaseScale = scales.traceToBaseScale;
             traceNormalOptions.remoteCacheRoot = options.remoteCacheDirectory;
             const auto traceNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, traceNormalOptions);
-            const vc::lasagna::LasagnaNormalSampler traceNormalSampler(traceNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+            const vc::lasagna::LasagnaNormalSampler traceNormalSampler(traceNormalDataset);
 
             const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
             if (fiber.controlPointLineIndices.empty() || fiber.controlPointLineIndices.front() >= fiber.linePointsXyzBase.size()) {
@@ -5400,7 +5399,7 @@ int main(int argc, char** argv)
             canonicalNormalOptions.remoteCacheRoot = options.remoteCacheDirectory;
             const auto canonicalNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, canonicalNormalOptions);
             const auto canonicalNormalSampler =
-                std::make_shared<vc::lasagna::LasagnaNormalSampler>(canonicalNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(canonicalNormalDataset);
             const auto fiberletEvaluationQuantization = options.eagerGraphReplay
                 ? vc::fiber_tracer::exactFiberletReplayQuantization(
                       options.storageChunkSideBaseVoxels)
@@ -6184,7 +6183,7 @@ int main(int argc, char** argv)
         normalOptions.workingToBaseScale = grid.predictionToBaseScale;
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
-        const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+        const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset);
         const auto report = vc::fiber_tracer::traceFiberletPaths(
             anchors,
             grid,

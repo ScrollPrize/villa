@@ -1,5 +1,6 @@
 #include "FiberLiveBridge.hpp"
 #include <condition_variable>
+#include <atomic>
 #include <map>
 #include <set>
 #include <mutex>
@@ -24,6 +25,7 @@ public:
     using ChunkKey = std::pair<std::string, std::array<uint32_t, 3>>;
     std::set<ChunkKey> ready;
     std::string error;
+    std::atomic<bool> cancelled{false};
     size_t next = 1;
     std::chrono::seconds timeout{600};
     int fd = -1;
@@ -83,11 +85,29 @@ public:
         {
             std::lock_guard lock(mutex);
             if (error.empty()) error = reason;
+            cancelled.store(true, std::memory_order_release);
         }
         changed.notify_all();
 #ifdef VC_LIVE_SOCKET_SUPPORTED
         if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
 #endif
+    }
+
+    void checkActive()
+    {
+        if (!cancelled.load(std::memory_order_acquire)) return;
+        std::lock_guard lock(mutex);
+        throw std::runtime_error(error);
+    }
+
+    std::unique_lock<std::mutex> awaitLock(FiberReadinessProfile* profile)
+    {
+        if (!profile) return std::unique_lock<std::mutex>(mutex);
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_lock lock(mutex);
+        profile->bridgeLockSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        return lock;
     }
 
     void send(const nlohmann::json& message)
@@ -142,14 +162,15 @@ public:
     }
 
     void await(const std::string& source, size_t caseIndex, double remaining,
-               const std::vector<vc::fiber_tracer::FiberPredictionChunkDependency>& chunks)
+               const std::vector<vc::fiber_tracer::FiberPredictionChunkDependency>& chunks,
+               FiberReadinessProfile* profile)
     {
         if (chunks.empty()) return;
         auto state = std::make_shared<Waiter>();
         size_t request;
         std::vector<ChunkKey> missing;
         {
-            std::lock_guard lock(mutex);
+            auto lock = awaitLock(profile);
             if (!error.empty()) throw std::runtime_error(error);
             for (const auto& chunk : chunks) {
                 ChunkKey key{chunk.arrayPath.string(), chunk.indexZYX};
@@ -166,12 +187,14 @@ public:
             send({{"version", 1}, {"type", "demand"}, {"request_id", request},
                   {"source", source}, {"case", caseIndex}, {"remaining_base_voxels", remaining},
                   {"chunks", std::move(dependencies)}});
-            std::unique_lock lock(mutex);
+            auto lock = awaitLock(profile);
+            const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (!changed.wait_for(lock, timeout, [&] { return state->done || !error.empty(); })) {
                 lock.unlock();
                 cancel("timed out waiting for inference chunks");
                 lock.lock();
             }
+            if (profile) profile->readyWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
             waiting.erase(request);
             if (!error.empty()) throw std::runtime_error(error);
             // Bound native bookkeeping. Dropping ready knowledge merely asks
@@ -192,5 +215,6 @@ FiberLiveBridge::FiberLiveBridge(const nlohmann::json& endpoint) : impl_(std::ma
 FiberLiveBridge::~FiberLiveBridge() = default;
 void FiberLiveBridge::cancel(const std::string& reason) { impl_->cancel(reason); }
 void FiberLiveBridge::await(const std::string& source, size_t caseIndex, double remainingBase,
-                           const std::vector<vc::fiber_tracer::FiberPredictionChunkDependency>& chunks)
-{ impl_->await(source, caseIndex, remainingBase, chunks); }
+                           const std::vector<vc::fiber_tracer::FiberPredictionChunkDependency>& chunks, FiberReadinessProfile* profile)
+{ impl_->await(source, caseIndex, remainingBase, chunks, profile); }
+void FiberLiveBridge::checkActive() const { impl_->checkActive(); }

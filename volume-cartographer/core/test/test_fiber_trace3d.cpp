@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
+#include "../../apps/src/FiberLiveBridge.hpp"
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
@@ -38,7 +39,7 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     }
     const nlohmann::json json{{"version", 2}, {"source_to_base", 0.01}, {"groups", groups}};
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(json.dump(), directory.path / "manifest.json");
-    vc::fiber_tracer::FiberPredictionField field{vc::lasagna::LasagnaDataset(std::move(manifest)), 1024};
+    vc::fiber_tracer::FiberPredictionField field{vc::lasagna::LasagnaDataset(std::move(manifest))};
     int calls = 0;
     field.setReadinessGate([&](const auto& dependencies) {
         ++calls;
@@ -55,6 +56,19 @@ TEST_CASE("live field gates float visitor boundary chunks before any cache read"
     CHECK_THROWS_WITH_AS(field.sampleBatch(std::vector<cv::Vec3f>{{0.63f, 0.1f, 0.1f}},
         std::vector<cv::Vec3f>{{1, 0, 0}}, 1, samples, nullptr), doctest::Contains("synthetic not-ready"), std::runtime_error);
     CHECK(calls == 1);
+    field.setReadinessGate([&](const auto& dependencies) {
+        // A large duplicate batch strictly within chunk1 must not invent
+        // chunk0 from the uninitialized tail of a single-chunk cube request.
+        REQUIRE(dependencies.size() == 3);
+        for (const auto& key : dependencies)
+            CHECK(key.indexZYX == std::array<uint32_t, 3>{1, 1, 1});
+        throw std::runtime_error("synthetic not-ready");
+    });
+    vc::fiber_tracer::FiberTraceProfile profile;
+    CHECK_THROWS_WITH_AS(field.sampleBatch(std::vector<cv::Vec3f>(1000, {0.8f, 0.8f, 0.8f}),
+        std::vector<cv::Vec3f>(1000, {1, 0, 0}), 1, samples, &profile), doctest::Contains("synthetic not-ready"), std::runtime_error);
+    CHECK(profile.readinessPlanPoints == 1000);
+    CHECK(profile.readinessPlanDependencies == 3);
 }
 
 namespace
@@ -554,7 +568,7 @@ TEST_CASE("native fiber tracer scores persisted corners without materialized sam
     CHECK(score.selectedDirection[2] == doctest::Approx(0.0));
 }
 
-TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
+TEST_CASE("native fiber tracer always samples candidates in a batch")
 {
     BatchPrediction predictions;
     vc::fiber_tracer::FiberTraceOneWayRequest request;
@@ -567,7 +581,8 @@ TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
     request.config.coneAngleDegrees = 5.0;
     request.config.coneAngleStepDegrees = 5.0;
     request.config.beamWidth = 2;
-    request.config.parallelThreads = 2;
+    SUBCASE("one worker") { request.config.parallelThreads = 1; }
+    SUBCASE("two workers") { request.config.parallelThreads = 2; }
     request.config.smoothnessWeight = 0.0;
     request.config.smoothnessNormalWeight = 0.0;
     request.config.smoothnessTangentWeight = 0.0;
@@ -1908,4 +1923,76 @@ TEST_CASE("polyline box clipping preserves ordered exit and re-entry runs")
               minimum,
               maximum)
               .empty());
+}
+
+
+TEST_CASE("Case-local readiness bypasses the shared gate and permit on acknowledged hits")
+{
+    using Dependency = vc::fiber_tracer::FiberPredictionChunkDependency;
+    FiberReadinessProfile profile;
+    FiberCaseReadiness ready(4, &profile);
+    std::vector<Dependency> first{{"/source/a", {0,0,0}}};
+    int sharedCalls = 0;
+    bool cancelled = false;
+    auto active = [&] { if (cancelled) throw std::runtime_error("cancelled"); };
+    auto wait = [&](const auto& missing) {
+        ++sharedCalls; // production's CPU permit and bridge are BOTH inside here
+        CHECK(missing.size() == 1);
+    };
+    ready.await(first, wait, active);
+    for (int i=0; i<1000; ++i) ready.await(first, wait, active);
+    CHECK(sharedCalls == 1);
+    CHECK(profile.localHits == 1000);
+    CHECK(profile.bridgeCalls == 1);
+    first.push_back({"/source/b", {0,0,0}});
+    ready.await(first, wait, active);
+    CHECK(sharedCalls == 2); // same coordinates in another array are not a proof
+    first.push_back({"/source/a", {0,0,1}});
+    ready.await(first, wait, active);
+    CHECK(sharedCalls == 3);
+    cancelled = true;
+    CHECK_THROWS(ready.await(first, wait, active));
+    CHECK(sharedCalls == 3);
+}
+
+TEST_CASE("Case-local readiness never caches failed or cancelled acknowledgements")
+{
+    using Dependency = vc::fiber_tracer::FiberPredictionChunkDependency;
+    const std::vector<Dependency> chunks{{"/source/a", {0,0,0}}};
+    FiberCaseReadiness ready;
+    int calls = 0;
+    bool fail = true, cancelled = false;
+    auto active = [&] { if (cancelled) throw std::runtime_error("cancelled"); };
+    auto wait = [&](const auto&) { ++calls; if (fail) throw std::runtime_error("not published"); };
+    CHECK_THROWS(ready.await(chunks, wait, active));
+    CHECK_THROWS(ready.await(chunks, wait, active));
+    CHECK(calls == 2);
+    fail = false;
+    CHECK_THROWS(ready.await(chunks, [&](const auto&) { cancelled = true; }, active));
+    cancelled = false;
+    ready.await(chunks, wait, active);
+    CHECK(calls == 3); // cancelled acknowledgement established no proof
+    FiberCaseReadiness otherCase;
+    otherCase.await(chunks, wait, active);
+    CHECK(calls == 4);
+}
+
+TEST_CASE("Case-local readiness eviction and disabled mode conservatively recheck")
+{
+    using Dependency = vc::fiber_tracer::FiberPredictionChunkDependency;
+    const std::vector<Dependency> a{{"/source/a", {0,0,0}}}, b{{"/source/a", {0,0,1}}};
+    FiberReadinessProfile profile;
+    FiberCaseReadiness ready(1, &profile);
+    int calls = 0;
+    auto wait = [&](const auto&) { ++calls; };
+    auto active = [] {};
+    ready.await(a, wait, active);
+    ready.await(b, wait, active);
+    ready.await(a, wait, active);
+    CHECK(calls == 3);
+    CHECK(profile.cacheClears == 2);
+    FiberCaseReadiness disabled(0);
+    disabled.await(a, wait, active);
+    disabled.await(a, wait, active);
+    CHECK(calls == 5);
 }
