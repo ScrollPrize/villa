@@ -37,6 +37,21 @@ def _require(module_name: str, used_for: str) -> ModuleType:
         ) from exc
 
 
+def _load_parser(used_for: str) -> Tuple[ModuleType, ModuleType]:
+    """Import the remote-listing parser, checking the packages it imports first.
+
+    ``vesuvius.data.paths.parser`` imports ``aiohttp`` and ``lxml`` at module scope,
+    so both are checked before it is imported; otherwise a missing one surfaces as
+    a bare import error from inside the parser instead of the guidance above.
+    """
+
+    aiohttp = _require("aiohttp", used_for)
+    _require("lxml", used_for)
+    from vesuvius.data.paths import parser
+
+    return parser, aiohttp
+
+
 def _config_dir() -> Path:
     """Return the directory where packaged catalog YAML files live."""
     root = Path(get_installation_path()) / "vesuvius" / "install" / "configs"
@@ -49,9 +64,7 @@ async def scrape_website(
 ) -> Tuple[CatalogTree, CatalogListing]:
     """Collect directory metadata and Zarr links from a remote listing."""
 
-    from vesuvius.data.paths import parser
-
-    aiohttp = _require("aiohttp", "Refreshing the catalog from the data server")
+    parser, aiohttp = _load_parser("Refreshing the catalog from the data server")
 
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
@@ -71,9 +84,7 @@ async def scrape_website(
 async def collect_subfolders(base_url: str, ignore_list: List[str]) -> List[str]:
     """Return subfolder paths beneath ``base_url`` ignoring provided patterns."""
 
-    from vesuvius.data.paths import parser
-
-    aiohttp = _require("aiohttp", "Refreshing the catalog from the data server")
+    parser, aiohttp = _load_parser("Refreshing the catalog from the data server")
 
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
