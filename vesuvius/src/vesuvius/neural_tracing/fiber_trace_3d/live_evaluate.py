@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import shutil
@@ -44,6 +45,22 @@ def location(base, value):
             raise ValueError("use an unsigned source locator and ambient credentials; URLs are persisted as source identity")
         return value.rstrip("/")
     return str((base / value).resolve())
+
+
+def inference_cache_root(cache_root, namespace=None):
+    """Optional fresh prediction-only namespace; source fetch caches stay shared."""
+    root = Path(cache_root) / "live_inference"
+    if namespace is None:
+        return root
+    if not isinstance(namespace, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", namespace) is None:
+        raise ValueError("inference_cache_namespace must be a nonempty safe single component (max64 characters)")
+    destination = root / "_namespaces" / namespace
+    if not destination.resolve().is_relative_to(root.resolve()):
+        raise ValueError("inference cache namespace escapes live_inference through a symlink")
+    # Single-use prevents accidentally measuring a prediction-cache hit as a
+    # source-prefetched inference rerun. Existing predictions remain untouched.
+    destination.mkdir(parents=True, exist_ok=False)
+    return destination
 
 
 def freeze_checkpoint(path, cache_root):
@@ -233,7 +250,6 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         geometry, adapter, output, accumulator_dtype=settings.get("accumulator_dtype", "float16"),
         accumulator_layout=settings.get("accumulator_layout", "flat"),
         accumulator_prefault=settings.get("accumulator_prefault", False),
-        scratch_budget_bytes=int(settings.get("scratch_budget_bytes_per_source", 64 << 30)),
         prepare_output=prepare_output)
 
 
@@ -260,6 +276,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     binary = Path(shutil.which(str(native_binary)) or native_binary).resolve()
     resolver = binary.with_name("vc_cache_root")
     cache_root = Path(subprocess.check_output([str(resolver)], text=True).strip())
+    prediction_cache_root = inference_cache_root(cache_root, config.get("inference_cache_namespace"))
     snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
     effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
     settings = dict(config.get("inference", {}))
@@ -276,11 +293,15 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
         raise ValueError("invalid inference scaledown power")
     scale, chunk = 1 << power, int(settings.get("chunk_size", 32))
     dtype = settings.get("accumulator_dtype", "float16")
+    max_batch_size = settings.get("max_batch_size", 1)
+    if type(max_batch_size) is not int or max_batch_size < 1:
+        raise ValueError("inference.max_batch_size must be a positive integer")
     implementation = implementation_identity()
     model_identity = {"schema": 1, "checkpoint_sha256": checkpoint_digest, "config": effective,
                       "precision": precision, "tile": tile, "overlap": overlap, "border": border,
                       "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
-                      "compressor": settings.get("compressor", "blosc-zstd"), "implementation": implementation}
+                      "compressor": settings.get("compressor", "blosc-zstd"), "implementation": implementation,
+                      "max_batch_size": max_batch_size}
     model_key = json_digest(model_identity)
     evaluation = dict(config)
     if not isinstance(config.get("render", False), bool):
@@ -295,7 +316,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     native = None
     connection = None
     pool = None
-    with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
+    with ExitStack() as cleanup:
         for source in config["sources"]:
             source_id = source["id"]
             if source_id in source_to_store:
@@ -319,7 +340,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 "coordinate_space": source.get("coordinate_space")}
             source_key = json_digest(source_identity)
             source_to_store[source_id] = source_key
-            cache = cache_root / "live_inference" / source_key / model_key
+            cache = prediction_cache_root / source_key / model_key
             if source_key not in stores:
                 store = cleanup.enter_context(create_demand_store(cache, source_identity, model_identity,
                     geometry, effective, snapshot, level, settings))
@@ -344,6 +365,19 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                     raise ValueError("each explicit fiber path must contain one annotation")
                 backgrounds[source_key].update(reference_chunks(loaded[0].line_points_xyz,
                     (1 << level) * scale, geometry.output_shape, chunk))
+        return coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
+            backgrounds, readers, device_list, settings, started=started)
+
+
+def coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
+                      backgrounds, readers, device_list, settings, *, started=None, allow_inference=True):
+    """Shared authenticated control loop for live inference and cached-only replay."""
+    started = time.monotonic() if started is None else started
+    max_batch_size = settings.get("max_batch_size", 1)
+    if type(max_batch_size) is not int or max_batch_size < 1:
+        raise ValueError("inference.max_batch_size must be a positive integer")
+    native = connection = pool = None
+    with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
         listener = cleanup.enter_context(socket.socket())
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
@@ -376,6 +410,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             queue_log = None
             last_queue_report = 0.0
             while not authenticated or native.poll() is None or waiters or (pool is not None and pool.busy):
+                if not allow_inference and time.monotonic() - started > settings.get("cached_trace_timeout_seconds", 300):
+                    raise TimeoutError("cached trace profiling exceeded its bounded duration")
                 if select.select([connection], [], [], 0.005)[0]:
                     received = connection.recv(65536)
                     if not received:
@@ -414,18 +450,21 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                             origin = stores[key].request(item["index_zyx"], remaining=float(message["remaining_base_voxels"]))
                             targets.add((key, origin))
                         waiters[message["request_id"]] = targets
-                queued = any(any(t not in s.tiles for t in s.priorities) for s in stores.values())
+                queued = any(s.pending_tile_key() is not None for s in stores.values())
                 if pool is None and queued:
+                    if not allow_inference:
+                        raise RuntimeError("cached-only replay cannot schedule inference")
                     pool = demand.DemandWorkerPool(stores, readers, device_list,
                         slots_per_gpu=int(settings.get("slots_per_gpu", 2)), input_workers=int(settings.get("input_workers", 8)),
                         input_slots=settings.get("input_slots"),
                         result_slots=settings.get("result_slots"),
+                        max_batch_size=max_batch_size,
                         accumulator_workers=settings.get("accumulator_workers"),
                         flush_workers=int(settings.get("flush_workers", 4)))
                     queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
                     print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
                           f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
-                          f"result_slots={pool.stats['result_slots']}", flush=True)
+                          f"result_slots={pool.stats['result_slots']} max_batch_size={max_batch_size}", flush=True)
                 if pool is not None:
                     pool.pump()
                     if time.monotonic() - last_queue_report >= 1:

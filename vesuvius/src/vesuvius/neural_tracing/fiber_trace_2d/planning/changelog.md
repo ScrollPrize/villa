@@ -1,3 +1,46 @@
+## 2026-09-11 — Dynamic per-GPU inference batching
+
+- Shared tiled worker now supports immediately available dynamic model batches, individual conversion/normalization/result slots and unchanged accumulation. Positive inference.max_batch_size defaults1 and participates in cache identity; actual batch histograms/timings/CUDA peaks recorded. Legacy CLI fixtures repaired and terminal asynchronous-flush progress refreshed;105batching/demand/evaluation/profile tests and64preprocess tests/6subtests passed.
+- Full-set cap8 comparison exposed313s admission-stage overhead in684.879s coordinator time. Exact-order lazy heaps reduce admission to1.35s and coordinator time to516.699s. Matched heap batch1 completes in860.380s: cap8 saves39.95% wall time with78.05% higher normalized worker throughput. All100directions completed in each valid row, fresh inference and identical source membership. Standard classic config now uses256³/cap8 with a fresh namespace; genericAPIdefault1 unchanged.106targeted+64preprocess tests/6subtests passed. Full results and caveats: docs/full_dynamic_inference_batching_20260911.md/.json.
+- Four-fiber implementation/memory pilot caps1/2/4/8 completed fresh:28.372/26.224/28.712/25.094s, summed worker98.623/75.072/67.053/58.001s; cap8 peak35.01GiB allocated/54.67GiB reserved. Cap16OOM before publication, clean abort. No global default changed; full tuning reserved for full collection per user. Details docs/dynamic_inference_batching_20260911.md.
+
+## 2026-09-11 — Four-fiber fresh-inference tile comparison
+
+- Existing approved runner supports explicit filename subsets after full locked collection validation. Four fibers/eight directions completed with fresh inference at512³ and256³, all8GPUs exclusive:34.682s/29.144s coordinator wall,87/537tiles,zero reused predictions,23/22trace failures. Smaller tiles process22.85% fewer voxels but lower voxel-normalized throughput; single-run/cache/blending caveats recorded.23focused tests passed; no default changed. See docs/four_fiber_fresh_inference_20260911.md.
+
+## 2026-09-11 — Canonical batched tracer
+
+- Removed scalar candidate special case at threads1; shared efficient batch/fused paths now apply at any worker count. Exact-grid readiness grouping, valid cube-key collection (no fictitious chunk0), and eligibility-before-gate avoid repeated planning. Numerical change explicitly authorized; within-new-path determinism tested.
+- Cache-only4-direction pilot completed twice in0.982/1.035s, one candidate worker per fiber, zero inference, failures unchanged. Matched old per-direction timings30–52s versus new0.60–1.01s; prior8-way versus new4-way concurrency differs. Original8-case new attempt failed closed on uncached changed-path chunk.318native+77Python tests; report docs/batched_tracer_20260911.md. No full100-case rerun or adaptive worker scheduler implemented.
+
+## 2026-09-11 — Native wait profiling and readiness fast path
+
+- Completed strict cache-only short ABBA comparison through the existing exclusive-manager runner: native mean71.968→65.703s (8.71% less time), bridge entries8986980→243, exact original replay equality, zero inference.318 native/76 Python tests. See docs/cached_trace_profile_20260911.md; preliminary cropped/reserialized pilots are excluded.
+
+- Added per-thread CPU/wait observations through the same approved runner.
+  Kernel denied stack/wait-object attribution; no exact lock claim made.
+- Case-local acknowledged-chunk proofs avoid redundant bridge locks and
+  CPU-permit operations, preserving atomic cancellation and first-read gates.
+  Added opt-in per-case readiness/native stage timing.318 native cases and
+  74 Python tests passed; synthetic bridge calls18→6 with identical traces.
+- Current full evaluation was not interrupted; new code is not hot-injected.
+  Dataset speedup and exact-lock attribution pending an instrumented run.
+  See docs/tracer_wait_profile_20260911.md.
+
+## 2026-09-11 — Unified native fiber/normal decoded cache
+
+- Removed LasagnaChannelChunkCache and its duplicate payload copies, LRU and read pool. Scalar and corner sampling now share regular ChunkCacheService source handles and one native-process decoded budget; extracted the existing bounded local-reference helper for both samplers.
+- Batch evaluation defaults to10% physical RAM and records the effective budget; standalone options configure the service, not individual samplers. Preserved requested-level/readiness/fill and numerical behavior.315 native cases +69 Python tests passed.
+- Authorized full100-direction rerun launched with exclusive manager ownership and a fresh inference namespace, via the unchanged approved runner. Timing pending; details:docs/unified_native_cache_20260911.md.
+
+## 2026-09-11 — Remove artificial live-inference scratch cap
+
+- Removed the64GiB/source cap, touched-byte accounting and per-tile storage
+  polling after they aborted the full evaluation. File-backed accumulators are
+  now uncapped by the application; shared RAM pools remain bounded. Filesystem
+  errors and worker failures still abort without falsely publishing readiness.
+  Full-run restart/timing remains pending; no numerical changes intended.
+
 ## 2026-09-11 — Embedding merge and exclusive bbox/inference profile
 
 - Merged fiber-training-embedding preserving embeddings, training sample progress,

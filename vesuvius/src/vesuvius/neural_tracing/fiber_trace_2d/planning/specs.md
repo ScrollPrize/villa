@@ -1,6 +1,52 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Dynamic per-GPU inference batches (2026-09-11)
+
+- inference.max_batch_size is a positive integer model-batch cap per GPU, default1. Shared tiled worker takes the first descriptor and drains only immediately available descriptors up to the cap. No batch-fill delay, fixed queue partitions, extra staging files or replacement accumulator. Actual capacity is also bounded by ready inputs and available result slots.
+- Per-tile dtype conversion and adapter normalization retain individual sample statistics. Batch tensor is B,1,D,H,W; adapters opting into batching must return B-preserving products. Each result keeps its own original coordinates, requested products and result slot. Input is released after synchronous shared-memory H2D; output readiness still requires complete accumulation/publication. Validate batch/spatial product shape before result descriptors; failures abort the pool, not silently shrink/retry the cap.
+- Batch cap participates in inference cache identity. GPU batch shapes and existing asynchronous float16 accumulation can change low-order values and trajectories; no claim of bit-identical fresh-run results. Precision, blend/filter/finalization rules and tracing parameters stay unchanged.
+- Demand summaries record batch_size_counts, batch_seconds, batches and per-worker CUDA allocation/reservation peaks. Histogram weighted count equals completed tiles after successful drain. Existing worker_seconds and optional per-tile stage timings amortize batch costs across tiles, so aggregate time is not multiplied by batch size. CUDA input-stage events sum separate per-input intervals.
+- Pending inference admission uses per-store lazy priority heaps. The exact ordering remains foreground before background, larger remaining reference length first, then source key and tile coordinates. Only new/promoted pending priorities add heap entries; stale/admitted entries are discarded. Coordinator owns these structures. Cached-only stores expose no pending work. Per-second detailed queue accounting can still scan metadata; this is not a priority-policy change.
+- Successful full-volume progress must refresh finalized output extent after the final asynchronous publication acknowledgement, even if tile count has not changed. This reporting update must not imply publication before flush completion.
+
+## Explicit fresh-inference comparison subsets (2026-09-11)
+
+- Classic runner source.test_fibers optionally selects original filenames only after validating complete locked collection membership, hashes and count. Empty, duplicate, unknown and non-filename entries fail. Default evaluates the entire source.
+- Fresh inference comparisons use distinct single-use inference_cache_namespace values; fetched source CT/normal caches remain shared. Tile-size comparisons report normalized inferred volume and total wall, retain output chunk size, and disclose changed overlap amplification and possible blended prediction differences.
+
+## Canonical batched tracer (2026-09-11)
+
+- Candidate evaluation always uses the shared batch path, including threads1. Compatible prediction/normal grids use fused corners; incompatible grids use separate batches. Generic sources retain the shared virtual batch fallback and concurrency capability limits. Scalar seed sampling remains, not a second candidate evaluator.
+- User explicitly permits numerical differences when replacing the former single-worker scalar candidate path with existing batch arithmetic. No fast-math or precision compiler flags change. New-path thread-count/repetition/live-offline determinism remains required; old serialized replay comparison is recorded rather than enforced only when profile.allow_original_replay_difference is explicitly true. Default strict old-replay comparison remains unchanged.
+- Live readiness planning uses immutable exact-lattice groups, valid interpolation keys and integer-key dedup before path expansion. Both float and double public sampling footprints stay covered. No fictitious unused single-chunk key slots; no repeated pre-gate planning for incompatible fused attempts. Publication acknowledgement/cancellation stays caller-side before internal candidate workers. Profile readiness_plan counters cover profiled batch calls, excluding scalar seeds.
+
+## Cached-only tracer profiling (2026-09-11)
+
+- The approved classic evaluation runner supports profile.kind=cached-trace under its usual exclusive manager grant. It reuses the authenticated native coordinator; a read-only published-store adapter validates completed provenance and channel completeness. Missing inference is an error, never a request to infer or allocate scratch.
+- Diagnostic readiness_cache_entries=0 disables case-local proofs;4096 is the default. Each mode preserves exact replay geometry/failures, publication-before-read checks and cancellation. Repetitions use identical references/settings; required artifact coverage is validated.
+- The short cached workload selects complete short fibers to preserve forward/reverse start points. Prefix cropping is not guaranteed to stay within published inference coverage. No missing-cache fallback or inference is permitted.
+
+## Native Lasagna decoded-cache ownership (2026-09-11)
+
+- FiberPredictionField and LasagnaNormalSampler use regular process-wide ChunkCacheService for scalar and corner paths. Canonical source handles, coalesced reads, uint8 payloads, LRU and decoded-byte budget are shared; no LasagnaChannelChunkCache or sampler-local budget remains.
+- LocalChunkCache is the existing bounded plane-sampler reference helper, extracted for reuse. Cube/batch references pin shared payloads without copying them; the regular budget accounts and protects these pins until released, so outstanding readers can temporarily exceed its ceiling.
+- Samplers never reconfigure the GUI budget. Standalone tools configure their existing cache option at startup; replay-set defaults to10% physical RAM, or an explicit positive decoded_cache_bytes. The effective capacity is recorded in the result config. cache_bytes_per_channel is rejected.
+- Missing chunks use explicit uint8 fill when present; absent fill remains unavailable for scalar sampling. Stored all-zero chunks without declared fill remain real data. Errors are not silently converted to fill. Requested-level/readiness gates and interpolation math are unchanged.
+- This unifies native-process decoded caching, not caches in separate Python inference processes or algorithm-specific non-voxel caches.
+
 ## Native live reference evaluation (standalone first)
+
+- Live cases keep thread-confined publication proofs for acknowledged chunks
+  (readiness_cache_entries default4096;0 disables memoization for diagnostics).
+  Local hits avoid shared bridge locks and CPU-permit suspension, but still
+  observe atomic bridge cancellation. Failed acknowledgements never create
+  proofs. Eviction only causes conservative rechecks. This metadata is not a
+  decoded-payload cache and cannot transfer across cases/inference sessions.
+- Optional profile_tracing records per-case readiness counters/timers and
+  existing native trace-stage profiles. Progress callbacks may emit profile
+  lines at10s intervals; these are not stall heartbeats. Completion writes
+  cases/N/profile.json. Timings are inclusive/nested where documented; no
+  tracing decisions, inference parameters or numerical behavior change.
 
 - Classic evaluation uses the exclusive GPU-manager launcher at explicit priority
   100. Admission precedes model/GPU work; the shared manager may auto-start using
@@ -73,7 +119,7 @@
 - Optional `inference.accumulator_layout` is `flat` (default) or `chunk-major`.
   Chunk-major scratch stores output-chunk grid ZYX followed by local brick ZYX,
   in the same per-channel files. Edge bricks are padded; descriptors retain the
-  logical volume shape, and scratch budgeting charges whole touched bricks.
+  logical volume shape. Scratch has no application-imposed byte cap.
   Shared accumulator/finalizer helpers translate regions, preserving per-add
   arithmetic. Output Zarr geometry and chunk ownership/tasks do not change.
   No prefaulting, eager allocation, advice or extra sync accompanies layout alone.
@@ -109,6 +155,13 @@
   reference-segment-intersection prefetch. Prefetch is drained before coordinator
   completion. First-version priorities are monotone promotions without aging.
 - Cache lives under the shared global root's `live_inference/<source>/<model>`.
+  Optional evaluation `inference_cache_namespace` creates a fresh, single-use
+  `live_inference/_namespaces/<name>/<source>/<model>` prediction tree for timing
+  reruns. It never relocates/clears source CT or normal caches, nor old predictions.
+  Names are1–64ASCII letters/digits/underscore/hyphen, starting alphanumeric;
+  existing namespaces and resolved symlink escapes are rejected. Omitted/null
+  retains normal reusable prediction-cache behavior. It is an operational path
+  choice, not an inference/numerical parameter.
   Source identity includes locator/revision/metadata/lattice; inference identity
   includes frozen checkpoint SHA256, effective parameters, relevant code hashes
   and runtime versions. Require an updated revision for mutable input content.
@@ -126,9 +179,10 @@
   validate all paths and remove its old siblings so process interruption cannot
   leave a mixed-generation complete group. This is not a power-loss transactional
   guarantee; same-size, decodable corruption is not cryptographically detected.
-- Per-source scratch and active shared slots have budgets. Fresh sparse mmap
-  holes read as zeros; logical touched-byte and periodic allocated/free-space
-  checks are advisory, not guaranteed preallocation. Concurrent disk exhaustion
+- Active shared RAM slots remain bounded; file-backed scratch has no configured
+  size cap, touched-byte accounting or per-tile filesystem-space polling.
+  Fresh sparse mmap holes read as zeros, without preallocation. Actual filesystem
+  errors propagate rather than being masked. Disk exhaustion
   can still cause a worker SIGBUS; worker death aborts instead of marking ready.
   No silent partial-output eviction. Stuck underlying
   input-read cancellation is explicitly deferred by the user (not an observed

@@ -46,6 +46,19 @@ def validate_locked_membership(split_root, collection):
             raise ValueError(f"locked annotation hash mismatch: {name}")
 
 
+def select_test_files(files, names=None):
+    """Select explicit filenames after the complete collection is validated."""
+    if names is None:
+        return files
+    if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names):
+        raise ValueError("test_fibers must be a nonempty list of filenames")
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate test_fibers selection")
+    if not set(names).issubset({p.name for p in files}):
+        raise ValueError("test_fibers contains unknown or non-filename entries")
+    return [p for p in files if p.name in names]
+
+
 def resolve_normal_binding(manager, binding, predictions):
     """Resolve the configured source and exact normal choice, without fallbacks."""
     from lasagna.manager.fiberlets import _completed_dependency, _published_dependency
@@ -121,6 +134,7 @@ def prepare(workload, *, pilot_only=False):
         files = sorted((SPLIT / "test" / collection).glob("*.json"))
         if len(files) != count:
             raise ValueError(f"locked test count changed for {collection}")
+        files = select_test_files(files, binding.get("test_fibers"))
         fibers = []
         for path in files:
             document = json.loads(path.read_text())
@@ -172,14 +186,22 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "profile"])
+    parser.add_argument("mode", choices=["prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "profile", "observe"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
     parser.add_argument("--manager-priority", type=int)
     parser.add_argument("--unmanaged", action="store_true", help="explicit bypass of configured manager")
+    parser.add_argument("--pid", type=int, help="existing coordinator PID for read-only observe")
+    parser.add_argument("--seconds", type=float, default=20, help="read-only observe duration,1–60s")
     args = parser.parse_args()
     workload = load_workload(args.config)
+    if args.mode == "observe":
+        if args.pid is None:
+            parser.error("observe requires --pid")
+        from vesuvius.neural_tracing.fiber_trace_3d.live_process_probe import observe
+        observe(args.pid, workload["output_root"], seconds=args.seconds)
+        return 0
     devices = args.devices or (workload["pilot_devices"] if args.mode == "pilot" else workload["devices"])
     manager = workload["evaluation"].get("gpu_manager", {})
     if args.mode in ("pilot", "full", "profile") and not args.unmanaged and (
@@ -190,6 +212,12 @@ def main():
                               devices=devices, settings=manager, socket=args.manager_socket,
                               priority=args.manager_priority)
     if args.mode == "profile":
+        if workload.get("profile", {}).get("kind") == "cached-trace":
+            for source in workload["sources"]:
+                validate_locked_membership(Path(workload["split_root"]), source["id"])
+            from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import run
+            run(workload)
+            return 0
         from vesuvius.neural_tracing.fiber_trace_3d.live_inference_profile import profile_workload
         profile_workload(workload, devices_override=devices)
         return

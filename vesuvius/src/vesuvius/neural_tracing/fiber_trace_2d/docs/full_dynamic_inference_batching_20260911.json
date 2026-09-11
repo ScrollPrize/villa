@@ -1,0 +1,487 @@
+{
+  "workload": "50 locked test fibers / 100 directions; 256^3 inference; eight exclusive H100 GPUs",
+  "measurement_notes": [
+    "Fresh inference namespaces; shared source fetch caches; one full run per row.",
+    "Worker seconds sum overlapping workers; batch distributions mix actual batch sizes.",
+    "Generic API default remains 1; standard classic workload uses cap8.",
+    "The first full cap1 v1 timed out and is excluded."
+  ],
+  "rows": [
+    {
+      "run": "classic_full_dynamic256_b8_20260911_v2",
+      "status": "complete",
+      "result_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v2/full",
+      "scheduler": "scan",
+      "max_batch_size": 8,
+      "coordinator_seconds": 684.8789527192712,
+      "native_seconds": 637.366560467,
+      "tiles": 34394,
+      "inferred_gvox": 577.035567104,
+      "model_calls": 6865,
+      "worker_seconds": 3603.7034222315856,
+      "equivalent128_per_worker_second": 76.35256505920033,
+      "equivalent128_per_coordinator_second": 401.7527460984534,
+      "batch_histogram": {
+        "1": 2628,
+        "2": 85,
+        "3": 54,
+        "4": 45,
+        "5": 59,
+        "6": 208,
+        "7": 577,
+        "8": 3209
+      },
+      "mean_actual_batch": 5.0100509832483615,
+      "full_cap_tile_percent": 74.64092574286212,
+      "batch_seconds": {
+        "n": 6865,
+        "mean": 0.5249385902740858,
+        "min": 0.17072270065546036,
+        "p50": 0.6688237134367228,
+        "p95": 0.7516506880521773,
+        "max": 2.3733269535005093
+      },
+      "cases": 100,
+      "failures": 1990,
+      "directed_reference_mm": 8081.558059624804,
+      "failures_per_directed_mm": 0.2462396465283067,
+      "published_chunks": 11143,
+      "warm_chunks": 0,
+      "source_stats": {
+        "5353a107b5d394f37ebf9e543817d693e39be28d7500a3991820dee7d9e5c823": {
+          "inferred_tiles": 1086,
+          "published_chunks": 473,
+          "warm_chunks": 0
+        },
+        "6f3ddc1490019e865be779f53e09db0264bfe76004a035b97498ed852f55b3cc": {
+          "inferred_tiles": 24655,
+          "published_chunks": 7906,
+          "warm_chunks": 0
+        },
+        "891c28cce8edbbee74ce9cd7317bd0e9bb29b7b8ef797dc62dd7fac9b2d2bc08": {
+          "inferred_tiles": 504,
+          "published_chunks": 136,
+          "warm_chunks": 0
+        },
+        "a94d5ea349549975e372f8d5e9fb68a2fb5474c3dd06f00950b7d1cbe33ade20": {
+          "inferred_tiles": 2367,
+          "published_chunks": 702,
+          "warm_chunks": 0
+        },
+        "f87eef23d15f7f99edf8a4ffa452785e2eb024b9a2890b962d737770e6374487": {
+          "inferred_tiles": 5782,
+          "published_chunks": 1926,
+          "warm_chunks": 0
+        }
+      },
+      "per_gpu_memory_peaks": {
+        "0": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "1": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "2": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "3": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "4": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "5": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "6": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "7": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        }
+      },
+      "max_allocated_gib": 35.0053186416626,
+      "max_reserved_gib": 54.671875,
+      "coordinator_stages": {
+        "pump_admit_seconds": 313.1282590087503,
+        "pump_background_seconds": 41.395953269675374,
+        "pump_dispatch_seconds": 1.2990340776741505,
+        "pump_events_seconds": 37.64688475988805
+      },
+      "queue_distributions": {
+        "read_done": {
+          "n": 606,
+          "mean": 80.74257425742574,
+          "min": 0,
+          "p50": 118,
+          "p95": 127,
+          "max": 128
+        },
+        "gpu_submitted_uncollected": {
+          "n": 606,
+          "mean": 57.29537953795379,
+          "min": 0,
+          "p50": 53,
+          "p95": 128,
+          "max": 128
+        },
+        "publications_queued": {
+          "n": 606,
+          "mean": 2276.53300330033,
+          "min": 0,
+          "p50": 2243.5,
+          "p95": 4597,
+          "max": 4647
+        }
+      },
+      "final_queue": {
+        "elapsed_seconds": 684.8494726642966,
+        "phase": "complete",
+        "trace_requests_waiting": 0,
+        "read_queued": 0,
+        "read_running": 0,
+        "read_done": 0,
+        "reads_submitted": 0,
+        "tiles_queued": 0,
+        "tiles_queued_foreground": 0,
+        "tiles_queued_background": 0,
+        "requested_chunks_pending": 0,
+        "incidental_chunks_pending": 132455,
+        "gpu_submitted_uncollected": 0,
+        "input_slots_owned": 0,
+        "input_slots_free": 256,
+        "input_slots_capacity": 256,
+        "result_slots_free": 128,
+        "result_slots_capacity": 128,
+        "tiles_accumulating": 0,
+        "accumulation_tasks_outstanding": 0,
+        "accumulation_tasks_not_submitted": 0,
+        "publications_submitted": 0,
+        "publications_queued": 0
+      }
+    },
+    {
+      "run": "classic_full_dynamic256_b8_20260911_v3_heap",
+      "status": "complete",
+      "result_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full",
+      "scheduler": "heap",
+      "max_batch_size": 8,
+      "coordinator_seconds": 516.6992826592177,
+      "native_seconds": 469.561863196,
+      "tiles": 34441,
+      "inferred_gvox": 577.824096256,
+      "model_calls": 4760,
+      "worker_seconds": 3402.995326809585,
+      "equivalent128_per_worker_second": 80.96631747605606,
+      "equivalent128_per_coordinator_second": 533.2463373705144,
+      "batch_histogram": {
+        "1": 487,
+        "2": 18,
+        "3": 15,
+        "4": 5,
+        "5": 6,
+        "6": 4,
+        "7": 1,
+        "8": 4224
+      },
+      "mean_actual_batch": 7.235504201680672,
+      "full_cap_tile_percent": 98.11561801341425,
+      "batch_seconds": {
+        "n": 4760,
+        "mean": 0.7149149846238624,
+        "min": 0.17099825106561184,
+        "p50": 0.7310539241880178,
+        "p95": 1.318775900825859,
+        "max": 2.5899409111589193
+      },
+      "cases": 100,
+      "failures": 1995,
+      "directed_reference_mm": 8081.558059624804,
+      "failures_per_directed_mm": 0.24685833910752358,
+      "published_chunks": 11169,
+      "warm_chunks": 0,
+      "source_stats": {
+        "5353a107b5d394f37ebf9e543817d693e39be28d7500a3991820dee7d9e5c823": {
+          "inferred_tiles": 1082,
+          "published_chunks": 473,
+          "warm_chunks": 0
+        },
+        "6f3ddc1490019e865be779f53e09db0264bfe76004a035b97498ed852f55b3cc": {
+          "inferred_tiles": 24655,
+          "published_chunks": 7930,
+          "warm_chunks": 0
+        },
+        "891c28cce8edbbee74ce9cd7317bd0e9bb29b7b8ef797dc62dd7fac9b2d2bc08": {
+          "inferred_tiles": 509,
+          "published_chunks": 136,
+          "warm_chunks": 0
+        },
+        "a94d5ea349549975e372f8d5e9fb68a2fb5474c3dd06f00950b7d1cbe33ade20": {
+          "inferred_tiles": 2394,
+          "published_chunks": 713,
+          "warm_chunks": 0
+        },
+        "f87eef23d15f7f99edf8a4ffa452785e2eb024b9a2890b962d737770e6374487": {
+          "inferred_tiles": 5801,
+          "published_chunks": 1917,
+          "warm_chunks": 0
+        }
+      },
+      "per_gpu_memory_peaks": {
+        "0": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "1": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "2": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "3": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "4": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "5": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 58703478784
+        },
+        "6": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        },
+        "7": {
+          "cuda_peak_allocated_bytes": 37586674688,
+          "cuda_peak_reserved_bytes": 43660607488
+        }
+      },
+      "max_allocated_gib": 35.0053186416626,
+      "max_reserved_gib": 54.671875,
+      "coordinator_stages": {
+        "pump_admit_seconds": 1.350534213706851,
+        "pump_background_seconds": 30.64028238505125,
+        "pump_dispatch_seconds": 4.310602676123381,
+        "pump_events_seconds": 37.14511659555137
+      },
+      "queue_distributions": {
+        "read_done": {
+          "n": 458,
+          "mean": 111.55676855895196,
+          "min": 0,
+          "p50": 128,
+          "p95": 128,
+          "max": 128
+        },
+        "gpu_submitted_uncollected": {
+          "n": 458,
+          "mean": 107.1943231441048,
+          "min": 0,
+          "p50": 121,
+          "p95": 128,
+          "max": 128
+        },
+        "publications_queued": {
+          "n": 458,
+          "mean": 0.5152838427947598,
+          "min": 0,
+          "p50": 0,
+          "p95": 4,
+          "max": 11
+        }
+      },
+      "final_queue": {
+        "elapsed_seconds": 516.6688749138266,
+        "phase": "complete",
+        "trace_requests_waiting": 0,
+        "read_queued": 0,
+        "read_running": 0,
+        "read_done": 0,
+        "reads_submitted": 0,
+        "tiles_queued": 0,
+        "tiles_queued_foreground": 0,
+        "tiles_queued_background": 0,
+        "requested_chunks_pending": 0,
+        "incidental_chunks_pending": 132708,
+        "gpu_submitted_uncollected": 0,
+        "input_slots_owned": 0,
+        "input_slots_free": 256,
+        "input_slots_capacity": 256,
+        "result_slots_free": 128,
+        "result_slots_capacity": 128,
+        "tiles_accumulating": 0,
+        "accumulation_tasks_outstanding": 0,
+        "accumulation_tasks_not_submitted": 0,
+        "publications_submitted": 0,
+        "publications_queued": 0
+      }
+    },
+    {
+      "run": "classic_full_dynamic256_b1_20260911_v3_heap",
+      "status": "complete",
+      "result_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b1_20260911_v3_heap/full",
+      "scheduler": "heap",
+      "max_batch_size": 1,
+      "coordinator_seconds": 860.3798915501684,
+      "native_seconds": 812.406531373,
+      "tiles": 34540,
+      "inferred_gvox": 579.48504064,
+      "model_calls": 34540,
+      "worker_seconds": 6076.468062143773,
+      "equivalent128_per_worker_second": 45.47378463510175,
+      "equivalent128_per_coordinator_second": 321.1604579718236,
+      "batch_histogram": {
+        "1": 34540
+      },
+      "mean_actual_batch": 1,
+      "full_cap_tile_percent": 100,
+      "batch_seconds": {
+        "n": 34540,
+        "mean": 0.1759255374100687,
+        "min": 0.17054899595677853,
+        "p50": 0.17174174170941114,
+        "p95": 0.20624418398365377,
+        "max": 0.9402959402650595
+      },
+      "cases": 100,
+      "failures": 2011,
+      "directed_reference_mm": 8081.558059624804,
+      "failures_per_directed_mm": 0.2488381553610175,
+      "published_chunks": 11227,
+      "warm_chunks": 0,
+      "source_stats": {
+        "5353a107b5d394f37ebf9e543817d693e39be28d7500a3991820dee7d9e5c823": {
+          "inferred_tiles": 1081,
+          "published_chunks": 471,
+          "warm_chunks": 0
+        },
+        "6f3ddc1490019e865be779f53e09db0264bfe76004a035b97498ed852f55b3cc": {
+          "inferred_tiles": 24768,
+          "published_chunks": 7975,
+          "warm_chunks": 0
+        },
+        "891c28cce8edbbee74ce9cd7317bd0e9bb29b7b8ef797dc62dd7fac9b2d2bc08": {
+          "inferred_tiles": 498,
+          "published_chunks": 133,
+          "warm_chunks": 0
+        },
+        "a94d5ea349549975e372f8d5e9fb68a2fb5474c3dd06f00950b7d1cbe33ade20": {
+          "inferred_tiles": 2413,
+          "published_chunks": 718,
+          "warm_chunks": 0
+        },
+        "f87eef23d15f7f99edf8a4ffa452785e2eb024b9a2890b962d737770e6374487": {
+          "inferred_tiles": 5780,
+          "published_chunks": 1930,
+          "warm_chunks": 0
+        }
+      },
+      "per_gpu_memory_peaks": {
+        "0": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "1": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "2": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "3": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "4": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "5": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "6": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        },
+        "7": {
+          "cuda_peak_allocated_bytes": 4864839680,
+          "cuda_peak_reserved_bytes": 6071255040
+        }
+      },
+      "max_allocated_gib": 4.530735015869141,
+      "max_reserved_gib": 5.654296875,
+      "coordinator_stages": {
+        "pump_admit_seconds": 1.6200427934527397,
+        "pump_background_seconds": 14.24496523477137,
+        "pump_dispatch_seconds": 7.375744767487049,
+        "pump_events_seconds": 36.731953766196966
+      },
+      "queue_distributions": {
+        "read_done": {
+          "n": 794,
+          "mean": 116.97229219143577,
+          "min": 0,
+          "p50": 127,
+          "p95": 128,
+          "max": 128
+        },
+        "gpu_submitted_uncollected": {
+          "n": 794,
+          "mean": 117.5528967254408,
+          "min": 0,
+          "p50": 127,
+          "p95": 128,
+          "max": 128
+        },
+        "publications_queued": {
+          "n": 794,
+          "mean": 0.005037783375314861,
+          "min": 0,
+          "p50": 0,
+          "p95": 0,
+          "max": 2
+        }
+      },
+      "final_queue": {
+        "elapsed_seconds": 860.350021051243,
+        "phase": "complete",
+        "trace_requests_waiting": 0,
+        "read_queued": 0,
+        "read_running": 0,
+        "read_done": 0,
+        "reads_submitted": 0,
+        "tiles_queued": 0,
+        "tiles_queued_foreground": 0,
+        "tiles_queued_background": 0,
+        "requested_chunks_pending": 0,
+        "incidental_chunks_pending": 132963,
+        "gpu_submitted_uncollected": 0,
+        "input_slots_owned": 0,
+        "input_slots_free": 256,
+        "input_slots_capacity": 256,
+        "result_slots_free": 128,
+        "result_slots_capacity": 128,
+        "tiles_accumulating": 0,
+        "accumulation_tasks_outstanding": 0,
+        "accumulation_tasks_not_submitted": 0,
+        "publications_submitted": 0,
+        "publications_queued": 0
+      }
+    }
+  ]
+}

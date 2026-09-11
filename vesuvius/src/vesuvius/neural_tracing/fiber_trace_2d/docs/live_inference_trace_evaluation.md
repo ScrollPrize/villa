@@ -4,6 +4,15 @@ First standalone implementation, 2026-09-10. **Offline evaluation and on-demand 
 
 ## Current live implementation and command
 
+Dynamic model batches are available through `inference.max_batch_size` (positive integer, default1). This is the number of inference tiles **per GPU model call**, not a queue depth. A worker takes whatever descriptors are currently ready, up to that cap, without waiting for a full batch. Per-tile CT normalization and result/accumulator ownership remain independent. Keep enough input/result slots for the desired concurrency; a cap does not guarantee that many ready tiles or enough GPU memory. The cap is included in cache provenance. Summaries report actual batch histograms, amortized tile timings and peak allocated/reserved GPU memory. See [the dynamic batching benchmark](dynamic_inference_batching_20260911.md) for256³ measurements and practical limits.
+
+The classic50-fiber workload explicitly uses256³ tiles and dynamic cap8 after a
+complete100-direction validation on8H100 GPUs. Other models retain generic cap1.
+Pending work uses exact-order priority heaps (foreground, remaining length, then
+source/tile ties); no scheduling-policy change. The classic request timeout is
+3600s because longest-first scheduling can legitimately leave a short trace behind
+more than600s of healthy queued work. See [full-set measurements](full_dynamic_inference_batching_20260911.md).
+
 Use the existing environment directly; activation is unnecessary:
 
 ```sh
@@ -33,8 +42,7 @@ Use the offline example below, but remove `fiber_manifest` and per-source `infer
   "accumulator_dtype": "float16",
   "compressor": "blosc-zstd",
   "slots_per_gpu": 2,
-  "input_workers": 8,
-  "scratch_budget_bytes_per_source": 68719476736
+  "input_workers": 8
 }
 ```
 
@@ -42,14 +50,22 @@ Set top-level `workers` for active CPU cases (e.g.16) and include `--threads 1` 
 
 ### Implemented architecture
 
+File-backed accumulator scratch has no application size cap. Sparse files grow
+their physical footprint as pages are written; there is no per-tile byte-budget
+accounting or free-space polling. Input/result shared RAM pools remain bounded.
+Actual filesystem errors still fail the run; mmap write faults on exhausted
+storage may terminate a worker with SIGBUS, which is treated as failure, not
+successful chunk publication. Scratch is removed on normal error cleanup; a
+process crash may leave owned temporary scratch for existing restart cleanup.
+
 - `FiberTraceEvaluationCli.cpp` extends the existing native wrapper; `FiberTrace.cpp` remains the same VC3D greedy/beam search. Whole fibers run in both directions. Existing ellipsoid failure/reset policy and forward matching are preserved. Beam checks only irrevocable prefixes and selected terminal paths, never reference-guided speculative pruning.
 - `FiberLiveBridge.{hpp,cpp}` and `FiberPredictionField` gate scalar, batch, optimized corner and prefetch reads before cache access. The exact float visitor and double sampler corner sets are covered; unavailable data never becomes fill-zero or a geometric failure. Live stored-grid scans are rejected.
 - Version1 localhost TCP exchanges authenticated `hello`, batched `demand` descriptors (source/case/chunk/remaining length), `ready`, and cancellation `error`. No image tensors cross it. Tokens are redacted in saved config; native ready knowledge is bounded to100000 entries.
 - **Reviewed deviation:** one stack-preserving OS thread per directed case, default maximum256, with bounded active CPU permits. Waiting releases its permit without holding sampler locks. This preserves beam state but is not a stackless session engine, persistent trace recovery, or a solution for thousands of case threads.
 - `live_evaluate.py` freezes a checkpoint by SHA256/copy, validates bindings, creates the source/model cache, starts native replay and persistent spawned GPU workers lazily, prioritizes demand by longest remaining length, then drains reference-intersection prefetch. Reference prefetch starts after authenticated source validation even if tracing produces no demand. No whole-array scan.
 - `lasagna/demand_predict3d.py` reuses shared tile geometry, GPU worker, raw input conversion, blending/filtering, per-add accumulation and output flush/finalizer from `tiled_predict3d.py`. Native input sampling is the same selected-level primitive as fast training. All model options/products publish coherent ordinary Zarr channels.
-- Full logical output-shape sparse mmap holds raw products and weights inside hidden output-Zarr directories. Fresh holes already read as zero: no zero reservation, scratch fsync or NPZ staging. Shared-RAM results go directly to the existing accumulator processes. Demand uses arrival-order additions (same f16/f32 precision, not guaranteed bitwise equality across schedules). Logical touched-byte/allocated-byte/free-space checks are advisory; disk exhaustion can still kill an accumulator and abort the run.
-- Optional `inference.accumulator_layout: "chunk-major"` stores a flat grid of contiguous output-chunk bricks within each existing per-channel mmap. Boundary bricks are padded and budgeted in full; logical output shape and Zarr encoding do not change. Both additions and finalizer reads use shared addressing helpers. Default remains `flat`; sequential circular-Z storage is unaffected. See the [layout benchmark](live_inference_chunk_major_20260910.md).
+- Full logical output-shape sparse mmap holds raw products and weights inside hidden output-Zarr directories. Fresh holes already read as zero: no zero reservation, scratch fsync or NPZ staging. Shared-RAM results go directly to the existing accumulator processes. Demand uses arrival-order additions (same f16/f32 precision, not guaranteed bitwise equality across schedules). There is no application scratch cap or per-tile storage polling; actual disk exhaustion can still kill an accumulator and abort the run.
+- Optional `inference.accumulator_layout: "chunk-major"` stores a flat grid of contiguous output-chunk bricks within each existing per-channel mmap. Boundary bricks are padded, without scratch byte accounting; logical output shape and Zarr encoding do not change. Both additions and finalizer reads use shared addressing helpers. Default remains `flat`; sequential circular-Z storage is unaffected. See the [layout benchmark](live_inference_chunk_major_20260910.md).
 - Optional `inference.accumulator_prefault: true` requires chunk-major and Linux writable-prefault support. The owner advises a full brick once per channel mapping immediately before its first addition. This can allocate sparse backing, but adds no Python zero writes or scratch sync. Cost is inside task timings; failures are explicit, never silently replaced by read-prefetch. Default is false. Both options participate in identity and have isolated `profile` overrides in the classic runner config.
 - A tile feeds all touched chunks, including unrequested partial neighbors, **without scheduling their missing tiles**. Late demand reuses that partial accumulation. Shared result slots release only after all touched consumers apply them. Coordinator-owned SQLite WAL tables track identity, chunks, tiles and scratch under an exclusive writer lock; pending/applied contribution edges stay in RAM.
 - Ready means all contributors applied, every sibling physically published (including all-zero chunks), integrity checked/fsynced, then ledger committed. Restart validates ready file size/SHA256, discards unfinished scratch/edges and rebuilds incomplete chunks. An active ready chunk must never be edited/evicted externally.
@@ -61,9 +77,9 @@ Set top-level `workers` for active CPU cases (e.g.16) and include `--threads 1` 
 
 Only the inference level is generated; no coarser pyramid production. Metadata explicitly labels partial coverage. Ordinary Zarr viewers still see uncomputed chunks as fill and need future live-readiness integration.
 
-Other limitations/deferred hardening: per-source scratch and active slots are bounded but queued ledger descriptors have no global cap; priorities are monotone promotions rather than exact aging/decrementing waiter priorities. Accumulation uses chunk-owner processes and publication runs on bounded background threads; each GPU call still handles one tile. Short pipeline profiles measure throughput/backlogs, not full-cohort sustained saturation. Input reads are threaded and shutdown can wait for a stuck native/remote read; **the user explicitly deferred this edge case**, and it is not being worked on now. No stuck read has been observed in passing tests. Broader crash/worker-death/ENOSPC stress remains future work. No persistent trace resume, training hook or GUI live integration yet. Ubuntu/macOS source paths are implemented, but only Ubuntu amd64 tests have run; the optional writable-prefault experiment is Linux-only. The requested batch visualization is the simple `--render` flag, not a separate selection framework.
+Other limitations/deferred hardening: active shared RAM slots are bounded, but file-backed scratch and queued descriptors have no application size cap; priorities are monotone promotions rather than exact aging/decrementing waiter priorities. Accumulation uses chunk-owner processes and publication runs on bounded background threads; each GPU call still handles one tile. Short pipeline profiles measure throughput/backlogs, not full-cohort sustained saturation. Input reads are threaded and shutdown can wait for a stuck native/remote read; **the user explicitly deferred this edge case**, and it is not being worked on now. No stuck read has been observed in passing tests. Broader crash/worker-death/ENOSPC stress remains future work. No persistent trace resume, training hook or GUI live integration yet. Ubuntu/macOS source paths are implemented, but only Ubuntu amd64 tests have run; the optional writable-prefault experiment is Linux-only. The requested batch visualization is the simple `--render` flag, not a separate selection framework.
 
-Validation covers exact offline/live beam/greedy geometry, all cases waiting with one CPU permit, cold/warm spawned identity-model runs, scale1/2 odd-shape arrival-order oracle checks in f16/f32, reverse completion, late demand, physical zeros, identity/writer/corruption/budget checks. Flat/chunk-major addressing and optional prefault have regression coverage. Timing p50/p95 and OS counters are in the short profile reports. No full real-model output parity, peak-memory survey or full-cohort over-inference measurement is claimed.
+Validation covers exact offline/live beam/greedy geometry, all cases waiting with one CPU permit, cold/warm spawned identity-model runs, scale1/2 odd-shape arrival-order oracle checks in f16/f32, reverse completion, late demand, physical zeros, identity/writer/corruption checks, uncapped sparse scratch planning and storage-error propagation. Flat/chunk-major addressing and optional prefault have regression coverage. Timing p50/p95 and OS counters are in the short profile reports. No full real-model output parity, peak-memory survey or full-cohort over-inference measurement is claimed.
 
 ## Available offline commands
 
@@ -196,7 +212,7 @@ Model inference complete is NOT output ready. Ready requires every contributing 
 
 ## Scratch, ordering and late requests
 
-The existing circular Z mmap requires monotonic Z order and cannot serve arbitrary demand. Live mode uses full-logical-shape, sparse-on-touch file-backed accumulation. Preserve accumulator precision; demand update order is explicitly allowed to vary. No full-volume zero initialization or dense in-memory allocation. Sparse-file support and advisory free-space checks are prerequisites, not protection against concurrent disk exhaustion.
+The existing circular Z mmap requires monotonic Z order and cannot serve arbitrary demand. Live mode uses full-logical-shape, sparse-on-touch file-backed accumulation. Preserve accumulator precision; demand update order is explicitly allowed to vary. No full-volume zero initialization or dense in-memory allocation. Sparse-file support is required; actual filesystem failures propagate without an application byte cap or per-tile free-space checks.
 
 GPU completion and addition order may be arbitrary. Feed shared result descriptors directly to the SAME `_accumulate_process_main` workers as whole-volume inference; the shared task executor is also used by the synchronous test adapter. Each output chunk has one stable owner, hashing its chunk-grid coordinates (voxel coordinates divisible by32 would collapse modulo8 ownership). FIFO owner queues prevent overlapping read-modify-write races without file synchronization. Retain each RAM result until ALL touched unready chunks acknowledge it, including incidental neighbors. Apply weight and every raw channel before acknowledging. No missing-predecessor waiting and no intermediate tensor files.
 

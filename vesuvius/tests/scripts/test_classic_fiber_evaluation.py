@@ -6,6 +6,34 @@ from pathlib import Path
 import pytest
 
 
+def test_default_classic_workload_uses_full_set_validated_batching():
+    configs = Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs"
+    default = json.loads((configs / "eval_classic_collection.json").read_text())
+    measured = json.loads((configs / "eval_classic_full_dynamic256_b8_heap.json").read_text())
+    assert default["evaluation"]["inference"] == measured["evaluation"]["inference"]
+    assert default["sources"] == measured["sources"]
+    assert sum(s["expected_test_count"] for s in default["sources"]) == 50
+    assert all("test_fibers" not in s for s in default["sources"])
+    assert default["evaluation"]["trace_args"] == measured["evaluation"]["trace_args"]
+    assert default["checkpoint_sha256"] == measured["checkpoint_sha256"]
+    assert default["evaluation"]["gpu_manager"] == measured["evaluation"]["gpu_manager"]
+    assert default["output_root"] != measured["output_root"]
+    assert default["evaluation"]["inference_cache_namespace"] != measured["evaluation"]["inference_cache_namespace"]
+
+
+def test_explicit_test_subset_is_validated_and_preserves_original_order(tmp_path):
+    script = Path(__file__).resolve().parents[2] / "scripts/run_classic_fiber_evaluation.py"
+    spec = importlib.util.spec_from_file_location("classic_eval", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    files = [tmp_path / "a.json", tmp_path / "b.json", tmp_path / "c.json"]
+    assert module.select_test_files(files) == files
+    assert module.select_test_files(files, ["c.json", "a.json"]) == [files[0], files[2]]
+    for invalid in ([], "a.json", [1], ["a.json", "a.json"], ["missing.json"], ["../a.json"], [str(files[0])]):
+        with pytest.raises(ValueError):
+            module.select_test_files(files, invalid)
+
+
 def test_workload_config_owns_collection_mapping(tmp_path):
     script = Path(__file__).resolve().parents[2] / "scripts/run_classic_fiber_evaluation.py"
     spec = importlib.util.spec_from_file_location("classic_eval", script)

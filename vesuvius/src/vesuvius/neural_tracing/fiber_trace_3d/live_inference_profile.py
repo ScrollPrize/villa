@@ -227,7 +227,7 @@ def profile_workload(workload, *, devices_override=None):
             raise ValueError("profiling requires CUDA")
         report["gpu_names"] = [torch.cuda.get_device_name(d) for d in devices]
         settings = dict(workload["evaluation"]["inference"])
-        for option in ("accumulator_layout", "accumulator_prefault"):
+        for option in ("accumulator_layout", "accumulator_prefault", "max_batch_size"):
             if option in params:
                 settings[option] = params[option]
         effective, _ = live._checkpoint_config_for_inference(checkpoint, None)
@@ -321,12 +321,13 @@ def profile_workload(workload, *, devices_override=None):
                         with lock:
                             phase_values.setdefault(name, []).append(time.perf_counter() - begin)
                 return call
-            for name in ("begin_complete", "contribution_done", "publication_done", "_publish", "_cached_chunk_complete", "_sync_published", "_check_disk_budget"):
+            for name in ("begin_complete", "contribution_done", "publication_done", "_publish", "_cached_chunk_complete", "_sync_published"):
                 setattr(store, name, instrument(name, getattr(store, name)))
             pool = cleanup.enter_context(demand.DemandWorkerPool({"source": store}, {"source": instrument("native_read", reader)},
                 devices, slots_per_gpu=settings["slots_per_gpu"], input_workers=settings["input_workers"],
                 input_slots=settings.get("input_slots"),
                 result_slots=params.get("result_slots", settings.get("result_slots")),
+                max_batch_size=settings.get("max_batch_size", 1),
                 accumulator_workers=settings.get("accumulator_workers"),
                 flush_workers=int(settings.get("flush_workers", 4)), profile_pipeline=True))
             warm_start = time.perf_counter()

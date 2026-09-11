@@ -118,14 +118,14 @@ def replay_fixture(tmp_path):
     write(tmp_path / "annotation.json", {"type": "vc3d_fiber", "version": 1,
           "line_points": points, "control_points": points})
     config = {"version": 1, "output": "evaluation", "workers": 2,
-              "cache_bytes_per_channel": 1024 * 1024,
+              "decoded_cache_bytes": 1024 * 1024,
               "trace_args": ["--cone-angle-degrees", "0", "--step-voxels", "2"],
               "sources": [{"id": "synthetic", "fiber_manifest": "fiber.json", "normal_manifest": "normal.json",
                            "ct_volume": "ct.zarr/0", "base_voxel_size_um": 1,
                            "inference_scaledown_power": 0, "fibers": ["annotation.json"]}]}
     write(tmp_path / "evaluation.json", config)
     render = {"normal_manifest": "normal.json", "ct_volume": "ct.zarr/0", "normal_working_to_base": 1,
-              "threads": 1, "output": "rendered", "cache_bytes": 1024 * 1024}
+              "threads": 1, "output": "rendered", "decoded_cache_bytes": 1024 * 1024}
     write(tmp_path / "render.json", render)
     env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
 
@@ -144,6 +144,7 @@ def test_bidirectional_export_and_posthoc_strips(replay_fixture):
     run("replay-set", "--config", root / "evaluation.json")
     summary = json.loads((root / "evaluation/summary.json").read_text())
     assert summary["completed"] and summary["cases"] == 2
+    assert summary["config"]["decoded_cache_bytes"] == 1024 * 1024
     assert summary["failures"] == 0
     assert summary["directed_reference_length_mm"] == pytest.approx(0.032)
     for index in range(2):
@@ -239,11 +240,37 @@ def test_cache_root_rejects_unwritable_before_saving(tmp_path):
     assert not list(root.iterdir())  # successful write probe cleans up its own files
 
 
+def test_batched_tracer_one_and_four_workers_are_identical(replay_fixture):
+    root, config, run = replay_fixture
+    presence = zarr.open_array(str(root / "fiber_presence.zarr"), mode="r+")
+    z, y, x = np.indices(presence.shape)
+    presence[:] = (180 + (3 * x + 2 * y + z) % 70).astype(np.uint8)
+    results = []
+    for threads in (1, 4):
+        config["output"] = "batch-" + str(threads)
+        config["profile_tracing"] = True
+        config["trace_args"] = ["--threads", str(threads), "--cone-angle-degrees", "10",
+                                "--step-voxels", "2", "--beam-width", "4", "--beam-lookahead-steps", "2"]
+        (root / "batch.json").write_text(json.dumps(config))
+        run("replay-set", "--config", root / "batch.json")
+        output = root / config["output"]
+        results.append([json.loads((output / f"cases/{i}/trace.json").read_text())["replay"] for i in range(2)])
+        for i in range(2):
+            profile = json.loads((output / f"cases/{i}/profile.json").read_text())
+            assert profile["trace"]["corner_points"] > 0
+    assert results[0] == results[1]
+
+
 @pytest.mark.parametrize("beam_width", [1, 4])
-def test_live_gate_matches_offline_with_all_cases_waiting(replay_fixture, beam_width):
+@pytest.mark.parametrize("readiness_entries", [0, 4096])
+def test_live_gate_matches_offline_with_all_cases_waiting(replay_fixture, beam_width, readiness_entries):
     root, config, run = replay_fixture
     config["workers"] = 1
     config["trace_args"] += ["--beam-width", str(beam_width), "--beam-lookahead-steps", "2"]
+    # Different normal/prediction grids force the non-fused batch route.
+    normal = json.loads((root / "normal.json").read_text())
+    normal["source_to_base"] = 2
+    (root / "normal.json").write_text(json.dumps(normal))
     (root / "evaluation.json").write_text(json.dumps(config))
     run("replay-set", "--config", root / "evaluation.json")
     # Remove every prediction data chunk. Only the coordinator may publish it.
@@ -258,6 +285,8 @@ def test_live_gate_matches_offline_with_all_cases_waiting(replay_fixture, beam_w
     listener.listen(1)
     listener.settimeout(15)
     config["output"] = "live-evaluation"
+    config["profile_tracing"] = True
+    config["readiness_cache_entries"] = readiness_entries
     config["live_endpoint"] = {"port": listener.getsockname()[1], "token": "synthetic-secret", "timeout_seconds": 15}
     (root / "live.json").write_text(json.dumps(config))
     errors, requests = [], []
@@ -309,6 +338,14 @@ def test_live_gate_matches_offline_with_all_cases_waiting(replay_fixture, beam_w
         offline = json.loads((root / f"evaluation/cases/{i}/trace.json").read_text())
         live = json.loads((root / f"live-evaluation/cases/{i}/trace.json").read_text())
         assert live["replay"] == offline["replay"]
+        measured = json.loads((root / f"live-evaluation/cases/{i}/profile.json").read_text())
+        ready = measured["readiness"]
+        assert ready["bridge_calls"] > 0
+        assert ready["calls"] == ready["bridge_calls"] + ready["local_hits"]
+        assert (ready["local_hits"] > 0) == (readiness_entries > 0)
+        assert measured["trace"]["candidates"] > 0
+        assert measured["trace"]["readiness_plan_points"] == measured["trace"]["candidates"]
+        assert ready["bridge_lock_seconds"] >= 0
     assert "synthetic-secret" not in (root / "live-evaluation/summary.json").read_text()
 
 
