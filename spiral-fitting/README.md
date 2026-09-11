@@ -67,14 +67,18 @@ PHerc0125, PHerc0826, PHerc0211 and PHerc0358 (30,000-step fits on one RTX 3090 
 ```
 
 **Umbilicus.** The open-data bucket publishes one for some scrolls under
-`<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json` (PHerc0125, PHerc0826 and PHerc0211 at the
-time of writing). For the others, `estimate_umbilicus.py` derives control points from the organizers' surface
+`<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json` (PHerc0125, PHerc0139, PHerc0211, PHerc0332
+and PHerc0826 at the time of writing; PHerc0139's is annotated on a different scan from its only surface store).
+For the others, `estimate_umbilicus.py` derives control points from the organizers' surface
 prediction: at each of N heights it takes the largest connected component of the sheet mask at pyramid level 3,
-fills it, and uses the point farthest from the mask boundary (the innermost point of the winding pack) as the
-core. Against the published PHerc0125 umbilicus the estimate is 0.2-2.6 mm off through the middle of the scroll
-and worse within a few millimetres of the ends. A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
+fills it, and uses the point farthest from the mask boundary as the core. That point is the centre of the widest
+lobe of the section, which is the winding centre when the section is round and not otherwise. Measured against the
+published PHerc0125 umbilicus at its default `n_z=12`, over the 75 published control points inside the estimate's
+z coverage, the lateral error is 0.4-12.5 mm (median 5.0); restricted to the interior, away from the last tenth at
+each end, it is 0.4-9.1 mm (median 4.1). A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
 windings, 30,000 steps) ended with 50% of track points satisfied, against 12-38% for the three scrolls fitted from
-published umbilici, so the estimate is good enough for the tracks to pull the spiral into place.
+published umbilici, so the estimate is good enough for the tracks to pull the spiral into place, but it is a
+starting point for the fit rather than a substitute for a published umbilicus.
 
 ```sh
 python estimate_umbilicus.py PHerc0358 \
