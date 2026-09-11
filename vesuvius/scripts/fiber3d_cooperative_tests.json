@@ -1,5 +1,5 @@
 {
-  "suites": ["cpu", "manager"],
+  "suites": ["cuda-cohort"],
   "native_build": true,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

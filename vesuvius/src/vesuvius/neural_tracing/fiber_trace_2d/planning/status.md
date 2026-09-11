@@ -1,6 +1,6 @@
-# Status
+# Existing-forward visualization
 
-- [x] Independent plan review, including expanded managed-default implementation
-- [x] Managed-by-default dispatch and shared default socket; explicit debug opt-out
-- [x] Replace unmanaged production examples
-- [x] Validate command/help and document prerequisites
+- [x] Inspection and plan.
+- [x] Independent review.
+- [x] Implementation.
+- [x] CPU tests and docs (20 passed, 2 GPU-only skipped via reusable launcher).

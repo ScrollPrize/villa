@@ -123,7 +123,7 @@
     }
   ],
   "training": {
-    "checkpoint_interval": 100,
+    "checkpoint_interval": 1000,
     "device": "auto",
     "direction_weight": 10,
     "kept_snapshot_interval": 10000,
@@ -131,7 +131,7 @@
     "loader_prefetch_factor": 2,
     "loader_worker_device": "cpu",
     "loader_workers": 8,
-    "max_steps": 20000,
+    "max_steps": 2000000,
     "mixed_precision": "bf16",
     "presence_weight": 1,
     "run_name": "collection_20260909_5scroll_128_sd1_16x8",
@@ -140,7 +140,7 @@
     "scalar_log_interval": 100,
     "tensorboard_enabled": true,
     "test_control_points": 0,
-    "test_interval": 100,
+    "test_interval": 1000,
     "test_start_sample_index": 0,
     "test_trace2cp_block_context_voxels": 4,
     "test_trace2cp_control_points": 0,

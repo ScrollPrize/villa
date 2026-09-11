@@ -442,7 +442,17 @@
   still required before production use. This option alone does not enable
   dynamic GPU reconfiguration.
 - Fiber3D training defaults to the CPU supervisor with a measured config-matched
-  memory calibration and complete resource request. The shared default prefers
+  memory calibration and automatically derived resource request. Training reuses
+  a compatible manager or starts a detached service on absent/refused connection,
+  preserving singleton locking, recovery journals and external-use monitoring.
+  A missing memory profile starts exclusive real-update calibration: configured
+  initial evaluation and real optimizer updates measure conservative capacity
+  while preserving the logical macro-batch. No updates are discarded/replayed.
+  Reports are saved to `<run_path>/.memory-calibrations/<config-fingerprint>.json`;
+  no manager config fields or separate calibration invocation are required.
+  Automatic requests respect visibility, compatible GPU
+  models, measured distributed coverage and CPU inventory. Explicit requests
+  cannot broaden visibility. The shared default prefers
   `/run/villa-gpu-manager/manager.sock` when its location is writable/searchable
   or a listener is reachable; otherwise it uses the home path
   `~/.local/run/villa-gpu-manager/manager.sock`. CLI override takes precedence over
@@ -461,9 +471,12 @@
 - Dense evaluation preserves original logical test-group normalization and yields
   between group waves. Trace evaluation yields between CP segments. Completed
   test rows and single-writer logging survive reconfiguration without duplicate
-  metrics/snapshots. Visualization selection is canonical rather than rank-local;
-  managed train visualization reloads existing CPU augmentation for those samples
-  (small differences from CUDA augmentation affect visualization only).
+  metrics/snapshots. Initial and periodic train/test visualization share bounded
+  capture/rendering of actual loss-forward inputs and detached predictions.
+  Training selects rank-local samples, up to the configured count across local
+  microbatches; a rank with no samples emits no sheet. No visualization refetch,
+  repeated augmentation, target construction or additional forward is allowed.
+  Only CPU image sheets survive test-wave handoff/reconfiguration.
 - Memory observations must cover the requested GPU count and match model/config,
   GPU model and software identity. Only measured physical batch sizes are admitted;
   unexpected OOM/over-budget driver usage fails rather than changing training.
@@ -735,8 +748,8 @@
   direction is closer to the slice normal by `abs(dot(axis, normal))`, the other
   prediction presence, max prediction presence, min prediction presence, and
   average prediction presence. In conditioned mode the first prediction is the
-  zero-query output and the second prediction is the recurrent output
-  conditioned on the first decoded direction; in legacy branch mode these are
+  zero-query output and the second prediction is the random-query output from
+  the same loss forward; in legacy branch mode these are
   branch outputs. The target/context
   presence panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
@@ -816,11 +829,14 @@
   rank 0, restored to global batch order, and combined with the historical
   unweighted Python per-batch mean so metric and best-snapshot semantics remain
   unchanged. Ranks with no assigned batch still enter the gather.
-- Each rank retains a separate persistent test DataLoader worker pool using the
-  same worker count, prefetch factor, worker device, and multiprocessing context
-  as training. Rank 0 reuses its already evaluated global batch zero for the
-  test sample sheet instead of synchronously loading it again. The train and
-  test pools coexist and are both released before distributed teardown.
+- Train and dense test jobs share the optimized source-tagged parallel sample
+  queue, worker factories and bounded transport, managed or unmanaged. Source and
+  canonical RNG/sample identity are separate from transport ordinal/generation.
+  Train admission stops at the next scheduled test boundary so future training
+  cannot monopolize test credits. The broker preserves ownership/distribution;
+  it does not implement an alternative loader. Evaluation resumes retain completed
+  logical-group rows. Visualization retains bounded CPU sheets, never a batch
+  or autograd graph beyond its lease.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -830,22 +846,15 @@
   every optimizer param group while preserving loaded AdamW moment buffers and
   step counters. If finite `training.max_steps` is not greater than the
   checkpoint step, training must fail clearly.
-- 3D training and `--benchmark --load-only` runtime loading use
-  `torch.utils.data.DataLoader` worker processes when
-  `training.loader_workers > 0`. Each DataLoader item is one complete
-  `FiberTrace3DBatch`, not an individual CP patch, and PyTorch default
-  collation is bypassed so the custom dataclass is not nested or reshaped.
-- Each 3D DataLoader worker lazily constructs its own `FiberTrace3DLoader` and
-  VC3D sampler state in the worker process. Worker outputs are CPU
-  `FiberTrace3DBatch` objects; the main training process transfers the whole
-  batch to `training.device` immediately before forward/backward. The old
-  thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- Production 3D train/test loading uses per-sample queue jobs, not whole-batch
+  DataLoader jobs or synchronous GPU-worker loading. Workers lazily retain each
+  source's loader/sampler state. Existing batch loading helpers may remain for
+  explicit diagnostics and correctness comparisons, not as production fallbacks.
 - The standalone 3D sample-pipeline benchmark uses the shared
   `OrderedTwoStageSamplePipeline`: free load processes claim deterministic
   sample indices one at a time, a bounded raw queue feeds free value-
   augmentation processes, and a bounded result queue feeds ordered batch
-  assembly. The normal training loader is unchanged until this benchmarked
-  path is explicitly integrated.
+  assembly. Production train/test reuses this same queue engine and sample factories.
 - One global credit window bounds all claimed, executing, queued, and
   coordinator-reordered samples. Credits are released only at ordered
   delivery. The coordinator must drain later completions while waiting for an
@@ -3069,14 +3078,15 @@
   shared-slot ownership remain capped by `max_in_flight` until ordered delivery
   or explicit release. A future index cannot reuse a modulo slot still owned by
   an earlier leased sample.
-- Training may opt into the reusable per-sample pool with
+- Training and evaluation use the reusable per-sample pool controlled by
   `training.sample_pipeline_workers`. Worker, shared-slot, load-affinity, and
   initial-admission settings are global host budgets partitioned
   deterministically across DDP ranks. Each rank maps consecutive local
   pipeline indices onto the canonical interleaved DDP sample stream.
 - Shared batch slots remain leased until the rank's H2D copy has synchronized.
-  Training closes the pipeline explicitly on normal or exceptional exit. A
-  zero worker count retains the legacy whole-batch DataLoader path.
+  Training closes the pipeline explicitly on normal or exceptional exit. An
+  omitted/zero sample worker setting derives a positive worker budget from the
+  legacy loader worker setting; it does not select a synchronous loading path.
 - Training may additionally set `training.sample_pipeline_cuda_prefetch_depth`
   when the shared sample pipeline and CUDA are active. Zero is the compatibility
   default; the profiled setting is two future batches. One coordinator thread
@@ -6735,3 +6745,22 @@
   `method_label`. All occurrences of one method must use the same base label.
   Benchmark-stage suffixes are appended without reordering or rewriting that
   base label; unmeasured floor assumptions do not claim an unexecuted stage.
+# Managed calibration and priority
+
+- Memory calibration must acquire an exact exclusive, non-pausable/non-adaptable
+  manager grant before GPU initialization. No unmanaged/shared bypass. Confirm
+  worker ownership before authorization; release only after workers stop.
+- Optional `training.cooperative.priority` overrides request.priority, default 0.
+  Calibration defaults to training priority +100; its CLI --priority overrides
+  that value. Exclusivity has no implicit scheduler priority boost.
+# Manager communication grace (2026-09-11)
+
+- Fiber adaptive execution tolerates60s continuous manager communication loss
+  while advancing only already-authorized work; failures print exception details.
+- Retry every5s after failure. After60s stop admission, pause at safe boundary,
+  join workers/free GPU memory and retain RAM state. Reconnect reconciles existing
+  ownership before release/regrant and automatic resume. Hello alone is not recovery.
+- Exclusive non-pausable startup may finish its authorized cohort offline, but
+  no new cohort/size is initialized or authorized without manager confirmation.
+- Explicit stop, known release and observed epoch change override grace.
+- No wire fields change; EOF/timeout never frees server-side reservations.

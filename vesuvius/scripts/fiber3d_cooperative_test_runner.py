@@ -2,10 +2,12 @@
 
 Only named test suites run. CUDA suites have small allocator caps in their tests
 (4 GiB numerical oracle; 6 GiB/cohort worker + 4 GiB driver reserve). No unbounded
-reference benchmark is launched by this caller. Suites run sequentially.
+reference benchmark is launched by this caller. GPU suites first reserve the
+whole manager inventory exclusively and non-preemptibly. Suites run sequentially.
 """
 
 from datetime import datetime, timezone
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -34,6 +36,9 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "visualization": ["tests/neural_tracing/test_forward_visualization.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],
+    "unified-loading": ["tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_training_state.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_gradient_accumulation.py"],
+    "unified-managed": ["tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py", "../gpu_manager/tests/test_supervisor.py"],
     "cpu": CPU_TESTS,
     "manager": ["../gpu_manager/tests"],
     "reference-unit": ["tests/neural_tracing/test_cooperative_reference.py"],
@@ -129,12 +134,35 @@ def main():
             peaks = {uuid.strip(): 0 for uuid in uuids}
             monitor = NvidiaMonitor({"cpu_cores": 1, "gpus": {gpu: 20 * 1024**3 for gpu in peaks}},
                                     0, interval=0.25)
-        with log.open("w") as stream:
-            process = subprocess.Popen(command, cwd=ROOT / "vesuvius", env=env,
-                                       stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        with ExitStack() as resources, log.open("w") as stream:
+            managed_command = None
+            if suite.startswith("cuda-"):
+                from villa_gpu_manager.bootstrap import ensure_manager
+                from villa_gpu_manager.exclusive import ExclusiveTask
+                from villa_gpu_manager.exclusive_command import ExclusiveCommand
+                wait_started = time.monotonic()
+                manager_socket, inventory = ensure_manager()
+                lease = resources.enter_context(ExclusiveTask(manager_socket, inventory,
+                    label=f"fiber-tests-{suite}", priority=100))
+                # Resource waiting is not test execution time.
+                invocation_started += time.monotonic() - wait_started
+                started = time.monotonic()
+                env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
+                if suite == "cuda-amp":
+                    env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
+                managed_command = ExclusiveCommand(command, cwd=ROOT / "vesuvius", env=env,
+                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                lease.cohort = managed_command
+                lease.authorize()
+                process = managed_command.process
+            else:
+                process = subprocess.Popen(command, cwd=ROOT / "vesuvius", env=env,
+                                           stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 known_pids = {process.pid}
                 while process.poll() is None:
+                    if managed_command is not None:
+                        managed_command.observe()
                     if time.monotonic() - invocation_started > timeout:
                         raise subprocess.TimeoutExpired(command, timeout)
                     if monitor is not None:
@@ -155,6 +183,9 @@ def main():
                     time.sleep(0.1)
                 code = process.returncode
             except BaseException:
+                if managed_command is not None:
+                    managed_command.abort()
+                    raise
                 # Kill only this test's process group, never the user's training.
                 os.killpg(process.pid, signal.SIGTERM)
                 try:

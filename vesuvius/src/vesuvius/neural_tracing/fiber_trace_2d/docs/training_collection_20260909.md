@@ -1,8 +1,9 @@
 # Five-scroll JSON fiber training
 
 Config: `fiber_trace_3d/configs/train_collection_20260909_5scroll_16x8.json`.
-Based on `train_s1a_nml_8gpu_fast.json`; only dataset lists, run name and explicit
-`embedding.enabled=false` differ. LR 0.01, 100-step warmup, SD1 input (half
+Based on `train_s1a_nml_8gpu_fast.json`; dataset lists, run name, explicit
+`embedding.enabled=false` and test/checkpoint intervals (1000 instead of 100)
+differ. Initial evaluation remains enabled. LR 0.01, 100-step warmup, SD1 input (half
 resolution), 128³ patches, GroupNorm/BF16, stride-4 output, target 16 samples/GPU
 and effective batch 128. The manager may change physical parallelism while
 preserving that effective batch. Logs go to `/ephemeral/hendrik/fiber3d_train2/runs`.

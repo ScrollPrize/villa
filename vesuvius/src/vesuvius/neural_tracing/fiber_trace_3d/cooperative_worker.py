@@ -18,11 +18,37 @@ class QueueBatchSource:
     update completion. Closing this view never closes the shared loading pool.
     """
 
-    def __init__(self, batches, received, owner_pid, index_map):
+    def __init__(self, batches, received, owner_pid, index_map, test_connection=None):
         self.batches, self.received, self.owner_pid = batches, received, owner_pid
         self.stopped = threading.Event()
         self.index_map = index_map
         self.ordinal = self.samples = 0
+        self.test_connection = test_connection
+
+    def test_batches(self, *, step, global_batch_indices, batch_size, start_sample_index=0,
+                     sample_count=None):
+        if self.test_connection is None:
+            raise RuntimeError("managed evaluation requires the shared sample broker")
+        return _QueueTestBatches(self, step, global_batch_indices, batch_size, start_sample_index, sample_count)
+
+    def _test_boundary(self, kind, step):
+        connection = self.test_connection
+        if connection is None:
+            raise RuntimeError("managed tests require shared sample phase coordination")
+        connection.send((kind, step, ()))
+        while not connection.poll(0.1):
+            if self.stopped.is_set():
+                raise RuntimeError("sample source closed during test phase transition")
+            if os.getppid() != self.owner_pid:
+                raise RuntimeError("sample supervisor exited during test phase transition")
+        if connection.recv() != (kind, step):
+            raise RuntimeError("invalid sample phase acknowledgement")
+
+    def begin_test(self, step):
+        self._test_boundary("begin-test", step)
+
+    def end_test(self, step):
+        self._test_boundary("end-test", step)
 
     def __iter__(self):
         return self
@@ -58,6 +84,47 @@ class QueueBatchSource:
         self.stopped.set()
 
 
+class _QueueTestBatches:
+    def __init__(self, source, step, groups, batch_size, offset, sample_count):
+        self.source, self.step = source, step
+        self.groups = iter(groups)
+        self.batch_size, self.offset = batch_size, offset
+        self.current = None
+        self.sample_count = sample_count
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current is not None:
+            raise RuntimeError("previous test batch has not been released")
+        group = next(self.groups)
+        stop = (group + 1) * self.batch_size
+        if self.sample_count is not None:
+            stop = min(stop, self.sample_count)
+        indices = tuple(range(self.offset + group * self.batch_size, self.offset + stop))
+        connection = self.source.test_connection
+        connection.send(("test", self.step, indices))
+        while not connection.poll(0.1):
+            if self.source.stopped.is_set():
+                raise StopIteration
+            if os.getppid() != self.source.owner_pid:
+                raise RuntimeError("sample supervisor exited during evaluation loading")
+        batch = connection.recv()
+        if batch.stream_indices.tolist() != list(indices):
+            raise RuntimeError("test data differs from canonical sample sequence")
+        self.current = indices
+        return batch
+
+    def release_current(self):
+        if self.current is not None:
+            self.source.test_connection.send(("release-test", self.step, self.current))
+            self.current = None
+
+    def close(self):
+        self.release_current()
+
+
 @dataclass(frozen=True)
 class FiberWorkerFactory:
     config_path: str
@@ -75,6 +142,8 @@ class FiberWorkerFactory:
     calibrated_gpu_names: tuple = ()
     calibrated_torch_versions: tuple = ()
     calibrated_cuda_versions: tuple = ()
+    test_connections: tuple = ()
+    measure_startup_memory: bool = False
 
     def __call__(self, rank, grant, state):
         os.environ.update(RANK=str(rank), WORLD_SIZE=str(len(self.microbatch_sizes)), LOCAL_RANK="0")
@@ -86,6 +155,11 @@ class FiberTrainingWorker:
         import torch
         from .train import _load_raw_config
         raw = _load_raw_config(factory.config_path)
+        self.factory, self.rank = factory, rank
+        self.gpu_uuid = sorted(grant["gpus"])[rank]
+        self._measurement_initialization = 0
+        self._saw_test = False
+        self._completed_initial_test = False
         self.allowance = grant["gpus"][sorted(grant["gpus"])[rank]]
         self.reserve = factory.reserve_bytes
         self.cuda = str(raw.get("training", {}).get("device", "auto")).split(":")[0] in ("auto", "cuda")
@@ -101,11 +175,14 @@ class FiberTrainingWorker:
             from .cooperative_resources import initialize_worker_volume_cache
             if raw.get("datasets"):
                 initialize_worker_volume_cache(raw)
+            if factory.measure_startup_memory:
+                torch.cuda.reset_peak_memory_stats(0)
         from .train import training_units
         from .cooperative_resources import EffectiveBatchSampleIndex
         index_map = EffectiveBatchSampleIndex(factory.effective_batch_size, factory.microbatch_sizes,
                                               rank, factory.start_step)
-        self.source = QueueBatchSource(factory.queues[rank], factory.received[rank], factory.owner_pid, index_map)
+        self.source = QueueBatchSource(factory.queues[rank], factory.received[rank], factory.owner_pid, index_map,
+                                       factory.test_connections[rank] if factory.test_connections else None)
         self.units = training_units(
             factory.config_path, resume_checkpoint=factory.resume_checkpoint,
             handoff=state, physical_microbatch_sizes=factory.microbatch_sizes,
@@ -114,6 +191,16 @@ class FiberTrainingWorker:
             training_overrides=factory.training_overrides,
         )
         self.boundary = next(self.units)
+        self._saw_test = self.boundary.phase == "test"
+        if factory.measure_startup_memory and state is None and not self._saw_test:
+            self.units.close()
+            raise RuntimeError("startup calibration produced no initial test work; cannot publish a complete memory profile")
+        if factory.measure_startup_memory:
+            torch.cuda.synchronize(0)
+            self._measurement_initialization = int(torch.cuda.memory_reserved(0))
+            self._measurement_test_peak = int(torch.cuda.max_memory_reserved(0)) if self._saw_test else 0
+            from .training_state import config_fingerprint
+            self._measurement_fingerprint = config_fingerprint(raw)
         self._check_memory()
 
     def _check_memory(self):
@@ -124,9 +211,41 @@ class FiberTrainingWorker:
 
     def run_unit(self):
         if not self.boundary.done:
-            self.boundary = next(self.units)
+            try:
+                self.boundary = next(self.units)
+            except Exception as error:
+                if self.factory.measure_startup_memory:
+                    import torch
+                    if isinstance(error, torch.cuda.OutOfMemoryError):
+                        raise RuntimeError(
+                            f"real startup calibration exhausted VRAM at microbatch "
+                            f"{self.factory.microbatch_sizes[self.rank]}; last completed "
+                            f"boundary step={self.boundary.step} phase={self.boundary.phase}. "
+                            "No update was retried or discarded; the run is stopping.") from error
+                raise
         self._check_memory()
-        return {"step": self.boundary.step, "done": self.boundary.done, "phase": self.boundary.phase}
+        row = {"step": self.boundary.step, "done": self.boundary.done, "phase": self.boundary.phase}
+        if self.factory.measure_startup_memory:
+            import torch
+            torch.cuda.synchronize(0)
+            self._saw_test |= self.boundary.phase == "test"
+            if self.boundary.phase == "test":
+                self._measurement_test_peak = max(self._measurement_test_peak, int(torch.cuda.max_memory_reserved(0)))
+            self._completed_initial_test |= self._saw_test and self.boundary.phase == "update"
+            row["memory"] = {
+                "microbatch_size": self.factory.microbatch_sizes[self.rank],
+                "initialization_reserved_bytes": self._measurement_initialization,
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(0)),
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(0)),
+                "gpu_name": torch.cuda.get_device_name(0), "torch_version": str(torch.__version__),
+                "cuda_version": torch.version.cuda, "config_fingerprint": self._measurement_fingerprint,
+                "world_size": len(self.factory.microbatch_sizes),
+                "gpu_uuid": self.gpu_uuid,
+                "optimizer_steps": self.boundary.step - self.factory.start_step,
+                "initial_test_completed": self._completed_initial_test,
+                "initial_test_peak_bytes": self._measurement_test_peak,
+            }
+        return row
 
     def capture(self):
         from .training_state import replica_signature

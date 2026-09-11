@@ -1,4 +1,22 @@
+## 2026-09-11 — Unified training/evaluation loading and startup measurement
+
+- Train and dense evaluation use the same optimized bounded sample queue,
+  including cooperative execution and visualization; phase admission prevents
+  future training work blocking evaluation.
+- Added memory measurement using real initial evaluation and optimizer updates,
+  retaining state across physical microbatch changes. CPU validation:181passed,
+  14GPU-only skipped. GPU validation is pending resource availability.
+- Exclusive-to-adaptive transition uses two registrations without changing the
+  locked protocol; user approved this lifecycle. Evaluation retains measured microbatch1.
+
 ## 2026-09-10 — Local Fiber3D embeddings
+
+- Calibration now acquires exclusive manager ownership before GPU initialization;
+  added training priority shorthand and calibration priority default +100.
+
+- Added automatic manager connection/startup and task-derived CPU/GPU/VRAM
+  requests. Manual calibration reports now have a fingerprinted default path
+  automatically discovered by training, removing manager config preparation.
 
 - Production training now defaults to the cooperative supervisor and shared
   default socket; only explicit --unmanaged permits debug/test bypass. Updated
@@ -2203,3 +2221,15 @@
   selected margin `0.40` with stored quality threshold `0.21` on the reference
   crop after a joint sweep. This tuned point reached 24/24 exact estimates at
   oracle round zero and remains disabled by default.
+## 2026-09-11 — Communication grace for cooperative training
+
+- Log real manager communication errors, retry with retained identity, allow60s
+  adaptive work before safe-boundary pause and resume after ownership reconciliation.
+  Exclusive calibration may finish its current authorized size offline; new workers
+  still require manager confirmation. No wire fields changed.
+## 2026-09-11 — Actual-forward visualization
+
+- Initial and periodic train/test rendering share bounded detached forward-result
+  capture. Removed broker visualization fetch and repeated augmentation/forward.
+  CPU sheets survive test resize; conditioned panels show actual zero/random
+  queries. Reusable no-argument visualization suite: 20 passed, 2 GPU skips.

@@ -1,11 +1,31 @@
-# Manager-only launch documentation
+# Existing-forward visualization
 
-The prior embedding command bypassed the manager. The supplied embedding config has no training.cooperative request or measured calibration. The manager CLI is not installed in the venv; its source module can run using PYTHONPATH. This task updates guidance without inventing memory estimates, launching GPU jobs, or changing internal test launchers.
-
-- User expanded scope: implemented managed-by-default run_training and explicit --unmanaged opt-out. Shared default socket helper preserves the existing path; config/CLI overrides remain. The explicit profiling harness now passes --unmanaged; internal cohort training primitives are unchanged.
-- Independent review approved the design; updated the stale torchrun recommendation in errors, retained fatal missing-calibration errors, and tested auxiliary prefetch dispatch.
-- CPU suite (managed launch, calibration, cooperative integration, embeddings): 47 passed, 1 GPU skip in 18.22s. After adding auxiliary dispatch coverage, focused launch/calibration tests: 15 passed in 1.69s (48 distinct passing tests total). CLI --help and git diff --check passed.
-- No GPU execution or service startup. The real embedding config still requires a complete request and configuration-matched measured calibration; this is documented, not replaced with invented values. Previous seed fix remains in this uncommitted worktree.
-
-- User refined socket policy: shared helper now prefers /run/villa-gpu-manager/manager.sock if a listener is reachable (100ms connect-only probe) or its creation location is writable/searchable; otherwise home path. No filesystem creation during selection, no task registration, no postselection fallback. Server group/UID/ownership checks unchanged.
-- Review caught inaccessible-parent OSError handling and eager CLI probing despite explicit overrides; both fixed and covered. Final socket/launch/calibration tests: 22 passed. No server startup or permission changes performed.
+- Inspected periodic training broker request and initial retained-test path.
+- Implement shared bounded rendering of actual forward results; no additional data requests.
+- Independent review required conditioned-panel relabeling and CPU-sheet handoff;
+  both implemented. Intentional selection change: rank-local actual training
+  samples replace canonical-global replay; conditioned panels use zero/random
+  loss outputs rather than a new recurrent inference. No-work rank logs no sheet.
+- Removed train-visual IPC and model-replay visualization helper. Added six CPU
+  regressions: same forwards/gradients/mode, bounded capture and restored sheets.
+- Selected prior forward/render tests: 5 passed (282 deselected), 2.46s.
+- Reused fixed no-argument run_fiber3d_cooperative_tests launcher with adjacent
+  JSON configuration as requested; visualization suite CPU-only, no GPU use.
+- First reusable integration run found NumPy sheets incompatible with replica
+  signature validation on resize. Store sheets as CPU uint8 tensors instead;
+  convert to NumPy only at the shared final image logging boundary.
+- Final reusable run: 20 passed, 2 GPU-only skipped in 37.79s. Includes actual
+  two-rank CPU training/test handoff and restoration to one rank during test.
+  Logs: /ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260911_134951_999648/.
+- No live training/manager restart, GPU execution, or wall-time speed claim.
+  The old timeout's exact rank-zero stack was unavailable; removing the entire
+  visualization refetch path eliminates that dependency, not proof of its cause.
+- Follow-up: GPU suites now use shared ExclusiveTask with deferred subprocess
+  startup and identity-based descendant cleanup. Manager suite: 127 passed in
+  32.57s, including authorization-before-start and joined-before-release test.
+- Requested CUDA cohort tests (initial/test resize and periodic train sheets)
+  launched via the same fixed script, currently queued behind non-pausable
+  fiber-evaluation task 232a816c-345a-4e17-b7ae-ac9260cdcc6c.
+- CUDA cohort tests subsequently acquired the exclusive reservation and passed:
+  2 passed, 7 deselected in 42.88s. Log:
+  /ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260911_135643_807293/cuda-cohort.log.

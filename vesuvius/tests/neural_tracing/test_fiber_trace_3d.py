@@ -3457,7 +3457,7 @@ def test_write_3d_sample_sheet_adds_image() -> None:
     batch = _load_materialized_batch(loader, 0)
     writer = _Writer()
 
-    _write_3d_sample_sheet(writer, "test_sample_3d/principal_slices", _ZeroModel(), batch, 7)
+    _write_3d_sample_sheet(writer, "test_sample_3d/principal_slices", batch, _ZeroModel()(batch.volume), 7)
 
     assert len(writer.calls) == 1
     tag, image, step, dataformats = writer.calls[0]

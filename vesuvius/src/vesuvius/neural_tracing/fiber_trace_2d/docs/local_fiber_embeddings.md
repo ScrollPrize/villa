@@ -17,15 +17,19 @@ checkpoint. GPU memory and throughput with embeddings remain unmeasured.
 Production training must use the cooperative manager. Do not launch with
 `torchrun`: the CPU supervisor starts and reconfigures GPU workers itself.
 
-**Setup is not complete for this config:** add `training.cooperative.request`
-and a measured `training.cooperative.memory_calibration` following
-[managed setup and calibration](cooperative_training.md#managed-launch).
-The current JSON contains neither. Calibration must cover this embedding model
-and the requested GPU count; old non-embedding measurements cannot be reused.
-Start or connect to the manager controlling those GPUs. Default socket selection does
-not supply the missing request/calibration, and the launcher fails explicitly.
+No manager configuration is necessary. The command below connects to an existing
+manager or starts one automatically, and derives its CPU/GPU/VRAM request from
+the available inventory, GPU visibility and measured calibration. The manager
+outlives the initiating task; simultaneous starters reuse one service.
 
-Once those prerequisites are complete, run from any directory:
+Run the [manual memory calibration](cooperative_training.md#memory-probe--run-only-after-gpu-permission)
+once for this embedding config, omitting `--output`. Its report is saved under
+`/ephemeral/hendrik/fiber3d_train2/runs/.memory-calibrations/<config-fingerprint>.json`
+and loaded automatically. No copying JSON into the config is required. Missing
+or stale calibration produces an error before a service or training is started;
+old non-embedding measurements cannot be reused.
+
+Then run from any directory:
 
 ```bash
 export PYTHONPATH=/home/hendrik/villa/gpu_manager/src:/home/hendrik/villa/vesuvius/src:/home/hendrik/villa/vesuvius:/home/hendrik/villa

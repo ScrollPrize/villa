@@ -282,6 +282,7 @@ def _shared_worker_main(
     active_workers: Any,
     worker_busy: Any,
     elastic_workers: bool,
+    admitted_frontier: Any,
 ) -> None:
     """Claim eligible work without a coordinator round trip."""
 
@@ -303,7 +304,8 @@ def _shared_worker_main(
         def claim_load() -> int | None:
             with claim_lock:
                 candidate = int(next_index.value)
-                if candidate >= int(end_index) or candidate >= int(target_frontier.value):
+                if (candidate >= int(end_index) or candidate >= int(target_frontier.value)
+                        or candidate >= int(admitted_frontier.value)):
                     return None
                 slot = (
                     (candidate - int(start_index)) % int(slot_count)
@@ -473,6 +475,7 @@ class OrderedTwoStageSamplePipeline:
         shared_stage1_affinity_workers: int | None = None,
         elastic_workers: bool = False,
         initial_active_workers: int | None = None,
+        manual_admission: bool = False,
     ) -> None:
         for name, value in (
             ("item_count", item_count),
@@ -492,6 +495,8 @@ class OrderedTwoStageSamplePipeline:
         self.shared_pool = int(shared_workers) > 0
         if elastic_workers and not self.shared_pool:
             raise ValueError("elastic workers require the shared pool")
+        if manual_admission and not self.shared_pool:
+            raise ValueError("manual admission requires the shared pool")
         if initial_active_workers is not None and not elastic_workers:
             raise ValueError("initial_active_workers requires elastic_workers")
         if self.shared_pool:
@@ -550,6 +555,10 @@ class OrderedTwoStageSamplePipeline:
         self.start_event = self.context.Event()
         self.stop_event = self.context.Event()
         self.next_index = self.context.Value("q", self.start_index)
+        self.manual_admission = bool(manual_admission)
+        self._admitted_frontier = self.context.Value(
+            "q", self.start_index if manual_admission else self.end_index
+        )
         self.claim_lock = self.context.Lock()
         self.elastic_workers = bool(elastic_workers)
         initial_active = int(shared_workers) if initial_active_workers is None else initial_active_workers
@@ -636,6 +645,7 @@ class OrderedTwoStageSamplePipeline:
                             self._active_workers,
                             self._worker_busy,
                             self.elastic_workers,
+                            self._admitted_frontier,
                         ),
                         name=f"ordered-sample-shared-{worker_id}",
                     )
@@ -829,6 +839,19 @@ class OrderedTwoStageSamplePipeline:
         if self.next_expected not in self.reorder:
             return None
         return self._deliver_next(release_credit=release_credit)
+
+    def admit_until(self, end: int) -> None:
+        """Publish initialized descriptors, never change already admitted work.
+
+        This is separate from credit/ramp-up limits: workers still claim only
+        runnable work through the ordinary shared-pool scheduler.
+        """
+        if not self.manual_admission or self.closed:
+            raise RuntimeError("explicit admission requires an open manual stream")
+        with self.claim_lock:
+            if not int(self._admitted_frontier.value) <= end <= self.end_index:
+                raise ValueError("admission frontier must advance within the stream")
+            self._admitted_frontier.value = end
 
     def set_worker_limit(self, count: int) -> None:
         """Cooperative shrink: current jobs finish, surplus workers then park."""

@@ -13,6 +13,7 @@ import torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DBatch,
+    FiberTrace3DConfig,
     FiberTrace3DLoader,
     FiberTrace3DRawSample,
     FiberTrace3DSample,
@@ -34,6 +35,22 @@ from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
 class IdentitySampleIndex:
     def __call__(self, index: int) -> int:
         return int(index)
+
+
+def _pipeline_config(source):
+    """Accept a resolved test config without reloading the training datasets."""
+    return source if isinstance(source, FiberTrace3DConfig) else load_config(source)
+
+
+@dataclass(frozen=True)
+class EvaluationSampleIndex:
+    batch_size: int
+    global_batch_indices: tuple[int, ...]
+    start_sample_index: int = 0
+
+    def __call__(self, index):
+        batch, offset = divmod(index, self.batch_size)
+        return self.start_sample_index + self.global_batch_indices[batch] * self.batch_size + offset
 
 
 @dataclass(frozen=True)
@@ -144,8 +161,8 @@ class FiberTrace3DLoadFactory:
             message=r"skipping NML fiber component with branch node:.*",
             category=RuntimeWarning,
         )
-        config = load_config(self.config_path)
-        if self.single_core:
+        config = _pipeline_config(self.config_path)
+        if self.single_core and getattr(config, "_array_records", None) is None:
             from .cooperative_resources import initialize_worker_volume_cache
             initialize_worker_volume_cache({"volume_cache_memory_mib": config.volume_cache_memory_mib})
             config = replace(config, volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
@@ -191,7 +208,7 @@ class FiberTrace3DFusedLoadFactory:
             category=RuntimeWarning,
         )
         return FiberTrace3DFusedLoadOperation(
-            FiberTrace3DLoader(load_config(self.config_path)),
+            FiberTrace3DLoader(_pipeline_config(self.config_path)),
             self.sample_index_limit,
             self.sample_mode,
             self.index_map,
@@ -228,10 +245,194 @@ class FiberTrace3DAugmentFactory:
 
     def __call__(self) -> FiberTrace3DAugmentOperation:
         return FiberTrace3DAugmentOperation(
-            load_config(self.config_path),
+            _pipeline_config(self.config_path),
             self.profile,
             self.defer_cuda_suffix,
         )
+
+
+@dataclass(frozen=True)
+class SampleQueueSource:
+    """Sampling semantics; transport ordinals never seed sample generation."""
+
+    config: Any
+    sample_mode: str = "random"
+    sample_index_limit: int | None = None
+    defer_cuda_value_augmentation: str | None = None
+
+
+@dataclass(frozen=True)
+class _QueueDescriptors:
+    rows: Any
+    slot_count: int
+
+    def descriptor(self, index):
+        generation, source, canonical = self.rows[index % self.slot_count].tolist()
+        if generation != index:
+            raise RuntimeError("sample descriptor was reused before release")
+        return int(source), int(canonical)
+
+    def __call__(self, index):
+        return self.descriptor(index)[1]
+
+
+@dataclass(frozen=True)
+class _RoutedFactory:
+    sources: tuple[SampleQueueSource, ...]
+    descriptors: _QueueDescriptors
+    stage: str
+    profile: bool
+
+    def __call__(self):
+        # Source loaders are initialized lazily in each existing worker, once.
+        operations = {}
+
+        def run(value):
+            if self.stage == "load":
+                source_id, canonical = self.descriptors.descriptor(value)
+            else:
+                source_id, value = value
+            if source_id not in operations:
+                source = self.sources[source_id]
+                factory = (
+                    FiberTrace3DLoadFactory(source.config, source.sample_index_limit,
+                        source.sample_mode, profile=self.profile, single_core=True)
+                    if self.stage == "load" else
+                    FiberTrace3DAugmentFactory(source.config, profile=self.profile,
+                        defer_cuda_suffix=source.defer_cuda_value_augmentation)
+                )
+                operations[source_id] = factory()
+            result = operations[source_id](canonical if self.stage == "load" else value)
+            return source_id, result
+
+        return run
+
+
+class _RoutedTransport:
+    def __init__(self, banks, descriptors):
+        self.banks = banks
+        self.descriptors = descriptors
+        self.slot_count = descriptors.slot_count
+
+    def _location(self, index):
+        return index % self.slot_count, index // self.slot_count
+
+    def encode(self, index, value, *, final):
+        source, sample = value
+        if self.descriptors.descriptor(index)[0] != source:
+            raise RuntimeError("sample source differs from admitted job")
+        return source, self.banks[source].encode(index, sample, final=final)
+
+    def decode(self, index, value, *, final):
+        source, payload = value
+        if self.descriptors.descriptor(index)[0] != source:
+            raise RuntimeError("sample result source differs from admitted job")
+        sample = self.banks[source].decode(index, payload, final=final)
+        return sample if final else (source, sample)
+
+    def batch_tensors(self, indices, *, allow_wrap=True):
+        source = self.descriptors.descriptor(indices[0])[0]
+        if any(self.descriptors.descriptor(index)[0] != source for index in indices):
+            raise ValueError("one batch must come from one sample source")
+        return self.banks[source].batch_tensors(indices, allow_wrap=allow_wrap)
+
+
+class FiberTrace3DSampleQueue:
+    """Persistent optimized workers shared by explicitly ordered train/test jobs.
+
+    Admission is bounded by *leased plus future* slots. Owners decide phase order
+    before admission; no worker waits for work queued behind its dependency.
+    Different source dtypes keep uint8 training transfers intact. All sources use
+    the same slot-ownership ledger and worker pool, not independent data loaders.
+    """
+
+    def __init__(self, *, sources, workers, slot_count, initial_in_flight,
+                 load_affinity_workers=None, initial_active_workers=None, profile=False):
+        if not sources:
+            raise ValueError("sample queue requires at least one source")
+        self.sources = dict(sources)
+        self.names = tuple(sources)
+        self._source_ids = {name: index for index, name in enumerate(self.names)}
+        rows = torch.full((slot_count, 3), -1, dtype=torch.int64).share_memory_()
+        self.descriptors = _QueueDescriptors(rows, slot_count)
+        banks = []
+        for source in self.sources.values():
+            config = _pipeline_config(source.config)
+            banks.append(FiberTrace3DSharedTensorSlots(
+                start_index=0, slot_count=slot_count, patch_shape_zyx=config.patch_shape_zyx,
+                stream_index_map=self.descriptors,
+                volume_dtype=torch.uint8 if source.defer_cuda_value_augmentation == "all" else torch.float32,
+                embedding_stride=config.embedding.output_stride if config.embedding.enabled else 0))
+        self.transport = _RoutedTransport(tuple(banks), self.descriptors)
+        factory_args = (tuple(self.sources.values()), self.descriptors)
+        self.pipeline = OrderedTwoStageSamplePipeline(
+            stage1_factory=_RoutedFactory(*factory_args, "load", profile),
+            stage2_factory=_RoutedFactory(*factory_args, "augment", profile),
+            start_index=0, item_count=2**62, stage1_workers=0, stage2_workers=0,
+            shared_workers=workers, elastic_workers=True,
+            initial_active_workers=workers if initial_active_workers is None else initial_active_workers,
+            raw_queue_capacity=max(1, min(slot_count, workers)),
+            result_queue_capacity=max(1, min(slot_count, workers)),
+            max_in_flight=slot_count, initial_in_flight=min(slot_count, max(1, initial_in_flight)),
+            shared_stage1_affinity_workers=load_affinity_workers,
+            transport=self.transport, manual_admission=True)
+        self._lock = threading.RLock()
+        self._next = 0
+        self._owned = set()
+        self._ready = {}
+        self.profile = profile
+
+    def submit(self, source, canonical_indices):
+        indices = tuple(int(index) for index in canonical_indices)
+        if not indices or len(indices) > self.transport.slot_count:
+            raise ValueError("sample batch must fit the bounded shared slots")
+        source_id = self._source_ids[source]
+        with self._lock:
+            ticket = tuple(range(self._next, self._next + len(indices)))
+            if any(index % self.transport.slot_count in self._owned for index in ticket):
+                return None
+            for ordinal, canonical in zip(ticket, indices):
+                self.descriptors.rows[ordinal % self.transport.slot_count] = torch.tensor(
+                    (ordinal, source_id, canonical), dtype=torch.int64)
+                self._owned.add(ordinal % self.transport.slot_count)
+            self._next += len(indices)
+            self.pipeline.admit_until(self._next)
+            return ticket
+
+    def poll(self, limit=64):
+        with self._lock:
+            for _ in range(limit):
+                result = self.pipeline.try_next_ordered(release_credit=False)
+                if result is None:
+                    break
+                self._ready[result.index] = result
+
+    def batch(self, ticket):
+        with self._lock:
+            self.poll()
+            if not all(index in self._ready for index in ticket):
+                return None
+            source_id = self.descriptors.descriptor(ticket[0])[0]
+            source = self.sources[self.names[source_id]]
+            return collate_pipeline_results(
+                [self._ready[index] for index in ticket],
+                self.transport.batch_tensors(list(ticket), allow_wrap=True),
+                defer_cuda_value_augmentation=source.defer_cuda_value_augmentation,
+                profile=self.profile, total_start=time.perf_counter())
+
+    def release(self, ticket):
+        with self._lock:
+            for index in ticket:
+                if index not in self._ready:
+                    raise RuntimeError("cannot release an undelivered sample")
+                self.pipeline.release(index)
+                del self._ready[index]
+                self._owned.remove(index % self.transport.slot_count)
+
+    def close(self):
+        self.pipeline.close()
+        self._ready.clear()
+        self._owned.clear()
 
 
 def collate_pipeline_results(results, volumes, *, defer_cuda_value_augmentation=None,
@@ -421,6 +622,24 @@ def _batch_tensor_bytes(batch: FiberTrace3DBatch) -> int:
     )
 
 
+def apply_deferred_batch_augmentation(batch, config, *, mode):
+    """Complete the same deferred value transform for training/evaluation/views.
+
+    Call after transfer, under disabled autocast. The mode is explicit because
+    suffix-only batches also retain augmentation parameters for reproducibility.
+    """
+    if batch.deferred_blur_kernels is None:
+        return batch
+    if mode == "all":
+        if batch.deferred_augmentation_params is None:
+            raise RuntimeError("CUDA augmentation parameters are missing")
+        volume = apply_value_augmentation_batch_3d(config, batch.volume,
+            batch.deferred_augmentation_params, batch.deferred_blur_kernels)
+    else:
+        volume = apply_value_augmentation_suffix_batch_3d(batch.volume, batch.deferred_blur_kernels)
+    return replace(batch, volume=volume, deferred_augmentation_params=None, deferred_blur_kernels=None)
+
+
 class FiberTrace3DCudaBatchPipeline:
     """Prepare two future training batches on a dedicated CUDA stream."""
 
@@ -489,27 +708,8 @@ class FiberTrace3DCudaBatchPipeline:
                     device_batch = pinned.to(self.device, non_blocking=True)
                     transfer_finished.record(self.stream)
                     with torch.autocast(device_type="cuda", enabled=False):
-                        if device_batch.deferred_blur_kernels is not None:
-                            if self.value_augmentation_suffix == "all":
-                                if device_batch.deferred_augmentation_params is None:
-                                    raise RuntimeError("CUDA augmentation parameters are missing")
-                                augmented = apply_value_augmentation_batch_3d(
-                                    self.config,
-                                    device_batch.volume,
-                                    device_batch.deferred_augmentation_params,
-                                    device_batch.deferred_blur_kernels,
-                                )
-                            else:
-                                augmented = apply_value_augmentation_suffix_batch_3d(
-                                    device_batch.volume,
-                                    device_batch.deferred_blur_kernels,
-                                )
-                            device_batch = replace(
-                                device_batch,
-                                volume=augmented,
-                                deferred_augmentation_params=None,
-                                deferred_blur_kernels=None,
-                            )
+                        device_batch = apply_deferred_batch_augmentation(
+                            device_batch, self.config, mode=self.value_augmentation_suffix)
                     augmentation_finished.record(self.stream)
                     device_batch = materialize_targets(
                         device_batch,

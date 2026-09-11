@@ -20,6 +20,9 @@ def test_collection_training_config():
     assert raw["training"]["learning_rate"] == 0.01
     assert raw["training"]["optimizer_global_batch_size"] == 128
     assert raw["batch_size"] == 16
+    for key in ("test_interval", "checkpoint_interval"):
+        assert raw["training"][key] == 1000
+        baseline["training"][key] = 1000
     for field in ("datasets", "test_datasets", "embedding"):
         raw.pop(field, None)
         baseline.pop(field, None)

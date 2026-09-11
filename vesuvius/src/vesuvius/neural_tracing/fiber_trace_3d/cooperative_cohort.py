@@ -21,7 +21,9 @@ from vesuvius.neural_tracing.ordered_sample_pipeline import native_thread_enviro
 class FiberCohort:
     def __init__(self, *, config_path, grant, state, broker, calibration,
                  queue_depth=2, writer_factory=None, resume_checkpoint=None,
-                 drain_timeout=300.0, training_overrides=None, calibration_observations=()):
+                 drain_timeout=300.0, training_overrides=None, calibration_observations=(),
+                 startup_microbatch_size=None, startup_reserve_bytes=4 * 1024**3,
+                 on_startup_observation=None):
         from villa_gpu_manager.cohort import ProcessCohort
         if type(queue_depth) is not int or queue_depth < 1:
             raise ValueError("GPU input queue depth must be positive")
@@ -37,22 +39,36 @@ class FiberCohort:
         self._drain_started = None
         self._publication_errors = queue.SimpleQueue()
         self._memory_monitor = None
+        self._on_startup_observation = on_startup_observation
+        self._driver_peaks = {gpu: 0 for gpu in grant["gpus"]}
         self.gpu = None
         self._authorized_at = None
         self._gpu_pids = set()
         self._temp = tempfile.TemporaryDirectory(prefix="fiber-cohort-")
         context = mp.get_context("spawn")
         devices = sorted(grant["gpus"])
-        sizes = tuple(calibration.microbatch_for(grant["gpus"][gpu]) for gpu in devices)
+        if startup_microbatch_size is not None:
+            if type(startup_microbatch_size) is not int or startup_microbatch_size < 1 or calibration is not None:
+                raise ValueError("startup requires a positive physical batch and no invented calibration")
+            sizes = (startup_microbatch_size,) * len(devices)
+            reserve = startup_reserve_bytes
+        else:
+            sizes = tuple(calibration.microbatch_for(grant["gpus"][gpu]) for gpu in devices)
+            reserve = calibration.reserve_bytes
         if not sizes or min(sizes) < 1:
             self._temp.cleanup()
             raise ValueError("grant cannot fit a calibrated microbatch")
         self._queues, self._received, self._maps = [], [], []
+        self._test_connections, self._test_children, self._test_pending = [], [], {}
+        self._test_boundaries = {}
         self._ordinals = [0] * len(sizes)
         self._samples = [0] * len(sizes)
         start_step = broker.frontier // broker.effective_batch_size
         try:
             for rank in range(len(sizes)):
+                parent_test, child_test = context.Pipe(duplex=True)
+                self._test_connections.append(parent_test)
+                self._test_children.append(child_test)
                 self._queues.append(context.Queue(maxsize=queue_depth))
                 # Queue.put returns before the feeder serializes the batch.
                 # Surface its actual exception instead of treating admission
@@ -67,15 +83,17 @@ class FiberCohort:
                 (Path(self._temp.name) / "rendezvous").as_uri(), start_step, broker.effective_batch_size,
                 writer_factory=writer_factory, resume_checkpoint=resume_checkpoint,
                 training_overrides=training_overrides,
-                reserve_bytes=calibration.reserve_bytes,
+                reserve_bytes=reserve,
                 calibrated_gpu_names=tuple(sorted({row["gpu_name"] for row in calibration_observations})),
                 calibrated_torch_versions=tuple(sorted({row["torch_version"] for row in calibration_observations})),
                 calibrated_cuda_versions=tuple(sorted({row["cuda_version"] for row in calibration_observations})),
+                test_connections=tuple(self._test_children),
+                measure_startup_memory=startup_microbatch_size is not None,
             )
             self.gpu = ProcessCohort(factory, grant, state, environment=native_thread_environment(),
                                      on_unit=self._completed_unit)
             self._gpu_pids = {row["pid"] for row in self.gpu.processes}
-            if calibration_observations:
+            if calibration_observations or startup_microbatch_size is not None:
                 from villa_gpu_manager.processes import NvidiaMonitor
                 self._memory_monitor = NvidiaMonitor(grant, 0, interval=1)
         except BaseException:
@@ -91,7 +109,8 @@ class FiberCohort:
             raise
 
     def _completed_unit(self, rows):
-        if not rows or any(row != rows[0] for row in rows[1:]):
+        progress = [{key: value for key, value in row.items() if key != "memory"} for row in rows]
+        if not rows or any(row != progress[0] for row in progress[1:]):
             raise RuntimeError("GPU ranks disagree about completed training progress")
         step = rows[0]["step"]
         frontier = self.broker.frontier // self.broker.effective_batch_size
@@ -99,6 +118,13 @@ class FiberCohort:
             self.broker.commit(step)
         elif rows[0].get("phase") not in ("test", "update"):
             raise RuntimeError("invalid repeated training boundary")
+        if self._on_startup_observation is not None:
+            observations = []
+            for row in rows:
+                memory = dict(row["memory"])
+                memory["driver_peak_bytes"] = self._driver_peaks[memory["gpu_uuid"]]
+                observations.append(memory)
+            self._on_startup_observation(observations, progress[0])
         return rows[0]["done"]
 
     @property
@@ -166,12 +192,13 @@ class FiberCohort:
         if not self.authorized:
             return
         self._check_driver_memory()
+        self._poll_test_requests()
         for rank, mapping in enumerate(self._maps):
             if not mapping.batch_sizes:
                 continue
             take = mapping.batch_sizes[self._ordinals[rank] % len(mapping.batch_sizes)]
             indices = tuple(mapping(self._samples[rank] + i) for i in range(take))
-            if indices[-1] >= self.broker.pipeline.end_index:
+            if indices[-1] >= self.broker.end_index:
                 continue
             if self._draining and indices[0] >= self.broker.frontier + self.broker.effective_batch_size:
                 continue
@@ -190,6 +217,37 @@ class FiberCohort:
             self._samples[rank] += take
             self._sent[rank] += 1
 
+    def _poll_test_requests(self):
+        for rank, connection in enumerate(self._test_connections):
+            while connection.poll():
+                kind, step, indices = connection.recv()
+                if kind == "release-test":
+                    self.broker.release_test(step, indices)
+                elif kind in ("begin-test", "end-test") and rank not in self._test_boundaries:
+                    self._test_boundaries[rank] = (kind, step)
+                elif kind == "test" and rank not in self._test_pending:
+                    self._test_pending[rank] = (kind, step, indices)
+                else:
+                    raise RuntimeError("invalid managed evaluation sample request")
+            if rank in self._test_pending:
+                kind, step, indices = self._test_pending[rank]
+                batch = self.broker.test_batch(step, indices)
+                if batch is not None:
+                    connection.send(batch)
+                    del self._test_pending[rank]
+        if len(self._test_boundaries) == len(self._test_connections):
+            boundaries = list(self._test_boundaries.values())
+            if any(row != boundaries[0] for row in boundaries):
+                raise RuntimeError("GPU ranks disagree on sample phase boundary")
+            kind, step = boundaries[0]
+            if kind == "begin-test":
+                self.broker.begin_test(step)
+            else:
+                self.broker.end_test(step)
+            for connection in self._test_connections:
+                connection.send((kind, step))
+            self._test_boundaries.clear()
+
     def _publication_failed(self, error, _item):
         self._publication_errors.put(f"{type(error).__name__}: {error}")
 
@@ -207,6 +265,7 @@ class FiberCohort:
                 raise RuntimeError(f"allocated GPU {gpu} disappeared from driver inventory")
             used = sum(size for pid, size in monitor.last_snapshot[gpu]["processes"].items()
                        if pid in self._gpu_pids)
+            self._driver_peaks[gpu] = max(self._driver_peaks[gpu], used)
             if used > budget:
                 raise RuntimeError(f"task exceeded VRAM grant on {gpu}: {used} > {budget} bytes")
 
@@ -234,6 +293,8 @@ class FiberCohort:
     def _close_queues(self, *, abort=False):
         if self._queues_closed:
             return
+        for connection in self._test_connections + self._test_children:
+            connection.close()
         for batches in self._queues:
             if abort:
                 batches.cancel_join_thread()

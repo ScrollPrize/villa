@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import faulthandler
 import hashlib
 import json
@@ -53,6 +54,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
     FiberTrace3DCudaBatchPipeline,
     FiberTrace3DTrainingBatchPipeline,
     VirtualBatchSampleIndex,
+    EvaluationSampleIndex,
+    FiberTrace3DSampleQueue,
+    SampleQueueSource,
+    apply_deferred_batch_augmentation,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.queued_batches import (
+    QueuedBatchView, TrainingBatchIndices, test_batches as queued_test_batches,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
@@ -1504,6 +1512,7 @@ def compute_conditioned_losses(
     positive_query_weight: float = 1.0,
     negative_query_weight: float = 1.0,
     _return_statistics: bool = False,
+    prediction_observer: Any | None = None,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
@@ -1549,6 +1558,8 @@ def compute_conditioned_losses(
     perp_sparse = components["point_output"]
     if zero_output is None or random_output is None:
         raise RuntimeError("conditioned model forward did not return dense outputs")
+    if prediction_observer is not None:
+        prediction_observer(batch, torch.cat((zero_output.detach(), random_output.detach()), dim=1))
     batch_size, _channels, depth, height, width = (int(v) for v in zero_output.shape)
 
     positive_query_count = 2
@@ -2218,8 +2229,9 @@ def _evaluate_dense_loss_rows(
     diagnostic_step: int = 0,
     global_batch_indices: Sequence[int] | None = None,
     batch_iterator: Any | None = None,
-    captured_batches: dict[int, FiberTrace3DBatch] | None = None,
+    prediction_observer: Any | None = None,
     microbatch_size: int | None = None,
+    profile_times: dict[str, list[float]] | None = None,
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
     batch_size = int(loader.config.batch_size)
@@ -2229,6 +2241,11 @@ def _evaluate_dense_loss_rows(
     if global_batch_indices is None:
         global_batch_indices = range((int(sample_count) + batch_size - 1) // batch_size)
     indexed_rows: list[tuple[int, dict[str, float]]] = []
+    def timed_stage(name, started):
+        if profile_times is not None:
+            _synchronize_device(device)
+            profile_times.setdefault(name, []).append(time.monotonic() - started)
+
     for local_batch_index, global_batch_index_raw in enumerate(global_batch_indices):
         global_batch_index = int(global_batch_index_raw)
         consumed = global_batch_index * batch_size
@@ -2255,6 +2272,7 @@ def _evaluate_dense_loss_rows(
             )
         else:
             batch = next(batch_iterator).to(load_device)
+        timed_stage("load", batch_started)
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-load-end",
@@ -2276,6 +2294,7 @@ def _evaluate_dense_loss_rows(
             batch = materialize_targets(
                 batch, loader.config, output_stride=_model_output_stride(model),
             )
+        timed_stage("targets", targets_started)
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-targets-end",
@@ -2297,8 +2316,6 @@ def _evaluate_dense_loss_rows(
             )
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
-        if captured_batches is not None and global_batch_index == 0:
-            captured_batches[global_batch_index] = batch
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-forward-begin",
@@ -2315,6 +2332,7 @@ def _evaluate_dense_loss_rows(
                     model, batch, direction_weight=direction_weight,
                     presence_weight=presence_weight,
                     conditioned_loss_options=conditioned_loss_options, training_loss=False,
+                    prediction_observer=prediction_observer,
                 )
         else:
             statistics = None
@@ -2323,7 +2341,8 @@ def _evaluate_dense_loss_rows(
                 physical = materialize_targets(physical, loader.config, output_stride=_model_output_stride(model))
                 with _autocast_context(mixed_precision):
                     part = _forward_loss_statistics(model, physical,
-                        conditioned_loss_options=conditioned_loss_options, training_loss=False)
+                        conditioned_loss_options=conditioned_loss_options, training_loss=False,
+                        prediction_observer=prediction_observer)
                 statistics = part if statistics is None else statistics + part
                 del physical
             options = conditioned_loss_options or {}
@@ -2357,6 +2376,7 @@ def _evaluate_dense_loss_rows(
                 consumed=consumed,
             )
         rows = _losses_to_float_dict(loss_tensors)
+        timed_stage("forward", forward_started)
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-to-cpu-end",
@@ -2366,8 +2386,34 @@ def _evaluate_dense_loss_rows(
                 consumed=consumed,
             )
         indexed_rows.append((global_batch_index, rows))
+        if batch_iterator is not None and hasattr(batch_iterator, "release_current"):
+            # Loss-to-CPU above completes device consumption before slot reuse.
+            batch_iterator.release_current()
     model.train()
     return indexed_rows
+
+
+def _make_test_sample_pipeline(config, *, raw_config, global_batch_indices,
+                               start_sample_index=0, sample_mode="sequential"):
+    """Reuse training's bounded sample pool for exact logical test batches."""
+    indices = tuple(int(i) for i in global_batch_indices)
+    if not indices:
+        return None
+    training = raw_config.get("training", {})
+    world = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    workers = max(2, int(training.get("sample_pipeline_workers", 128)) // world)
+    batch = config.batch_size
+    slots = max(batch, min(int(training.get("sample_pipeline_slots", 512)) // world,
+                           batch * len(indices)))
+    slots = max(batch, (slots // batch) * batch)
+    return FiberTrace3DTrainingBatchPipeline(
+        config_path=config, index_map=EvaluationSampleIndex(batch, indices, start_sample_index),
+        batch_size=batch, patch_shape_zyx=config.patch_shape_zyx, batch_count=len(indices),
+        workers=workers, load_affinity_workers=max(1, min(workers-1, int(workers*0.75))),
+        slot_count=slots, initial_in_flight=min(slots, max(batch, workers)),
+        sample_index_limit=None, sample_mode=sample_mode, profile=False,
+        single_core_load=True,
+        embedding_stride=config.embedding.output_stride if config.embedding.enabled else 0)
 
 
 @torch.no_grad()
@@ -2474,6 +2520,7 @@ def _forward_loss_tensors(
     presence_weight: float,
     conditioned_loss_options: dict[str, float] | None = None,
     training_loss: bool,
+    prediction_observer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     if _model_uses_conditioned_decoder(model):
         return compute_conditioned_losses(
@@ -2481,11 +2528,14 @@ def _forward_loss_tensors(
             batch,
             direction_weight=direction_weight,
             presence_weight=presence_weight,
+            prediction_observer=prediction_observer,
             **dict(conditioned_loss_options or {}),
         )
     use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
     result = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
     output = result["prediction"] if use_embeddings else result
+    if prediction_observer is not None:
+        prediction_observer(batch, output)
     return compute_losses(
         output,
         batch,
@@ -2504,6 +2554,7 @@ def _forward_loss_statistics(
     *,
     conditioned_loss_options: dict[str, float] | None = None,
     training_loss: bool = True,
+    prediction_observer: Any | None = None,
 ) -> _LossStatistics:
     if _model_uses_conditioned_decoder(model):
         result = compute_conditioned_losses(
@@ -2513,11 +2564,14 @@ def _forward_loss_statistics(
             presence_weight=1.0,
             **dict(conditioned_loss_options or {}),
             _return_statistics=True,
+            prediction_observer=prediction_observer,
         )
     else:
         use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
         prediction = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
         output = prediction["prediction"] if use_embeddings else prediction
+        if prediction_observer is not None:
+            prediction_observer(batch, output)
         result = compute_losses(
             output,
             batch,
@@ -2670,6 +2724,11 @@ def training_units(
         raw_config = {**raw_config, "training": {**raw_config.get("training", {}), **training_overrides}}
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
+    evaluation_microbatch_size = training.get("evaluation_microbatch_size")
+    if evaluation_microbatch_size is not None and (
+        type(evaluation_microbatch_size) is not int or evaluation_microbatch_size < 1
+    ):
+        raise ValueError("training.evaluation_microbatch_size must be a positive integer")
     bounded_accumulation = training.get("bounded_gradient_accumulation", False)
     if type(bounded_accumulation) is not bool:
         raise ValueError("training.bounded_gradient_accumulation must be a boolean")
@@ -2910,7 +2969,7 @@ def training_units(
             "times abs dot with the GT tangent. Multi-output columns instead show first, "
             "second, normal-closest, other, max, min, and average prediction presence. "
             "In conditioned mode the first prediction is zero-query output and the second is "
-            "the recurrent output conditioned on the first decoded direction. "
+            "the random-query output from the same loss forward. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -2924,7 +2983,7 @@ def training_units(
             "times abs dot with the GT tangent. Multi-output columns instead show first, "
             "second, normal-closest, other, max, min, and average prediction presence. "
             "In conditioned mode the first prediction is zero-query output and the second is "
-            "the recurrent output conditioned on the first decoded direction. "
+            "the random-query output from the same loss forward. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -3097,17 +3156,54 @@ def training_units(
         if test_loader is not None and test_interval > 0
         else ()
     )
-    if test_loader is not None and test_interval > 0 and physical_microbatch_sizes is None:
-        test_dataloader = _make_batch_dataloader(
-            test_loader.config,
-            raw_config=raw_config,
-            start_batch_index=distributed.rank,
-            batch_index_stride=distributed.world_size,
-            sample_index_offset=test_start_sample_index,
-            batch_count=len(test_batch_indices),
-            sample_index_limit=None,
-            sample_mode=test_sample_mode,
-        )
+    # One source-tagged worker pool services training and evaluation. Transport
+    # ordinals are independent of canonical dataset/RNG sample indices.
+    sample_queue = None
+    queued_train = None
+    remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
+    pipeline_batch_count = (1 if profile_replay_batch or profile_replay_cpu_batch else
+                            (remaining_steps * optimizer_microbatch_count if remaining_steps is not None else None))
+    sample_pipeline_workers = _training_sample_pipeline_workers(training)
+    if batch_source is None:
+        if pipeline_batch_count is None:
+            raise ValueError("queued training requires a finite training.max_steps")
+        local_workers = max(1, _rank_partition(
+            sample_pipeline_workers or max(distributed.world_size, loader_workers),
+            world_size=distributed.world_size, rank=distributed.rank))
+        local_slots = max(loader.config.batch_size,
+                          test_loader.config.batch_size if test_loader is not None else 1,
+                          _rank_partition(int(training.get("sample_pipeline_slots", 512)),
+                                          world_size=distributed.world_size, rank=distributed.rank))
+        sources = {"train": SampleQueueSource(loader.config, sample_mode="random",
+                    sample_index_limit=sample_index_limit,
+                    defer_cuda_value_augmentation=cuda_value_augmentation)}
+        if test_loader is not None:
+            sources["test"] = SampleQueueSource(test_loader.config, sample_mode=test_sample_mode)
+        sample_queue = FiberTrace3DSampleQueue(
+            sources=sources, workers=local_workers, slot_count=local_slots,
+            initial_in_flight=min(local_slots, max(1, int(training.get("sample_pipeline_initial_in_flight", 16)))),
+            load_affinity_workers=max(0, local_workers // 2), profile=profile_loader)
+        index_map = bounded_index or VirtualBatchSampleIndex(
+            batch_size=loader.config.batch_size, physical_world_size=distributed.world_size,
+            rank=distributed.rank, virtual_world_size=optimizer_virtual_world_size, start_step=int(start_step))
+        queued_train = QueuedBatchView(sample_queue, "train", TrainingBatchIndices(
+            index_map, optimizer_microbatch_takes, pipeline_batch_count), limit=0)
+
+    def admit_training_until_test(completed_step):
+        if queued_train is not None:
+            next_test = ((completed_step // test_interval + 1) * test_interval
+                         if test_interval > 0 else max_steps)
+            queued_train.set_limit(min(pipeline_batch_count,
+                max(0, next_test - start_step) * optimizer_microbatch_count))
+
+    def queued_evaluation(indices, at_step):
+        batches = queued_test_batches(indices, batch_size=test_loader.config.batch_size,
+            sample_count=test_control_points, start_sample_index=test_start_sample_index)
+        if sample_queue is not None:
+            return QueuedBatchView(sample_queue, "test", batches)
+        return batch_source.test_batches(step=at_step, global_batch_indices=indices,
+            batch_size=test_loader.config.batch_size, sample_count=test_control_points,
+            start_sample_index=test_start_sample_index)
     best_metric = float((handoff_progress or {}).get("best_metric", math.inf))
     pending_test = (handoff_progress or {}).get("pending_test")
     cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
@@ -3201,6 +3297,8 @@ def training_units(
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
         try:
+            if batch_source is not None:
+                batch_source.begin_test(step)
             _diagnostic_cuda_synchronize(
                 diagnostics,
                 phase="test-entry-cuda-sync",
@@ -3209,16 +3307,17 @@ def training_units(
             )
             metric: float | None = None
             metric_name: str | None = None
-            captured_test_batches: dict[int, FiberTrace3DBatch] = {}
+            test_vis_due = test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0
+            test_sheets = pending_test.setdefault("visualization_sheets", []) if pending_test is not None else []
+            test_visualization = _ForwardVisualization(test_sample_vis_count, test_sheets)
             if test_loader is not None and test_interval > 0:
-                dense_iterator = iter(test_dataloader) if test_dataloader is not None else None
                 options = dict(
                     device=device, start_sample_index=test_start_sample_index,
                     sample_count=test_control_points, sample_mode=test_sample_mode,
                     direction_weight=direction_weight, presence_weight=presence_weight,
                     conditioned_loss_options=conditioned_loss_options, mixed_precision=mixed_precision,
                     diagnostics=diagnostics, diagnostic_step=step,
-                    captured_batches=captured_test_batches if distributed.is_main else None,
+                    prediction_observer=test_visualization if distributed.is_main and writer is not None and test_vis_due else None,
                 )
                 if physical_microbatch_sizes is not None:
                     if pending_test["step"] != step:
@@ -3230,14 +3329,27 @@ def training_units(
                         # One original logical group per rank is a bounded test
                         # unit. All completed rows survive repartition in RAM.
                         wave = remaining[start:start + distributed.world_size]
+                        capture_pending = test_vis_due and len(test_visualization.sheets) < test_sample_vis_count
                         indices = wave[distributed.rank:distributed.rank + 1]
-                        local_rows = _evaluate_dense_loss_rows(
-                            raw_model, test_loader, **options, global_batch_indices=indices,
-                            microbatch_size=loader.config.batch_size,
-                        )
+                        dense_iterator = queued_evaluation(indices, step)
+                        try:
+                            local_rows = _evaluate_dense_loss_rows(
+                                raw_model, test_loader, **options, global_batch_indices=indices,
+                                batch_iterator=dense_iterator,
+                                microbatch_size=min(loader.config.batch_size, evaluation_microbatch_size or loader.config.batch_size),
+                            )
+                        finally:
+                            dense_iterator.close()
                         rows = _distributed_gather_dense_test_rows(local_rows, distributed)
                         rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
                         pending_test["rows"].extend(rows)
+                        # Keep only small CPU images in every rank's handoff,
+                        # so resizing never needs to reload or re-infer samples.
+                        if capture_pending:
+                            sheets = _distributed_broadcast_object(
+                                test_visualization.sheets if distributed.is_main else None, distributed)
+                            pending_test["visualization_sheets"] = sheets
+                            test_visualization.sheets = sheets
                         elapsed = time.monotonic() - test_started
                         pending_test["elapsed"] += _distributed_broadcast_object(
                             elapsed if distributed.is_main else None, distributed)
@@ -3245,10 +3357,15 @@ def training_units(
                         test_started = time.monotonic()
                     gathered_rows = pending_test["rows"]
                 else:
-                    local_rows = _evaluate_dense_loss_rows(
-                        raw_model, test_loader, **options,
-                        global_batch_indices=test_batch_indices, batch_iterator=dense_iterator,
-                    )
+                    dense_iterator = queued_evaluation(test_batch_indices, step)
+                    try:
+                        local_rows = _evaluate_dense_loss_rows(
+                            raw_model, test_loader, **options,
+                            global_batch_indices=test_batch_indices, batch_iterator=dense_iterator,
+                            microbatch_size=evaluation_microbatch_size,
+                        )
+                    finally:
+                        dense_iterator.close()
                     gathered_rows = _distributed_gather_dense_test_rows(local_rows, distributed)
                 if distributed.is_main:
                     test_losses = _mean_dense_test_rows(gathered_rows)
@@ -3284,29 +3401,7 @@ def training_units(
                     and step % test_sample_vis_interval == 0
                     and (pending_test is None or not pending_test["dense_logged"])
                 ):
-                    vis_batch = captured_test_batches.get(0)
-                    if vis_batch is None and physical_microbatch_sizes is not None:
-                        # Reconfiguration may change the rank that evaluated
-                        # group zero. Reload its deterministic CPU samples only.
-                        vis_batch = test_loader.load_batch(test_start_sample_index,
-                            sample_mode=test_sample_mode, device=torch.device("cpu"))
-                    if vis_batch is None:
-                        raise RuntimeError("rank 0 did not retain global test batch 0 for visualization")
-                    diagnostics.marker("test-visualization-reuse-batch", step=step, batch=0)
-                    diagnostics.marker("test-visualization-forward-image-begin", step=step)
-                    _write_3d_sample_sheet(
-                        writer,
-                        "test_sample_3d/principal_slices",
-                        raw_model,
-                        vis_batch,
-                        step,
-                        sample_count=test_sample_vis_count,
-                        mixed_precision=mixed_precision,
-                        diagnostics=diagnostics,
-                        loader_config=(test_loader.config if physical_microbatch_sizes is not None else None),
-                        microbatch_size=(loader.config.batch_size if physical_microbatch_sizes is not None else None),
-                    )
-                    diagnostics.marker("test-visualization-forward-image-end", step=step)
+                    test_visualization.write(writer, "test_sample_3d/principal_slices", step)
             if pending_test is not None:
                 pending_test["dense_logged"] = True
             trace2cp_metric = None
@@ -3382,6 +3477,8 @@ def training_units(
                 step=step,
                 elapsed_s=f"{test_elapsed_seconds:.3f}",
             )
+            if batch_source is not None:
+                batch_source.end_test(step)
             return metric, metric_name
         finally:
             diagnostics.cancel_test_watchdog(step=step)
@@ -3398,6 +3495,8 @@ def training_units(
     except BaseException:
         # This can yield before the training prefetcher exists. Closing a
         # cohort here must still release its writer and process group.
+        if sample_queue is not None:
+            sample_queue.close()
         if writer is not None:
             writer.close()
         diagnostics.close()
@@ -3405,112 +3504,15 @@ def training_units(
         raise
     _distributed_barrier(distributed)
 
-    remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
-    pipeline_batch_count = (
-        1
-        if profile_replay_batch or profile_replay_cpu_batch
-        else (
-            None
-            if remaining_steps is None
-            else remaining_steps * optimizer_microbatch_count
-        )
-    )
-    sample_pipeline_workers = _training_sample_pipeline_workers(training)
-    if manual_gradient_sync and sample_pipeline_workers <= 0 and batch_source is None:
-        raise ValueError(
-            "optimizer_global_batch_size simulation requires "
-            "training.sample_pipeline_workers > 0"
-        )
-    if batch_source is not None:
-        if not bounded_accumulation:
-            raise ValueError("external canonical sample ownership requires bounded accumulation")
-        train_iterator = train_dataloader = batch_source
-    elif sample_pipeline_workers > 0 and (
-        pipeline_batch_count is None or int(pipeline_batch_count) > 0
-    ):
-        if pipeline_batch_count is None:
-            raise ValueError("sample_pipeline_workers requires training.max_steps")
-        local_workers = _rank_partition(
-            sample_pipeline_workers,
-            world_size=distributed.world_size,
-            rank=distributed.rank,
-        )
-        total_affinity = int(
-            training.get("sample_pipeline_load_affinity_workers", 0)
-        ) or int(round(sample_pipeline_workers * (87.0 / 128.0)))
-        local_affinity = _rank_partition(
-            total_affinity,
-            world_size=distributed.world_size,
-            rank=distributed.rank,
-        )
-        total_slots = int(training.get("sample_pipeline_slots", 512))
-        local_slots = _rank_partition(
-            total_slots,
-            world_size=distributed.world_size,
-            rank=distributed.rank,
-        )
-        total_initial = int(training.get("sample_pipeline_initial_in_flight", 16))
-        local_initial = max(
-            loader.config.batch_size,
-            _rank_partition(
-                total_initial,
-                world_size=distributed.world_size,
-                rank=distributed.rank,
-            ),
-        )
-        if local_workers < 2 or not 0 < local_affinity < local_workers:
-            raise ValueError(
-                "sample pipeline partition must leave loading and augmentation workers per rank"
-            )
-        if local_slots < loader.config.batch_size or local_slots % loader.config.batch_size:
-            raise ValueError(
-                "sample_pipeline_slots partition must be a positive multiple of batch_size"
-            )
-        training_sample_index_map = bounded_index or VirtualBatchSampleIndex(
-            batch_size=loader.config.batch_size,
-            physical_world_size=distributed.world_size,
-            rank=distributed.rank,
-            virtual_world_size=optimizer_virtual_world_size,
-            start_step=int(start_step),
-        )
-        train_iterator = FiberTrace3DTrainingBatchPipeline(
-            embedding_stride=loader_config.embedding.output_stride if loader_config.embedding.enabled else 0,
-            config_path=str(Path(config_path).resolve()),
-            index_map=training_sample_index_map,
-            batch_size=loader.config.batch_size,
-            patch_shape_zyx=loader.config.patch_shape_zyx,
-            batch_count=int(pipeline_batch_count),
-            workers=local_workers,
-            load_affinity_workers=local_affinity,
-            slot_count=local_slots,
-            initial_in_flight=local_initial,
-            sample_index_limit=sample_index_limit,
-            sample_mode="random",
-            profile=profile_loader,
-            defer_cuda_value_augmentation=cuda_value_augmentation,
-            batch_sizes=optimizer_microbatch_takes if bounded_accumulation else None,
-            single_core_load=physical_microbatch_sizes is not None,
-        )
-        train_dataloader = train_iterator
-    else:
-        train_dataloader = _make_batch_dataloader(
-            config_path,
-            raw_config=raw_config,
-            start_batch_index=(
-                start_step * optimizer_microbatch_count * distributed.world_size
-                + distributed.rank
-            ),
-            batch_index_stride=distributed.world_size,
-            batch_count=pipeline_batch_count,
-            sample_index_limit=sample_index_limit,
-            sample_mode="random",
-            profile=profile_loader,
-        )
-        train_iterator = iter(train_dataloader) if train_dataloader is not None else None
+    if batch_source is not None and not bounded_accumulation:
+        raise ValueError("external canonical sample ownership requires bounded accumulation")
+    train_iterator = train_dataloader = batch_source if batch_source is not None else queued_train
+    admit_training_until_test(start_step)
+
     cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
     if cuda_batch_depth > 0 and optimizer_microbatch_count > 0:
-        if not isinstance(train_iterator, FiberTrace3DTrainingBatchPipeline) and batch_source is None:
-            raise RuntimeError("CUDA batch preparation requires the shared sample pipeline")
+        if train_iterator is None:
+            raise RuntimeError("CUDA batch preparation requires a shared sample source")
         cuda_batch_pipeline = FiberTrace3DCudaBatchPipeline(
             train_iterator,
             config=loader.config,
@@ -3593,6 +3595,8 @@ def training_units(
                     torch.cuda.reset_peak_memory_stats(device)
                 throughput_started = time.perf_counter()
             profile.begin(step)
+            train_vis_due = sample_vis_interval > 0 and (step == 1 or step % sample_vis_interval == 0)
+            train_visualization = _ForwardVisualization(sample_vis_count) if writer is not None and train_vis_due else None
             console_metrics_due = _training_scalar_metrics_due(
                 step,
                 scalar_interval=scalar_interval,
@@ -3721,6 +3725,7 @@ def training_units(
                             train_model,
                             next_batch,
                             conditioned_loss_options=conditioned_loss_options,
+                            prediction_observer=train_visualization,
                         )
                     if component_accumulator is not None:
                         if scaler_enabled:
@@ -3881,32 +3886,8 @@ def training_units(
                 )
                 writer.add_scalar("timing/target_ms", target_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
-            train_vis_due = sample_vis_interval > 0 and (
-                step == 1 or step % sample_vis_interval == 0
-            )
-            if writer is not None and train_vis_due and physical_microbatch_sizes is not None:
-                # Select from canonical stream IDs, not whichever physical
-                # batch rank zero happened to receive. Reuse deterministic
-                # loading/augmentation for this infrequent CPU visualization.
-                vis_batch = collate_fiber_trace_3d_samples([
-                    loader.load_sample((step - 1) * optimizer_global_batch_size + offset,
-                        sample_index_limit=sample_index_limit, sample_mode="random", device="cpu")
-                    for offset in range(min(sample_vis_count, optimizer_global_batch_size))
-                ])
-                _write_3d_sample_sheet(writer, "train_sample_3d/principal_slices", raw_model,
-                    vis_batch, step, sample_count=sample_vis_count, mixed_precision=mixed_precision,
-                    loader_config=loader.config, microbatch_size=loader.config.batch_size)
-                del vis_batch
-            elif writer is not None and train_vis_due and batch is not None:
-                _write_3d_sample_sheet(
-                    writer,
-                    "train_sample_3d/principal_slices",
-                    raw_model,
-                    batch,
-                    step,
-                    sample_count=sample_vis_count,
-                    mixed_precision=mixed_precision,
-                )
+            if train_visualization is not None:
+                train_visualization.write(writer, "train_sample_3d/principal_slices", step)
             if train_vis_due:
                 _distributed_barrier(distributed)
 
@@ -3916,12 +3897,16 @@ def training_units(
             if test_due:
                 if cuda_batch_pipeline is not None:
                     cuda_batch_pipeline.pause()
+                if queued_train is not None:
+                    queued_train.release_current()
                 test_metric, test_metric_name = yield from run_configured_tests(step)
                 test_metric = _distributed_broadcast_object(test_metric, distributed)
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
 
             save_test_snapshots(step, test_metric, test_metric_name)
             pending_test = None
+            if test_due:
+                admit_training_until_test(step)
             if test_due and cuda_batch_pipeline is not None:
                 cuda_batch_pipeline.resume()
             profile_timings = {
@@ -4028,6 +4013,8 @@ def training_units(
                 _shutdown_dataloader_iterator(train_iterator)
                 train_iterator = None
                 train_dataloader = None
+            if sample_queue is not None:
+                sample_queue.close()
             if writer is not None:
                 writer.flush()
                 writer.close()
@@ -4971,78 +4958,33 @@ def _join_sample_sheets(sheets: list[np.ndarray]) -> np.ndarray:
     return out
 
 
-def _write_3d_sample_sheet(
-    writer: Any,
-    tag: str,
-    model: torch.nn.Module,
-    batch: FiberTrace3DBatch,
-    step: int,
-    *,
-    sample_count: int = 1,
-    mixed_precision: _MixedPrecisionConfig | None = None,
-    diagnostics: _TrainingHangDiagnostics | None = None,
-    loader_config: Any | None = None,
-    microbatch_size: int | None = None,
-) -> None:
-    was_training = bool(model.training)
-    model.eval()
-    take = min(max(1, int(sample_count)), int(batch.volume.shape[0]))
-    if microbatch_size is not None:
-        if type(microbatch_size) is not int or microbatch_size < 1 or loader_config is None:
-            raise ValueError("bounded visualization requires a positive microbatch and loader config")
-        # Render one sample at a time. The CPU contact sheet is small; never
-        # retain dense GPU outputs/targets for a whole logical test batch.
-        sheets = []
-        try:
-            for index in range(take):
-                physical = _slice_batch(batch, index, index + 1).to(next(model.parameters()).device)
-                physical = materialize_targets(physical, loader_config, output_stride=_model_output_stride(model))
-                with torch.no_grad(), _autocast_context(mixed_precision):
-                    if _model_uses_conditioned_decoder(model) and hasattr(model, "forward_recurrent_grouped"):
-                        output = model.forward_recurrent_grouped(physical.volume, steps=2)
-                    else:
-                        output = model(physical.volume)
-                sheets.append(_make_train_sample_3d_sheet(physical, output.float()))
-                del physical, output
-            writer.add_image(tag, _join_sample_sheets(sheets), int(step), dataformats="HWC")
-        finally:
-            model.train(was_training)
-        return
-    with torch.no_grad():
-        with _autocast_context(mixed_precision):
-            if _model_uses_conditioned_decoder(model) and hasattr(
-                model,
-                "forward_recurrent_grouped",
-            ):
-                vis_output = model.forward_recurrent_grouped(batch.volume[:take], steps=2)
-            else:
-                vis_output = model(batch.volume[:take])
-        vis_output = vis_output.float()
-    if diagnostics is not None:
-        diagnostics.marker("sample-sheet-forward-complete", step=step, tag=tag)
-    _diagnostic_cuda_synchronize(
-        diagnostics,
-        phase="sample-sheet-cuda-sync",
-        step=step,
-        device=batch.volume.device,
-        tag=tag,
-    )
-    if was_training:
-        model.train()
-    if diagnostics is not None:
-        diagnostics.marker("sample-sheet-render-begin", step=step, tag=tag)
-    sheet = _make_train_sample_3d_contact_sheet(batch, vis_output, sample_count=take)
-    if diagnostics is not None:
-        diagnostics.marker("sample-sheet-render-end", step=step, tag=tag)
-        diagnostics.marker("sample-sheet-add-image-begin", step=step, tag=tag)
-    writer.add_image(
-        tag,
-        sheet,
-        int(step),
-        dataformats="HWC",
-    )
-    if diagnostics is not None:
-        diagnostics.marker("sample-sheet-add-image-end", step=step, tag=tag)
+class _ForwardVisualization:
+    """Render a bounded set of actual loss-forward samples; retain CPU images only."""
+
+    def __init__(self, sample_count, sheets=None):
+        self.sample_count = max(0, int(sample_count))
+        self.sheets = [] if sheets is None else sheets
+
+    @torch.no_grad()
+    def __call__(self, batch, output):
+        remaining = self.sample_count - len(self.sheets)
+        with torch.autocast(device_type=output.device.type, enabled=False):
+            for index in range(min(max(0, remaining), int(batch.volume.shape[0]))):
+                physical = _slice_batch(batch, index, index + 1)
+                self.sheets.append(torch.from_numpy(_make_train_sample_3d_sheet(
+                    physical, output[index:index + 1].detach().float())))
+
+    def write(self, writer, tag, step):
+        if self.sheets:
+            writer.add_image(tag, _join_sample_sheets([np.asarray(sheet) for sheet in self.sheets]),
+                             int(step), dataformats="HWC")
+
+
+def _write_3d_sample_sheet(writer, tag, batch, output, step, *, sample_count=1):
+    """Render supplied predictions; never load, augment, or call a model."""
+    capture = _ForwardVisualization(sample_count)
+    capture(batch, output)
+    capture.write(writer, tag, step)
 
 
 def _draw_trace2cp_3d_panel(
