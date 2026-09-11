@@ -73,15 +73,16 @@ def _unlink(name):
 class _Channel:
     """Nonblocking, bounded framing. poll/recv never waits for a full frame."""
 
-    def __init__(self, sock):
+    def __init__(self, sock, *, max_frame=MAX_FRAME):
         self.socket = sock
+        self.max_frame = max_frame
         sock.setblocking(False)
         self.input = bytearray()
         self.output = bytearray()
 
     def send(self, kind, payload=None):
-        frame = encode(dict(kind=kind, payload=payload))
-        if len(self.output) + len(frame) > MAX_FRAME:
+        frame = encode(dict(kind=kind, payload=payload), max_frame=self.max_frame)
+        if len(self.output) + len(frame) > self.max_frame:
             raise RuntimeError("cohort control output exceeds bound")
         self.output.extend(frame)
 
@@ -102,13 +103,13 @@ class _Channel:
                 self.input.extend(data)
             except BlockingIOError:
                 pass
-        if len(self.input) > MAX_FRAME:
+        if len(self.input) > self.max_frame:
             raise RuntimeError("cohort control input exceeds bound")
         if b"\n" not in self.input:
             return None
         frame, _, rest = self.input.partition(b"\n")
         self.input = bytearray(rest)
-        value = decode(frame)
+        value = decode(frame, max_frame=self.max_frame)
         if set(value) != {"kind", "payload"}:
             raise RuntimeError("invalid cohort control message")
         return value["kind"], value["payload"]

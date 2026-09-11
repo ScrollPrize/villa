@@ -52,8 +52,8 @@ def _pairs(items):
     return result
 
 
-def decode(frame):
-    require(len(frame) <= MAX_FRAME, "frame exceeds 1 MiB", "frame_too_large")
+def decode(frame, *, max_frame=MAX_FRAME):
+    require(len(frame) <= max_frame, "frame exceeds size bound", "frame_too_large")
     try:
         def finite_float(text):
             number = float(text)
@@ -69,7 +69,7 @@ def decode(frame):
     return value
 
 
-def encode(value):
+def encode(value, *, max_frame=MAX_FRAME):
     data = json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True).encode() + b"\n"
-    require(len(data) - 1 <= MAX_FRAME, "frame exceeds 1 MiB", "frame_too_large")
+    require(len(data) - 1 <= max_frame, "frame exceeds size bound", "frame_too_large")
     return data

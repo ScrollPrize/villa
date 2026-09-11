@@ -45,6 +45,14 @@ class Engine:
                 task.setdefault("fixed_allocation", None)
                 if task["terminal"]:
                     continue
+                if task["granted"] == empty() and task["held"] == empty():
+                    # The journal already records completed release. There is
+                    # no ownership to reconfirm, including after an older
+                    # manager left an empty task stuck in recovery's release.
+                    if task["phase"] != "waiting":
+                        task["phase"] = "waiting"
+                        task["reason"] = "server_restart"
+                    continue
                 if not task["pausable"]:
                     # Restart cannot revoke a non-preemptible ownership promise.
                     continue
@@ -161,6 +169,10 @@ class Engine:
         if cached:
             require(encode(cached["request"]) == encode(request), "request ID reused with different contents", "conflict")
             return copy.deepcopy(cached["response"])
+        if op in ("poll", "status"):
+            # Read paths never traverse/copy the historical transaction ledger.
+            # Policy is reconciled by mutations and observations, not polling.
+            return self._operate(op, body, uid)
         previous = copy.deepcopy(self.state)
         try:
             response = self._operate(op, body, uid)
@@ -259,10 +271,12 @@ class Engine:
         fields(body, ("task_id",) + allowed[op], ("token",))
         task = self._authorize(body, uid, controller=op in ("set_request", "set_paused"))
         require(not task["terminal"], "task is terminal", "terminal")
-        task["last_contact_ms"] = int(time.time() * 1000)
         if op == "poll":
             integer(body["last_generation"])
-        elif op == "set_request":
+            task["last_contact_ms"] = int(time.time() * 1000)
+            return {"task": self._public(task)}
+        task["last_contact_ms"] = int(time.time() * 1000)
+        if op == "set_request":
             integer(body["expected_request_revision"])
             require(body["expected_request_revision"] == task["request_revision"], "stale request revision", "conflict")
             validate_request(body["request"], self.inventory)

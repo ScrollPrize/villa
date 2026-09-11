@@ -201,6 +201,27 @@ def test_recovery_preserves_pause_requests_and_reservations():
     assert t["phase"] == "waiting" and t["granted"] == empty()
 
 
+@pytest.mark.parametrize("old_phase", ["waiting", "release"])
+@pytest.mark.parametrize("paused", [False, True])
+def test_recovery_empty_allocation_needs_no_release_report(old_phase, paused):
+    e = engine()
+    a = register(e)
+    report(e, a, "applied")
+    task_call(e, a, "set_paused", paused=True, scope="controller")
+    report(e, a, "released", empty())
+    old = e.tasks[a["task"]["task_id"]]
+    old["phase"] = old_phase  # Includes journals stuck by the old recovery bug.
+    old["paused"]["controller"] = paused
+    restored = engine(e.state)
+    t = restored.tasks[a["task"]["task_id"]]
+    assert t["phase"] == "waiting"
+    assert t["granted"] == t["held"] == empty()
+    restored.scan_processes()
+    assert t["phase"] == ("waiting" if paused else "initialize")
+    task_call(restored, a, "set_paused", paused=False, scope="controller")
+    assert t["phase"] == "initialize" and t["granted"] == POOL
+
+
 def test_dead_root_not_enough_to_reclaim():
     e = engine()
     a = register(e)

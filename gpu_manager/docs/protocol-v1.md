@@ -151,8 +151,9 @@ No further protocol changes are authorized by this amendment.
 Non-pausable clients can keep working under their existing grant on server loss;
 reconnect/register/poll preserves its generation and phase. Never initialize a
 duplicate workload on reconnect or interpret disconnection as release. The
-reference `Supervisor` remains fully pausable/adaptable (as used by Fiber).
-Non-pausable workflows use the low-level `Client`.
+reference `Supervisor` supports both capability modes, including exclusive
+non-pausable startup calibration. It never creates or authorizes new workers
+offline, so a calibration cohort restart waits for restored communication.
 
 ## Retries, recovery and bounds
 
@@ -166,7 +167,9 @@ guess whether a grant exists. Never reuse a completed task UUID.
 
 On restart the epoch changes, dedup replies are discarded, and active reservations
 are retained with a new release directive. Reconnect via hello and register using
-the retained token. Old-epoch mutations fail. Before regrant, the client releases
+the retained token. A task with both journaled granted and held allocations empty
+has no active reservation and recovers to waiting, retaining its pause flags,
+without requiring a release report. Old-epoch mutations fail. Before regrant, the client releases
 old workers or the server verifies the entire known process tree is dead. EOF and
 missing heartbeat are not death. A root that dies while descendants survive stays
 reserved. PID discovery defaults to every 60 seconds; clients must not detach
@@ -179,8 +182,22 @@ their storage grows with lifetime task count (roughly 40 bytes/task), not GPU da
 Status pages are ordered by registration sequence and are a live view, not an
 atomic multi-page snapshot. The reference client's status() collects all pages.
 
-On server loss clients unload at the next safe boundary, retain CPU state and
-reconnect; they must not continue indefinitely under an unverifiable grant.
+### User-authorized communication grace (2026-09-11)
+
+No wire fields or allocation/release rules change. Pausable clients may continue
+already-authorized work for a bounded communication grace period (Fiber:60s from
+the first failed task exchange), logging actual exceptions and retrying (Fiber:5s
+after a failed attempt). Successful hello alone does not reset the deadline.
+At expiry they stop admitting work, unload at the next safe boundary, retain CPU
+state and reconnect. They must not continue indefinitely under an unverifiable
+grant. The generic Supervisor default remains immediate safe-boundary drain.
+Exclusive non-pausable calibration may finish its current authorized cohort
+without an outage deadline. Stop, known release directives and observed epoch
+changes override grace immediately. No new workers are initialized or authorized
+offline. Reconnection uses the same task/token and validates the allocation;
+after a drain, join and release/regrant precede automatic resume. Transient
+transport failure is not task termination and never releases reservations.
+
 Socket locks prevent concurrent servers; missing/corrupt journal with an existing
 initialized lock fails closed. Inventory changes require explicit reconciliation,
 not replacing the journal with an empty one.

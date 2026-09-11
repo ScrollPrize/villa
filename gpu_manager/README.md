@@ -31,6 +31,22 @@ No installer or GPU service is automatically started by importing the package.
 Linux/macOS Unix sockets are supported; NVIDIA inventory monitoring requires
 `nvidia-smi`. Tests use fake inventories and do not allocate GPUs.
 
+## Service responsiveness
+
+The production CLI separates socket multiplexing, policy/journal ownership, and
+process-table collection into three OS processes (not Python worker threads).
+One collected PID/parent table is reused across all task trees. Read-only polls
+do not copy historical state or recalculate allocations. The state owner retains
+the singleton lock even if the socket process crashes; recovery cannot race an
+old journal writer. Wire protocol and resource-release verification are unchanged.
+
+Slow collection does not block poll/status replies. Durable mutations still wait
+for journal writes, and policy work remains serialized in its owning process:
+this is not a guarantee against arbitrarily slow storage or policy computation.
+See [measurements and tests](docs/responsive-service-validation.md).
+Already-running managers retain their loaded implementation; deploying this
+change requires a controlled service restart, not deletion of its journal.
+
 ## Operator commands
 
 Python tasks may call `villa_gpu_manager.bootstrap.ensure_manager()` to reuse an
@@ -109,6 +125,10 @@ The service journals ownership beside the socket (`.json`), protected by a
 separate `.lock`. Never delete these files while clients might still hold GPUs.
 Restart with the same inventory; surviving clients must release before receiving
 a fresh grant, except declared non-pausable clients whose grants remain intact.
+Tasks whose journal already records both granted and held allocations as empty
+recover directly to waiting, preserving pause flags; they need no additional
+release acknowledgement. This also repairs empty tasks left in release by the
+older recovery implementation.
 Missing/corrupt recovery state fails closed rather than assuming
 the GPUs are free. Unknown/inaccessible process state remains reserved.
 

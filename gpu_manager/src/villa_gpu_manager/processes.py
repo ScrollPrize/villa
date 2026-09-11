@@ -127,7 +127,7 @@ class NvidiaMonitor:
                 try:
                     if self.process.returncode != 0:
                         raise ValueError("driver query failed")
-                    self.blocked = self.parse(bytes(self.buffer), owned_pids)
+                    self.blocked = self.parse(bytes(self.buffer), owned_pids() if callable(owned_pids) else owned_pids)
                 except (ValueError, ET.ParseError, TypeError):
                     self.blocked = set(self.inventory["gpus"])
                 self.process.stdout.close()
