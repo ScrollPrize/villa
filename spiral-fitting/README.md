@@ -49,10 +49,12 @@ specifically):
 
 ## Fitting a scroll that ships only tracks (the 2025-2026 scans)
 
-The spiral datasets published for the 2025-2026 scans (`dl.ash2txt.org/datasets/spiral_datasets/<scroll>/<volume>/`)
-contain a `tracks/` directory and nothing else: no `umbilicus.json`, no `outer_shell/`, no patches, no
-`lasagna_inputs/`. The headless fitter still needs three more things. This is the layout that worked for
-PHerc0125, PHerc0826, PHerc0211 and PHerc0358 (30,000-step fits on one RTX 3090 under WSL2):
+The spiral datasets published for the 2025-2026 scans
+(`dl.ash2txt.org/datasets/spiral_datasets/<scroll>/<volume>/`) contain a
+`tracks/` directory and nothing else: no `umbilicus.json`, no `outer_shell/`,
+no patches, no `lasagna_inputs/`. The headless fitter still needs three more
+things. This is the layout that worked for PHerc0125, PHerc0826, PHerc0211 and
+PHerc0358 (30,000-step fits on one RTX 3090 under WSL2):
 
 ```
 <dataset>/
@@ -67,26 +69,33 @@ PHerc0125, PHerc0826, PHerc0211 and PHerc0358 (30,000-step fits on one RTX 3090 
 ```
 
 **Umbilicus.** The open-data bucket publishes one for some scrolls under
-`<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json` (PHerc0125, PHerc0139, PHerc0211, PHerc0332
-and PHerc0826 at the time of writing; PHerc0139's is annotated on a different scan from its only surface store).
-For the others, `estimate_umbilicus.py` derives control points from the organizers' surface
-prediction: at each of N heights it takes the largest connected component of the sheet mask at pyramid level 3,
-fills it, and takes as the core the point of the distance-to-boundary plateau (within 0.9 of the maximum) nearest
-the centroid of the component. `core=argmax` selects the previous behaviour, the plain argmax of the distance
-transform, and reproduces files written before that option existed byte for byte. The plateau rule exists because
-the distance transform is nearly flat over a wide region, so its argmax picks one pixel out of many almost equal
-ones and jumps between lobes of the section from one slice to the next.
+`<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json`
+(PHerc0125, PHerc0139, PHerc0211, PHerc0332 and PHerc0826 at the time of
+writing; PHerc0139's is annotated on a different scan from its only surface
+store). For the others, `estimate_umbilicus.py` derives control points from
+the organizers' surface prediction: at each of N heights it takes the largest
+connected component of the sheet mask at pyramid level 3, fills it, and takes
+as the core the point of the distance-to-boundary plateau (within 0.9 of the
+maximum) nearest the centroid of the component. `core=argmax` selects the
+previous behaviour, the plain argmax of the distance transform, and reproduces
+files written before that option existed byte for byte. The plateau rule
+exists because the distance transform is nearly flat over a wide region, so
+its argmax picks one pixel out of many almost equal ones and jumps between
+lobes of the section from one slice to the next.
 
-Measured against the published PHerc0125 umbilicus at the default `n_z=12`, over the 75 published control points
-inside the estimate's z coverage: plateau 0.1-6.5 mm (median 2.2), argmax 0.5-11.0 mm (median 3.0), with the
-plateau point closer at 57 of the 75. Most of the gain is in the worst cases rather than the median, which is what
-the lobe jumping predicts. Those 75 points fall in 11 intervals between estimate knots and are not independent, so
-treat a paired test across them as indicative rather than as a p-value.
+Measured against the published PHerc0125 umbilicus at the default `n_z=12`,
+over the 75 published control points inside the estimate's z coverage: plateau
+0.1-6.5 mm (median 2.2), argmax 0.5-11.0 mm (median 3.0), with the plateau
+point closer at 57 of the 75. Most of the gain is in the worst cases rather
+than the median, which is what the lobe jumping predicts. Those 75 points fall
+in 11 intervals between estimate knots and are not independent, so treat a
+paired test across them as indicative rather than as a p-value.
 
-A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100 windings, 30,000 steps) ended with 50% of track
-points satisfied, against 12-38% for the three scrolls fitted from published umbilici, so the estimate is good
-enough for the tracks to pull the spiral into place, but it is a starting point for the fit rather than a
-substitute for a published umbilicus.
+A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100 windings,
+30,000 steps) ended with 50% of track points satisfied, against 12-38% for the
+three scrolls fitted from published umbilici, so the estimate is good enough
+for the tracks to pull the spiral into place, but it is a starting point for
+the fit rather than a substitute for a published umbilicus.
 
 ```sh
 python estimate_umbilicus.py PHerc0358 \
@@ -95,14 +104,17 @@ python estimate_umbilicus.py PHerc0358 \
 ```
 
 **Lasagna inputs.** The normal fields live at
-`<scroll>/representations/predictions/lasagna/<volume>-lasagna-<run>/<scroll>_{nx,ny,grad_mag}.ome.zarr`; for
-these scrolls group `"2"` is a 4x downsample, so `spiral-scroll.json` needs `"normal_zarr_group": "2"` and
-`"lasagna_scale": 4`. The fitter only reads the z-window it optimises, so copying the chunks for
-`[z_begin/4 - 50, z_end/4 + 50)` of each store into `lasagna_inputs/las_008_<name>.ome.zarr/2` (keeping the
-chunk grid and the store's `.zattrs`/`.zarray`) is enough; a 1,500-slice band is about 2 GB for the three stores.
+`<scroll>/representations/predictions/lasagna/<volume>-lasagna-<run>/<scroll>_{nx,ny,grad_mag}.ome.zarr`;
+for these scrolls group `"2"` is a 4x downsample, so `spiral-scroll.json`
+needs `"normal_zarr_group": "2"` and `"lasagna_scale": 4`. The fitter only
+reads the z-window it optimises, so copying the chunks for `[z_begin/4 - 50,
+z_end/4 + 50)` of each store into `lasagna_inputs/las_008_<name>.ome.zarr/2`
+(keeping the chunk grid and the store's `.zattrs`/`.zarray`) is enough; a
+1,500-slice band is about 2 GB for the three stores.
 
-**Configuration.** The headless CLI takes configuration overrides as JSON in the `FIT_SPIRAL_CONFIG_OVERRIDES`
-environment variable and the output root in `FIT_SPIRAL_OUT_DIR`. With tracks only, the switches that matter are:
+**Configuration.** The headless CLI takes configuration overrides as JSON in
+the `FIT_SPIRAL_CONFIG_OVERRIDES` environment variable and the output root in
+`FIT_SPIRAL_OUT_DIR`. With tracks only, the switches that matter are:
 
 ```sh
 export FIT_SPIRAL_OUT_DIR=/path/to/out
@@ -117,16 +129,19 @@ export FIT_SPIRAL_CONFIG_OVERRIDES='{
 python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
 ```
 
-- `input_use_tracks` defaults to `false`; without it the fit silently optimises against the umbilicus and the
-  normals only.
-- The two shell-loss weights must be `0` because there is no outer shell (the winding model needs one too, so
-  `dense_spacing_mode` cannot be `winding_model`); `phase` spacing needs a surf-SDT store these datasets do not
-  have, hence `grad_mag` with weight `0`.
-- `shell_outer_winding_idx` and `model_gap_expander_num_windings` default to 130, which is Scroll 1's winding
-  count. The exporter writes windings `[output_first_winding, shell_outer_winding_idx)`, so leaving 130 on a
-  60-winding scroll exports dozens of windings that lie outside the papyrus. Set both to a little above the
-  scroll's own count. Counting sheet crossings along radial rays through the organizers' surface prediction at
-  three heights (`winding_counts.py`) gives:
+- `input_use_tracks` defaults to `false`; without it the fit silently
+  optimises against the umbilicus and the normals only.
+- The two shell-loss weights must be `0` because there is no outer shell (the
+  winding model needs one too, so `dense_spacing_mode` cannot be
+  `winding_model`); `phase` spacing needs a surf-SDT store these datasets do
+  not have, hence `grad_mag` with weight `0`.
+- `shell_outer_winding_idx` and `model_gap_expander_num_windings` default to
+  130, which is Scroll 1's winding count. The exporter writes windings
+  `[output_first_winding, shell_outer_winding_idx)`, so leaving 130 on a
+  60-winding scroll exports dozens of windings that lie outside the papyrus.
+  Set both to a little above the scroll's own count. Counting sheet crossings
+  along radial rays through the organizers' surface prediction at three
+  heights (`winding_counts.py`) gives:
 
   | scroll | median crossings per ray (three heights) | used |
   |---|---|---|
@@ -139,13 +154,15 @@ python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
   | PHerc0813 | 72-79 | |
   | PHerc0800 | 79-88 | |
   | PHerc0268 | 86-101 | |
+The count is a lower bound where sheets are pressed together, so the value
+  used should sit above the range.
 
-  The count is a lower bound where sheets are pressed together, so the value used should sit above the range.
-
-**What to expect.** A 1,500-slice band runs at 7-8 it/s on an RTX 3090 (about 70 minutes for 30,000 steps) and
-reports 12-18% satisfied track points at the end. Meshes are written to
-`<out>/<date>_<scroll>_slice-<z_begin>-<z_end>_0-patch/meshes/fitted/w<NNN>` as tifxyz at scale 0.05. Fits with
-tracks and no outer shell need #1732 (or `"input_use_outer_shell": false`); a truncated `crossings.npz` from an
+**What to expect.** A 1,500-slice band runs at 7-8 it/s on an RTX 3090 (about
+70 minutes for 30,000 steps) and reports 12-18% satisfied track points at the
+end. Meshes are written to
+`<out>/<date>_<scroll>_slice-<z_begin>-<z_end>_0-patch/meshes/fitted/w<NNN>`
+as tifxyz at scale 0.05. Fits with tracks and no outer shell need #1732 (or
+`"input_use_outer_shell": false`); a truncated `crossings.npz` from an
 interrupted download needs #1735 (or delete the file so it is rebuilt).
 
 ## Sweep runner output
@@ -210,7 +227,8 @@ the session at different host paths.
 ### Creating the Spiral Python environment
 
 The service host needs the Spiral environment (a CUDA-capable PyTorch plus the
-dependencies in `pyproject.toml`, Python ≥ 3.14). With [uv](https://docs.astral.sh/uv/):
+dependencies in `pyproject.toml`, Python ≥ 3.14). With
+[uv](https://docs.astral.sh/uv/):
 
 ```sh
 cd spiral-fitting
@@ -222,14 +240,14 @@ This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.surface_index`. OpenMP is used when the toolchain provides it; the
 same modules build with serial kernels when it does not.
 
-or with conda/pip, install `torch` for your CUDA version and then
-`pip install -e .` from `spiral-fitting/`.
+or with conda/pip, install `torch` for your CUDA version and then `pip install
+-e .` from `spiral-fitting/`.
 
 ### Resident sparse field pools
 
-Normals, gradient magnitude, and surf-SDT samples are served by fully
-resident device brick pools. Each store's occupied bricks are packed once
-into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
+Normals, gradient magnitude, and surf-SDT samples are served by fully resident
+device brick pools. Each store's occupied bricks are packed once into a flat
+sidecar next to the source zarr by `pack_resident_pools.py`:
 
 ```sh
 python pack_resident_pools.py /path/to/lasagna_inputs \
@@ -237,16 +255,15 @@ python pack_resident_pools.py /path/to/lasagna_inputs \
 ```
 
 `--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
-scroll) so those bricks drop out of the pool and sample as no-data. The
-fitter loads the sidecars restricted to the configured z-ROI in one
-sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
-normals); after that every gather is pure device indexing with no I/O and no
-eviction. When a required sidecar is missing, the fitter builds it before GPU
-loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
-prepacking with `--ct` remains useful because the CT mask can substantially
-reduce the resident pool size.
-Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
-assertions when debugging new sampling code.
+scroll) so those bricks drop out of the pool and sample as no-data. The fitter
+loads the sidecars restricted to the configured z-ROI in one sequential read
+per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB normals); after that
+every gather is pure device indexing with no I/O and no eviction. When a
+required sidecar is missing, the fitter builds it before GPU loading and
+reports chunk progress. In DDP runs only rank 0 builds it. Manual prepacking
+with `--ct` remains useful because the CT mask can substantially reduce the
+resident pool size. Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable
+per-gather bounds assertions when debugging new sampling code.
 
 ### Internet flow (SSH attach)
 
@@ -265,17 +282,18 @@ tmux new -s spiral-bob 'python spiral_service.py --port 8766 \
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
-device or enable distributed fitting across several GPUs with a comma-separated
-host-side list:
+device or enable distributed fitting across several GPUs with a
+comma-separated host-side list:
 
 ```sh
 python spiral_service.py --port 8765 \
     --dataset /data/scrolls/s1 --output /data/spiral-output/s1 --gpus 0,1,2,3
 ```
 
-Multi-GPU sessions run one fitter rank per listed device and split the configured
-per-step sample counts across those ranks by default. The device list is fixed for
-the lifetime of the service; restart it to change the selection.
+Multi-GPU sessions run one fitter rank per listed device and split the
+configured per-step sample counts across those ranks by default. The device
+list is fixed for the lifetime of the service; restart it to change the
+selection.
 
 A named service writes autosaves, previews, artifacts, uploaded checkpoints,
 Lasagna output, and ephemeral inputs beneath `<output>/<session-name>/`, held
@@ -286,13 +304,13 @@ nothing generated is ever written under the dataset root.
 
 Every completed Spiral preview is flattened by the host's Lasagna service
 before it becomes downloadable in VC3D. The published grid uses a fixed
-20-voxel output step: each dimension is
-`ceil(((source_points - 1) * source_step) / 20) + 1`. Winding membership,
-loss-map overlays, and run differences are transferred through Lasagna's
-output-to-source correspondence so they remain aligned when the output grid
-dimensions differ from the Spiral grid. If flattening or artifact mapping
-fails, the service reports the publication error and VC3D keeps displaying the
-previous successfully published preview.
+20-voxel output step: each dimension is `ceil(((source_points - 1) *
+source_step) / 20) + 1`. Winding membership, loss-map overlays, and run
+differences are transferred through Lasagna's output-to-source correspondence
+so they remain aligned when the output grid dimensions differ from the Spiral
+grid. If flattening or artifact mapping fails, the service reports the
+publication error and VC3D keeps displaying the previous successfully
+published preview.
 
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
@@ -312,11 +330,11 @@ preview stage with elapsed time. Stages with a real work total also show a
 counter and ETA; opaque native or CUDA operations deliberately use an
 indeterminate bar instead of a guessed overall percentage. The same stage
 updates are printed by standalone `fit_spiral.py`, with periodic elapsed-time
-heartbeats when output is captured to a log.
-While connected, the circular-arrow button beside the connection controls
-restarts the remote service and reconnects automatically. The service replaces
-its own process in place, so a containing `tmux` session remains alive and an
-attached terminal is not disconnected.
+heartbeats when output is captured to a log. While connected, the
+circular-arrow button beside the connection controls restarts the remote
+service and reconnects automatically. The service replaces its own process in
+place, so a containing `tmux` session remains alive and an attached terminal
+is not disconnected.
 
 ### Trusted-LAN flow (direct HTTP)
 
@@ -377,14 +395,13 @@ values. Connection must succeed (an authenticated `/health` handshake and an
 API-version check) before session controls enable. The base-input rows always
 populate read-only from the service's advertised dataset resolution; run
 parameters (z range, iterations, advanced config) stay editable and persist
-per profile. Generated previews, geometry, and
-checkpoints transfer through the artifact API into a local cache — no shared
-filesystem is needed. Optional: set the profile's **Local dataset path** if
-this machine mounts the same dataset, so input surface overlays
-(verified/unverified/shell) can be displayed locally. It is assumed to
-correspond to the dataset root the service advertises, which is the prefix
-service paths are translated from; without it those overlays are simply marked
-unavailable.
+per profile. Generated previews, geometry, and checkpoints transfer through
+the artifact API into a local cache — no shared filesystem is needed.
+Optional: set the profile's **Local dataset path** if this machine mounts the
+same dataset, so input surface overlays (verified/unverified/shell) can be
+displayed locally. It is assumed to correspond to the dataset root the service
+advertises, which is the prefix service paths are translated from; without it
+those overlays are simply marked unavailable.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
 name and voxel resolution and of the Lasagna store layout (zarr groups,
@@ -446,15 +463,16 @@ configuration carried by that checkpoint. *Initialize Fit* is the separate
 from-scratch action.
 
 With an existing fit, *Load* replaces the resident model's weights, optimiser
-and RNG state in place. When the checkpoint does not match the live model the service refuses
-it and says what a rebuild would have to replace: rebuilding the **model only**
-keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and discards added inputs that
-were never committed. The panel reports the reasons and asks; a checkpoint no
-rebuild can accept — one written against another dataset, or against a
-configuration schema this service does not have — is reported and nothing is
-offered. A checkpoint-backed session takes its durable configuration from the
-checkpoint, so the local advanced-config profile does not override it.
+and RNG state in place. When the checkpoint does not match the live model the
+service refuses it and says what a rebuild would have to replace: rebuilding
+the **model only** keeps the loaded dataset inputs and everything already
+added to the fit, while a **whole-fit** rebuild re-reads the dataset and
+discards added inputs that were never committed. The panel reports the reasons
+and asks; a checkpoint no rebuild can accept — one written against another
+dataset, or against a configuration schema this service does not have — is
+reported and nothing is offered. A checkpoint-backed session takes its durable
+configuration from the checkpoint, so the local advanced-config profile does
+not override it.
 
 The Iterations value on *Run* is a count added to the checkpoint's durable
 iteration. The progress bar is local to that run and therefore starts at zero;
@@ -471,9 +489,9 @@ it tears the fit session down at a safe boundary. Logs go to the service's
 stdout/stderr on the host — for a `tmux` session, `tmux attach -t spiral`; for
 an unowned service VC3D's Python-output dialog only reminds you of this. A
 service started on an explicit port can be restarted immediately (the socket
-uses `SO_REUSEADDR`). VC3D's remote restart control does not run
-`tmux kill-session`; it gracefully closes the fit and re-executes the service
-with the same interpreter, arguments, and process ID. Note that a large artifact
+uses `SO_REUSEADDR`). VC3D's remote restart control does not run `tmux
+kill-session`; it gracefully closes the fit and re-executes the service with
+the same interpreter, arguments, and process ID. Note that a large artifact
 download during a running fit competes with the fitter for the Python
 interpreter and can slow iterations somewhat.
 
@@ -516,22 +534,24 @@ python convert_track_store.py \
 ```
 
 This writes `2um_ds2_ps256_surf_v2.dbm.vctracks/` atomically. The directory
-contains contiguous coordinates, ragged offsets, source IDs, family codes,
-Z bounds, arclengths, and tortuosities. `fit_spiral.py` automatically prefers
-a current adjacent packed store while retaining the DBM as the authoritative
+contains contiguous coordinates, ragged offsets, source IDs, family codes, Z
+bounds, arclengths, and tortuosities. `fit_spiral.py` automatically prefers a
+current adjacent packed store while retaining the DBM as the authoritative
 source and compatibility fallback. A source-file fingerprint prevents a stale
-store from being used after the DBM changes; rerun with `--force` to replace it.
+store from being used after the DBM changes; rerun with `--force` to replace
+it.
 
-The native `vc_spiral.track_store` loader memory-maps the packed files, applies the Z
-ROI from per-track metadata, and emits one compact float32 ragged array without
-constructing per-track Python objects. The crossing builder also stages
-directly from a current packed store, bypassing DBM and pickle decoding.
+The native `vc_spiral.track_store` loader memory-maps the packed files,
+applies the Z ROI from per-track metadata, and emits one compact float32
+ragged array without constructing per-track Python objects. The crossing
+builder also stages directly from a current packed store, bypassing DBM and
+pickle decoding.
 
 ## Caching exact track crossings
 
 Crossing-connected track sampling needs the exact shared voxels between the
-horizontal and vertical track families. Build that index once as a CSR
-sidecar instead of sorting every track point whenever a fit session loads:
+horizontal and vertical track families. Build that index once as a CSR sidecar
+instead of sorting every track point whenever a fit session loads:
 
 ```sh
 python build_track_crossings.py \
@@ -551,24 +571,23 @@ extension is built with the other Spiral native modules by `uv sync` from this
 directory. A slower Python fallback remains available.
 
 The builder needs roughly 20 bytes of temporary disk space per selected point.
-The native radix sort temporarily holds about 32 RAM bytes per point; after the
-sort, those arrays are released before the 8-byte-per-point arclength vector and
-compact 16-byte crossing events are consolidated. This avoids retaining either
-the selected track database or Python dictionaries of crossing pairs in RAM.
-Temporary files are removed after the sidecar is written. Without `--temp-dir`,
-the temporary workspace is created beside the tracks DBM rather than under the
-system temporary directory.
+The native radix sort temporarily holds about 32 RAM bytes per point; after
+the sort, those arrays are released before the 8-byte-per-point arclength
+vector and compact 16-byte crossing events are consolidated. This avoids
+retaining either the selected track database or Python dictionaries of
+crossing pairs in RAM. Temporary files are removed after the sidecar is
+written. Without `--temp-dir`, the temporary workspace is created beside the
+tracks DBM rather than under the system temporary directory.
 
-The script writes
-`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically.
-`fit_spiral.py` finds it automatically from the configured tracks path. The
-sidecar includes a fingerprint of every DBM backing file; a stale or malformed
-file is ignored and the fitter falls back to its in-memory exact crossing
-scan. Re-run the builder after changing the DBM (`--force` replaces a current
-cache). A range-limited sidecar can serve the same or a narrower fitting Z
-range; building another range replaces it. Point-level track exclusion also
-uses the fallback because clipping a
-track changes its crossing-local indices.
+The script writes `/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz`
+atomically. `fit_spiral.py` finds it automatically from the configured tracks
+path. The sidecar includes a fingerprint of every DBM backing file; a stale or
+malformed file is ignored and the fitter falls back to its in-memory exact
+crossing scan. Re-run the builder after changing the DBM (`--force` replaces a
+current cache). A range-limited sidecar can serve the same or a narrower
+fitting Z range; building another range replaces it. Point-level track
+exclusion also uses the fallback because clipping a track changes its
+crossing-local indices.
 
 ## Converting track DBMs to OME-Zarr
 
@@ -613,25 +632,25 @@ and optimisation then does no inference-store filesystem I/O. The default
 24,000 samples per step are split evenly between long relative-winding pairs
 (`sample_count_winding_model_relative_pairs`, index separation drawn from
 `winding_model_relative_pair_delta`) and adjacent-passage density pairs
-(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
-neither loaded nor required, while the independent Lasagna normal and native
+(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is neither
+loaded nor required, while the independent Lasagna normal and native
 minimum-spacing losses remain available.
 
 The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
 exact export command and format.
 
-For a headless fit, pass the dataset root with `--dataset` and select inference
-mode (plus any independently disabled losses) through
+For a headless fit, pass the dataset root with `--dataset` and select
+inference mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
 declarative input catalog determine which conventional inputs are resolved.
 
 ## Fiber direction samples
 
-The optional fiber-direction loss consumes one packed artifact extracted from a
-remote Lasagna fiber prediction. Extraction downloads only chunks intersecting
-the requested z ROI and keeps the highest-presence voxel in each fixed
-prediction-space cell:
+The optional fiber-direction loss consumes one packed artifact extracted from
+a remote Lasagna fiber prediction. Extraction downloads only chunks
+intersecting the requested z ROI and keeps the highest-presence voxel in each
+fixed prediction-space cell:
 
 ```bash
 ./.venv/bin/python fiber_direction_samples.py \
@@ -642,12 +661,12 @@ prediction-space cell:
 ```
 
 The z ROI is half-open and expressed in the output/fitter coordinate system;
-`--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels. The
-extractor always covers the fiber volume's complete XY extent.
+`--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels.
+The extractor always covers the fiber volume's complete XY extent.
 
 Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
-to off/zero; set the toggle true and the weight above zero to enable the
-loss. The fitter then loads the conventional `fiber_directions.npz` artifact
-and samples `sample_count_fiber_direction_points` observations per step.
-Positions and directions constrain only local fitted-sheet orientation; they
-do not attach a sample to a particular winding.
+to off/zero; set the toggle true and the weight above zero to enable the loss.
+The fitter then loads the conventional `fiber_directions.npz` artifact and
+samples `sample_count_fiber_direction_points` observations per step. Positions
+and directions constrain only local fitted-sheet orientation; they do not
+attach a sample to a particular winding.
