@@ -1104,8 +1104,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
-        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
-        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
+        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch the chunks this render reads into the shared remote cache before rendering")
+        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch; fetched chunks persist under the shared remote cache root (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -1384,15 +1384,23 @@ int main(int argc, char *argv[])
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
+    std::shared_ptr<Volume> remoteVolume;
+    std::shared_ptr<vc::render::ChunkCache> remoteCache;
     vc::render::IChunkedArray* chunk_cache = nullptr;
 
     if (useRemoteCache) {
         try {
             vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
-            ownedChunkCache = vc::render::createChunkCache(
-                vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
+            // Open through Volume so the renderer shares VC3D's remote cache:
+            // the globally configured cache root, the URL-derived source
+            // identity and the process-wide cache service, with fetched chunks
+            // persisted. Opening the pyramid directly rebuilt a private cache
+            // each run and re-downloaded the whole ROI.
+            remoteVolume = Volume::NewFromUrl(remoteUrl, remoteAuth);
+            vc::render::processChunkCacheService()->configureDecodedByteCapacity(
                 cache_bytes);
-            chunk_cache = ownedChunkCache.get();
+            remoteCache = remoteVolume->sharedChunkCache();
+            chunk_cache = remoteCache.get();
             if (!chunkLevelPresent(*chunk_cache, cacheLevel)) {
                 logPrintf(stderr,
                           "Error: group index %d not available in remote zarr (present levels: %s)\n",
