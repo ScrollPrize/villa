@@ -10,6 +10,7 @@ from dataclasses import replace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import itertools
+import heapq
 import json
 import math
 import os
@@ -93,7 +94,7 @@ class DemandStore:
     """
     def __init__(self, root, identity, geometry, model_adapter, output_adapter,
                  *, accumulator_dtype="float16", accumulator_layout="flat", accumulator_prefault=False,
-                 scratch_budget_bytes=64 << 30, prepare_output=None):
+                 prepare_output=None):
         if accumulator_layout not in ("flat", "chunk-major"):
             raise ValueError("accumulator_layout must be flat or chunk-major")
         if not isinstance(accumulator_prefault, bool):
@@ -123,13 +124,9 @@ class DemandStore:
         if self.dtype not in (np.dtype("float16"), np.dtype("float32")):
             self.lock.close()
             raise ValueError("accumulator dtype must match sequential float16/float32")
-        self.budget = int(scratch_budget_bytes)
-        if self.budget <= 0:
-            self.lock.close()
-            raise ValueError("scratch budget must be positive")
         self.scratch_dirs, self.arrays, self.accumulators = [], [], {}
         self.tiles, self.chunks, self.priorities = {}, {}, {}
-        self.scratch_bytes = 0
+        self._pending_priorities = []
         self.publications = deque()
         self.stats = {"inferred_tiles": 0, "published_chunks": 0, "warm_chunks": 0}
         try:
@@ -278,7 +275,7 @@ class DemandStore:
             dependencies = self.geometry.contributors(origin)
             self.chunks[origin] = {"ready": False, "dependencies": dependencies,
                                    "applied": set(), "pending": set(), "requested": False,
-                                   "allocated": False, "publishing": False}
+                                   "publishing": False}
 
     def request(self, index, *, remaining=0.0, background=False):
         origin = self.geometry.origin(index)
@@ -289,16 +286,28 @@ class DemandStore:
             priority = (0 if background else 1, float(remaining))
             for tile in entry["dependencies"]:
                 if tile not in self.tiles:
-                    self.priorities[tile] = max(priority, self.priorities.get(tile, (-1, 0)))
+                    previous = self.priorities.get(tile)
+                    if previous is None or priority > previous:
+                        self.priorities[tile] = priority
+                        heapq.heappush(self._pending_priorities, (-priority[0], -priority[1], tile))
             self._queue_publication(origin)
         return origin
 
+    def pending_tile_key(self):
+        """Best unadmitted tile; lazy promotion entries retain exact priority ties."""
+        while self._pending_priorities:
+            foreground, remaining, tile = self._pending_priorities[0]
+            if tile not in self.tiles and self.priorities.get(tile) == (-foreground, -remaining):
+                return foreground, remaining, tile
+            heapq.heappop(self._pending_priorities)
+        return None
+
     def next_tile(self, *, profile_samples=None):
         with stage_timing(profile_samples, "admit.store_priority_selection"):
-            candidates = [tile for tile in self.priorities if tile not in self.tiles]
-            if not candidates:
+            key = self.pending_tile_key()
+            if key is None:
                 return None
-            tile = min(candidates, key=lambda t: (-self.priorities[t][0], -self.priorities[t][1], t))
+            _, _, tile = heapq.heappop(self._pending_priorities)
         with stage_timing(profile_samples, "admit.store_state_update"):
             self.tiles[tile] = {"state": "inflight"}
         return tile
@@ -312,7 +321,6 @@ class DemandStore:
         """Plan chunk-owner tasks without copying or persisting result tensors."""
         if self.tiles.get(tile, {}).get("state") != "inflight":
             raise ValueError("duplicate/unrequested inference completion")
-        self._check_disk_budget()
         tasks = []
         for origin in self.geometry.touched(tile):
             self._register(origin)
@@ -321,15 +329,6 @@ class DemandStore:
                 continue
             if tile not in entry["dependencies"] or tile in entry["pending"] or tile in entry["applied"]:
                 raise ValueError("invalid/duplicate contribution")
-            if not entry["allocated"]:
-                size = (self.geometry.chunk ** 3 if self.layout == "chunk-major" else
-                        math.prod(min(self.geometry.chunk, n - o)
-                                  for n, o in zip(self.geometry.output_shape, origin)))
-                size *= sum(a.dtype.itemsize for a in self.arrays)
-                if self.scratch_bytes + size > self.budget:
-                    raise RuntimeError("live inference scratch budget exhausted")
-                self.scratch_bytes += size
-                entry["allocated"] = True
             destination, source = self.geometry.intersection(origin, tile)
             tasks.append(tiled._AccumulateProcessTask(
                 -1, sequence, slot, result_spec, self.geometry.scale, origin,
@@ -375,13 +374,6 @@ class DemandStore:
             raise ValueError("duplicate/unexpected publication acknowledgement")
         entry["ready"] = True
         self.stats["published_chunks"] += 1
-
-    def _check_disk_budget(self):
-        # Advisory only: no preallocation, zero writes, or scratch fsync. Another
-        # process can still exhaust disk after this check; worker failure aborts.
-        allocated = sum(Path(a.filename).stat().st_blocks * 512 for a in self.arrays)
-        if max(allocated, self.scratch_bytes) > self.budget or shutil.disk_usage(self.root).free < (64 << 20):
-            raise RuntimeError("live inference scratch budget/free disk exhausted")
 
     def complete(self, tile, arrays):
         """Synchronous small-test adapter using the SAME shared worker executor.
@@ -474,7 +466,10 @@ class DemandWorkerPool:
     geometry or tensor payload passes through the native control transport.
     """
     def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8, input_slots=None,
-                 result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False):
+                 result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False,
+                 max_batch_size=1):
+        if type(max_batch_size) is not int or max_batch_size < 1:
+            raise ValueError("max_batch_size must be a positive integer")
         if not stores or not devices or slots_per_gpu < 1 or input_workers < 1:
             raise ValueError("nonempty stores/devices and positive worker budgets required")
         self.stores, self.readers = stores, readers
@@ -531,6 +526,8 @@ class DemandWorkerPool:
         self.accumulator_backends = {}
         self.worker_ids = set()
         self.stats = {"tiles": 0, "worker_seconds": 0.0, "load_seconds": 0.0,
+                      "max_batch_size": max_batch_size, "batches": 0,
+                      "batch_size_counts": {}, "batch_seconds": [], "gpu_memory_peaks": {},
                       "input_copy_seconds": 0.0, "pump_admit_seconds": 0.0,
                       "pump_dispatch_seconds": 0.0, "pump_events_seconds": 0.0,
                       "pump_background_seconds": 0.0,
@@ -562,7 +559,7 @@ class DemandWorkerPool:
                     i, str(device), self.adapter, None, self.geometry.tile,
                     tiled.blend_ramp(self.geometry.tile, self.geometry.border, self.geometry.overlap), scales,
                     int(getattr(self.adapter, "native_output_stride", 1)), input_specs, result_specs,
-                    self.work, self.events, profile_pipeline))
+                    self.work, self.events, profile_pipeline, max_batch_size, True))
                 process.start()
                 self.processes.append(process)
         except BaseException:
@@ -572,7 +569,7 @@ class DemandWorkerPool:
     @property
     def busy(self):
         return bool(self.active or self.loading or self.accumulating or self.publishing or any(
-            s.publications or any(tile not in s.tiles for tile in s.priorities) for s in self.stores.values()))
+            s.publications or s.pending_tile_key() is not None for s in self.stores.values()))
 
     def queue_snapshot(self):
         """Coordinator snapshot, not device utilization or native I/O request counts.
@@ -663,6 +660,14 @@ class DemandWorkerPool:
             tiled._slot_array(self.inputs[slot], layout)[:] = raw
         return raw.dtype.str, time.perf_counter() - started
 
+    def _next_admission(self):
+        choices = []
+        for name, store in self.stores.items():
+            key = store.pending_tile_key()
+            if key is not None:
+                choices.append((key[0], key[1], name, key[2]))
+        return min(choices, default=None)
+
     def pump(self):
         for process in self.processes + self.accumulator_processes:
             if process.exitcode is not None:
@@ -680,14 +685,10 @@ class DemandWorkerPool:
         # overtake background work not yet submitted to a non-preemptible read.
         while self.free_inputs and admitted < 16 and len(self.loading) < self.input_workers:
             with stage_timing(self.stage_samples, "admit.global_priority_selection"):
-                choices = []
-                for name, store in self.stores.items():
-                    for tile, priority in store.priorities.items():
-                        if tile not in store.tiles:
-                            choices.append((-priority[0], -priority[1], name, tile))
-                if not choices:
+                choice = self._next_admission()
+                if choice is None:
                     break
-                _, _, name, _ = min(choices)
+                _, _, name, _ = choice
             tile = self.stores[name].next_tile(profile_samples=self.stage_samples)
             with stage_timing(self.stage_samples, "admit.reserve_input_slot"):
                 slot, sequence = self.free_inputs.popleft(), self.sequence
@@ -734,6 +735,17 @@ class DemandWorkerPool:
                 continue
             if event[0] == "error":
                 raise RuntimeError(f"shared inference worker error: {event[4:]}")
+            if event[0] == "batch":
+                worker, sample = str(event[1]), event[2]
+                size = str(sample["size"])
+                self.stats["batches"] += 1
+                counts = self.stats["batch_size_counts"]
+                counts[size] = counts.get(size, 0) + 1
+                self.stats["batch_seconds"].append(sample["seconds"])
+                peaks = self.stats["gpu_memory_peaks"].setdefault(worker, {})
+                for key in ("cuda_peak_allocated_bytes", "cuda_peak_reserved_bytes"):
+                    peaks[key] = max(peaks.get(key, 0), sample[key])
+                continue
             if event[0] != "result":
                 raise RuntimeError("unknown shared worker event")
             self.worker_ids.add(event[5])

@@ -355,20 +355,23 @@ def test_flat_descriptor_keeps_circular_z_wrap(tmp_path):
         storage._mmap.close()
 
 
-def test_chunk_major_padded_edge_budget(tmp_path):
+def test_chunk_major_padded_edge_has_no_budget_and_preserves_values(tmp_path):
     geometry = DemandGeometry((3, 3, 3), 4, 0, 0, 1, 4)
     adapter, output = outputs(tmp_path, geometry.output_shape, 4)
-    with DemandStore(tmp_path, {}, geometry, adapter, output, accumulator_layout="chunk-major",
-                     scratch_budget_bytes=3**3*6+1) as store:
+    with DemandStore(tmp_path, {}, geometry, adapter, output, accumulator_layout="chunk-major") as store:
         store.request((0, 0, 0))
         tile = store.next_tile()
-        with pytest.raises(RuntimeError, match="scratch budget"):
-            store.complete(tile, tensor_result(geometry, tile, np.zeros(geometry.shape, np.uint8)))
-        assert all(Path(a.filename).stat().st_blocks == 0 for a in store.arrays)
+        store.complete(tile, tensor_result(geometry, tile, np.full(geometry.shape, 85, np.uint8)))
+        assert store.ready((0, 0, 0))
+    # Preserve the existing fp16 input/accumulator and truncating finalizer,
+    # rather than assuming byte-perfect identity through that numerical path.
+    expected = np.uint8(np.float32(np.float16(85 / 255)) * 255)
+    np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:], expected)
 
 
 @pytest.mark.parametrize("profile_pipeline", [False, True])
-def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline):
+@pytest.mark.parametrize("max_batch_size", [1, 3])
+def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline, max_batch_size):
     geometry = DemandGeometry((5, 5, 5), 4, 2, 1, 1, 4)
     volume = np.full(geometry.shape, 180, dtype=np.uint8)
     adapter, output = outputs(tmp_path, geometry.output_shape, geometry.chunk)
@@ -381,8 +384,8 @@ def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline):
         origin = store.request((0, 0, 0), remaining=10)
         # CPU is only an identity-model smoke fixture; production runner
         # requires explicitly selected CUDA devices.
-        with DemandWorkerPool({"test": store}, {"test": reader}, ["cpu"], slots_per_gpu=1, input_workers=1,
-                              profile_pipeline=profile_pipeline) as pool:
+        with DemandWorkerPool({"test": store}, {"test": reader}, ["cpu"], slots_per_gpu=5, input_workers=5,
+                              profile_pipeline=profile_pipeline, max_batch_size=max_batch_size) as pool:
             deadline = time.monotonic() + 30
             while pool.busy and time.monotonic() < deadline:
                 pool.pump()
@@ -391,6 +394,10 @@ def test_shared_spawned_worker_demand_pipeline(tmp_path, profile_pipeline):
             assert store.ready(origin)
             assert pool.stats["tiles"] > 0
             assert pool.worker_ids == {0}
+            assert sum(int(size) * count for size, count in pool.stats["batch_size_counts"].items()) == pool.stats["tiles"]
+            assert max(map(int, pool.stats["batch_size_counts"])) <= max_batch_size
+            assert sum(pool.stats["batch_seconds"]) == pytest.approx(pool.stats["worker_seconds"])
+            assert len(pool.free_inputs) == 5 and len(pool.free) == 5
             assert bool(pool.profile_samples) == profile_pipeline
             assert bool(pool.stage_samples) == profile_pipeline
             if profile_pipeline:
@@ -575,16 +582,65 @@ def test_interrupted_sibling_replacement_cannot_reuse_old_generation(tmp_path, m
     assert np.all(zarr.open_array(str(tmp_path / "b.zarr/0"), mode="r")[:] == 127)
 
 
-def test_scratch_budget_rejects_without_reservation(tmp_path):
-    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
-    adapter, output = outputs(tmp_path, geometry.shape, 4)
-    with DemandStore(tmp_path, {}, geometry, adapter, output, scratch_budget_bytes=100) as store:
+def test_scratch_plans_touched_brick_above_old_cap_without_reservation(tmp_path, monkeypatch):
+    # Old chunk-major accounting rejected this single padded brick (>64GiB).
+    # Plan only: never allocate/write a giant tensor or publish a giant chunk.
+    geometry = DemandGeometry((3, 3, 3), 4, 0, 0, 1, 4096)
+    adapter, output = outputs(tmp_path, geometry.shape, geometry.chunk)
+    with DemandStore(tmp_path, {}, geometry, adapter, output, accumulator_layout="chunk-major") as store:
+        assert sum(a.nbytes for a in store.arrays) > 64 << 30
+        def forbidden(*args, **kwargs):
+            raise AssertionError("no per-tile filesystem-space polling")
+        monkeypatch.setattr("shutil.disk_usage", forbidden)
         store.request((0, 0, 0))
         tile = store.next_tile()
-        with pytest.raises(RuntimeError, match="scratch budget"):
-            store.complete(tile, tensor_result(geometry, tile, np.ones(geometry.shape, np.uint8)))
+        tasks = store.begin_complete(tile, None, 0, 0)
+        assert len(tasks) == 1
+        assert tasks[0].origin == (0, 0, 0)
         assert all(Path(a.filename).stat().st_blocks == 0 for a in store.arrays)
+        assert not store.ready((0, 0, 0))
+
+
+def test_scratch_mapping_failure_propagates_and_cleans_up(tmp_path, monkeypatch):
+    import errno
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    original = np.memmap
+    opened = []
+    def fail_second_mapping(*args, **kwargs):
+        if opened:
+            raise OSError(errno.ENOSPC, "injected mapping failure")
+        opened.append(original(*args, **kwargs))
+        return opened[-1]
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "memmap", fail_second_mapping)
+        with pytest.raises(OSError) as error:
+            DemandStore(tmp_path, {}, geometry, adapter, output)
+    assert error.value.errno == errno.ENOSPC
+    assert opened[0]._mmap.closed
+    assert not list(tmp_path.glob("value.zarr/.live_tmp/session-*"))
+    # Constructor failure released the writer lock too.
+    with DemandStore(tmp_path, {}, geometry, adapter, output):
+        pass
+
+
+@pytest.mark.parametrize("stage", ["_execute_accumulate_process_task", "_execute_flush_process_task"])
+def test_actual_storage_error_propagates_without_readiness(tmp_path, monkeypatch, stage):
+    import errno
+    geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    def fail(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "injected storage failure")
+    monkeypatch.setattr(tiled, stage, fail)
+    with DemandStore(tmp_path, {}, geometry, adapter, output) as store:
+        store.request((0, 0, 0))
+        tile = store.next_tile()
+        with pytest.raises(OSError) as error:
+            store.complete(tile, tensor_result(geometry, tile, np.ones(geometry.shape, np.uint8)))
+        assert error.value.errno == errno.ENOSPC
+        assert not store.ready((0, 0, 0))
         assert not output.product_chunk_complete(adapter.output_products[0], chunk_origin_zyx=(0, 0, 0))
+    assert not list(tmp_path.glob("value.zarr/.live_tmp/session-*"))
 
 
 def test_demand_priority_promotes_reference_prefetch(tmp_path):
@@ -600,6 +656,58 @@ def test_demand_priority_promotes_reference_prefetch(tmp_path):
         store.request((0, 0, 0), remaining=100)
         assert store.next_tile() == (0, 0, 0)
         assert store.next_tile() == (4, 0, 0)
+
+
+def test_priority_heap_matches_full_scan_with_promotions_and_source_ties(tmp_path):
+    from contextlib import ExitStack
+    import random
+    rng = random.Random(20260911)
+    geometry = DemandGeometry((64, 4, 4), 4, 0, 0, 1, 4)
+    with ExitStack() as cleanup:
+        pool = DemandWorkerPool.__new__(DemandWorkerPool)
+        pool.stores = {}
+        priorities, admitted = {}, set()
+        for name in ("z", "a", "m"):
+            root = tmp_path / name
+            root.mkdir()
+            adapter, output = outputs(root, geometry.shape, 4)
+            pool.stores[name] = cleanup.enter_context(DemandStore(root, {}, geometry, adapter, output))
+
+        def request(name, index, remaining, background):
+            pool.stores[name].request((index, 0, 0), remaining=remaining, background=background)
+            tile = (index * 4, 0, 0)
+            if (name, tile) not in admitted:
+                priorities[name, tile] = max((0 if background else 1, remaining),
+                                            priorities.get((name, tile), (-1, 0)))
+
+        def take():
+            expected = min(((-p[0], -p[1], name, tile)
+                            for (name, tile), p in priorities.items() if (name, tile) not in admitted),
+                           default=None)
+            assert pool._next_admission() == expected
+            if expected is not None:
+                _, _, name, tile = expected
+                assert pool.stores[name].next_tile() == tile
+                assert pool.stores[name].tiles[tile]["state"] == "inflight"
+                admitted.add((name, tile))
+            return expected
+
+        for name in pool.stores:
+            for index in range(16):
+                request(name, index, 0, True)
+        take()  # Equal priorities: source name precedes tile coordinates.
+        for _ in range(300):
+            name, index = rng.choice(tuple(pool.stores)), rng.randrange(16)
+            request(name, index, rng.choice((0, 5, 5, 50, 100)), rng.choice((False, True)))
+            if rng.random() < .2:
+                take()
+        while take() is not None:
+            pass
+        assert len(admitted) == 48
+        for store in pool.stores.values():
+            assert store.pending_tile_key() is None
+            assert store.next_tile() is None
+            assert not store._pending_priorities  # Stale promotions fully drained.
 
 
 @pytest.mark.parametrize("layout,prefault", LAYOUT_CASES)

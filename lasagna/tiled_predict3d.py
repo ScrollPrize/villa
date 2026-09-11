@@ -543,7 +543,7 @@ class ModelAdapter(Protocol):
 		...
 
 	def run_tile_inference(self, model: Any, tile: torch.Tensor, *, device: torch.device) -> Any:
-		"""Run one normalized tile through the model and return raw model output."""
+		"""Run normalized B,1,D,H,W input; opt-in batching must preserve B in products."""
 		...
 
 	def product_tensors_from_output(self, raw_output: Any) -> Mapping[str, torch.Tensor]:
@@ -1317,13 +1317,13 @@ class _Predict3dProgressEmitter:
 		self._last_done = 0
 		self._line_open = False
 
-	def emit(self, status: str, *, done: int, total: int) -> None:
+	def emit(self, status: str, *, done: int, total: int, force: bool = False) -> None:
 		now = float(self._clock())
 		changed = int(done) != self._last_done
 		self._last_done = int(done)
-		if not changed:
+		if not changed and not force:
 			return
-		if int(done) >= int(total) or now - self._last_history >= self._history_seconds:
+		if force or int(done) >= int(total) or now - self._last_history >= self._history_seconds:
 			print(("\r" if self._line_open else "") + status, flush=True)
 			self._line_open = False
 			self._last_refresh = now
@@ -2495,6 +2495,22 @@ def _flush_process_main(
 				mmap_obj.close()
 
 
+def _ready_inference_batch(work_queue, first, max_batch_size):
+	"""Take available descriptors only; never wait to fill a model batch."""
+	batch = [first]
+	stop = False
+	while len(batch) < max_batch_size:
+		try:
+			item = work_queue.get_nowait()
+		except queue.Empty:
+			break
+		if item is None:
+			stop = True
+			break
+		batch.append(item)
+	return batch, stop
+
+
 def _multi_gpu_worker_main(
 	worker_index: int,
 	device_text: str,
@@ -2509,8 +2525,12 @@ def _multi_gpu_worker_main(
 	work_queue,
 	result_queue,
 	profile_pipeline: bool = False,
+	max_batch_size: int = 1,
+	report_batches: bool = False,
 ) -> None:
-	"""Persistent spawned GPU worker; queues carry descriptors only."""
+	"""Shared worker for serial-tile and dynamic-batch descriptor schedulers."""
+	if type(max_batch_size) is not int or max_batch_size < 1:
+		raise ValueError("max_batch_size must be a positive integer")
 	_native_limits = _limit_native_worker_threads()
 	device = torch.device(device_text)
 	if device.type == "cuda":
@@ -2543,56 +2563,74 @@ def _multi_gpu_worker_main(
 			task = work_queue.get()
 			if task is None:
 				break
-			seq, coord, input_slot, result_slot, needed_names = task[:5]
+			batch, stop = _ready_inference_batch(work_queue, task, max_batch_size)
+			seq, coord = task[:2]
 			started = time.perf_counter()
 			try:
 				profile = {} if profile_pipeline else None
-				input_layout = input_specs[input_slot].layouts[0]
-				if len(task) == 6:
-					# Demand mode can mix uint8/uint16 sources while retaining a
-					# single persistent model and descriptor-only work queue.
-					input_dtype = np.dtype(task[5])
-					if input_dtype not in (np.dtype("uint8"), np.dtype("uint16")):
-						raise TypeError("unsupported demand tile dtype")
-					input_layout = replace(input_layout, dtype=input_dtype.str)
-					if input_layout.offset + input_layout.nbytes > input_specs[input_slot].nbytes:
-						raise ValueError("demand tile exceeds its shared slot")
-				tile_np = _slot_array(inputs[input_slot], input_layout)
 				cuda_events = {}
+				input_cuda_events = {"h2d": [], "cuda_convert": []}
 				if profile is not None and device.type == "cuda":
-					for name in ("h2d", "cuda_convert", "adapter_preprocess", "model_inference", "output"):
+					for name in ("adapter_preprocess", "model_inference", "output"):
 						cuda_events[name] = (
 							torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True),
 						)
-				if device.type == "cuda":
-					source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
-					if cuda_events:
-						cuda_events["h2d"][0].record()
-					stage_started = time.perf_counter()
-					compact = source.to(device)
-					if profile is not None:
-						profile["compact_h2d_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["h2d"][1].record()
-					# Pageable shared-memory H2D is synchronous, so this slot is now reusable.
-					result_queue.put(("input_released", seq, input_slot, worker_index))
-					if cuda_events:
-						cuda_events["cuda_convert"][0].record()
-					stage_started = time.perf_counter()
-					if compact.dtype == torch.uint16:
-						tile = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
-					elif compact.dtype == torch.uint8:
-						tile = compact.to(torch.float32).div_(255.0)
+				# Keep integer conversion independent for mixed uint8/uint16
+				# sources. Do not retain B separate float tiles plus a cat copy.
+				tile = None
+				for index, item in enumerate(batch):
+					seq, coord, input_slot, result_slot, needed_names = item[:5]
+					input_layout = input_specs[input_slot].layouts[0]
+					if len(item) == 6:
+						input_dtype = np.dtype(item[5])
+						if input_dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+							raise TypeError("unsupported demand tile dtype")
+						input_layout = replace(input_layout, dtype=input_dtype.str)
+						if input_layout.offset + input_layout.nbytes > input_specs[input_slot].nbytes:
+							raise ValueError("demand tile exceeds its shared slot")
+					tile_np = _slot_array(inputs[input_slot], input_layout)
+					if device.type == "cuda":
+						source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
+						if cuda_events:
+							for name in input_cuda_events:
+								input_cuda_events[name].append((torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)))
+							input_cuda_events["h2d"][-1][0].record()
+						stage_started = time.perf_counter()
+						compact = source.to(device)
+						if profile is not None:
+							profile["compact_h2d_wall_s"] = profile.get("compact_h2d_wall_s", 0.0) + time.perf_counter() - stage_started
+						if cuda_events:
+							input_cuda_events["h2d"][-1][1].record()
+						# Synchronous pageable H2D finished reading the shared
+						# input. Subsequent conversion uses GPU-owned compact.
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+						if cuda_events:
+							input_cuda_events["cuda_convert"][-1][0].record()
+						stage_started = time.perf_counter()
+						if compact.dtype == torch.uint16:
+							converted = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
+						elif compact.dtype == torch.uint8:
+							converted = compact.to(torch.float32).div_(255.0)
+						else:
+							raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
+						if profile is not None:
+							profile["cuda_convert_submit_wall_s"] = profile.get("cuda_convert_submit_wall_s", 0.0) + time.perf_counter() - stage_started
+						del compact, source
 					else:
-						raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
-					if profile is not None:
-						profile["cuda_convert_submit_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["cuda_convert"][1].record()
-				else:
-					stage_started = time.perf_counter()
-					tile = _input_tile_to_device(tile_np, device)
-					if profile is not None:
-						profile["cpu_convert_wall_s"] = time.perf_counter() - stage_started
-					result_queue.put(("input_released", seq, input_slot, worker_index))
+						stage_started = time.perf_counter()
+						converted = _input_tile_to_device(tile_np, device)
+						if profile is not None:
+							profile["cpu_convert_wall_s"] = profile.get("cpu_convert_wall_s", 0.0) + time.perf_counter() - stage_started
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+					if len(batch) == 1:
+						tile = converted
+					else:
+						if tile is None:
+							tile = torch.empty((len(batch), *converted.shape[1:]), dtype=converted.dtype, device=device)
+						tile[index:index + 1].copy_(converted)
+					del converted
+					if cuda_events:
+						input_cuda_events["cuda_convert"][-1][1].record()
 				preprocess = getattr(model_adapter, "preprocess_tile", None)
 				if cuda_events:
 					cuda_events["adapter_preprocess"][0].record()
@@ -2614,26 +2652,28 @@ def _multi_gpu_worker_main(
 						cuda_events["output"][0].record()
 				stage_started = time.perf_counter()
 				tensors = model_adapter.product_tensors_from_output(raw_output)
-				for name in needed_names:
+				# Validate every item before publishing any result descriptor.
+				for name in {name for item in batch for name in item[4]}:
 					observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
-					if observed_shape != expected_native_shape:
+					if tensors[name].shape[0] != len(batch) or observed_shape != expected_native_shape:
 						raise ValueError(
-							f"product {name!r} native tile shape {observed_shape} does not match "
-							f"model native output stride {native_output_stride} expected shape "
-							f"{expected_native_shape}"
+							f"product {name!r} batch/native tile shape {tuple(tensors[name].shape)} "
+							f"does not match batch {len(batch)}, native stride {native_output_stride}, "
+							f"expected shape {expected_native_shape}"
 						)
-				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
-				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
-				for sd in needed_scales:
-					weight = weights_by_scale[sd]
-					_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weight.detach().cpu().numpy()
-				for name in needed_names:
-					sd = int(product_scales[name])
-					weighted = tensors[name][0] * w_native
-					remaining_scaledown = sd // native_output_stride
-					if remaining_scaledown > 1:
-						weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
-					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+				for index, item in enumerate(batch):
+					result_slot, needed_names = item[3:5]
+					layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
+					for sd in sorted({int(product_scales[name]) for name in needed_names}):
+						_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weights_by_scale[sd].detach().cpu().numpy()
+					for name in needed_names:
+						sd = int(product_scales[name])
+						weighted = tensors[name][index] * w_native
+						remaining_scaledown = sd // native_output_stride
+						if remaining_scaledown > 1:
+							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
+						_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+						del weighted
 				if profile is not None:
 					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started
 					if cuda_events:
@@ -2642,20 +2682,32 @@ def _multi_gpu_worker_main(
 				if device.type == "cuda":
 					torch.cuda.synchronize(device)
 				finished = time.perf_counter()
+				elapsed = finished - started
 				if profile is not None:
 					profile["terminal_sync_wall_s"] = finished - sync_started
-					profile["worker_total_wall_s"] = finished - started
+					profile["worker_total_wall_s"] = elapsed
 					for name, (event_start, event_end) in cuda_events.items():
 						profile[f"{name}_cuda_s"] = event_start.elapsed_time(event_end) / 1000.0
-					result_queue.put((
-						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
-						finished - started, profile, finished,
-					))
-				else:
-					result_queue.put((
-						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
-						finished - started,
-					))
+					for name, pairs in input_cuda_events.items():
+						if pairs:
+							profile[f"{name}_cuda_s"] = sum(start.elapsed_time(end) for start, end in pairs) / 1000.0
+					# Preserve the existing per-tile aggregate accounting.
+					profile = {name: value / len(batch) for name, value in profile.items()}
+					profile["batch_size"] = len(batch)
+				if report_batches:
+					result_queue.put(("batch", worker_index, {
+						"size": len(batch), "seconds": elapsed,
+						"cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
+						"cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0,
+					}))
+				for item in batch:
+					seq, coord, _, result_slot, needed_names = item[:5]
+					result = ("result", seq, coord, result_slot, tuple(needed_names), worker_index, elapsed / len(batch))
+					result_queue.put((*result, profile, finished) if profile is not None else result)
+				# No previous-batch tensors may inflate the next forward peak.
+				del tile, tensors, raw_output
+				if stop:
+					break
 			except BaseException as exc:
 				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
 				break
@@ -4583,6 +4635,11 @@ def run_tiled_inference_3d(
 					shm.unlink()
 		_complete_pending_flush()
 		_shutdown_flush_workers(terminate=False)
+		# Tile completion can precede asynchronous publication. Refresh once the
+		# final flush is acknowledged even though the tile count is unchanged.
+		if progress is not None:
+			progress_emitter.emit(_predict3d_progress_line(progress),
+				done=int(progress["tiles_done"]), total=int(progress["tiles_total"]), force=True)
 		progress_emitter.finish_line()
 		flush_wall = 0.0 if flush_started_at is None else time.perf_counter() - flush_started_at
 		flush_rate = 0.0 if flush_wall <= 0.0 else flush_chunks_total / flush_wall

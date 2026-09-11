@@ -7,6 +7,8 @@ import tempfile
 import threading
 from pathlib import Path
 import types
+import builtins
+from contextlib import chdir
 from unittest import mock
 
 import numpy as np
@@ -76,7 +78,8 @@ class _StopAfterManifest(Exception):
 
 
 def _write_zarr_array(path: Path, shape: tuple[int, int, int], value: int = 1) -> Path:
-	arr = zarr.open(str(path), mode="w", shape=shape, chunks=(4, 4, 4), dtype="uint8")
+	# The production TensorStore input reader consumes Zarr-v2 arrays.
+	arr = zarr.open(str(path), mode="w", shape=shape, chunks=(4, 4, 4), dtype="uint8", zarr_format=2)
 	arr[:] = np.full(shape, value, dtype=np.uint8)
 	return path
 
@@ -429,6 +432,14 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			emitter.emit("second", done=2, total=4)
 			emitter.emit("third", done=3, total=4)
 		self.assertEqual(output.getvalue(), "\rsecond  \rthird\n")
+
+	def test_progress_force_reports_flush_completion_without_more_tiles(self):
+		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: 0.0)
+		with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+			emitter.emit("tiles done, flushing", done=2, total=2)
+			emitter.emit("suppressed", done=2, total=2)
+			emitter.emit("final_z=8/8", done=2, total=2, force=True)
+		self.assertEqual(output.getvalue(), "tiles done, flushing\nfinal_z=8/8\n")
 
 	def test_shared_result_layout_is_packed_without_queue_payloads(self):
 		layouts, total = shared_predict3d._packed_layouts((
@@ -1008,6 +1019,37 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						ome_chunk=4,
 					)
 
+	def _dispatch_predict3d_fixture(self, args):
+		"""Exercise real CLI provenance I/O; mock only expensive inference/procfs."""
+		with tempfile.TemporaryDirectory() as td, chdir(td):
+			for flag in ("--input", "--base-ref", "--pred-dt"):
+				if flag in args:
+					_write_zarr_array(Path(args[args.index(flag) + 1]), (8, 8, 8))
+			checkpoint = Path(args[args.index("--unet-checkpoint") + 1])
+			torch.save({"state_dict": {}, "patch_size": 64}, checkpoint)
+			def fake_run(**kwargs):
+				manifest = Path(kwargs["output_path"])
+				_write_zarr_array(manifest.parent / "cos.ome.zarr" / "0", (2, 2, 2))
+				manifest.write_text(json.dumps({"version": 2, "groups": {
+					"cos": {"zarr": "cos.ome.zarr/0", "scaledown": 0, "channels": ["cos"]}
+				}}))
+			real_open = builtins.open
+			def deny_proc_adjustment(path, *positional, **keywords):
+				if str(path) == "/proc/self/oom_score_adj":
+					raise PermissionError("test must not change process OOM policy")
+				return real_open(path, *positional, **keywords)
+			with mock.patch("builtins.open", side_effect=deny_proc_adjustment), \
+				 mock.patch("preprocess_cos_omezarr._shared_auto_download") as auto_download, \
+				 mock.patch("preprocess_cos_omezarr.run_preprocess_3d", side_effect=fake_run) as run:
+				self.assertEqual(cli_main(args), 0)
+			manifest = Path(args[args.index("--output") + 1])
+			provenance = json.loads((manifest.parent / "inference.json").read_text())
+			self.assertEqual(provenance["status"], "completed")
+			self.assertEqual(provenance["checkpoint"]["name"], checkpoint.name)
+			self.assertEqual(len(provenance["checkpoint"]["sha256"]), 64)
+			self.assertTrue(provenance["artifacts"])
+			return run, auto_download
+
 	def test_predict3d_cli_dispatch_preserves_legacy_args(self):
 		args = [
 			"predict3d",
@@ -1034,10 +1076,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--ome-chunk", "32",
 			"--no-download",
 		]
-		with mock.patch("builtins.open", side_effect=PermissionError):
-			with mock.patch("preprocess_cos_omezarr._auto_download") as auto_download:
-				with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
-					self.assertEqual(cli_main(args), 0)
+		run, auto_download = self._dispatch_predict3d_fixture(args)
 
 		auto_download.assert_not_called()
 		run.assert_called_once()
@@ -1092,9 +1131,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--download-workers", "123",
 			"--ome-compressor", "none",
 		]
-		with mock.patch("builtins.open", side_effect=PermissionError):
-			with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
-				self.assertEqual(cli_main(args), 0)
+		run, auto_download = self._dispatch_predict3d_fixture(args)
+		auto_download.assert_not_called()
 		kwargs = run.call_args.kwargs
 		self.assertIsNone(kwargs["device"])
 		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
@@ -1162,11 +1200,12 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			out = stdout.getvalue()
 			self.assertIn(
-				"rolling accumulators: fine channels=1 zyx=(8,4,4) sd=1; "
-				"coarse channels=7 zyx=(8,4,4) sd=1",
+				"ring sd=1 zyx=(8,4,4) logical_z=8 products=2",
 				out,
 			)
-			self.assertIn("final_z=4/8", out)
+			# Flush acknowledgements may occur after the last tile progress line.
+			self.assertIn("flush complete sd=1 z=4", out)
+			self.assertIn("flush complete sd=1 z=8", out)
 			self.assertIn("final_z=8/8", out)
 			self.assertNotIn("\n[predict3d] final_z=", out)
 
@@ -1693,7 +1732,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			arr = zarr.open(
 				str(input_path), mode="w", shape=(24, 24, 24),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			arr[:] = 1
 			output = Output()
@@ -1840,7 +1879,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 		with tempfile.TemporaryDirectory() as td:
 			input_path = Path(td) / "input.zarr"
-			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8", zarr_format=2)
 			arr[0:4, 0:4, 0:4] = 1
 			with mock.patch.object(_CircularZBand, "clear", new=spy_clear):
 				run_tiled_inference_3d(
@@ -1876,7 +1915,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			arr = zarr.open(
 				str(input_path), mode="w", shape=(16, 16, 16),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			arr[8:16, 8:16, 8:16] = 1
 			output = Output()
@@ -1914,7 +1953,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			zarr.open(
 				str(input_path), mode="w", shape=(16, 16, 16),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			output = Output()
 			run_tiled_inference_3d(
@@ -1975,6 +2014,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				shape=(16, 16, 16),
 				chunks=(4, 4, 4),
 				dtype=np.uint8,
+				zarr_format=2,
 			)
 			zz, yy, xx = np.indices((16, 16, 16), dtype=np.int32)
 			arr[:] = ((zz * 17 + yy * 5 + xx * 3) % 251).astype(np.uint8)
