@@ -11,6 +11,8 @@ from scipy import ndimage as ndi
 B = "https://vesuvius-challenge-open-data.s3.amazonaws.com/"
 scroll, rel, out = sys.argv[1:4]; n_z = int(sys.argv[4]) if len(sys.argv) > 4 else 12
 core = sys.argv[5] if len(sys.argv) > 5 else 'plateau'
+if core.startswith('core='): core = core.split('=', 1)[1]      # the usage line invites the prefixed form
+if core not in ('plateau', 'argmax'): sys.exit(f"core must be 'plateau' or 'argmax', got {core!r}")
 url = B + rel
 def read_slice(level, z):
     meta = json.loads(urllib.request.urlopen(url + f'{level}/.zarray', timeout=60).read().decode())
@@ -41,6 +43,7 @@ for frac in np.linspace(0.08, 0.92, n_z):
         gy, gx = ndi.center_of_mass(mask); ys, xs = np.where(dist >= 0.9 * dist.max())
         j = int(np.argmin((xs - gx) ** 2 + (ys - gy) ** 2)); cy, cx = ys[j], xs[j]
     pts.append({'x': int(cx * f + f // 2), 'y': int(cy * f + f // 2), 'z': int(z * f), 'score': 60})
-    print(f'z={z*f}: core at x={cx*f} y={cy*f} (depth {dist.max()*f*9.4/1000:.1f} mm)', flush=True)
-json.dump({'control_points': pts, 'metadata': {'source': f'estimate_umbilicus.py ({core} of sheet mask, L3)', 'scroll': scroll}}, open(out, 'w'), indent=1)
+    print(f'z={z*f}: core at x={cx*f} y={cy*f} (depth {dist[cy, cx]*f*9.4/1000:.1f} mm)', flush=True)
+SOURCE = {'argmax': 'max distance-to-boundary', 'plateau': 'distance plateau nearest the centroid'}   # argmax keeps the old literal, so core=argmax reproduces existing files byte for byte
+json.dump({'control_points': pts, 'metadata': {'source': f'estimate_umbilicus.py ({SOURCE[core]} of sheet mask, L3)', 'scroll': scroll}}, open(out, 'w'), indent=1)
 print('wrote', out, len(pts), 'points')
