@@ -586,6 +586,101 @@ TEST_CASE("line annotation straight shift scroll moves cut origin along plane no
     CHECK(cv::norm(normal - cv::Vec3f{0.0f, 0.0f, 2.0f}) == doctest::Approx(0.0f));
 }
 
+TEST_CASE("line annotation plane origin shift along normal is signed and normal-length independent")
+{
+    const cv::Vec3f origin{1.0f, 2.0f, 3.0f};
+    const cv::Vec3f normal{0.0f, -4.0f, 0.0f};
+
+    const cv::Vec3f forward =
+        vc3d::line_annotation::planeOriginShiftedAlongNormal(origin, normal, 8.0);
+    CHECK(forward[0] == doctest::Approx(1.0f));
+    CHECK(forward[1] == doctest::Approx(-6.0f));
+    CHECK(forward[2] == doctest::Approx(3.0f));
+
+    const cv::Vec3f backward =
+        vc3d::line_annotation::planeOriginShiftedAlongNormal(origin, normal, -8.0);
+    CHECK(backward[1] == doctest::Approx(10.0f));
+
+    const cv::Vec3f degenerate = vc3d::line_annotation::planeOriginShiftedAlongNormal(
+        origin, cv::Vec3f{0.0f, 0.0f, 0.0f}, 8.0);
+    CHECK(cv::norm(degenerate - origin) == doctest::Approx(0.0f));
+    const cv::Vec3f nanDistance = vc3d::line_annotation::planeOriginShiftedAlongNormal(
+        origin, normal, std::numeric_limits<double>::quiet_NaN());
+    CHECK(cv::norm(nanDistance - origin) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("line annotation straight-ahead direction follows the raw tangent and locks per gesture")
+{
+    using vc3d::line_annotation::straightAheadDirection;
+    const cv::Vec3f ahead{0.0f, 0.0f, 1.0f};
+
+    // Fresh gesture: the sign is whichever half-space of the normal faces
+    // increasing line position, so a display-sign-flipped (or rotated past a
+    // quarter turn) normal translates against itself.
+    CHECK(straightAheadDirection(cv::Vec3f{0.0f, 0.0f, 1.0f}, ahead, false, 1.0) == 1.0);
+    CHECK(straightAheadDirection(cv::Vec3f{0.0f, 0.0f, -1.0f}, ahead, false, 1.0) == -1.0);
+    CHECK(straightAheadDirection(cv::Vec3f{0.1f, 0.0f, -0.05f}, ahead, false, 1.0) == -1.0);
+    // Exactly orthogonal resolves to forward.
+    CHECK(straightAheadDirection(cv::Vec3f{1.0f, 0.0f, 0.0f}, ahead, false, -1.0) == 1.0);
+
+    // Mid-gesture: the tangent at the marker has swung past the plane normal
+    // (the model curving away), yet the plane keeps the sign it started with,
+    // so two +1 notches and one +2 notch travel the same way.
+    CHECK(straightAheadDirection(cv::Vec3f{0.0f, 0.0f, -1.0f}, ahead, true, 1.0) == 1.0);
+    CHECK(straightAheadDirection(cv::Vec3f{0.0f, 0.0f, 1.0f}, ahead, true, -1.0) == -1.0);
+    // A stale lock value that is not a sign is ignored.
+    CHECK(straightAheadDirection(cv::Vec3f{0.0f, 0.0f, -1.0f}, ahead, true, 0.0) == -1.0);
+}
+
+TEST_CASE("line annotation straight-ahead distance follows the marker's actual arclength advance")
+{
+    using vc3d::line_annotation::kShiftScrollLineStepBaseVoxels;
+    using vc3d::line_annotation::shiftedLinePositionByArclength;
+    using vc3d::line_annotation::straightAheadDistanceForShiftScroll;
+
+    // Same mixed-density map as the along-line test: 4 vx vertices for
+    // positions 0..10, 32 vx vertices for positions 11..15 (total 200 vx).
+    std::vector<double> arclengths;
+    for (int i = 0; i <= 10; ++i) {
+        arclengths.push_back(4.0 * i);
+    }
+    for (int i = 1; i <= 5; ++i) {
+        arclengths.push_back(40.0 + 32.0 * i);
+    }
+    REQUIRE(arclengths.size() == 16);
+
+    // One notch inside the line: the plane travels exactly the marker's 8 vx,
+    // in both densities and in both directions.
+    double from = 2.0;
+    double to = shiftedLinePositionByArclength(from, 1, 1, arclengths);
+    CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) ==
+          doctest::Approx(kShiftScrollLineStepBaseVoxels));
+    from = 12.0;
+    to = shiftedLinePositionByArclength(from, -1, 1, arclengths);
+    CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) ==
+          doctest::Approx(-kShiftScrollLineStepBaseVoxels));
+    // Slice step size scales the notch.
+    from = 2.0;
+    to = shiftedLinePositionByArclength(from, 1, 3, arclengths);
+    CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) ==
+          doctest::Approx(3.0 * kShiftScrollLineStepBaseVoxels));
+
+    // A notch that clamps at the line end moves the plane only as far as the
+    // marker got (196 -> 200 is 4 vx, not 8), and a notch AT the end moves nothing.
+    from = vc3d::fiber_slice::linePositionAtArclength(arclengths, 196.0);
+    to = shiftedLinePositionByArclength(from, 1, 1, arclengths);
+    CHECK(to == doctest::Approx(15.0));
+    CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) == doctest::Approx(4.0));
+    to = shiftedLinePositionByArclength(15.0, 1, 1, arclengths);
+    CHECK(straightAheadDistanceForShiftScroll(15.0, to, arclengths) == doctest::Approx(0.0));
+
+    // Without a usable map (the dialog passes an empty one) the marker does not
+    // move and neither does the plane.
+    const std::vector<double> noMap;
+    CHECK(shiftedLinePositionByArclength(2.0, 2, 1, noMap) == doctest::Approx(2.0));
+    CHECK(straightAheadDistanceForShiftScroll(2.0, 2.0, noMap) == doctest::Approx(0.0));
+}
+
 TEST_CASE("line annotation straight shift scroll clamps invalid step size but not line position")
 {
     const cv::Vec3f origin{10.0f, 0.0f, 0.0f};
@@ -3804,4 +3899,47 @@ TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the chang
     auto neverRecorded = stale;
     neverRecorded.orientationEpoch = -1;
     CHECK(paneNeedsOrientationRefresh(neverRecorded, kEpoch));
+}
+
+TEST_CASE("controlled span keeps only the line between the outer control points")
+{
+    using vc3d::line_annotation::linePointsBetweenOuterControlPoints;
+    const std::vector<cv::Vec3d> line{
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
+
+    SUBCASE("interior controls drop both extrapolated tails")
+    {
+        const auto span = linePointsBetweenOuterControlPoints(line, {line[1], line[3]});
+        REQUIRE(span.size() == 3);
+        CHECK(span.front() == line[1]);
+        CHECK(span.back() == line[3]);
+    }
+    SUBCASE("one control is a single point, so nothing of the fiber is drawn")
+    {
+        const auto span = linePointsBetweenOuterControlPoints(line, {line[2]});
+        REQUIRE(span.size() == 1);
+        CHECK(span.front() == line[2]);
+    }
+    SUBCASE("a control off the line has no controlled span")
+    {
+        CHECK(linePointsBetweenOuterControlPoints(line, {line[1], {2.5, 0.0, 0.0}}).empty());
+    }
+    SUBCASE("no controls has no controlled span")
+    {
+        CHECK(linePointsBetweenOuterControlPoints(line, {}).empty());
+    }
+    SUBCASE("a line revisiting a coordinate is mapped in loader order, not by nearest point")
+    {
+        const cv::Vec3d a{0.0, 0.0, 0.0};
+        const cv::Vec3d b{2.0, 0.0, 0.0};
+        const cv::Vec3d c{2.0, 2.0, 0.0};
+        const cv::Vec3d d{0.0, -2.0, 0.0};
+        const std::vector<cv::Vec3d> loop{a, b, c, a, d};
+        const auto span = linePointsBetweenOuterControlPoints(loop, {b, a});
+        // Controls B then A: the second A (index 3), so the span is B, C, A.
+        REQUIRE(span.size() == 3);
+        CHECK(span[0] == b);
+        CHECK(span[1] == c);
+        CHECK(span[2] == a);
+    }
 }

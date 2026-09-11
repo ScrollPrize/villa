@@ -9,6 +9,7 @@ import torch
 import zarr
 
 import fit_data
+import sparse_tensorstore_cache
 from lasagna_volume import ChannelGroup, LasagnaVolume
 
 
@@ -69,6 +70,15 @@ class _FakeSparseChunkGroupCache:
 		self.channel_indices = dict(channel_indices)
 		self.is_3d_zarr = bool(is_3d_zarr)
 		self.chunk_table = torch.zeros(1, dtype=torch.int64, device=device)
+
+
+class _FakeTensorStoreSparseChunkGroupCache(_FakeSparseChunkGroupCache):
+	created: list[tuple[str, bool]] = []
+
+	def __init__(self, *, zarr_path: str, remote: bool = False, **kwargs) -> None:
+		super().__init__(zarr_path=zarr_path, **kwargs)
+		self.remote = bool(remote)
+		type(self).created.append((zarr_path, self.remote))
 
 
 class FitDataManifestLazyTests(unittest.TestCase):
@@ -271,6 +281,190 @@ class FitDataManifestLazyTests(unittest.TestCase):
 			self.assertIsNone(data.umbilicus_points)
 			self.assertIsNone(data.umbilicus_xy_lookup)
 			self.assertEqual(set(data.channel_spacing or {}), {"grad_mag", "nx", "ny"})
+
+	def test_streaming_source_keeps_complete_local_zarr(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			_write_u8_zarr(root / "surface.zarr", (3, 4, 5, 6))
+			manifest = _write_manifest(root, groups=_surface_group())
+			vol = LasagnaVolume.load(manifest)
+
+			source = fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+			self.assertFalse(source.remote)
+			self.assertEqual(Path(source.zarr_path), root / "surface.zarr")
+
+	def test_streaming_source_uses_validated_remote_marker_for_vc3d_split_cache(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(
+				root,
+				groups=_surface_group("surface.ome.zarr/4"),
+				base_shape=(4, 5, 6),
+				umbilicus_json=None,
+			)
+			mirror = root / ".lasagna-zarr-metadata" / "surface.ome.zarr" / "4"
+			mirror.mkdir(parents=True)
+			(mirror / ".zarray").write_text('{"shape":[3,4,5,6]}', encoding="utf-8")
+			(root / "lasagna-remote.json").write_text(
+				json.dumps({
+					"artifact_url": "https://example.test/artifacts/lasagna/",
+					"manifest_file": manifest.name,
+				}) + "\n",
+				encoding="utf-8",
+			)
+			vol = LasagnaVolume.load(manifest)
+
+			source = fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+			self.assertTrue(source.remote)
+			self.assertEqual(source.zarr_path, "https://example.test/artifacts/lasagna/surface.ome.zarr/4")
+
+	def test_catalog_marker_stays_remote_when_metadata_was_copied_into_partial_cache(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(root, groups=_surface_group("surface.ome.zarr/4"))
+			partial = root / "surface.ome.zarr" / "4"
+			partial.mkdir(parents=True)
+			(partial / ".zarray").write_text('{"shape":[3,4,5,6]}', encoding="utf-8")
+			(partial / "0.0.0").write_bytes(b"one cached chunk")
+			(root / "lasagna-remote.json").write_text(
+				json.dumps({
+					"artifact_url": "https://example.test/artifacts/lasagna",
+					"manifest_file": manifest.name,
+				}) + "\n",
+				encoding="utf-8",
+			)
+			vol = LasagnaVolume.load(manifest)
+
+			source = fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+			self.assertTrue(source.remote)
+			self.assertEqual(source.zarr_path, "https://example.test/artifacts/lasagna/surface.ome.zarr/4")
+
+	def test_remote_artifact_join_preserves_query_and_fragment(self) -> None:
+		self.assertEqual(
+			fit_data._join_remote_artifact_url(
+				"https://example.test/artifacts/lasagna/?token=a%2Fb#anchor",
+				("surface.ome.zarr", "4"),
+			),
+			"https://example.test/artifacts/lasagna/surface.ome.zarr/4?token=a%2Fb#anchor",
+		)
+
+	def test_load_streaming_split_cache_uses_remote_tensorstore_not_partial_local_store(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(
+				root,
+				groups=_surface_group("surface.ome.zarr/4"),
+				base_shape=(4, 5, 6),
+				umbilicus_json=None,
+			)
+			mirror = root / ".lasagna-zarr-metadata" / "surface.ome.zarr" / "4"
+			mirror.mkdir(parents=True)
+			(mirror / ".zarray").write_text('{"shape":[3,4,5,6]}', encoding="utf-8")
+			(root / "surface.ome.zarr" / "4").mkdir(parents=True)
+			(root / "lasagna-remote.json").write_text(
+				json.dumps({
+					"artifact_url": "https://example.test/artifacts/lasagna",
+					"manifest_file": manifest.name,
+				}) + "\n",
+				encoding="utf-8",
+			)
+			_FakeTensorStoreSparseChunkGroupCache.created.clear()
+			with (
+				mock.patch.object(
+					fit_data, "_probe_tensorstore_zarr_shape", return_value=(3, 4, 5, 6)
+				),
+				mock.patch(
+					"sparse_tensorstore_cache.TensorStoreSparseChunkGroupCache",
+					_FakeTensorStoreSparseChunkGroupCache,
+				),
+				mock.patch.object(fit_data.zarr, "open", side_effect=AssertionError("partial local store opened")),
+			):
+				data = fit_data.load_3d_streaming(
+					path=str(manifest), device=torch.device("cpu"), sparse_prefetch_backend="tensorstore"
+				)
+
+			self.assertEqual(data.size, (4, 5, 6))
+			self.assertEqual(
+				_FakeTensorStoreSparseChunkGroupCache.created,
+				[("https://example.test/artifacts/lasagna/surface.ome.zarr/4", True)],
+			)
+
+	def test_streaming_source_rejects_split_cache_without_valid_marker(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(root, groups=_surface_group("surface.ome.zarr/4"))
+			mirror = root / ".lasagna-zarr-metadata" / "surface.ome.zarr" / "4"
+			mirror.mkdir(parents=True)
+			(mirror / ".zarray").write_text("{}", encoding="utf-8")
+			(root / "lasagna-remote.json").write_text(
+				json.dumps({"artifact_url": "https://example.test/a", "manifest_file": "other.lasagna.json"}),
+				encoding="utf-8",
+			)
+			vol = LasagnaVolume.load(manifest)
+
+			with self.assertRaisesRegex(ValueError, "does not identify the opened manifest"):
+				fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+	def test_streaming_source_rejects_split_cache_without_marker(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(root, groups=_surface_group("surface.ome.zarr/4"))
+			mirror = root / ".lasagna-zarr-metadata" / "surface.ome.zarr" / "4"
+			mirror.mkdir(parents=True)
+			(mirror / ".zarray").write_text("{}", encoding="utf-8")
+			vol = LasagnaVolume.load(manifest)
+
+			with self.assertRaisesRegex(ValueError, "no adjacent lasagna-remote.json"):
+				fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+	def test_streaming_source_rejects_unsafe_remote_group_path(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			manifest = _write_manifest(root, groups=_surface_group("../outside.zarr"))
+			(root / "lasagna-remote.json").write_text(
+				json.dumps({"artifact_url": "https://example.test/a", "manifest_file": manifest.name}),
+				encoding="utf-8",
+			)
+			vol = LasagnaVolume.load(manifest)
+
+			with self.assertRaisesRegex(ValueError, "safe relative path"):
+				fit_data.resolve_streaming_zarr_source(vol, vol.groups["surface"])
+
+	def test_tensorstore_kvstore_specs_cover_local_http_https_and_s3(self) -> None:
+		self.assertEqual(
+			sparse_tensorstore_cache.zarr_kvstore_spec("C:/data/a.zarr", remote=False),
+			{"driver": "file", "path": "C:/data/a.zarr"},
+		)
+		self.assertEqual(
+			sparse_tensorstore_cache.zarr_kvstore_spec(
+				"http://localhost/a.zarr/4", remote=True
+			),
+			{"driver": "http", "base_url": "http://localhost/a.zarr/4/"},
+		)
+		self.assertEqual(
+			sparse_tensorstore_cache.zarr_kvstore_spec(
+				"https://example.test/a.zarr/4", remote=True
+			),
+			{"driver": "http", "base_url": "https://example.test/a.zarr/4/"},
+		)
+		self.assertEqual(
+			sparse_tensorstore_cache.zarr_kvstore_spec(
+				"https://example.test/a.zarr/4?token=a%2Fb#ignored", remote=True
+			),
+			{
+				"driver": "http",
+				"base_url": "https://example.test/a.zarr/4/?token=a%2Fb",
+			},
+		)
+		self.assertEqual(
+			sparse_tensorstore_cache.zarr_kvstore_spec(
+				"s3://bucket/prefix/a.zarr/4", remote=True
+			),
+			{"driver": "s3", "bucket": "bucket", "path": "prefix/a.zarr/4"},
+		)
 
 	def test_load_3d_streaming_requires_umbilicus_when_requested(self) -> None:
 		with tempfile.TemporaryDirectory() as td:

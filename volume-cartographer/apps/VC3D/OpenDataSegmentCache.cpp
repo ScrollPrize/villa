@@ -2052,6 +2052,95 @@ std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     return out;
 }
 
+namespace {
+
+struct RegisteredCatalogEntry {
+    const vc::project::Entry* entry = nullptr;
+    std::filesystem::path path;
+    std::size_t depth = 0;
+};
+
+bool pathContains(const std::filesystem::path& root,
+                  const std::filesystem::path& candidate)
+{
+    auto candidatePart = candidate.begin();
+    for (auto rootPart = root.begin(); rootPart != root.end();
+         ++rootPart, ++candidatePart) {
+        if (candidatePart == candidate.end() || *candidatePart != *rootPart) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<RegisteredCatalogEntry> findRegisteredOpenDataCatalogEntry(
+    const VolumePkg& pkg,
+    const std::filesystem::path& catalogSegmentDir,
+    bool preferDeepest)
+{
+    std::error_code canonicalError;
+    const auto canonicalSegment =
+        std::filesystem::weakly_canonical(catalogSegmentDir, canonicalError);
+    if (canonicalError) {
+        return std::nullopt;
+    }
+
+    std::optional<RegisteredCatalogEntry> match;
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (vc::project::isLocationRemote(entry.location) ||
+            !vc::project::hasEntryTag(entry, "open-data") ||
+            !vc::project::hasEntryTag(entry, "immutable")) {
+            continue;
+        }
+        std::error_code error;
+        const auto entryPath = std::filesystem::weakly_canonical(
+            vc::project::resolveLocalPath(
+                entry.location, pkg.path().parent_path()),
+            error);
+        if (error || !pathContains(entryPath, canonicalSegment)) {
+            continue;
+        }
+        const auto depth = static_cast<std::size_t>(
+            std::distance(entryPath.begin(), entryPath.end()));
+        if (!match || (preferDeepest ? depth > match->depth
+                                    : depth < match->depth)) {
+            match = RegisteredCatalogEntry{&entry, entryPath, depth};
+        }
+    }
+    return match;
+}
+
+std::filesystem::path canonicalPathOrThrow(
+    const std::filesystem::path& path,
+    const char* label)
+{
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error);
+    if (error) {
+        throw std::runtime_error(
+            std::string("could not resolve ") + label + ": " +
+            error.message());
+    }
+    const auto canonical = std::filesystem::weakly_canonical(absolute, error);
+    if (error) {
+        throw std::runtime_error(
+            std::string("could not resolve ") + label + ": " +
+            error.message());
+    }
+    return canonical;
+}
+
+} // namespace
+
+std::filesystem::path registeredOpenDataCatalogRootForSegment(
+    const VolumePkg& pkg,
+    const std::filesystem::path& catalogSegmentDir)
+{
+    const auto match = findRegisteredOpenDataCatalogEntry(
+        pkg, catalogSegmentDir, false);
+    return match ? match->path : std::filesystem::path{};
+}
+
 std::filesystem::path defaultEditableCopyPathForCatalogSegment(
     const std::filesystem::path& catalogSegmentDir,
     const std::filesystem::path& activeSegmentsRoot)
@@ -2074,6 +2163,7 @@ std::filesystem::path defaultEditableCopyPathForCatalogSegment(
 }
 
 void copyCatalogSegmentToEditableDirectory(
+    const VolumePkg& pkg,
     const std::filesystem::path& catalogSegmentDir,
     const std::filesystem::path& editableSegmentDir)
 {
@@ -2081,6 +2171,39 @@ void copyCatalogSegmentToEditableDirectory(
         !requiredFilesPresent(catalogSegmentDir)) {
         throw std::runtime_error("catalog segment is not a complete open-data tifxyz directory");
     }
+    const auto canonicalSource = canonicalPathOrThrow(
+        catalogSegmentDir, "catalog segment path");
+    const auto canonicalDestination = canonicalPathOrThrow(
+        editableSegmentDir, "editable segment path");
+    const auto pathsOverlap = [&](const std::filesystem::path& protectedPath) {
+        return pathContains(protectedPath, canonicalDestination) ||
+               pathContains(canonicalDestination, protectedPath);
+    };
+    if (pathsOverlap(canonicalSource)) {
+        throw std::runtime_error(
+            "editable destination must not overlap the immutable catalog segment");
+    }
+    if (isOpenDataCatalogSegmentDirectory(editableSegmentDir)) {
+        throw std::runtime_error(
+            "editable destination is an immutable catalog segment");
+    }
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (vc::project::isLocationRemote(entry.location) ||
+            !vc::project::hasEntryTag(entry, "open-data") ||
+            !vc::project::hasEntryTag(entry, "immutable")) {
+            continue;
+        }
+        std::error_code rootError;
+        const auto catalogRoot = std::filesystem::weakly_canonical(
+            vc::project::resolveLocalPath(
+                entry.location, pkg.path().parent_path()),
+            rootError);
+        if (!rootError && pathsOverlap(catalogRoot)) {
+            throw std::runtime_error(
+                "editable destination must be outside the immutable catalog root");
+        }
+    }
+
     std::error_code ec;
     if (std::filesystem::exists(editableSegmentDir, ec)) {
         if (!std::filesystem::is_directory(editableSegmentDir, ec)) {
@@ -2111,6 +2234,60 @@ void copyCatalogSegmentToEditableDirectory(
     if (!requiredFilesPresent(editableSegmentDir)) {
         throw std::runtime_error("editable destination is missing required tifxyz files");
     }
+}
+
+void attachEditableOpenDataSegmentRoot(
+    VolumePkg& pkg,
+    const std::filesystem::path& catalogSegmentDir,
+    const std::filesystem::path& editableSegmentsRoot,
+    bool select)
+{
+    std::vector<std::string> tags{"open-data-editable"};
+    const auto sourceMatch = findRegisteredOpenDataCatalogEntry(
+        pkg, catalogSegmentDir, true);
+    const vc::project::Entry* sourceEntry =
+        sourceMatch ? sourceMatch->entry : nullptr;
+    bool copiedRoutingTag = false;
+    if (sourceEntry) {
+        for (const auto& tag : sourceEntry->tags) {
+            const bool routingTag =
+                tag.rfind("vc-open-data-coordinate-space:", 0) == 0 ||
+                tag.rfind("vc-open-data-source-coordinate-level:", 0) == 0 ||
+                tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
+                tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
+            if (routingTag &&
+                std::find(tags.begin(), tags.end(), tag) == tags.end()) {
+                tags.push_back(tag);
+                copiedRoutingTag = true;
+            }
+        }
+    }
+
+    pkg.attachSegmentsEntry(editableSegmentsRoot.string(), tags, select);
+    std::string persistedLocation = editableSegmentsRoot.string();
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (vc::project::isLocationRemote(entry.location)) {
+            continue;
+        }
+        const auto entryPath = vc::project::resolveLocalPath(
+            entry.location, pkg.path().parent_path());
+        std::error_code error;
+        if (std::filesystem::equivalent(
+                editableSegmentsRoot, entryPath, error) && !error) {
+            persistedLocation = entry.location;
+            break;
+        }
+    }
+    pkg.reconcileSegmentsEntryTags(
+        persistedLocation,
+        tags,
+        copiedRoutingTag
+            ? std::vector<std::string>{
+                  "vc-open-data-coordinate-space:",
+                  "vc-open-data-source-coordinate-level:",
+                  "vc-open-data-source-volume-id:",
+                  "vc-open-data-target-volume-id:"}
+            : std::vector<std::string>{});
 }
 
 OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
