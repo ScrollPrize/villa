@@ -41,7 +41,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 - `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)
 - `STRIDE`: Controls overlap between tiles. Smaller stride = more overlap = smoother blending but slower inference
 - `BATCH_SIZE`: Number of tiles to process in parallel. Larger values = faster but more GPU memory. Reduce if you encounter OOM errors
-- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window such as `START_LAYER=1`, `END_LAYER=63`
+- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window centred on the segment surface, which is the middle slice of the published surface volumes: for a 109-layer volume (e.g. PHerc0139 at 2.4 um) use `START_LAYER=24`, `END_LAYER=86`. `START_LAYER=1`, `END_LAYER=63` is centred only on a 65-layer volume. On PHerc0139 segment 20250108000000-w025 (109 layers), layers 24-85 reproduce the published prediction (pixel correlation 0.875, ink area 85.0% vs 84.8% published) while layers 1-62 do not (0.38, 40.6%)
 
 ### S3 layout (expected)
 
@@ -319,6 +319,7 @@ argo submit wf.yaml \
 
 Tip:
 - `END_LAYER` is exclusive. For layers `00.tif` through `25.tif`, use `START_LAYER=0`, `END_LAYER=26`.
+- Centre the window on the surface. For a volume of `N` layers with the surface in the middle slice and a window of `W` layers, use `START_LAYER` = (N - W) / 2 rounded to a whole number and `END_LAYER` = `START_LAYER` + W.
 
 ## Notes on models
 
