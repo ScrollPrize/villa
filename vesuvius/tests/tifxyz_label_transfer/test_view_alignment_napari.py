@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -364,6 +365,32 @@ class SurfaceVolumeCompositeTests(unittest.TestCase):
 
             self.assertIsInstance(actual, np.memmap)
             np.testing.assert_array_equal(actual, expected)
+
+            # read_render_tiff hands back a live mapping, so this test owns it
+            # and has to release it before temp_dir is removed.
+            viewer.close_memmap(actual)
+
+    def test_render_array_reader_leaves_the_cache_file_unmapped(self) -> None:
+        """Renders handed to a caller must not keep their cache file mapped.
+
+        read_render_tiff maps deliberately, but a mapping that escapes has no
+        end of life the caller can reach: on POSIX it silently pins the file,
+        and on Windows the cache can then be neither replaced nor deleted.
+        """
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        path = temp_dir / "render.tif"
+        expected = np.arange(12, dtype=np.uint8).reshape(3, 4)
+        tifffile.imwrite(path, expected, metadata=None)
+
+        actual = viewer.read_render_array(path)
+
+        self.assertNotIsInstance(actual, np.memmap)
+        self.assertNotIsInstance(actual.base, np.memmap)
+        # Removable straight away, with the render still referenced.
+        path.unlink()
+        temp_dir.rmdir()
+        np.testing.assert_array_equal(actual, expected)
 
     def test_centered_thirteen_plane_max_selects_six_each_side(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

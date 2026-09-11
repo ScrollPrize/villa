@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -10,10 +11,12 @@ import numpy as np
 import tifffile
 
 from vesuvius.tifxyz_label_transfer.io import (
+    close_memmap,
     load_surface,
     read_image,
     read_image_shape,
     StreamingTiffOutputs,
+    TemporaryRaster,
 )
 from tests.zarr_utils import create_v2_group_array
 
@@ -148,6 +151,79 @@ class SurfaceIoTests(unittest.TestCase):
         expected = np.ones((2, 3), dtype=bool)
         expected[1, 2] = False
         np.testing.assert_array_equal(surface.valid, expected)
+
+    def test_readers_and_temporary_rasters_leave_no_file_mapped(self) -> None:
+        """Nothing this module hands back may keep its file mapped.
+
+        A mapping that outlives the call pins the file: on POSIX it merely
+        survives unlink, but on Windows the file cannot be removed at all,
+        which is what made every temporary directory in this suite fail to
+        clean up. Both platforms can see it in the returned arrays.
+        """
+
+        def maps_a_file(array: object) -> bool:
+            while array is not None:
+                if isinstance(array, np.memmap):
+                    return True
+                array = getattr(array, "base", None)
+            return False
+
+        temporary = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        surface_path = temporary / "surface.tifxyz"
+        surface_path.mkdir()
+        grid = np.zeros((2, 3), dtype=np.float32)
+        for axis in ("x", "y", "z"):
+            tifffile.imwrite(surface_path / f"{axis}.tif", grid, metadata=None)
+        (surface_path / "meta.json").write_text(
+            json.dumps({"scale": [1.0, 1.0]}), encoding="utf-8"
+        )
+        label_path = temporary / "label.tif"
+        tifffile.imwrite(
+            label_path, np.zeros((2, 3), dtype=np.uint8), metadata=None
+        )
+
+        surface = load_surface(surface_path, use_mask=False)
+        label = read_image(label_path)
+
+        for array in (surface.x, surface.y, surface.z, label):
+            self.assertFalse(maps_a_file(array))
+
+        # A caller holding one of the raster's own views must not stop its
+        # owner from releasing the backing file.
+        raster = TemporaryRaster(
+            temporary, (2, 3), np.dtype(np.uint8), 0, ".probe-"
+        )
+        raster_path = raster.path
+        escaped_view = raster.array[:1]
+        raster.close()
+        del escaped_view
+        self.assertFalse(raster_path.exists())
+
+        # Removable immediately, with the loaded arrays still referenced.
+        for item in (label_path, *surface_path.iterdir()):
+            item.unlink()
+        surface_path.rmdir()
+        temporary.rmdir()
+        self.assertFalse(temporary.exists())
+
+    def test_close_memmap_refuses_a_view_of_the_mapping(self) -> None:
+        """Closing through a view would close the parent for everyone.
+
+        NumPy copies ``_mmap`` onto every view, so the naive call succeeds and
+        leaves the owner reading freed pages -- a segfault, not an exception.
+        """
+        temporary = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        raster = TemporaryRaster(
+            temporary, (2, 3), np.dtype(np.uint8), 0, ".probe-"
+        )
+        self.addCleanup(raster.close)
+
+        with self.assertRaises(ValueError):
+            close_memmap(raster.array[:1])
+
+        self.assertFalse(raster.array._mmap.closed)
 
 
 if __name__ == "__main__":
