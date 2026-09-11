@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics as _LossStatistics
+from vesuvius.neural_tracing.fiber_trace_3d.embedding import embedding_statistics
 from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
     ComponentGradientAccumulator, validate_sample_independent_model,
 )
@@ -485,8 +486,9 @@ def _torchrun_world_size_from_env(env: dict[str, str] | None = None) -> int:
 def _require_single_process_cli_mode(mode_name: str) -> None:
     if _torchrun_world_size_from_env() > 1:
         raise SystemExit(
-            f"{mode_name} is single-process only. Run normal training under torchrun, "
-            "or run this subcommand without torchrun/WORLD_SIZE>1."
+            f"{mode_name} is single-process only. Launch without torchrun/WORLD_SIZE>1; "
+            "normal training's manager supervisor launches GPU workers. "
+            "Unmanaged distributed testing requires the explicit --unmanaged flag."
         )
 
 
@@ -947,8 +949,12 @@ def _finalize_loss_statistics(
         "branch0",
         "branch1",
         "selected_score",
+        "positive_embedding",
+        "negative_embedding",
     )
     local_pairs = {
+        "positive_embedding": (statistics.positive_embedding_sum, statistics.positive_embedding_count),
+        "negative_embedding": (statistics.negative_embedding_sum, statistics.negative_embedding_count),
         "direction": (statistics.direction_sum, statistics.direction_count),
         "positive_presence": (
             statistics.positive_presence_sum,
@@ -1016,11 +1022,16 @@ def _finalize_loss_statistics(
         * negative_presence_loss
         * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
     )
-    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
+    embedding_loss = 0.5 * (ratio("positive_embedding") + ratio("negative_embedding"))
+    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss + embedding_loss
     return {
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
+        "embedding": embedding_loss,
+        "embedding_positive": ratio("positive_embedding"),
+        "embedding_negative": ratio("negative_embedding"),
+        "embedding_negative_pairs": global_values["negative_embedding"][1] if global_values else statistics.negative_embedding_count,
         "angle_mean_deg": ratio("angle"),
         "branch0_fraction": ratio("branch0"),
         "branch1_fraction": ratio("branch1"),
@@ -1313,6 +1324,7 @@ def compute_losses(
     direction_weight: float,
     presence_weight: float,
     branch_selection_mode: str = "eval_voxel",
+    embeddings: torch.Tensor | None = None,
     _return_statistics: bool = False,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
     require_materialized_targets(batch)
@@ -1469,6 +1481,10 @@ def compute_losses(
         selected_score_sum=selected_score_sum,
         selected_score_count=selected_score_count,
     )
+    if embeddings is not None:
+        pos, pc, neg, nc = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch)
+        statistics = replace(statistics, positive_embedding_sum=pos, positive_embedding_count=pc,
+                             negative_embedding_sum=neg, negative_embedding_count=nc)
     if _return_statistics:
         return statistics
     return _finalize_loss_statistics(
@@ -2152,6 +2168,10 @@ def _mean_dense_test_rows(
     if not ordered:
         return {
             "total": math.inf,
+            "embedding": math.inf,
+            "embedding_positive": math.inf,
+            "embedding_negative": math.inf,
+            "embedding_negative_pairs": 0.0,
             "direction": math.inf,
             "presence": math.inf,
             "angle_mean_deg": math.inf,
@@ -2409,6 +2429,7 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         if sparse_tangent is not None:
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
+        embedding_geometry=None if batch.embedding_geometry is None else batch.embedding_geometry[start:stop],
         volume=batch.volume[start:stop],
         valid_mask=None if batch.valid_mask is None else batch.valid_mask[start:stop],
         cp_local_zyx=batch.cp_local_zyx[start:stop],
@@ -2462,10 +2483,13 @@ def _forward_loss_tensors(
             presence_weight=presence_weight,
             **dict(conditioned_loss_options or {}),
         )
-    output = model(batch.volume)
+    use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
+    result = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
+    output = result["prediction"] if use_embeddings else result
     return compute_losses(
         output,
         batch,
+        embeddings=result["embeddings"] if use_embeddings else None,
         direction_weight=direction_weight,
         presence_weight=presence_weight,
         branch_selection_mode=(
@@ -2491,10 +2515,13 @@ def _forward_loss_statistics(
             _return_statistics=True,
         )
     else:
-        output = model(batch.volume)
+        use_embeddings = bool(getattr(_unwrap_model(model), "embedding_channels", 0))
+        prediction = model(batch.volume, return_embeddings=True) if use_embeddings else model(batch.volume)
+        output = prediction["prediction"] if use_embeddings else prediction
         result = compute_losses(
             output,
             batch,
+            embeddings=prediction["embeddings"] if use_embeddings else None,
             direction_weight=1.0,
             presence_weight=1.0,
             branch_selection_mode="train_offset_grid_min_fraction" if training_loss else "eval_voxel",
@@ -2503,6 +2530,19 @@ def _forward_loss_statistics(
     if not isinstance(result, _LossStatistics):
         raise TypeError("training loss did not return sufficient statistics")
     return result
+
+
+def _embedding_log(losses, model):
+    if not getattr(_unwrap_model(model), "embedding_channels", 0):
+        return ""
+    return (f"loss_embedding={losses['embedding']:.6f} "
+            f"embedding_negative_pairs={losses['embedding_negative_pairs']:.0f} ")
+
+
+def _log_embedding_scalars(writer, prefix, losses, model, step):
+    if getattr(_unwrap_model(model), "embedding_channels", 0):
+        for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs"):
+            writer.add_scalar(f"{prefix}/{key}", losses[key], step)
 
 
 def _losses_to_float_dict(losses: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -2586,8 +2626,11 @@ def run_training(
     resume_checkpoint: str | Path | None = None,
     test_hang_diagnostics: bool = False,
     manager_socket: str | None = None,
+    unmanaged: bool = False,
 ) -> None:
-    if manager_socket is not None or _load_raw_config(config_path).get("training", {}).get("cooperative"):
+    if unmanaged and manager_socket is not None:
+        raise ValueError("--unmanaged cannot be combined with --manager-socket")
+    if not unmanaged:
         _require_single_process_cli_mode("cooperative training (do not use torchrun)")
         from .cooperative_training import run_cooperative_training
         return run_cooperative_training(config_path, socket=manager_socket,
@@ -2747,10 +2790,7 @@ def training_units(
         if handoff_progress.get("config_fingerprint") != source_fingerprint:
             raise ValueError("training config changed since the captured cohort state")
         start_step = int(handoff_progress["step"])
-        progress_metadata = {
-            "samples_seen": handoff_progress.get("samples_seen", handoff_progress["sample_frontier"]),
-            "optimizer_global_batch_size": handoff_progress["effective_batch_size"],
-        }
+        progress_metadata = dict(handoff_progress)
     elif resume:
         start_step = _load_snapshot(
             resume,
@@ -2933,7 +2973,8 @@ def training_units(
     sample_progress = _SampleProgress(
         start_update=start_step,
         start_samples=_resume_sample_count(
-            progress_metadata, start_step, training.get("resume_samples_seen") if resume and handoff is None else None,
+            progress_metadata, start_step,
+            training.get("resume_samples_seen") if resume and handoff_progress is None else None,
         ),
         global_batch_size=optimizer_global_batch_size,
     )
@@ -3084,6 +3125,7 @@ def training_units(
             progress={"step": step, "effective_batch_size": optimizer_global_batch_size,
                       "sample_frontier": step * optimizer_global_batch_size,
                       "samples_seen": sample_progress.at(step),
+                      "optimizer_global_batch_size": optimizer_global_batch_size,
                       "best_metric": best_metric, "run_datestr": str(run_datestr),
                       "pending_test": pending_test, "config_fingerprint": source_fingerprint},
         )
@@ -3217,6 +3259,7 @@ def training_units(
                             f"test samples={sample_progress.at(step)} update={step} loss_total={test_losses['total']:.6f} "
                             f"loss_direction={test_losses['direction']:.6f} "
                             f"loss_presence={test_losses['presence']:.6f} "
+                            f"{_embedding_log(test_losses, raw_model)}"
                             f"angle_mean_deg={test_losses['angle_mean_deg']:.2f} "
                             f"branch0={test_losses['branch0_fraction']:.3f} "
                             f"branch1={test_losses['branch1_fraction']:.3f} "
@@ -3228,6 +3271,7 @@ def training_units(
                         writer.add_scalar("test/loss_total", test_losses["total"], step)
                         writer.add_scalar("test/loss_direction", test_losses["direction"], step)
                         writer.add_scalar("test/loss_presence", test_losses["presence"], step)
+                        _log_embedding_scalars(writer, "test", test_losses, raw_model, step)
                         writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
                         writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
                         writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
@@ -3430,6 +3474,7 @@ def training_units(
             start_step=int(start_step),
         )
         train_iterator = FiberTrace3DTrainingBatchPipeline(
+            embedding_stride=loader_config.embedding.output_stride if loader_config.embedding.enabled else 0,
             config_path=str(Path(config_path).resolve()),
             index_map=training_sample_index_map,
             batch_size=loader.config.batch_size,
@@ -3794,6 +3839,7 @@ def training_units(
                     f"samples={sample_progress.at(step)} update={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
+                    f"{_embedding_log(losses, raw_model)}"
                     f"angle_mean_deg={losses['angle_mean_deg']:.2f} "
                     f"branch0={losses['branch0_fraction']:.3f} "
                     f"branch1={losses['branch1_fraction']:.3f} "
@@ -3812,6 +3858,7 @@ def training_units(
                 writer.add_scalar("train/loss_total", losses["total"], step)
                 writer.add_scalar("train/loss_direction", losses["direction"], step)
                 writer.add_scalar("train/loss_presence", losses["presence"], step)
+                _log_embedding_scalars(writer, "train", losses, raw_model, step)
                 writer.add_scalar("train/angle_mean_deg", losses["angle_mean_deg"], step)
                 writer.add_scalar("train/branch0_fraction", losses["branch0_fraction"], step)
                 writer.add_scalar("train/branch1_fraction", losses["branch1_fraction"], step)
@@ -5993,8 +6040,11 @@ def main() -> None:
     parser.add_argument("--trace2cp-step-px", type=float, default=None)
     parser.add_argument("--trace2cp-rf-margin-px", type=float, default=None)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--manager-socket", type=Path, default=None,
-                        help="opt in to cooperative GPU allocation; requires training.cooperative memory calibration/request")
+    launch_mode = parser.add_mutually_exclusive_group()
+    launch_mode.add_argument("--manager-socket", type=Path, default=None,
+                            help="override manager socket (default: available /run/villa-gpu-manager/manager.sock, otherwise ~/.local/run/villa-gpu-manager/manager.sock); training is managed by default")
+    launch_mode.add_argument("--unmanaged", action="store_true",
+                            help="explicit testing/debug only: bypass cooperative GPU management")
     parser.add_argument(
         "--test-hang-diagnostics",
         action="store_true",
@@ -6002,8 +6052,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     auxiliary_mode = args.prefetch or args.trace2cp_vis or args.benchmark
-    if args.manager_socket is not None and auxiliary_mode:
-        raise SystemExit("--manager-socket applies only to training")
+    if (args.manager_socket is not None or args.unmanaged) and auxiliary_mode:
+        raise SystemExit("--manager-socket and --unmanaged apply only to training")
     if args.test_hang_diagnostics and auxiliary_mode:
         raise SystemExit("--test-hang-diagnostics is supported only for normal training")
     if args.prefetch:
@@ -6038,7 +6088,8 @@ def main() -> None:
     else:
         run_training(args.config, resume_checkpoint=args.resume,
             test_hang_diagnostics=bool(args.test_hang_diagnostics),
-            manager_socket=str(args.manager_socket) if args.manager_socket is not None else None)
+            manager_socket=str(args.manager_socket) if args.manager_socket is not None else None,
+            unmanaged=bool(args.unmanaged))
 
 
 if __name__ == "__main__":

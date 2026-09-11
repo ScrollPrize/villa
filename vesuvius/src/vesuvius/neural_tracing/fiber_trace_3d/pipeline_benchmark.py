@@ -446,9 +446,11 @@ def main(argv: list[str] | None = None) -> int:
     verify_seconds = time.perf_counter() - verify_started
 
     total_items = int(args.warmup_samples) + int(args.samples)
+    embedding = load_config(config_path).embedding
     sample_limit = None if int(args.sample_index_limit) <= 0 else int(args.sample_index_limit)
     transport = (
         FiberTrace3DSharedTensorSlots(
+            embedding_stride=embedding.output_stride if embedding.enabled else 0,
             start_index=int(args.start_index),
             slot_count=int(args.max_in_flight),
             patch_shape_zyx=tuple(int(v) for v in config_payload["patch_shape_zyx"]),

@@ -28,6 +28,7 @@ from test_manager import POOL, engine, call, register, report, request, settle, 
 
 @contextmanager
 def running_server(path, **options):
+    options["engine_options"] = {"protected_processes": lambda: [], **options.get("engine_options", {})}
     with Server(path, POOL, **options) as server:
         stop = threading.Event()
         errors = []

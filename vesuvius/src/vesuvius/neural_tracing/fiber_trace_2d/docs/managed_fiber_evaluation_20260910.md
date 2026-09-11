@@ -6,8 +6,9 @@ current cache lifecycle, validation, limitations and profiling comparison.
 
 The classic runner now defaults to a fixed exclusive GPU-manager request,
 priority100. It never starts training. Only cooperative registered pausable jobs
-can yield; it cannot evict arbitrary GPU processes. A missing service is an error,
-not permission to run unmanaged. The standalone module supports the same config
+can yield; it cannot evict arbitrary GPU processes. The shared service can now
+auto-start with logical CPU capacity; startup/admission failures are not
+permission to run unmanaged. The standalone module supports the same config
 and --manager-socket/--manager-priority options; --unmanaged is an explicit opt-out.
 
 The CPU-only launcher resolves physical NVIDIA indices (or indices into an
@@ -28,7 +29,7 @@ resumable evaluation. C++ code merged automatically; both README sections stayed
 
 ## Running
 
-With the service running, the reusable benchmark command is:
+The reusable benchmark command (auto-starting the shared service if needed) is:
 
 ```
 /home/hendrik/.venv_las/bin/python /home/hendrik/villa2/vesuvius/scripts/run_classic_fiber_evaluation.py profile

@@ -15,6 +15,7 @@ from vesuvius.neural_tracing.fiber_trace.model import (
     _derive_unet_strides,
 )
 from vesuvius.neural_tracing.nets.vesuvius_unet3d import Vesuvius3dUnetModel
+from .embedding import EmbeddingConfig
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class FiberTrace3DModelConfig:
     squeeze_excitation: bool = False
     normalization: str = "batch"
     output_stride: int = 1
+    embedding_channels: int = 0
 
 
 class FiberTrace3DNet(nn.Module):
@@ -45,6 +47,9 @@ class FiberTrace3DNet(nn.Module):
         if not cfg.features_per_stage:
             raise ValueError("features_per_stage must not be empty")
         self.conditioned_decoder_enabled = bool(cfg.conditioned_decoder_enabled)
+        self.embedding_channels = int(cfg.embedding_channels)
+        if self.embedding_channels < 0 or (self.embedding_channels and self.conditioned_decoder_enabled):
+            raise ValueError("embedding channels require an unconditioned U-Net")
         if self.conditioned_decoder_enabled:
             if int(cfg.output_channels) != 7:
                 raise ValueError(
@@ -87,7 +92,7 @@ class FiberTrace3DNet(nn.Module):
         backbone_out_channels = (
             int(cfg.conditioned_latent_channels)
             if self.conditioned_decoder_enabled
-            else int(cfg.output_channels)
+            else int(cfg.output_channels) + self.embedding_channels
         )
         self.net = Vesuvius3dUnetModel(
             int(cfg.input_channels),
@@ -127,6 +132,7 @@ class FiberTrace3DNet(nn.Module):
         conditioned_point_indices_bzyx: torch.Tensor | None = None,
         conditioned_point_query_n6: torch.Tensor | None = None,
         return_conditioned_components: bool = False,
+        return_embeddings: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor | None]:
         if volume.ndim != 5:
             raise ValueError("volume must have shape B,C,D,H,W")
@@ -176,7 +182,10 @@ class FiberTrace3DNet(nn.Module):
                 "conditioned forward arguments require conditioned decoder mode"
             )
         raw = self.net(volume)
-        return torch.sigmoid(raw)
+        prediction = torch.sigmoid(raw[:, :self.output_channels])
+        if return_embeddings:
+            return {"prediction": prediction, "embeddings": raw[:, self.output_channels:]}
+        return prediction
 
     def encode_volume(self, volume: torch.Tensor) -> torch.Tensor:
         if not self.conditioned_decoder_enabled:
@@ -350,6 +359,7 @@ def presence_outputs(output: torch.Tensor) -> torch.Tensor:
 
 
 def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
+    embedding = EmbeddingConfig.from_mapping(config)
     model_cfg = dict(config.get("model_3d", config.get("model", {})))
     features_per_stage = _derive_features_per_stage(model_cfg)
     strides = _derive_unet_strides(
@@ -393,5 +403,6 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
             squeeze_excitation=bool(model_cfg.get("squeeze_excitation", False)),
             normalization=str(model_cfg.get("normalization", "batch")),
             output_stride=int(model_cfg.get("output_stride", 1)),
+            embedding_channels=embedding.channels if embedding.enabled else 0,
         )
     )

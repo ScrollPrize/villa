@@ -22,6 +22,7 @@ _TEST_METRIC_PATTERN = re.compile(
     r"loss_total=(?P<loss_total>[-+0-9.eE]+) "
     r"loss_direction=(?P<loss_direction>[-+0-9.eE]+) "
     r"loss_presence=(?P<loss_presence>[-+0-9.eE]+) "
+    r"(?:loss_embedding=[-+0-9.eE]+ embedding_negative_pairs=[-+0-9.eE]+ )?"
     r"angle_mean_deg=(?P<angle_mean_deg>[-+0-9.eE]+)"
 )
 
@@ -747,7 +748,7 @@ def main():
                TRITON_CACHE_DIR=str(args.output.resolve() / "triton_cache"))
     command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
                f"--nproc_per_node={world_size}", "-m", "vesuvius.neural_tracing.fiber_trace_3d.train",
-               str(config_path)]
+               str(config_path), "--unmanaged"]
     metadata = {"command": command, "start_unix": time.time(),
                 "cuda_visible_devices": env["CUDA_VISIBLE_DEVICES"],
                 "world_size": world_size,

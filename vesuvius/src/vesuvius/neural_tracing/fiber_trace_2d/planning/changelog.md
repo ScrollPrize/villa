@@ -1,3 +1,15 @@
+## 2026-09-11 — Embedding merge and exclusive bbox/inference profile
+
+- Merged fiber-training-embedding preserving embeddings, training sample progress,
+  RAM-only inference and native bbox work. Unified calibration/command exclusive
+  leases while retaining watchdog cleanup; logical224CPU inventory, bootstrap,
+  idle retirement and service-ownership exclusion reviewed/tested.
+- Exclusive8GPU classic profile reached523.19equivalent128³tiles/s versus prior
+  177.86–188.57/s. Coordinator stalls removed; GPU work dominates the buffered
+  40s window, with native-read long-tail waits still needing diagnosis. No claim
+  of full tracer completion or sustained long-run throughput. Tests, conflicts,
+  exact commands and complete breakdown:docs/embedding_manager_merge_profile_20260911.md.
+
 ## 2026-09-10 — Unified strict native bbox reads
 
 - Removed duplicate sample_zyx_block API/implementation. read_zyx is the single
@@ -124,6 +136,38 @@
   946 train / 50 test files. Added reusable splitter, source checksums, membership
   and geometry/branch audit, documentation and seven passing tests. Originals
   remain unchanged; split directories contain relative symlinks.
+## 2026-09-10 — Local Fiber3D embeddings
+
+- Production training now defaults to the cooperative supervisor and shared
+  default socket; only explicit --unmanaged permits debug/test bypass. Updated
+  S1a/embedding launch docs; calibration/request remain mandatory.
+
+- Fixed initial evaluation overflow from 128-bit loader seeds by applying the
+  existing PyTorch seed conversion at the embedding sampler boundary; tested
+  deterministic losses and gradients with real loader-generated seeds.
+
+- Merged S1a retraining/sample-based progress into embedding training. Added
+  the local S1a 16x8 embedding config with LR 0.01 and matching Paris4 normals;
+  retained sample counts through cooperative handoff and shared checkpoints.
+
+- Added opt-in 16-channel embeddings, balanced within-patch cosine supervision,
+  detached-presence negative sampling, and base-coordinate 20/80 Lasagna-normal
+  exclusion. Extended shared-slot transport, ordinary/cooperative sufficient
+  statistics, checkpoint handling and scalar logging. CPU geometry, real local
+  manifest and distributed-gradient tests cover the feature; GPU performance and
+  learning quality remain unmeasured.
+
+## 2026-09-10 — Cooperative GPU management and elastic Fiber3D training
+
+- Added standalone cooperative CPU/GPU/VRAM manager and opt-in Fiber supervisor,
+  shared bounded gradient accumulation, persistent canonical sample ownership,
+  RAM cohort handoff and resumable evaluation. Protocol v1 is locked after CPU
+  conformance/failure tests and real two-GPU S1A calibration, pause/resize and
+  gradient checks. BF16 compute is retained; resized trajectory differences and
+  the bounded accumulation cost are documented, not hidden by relaxed tolerances.
+- Normal cooperative tests have a five-minute total cap; long repeated timing
+  sweeps were cancelled at user request after one complete comparison. Native
+  prerequisites support missing HiGHS and initialize bounded worker pools.
 
 ## 2026-09-09 — Sample-based training progress
 
@@ -137,17 +181,7 @@
 - Added an opt-in fast-pipeline S1a NML reproduction config at
   global batch 128 with the recorded LR 0.01 / 100-step warmup recommendation.
   Added launch commands and historical comparison caveats.
-## 2026-09-10 — Cooperative GPU management and elastic Fiber3D training
 
-- Added standalone cooperative CPU/GPU/VRAM manager and opt-in Fiber supervisor,
-  shared bounded gradient accumulation, persistent canonical sample ownership,
-  RAM cohort handoff and resumable evaluation. Protocol v1 is locked after CPU
-  conformance/failure tests and real two-GPU S1A calibration, pause/resize and
-  gradient checks. BF16 compute is retained; resized trajectory differences and
-  the bounded accumulation cost are documented, not hidden by relaxed tolerances.
-- Normal cooperative tests have a five-minute total cap; long repeated timing
-  sweeps were cancelled at user request after one complete comparison. Native
-  prerequisites support missing HiGHS and initialize bounded worker pools.
 
 ## 2026-09-09 — Fiberlets/Fiber3D training integration
 

@@ -63,8 +63,8 @@ def nvidia_inventory(cpu_cores, gpu_uuids, reserve_bytes):
             found[gpu] = int(mib) * 1024**2 - reserve_bytes
     require(set(found) == set(gpu_uuids), "managed GPU UUID not found")
     require(all(v > 0 for v in found.values()), "reserve exceeds GPU memory")
-    physical = psutil.cpu_count(logical=False)
-    require(physical is not None and 0 < cpu_cores <= physical, "CPU budget exceeds physical core inventory")
+    logical = psutil.cpu_count(logical=True)
+    require(logical is not None and 0 < cpu_cores <= logical, "CPU budget exceeds logical CPU inventory")
     return {"cpu_cores": cpu_cores, "gpus": found}
 
 

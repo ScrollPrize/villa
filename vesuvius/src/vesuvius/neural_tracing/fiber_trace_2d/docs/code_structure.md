@@ -648,11 +648,11 @@ Ownership changed as follows:
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
   `--resume`, `--trace2cp-vis`, and the normal-training-only
   `--test-hang-diagnostics` flag.
-- Multi-GPU training uses the standard `torchrun` launch environment and does
-  not require config changes:
+- Production multi-GPU training uses one cooperative supervisor and a configured
+  resource request/memory calibration (see [managed launch](cooperative_training.md#managed-launch)):
 
   ```bash
-  torchrun --standalone --nproc_per_node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
+  python -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
   ```
 
   The configured `batch_size` is local to each rank, so the effective

@@ -139,15 +139,20 @@ service on import. Start the manager on explicitly available GPU UUIDs using its
 README, then run one CPU supervisor, **not torchrun**:
 
 ```bash
-python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json --manager-socket /path/to/manager.sock
+python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json
 ```
 
-Alternatively specify `training.cooperative.socket`. Ordinary configs without
-`cooperative` retain unmanaged behavior. Add this object at `training.cooperative`:
+Training automatically prefers `/run/villa-gpu-manager/manager.sock` when its
+location is writable/searchable or a listener is reachable; otherwise it uses
+`~/.local/run/villa-gpu-manager/manager.sock`. Optional `--manager-socket PATH`
+overrides `training.cooperative.socket`, which overrides that shared default.
+Only explicit `--unmanaged` selects the testing/debug path; failures never fall
+back to unmanaged execution. Do not use a fixed-rank launcher for production.
+The launcher does not silently infer a request or memory estimate from a socket.
+Add this object at `training.cooperative`:
 
 ```json
 {
-  "socket": "/path/to/manager.sock",
   "request": {
     "max_cpu_cores": 128,
     "max_gpus": 8,

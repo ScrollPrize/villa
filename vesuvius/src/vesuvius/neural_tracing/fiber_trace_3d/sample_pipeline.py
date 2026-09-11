@@ -293,6 +293,7 @@ class FiberTrace3DTrainingBatchPipeline:
         defer_cuda_value_augmentation: str | None = None,
         batch_sizes: tuple[int, ...] | None = None,
         single_core_load: bool = False,
+        embedding_stride: int = 0,
     ) -> None:
         if int(batch_count) <= 0:
             raise ValueError("batch_count must be positive")
@@ -312,6 +313,7 @@ class FiberTrace3DTrainingBatchPipeline:
         self.defer_cuda_value_augmentation = defer_cuda_value_augmentation
         self._leased: list[int] = []
         self.transport = FiberTrace3DSharedTensorSlots(
+            embedding_stride=embedding_stride,
             start_index=0,
             slot_count=int(slot_count),
             patch_shape_zyx=patch_shape_zyx,
@@ -413,6 +415,9 @@ def _batch_tensor_bytes(batch: FiberTrace3DBatch) -> int:
         int(value.numel()) * int(value.element_size())
         for value in vars(batch).values()
         if isinstance(value, torch.Tensor)
+    ) + sum(
+        int(item.eligible.numel()) * int(item.eligible.element_size())
+        for item in batch.embedding_geometry or () if item is not None and item.eligible is not None
     )
 
 

@@ -20,12 +20,14 @@ class Engine:
     """All mutations are transactional; caller persists before sending response."""
 
     def __init__(self, inventory, *, controller_uids, state=None, inspect=process_state,
-                 discover=descendants, max_tasks=512):
+                 discover=descendants, max_tasks=512, protected_processes=lambda: ()):
         validate_inventory(inventory)
         self.inventory = copy.deepcopy(inventory)
         self.controllers = set(controller_uids)
         self.inspect = inspect
         self.discover = discover
+        self.protected_processes = protected_processes
+        self._protected = list(protected_processes())
         self.max_tasks = max_tasks
         self.draining = False
         self.blocked_gpus = set()
@@ -35,6 +37,7 @@ class Engine:
             "policy_revision": 0, "next_order": 0, "dedup": {}, "retired_ids": []}
         require(self.state["inventory"] == inventory, "journal inventory differs; reconcile before changing pool")
         self.state["dedup"] = {}
+        self._exclude_service_members()
         if state is not None:
             for task in self.tasks.values():
                 task.setdefault("pausable", True)
@@ -54,6 +57,19 @@ class Engine:
     @property
     def tasks(self):
         return self.state["tasks"]
+
+    def _exclude_service_members(self):
+        """Service children are infrastructure, never workload ownership evidence.
+
+        Match full identities (not reusable PIDs) and preserve task roots. This
+        also removes mistakenly discovered service members in older journals.
+        """
+        for task in self.tasks.values():
+            task["processes"] = [p for p in task["processes"]
+                                 if p == task["root"] or p not in self._protected]
+
+    def _task_children(self, root, uid):
+        return [p for p in self.discover(root, uid) if p not in self._protected]
 
     def _public(self, task):
         return {k: copy.deepcopy(v) for k, v in task.items() if k not in ("token", "last_report", "processes", "fixed_allocation")}
@@ -128,6 +144,9 @@ class Engine:
         identity(request["id"])
         require(type(request["op"]) is str and type(request["body"]) is dict, "invalid operation/body")
         op, body = request["op"], request["body"]
+        if op in ("register", "report"):
+            self._protected = list(self.protected_processes())
+            self._exclude_service_members()
         if op == "hello":
             fields(body, ("versions", "required_capabilities"))
             require(type(body["versions"]) is list and all(type(v) is int for v in body["versions"])
@@ -169,6 +188,7 @@ class Engine:
             require(body["reconfigure_mode"] == "full_release", "only full_release capability supported")
             validate_request(body["request"], self.inventory)
             validate_process(body["root"])
+            require(body["root"] not in self._protected, "manager service cannot register as a task")
             require(key not in self.state["retired_ids"], "task ID is retired", "terminal")
             if key in self.tasks:
                 task = self._authorize(body, uid)
@@ -179,14 +199,14 @@ class Engine:
             require(not self.draining, "manager is draining", "unavailable")
             require(sum(not t["terminal"] for t in self.tasks.values()) < self.max_tasks, "active task capacity reached", "capacity")
             require(self.inspect(body["root"], uid) == "alive", "root identity/ownership not verifiable")
-            members = [body["root"]] + self.discover(body["root"], uid)
+            members = [body["root"]] + self._task_children(body["root"], uid)
             for t in self.tasks.values():
                 if t["terminal"]:
                     continue
                 # A new child can register between periodic scans. Refresh the
                 # existing tree *at registration*, not only the proposed tree.
                 for p in list(t["processes"]):
-                    for child in self.discover(p, t["uid"]):
+                    for child in self._task_children(p, t["uid"]):
                         if child not in t["processes"]:
                             t["processes"].append(child)
                 require(not any(p in t["processes"] for p in members), "overlapping task process trees")
@@ -279,6 +299,7 @@ class Engine:
             require(type(body["detail"]) is str and len(body["detail"]) <= 4096, "invalid report detail")
             require(type(body["processes"]) is list and len(body["processes"]) <= 4096, "invalid process list")
             for p in body["processes"]:
+                require(p not in self._protected, "manager service cannot be reported as a worker")
                 validate_process(p)
                 require(self.inspect(p, uid) == "alive", "reported worker identity not verifiable")
                 for other in self.tasks.values():
@@ -341,11 +362,13 @@ class Engine:
         self._reconcile()
 
     def scan_processes(self):
+        self._protected = list(self.protected_processes())
+        self._exclude_service_members()
         for key, task in self.tasks.items():
             if task["terminal"]:
                 continue
             for root in list(task["processes"]):
-                for child in self.discover(root, task["uid"]):
+                for child in self._task_children(root, task["uid"]):
                     if child not in task["processes"]:
                         task["processes"].append(child)
             states = [self.inspect(p, task["uid"]) for p in task["processes"]]

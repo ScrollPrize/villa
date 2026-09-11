@@ -35,17 +35,17 @@ The fast topology uses 128 total pipeline workers, 87 load-affinity workers, 204
 
 ## Launch
 
-Run from `/ephemeral/hendrik/fiber3d_train2`; absolute config paths and explicit PYTHONPATH select the current checkout. This run uses all eight GPUs. No training has been launched by the agent.
+Production runs must use the cooperative manager, not a fixed-rank launcher.
+The baseline JSON needs a `training.cooperative` resource request and matching
+measured calibration before launch; see [managed setup](cooperative_training.md#managed-launch).
+For the embedding variant use [the S1a embedding command](local_fiber_embeddings.md#s1a-eight-gpu-training).
 
 ```bash
-cd /ephemeral/hendrik/fiber3d_train2
-export PYTHONPATH=/home/hendrik/villa2/vesuvius/src:/home/hendrik/villa2/vesuvius:/home/hendrik/villa2
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONPATH=/home/hendrik/villa/gpu_manager/src:/home/hendrik/villa/vesuvius/src:/home/hendrik/villa/vesuvius:/home/hendrik/villa
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
 
-/home/hendrik/.venv_las/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  -m vesuvius.neural_tracing.fiber_trace_3d.train \
-  /home/hendrik/villa2/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_8gpu_fast.json
+/home/hendrik/.venv_las/bin/python -m vesuvius.neural_tracing.fiber_trace_3d.train \
+  /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_8gpu_fast.json
 ```
 
 Timestamped outputs are under `/ephemeral/hendrik/fiber3d_train2/runs/s1a_repro1_<timestamp>` for this first reproduction test. Evaluation, scalar logging and checkpoint saving remain every 100 steps; visualization every 500; retained snapshots every 10,000. Resume by appending `--resume /absolute/path/to/checkpoint`.

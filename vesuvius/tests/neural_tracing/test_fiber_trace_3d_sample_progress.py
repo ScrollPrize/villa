@@ -55,7 +55,8 @@ def test_legacy_checkpoint_sample_count_requires_known_global_batch():
 
 
 @pytest.mark.parametrize('prefix', ['test step=10 ', 'test samples=1280 update=10 '])
-def test_benchmark_parser_retains_optimizer_update_units(prefix):
-    match = _TEST_METRIC_PATTERN.match(prefix + 'loss_total=1.0 loss_direction=0.2 loss_presence=0.8 angle_mean_deg=5.0')
+@pytest.mark.parametrize('embedding', ['', 'loss_embedding=0.3 embedding_negative_pairs=32768 '])
+def test_benchmark_parser_retains_optimizer_update_units(prefix, embedding):
+    match = _TEST_METRIC_PATTERN.match(prefix + 'loss_total=1.0 loss_direction=0.2 loss_presence=0.8 ' + embedding + 'angle_mean_deg=5.0')
     assert match is not None
     assert int(match.group('step')) == 10

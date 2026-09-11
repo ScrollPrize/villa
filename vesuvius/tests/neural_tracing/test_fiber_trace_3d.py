@@ -577,6 +577,8 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
                 "branch0",
                 "branch1",
                 "selected_score",
+                "positive_embedding",
+                "negative_embedding",
             )
             for item in (
                 {
@@ -587,6 +589,8 @@ def test_global_loss_statistics_match_single_batch_value_and_ddp_gradient(monkey
                     "branch0": (torch.tensor(3.0), torch.tensor(3.0)),
                     "branch1": (torch.tensor(0.0), torch.tensor(3.0)),
                     "selected_score": (sum(s.selected_score_sum for s in statistics), torch.tensor(3.0)),
+                    "positive_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
+                    "negative_embedding": (torch.tensor(0.0), torch.tensor(0.0)),
                 }[name]
             )
         ]

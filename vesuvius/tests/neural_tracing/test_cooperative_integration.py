@@ -141,6 +141,7 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             payload = state.load()
             assert payload["progress"]["step"] == target
             assert payload["progress"]["samples_seen"] == target * 5
+            assert payload["progress"]["optimizer_global_batch_size"] == 5
             assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
         finally:
             if not cohort.closed:

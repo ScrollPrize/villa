@@ -2,6 +2,8 @@
 
 import os
 import socket
+import subprocess
+import sys
 import time
 import uuid
 
@@ -10,6 +12,7 @@ import pytest
 from villa_gpu_manager.cohort import ProcessCohort, _Channel
 from villa_gpu_manager.engine import Engine
 from villa_gpu_manager.policy import empty
+from villa_gpu_manager.processes import process_identity, process_state
 from villa_gpu_manager.supervisor import Supervisor
 
 
@@ -274,6 +277,57 @@ def test_real_spawn_join_handoff_and_resume():
         cohort.state.close()
         if resumed.state is not cohort.state:
             resumed.state.close()
+
+
+class LoaderDescendantAdapter(CpuAdapter):
+    """A loader that survives its rank, in a separate group of the same session."""
+
+    def __init__(self, rank, grant, state):
+        super().__init__(rank, grant, state)
+        self.loader = subprocess.Popen(
+            [sys.executable, "-c", "import os, signal, time; os.setpgid(0, 0); "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(120)"],
+            stdout=subprocess.PIPE, text=True)
+        assert self.loader.stdout.readline().strip() == "ready"
+        self.loader.stdout.close()
+
+    def run_unit(self):
+        return process_identity(self.loader.pid)
+
+
+@pytest.mark.parametrize("parent_exit", ["crash", "normal"])
+def test_cohort_stops_orphaned_loader_before_closed(parent_exit):
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    completed = []
+    cohort = ProcessCohort(LoaderDescendantAdapter,
+                          {"cpu_cores": 1, "gpus": {"GPU-fake": 100}},
+                          on_unit=lambda rows: completed.extend(rows))
+    try:
+        cohort.authorize()
+        until(cohort, lambda: cohort.ready)
+        cohort.start_unit()
+        until(cohort, lambda: bool(completed))
+        loader = completed[0]
+        if parent_exit == "crash":
+            cohort._children[0].kill()
+            cohort._children[0].join(timeout=5)
+            assert cohort._children[0].exitcode is not None
+        else:
+            cohort.drain()
+            with pytest.raises(RuntimeError, match="loader descendants remain alive"):
+                until(cohort, lambda: cohort.closed)
+        assert process_state(loader, os.getuid()) == "alive"
+        assert not cohort.closed
+        cohort.abort()
+        assert cohort.closed
+        assert process_state(loader, os.getuid()) == "dead"
+        assert unrelated.poll() is None
+    finally:
+        cohort.abort()
+        if cohort.state is not None:
+            cohort.state.close()
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
 
 
 class CpuTensorAdapter(CpuAdapter):

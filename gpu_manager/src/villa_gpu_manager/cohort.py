@@ -12,10 +12,13 @@ import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
 import os
 import pickle
+import signal
 import socket
 import time
 import traceback
 import uuid
+
+import psutil
 
 from .processes import process_identity
 from .protocol import MAX_FRAME, decode, encode
@@ -132,6 +135,9 @@ class _Channel:
 
 
 def _worker(sock, factory, rank, grant, initial_state, state_name):
+    # Loader processes inherit this session. Keep them separate from the CPU
+    # supervisor so failure cleanup can stop orphaned descendants as well.
+    os.setsid()
     channel = _Channel(sock)
     adapter = None
     try:
@@ -203,6 +209,7 @@ class ProcessCohort:
         if state is not None and not isinstance(state, SharedState):
             raise TypeError("cohort restore requires opaque SharedState, not a large spawn argument")
         self._children, self._channels = [], []
+        self._identities = {}
         self._phases, self._replies = {}, {}
         self.ready = self.idle = self.closed = self.done = self.authorized = False
         self.state = state
@@ -232,6 +239,7 @@ class ProcessCohort:
                     with _spawn_environment(values):
                         process.start()
                     self._children.append(process)
+                    self._identities[process.pid] = process_identity(process.pid)
                     self._phases[rank] = "starting"
                 finally:
                     child.close()
@@ -335,6 +343,8 @@ class ProcessCohort:
             if all(child.exitcode is not None for child in self._children):
                 if any(child.exitcode != 0 for child in self._children):
                     raise RuntimeError("cohort worker failed during shutdown")
+                if self._live_worker_sessions():
+                    raise RuntimeError("cohort loader descendants remain alive after worker shutdown")
                 if self.authorized:
                     self.state = SharedState(**self._replies[0][1])
                 self.closed = True
@@ -346,18 +356,56 @@ class ProcessCohort:
         if (self._closing or not self.ready or not self.idle) and self._clock() - self._started > timeout:
             raise TimeoutError(f"cohort timed out: phases={self._phases} unit={self._sequence} closing={self._closing}")
 
+    def _live_worker_sessions(self):
+        """Find owned sessions even after a rank exits and loaders are orphaned.
+
+        Workers/loaders must not detach from their session. An inaccessible
+        process inspection fails closed; only vanished processes and zombies
+        are considered gone. Check leader identity against PID reuse.
+        """
+        sessions = set(self._identities)
+        for pid in tuple(sessions):
+            try:
+                if process_identity(pid) != self._identities[pid]:
+                    sessions.remove(pid)
+            except psutil.NoSuchProcess:
+                pass
+        live = set()
+        for process in psutil.process_iter():
+            try:
+                session = os.getsid(process.pid)
+                if session in sessions and process.status() != psutil.STATUS_ZOMBIE:
+                    # Descendants may create a process group, but not a session.
+                    live.add((session, os.getpgid(process.pid)))
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                continue
+        return live
+
     def abort(self):
-        """Fatal failure: stop only this adapter's owned children, then join."""
-        for child in self._children:
-            if child.is_alive():
-                child.terminate()
-        for child in self._children:
-            child.join(timeout=5)
-            if child.is_alive():
-                child.kill()
-                child.join(timeout=5)
-            if child.is_alive():
-                raise RuntimeError(f"cannot join cohort worker {child.pid}; resources remain held")
+        """Stop owned worker sessions, including loaders, before claiming release."""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for _session, group in self._live_worker_sessions():
+                try:
+                    os.killpg(group, sig)
+                except ProcessLookupError:
+                    pass
+            # Also handle a newly spawned child not yet inside _worker/setsid.
+            for child in self._children:
+                if child.is_alive():
+                    (child.terminate if sig == signal.SIGTERM else child.kill)()
+            deadline = time.monotonic() + 5
+            while True:
+                for child in self._children:
+                    child.join(timeout=0)
+                if all(child.exitcode is not None for child in self._children) and not self._live_worker_sessions():
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            if all(child.exitcode is not None for child in self._children) and not self._live_worker_sessions():
+                break
+        else:
+            raise RuntimeError("cannot stop cohort worker/loader session; resources remain held")
         for channel in self._channels:
             channel.close()
         # A normal completed handoff is owned by the supervisor, not this cohort.

@@ -97,6 +97,7 @@ def _watch_group(fd, identity):
 class GatedCommand:
     """Child PID is verifiable before exec; group cleanup precedes release."""
     def __init__(self, command, environment):
+        self.closed = False
         read_fd, self.gate = os.pipe()
         try:
             self.process = subprocess.Popen(
@@ -130,6 +131,13 @@ class GatedCommand:
             os.close(read_fd)
 
     @property
+    def processes(self):
+        return self.identities
+
+    def abort(self):
+        self.close()
+
+    @property
     def identities(self):
         return [self.identity, self.watchdog_identity]
 
@@ -156,6 +164,7 @@ class GatedCommand:
             self.heartbeat = None
         if self.watchdog.wait(timeout=10) != 0:
             raise RuntimeError("exclusive watchdog failed; reservation retained")
+        self.closed = True
 
 
 def _termination_signals(function):
@@ -177,107 +186,184 @@ def _termination_signals(function):
     return call
 
 
-@_termination_signals
-def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-evaluation",
-                  environment=None, poll_interval=1.0, stop_event=None,
-                  client_factory=Client, cleanup_timeout=30.0):
-    """Run once under an exact full-VRAM grant for the selected managed GPUs.
 
-    No service startup or unmanaged fallback. Manager loss during a live rigid
-    grant permits continued work/reconnect, as specified by protocol v1. Cleanup
-    failure NEVER produces a zero-resource report. Returns the command exit code.
+class AdmissionCancelled(Exception):
+    """Stopped before workers were authorized."""
+
+
+class ExclusiveTask:
+    """Shared exact-grant lease for gated calibration cohorts and commands.
+
+    The cohort adapter supplies processes, authorize(), abort(), and closed.
+    Cleanup must verifiably join workers before the lease releases ownership.
     """
-    if not command or not gpu_uuids or len(set(gpu_uuids)) != len(gpu_uuids):
-        raise ValueError("command and distinct GPU UUIDs required")
-    if type(priority) is not int or poll_interval <= 0 or cleanup_timeout <= 0:
-        raise ValueError("integer priority and positive intervals required")
-    client = client_factory(socket)
-    child, request, grant = None, None, None
-    outcome = "failed"
+    def __init__(self, path, grant, *, label, priority=0, poll_seconds=.1,
+                 client_factory=Client, stop_event=None, cleanup_timeout=30.0):
+        if type(priority) is not int or poll_seconds <= 0 or cleanup_timeout <= 0:
+            raise ValueError("integer priority and positive intervals required")
+        if (type(grant["cpu_cores"]) is not int or grant["cpu_cores"] < 1 or
+            not grant["gpus"] or any(type(v) is not int or v < 1 for v in grant["gpus"].values())):
+            raise ValueError("exclusive task requires positive GPU budgets and CPUs")
+        sizes = list(grant["gpus"].values())
+        self.grant = deepcopy(grant)
+        # The locked scheduler scales CPU promises with the sum of GPU bytes.
+        # Compensate for heterogeneous full-device capacities so the resulting
+        # CPU grant is exact too (ceil in cores_for cancels this floor).
+        max_cpu = grant["cpu_cores"] * len(sizes) * max(sizes) // sum(sizes)
+        self.request = dict(max_cpu_cores=max_cpu, max_gpus=len(sizes),
+            min_vram_bytes_per_gpu=min(sizes), max_vram_bytes_per_gpu=max(sizes),
+            allowed_gpu_uuids=sorted(grant["gpus"]), priority=priority, exclusive=True)
+        self.client = client_factory(path)
+        self.label, self.poll_seconds = label, poll_seconds
+        self.stop_event, self.cleanup_timeout = stop_event, cleanup_timeout
+        self.cohort = None
+        self.epoch = self.generation = None
+        self.closed = False
 
-    def reconnect():
-        client.connect()
-        return client.register(label, request, pausable=False, adaptable=False)
+    def _reconnect(self):
+        self.client.connect()
+        return self.client.register(self.label, self.request, pausable=False, adaptable=False)
 
-    def stopped():
-        return stop_event is not None and stop_event.is_set()
-
-    try:
-        inventory = client.connect()["inventory"]
-        if not set(gpu_uuids) <= inventory["gpus"].keys():
-            raise ValueError("requested GPUs are not in the manager inventory")
-        expected = {g: inventory["gpus"][g] for g in gpu_uuids}
-        request = dict(max_cpu_cores=inventory["cpu_cores"], max_gpus=len(expected),
-                       min_vram_bytes_per_gpu=min(expected.values()),
-                       max_vram_bytes_per_gpu=max(expected.values()),
-                       allowed_gpu_uuids=list(gpu_uuids), priority=priority, exclusive=True)
-        task = client.register(label, request, pausable=False, adaptable=False)
-        while True:
-            if stopped():
-                outcome = "cancelled"
-                return 130
-            if task["phase"] == "initialize":
-                grant = deepcopy(task["granted"])
-                if grant["gpus"] != expected:
-                    raise RuntimeError("manager granted only part of the requested devices/VRAM; not launching")
-                env = dict(os.environ if environment is None else environment)
-                env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
-                child = GatedCommand(command, env)
-                task = client.report("applied", grant, processes=child.identities)
-                if task["phase"] != "applied" or task["granted"] != grant:
-                    raise RuntimeError("exclusive grant changed before command authorization")
-                child.authorize()
-                print(f"gpu-manager running task={client.task_id} priority={priority} GPUs={len(expected)} exclusive", flush=True)
-                break
-            if task["phase"] != "waiting":
-                raise RuntimeError(f"unexpected admission phase: {task['phase']}")
-            print(f"gpu-manager waiting: {task['reason']}", flush=True)
-            time.sleep(poll_interval)
-            task = client.poll()
-        while child.process.poll() is None:
-            child.members()
-            if stopped():
-                outcome = "cancelled"
-                return 130
-            time.sleep(poll_interval)
-            try:
-                task = client.poll() if client.socket is not None else reconnect()
-                if task["phase"] != "applied" or task["granted"] != grant:
-                    raise RuntimeError("manager changed the fixed exclusive grant")
-            except OSError:
-                client.close()
-                print("gpu-manager disconnected; retaining fixed grant while reconnecting", flush=True)
-            except ProtocolError as error:
-                if error.code not in ("stale_epoch", "unavailable"):
-                    raise
-                client.close()
-        code = child.process.returncode
-        outcome = "completed" if code == 0 else f"command_exit:{code}"
-        return code
-    finally:
+    def __enter__(self):
         try:
-            # No release until all owned CPU/GPU processes are verifiably gone.
-            # Closing the child gate also handles an uncertain applied response.
-            if child is not None:
-                child.close()
-            if client.task_id is not None and request is not None:
-                deadline = time.monotonic() + cleanup_timeout
+            inventory = self.client.connect()["inventory"]
+            if (self.grant["cpu_cores"] > inventory["cpu_cores"] or
+                any(size > inventory["gpus"].get(gpu, 0) for gpu, size in self.grant["gpus"].items())):
+                raise ValueError("exclusive budget exceeds managed inventory")
+            task = self.client.register(self.label, self.request, pausable=False, adaptable=False)
+            last = None
+            while True:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise AdmissionCancelled()
+                if task["phase"] == "initialize":
+                    break
+                if task["phase"] != "waiting":
+                    raise RuntimeError(f"unexpected admission phase: {task['phase']}")
+                status = (task["phase"], task.get("reason"))
+                if status != last:
+                    print(f"gpu-manager task={self.client.task_id} waiting: {status[1]}", flush=True)
+                    last = status
+                time.sleep(self.poll_seconds)
+                task = self.client.poll()
+            if task["granted"] != self.grant:
+                raise RuntimeError("manager granted only part of the requested CPU/devices/VRAM; not launching")
+            self.epoch, self.generation = self.client.epoch, task["generation"]
+            print(f"gpu-manager task={self.client.task_id} exclusive grant={self.grant}", flush=True)
+            return self
+        except BaseException:
+            self.close("failed before worker startup")
+            raise
+
+    def _check(self, task, phase):
+        if (self.client.epoch != self.epoch or task["generation"] != self.generation or
+            task["phase"] != phase or task["granted"] != self.grant):
+            raise RuntimeError("manager allocation changed or was lost")
+
+    def authorize(self):
+        if self.cohort is None:
+            raise RuntimeError("no gated cohort")
+        self._check(self.client.poll(), "initialize")
+        task = self.client.report("applied", self.grant, processes=self.cohort.processes)
+        self._check(task, "applied")
+        self.cohort.authorize()
+
+    def check(self):
+        try:
+            if self.client.socket is None:
+                task = self._reconnect()
+                # Retained-token reconnect may observe a new server epoch;
+                # the rigid applied allocation must still be exactly ours.
+                if task["phase"] != "applied" or task["granted"] != self.grant:
+                    raise RuntimeError("manager allocation changed during reconnect")
+                self.epoch, self.generation = self.client.epoch, task["generation"]
+            else:
+                task = self.client.poll()
+            self._check(task, "applied")
+        except (OSError, ProtocolError) as error:
+            if isinstance(error, ProtocolError) and error.code not in ("stale_epoch", "unavailable"):
+                raise
+            self.client.close()
+            print("gpu-manager disconnected; retaining fixed grant while reconnecting", flush=True)
+
+    def close(self, outcome="completed"):
+        if self.closed:
+            return
+        try:
+            if self.cohort is not None and not self.cohort.closed:
+                self.cohort.abort()
+            if self.cohort is not None and not self.cohort.closed:
+                raise RuntimeError("refusing release before workers join")
+            if self.client.task_id is not None:
+                deadline = time.monotonic() + self.cleanup_timeout
                 while True:
                     try:
-                        task = client.poll() if client.socket is not None else reconnect()
+                        task = self.client.poll() if self.client.socket is not None else self._reconnect()
                         if task["terminal"]:
                             break
-                        task = client.pause(True)
+                        task = self.client.pause(True)
                         if task["granted"] != empty():
-                            client.report("released", empty(), detail="command group stopped and joined")
-                        client.finish(outcome)
+                            self.client.report("released", empty(), detail="owned workers stopped and joined")
+                        self.client.finish(outcome)
                         break
                     except (OSError, ProtocolError) as error:
-                        client.close()
+                        self.client.close()
                         if isinstance(error, ProtocolError) and error.code not in ("stale_epoch", "unavailable", "terminal"):
                             raise
                         if time.monotonic() >= deadline:
-                            raise RuntimeError("command stopped but manager release unconfirmed; reservation retained") from error
-                        time.sleep(min(poll_interval, .2))
+                            raise RuntimeError("workers stopped but manager release unconfirmed; reservation retained") from error
+                        time.sleep(min(self.poll_seconds, .2))
+            self.closed = True
         finally:
-            client.close()
+            self.client.close()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close("completed" if exc is None else f"failed: {type(exc).__name__}")
+
+
+@_termination_signals
+def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-evaluation",
+                  environment=None, poll_interval=1.0, stop_event=None,
+                  client_factory=Client, cleanup_timeout=30.0, before_authorize=None):
+    """Gated command adapter around ExclusiveTask; no unmanaged fallback.
+
+    The caller may bootstrap the shared manager before calling. An independent
+    watchdog retains ownership and cleans up if this launcher is killed.
+    """
+    if not command or not gpu_uuids or len(set(gpu_uuids)) != len(gpu_uuids):
+        raise ValueError("command and distinct GPU UUIDs required")
+    client = client_factory(socket)
+    try:
+        inventory = client.connect()["inventory"]
+    finally:
+        client.close()
+    if not set(gpu_uuids) <= inventory["gpus"].keys():
+        raise ValueError("requested GPUs are not in the manager inventory")
+    grant = dict(cpu_cores=inventory["cpu_cores"],
+                 gpus={gpu: inventory["gpus"][gpu] for gpu in gpu_uuids})
+    lease = ExclusiveTask(socket, grant, label=label, priority=priority,
+        poll_seconds=poll_interval, stop_event=stop_event, client_factory=client_factory,
+        cleanup_timeout=cleanup_timeout)
+    outcome = "failed"
+    try:
+        lease.__enter__()
+        if before_authorize is not None:
+            before_authorize()
+        env = dict(os.environ if environment is None else environment)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
+        lease.cohort = child = GatedCommand(command, env)
+        lease.authorize()
+        while child.process.poll() is None:
+            child.members()
+            if stop_event.is_set():
+                outcome = "cancelled"
+                return 130
+            time.sleep(poll_interval)
+            lease.check()
+        code = child.process.returncode
+        outcome = "completed" if code == 0 else f"command_exit:{code}"
+        return code
+    except AdmissionCancelled:
+        outcome = "cancelled"
+        return 130
+    finally:
+        lease.close(outcome)

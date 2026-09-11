@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from .engine import Engine
-from .processes import peer_uid
+from .processes import peer_uid, process_identity, descendants
 from .protocol import MAX_FRAME, VERSION, ProtocolError, decode, encode, require
 
 
@@ -36,7 +36,7 @@ def save_journal(path, state):
 class Server:
     def __init__(self, path, inventory, *, allowed_uids=None, controller_uids=None,
                  shared_group=False, scan_seconds=60, max_connections=128, engine_options=None,
-                 monitor=None):
+                 monitor=None, idle_seconds=30):
         self.path = Path(path)
         self.allowed = set(allowed_uids if allowed_uids is not None else [os.getuid()])
         self.controllers = set(controller_uids if controller_uids is not None else [os.getuid()])
@@ -52,6 +52,9 @@ class Server:
         self.inventory = inventory
         self.engine_options = engine_options or {}
         self.monitor = monitor
+        require(idle_seconds > 0, "invalid idle timeout")
+        self.idle_seconds = idle_seconds
+        self.idle_since = None
 
     def __enter__(self):
         try:
@@ -85,7 +88,18 @@ class Server:
                 state = json.load(f)
         elif self.path.exists() or os.fstat(self.lock).st_size:
             raise RuntimeError("missing recovery journal; refusing empty-ledger takeover")
-        self.engine = Engine(self.inventory, controller_uids=self.controllers, state=state, **self.engine_options)
+        # A fully retired CPU ledger can adopt a corrected CPU inventory. Never
+        # reinterpret live reservations or change the managed GPU pool here.
+        if (state is not None and state["inventory"]["gpus"] == self.inventory["gpus"]
+                and state.get("override") is None
+                and all(t["terminal"] and not t["held"]["gpus"] and not t["held"]["cpu_cores"]
+                        and not t["granted"]["gpus"] and not t["granted"]["cpu_cores"]
+                        for t in state["tasks"].values())):
+            state["inventory"] = self.inventory
+        service_identity = process_identity()
+        options = {"protected_processes": lambda: [service_identity] + descendants(service_identity, os.getuid())}
+        options.update(self.engine_options)
+        self.engine = Engine(self.inventory, controller_uids=self.controllers, state=state, **options)
         if self.monitor is not None:
             self.engine.update_blocked_gpus(self.inventory["gpus"])
         save_journal(self.journal, self.engine.state)
@@ -103,6 +117,21 @@ class Server:
         self.listener.setblocking(False)
         self.selector.register(self.listener, selectors.EVENT_READ, None)
         self.last_scan = time.monotonic()
+        self.idle_since = self.last_scan
+
+    def idle_expired(self):
+        """Disconnect alone cannot release a live task or its reservations.
+
+        A short grace period bridges bootstrap inventory probes and real clients.
+        Dead disconnected tasks are retired by the regular process-tree scan.
+        """
+        if self.connections or any(not task["terminal"] for task in self.engine.tasks.values()):
+            self.idle_since = None
+            return False
+        now = time.monotonic()
+        if self.idle_since is None:
+            self.idle_since = now
+        return now - self.idle_since >= self.idle_seconds
 
     def _drop(self, conn):
         self.selector.unregister(conn)
@@ -128,6 +157,7 @@ class Server:
                     conn.setblocking(False)
                     state = {"uid": uid, "in": bytearray(), "out": bytearray(), "hello": False, "contact": time.monotonic()}
                     self.connections[conn] = state
+                    self.idle_since = None
                     self.selector.register(conn, selectors.EVENT_READ, state)
                 except BaseException:
                     conn.close()

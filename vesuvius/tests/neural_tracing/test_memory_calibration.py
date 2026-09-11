@@ -35,6 +35,22 @@ def test_calibration_bounds_observations_and_does_not_extrapolate():
     assert settings.batch_size == 128
 
 
+def test_socket_default_and_override_precedence(monkeypatch, tmp_path):
+    from villa_gpu_manager import paths
+    from villa_gpu_manager.paths import default_socket_path
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(paths, "_listening", lambda _: False)
+    monkeypatch.setattr(paths, "_writable_location", lambda _: False)
+    raw = configuration()
+    assert launch_settings(raw, socket="/tmp/override.sock").socket == "/tmp/override.sock"
+    assert launch_settings(raw).socket == "/tmp/example.sock"
+    del raw["training"]["cooperative"]["socket"]
+    assert launch_settings(raw).socket == default_socket_path()
+    assert default_socket_path() == str(tmp_path / ".local/run/villa-gpu-manager/manager.sock")
+    with pytest.raises(ValueError, match="socket path"):
+        launch_settings(raw, socket="")
+
+
 def test_operational_controls_do_not_change_calibration_identity():
     raw = configuration()
     original = config_fingerprint(raw)

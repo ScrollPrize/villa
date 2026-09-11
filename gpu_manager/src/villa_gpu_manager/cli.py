@@ -6,17 +6,18 @@ import os
 from pathlib import Path
 
 from .client import Client
+from .paths import default_socket_path
 from .processes import NvidiaMonitor, nvidia_inventory
 from .server import Server
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--socket", default=str(Path.home() / ".local/run/villa-gpu-manager/manager.sock"))
+    parser.add_argument("--socket", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve")
     serve.add_argument("--gpus", nargs="+", required=True, help="explicit managed NVIDIA GPU UUIDs")
-    serve.add_argument("--cpu-cores", type=int, required=True)
+    serve.add_argument("--cpu-cores", type=int, required=True, help="logical CPU capacity")
     serve.add_argument("--reserve-bytes", type=int, default=1024**3)
     serve.add_argument("--allow-uid", type=int, action="append", default=[])
     serve.add_argument("--controller-uid", type=int, action="append", default=[])
@@ -33,6 +34,8 @@ def main(argv=None):
     setting.add_argument("--until-task")
     overrides.add_parser("clear")
     args = parser.parse_args(argv)
+    if args.socket is None:
+        args.socket = default_socket_path()
     if args.command == "serve":
         inventory = nvidia_inventory(args.cpu_cores, args.gpus, args.reserve_bytes)
         with Server(args.socket, inventory, allowed_uids=[os.getuid(), *args.allow_uid],
@@ -41,6 +44,9 @@ def main(argv=None):
             while True:
                 try:
                     server.step()
+                    if server.idle_expired():
+                        print("No clients or live tasks remain; shutting down.", flush=True)
+                        return 0
                     if server.engine.draining and all(not t["granted"]["gpus"] and not t["granted"]["cpu_cores"]
                                                        for t in server.engine.tasks.values()):
                         return 0

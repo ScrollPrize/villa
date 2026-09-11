@@ -42,9 +42,22 @@ def resolve_gpu_uuids(devices, *, inventory_text=None, visibility=None):
     return selected
 
 
+def assert_gpus_idle(gpu_uuids):
+    """Fail closed on unmanaged CUDA processes before benchmark authorization."""
+    output = subprocess.check_output([
+        "nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+        text=True, timeout=10)
+    occupied = [line.strip() for line in output.splitlines()
+                if line.split(",", 1)[0].strip() in gpu_uuids]
+    if occupied:
+        raise RuntimeError("external GPU processes prevent an isolated benchmark: " + "; ".join(occupied))
+
+
 def launch_managed(command, *, devices, settings, socket=None, priority=None):
     from villa_gpu_manager.exclusive import run_exclusive
+    from villa_gpu_manager.bootstrap import ensure_manager
     selected = resolve_gpu_uuids(devices)
+    socket, _ = ensure_manager(socket or settings.get("socket"))
     command = [*command, "--unmanaged", "--devices", ",".join(str(i) for i in range(len(selected)))]
     environment = dict(os.environ)
     # Preserve explicit local import roots in the exec child, including when
@@ -53,7 +66,7 @@ def launch_managed(command, *, devices, settings, socket=None, priority=None):
     environment["PYTHONPATH"] = os.pathsep.join([
         str(repo / "vesuvius/src"), str(repo), str(repo / "gpu_manager/src"),
         environment.get("PYTHONPATH", "")])
-    return run_exclusive(command, socket=socket or settings.get("socket") or
-                         str(Path.home() / ".local/run/villa-gpu-manager/manager.sock"),
+    return run_exclusive(command, socket=socket,
                          gpu_uuids=selected, priority=settings.get("priority", 100) if priority is None else priority,
-                         label=settings.get("label", "fiber-evaluation"), environment=environment)
+                         label=settings.get("label", "fiber-evaluation"), environment=environment,
+                         before_authorize=lambda: assert_gpus_idle(selected))

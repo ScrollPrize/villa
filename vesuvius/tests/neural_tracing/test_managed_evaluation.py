@@ -22,6 +22,8 @@ def test_gpu_identity_mapping(monkeypatch):
 
 def test_launch_uses_local_ordinals_and_existing_wrapper(monkeypatch):
     from villa_gpu_manager import exclusive
+    from villa_gpu_manager import bootstrap
+    monkeypatch.setattr(bootstrap, "ensure_manager", lambda path: (path, {}))
     monkeypatch.setattr(managed, "resolve_gpu_uuids", lambda devices: ["GPU-cc", "GPU-aa"])
     recorded = {}
     def run(command, **kwargs):
@@ -34,6 +36,15 @@ def test_launch_uses_local_ordinals_and_existing_wrapper(monkeypatch):
     assert recorded["gpu_uuids"] == ["GPU-cc", "GPU-aa"]
     assert recorded["priority"] == 101
     assert str(managed.Path(managed.__file__).resolve().parents[3]) in recorded["environment"]["PYTHONPATH"]
+
+
+def test_external_gpu_processes_block_benchmark(monkeypatch):
+    monkeypatch.setattr(managed.subprocess, "check_output", lambda *a, **k: "GPU-aa, 123\n")
+    with pytest.raises(RuntimeError, match="external GPU processes"):
+        managed.assert_gpus_idle(["GPU-aa"])
+    managed.assert_gpus_idle(["GPU-bb"])
+    monkeypatch.setattr(managed.subprocess, "check_output", lambda *a, **k: "")
+    managed.assert_gpus_idle(["GPU-aa"])
 
 
 def test_live_run_routes_before_checkpoint_cuda_or_native(monkeypatch, tmp_path):

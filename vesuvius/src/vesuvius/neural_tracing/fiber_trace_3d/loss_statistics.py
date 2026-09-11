@@ -22,6 +22,16 @@ class LossStatistics:
     branch_count: torch.Tensor
     selected_score_sum: torch.Tensor
     selected_score_count: torch.Tensor
+    positive_embedding_sum: torch.Tensor | None = None
+    positive_embedding_count: torch.Tensor | None = None
+    negative_embedding_sum: torch.Tensor | None = None
+    negative_embedding_count: torch.Tensor | None = None
+
+    def __post_init__(self):
+        for name in ("positive_embedding_sum", "positive_embedding_count",
+                     "negative_embedding_sum", "negative_embedding_count"):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, torch.zeros_like(self.direction_count))
 
     def __add__(self, other: "LossStatistics") -> "LossStatistics":
         return LossStatistics(**{field: getattr(self, field) + getattr(other, field)

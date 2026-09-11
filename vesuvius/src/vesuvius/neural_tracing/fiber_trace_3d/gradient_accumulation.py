@@ -40,6 +40,13 @@ def effective_batch_partition(step, effective_batch_size, rank, world_size, micr
 class ComponentGradientAccumulator:
     def __init__(self, model, *, loss_scale=1.0, protect_fp16=False, gradient_observer=None):
         validate_sample_independent_model(model)
+        base_model = model
+        if hasattr(base_model, "_orig_mod"):
+            base_model = base_model._orig_mod
+        while hasattr(base_model, "module"):
+            base_model = base_model.module
+        self.components = COMPONENTS + (("positive_embedding", "negative_embedding")
+                                       if getattr(base_model, "embedding_channels", 0) else ())
         self.parameters = tuple(p for p in model.parameters() if p.requires_grad)
         if not self.parameters:
             raise ValueError("no trainable parameters")
@@ -53,7 +60,7 @@ class ComponentGradientAccumulator:
         self.local_scale_retries = 0
         sizes = [p.numel() for p in self.parameters]
         self.flat_banks = [torch.zeros(sum(sizes), device=self.parameters[0].device,
-                                      dtype=torch.float32) for _ in COMPONENTS]
+                                      dtype=torch.float32) for _ in self.components]
         self.banks = [[view.view_as(p) for view, p in zip(bank.split(sizes), self.parameters, strict=True)]
                       for bank in self.flat_banks]
         self.used = torch.zeros(len(self.parameters), device=self.parameters[0].device, dtype=torch.int32)
@@ -63,11 +70,13 @@ class ComponentGradientAccumulator:
     def add(self, statistics: LossStatistics):
         if self.finished:
             raise RuntimeError("accumulator already finalized")
+        if len(self.components) == 3 and (statistics.positive_embedding_sum.requires_grad or statistics.negative_embedding_sum.requires_grad):
+            raise ValueError("embedding statistics require an embedding-enabled accumulator model")
         self.statistics.add_(statistics.packed())
-        numerators = [getattr(statistics, f"{name}_sum") for name in COMPONENTS]
+        numerators = [getattr(statistics, f"{name}_sum") for name in self.components]
         differentiable = [i for i, n in enumerate(numerators) if n.requires_grad]
         for index, component in enumerate(differentiable):
-            count = getattr(statistics, f"{COMPONENTS[component]}_count").detach().float().clamp_min(1)
+            count = getattr(statistics, f"{self.components[component]}_count").detach().float().clamp_min(1)
             # Normalize by actual local support, not a dense-volume upper bound:
             # FP16 cannot recover values that underflowed before the FP32 bank.
             # Locally normalized gradients can overflow while a full-batch mean
@@ -109,7 +118,7 @@ class ComponentGradientAccumulator:
                 dist.all_reduce(bank, group=process_group)
         statistics = LossStatistics.unpack(self.statistics)
         weights = (direction_weight, presence_weight * positive_query_weight,
-                   presence_weight * negative_query_weight)
+                   presence_weight * negative_query_weight, 0.5, 0.5)
         with torch.no_grad():
             # Keep GradScaler's scale applied. The existing optimizer boundary
             # unscales/checks/clips exactly once, after globally combining banks.
@@ -119,7 +128,7 @@ class ComponentGradientAccumulator:
                     parameter.grad = None
                     continue
                 grad = torch.zeros_like(parameter)
-                for ci, component in enumerate(COMPONENTS):
+                for ci, component in enumerate(self.components):
                     count = getattr(statistics, f"{component}_count").clamp_min(1)
                     grad.add_(self.banks[ci][pi] * (weights[ci] / count))
                 parameter.grad = grad

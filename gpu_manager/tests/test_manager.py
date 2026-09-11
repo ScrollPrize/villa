@@ -318,7 +318,8 @@ def test_shared_directory_requires_sticky_and_private_journal(tmp_path):
 
 def test_real_socket_and_journal(tmp_path):
     directory = tmp_path / "private"
-    with Server(directory / "manager.sock", POOL) as server:
+    with Server(directory / "manager.sock", POOL,
+                engine_options={"protected_processes": lambda: []}) as server:
         stop = threading.Event()
         errors = []
         def serve():
