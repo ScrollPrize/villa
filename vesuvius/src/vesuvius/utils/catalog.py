@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import ssl
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
-import aiohttp
-import nest_asyncio
 import requests
 import yaml
 
@@ -17,6 +17,24 @@ from vesuvius.install.accept_terms import get_installation_path
 
 CatalogTree = Dict[str, Optional[Dict]]
 CatalogListing = Dict[str, str]
+
+
+def _require(module_name: str, used_for: str) -> ModuleType:
+    """Import a package only needed for refreshing the catalog from the data server.
+
+    Reading the packaged catalog (:func:`list_files`, :func:`list_cubes`) needs neither
+    of these, so they are imported at the point of use rather than at module import.
+    """
+
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised via tests
+        raise ModuleNotFoundError(
+            f"{used_for} needs the '{module_name}' package, which is not installed. "
+            f"Install it with 'pip install {module_name}', or install the 'all' extra. "
+            "Reading the packaged catalog with list_files() or list_cubes() does not "
+            "need it."
+        ) from exc
 
 
 def _config_dir() -> Path:
@@ -32,6 +50,8 @@ async def scrape_website(
     """Collect directory metadata and Zarr links from a remote listing."""
 
     from vesuvius.data.paths import parser
+
+    aiohttp = _require("aiohttp", "Refreshing the catalog from the data server")
 
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
@@ -52,6 +72,8 @@ async def collect_subfolders(base_url: str, ignore_list: List[str]) -> List[str]
     """Return subfolder paths beneath ``base_url`` ignoring provided patterns."""
 
     from vesuvius.data.paths import parser
+
+    aiohttp = _require("aiohttp", "Refreshing the catalog from the data server")
 
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
@@ -91,7 +113,9 @@ def update_list(
 
     loop = _ensure_loop()
     if loop.is_running():
-        nest_asyncio.apply()
+        _require(
+            "nest_asyncio", "Refreshing the catalog from inside a running event loop"
+        ).apply()
 
     tree, zarr_files = loop.run_until_complete(scrape_website(base_url, ignore_list))
     cubes_tree, _ = loop.run_until_complete(scrape_website(base_url_cubes, ignore_list))
