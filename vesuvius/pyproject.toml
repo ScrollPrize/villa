@@ -57,10 +57,6 @@ models = [
     "timm>=1.0.20",
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
-    # Monorepo-only C++ package (resolved via [tool.uv.sources]); provides the vc /
-    # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
-    # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
-    "volume-cartographer",
     "numba>=0.60.0",
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
@@ -92,6 +88,16 @@ models = [
     "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]
 # Rendering and geometry utilities
+# The volume-cartographer Python bindings (vc / vc3d). Monorepo-only, resolved
+# via [tool.uv.sources]; there is no PyPI wheel, so installing this extra builds
+# a large C++ project and needs its full toolchain (CMake, Ceres, Boost, OpenCV).
+# Only vesuvius.neural_tracing imports it -- ink_detection and the rest of the
+# ML stack do not -- so it stays out of `models`, which is otherwise wheels only.
+# Same reasoning as #1442, one level further in.
+neural-tracing = [
+    "volume-cartographer",
+]
+
 render = [
     "trimesh>=4.8.2",
     "opencv-python-headless>=4.11.0.86",
@@ -151,7 +157,7 @@ all = [
     "numba>=0.60.0",
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
-    "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
+    "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.neural-tracing]
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
     "einops>=0.8.1",
@@ -259,3 +265,19 @@ volume-cartographer = { path = "../volume-cartographer", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }
+# PyPI serves a CPU-only torch wheel on Windows, so `uv sync --extra models`
+# there ends with torch.cuda.is_available() False and the tutorial's own check
+# printing "cuda: False". Route torch to a CUDA index on Windows, the way
+# spiral-fitting/pyproject.toml already does for its own torch.
+#
+# Not cu128, which spiral-fitting uses: that index stops at torch 2.11 for
+# cp314/win_amd64, and this package requires >=2.12. cu126 and cu130 both
+# carry 2.12; cu130 matches the CUDA 13 line.
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
