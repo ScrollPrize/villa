@@ -2391,3 +2391,6 @@
   selected margin `0.40` with stored quality threshold `0.21` on the reference
   crop after a joint sweep. This tuned point reached 24/24 exact estimates at
   oracle round zero and remains disabled by default.
+# Saved-test analysis — 2026-09-11
+
+- Committed measured native/inference/integration state (75013f6cc, a238c4598, 175e3645b), then audited all100 saved full-cap8 traces without rerunning. Mean failure-ended reference span3.427927mm; per-scroll/collection counts, terminal handling, historical4.048877mm corpus reliability and reproducible calculation in docs/trace_restart_analysis_20260911.md/.json/.py.

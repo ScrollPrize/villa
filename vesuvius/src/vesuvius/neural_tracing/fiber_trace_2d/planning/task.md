@@ -1,5 +1,3 @@
-# Dynamic per-GPU inference batches
+# Saved full-test trace-length analysis
 
-Implement dynamic batching of ready inference tiles up to configurable max_batch_size per GPU. User's128–1024 refers to this cap, not global queue size; determine a practical range for256³ through measurement. Use existing shared inference worker/accumulator, preserve per-tile preprocessing and priorities, run partial batches immediately. Benchmark the same four fibers/eight directions with fresh inference outputs, cached inputs, all8GPUs exclusive, approved classic runner unchanged.
-
-Continuation: accelerating the fiber tracer is NOT complete at the small pilot. Fix the documented legacy CLI fixture failure; run the full locked50-fiber/100-direction test collection with fresh inference for batch1 and batching candidates. Investigate remaining bottlenecks and integrate a measured useful configuration. Persist all evidence and continue until the requested acceleration is implemented and validated or a genuine input/authority blocker remains. No training-data evaluation: full set means all existing locked test fibers across six collections/five scans.
+Commit completed tracer/inference work, then report average trace lengths before restart globally and per actual scroll from saved full cap8 heap results. No rerun. Answer whether sustained execution is GPU-bound from existing profiling.
