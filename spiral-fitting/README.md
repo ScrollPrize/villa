@@ -83,10 +83,10 @@ plateau point closer at 57 of the 75. Most of the gain is in the worst cases rat
 the lobe jumping predicts. Those 75 points fall in 11 intervals between estimate knots and are not independent, so
 treat a paired test across them as indicative rather than as a p-value.
 
-A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
-windings, 30,000 steps) ended with 50% of track points satisfied, against 12-38% for the three scrolls fitted from
-published umbilici, so the estimate is good enough for the tracks to pull the spiral into place, but it is a
-starting point for the fit rather than a substitute for a published umbilicus.
+A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100 windings, 30,000 steps) ended with 50% of track
+points satisfied, against 12-38% for the three scrolls fitted from published umbilici, so the estimate is good
+enough for the tracks to pull the spiral into place, but it is a starting point for the fit rather than a
+substitute for a published umbilicus.
 
 ```sh
 python estimate_umbilicus.py PHerc0358 \
