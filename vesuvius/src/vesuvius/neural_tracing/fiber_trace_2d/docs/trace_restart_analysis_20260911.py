@@ -1,7 +1,9 @@
-import json, math, statistics, hashlib
+import argparse, json, math, statistics, hashlib
 from pathlib import Path
 from collections import defaultdict
-root = Path('/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full')
+parser = argparse.ArgumentParser(description='Audit saved full100-direction replay artifacts; no inference or writes.')
+parser.add_argument('root', nargs='?', type=Path, default=Path('/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full'))
+root = parser.parse_args().root
 raw = (root/'summary.json').read_bytes()
 summary = json.loads(raw)
 assert summary['completed'] and summary['cases'] == 100
@@ -40,7 +42,10 @@ for path in sorted((root/'cases').glob('*/trace.json')):
     scale = p['base_voxel_size_um']/1000
     segments = replay['segments']
     assert len(replay['failures']) == len(case['failures'])
-    assert len(segments) == len(case['failures']) + 1
+    # A failure/reset reaching the reference endpoint leaves no terminal suffix.
+    assert len(segments) in (len(case['failures']), len(case['failures']) + 1)
+    if len(segments) == len(case['failures']):
+        assert math.isclose(replay['completed_reference_arc_base'], replay['reference_end_arc_base'])
     positive_spans = []
     for seg in segments:
         begin = seg['matches'][0]['search_begin_arc_base'] if seg['matches'] else seg['end_reference_arc_base']
@@ -63,6 +68,7 @@ def aggregate(rows):
     n=len(failed); length=sum(r['reference_mm'] for r in rows)
     credit=sum(r['credited_mm'] for r in rows)
     return dict(fibers=len(rows)//2, directions=len(rows), failures=n,
+        attempts=len(all_physical), terminal_spans=len(all_physical)-n,
         zero_length_failures=sum(x==0 for x in failed),
         failure_free_directions=sum(r['failure_free'] for r in rows),
         directed_reference_mm=length, credited_mm=credit,
@@ -70,7 +76,7 @@ def aggregate(rows):
         median_before_restart_mm=statistics.median(failed),
         p05_before_restart_mm=percentiles[4],
         p95_before_restart_mm=percentiles[94],
-        mean_all_attempts_including_terminal_and_zero_mm=credit/(n+len(rows)),
+        mean_all_attempts_including_terminal_and_zero_mm=credit/len(all_physical),
         mean_positive_seeded_span_mm=credit/sum(r['seeded'] for r in rows),
         corpus_reliability_mm=length/(n+1),
         mean_failed_polyline_mm=statistics.mean(physical),

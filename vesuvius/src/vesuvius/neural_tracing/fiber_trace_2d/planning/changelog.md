@@ -1,3 +1,8 @@
+## 2026-09-11 — Full collection snapshot tracing comparison
+
+- Archived classic per-scroll mean/median/P05/P95 with command/data/snapshot/code revisions in docs/benchmarks/classic_full_5scroll_20260911.md (commitaf1a59c67), linked existing native benchmark log. Deferred GT-heading initialization audit.
+- Collection best17k (native output_stride4) completed all50testfibers/100directions over5scrolls with fresh inference/exclusive8GPUs. Existing shared worker already handles native stride;85focused checks passed. Faster400.888s vs516.699s but worse2885vs1995failures, mean before restart2.486310vs3.427927mm. Classic retained as quality reference; docs/benchmarks/collection_best17k_full_20260911.md/.json contain full provenance/statistics. Read-only audit counts actual terminal suffixes instead of assuming one per direction.
+
 ## 2026-09-11 — Dynamic per-GPU inference batching
 
 - Shared tiled worker now supports immediately available dynamic model batches, individual conversion/normalization/result slots and unchanged accumulation. Positive inference.max_batch_size defaults1 and participates in cache identity; actual batch histograms/timings/CUDA peaks recorded. Legacy CLI fixtures repaired and terminal asynchronous-flush progress refreshed;105batching/demand/evaluation/profile tests and64preprocess tests/6subtests passed.
