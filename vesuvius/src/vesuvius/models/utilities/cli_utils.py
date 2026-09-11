@@ -1,6 +1,16 @@
 from pathlib import Path
 from vesuvius.models.utilities.data_format_utils import detect_data_format
 
+# Effective defaults for the training schedule when neither the CLI flag nor
+# the YAML tr_config sets a value. These are the values the CLI flags used to
+# carry as argparse defaults; they are applied here so that they no longer
+# override a value the user put in the config.
+CLI_SCHEDULE_DEFAULTS = {
+    "max_epoch": 1000,
+    "max_steps_per_epoch": 250,
+    "max_val_steps_per_epoch": 50,
+}
+
 
 def update_config_from_args(mgr, args):
     if args.input is not None:
@@ -81,17 +91,31 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Set random seed for train/val split: {mgr.seed}")
 
-    if args.max_epoch is not None:
-        mgr.max_epoch = args.max_epoch
-        mgr.tr_configs["max_epoch"] = args.max_epoch
+    # Training schedule: an explicit CLI flag wins, otherwise the YAML tr_config
+    # value is kept, otherwise the historical CLI default applies.
+    for key, fallback in CLI_SCHEDULE_DEFAULTS.items():
+        cli_value = getattr(args, key, None)
+        if cli_value is not None:
+            value = int(cli_value)
+        elif key in mgr.tr_configs and mgr.tr_configs[key] is not None:
+            value = int(mgr.tr_configs[key])
+        else:
+            value = fallback
+        setattr(mgr, key, value)
+        mgr.tr_configs[key] = value
 
-    if args.max_steps_per_epoch is not None:
-        mgr.max_steps_per_epoch = args.max_steps_per_epoch
-        mgr.tr_configs["max_steps_per_epoch"] = args.max_steps_per_epoch
-
-    if args.max_val_steps_per_epoch is not None:
-        mgr.max_val_steps_per_epoch = args.max_val_steps_per_epoch
-        mgr.tr_configs["max_val_steps_per_epoch"] = args.max_val_steps_per_epoch
+    # Validation frequency: flag wins, otherwise the YAML value ConfigManager
+    # already loaded. Validate whichever source it came from, since the YAML
+    # value is now live too.
+    val_every_n = getattr(args, 'val_every_n', None)
+    if val_every_n is not None:
+        mgr.val_every_n = int(val_every_n)
+        mgr.tr_configs["val_every_n"] = int(val_every_n)
+        if mgr.verbose:
+            print(f"Validate every {val_every_n} epoch(s)")
+    if int(getattr(mgr, 'val_every_n', 1)) < 1:
+        source = "--val-every-n" if val_every_n is not None else "tr_config.val_every_n"
+        raise ValueError(f"{source} must be >= 1, got {mgr.val_every_n}")
 
     if getattr(args, 'profile_augmentations', False):
         mgr.profile_augmentations = True
