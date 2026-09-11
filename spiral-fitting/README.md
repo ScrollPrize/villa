@@ -47,6 +47,120 @@ specifically):
 }
 ```
 
+## Fitting a scroll that ships only tracks (the 2025-2026 scans)
+
+The spiral datasets published for the 2025-2026 scans (`dl.ash2txt.org/datasets/spiral_datasets/<scroll>/<volume>/`)
+contain a `tracks/` directory and nothing else: no `umbilicus.json`, no `outer_shell/`, no patches, no
+`lasagna_inputs/`. The headless fitter still needs three more things. This is the layout that worked for
+PHerc0125, PHerc0826, PHerc0211 and PHerc0358 (30,000-step fits on one RTX 3090 under WSL2):
+
+```
+<dataset>/
+  spiral-scroll.json                  # see "Scroll specification" above
+  umbilicus.json                      # published, or estimated (below)
+  tracks/<volume>_surface_m7_L0_th0.2.dbm                # 9-13 GB, from spiral_datasets
+  tracks/<volume>_surface_m7_L0_th0.2.dbm.crossings.npz  # 2-3 GB, same place
+  tracks/<volume>_surface_m7_L0_th0.2.extract.json
+  lasagna_inputs/las_008_nx.ome.zarr/2        # copied from the open-data bucket, z-slab only
+  lasagna_inputs/las_008_ny.ome.zarr/2
+  lasagna_inputs/las_008_grad_mag.ome.zarr/2
+```
+
+**Umbilicus.** The open-data bucket publishes one for some scrolls under
+`<scroll>/representations/umbilicus/<volume>-umbilicus-<date>.json` (PHerc0125, PHerc0826 and PHerc0211 at the
+time of writing). For the others, `estimate_umbilicus.py` derives control points from the organizers' surface
+prediction: at each of N heights it takes the largest connected component of the sheet mask at pyramid level 3,
+fills it, and uses the point farthest from the mask boundary (the innermost point of the winding pack) as the
+core. Against the published PHerc0125 umbilicus the estimate is 0.2-2.6 mm off through the middle of the scroll
+and worse within a few millimetres of the ends. A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
+windings, 30,000 steps) ended with 50% of track points satisfied, against 12-38% for the three scrolls fitted from
+published umbilici, so the estimate is good enough for the tracks to pull the spiral into place.
+
+```sh
+python estimate_umbilicus.py PHerc0358 \
+    PHerc0358/representations/predictions/surface/<volume>-surface-<run>-surface-m7-L0-th0.2.zarr/ \
+    <dataset>/umbilicus.json
+```
+
+**Lasagna inputs.** The normal fields live at
+`<scroll>/representations/predictions/lasagna/<volume>-lasagna-<run>/<scroll>_{nx,ny,grad_mag}.ome.zarr`; for
+these scrolls group `"2"` is a 4x downsample, so `spiral-scroll.json` needs `"normal_zarr_group": "2"` and
+`"lasagna_scale": 4`. The fitter only reads the z-window it optimises, so copying the chunks for
+`[z_begin/4 - 50, z_end/4 + 50)` of each store into `lasagna_inputs/las_008_<name>.ome.zarr/2` (keeping the
+chunk grid and the store's `.zattrs`/`.zarray`) is enough; a 1,500-slice band is about 2 GB for the three stores.
+
+**Configuration.** The headless CLI takes configuration overrides as JSON in the `FIT_SPIRAL_CONFIG_OVERRIDES`
+environment variable and the output root in `FIT_SPIRAL_OUT_DIR`. With tracks only, the switches that matter are:
+
+```sh
+export FIT_SPIRAL_OUT_DIR=/path/to/out
+export FIT_SPIRAL_CONFIG_OVERRIDES='{
+  "z_begin": 9000, "z_end": 10500, "optimizer_num_training_steps": 30000,
+  "input_use_tracks": true,
+  "input_disable_patches": true,
+  "loss_weight_shell_outer": 0, "loss_weight_shell_patch_radius": 0,
+  "dense_spacing_mode": "grad_mag", "loss_weight_dense_spacing": 0,
+  "shell_outer_winding_idx": 90, "model_gap_expander_num_windings": 90
+}'
+python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
+```
+
+- `input_use_tracks` defaults to `false`; without it the fit silently optimises against the umbilicus and the
+  normals only.
+- The two shell-loss weights must be `0` because there is no outer shell (the winding model needs one too, so
+  `dense_spacing_mode` cannot be `winding_model`); `phase` spacing needs a surf-SDT store these datasets do not
+  have, hence `grad_mag` with weight `0`.
+- `shell_outer_winding_idx` and `model_gap_expander_num_windings` default to 130, which is Scroll 1's winding
+  count. The exporter writes windings `[output_first_winding, shell_outer_winding_idx)`, so leaving 130 on a
+  60-winding scroll exports dozens of windings that lie outside the papyrus. Set both to a little above the
+  scroll's own count. Counting sheet crossings along radial rays through the organizers' surface prediction at
+  three heights (`winding_counts.py`) gives:
+
+  | scroll | median crossings per ray (three heights) | used |
+  |---|---|---|
+  | PHerc0125 | 58 | 90 |
+  | PHerc0826 | 53-60 | 70 |
+  | PHerc0211 | 60-77 | 90 |
+  | PHerc0257 | 67-68 | 90 |
+  | PHerc0358 | 69-82 | 100 |
+  | PHerc0191 | 70-83 | |
+  | PHerc0813 | 72-79 | |
+  | PHerc0800 | 79-88 | |
+  | PHerc0268 | 86-101 | |
+
+**Per-scroll presets.** `configs/scrolls/` holds one overrides file per track-ready scroll with the switches above and
+  the winding count that produced a clean fitted mesh, plus the estimated umbilicus for the scrolls that have no
+  published one (control points in full-resolution voxel coordinates, loadable by `--umbilicus` or as the dataset's
+  `umbilicus.json`). Set `z_begin`/`z_end` for the band you want and merge the rest:
+
+  ```sh
+  export FIT_SPIRAL_CONFIG_OVERRIDES="$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); d.update(z_begin=8000, z_end=9500, optimizer_num_training_steps=30000); print(json.dumps(d))' configs/scrolls/PHerc0358.json)"
+  cp configs/scrolls/PHerc0358_umbilicus_est.json <dataset>/umbilicus.json   # only when the dataset has none
+  python fit_spiral.py --dataset <dataset> --cache ~/spiral_cache
+  ```
+
+  | scroll | preset | windings | umbilicus | validated by |
+  |---|---|---|---|---|
+  | PHerc0125 | `configs/scrolls/PHerc0125.json` | 90 | published | 30k-step fit, clean continuous sheets (w089); 24+23 windings swept |
+  | PHerc0826 | `configs/scrolls/PHerc0826.json` | 70 | published | 44 windings swept over two z-bands |
+  | PHerc0211 | `configs/scrolls/PHerc0211.json` | 90 | published | 50 windings swept over two z-bands |
+  | PHerc0257 | `configs/scrolls/PHerc0257.json` | 90 | estimated (`configs/scrolls/PHerc0257_umbilicus_est.json`) | 51.7% of track points satisfied; 46 renders |
+  | PHerc0358 | `configs/scrolls/PHerc0358.json` | 100 | estimated (`configs/scrolls/PHerc0358_umbilicus_est.json`) | 50.4% of track points satisfied; 54 renders |
+  | PHerc0813 | `configs/scrolls/PHerc0813.json` | 80 | estimated (`configs/scrolls/PHerc0813_umbilicus_est.json`) | fitted and swept on Kaggle T4 (ACW); 46 renders |
+  | PHerc0191 | `configs/scrolls/PHerc0191.json` | 100 | estimated (`configs/scrolls/PHerc0191_umbilicus_est.json`) | fitted and swept on Kaggle T4 (CW); 54 renders |
+
+  PHerc0800 (median crossings 79-88), PHerc0268 (median crossings 86-101) ship an estimated umbilicus only; their winding counts have not been fitted yet, so start from
+  `shell_outer_winding_idx` a little above the median crossings and check the exported outer windings against the
+  papyrus boundary.
+
+  The count is a lower bound where sheets are pressed together, so the value used should sit above the range.
+
+**What to expect.** A 1,500-slice band runs at 7-8 it/s on an RTX 3090 (about 70 minutes for 30,000 steps) and
+reports 12-18% satisfied track points at the end. Meshes are written to
+`<out>/<date>_<scroll>_slice-<z_begin>-<z_end>_0-patch/meshes/fitted/w<NNN>` as tifxyz at scale 0.05. Fits with
+tracks and no outer shell need #1732 (or `"input_use_outer_shell": false`); a truncated `crossings.npz` from an
+interrupted download needs #1735 (or delete the file so it is rebuilt).
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
