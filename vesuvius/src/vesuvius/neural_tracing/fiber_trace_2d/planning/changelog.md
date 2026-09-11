@@ -1,3 +1,13 @@
+## 2026-09-11 — Collection run182306 best3k full test
+
+- Captured active training run's best3k/384000samples snapshot (ee4595cd…),
+  evaluated all50testfibers/100directions with fresh inference and exclusive8GPUs.
+  Completed404.521s,2144failures,mean before restart3.298736mm,
+  median0.137113mm,P05/P95 0.001733/17.413631mm. Improved versus previous
+  collection17k but not classic globally. All paired metrics/commands/provenance
+  in docs/benchmarks/collection_182306_best3k_full_20260911.md/.json.
+  No production changes;100artifacts audited,manager released,training resumed.
+
 ## 2026-09-11 — Full collection snapshot tracing comparison
 
 - Archived classic per-scroll mean/median/P05/P95 with command/data/snapshot/code revisions in docs/benchmarks/classic_full_5scroll_20260911.md (commitaf1a59c67), linked existing native benchmark log. Deferred GT-heading initialization audit.

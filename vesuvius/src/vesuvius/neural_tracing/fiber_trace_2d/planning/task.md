@@ -1,3 +1,3 @@
-# Collection snapshot full five-scroll evaluation
+# Full test of collection run 20260911_182306
 
-Record the current classic percentile table with measured code revision, exact command, data and checkpoint in the existing benchmark log; log the GT-heading issue for later and commit before the next run. Then evaluate the best snapshot from collection_20260909_5scroll_128_sd1_16x8_20260910_162446 on the FULL locked50-fiber/100-direction test across5scrolls (user clarified full, not four-fiber pilot). Reuse approved runner and exclusive8GPU manager. Adapt only if needed for native stride4 output; no GT-heading change in this comparison.
+Evaluate all50locked test fibers across5scrolls in both directions using best.pt from collection_20260909_5scroll_128_sd1_16x8_20260911_182306. Same tracer/inference geometry and metrics as previous full evaluation, fresh inference, shared fetched sources, exclusive8GPU manager. Freeze selected weights because training is active. Continue to completion and persist/report all metrics side by side, not only means. No GT-heading changes or training modifications.
