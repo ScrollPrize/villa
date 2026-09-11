@@ -71,11 +71,19 @@ PHerc0125, PHerc0826, PHerc0211 and PHerc0358 (30,000-step fits on one RTX 3090 
 and PHerc0826 at the time of writing; PHerc0139's is annotated on a different scan from its only surface store).
 For the others, `estimate_umbilicus.py` derives control points from the organizers' surface
 prediction: at each of N heights it takes the largest connected component of the sheet mask at pyramid level 3,
-fills it, and uses the point farthest from the mask boundary as the core. That point is the centre of the widest
-lobe of the section, which is the winding centre when the section is round and not otherwise. Measured against the
-published PHerc0125 umbilicus at its default `n_z=12`, over the 75 published control points inside the estimate's
-z coverage, the lateral error is 0.4-12.5 mm (median 5.0); restricted to the interior, away from the last tenth at
-each end, it is 0.4-9.1 mm (median 4.1). A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
+fills it, and takes as the core the point of the distance-to-boundary plateau (within 0.9 of the maximum) nearest
+the centroid of the component. `core=argmax` selects the previous behaviour, the plain argmax of the distance
+transform, and reproduces files written before that option existed byte for byte. The plateau rule exists because
+the distance transform is nearly flat over a wide region, so its argmax picks one pixel out of many almost equal
+ones and jumps between lobes of the section from one slice to the next.
+
+Measured against the published PHerc0125 umbilicus at the default `n_z=12`, over the 75 published control points
+inside the estimate's z coverage: plateau 0.1-6.5 mm (median 2.2), argmax 0.5-11.0 mm (median 3.0), with the
+plateau point closer at 57 of the 75. Most of the gain is in the worst cases rather than the median, which is what
+the lobe jumping predicts. Those 75 points fall in 11 intervals between estimate knots and are not independent, so
+treat a paired test across them as indicative rather than as a p-value.
+
+A PHerc0358 fit from an estimated umbilicus (slices 8000-9500, 100
 windings, 30,000 steps) ended with 50% of track points satisfied, against 12-38% for the three scrolls fitted from
 published umbilici, so the estimate is good enough for the tracks to pull the spiral into place, but it is a
 starting point for the fit rather than a substitute for a published umbilicus.
