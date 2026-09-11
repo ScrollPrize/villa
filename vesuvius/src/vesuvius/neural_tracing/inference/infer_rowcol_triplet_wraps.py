@@ -124,7 +124,7 @@ class _VcVolumeLevel:
         if any(v == 0 for v in read_shape):
             return np.empty(tuple(read_shape), dtype=self.dtype)
         return np.asarray(
-            self._volume.read_zyx(starts, read_shape, level=self._level, missing_policy="all_fill")
+            self._volume.read_zyx(starts, read_shape, level=self._level)
         )
 
 

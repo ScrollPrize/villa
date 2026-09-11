@@ -19,6 +19,7 @@ import select
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -186,24 +187,27 @@ def implementation_identity():
     return files
 
 
+def native_reader_options(settings):
+    """Identical native-cache budgets for live evaluation and its profiler."""
+    return dict(cache_budget_bytes=int(settings.get("input_cache_bytes", 4 << 30)),
+                io_threads=int(settings.get("input_io_threads", 16)),
+                decode_threads=int(settings.get("input_decode_threads", 8)), sample_threads=1)
+
+
 class NativeTileReader:
-    """Reuse fast training's strict selected-level native block sampler."""
-    def __init__(self, sampler, geometry, dtype):
+    """Read exact-level integer bboxes directly from the shared native cache."""
+    def __init__(self, sampler, geometry, dtype, *, profile_samples=None):
         self.sampler, self.geometry, self.dtype = sampler, geometry, np.dtype(dtype)
+        self.profile_samples = profile_samples
 
     def __call__(self, tile):
-        spec = tiled._tile_read_spec(self.geometry.shape, (0, 0, 0), *tile,
-                                     self.geometry.tile, self.geometry.border)
-        if spec.slices_zyx is None:
-            return tiled._finalize_tile_read(None, spec)
-        start = np.array([s.start for s in spec.slices_zyx], dtype=np.int64)
-        shape = tuple(s.stop - s.start for s in spec.slices_zyx)
-        sampled = self.sampler.sample_block_zyx(start, shape)
-        # Native uint8/uint16 samples are exactly representable in float32.
-        # Return original integer values; shared inference owns conversion and
-        # normalization (including the historical uint16 // 257 convention).
-        raw = sampled.image.astype(self.dtype)
-        return tiled._finalize_tile_read(raw, spec)
+        start = tuple(int(v) - self.geometry.border for v in tile)
+        shape = (self.geometry.tile,) * 3
+        with demand.stage_timing(self.profile_samples, "reader.native_block"):
+            raw = self.sampler.volume.read_zyx(start, shape, self.sampler.level)
+        if raw.dtype != self.dtype or raw.shape != shape or not raw.flags.c_contiguous:
+            raise ValueError("native bbox reader returned incompatible shape/dtype/layout")
+        return raw
 
 
 def create_demand_store(cache, source_identity, model_identity, geometry, effective, snapshot, level, settings):
@@ -223,7 +227,8 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         tiled.write_lasagna_product_manifest(output_path=cache / "inference.lasagna.json", products=products,
             base_shape_zyx=source_identity["base_shape"], provenance_json="inference.json")
         atomic_write(cache / "inference.json", {"source": source_identity, "model": model_identity,
-            "coverage": "partial; live.sqlite is required for readiness", "coarser_pyramids": "not generated"})
+            "coverage": "partial; readiness requires complete published sibling chunks; live scheduling state is RAM-only",
+            "coarser_pyramids": "not generated"})
     return demand.DemandStore(cache, {"source": source_identity, "model": model_identity},
         geometry, adapter, output, accumulator_dtype=settings.get("accumulator_dtype", "float16"),
         accumulator_layout=settings.get("accumulator_layout", "flat"),
@@ -232,9 +237,23 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
         prepare_output=prepare_output)
 
 
-def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False):
+def run(config_path, checkpoint, devices, native_binary, model_config=None, *, render=False,
+        manager_socket=None, manager_priority=None, unmanaged=False):
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
+    manager = config.get("gpu_manager", {})
+    if not unmanaged and (manager.get("enabled", False) or manager_socket is not None):
+        from .managed_evaluation import launch_managed
+        command = [sys.executable, "-m", __name__, "--config", str(config_path),
+                   "--checkpoint", str(checkpoint), "--native-binary", str(native_binary)]
+        # __name__ is __main__ under python -m; use the importable module name.
+        command[2] = "vesuvius.neural_tracing.fiber_trace_3d.live_evaluate"
+        if model_config is not None:
+            command.extend(["--model-config", str(model_config)])
+        if render:
+            command.append("--render")
+        return launch_managed(command, devices=devices, settings=manager,
+                              socket=manager_socket, priority=manager_priority)
     base = config_path.parent
     if config.get("version") != 1 or not config.get("sources"):
         raise ValueError("evaluation config requires version1 and explicit sources")
@@ -286,9 +305,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             if not 0 <= level <= 30:
                 raise ValueError("invalid input level")
             sampler = Vc3dCoordinateSampler(input_path, level=level, cache_root=str(cache_root),
-                cache_budget_bytes=int(settings.get("input_cache_bytes", 4 << 30)),
-                io_threads=int(settings.get("input_io_threads", 16)),
-                decode_threads=int(settings.get("input_decode_threads", 8)), sample_threads=1)
+                **native_reader_options(settings))
             volume_shape = tuple(int(v) for v in sampler.volume.shape_at(level))
             base_shape = tuple(int(v) for v in sampler.volume.shape_at(0))
             root_attrs = input_root_attributes(sampler.volume)
@@ -356,6 +373,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             authenticated = False
             waiters = {}
             last_report = time.monotonic()
+            queue_log = None
+            last_queue_report = 0.0
             while not authenticated or native.poll() is None or waiters or (pool is not None and pool.busy):
                 if select.select([connection], [], [], 0.005)[0]:
                     received = connection.recv(65536)
@@ -399,11 +418,22 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 if pool is None and queued:
                     pool = demand.DemandWorkerPool(stores, readers, device_list,
                         slots_per_gpu=int(settings.get("slots_per_gpu", 2)), input_workers=int(settings.get("input_workers", 8)),
+                        input_slots=settings.get("input_slots"),
                         result_slots=settings.get("result_slots"),
                         accumulator_workers=settings.get("accumulator_workers"),
                         flush_workers=int(settings.get("flush_workers", 4)))
+                    queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
+                    print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
+                          f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
+                          f"result_slots={pool.stats['result_slots']}", flush=True)
                 if pool is not None:
                     pool.pump()
+                    if time.monotonic() - last_queue_report >= 1:
+                        row = {"elapsed_seconds": time.monotonic() - started, "phase": "tracing",
+                               "trace_requests_waiting": len(waiters), **pool.queue_snapshot()}
+                        queue_log.write(json.dumps(row) + "\n")
+                        print("queues " + demand.format_queue_snapshot(row) + f" trace_waiters={len(waiters)}", flush=True)
+                        last_queue_report = time.monotonic()
                 for request_id, targets in list(waiters.items()):
                     if all(stores[key].ready(origin) for key, origin in targets):
                         connection.sendall((json.dumps({"version": 1, "type": "ready", "request_id": request_id}) + "\n").encode())
@@ -420,7 +450,13 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             if pool is not None:
                 while pool.busy:
                     pool.pump()
+                    if time.monotonic() - last_queue_report >= 1:
+                        queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
+                            "phase": "draining", "trace_requests_waiting": 0, **pool.queue_snapshot()}) + "\n")
+                        last_queue_report = time.monotonic()
                     time.sleep(0.005)
+                queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
+                    "phase": "complete", "trace_requests_waiting": 0, **pool.queue_snapshot()}) + "\n")
             atomic_write(Path(evaluation["output"]) / "inference_summary.json", {
                 "wall_seconds": time.monotonic() - started, "worker_pool": pool.stats if pool else None,
                 "sources": {key: store.stats for key, store in stores.items()},
@@ -469,9 +505,14 @@ def main():
     parser.add_argument("--devices", required=True, help="explicit CUDA indices, e.g. 0,1; no CPU production inference")
     parser.add_argument("--native-binary", default="vc_fiber_trace_metric")
     parser.add_argument("--render", action="store_true", help="render reference/traced strips directly after each completed case")
+    parser.add_argument("--manager-socket", help="request fixed exclusive GPUs from this manager")
+    parser.add_argument("--manager-priority", type=int, help="explicit exclusive-job priority (default100)")
+    parser.add_argument("--unmanaged", action="store_true", help="explicitly bypass configured GPU management")
     args = parser.parse_args()
-    run(args.config, args.checkpoint, args.devices, args.native_binary, args.model_config, render=args.render)
+    return run(args.config, args.checkpoint, args.devices, args.native_binary, args.model_config,
+               render=args.render, manager_socket=args.manager_socket,
+               manager_priority=args.manager_priority, unmanaged=args.unmanaged)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

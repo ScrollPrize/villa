@@ -1,3 +1,3 @@
-# Task: GPU-manager integration for parallel tracing
+# Merge embedding branch and profile with exclusive ownership
 
-Pause queue/profiling work and commit current changes. Merge fiber-training-manager into fiber-training-retrain, preserving both sides. Parallel live evaluation must request exclusive GPUs with high explicit priority, allowing cooperative training to pause and resume after evaluation.
+Merge fiber-training-embedding into current fiber-training-retrain, preserving both sides' features and all bbox/inference work. Review introduced GPU-manager logical-CPU/lifecycle changes. Ensure regression/performance tests use correct native binding and GPU profiling runs only under an exclusive manager grant. Run the pending tracer/bbox inference profile and report bottleneck.

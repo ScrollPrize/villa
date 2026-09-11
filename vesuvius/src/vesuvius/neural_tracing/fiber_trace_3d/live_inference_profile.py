@@ -12,6 +12,7 @@ from collections import Counter
 from pathlib import Path
 import pstats
 import subprocess
+import sys
 import threading
 import time
 
@@ -32,6 +33,103 @@ def distribution(values):
     return {"count": len(values), "sum": float(values.sum()), "mean": float(values.mean()),
             "p50": float(np.percentile(values, 50)), "p95": float(np.percentile(values, 95)),
             "min": float(values.min()), "max": float(values.max())}
+
+
+def responsiveness_probe(operation, *, iterations=12, interval=.002):
+    """Diagnostic only: does a second Python thread run during this operation?
+
+    A delayed heartbeat includes GIL contention AND OS scheduling. The operation
+    and its result destruction are timed separately; no production path changes.
+    """
+    if iterations < 1 or interval <= 0:
+        raise ValueError("positive probe iterations and interval required")
+    from lasagna.inference_profiling import stage_timing
+    ready, stop = threading.Event(), threading.Event()
+    beats, stages = [], []
+    def heartbeat():
+        beats.append(time.perf_counter())
+        ready.set()
+        while True:
+            ended = stop.wait(interval)
+            beats.append(time.perf_counter())
+            if ended:
+                return
+    thread = threading.Thread(target=heartbeat, name="inference-profile-heartbeat", daemon=True)
+    thread.start()
+    ready.wait()
+    try:
+        for _ in range(iterations):
+            with stage_timing(stages, "operation"):
+                result = operation()
+            with stage_timing(stages, "result_release"):
+                del result
+            time.sleep(0)  # Allow a beat between independent diagnostic trials.
+    finally:
+        stop.set()
+        thread.join()
+    return {"iterations": iterations, "heartbeat_interval_seconds": interval,
+            "heartbeat_gap_seconds": distribution(np.diff(beats)),
+            "heartbeat_timestamps": [b - beats[0] for b in beats],
+            "stages": stage_report(stages, beats[0], beats[-1]),
+            "note": "Isolated diagnostic, not pipeline throughput. Heartbeat gaps include GIL and OS scheduling. Operation excludes separately timed returned-buffer destruction."}
+
+
+def native_reader_probes(sampler, reader, tile, geometry):
+    """Separate no-I/O allocation, warm native read and Python conversion cost."""
+    # Match NativeTileReader's entire bbox, including declared-fill edges.
+    start = tuple(int(v) - geometry.border for v in tile)
+    shape = (geometry.tile,) * 3
+    outside = tuple(n + 32 for n in geometry.shape)
+    def empty(side, with_mask=False):
+        result = sampler.volume.read_zyx(outside, (side,) * 3, sampler.level,
+                                         with_mask=with_mask, with_stats=True)
+        if result[2]["requested_chunks"] != 0:
+            raise RuntimeError("allocation-only control unexpectedly touched chunks")
+        return result
+    def native():
+        return sampler.volume.read_zyx(start, shape, sampler.level)
+    del_result = native()  # Warm the exact region before the isolated tests.
+    del del_result
+    probes = {}
+    for name, operation in (("idle_sleep", lambda: time.sleep(.03)),
+                            ("allocation_only_128", lambda: empty(128)),
+                            ("allocation_only_512", lambda: empty(512)),
+                            ("allocation_only_512_with_mask", lambda: empty(512, True)),
+                            ("warm_native", native), ("warm_reader_wrapper", lambda: reader(tile))):
+        probes[name] = responsiveness_probe(operation)
+        gap = probes[name]["heartbeat_gap_seconds"]
+        print(f"reader-probe {name} heartbeat_ms mean={gap['mean']*1000:.3f} p95={gap['p95']*1000:.3f} max={gap['max']*1000:.3f}", flush=True)
+    module = sys.modules[type(sampler.volume).__module__]
+    path = Path(module.__file__).resolve()
+    return {"native_module": str(path), "native_module_sha256": sha256_file(path),
+            "gil_enabled": sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else None,
+            "source_dtype": str(sampler.volume.dtype), "real_read_shape": shape,
+            "real_read_start": start, "probes": probes}
+
+
+def stage_report(records, begin, end):
+    """Summarize only fully contained completed stages; expose crossings apart."""
+    rows = []
+    groups = {}
+    crossings = Counter()
+    for record in records:
+        if record["end_seconds"] <= begin or record["start_seconds"] >= end:
+            continue
+        contained = record["start_seconds"] >= begin and record["end_seconds"] <= end
+        row = {**record, "start_seconds": record["start_seconds"] - begin,
+               "end_seconds": record["end_seconds"] - begin, "contained": contained}
+        rows.append(row)
+        if contained:
+            groups.setdefault(record["stage"], []).append(record)
+        else:
+            crossings[record["stage"]] += 1
+    metrics = ("wall_seconds", "thread_cpu_seconds", "off_cpu_seconds_estimate",
+               "ru_minflt", "ru_majflt", "ru_nvcsw", "ru_nivcsw")
+    return {"contained": {name: {metric: distribution([r[metric] for r in samples if metric in r])
+                                for metric in metrics if any(metric in r for r in samples)}
+                           for name, samples in groups.items()},
+            "crossing_counts": dict(crossings), "records": rows,
+            "note": "Summaries exclude crossing-window records. Only completed stages available at cutoff are recorded. CPU/counters are calling-thread only, not native helper threads. Reader durations overlap. Nested/inclusive phases cannot be summed. Wall-minus-CPU includes all blocking/descheduling, not specifically GIL waits. Collection overhead is mostly outside timed stages; small clock and optional detail-sampling overhead remains inside."}
 
 
 def process_counters(pid, proc_root=Path("/proc")):
@@ -107,14 +205,15 @@ class ProcessMonitor:
                 "note": "Counters absent if unsupported/denied; zero blkio delay may mean kernel delay accounting disabled. wchan=0 may mean running or hidden. Wait counts are samples, not exact durations."}
 
 
-def profile_workload(workload):
+def profile_workload(workload, *, devices_override=None):
     started = time.perf_counter()
     params = workload["profile"]
     output = Path(params["output_root"]) / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     output.mkdir(parents=True, exist_ok=False)
     atomic_write(output / "workload.json", workload)
     print(f"profile output={output}", flush=True)
-    report = {"status": "initializing", "devices": workload["devices"], "torch": str(torch.__version__),
+    selected_devices = devices_override or workload["devices"]
+    report = {"status": "initializing", "devices": selected_devices, "torch": str(torch.__version__),
               "cuda": torch.version.cuda, "workload_sha256": json_digest(workload),
               "timing_note": "warmup/setup/cleanup excluded; windows end after current synchronous pump; phase timings overlap"}
     try:
@@ -123,7 +222,7 @@ def profile_workload(workload):
             raise ValueError("checkpoint identity changed")
         report["checkpoint_sha256"] = workload["checkpoint_sha256"]
         report["implementation"] = live.implementation_identity()
-        devices = [torch.device(f"cuda:{int(i)}") for i in workload["devices"].split(",")]
+        devices = [torch.device(f"cuda:{int(i)}") for i in selected_devices.split(",")]
         if not devices or not torch.cuda.is_available():
             raise ValueError("profiling requires CUDA")
         report["gpu_names"] = [torch.cuda.get_device_name(d) for d in devices]
@@ -137,7 +236,7 @@ def profile_workload(workload):
         binding = next(s for s in workload["sources"] if s["id"] == params["source_id"])
         cache_root = subprocess.check_output([str(Path(workload["native_binary"]).with_name("vc_cache_root"))], text=True).strip()
         sampler = Vc3dCoordinateSampler(binding["input_volume"], level=binding["input_level"],
-            cache_root=cache_root, cache_budget_bytes=4 << 30, io_threads=16, decode_threads=8, sample_threads=1)
+            cache_root=cache_root, **live.native_reader_options(settings))
         attrs = live.input_root_attributes(sampler.volume)
         live.validate_input_lattice(attrs, binding["input_level"])
         shape = tuple(sampler.volume.shape_at(binding["input_level"]))
@@ -158,10 +257,15 @@ def profile_workload(workload):
         with ExitStack() as cleanup:
             store = cleanup.enter_context(live.create_demand_store(output / "demand", source, model_identity,
                 geometry, effective, checkpoint, binding["input_level"], settings))
-            reader = live.NativeTileReader(sampler, geometry, sampler.volume.dtype)
+            reader_stage_samples = []
+            reader = live.NativeTileReader(sampler, geometry, sampler.volume.dtype,
+                                          profile_samples=reader_stage_samples)
             for index in sorted(requested):
                 store.request(index, background=True)
             tile = min(store.priorities)
+            if params.get("reader_responsiveness_probe", False):
+                report["reader_responsiveness"] = native_reader_probes(sampler, reader, tile, geometry)
+                atomic_write(output / "report.json", report)
             raw = reader(tile)
             adapter = store.model_adapter
             model = adapter.load_model(device=devices[0])
@@ -217,10 +321,11 @@ def profile_workload(workload):
                         with lock:
                             phase_values.setdefault(name, []).append(time.perf_counter() - begin)
                 return call
-            for name in ("begin_complete", "contribution_done", "publication_done", "_publish", "_fingerprints", "_check_disk_budget"):
+            for name in ("begin_complete", "contribution_done", "publication_done", "_publish", "_cached_chunk_complete", "_sync_published", "_check_disk_budget"):
                 setattr(store, name, instrument(name, getattr(store, name)))
             pool = cleanup.enter_context(demand.DemandWorkerPool({"source": store}, {"source": instrument("native_read", reader)},
                 devices, slots_per_gpu=settings["slots_per_gpu"], input_workers=settings["input_workers"],
+                input_slots=settings.get("input_slots"),
                 result_slots=params.get("result_slots", settings.get("result_slots")),
                 accumulator_workers=settings.get("accumulator_workers"),
                 flush_workers=int(settings.get("flush_workers", 4)), profile_pipeline=True))
@@ -252,7 +357,9 @@ def profile_workload(workload):
             begin = time.perf_counter()
             last_report = begin
             queue_samples = [{"elapsed_seconds": 0.0, **pool.queue_snapshot()}]
-            profiler.enable()
+            cprofile_enabled = bool(params.get("cprofile", True))
+            if cprofile_enabled:
+                profiler.enable()
             while pool.busy and time.perf_counter() - begin < params["pipeline_seconds"]:
                 pool.pump()
                 time.sleep(.005)
@@ -263,16 +370,20 @@ def profile_workload(workload):
                     print(f"pipeline measured={time.perf_counter()-begin:.1f}s tiles={pool.stats['tiles']-baseline['tiles']} received={len(pool.profile_samples)-sample_start} published={store.stats['published_chunks']-baseline_store['published_chunks']} accumulating={len(pool.accumulating)} free_results={len(pool.free)}", flush=True)
                     print("queues " + demand.format_queue_snapshot(queue_samples[-1]), flush=True)
                     last_report = time.perf_counter()
-            profiler.disable()
+            if cprofile_enabled:
+                profiler.disable()
             elapsed = time.perf_counter() - begin
+            detailed_stages = stage_report(tuple(pool.stage_samples) + tuple(reader_stage_samples),
+                                           begin, begin + elapsed)
             queue_samples.append({"elapsed_seconds": elapsed, **pool.queue_snapshot()})
             with lock:
                 measured_phases = {k: tuple(v) for k, v in phase_values.items()}
             os_metrics = monitor.finish() if monitor is not None else None
-            profiler.dump_stats(str(output / "coordinator.prof"))
-            stream = io.StringIO()
-            pstats.Stats(profiler, stream=stream).strip_dirs().sort_stats("cumulative").print_stats(45)
-            (output / "coordinator.txt").write_text(stream.getvalue())
+            if cprofile_enabled:
+                profiler.dump_stats(str(output / "coordinator.prof"))
+                stream = io.StringIO()
+                pstats.Stats(profiler, stream=stream).strip_dirs().sort_stats("cumulative").print_stats(45)
+                (output / "coordinator.txt").write_text(stream.getvalue())
             samples = pool.profile_samples[sample_start:]
             count = pool.stats["tiles"] - baseline["tiles"]
             published = store.stats["published_chunks"] - baseline_store["published_chunks"]
@@ -286,7 +397,11 @@ def profile_workload(workload):
                 "initial_backlog": initial_backlog, "final_backlog": backlog(),
                 "received_tiles": len(samples), "received_tiles_per_second": len(samples) / elapsed,
                 "all_workers_warm_before_measurement": len(warmed_worker_ids) == len(devices),
-                "instrumented_with_cprofile": True,
+                "instrumented_with_cprofile": cprofile_enabled,
+                "cprofile_note": "Diagnostic call graph only. On this runtime the capture includes background-thread activity; overlapping cumulative times are not a coordinator wall-time partition. Use explicit coordinator_stage_seconds and detailed per-thread stages for timing attribution.",
+                "coordinator_stage_seconds": {k: pool.stats[k] - baseline[k] for k in baseline if k.startswith("pump_")},
+                "detailed_stages": detailed_stages,
+                "input_copy_seconds_summed": pool.stats["input_copy_seconds"] - baseline["input_copy_seconds"],
                 "requested_window_seconds": params["pipeline_seconds"], "wall_seconds": elapsed,
                 "window_overrun_seconds": max(0, elapsed - params["pipeline_seconds"]), "completed_tiles": count,
                 "published_chunks": published, "published_voxels_upper_bound": published * geometry.chunk**3,

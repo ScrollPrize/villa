@@ -1,3 +1,44 @@
+## 2026-09-10 — Unified strict native bbox reads
+
+- Removed duplicate sample_zyx_block API/implementation. read_zyx is the single
+  blocking exact-level native uint8/uint16 bbox reader; read_xyz/slicing delegate.
+  Optional masks/statistics incur no large allocation/per-voxel work when omitted.
+  Missing/outside voxels use declared fill; errors/unresolved/malformed data throw.
+  Allocation/fill/prefetch/copy release the GIL. Python bbox scale fallbacks removed.
+- Inference now reads raw integer full bboxes without the training float adapter.
+  Boundary reflection intentionally changed to declared fill per user instruction.
+  Training-facing interface and arbitrary-coordinate sampling preserved.
+- Installed updated local binding;76targeted tests,3training-adapter tests,
+  expanded24native/profiling tests and native replay wrapper passed. Independent
+  review passed. Post-change GPU comparison blocked by absent manager whose saved
+  224-core inventory conflicts with112physical-core validation; awaiting approval
+  before reconciling shared state. No unmeasured speedup claim.
+- API contract, build/test commands and limitations:
+  docs/unified_bbox_reads_20260910.md.
+
+## 2026-09-10 — Native reader stall diagnosis
+
+- Added opt-in isolated native allocation/read heartbeat controls, disabled by
+  default. No-I/O512³ calls took63.7ms while delaying a2ms Python heartbeat up
+  to65.4ms; C++ buffer initialization occurs before releasing the GIL. Prewarmed
+  native read168ms versus wrapper398ms also exposes integer/float round-trip cost.
+- No optimization implemented yet. GDB attachment denied; source-backed in-process
+  controls used instead. Exact results, sample counts, limitations and commands:
+  docs/live_inference_reader_stalls_20260910.md. Ten profiling tests passed.
+
+## 2026-09-10 — RAM-only demand inference state
+
+- Removed SQLite; existing coordinator dictionaries/sets/deques hold all live
+  scheduling and contribution state. Static provenance and finalized Zarr output
+  remain, with lazy restart validation and safe owned-scratch cleanup. No replacement
+  journal or done markers; unidentified and legacy DB-only roots refused untouched.
+- Sixty targeted tests and independent review passed. Same managed8GPU profile:
+  177.9999→177.8633 fully accumulated128³-equivalent tiles/s: no end-to-end speedup.
+  State updates now0.000275s total, but coordinator waits shifted elsewhere.
+  Commands, stage measurements and integrity/restart limitations are in
+  docs/live_inference_ram_state_20260910.md. Prior manager/profiling history archived
+  in docs/managed_inference_profiling_history_20260910.md.
+
 ## 2026-09-10 — Queue visibility checkpoint (paused)
 
 - Shared queue snapshot and short-profile sampled time series added;51 relevant

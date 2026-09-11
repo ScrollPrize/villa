@@ -3736,14 +3736,15 @@ def test_vc3d_coordinate_sampler_direct_block_read_uses_binding() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int, bool]] = []
 
-        def sample_zyx_block(
+        def read_zyx(
             self,
             offset: tuple[int, int, int],
             shape: tuple[int, int, int],
             level: int,
-            blocking: bool,
+            *, with_mask: bool, with_stats: bool,
         ):
-            self.calls.append((tuple(offset), tuple(shape), int(level), bool(blocking)))
+            assert with_mask and with_stats
+            self.calls.append((tuple(offset), tuple(shape), int(level), True))
             image = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
             valid = np.ones(shape, dtype=np.uint8)
             stats = {

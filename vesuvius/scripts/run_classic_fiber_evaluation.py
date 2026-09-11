@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(REPO / "vesuvius/src"), str(REPO)]
+sys.path[:0] = [str(REPO / "vesuvius/src"), str(REPO), str(REPO / "gpu_manager/src")]
 
 DEFAULT_CONFIG = REPO / "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_classic_collection.json"
 
@@ -174,11 +174,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "profile"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--devices", help="runtime device selection (default from workload)")
+    parser.add_argument("--manager-socket")
+    parser.add_argument("--manager-priority", type=int)
+    parser.add_argument("--unmanaged", action="store_true", help="explicit bypass of configured manager")
     args = parser.parse_args()
     workload = load_workload(args.config)
+    devices = args.devices or (workload["pilot_devices"] if args.mode == "pilot" else workload["devices"])
+    manager = workload["evaluation"].get("gpu_manager", {})
+    if args.mode in ("pilot", "full", "profile") and not args.unmanaged and (
+            manager.get("enabled", False) or args.manager_socket is not None):
+        from vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation import launch_managed
+        return launch_managed([sys.executable, str(Path(__file__).resolve()), args.mode,
+                               "--config", str(args.config.resolve())],
+                              devices=devices, settings=manager, socket=args.manager_socket,
+                              priority=args.manager_priority)
     if args.mode == "profile":
         from vesuvius.neural_tracing.fiber_trace_3d.live_inference_profile import profile_workload
-        profile_workload(workload)
+        profile_workload(workload, devices_override=devices)
         return
     CHECKPOINT, SPLIT, ROOT, BINARY = (Path(workload[k]) for k in ("checkpoint", "split_root", "output_root", "native_binary"))
     validate_only = args.mode.startswith("validate-")
@@ -217,9 +230,8 @@ def main():
     if validate_only:
         print("Checkpoint, locked split membership/content, config and normal manifests verified.", flush=True)
         return
-    run(ROOT / f"{args.mode}.json", CHECKPOINT,
-        workload["pilot_devices"] if args.mode == "pilot" else workload["devices"], BINARY)
+    return run(ROOT / f"{args.mode}.json", CHECKPOINT, devices, BINARY, unmanaged=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

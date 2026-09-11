@@ -16,6 +16,51 @@ def test_distribution_reports_samples_and_percentiles():
     assert result["p95"] == pytest.approx(3.85)
 
 
+def test_responsiveness_probe_records_and_cleans_up_on_error():
+    import threading
+    import time
+    from vesuvius.neural_tracing.fiber_trace_3d.live_inference_profile import responsiveness_probe
+    report = responsiveness_probe(lambda: time.sleep(.005), iterations=3, interval=.001)
+    assert report["iterations"] == 3 and report["heartbeat_gap_seconds"]["count"] > 0
+    assert report["stages"]["contained"]["operation"]["wall_seconds"]["count"] == 3
+    assert report["stages"]["contained"]["result_release"]["wall_seconds"]["count"] == 3
+    def fail():
+        raise RuntimeError("probe fixture")
+    with pytest.raises(RuntimeError, match="probe fixture"):
+        responsiveness_probe(fail)
+    assert not any(t.name == "inference-profile-heartbeat" for t in threading.enumerate())
+    with pytest.raises(ValueError, match="positive"):
+        responsiveness_probe(fail, iterations=0)
+
+
+def test_native_reader_settings_and_classic_concurrency():
+    import json
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import native_reader_options
+    config_path = Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_classic_collection.json"
+    config = json.loads(config_path.read_text())
+    settings = config["evaluation"]["inference"]
+    assert settings["input_workers"] == 128
+    assert settings["input_slots"] == 256 and settings["result_slots"] == 128
+    assert settings["accumulator_layout"] == "chunk-major"
+    assert config["evaluation"]["workers"] == 0  # native automatic CPU budget, not a case limit
+    assert native_reader_options(settings) == dict(cache_budget_bytes=4 << 30,
+        io_threads=64, decode_threads=8, sample_threads=1)
+    assert native_reader_options({})["io_threads"] == 16  # legacy callers unchanged
+
+
+def test_stage_summary_excludes_crossing_window_from_totals():
+    from vesuvius.neural_tracing.fiber_trace_3d.live_inference_profile import stage_report
+    rows = [{"stage": "submit", "start_seconds": start, "end_seconds": end,
+             "thread_id": 1, "wall_seconds": end - start, "thread_cpu_seconds": .1}
+            for start, end in [(1, 2), (9, 11), (11, 12), (19, 21), (21, 22)]]
+    report = stage_report(rows, 10, 20)
+    assert report["contained"]["submit"]["wall_seconds"]["sum"] == 1
+    assert report["contained"]["submit"]["wall_seconds"]["count"] == 1
+    assert report["crossing_counts"] == {"submit": 2}
+    assert len(report["records"]) == 3
+    assert report["records"][0]["start_seconds"] == -1
+
+
 def test_process_counters_parse_linux_fields_and_missing(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.live_inference_profile import process_counters
     import os

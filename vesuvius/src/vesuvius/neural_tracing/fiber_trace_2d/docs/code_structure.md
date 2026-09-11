@@ -1226,8 +1226,11 @@ The important behavior is:
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
     are fetched/decoded and pinned before sampling starts;
-  - calls `Volume.sample_zyx_block(..., blocking=True)` for regular
-    axis-aligned block reads used by native 3D Trace2CP;
+  - calls `Volume.read_zyx(..., with_mask=True, with_stats=True)` for regular
+    axis-aligned block reads used by native 3D Trace2CP; the duplicate native
+    block-sampling API is removed. Native values remain uint8/uint16; only the
+    training-facing adapter converts to its float image interface. Standalone
+    demand inference bypasses that conversion and reads integer bboxes directly;
   - rejects blocking results that do not report strict requested-level sampling
     (`requested_level_only=true`, `fallback_levels=0`);
   - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency

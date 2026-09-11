@@ -2,6 +2,28 @@
 
 ## Native live reference evaluation (standalone first)
 
+- Classic evaluation uses the exclusive GPU-manager launcher at explicit priority
+  100. Admission precedes model/GPU work; missing service fails closed. Only
+  registered pausable jobs can yield. Fixed non-pausable grants cover the owned
+  non-detaching command process group and an independently reported cleanup
+  watchdog. Release follows verified group cleanup; no manager protocol changes.
+- Optional inference.input_slots overrides the input-RAM count independently of
+  GPU count; omitted uses devices*slots_per_gpu. Explicit result_slots is
+  recommended when tuning inputs (otherwise result capacity follows input count).
+  Reader futures are bounded by input_workers; remaining unsubmitted tiles stay
+  in the length-priority scheduler. Already admitted reads are non-preemptible.
+  Each pump admits at most16reads and dispatches at most8ready inputs, bounding
+  coordinator work counts, not guaranteeing a wall-clock latency bound.
+- Classic workload uses128tile readers/256input slots/128result slots and
+  chunk-major accumulation; active trace CPU permits are automatic (workers0).
+  Waiting trace threads were already independent of the CPU permit count.
+  Native source-read/decode concurrency is64/8, the process-cache capacities
+  exposed by the current binding. Profile/full share the same reader settings.
+  Live queueJSONL distinguishes pending trace requests, output chunks, queued
+  inference tiles, read futures, GPU submitted, accumulation and publication.
+  Queue counts do not measure hardware utilization. Optional profile.cprofile
+  controls deterministic profiling independently of wall/stage/queue metrics.
+
 - Workload configuration owns collection-to-scroll/scan/CT/normal bindings,
   checkpoint paths/digests, devices and inference parameters. Executable runners
   must not contain scroll-specific confirmation arguments or normal-source
@@ -85,14 +107,20 @@
   Source identity includes locator/revision/metadata/lattice; inference identity
   includes frozen checkpoint SHA256, effective parameters, relevant code hashes
   and runtime versions. Require an updated revision for mutable input content.
-- Single-writer SQLite tracks tiles, chunks and scratch. Coordinator memory
-  tracks pending/applied contribution sets; no canonical ordinal or durable
-  scratch-edge table. Bounded background publication uses the shared finalizer
-  after every contributor acknowledges; only the coordinator commits ready rows.
-  Only coherently published sibling Zarr chunks plus verified integrity constitute
-  completion, not queued/partial ledger rows. Explicit all-zero chunks are stored.
-  Restart validates ready files, deletes only validated owned scratch and rebuilds
-  incomplete work. Active ready files are immutable. No done-marker replacement.
+- Single-writer coordinator dictionaries, sets and deques track tiles, chunks,
+  priorities and pending/applied contributions entirely in RAM. No database,
+  mutable persistent ledger or per-chunk done markers. One static cache identity
+  JSON records provenance; unidentified payloads and legacy database-only roots
+  are refused without adopting or deleting their contents.
+  Bounded background publication uses the shared finalizer after all contributors
+  acknowledge; only the coordinator marks RAM readiness. Explicit zero chunks
+  are stored. Restart lazily checks all sibling files and decodes requested chunks
+  against expected shape/dtype/chunk geometry, cleans validated owned scratch and
+  rebuilds incomplete work. No whole-volume scan or persistent checksum table.
+  Active ready files are immutable. Before replacing an incomplete sibling group,
+  validate all paths and remove its old siblings so process interruption cannot
+  leave a mixed-generation complete group. This is not a power-loss transactional
+  guarantee; same-size, decodable corruption is not cryptographically detected.
 - Per-source scratch and active shared slots have budgets. Fresh sparse mmap
   holes read as zeros; logical touched-byte and periodic allocated/free-space
   checks are advisory, not guaranteed preallocation. Concurrent disk exhaustion
@@ -101,6 +129,13 @@
   input-read cancellation is explicitly deferred by the user (not an observed
   stuck condition or current blocker). Global queued-descriptor bounds and
   stress/performance validation remain future hardening, not guarantees.
+- The short inference profiler may opt into isolated native-reader responsiveness
+  controls: idle, no-intersection allocation-only reads, prewarmed native reads
+  and full reader-wrapper calls. A separate Python heartbeat and calling-thread
+  timers/fault counters expose blocking without modifying production inference.
+  Heartbeat gaps include GIL and OS scheduling, not exclusive lock attribution.
+  No-intersection controls must assert zero requested source chunks. Record
+  native module identity and sample counts; disable diagnostic controls by default.
 - Initial inputs are explicit zero-translation isotropic ZYX OME power-of-two
   lattices. No arbitrary crop/affine mapping or coarser pyramid generation yet.
   Partial manifests require live readiness awareness; ordinary viewers cannot
@@ -1235,9 +1270,24 @@
   be read by direct zarr/raw block slicing in Python. The block sampler must use
   strict requested-level VC3D blocking semantics, report
   `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
-  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
-  follow the existing strict VC3D rendering semantics: black covered pixels and
-  a non-zero `missing_chunks` stat.
+  mark out-of-volume voxels invalid with the declared Zarr fill value. Known-missing
+  requested-level chunks use that same fill value, remain valid in-volume and
+  contribute to `missing_chunks` when statistics are requested. The training block
+  adapter calls the unified `Volume.read_zyx(..., with_mask=True, with_stats=True)`;
+  its float image interface is retained for training. Standalone demand inference
+  calls `Volume.read_zyx` directly, returning native integer arrays without masks,
+  statistics or intermediate float conversion. It reads full bboxes, including
+  declared-fill boundaries, not the previous partial-tile reflect padding.
+- Native bbox Python APIs `read_zyx`/`read_xyz` require the exact scale group even
+  for empty/outside requests. No missing-level fallback argument. `read_xyz` and
+  slicing delegate to the same implementation; the duplicate `sample_zyx_block`
+  API is removed, not aliased. Default return is a C-order uint8/uint16 array.
+  Keyword-only `with_mask`/`with_stats` default false; if either is requested,
+  return `(array, mask-or-None, stats-or-None)`. Auxiliaries incur no large allocation
+  or per-voxel work when disabled. Buffer allocation/fill, dependency/prefetch and
+  copying release the GIL; Python object creation retains it. Logical volume edges
+  bound coverage even when storage chunks are padded. Fetch/decode errors,
+  unresolved blocking results, null data and malformed payload sizes throw.
 - Generic `CoordinateSampler.sample_coords(...)` and
   `sample_coord_batch(...)` remain the correct boundary for arbitrary
   coordinate surfaces such as side/top strips, TTA surfaces, and strip

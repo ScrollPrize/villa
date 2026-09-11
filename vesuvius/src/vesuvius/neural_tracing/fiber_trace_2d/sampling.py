@@ -208,24 +208,18 @@ class Vc3dCoordinateSampler(CoordinateSampler):
     ) -> CoordinateSampleResult:
         if hasattr(self, "blocking") and not bool(getattr(self, "blocking")):
             raise ValueError("VC3D block sampling requires blocking=True")
-        sample_block = getattr(self.volume, "sample_zyx_block", None)
-        if sample_block is None:
-            raise RuntimeError(
-                "VC3D volume binding does not expose sample_zyx_block; rebuild "
-                "volume-cartographer so native 3D Trace2CP can use strict "
-                "requested-level axis-aligned block reads"
-            )
         start = np.asarray(start_zyx, dtype=np.int64)
         shape = np.asarray(shape_zyx, dtype=np.int64)
         if start.shape != (3,) or shape.shape != (3,):
             raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
         if not bool(np.all(shape > 0)):
             raise ValueError("shape_zyx values must be positive")
-        image, sampled_valid, stats = sample_block(
+        image, sampled_valid, stats = self.volume.read_zyx(
             tuple(int(v) for v in start),
             tuple(int(v) for v in shape),
             self.level,
-            self.blocking,
+            with_mask=True,
+            with_stats=True,
         )
         image_arr = np.asarray(image, dtype=np.float32)
         valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
