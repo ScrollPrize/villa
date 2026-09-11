@@ -33,6 +33,33 @@ Linux/macOS Unix sockets are supported; NVIDIA inventory monitoring requires
 
 ## Operator commands
 
+Python tasks may call `villa_gpu_manager.bootstrap.ensure_manager()` to reuse an
+existing service or start a detached one automatically. It uses the same socket
+selection and ownership journal/lock as the CLI. Simultaneous starters converge
+on one service; no journal or socket is manually reset. Only absent/refused
+connections permit startup; authorization/protocol failures remain errors.
+Startup logs are under `~/.local/state/villa-gpu-manager/`. The auto service
+inventories all host GPUs; client visibility restricts requests, not the shared
+pool. Existing GPU processes are protected by the normal external-use monitor.
+The service exits after 30 seconds with no connected clients and no live tasks.
+This grace period permits the bootstrap probe to hand over to the real client.
+A disconnected live task still owns its reservation; the regular PID-tree scan
+retires dead tasks before idle shutdown. The socket is removed on clean exit,
+but the recovery journal is retained. A later client automatically starts a new
+service. Automatic inventory counts logical CPUs (224 on a 112-core SMT host),
+so a request for 128 loading workers fits that host's CPU capacity.
+On restart, a CPU-only inventory correction is accepted only for a fully retired,
+empty-reservation journal without an override. Live ownership and GPU inventory
+changes still fail closed; journals are never deleted to bypass this check.
+Numeric visibility masks are explicitly resolved as physical `nvidia-smi`
+indices and logged; UUID masks avoid CUDA ordinal-order ambiguity. Workers are
+always launched with UUID visibility. Malformed/ambiguous masks are errors.
+
+For an already prepared shared-group directory, auto startup allows its Unix group
+members as clients; only the server owner is a controller. Existing directory
+ownership/sticky-bit/world-permission protections still apply. It does not create
+Unix groups, change permissions or acquire privileges automatically.
+
 First identify UUIDs with `nvidia-smi --query-gpu=index,uuid --format=csv`.
 Pass only the GPUs explicitly assigned to this cooperative pool. Example:
 
@@ -119,3 +146,15 @@ with the identical allocation. See the protocol's authorized scheduling amendmen
 provides gated spawned children with bounded private controls and opaque CPU RAM
 state handoff. Application adapters provide initialize/run-unit/capture/close;
 only joined children count as released. These helpers do not import Torch.
+On Ubuntu/macOS each worker has a dedicated session. Loader descendants must
+remain in that session (no `setsid`/daemon detachment); failure cleanup stops the
+whole owned session, including orphaned loaders, before allowing release.
+
+`ExclusiveTask` is the reference helper for fixed-budget, non-pausable probes.
+It waits for an exact exclusive grant, then the caller assigns a gated
+`ProcessCohort` to `lease.cohort`. `lease.authorize()` confirms applied ownership
+and worker identities before opening the gate; `lease.check()` polls for loss
+of ownership. Context exit aborts/joins remaining owned workers before reporting
+release and finishing. A failed join retains the reservation. It uses the existing
+protocol, not a new scheduling API. Non-cooperating GPU processes remain outside
+the manager's enforcement; callers must still check actual available memory.

@@ -19,7 +19,9 @@ Reject duplicate keys, NaN/infinity (including float overflow), invalid UTF-8,
 unknown fields/operations, and noninteger resource quantities. Booleans are not
 integers. UUIDs for tasks/epochs/requests use canonical lowercase hyphenated
 strings; GPU identities are NVIDIA `GPU-...` identifiers, never local ordinals.
-Bytes, milliseconds and integer physical cores are the wire units.
+Bytes, milliseconds and integer logical CPUs are the wire units. Logical CPU
+accounting replaces physical-core accounting by explicit user instruction on
+2026-09-10; field names and framing remain unchanged.
 
 Every request:
 
