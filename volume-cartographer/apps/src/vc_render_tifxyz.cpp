@@ -46,6 +46,7 @@ static bool g_flipNormals = false;      // negate surface normals (--flip-normal
 static bool g_logRunning = false;      // protected by g_logFlushMutex
 static std::mutex g_logFlushMutex;
 static std::condition_variable g_logFlushWake;
+static std::thread g_logFlushThread;
 
 // Surface points that address a voxel outside the volume. A published tifxyz names the
 // volume it is aligned to in its own filename, but nothing guarantees it fits inside it:
@@ -78,7 +79,6 @@ static void countSamplesOutside(const cv::Mat_<cv::Vec3f>& base,
     g_samplesFinite.fetch_add(finite, std::memory_order_relaxed);
     g_samplesOutside.fetch_add(outside, std::memory_order_relaxed);
 }
-static std::thread g_logFlushThread;
 
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
