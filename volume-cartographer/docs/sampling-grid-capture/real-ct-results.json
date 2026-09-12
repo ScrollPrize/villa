@@ -1,0 +1,254 @@
+{
+  "status": "REAL_CT_RENDERER_CAPTURE_REPLAY_PASS",
+  "cases": [
+    {
+      "case": "native",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 0,
+      "oracle_exact_fraction": 1.0,
+      "capture_sha256": "553b2c6e720e2bcead04b83a62fc6c7cf4f0343e23485f4edc08f20868ca35ae",
+      "array_sha256": "0619f282cd6053d34b038a45a8b22f17bc21ee24dfdf0c522d84a06b2200f975",
+      "tiff_files_off": {
+        "00.tif": "26662700b634dd549d0ace6546ac56bb7d8e648592dbe2fe21fb872f143f7629",
+        "01.tif": "60c114ea3de8bc2ce3bd23190808afc5999f5540f771ed871367bf842356a668",
+        "02.tif": "0eb9299fa8cf5655cfda5a53dbca83581631bd1210ad16eeac5dd9d03640e289",
+        "03.tif": "af992fb0e931a7d67d73b4e5803a09f457cc3e8f5b9152a0112aba3cf1331d34",
+        "04.tif": "b9ae81ff0d08f8a5180e34ad0871f6d85002779d021269a1ff62581de8cf4e70"
+      },
+      "tiff_files_on": {
+        "00.tif": "26662700b634dd549d0ace6546ac56bb7d8e648592dbe2fe21fb872f143f7629",
+        "01.tif": "60c114ea3de8bc2ce3bd23190808afc5999f5540f771ed871367bf842356a668",
+        "02.tif": "0eb9299fa8cf5655cfda5a53dbca83581631bd1210ad16eeac5dd9d03640e289",
+        "03.tif": "af992fb0e931a7d67d73b4e5803a09f457cc3e8f5b9152a0112aba3cf1331d34",
+        "04.tif": "b9ae81ff0d08f8a5180e34ad0871f6d85002779d021269a1ff62581de8cf4e70"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 112
+    },
+    {
+      "case": "normal-flip",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 0,
+      "oracle_exact_fraction": 1.0,
+      "capture_sha256": "36d9dd2c65690c955c24bc35174a60682ca8d8904d755e21b6507aa2528ceb0d",
+      "array_sha256": "30812dd9c5c66fcf476f58d5031c67395d7b8df387f0a589a80e3a0fb91ea272",
+      "tiff_files_off": {
+        "00.tif": "b9ae81ff0d08f8a5180e34ad0871f6d85002779d021269a1ff62581de8cf4e70",
+        "01.tif": "af992fb0e931a7d67d73b4e5803a09f457cc3e8f5b9152a0112aba3cf1331d34",
+        "02.tif": "0eb9299fa8cf5655cfda5a53dbca83581631bd1210ad16eeac5dd9d03640e289",
+        "03.tif": "60c114ea3de8bc2ce3bd23190808afc5999f5540f771ed871367bf842356a668",
+        "04.tif": "26662700b634dd549d0ace6546ac56bb7d8e648592dbe2fe21fb872f143f7629"
+      },
+      "tiff_files_on": {
+        "00.tif": "b9ae81ff0d08f8a5180e34ad0871f6d85002779d021269a1ff62581de8cf4e70",
+        "01.tif": "af992fb0e931a7d67d73b4e5803a09f457cc3e8f5b9152a0112aba3cf1331d34",
+        "02.tif": "0eb9299fa8cf5655cfda5a53dbca83581631bd1210ad16eeac5dd9d03640e289",
+        "03.tif": "60c114ea3de8bc2ce3bd23190808afc5999f5540f771ed871367bf842356a668",
+        "04.tif": "26662700b634dd549d0ace6546ac56bb7d8e648592dbe2fe21fb872f143f7629"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 112
+    },
+    {
+      "case": "accumulation",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 0,
+      "oracle_exact_fraction": 1.0,
+      "capture_sha256": "1b98c0550ac7e7145642dc60e4d065da04a188b8af8f21191fb52d2b884cf6d4",
+      "array_sha256": "2b0f766fe96137b2dc7a4b6902b8f9173555c1245337510001a7b676f861e907",
+      "tiff_files_off": {
+        "00.tif": "3dbe1898e690746c5aa5e2f0103cf1c0a785303fa796ab86ca93fce0d9273261",
+        "01.tif": "66ca0a3bc34ccfc8f6942f4abe9cf826b24b9ba85239e86bdbda7e868ff64407",
+        "02.tif": "b9a419a507961ec38fcc88d507cca35735f1e3ab6eeb8eb90f63ba1da77de54f",
+        "03.tif": "f1d13692d81e29673d1b7ba08cf5204addd7c389d9afb1f2d955614edb068fa9",
+        "04.tif": "38568ca05f03fc9ca1bf3be011004f0a17680727db9ee9ebcdeaaf30ea009268"
+      },
+      "tiff_files_on": {
+        "00.tif": "3dbe1898e690746c5aa5e2f0103cf1c0a785303fa796ab86ca93fce0d9273261",
+        "01.tif": "66ca0a3bc34ccfc8f6942f4abe9cf826b24b9ba85239e86bdbda7e868ff64407",
+        "02.tif": "b9a419a507961ec38fcc88d507cca35735f1e3ab6eeb8eb90f63ba1da77de54f",
+        "03.tif": "f1d13692d81e29673d1b7ba08cf5204addd7c389d9afb1f2d955614edb068fa9",
+        "04.tif": "38568ca05f03fc9ca1bf3be011004f0a17680727db9ee9ebcdeaaf30ea009268"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.5
+      ],
+      "rows_captured": 112
+    },
+    {
+      "case": "two-bands",
+      "shape": [
+        5,
+        240,
+        112
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 1,
+      "oracle_exact_fraction": 0.9999925595238095,
+      "capture_sha256": "5df618759fb158ff7e2d418be70b8ca1cd4d5d794c8d8500d14a4c750d666468",
+      "array_sha256": "a5f57321393ea4db836ca79768d8990e50f9d59c7f66e896a001084a0c8e1a98",
+      "tiff_files_off": {
+        "00.tif": "77747a35c222a51312a75b910ee643ebec4aa4f665790c84cdab12ed67179d55",
+        "01.tif": "639f0e8d36146141f12019350bd5271cfdfbbbf13f7cba55c69a8933bdc0b9f1",
+        "02.tif": "be16370f775924463831995a078167020e8fae72b0ba608748d586ec6c53b187",
+        "03.tif": "7ec57649a9fffb1a324f119187259fb78f03baa37cacd8706f136473b9f900ee",
+        "04.tif": "b3e9c06f659471dd716b71191494f347117071c6ef4e66cd9f76eaedcee1bd71"
+      },
+      "tiff_files_on": {
+        "00.tif": "77747a35c222a51312a75b910ee643ebec4aa4f665790c84cdab12ed67179d55",
+        "01.tif": "639f0e8d36146141f12019350bd5271cfdfbbbf13f7cba55c69a8933bdc0b9f1",
+        "02.tif": "be16370f775924463831995a078167020e8fae72b0ba608748d586ec6c53b187",
+        "03.tif": "7ec57649a9fffb1a324f119187259fb78f03baa37cacd8706f136473b9f900ee",
+        "04.tif": "b3e9c06f659471dd716b71191494f347117071c6ef4e66cd9f76eaedcee1bd71"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 240
+    },
+    {
+      "case": "affine",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 1,
+      "oracle_exact_fraction": 0.9999925595238095,
+      "capture_sha256": "f3fff42ae83b85f984f8edee32825cc27291aba0ea6ea6db352613b1fed5d0e9",
+      "array_sha256": "7a5ebd4b14d5b2fef8c3d076c5685b55795613d4402b3a2faac405592d7de626",
+      "tiff_files_off": {
+        "00.tif": "411feef7c6cd6c9d5bd95f09adb6096aeecd4337717e0913c5402021ffb71df5",
+        "01.tif": "8302fc2b7889e6ee0334658112c6b5a4e40543cc01b409b42e69066ee3f64aaf",
+        "02.tif": "7587cf117909ae4f56d78cd7e26f68f1c2c29d9372410d045db38a7eb2a154fa",
+        "03.tif": "d8a5064a4598b2285b24115963e5ef9ce24bd9f8e95a3f0c777639b55c22a324",
+        "04.tif": "1b01cdc0a5626f3e6cd811794e883243754a1123ba67cf8611f43528c2afe51a"
+      },
+      "tiff_files_on": {
+        "00.tif": "411feef7c6cd6c9d5bd95f09adb6096aeecd4337717e0913c5402021ffb71df5",
+        "01.tif": "8302fc2b7889e6ee0334658112c6b5a4e40543cc01b409b42e69066ee3f64aaf",
+        "02.tif": "7587cf117909ae4f56d78cd7e26f68f1c2c29d9372410d045db38a7eb2a154fa",
+        "03.tif": "d8a5064a4598b2285b24115963e5ef9ce24bd9f8e95a3f0c777639b55c22a324",
+        "04.tif": "1b01cdc0a5626f3e6cd811794e883243754a1123ba67cf8611f43528c2afe51a"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 112
+    },
+    {
+      "case": "level-one",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 0,
+      "oracle_exact_fraction": 1.0,
+      "capture_sha256": "b5ff023381bc276c22b122945b5bbea10ca356504f0d199c34a8bfedb6110d8a",
+      "array_sha256": "6dbccf469fb26cc57bb726d213ad78360242ec614effe64ab582f80cd5503b4b",
+      "tiff_files_off": {
+        "00.tif": "451a6a2c39a1b7e0dfa263db1e03c192a02673eb09faa5e4ff0fa3fa91ca25c4",
+        "01.tif": "961db8728e4f792a6b8c8a19a1e894eba665ea65c3257a4d7f19d6b5eb0b69c5",
+        "02.tif": "fd35682dcc474fea801c9560d4eaad2a878539edbda560ffd274c50ed63f1997",
+        "03.tif": "058cb28e7e929c925342a6f935786068306f41fc2c96443d152c4d8f558f9e78",
+        "04.tif": "13d8f4b20cfa0f4012b319dc703e151f5bcdb167c0feac16167e9a9c19331446"
+      },
+      "tiff_files_on": {
+        "00.tif": "451a6a2c39a1b7e0dfa263db1e03c192a02673eb09faa5e4ff0fa3fa91ca25c4",
+        "01.tif": "961db8728e4f792a6b8c8a19a1e894eba665ea65c3257a4d7f19d6b5eb0b69c5",
+        "02.tif": "fd35682dcc474fea801c9560d4eaad2a878539edbda560ffd274c50ed63f1997",
+        "03.tif": "058cb28e7e929c925342a6f935786068306f41fc2c96443d152c4d8f558f9e78",
+        "04.tif": "13d8f4b20cfa0f4012b319dc703e151f5bcdb167c0feac16167e9a9c19331446"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 112
+    },
+    {
+      "case": "segmentation-scale",
+      "shape": [
+        5,
+        112,
+        240
+      ],
+      "capture_on_off_array_equal": true,
+      "pixels_compared": 134400,
+      "oracle_max_abs_error": 0,
+      "oracle_exact_fraction": 1.0,
+      "capture_sha256": "553b2c6e720e2bcead04b83a62fc6c7cf4f0343e23485f4edc08f20868ca35ae",
+      "array_sha256": "0619f282cd6053d34b038a45a8b22f17bc21ee24dfdf0c522d84a06b2200f975",
+      "tiff_files_off": {
+        "00.tif": "7c424b8733b786cd54a81d8f8be3e8cdce06701b8c3c760cb118808385e3d1e8",
+        "01.tif": "aa2ab9383d74435c3e7a11bc937cc23766a258659a1e7ca4ae513ae719d71888",
+        "02.tif": "df053ab1c723af5e1eaf926f2bf537320f94f4f541aec0819fe7a36a97299f21",
+        "03.tif": "e14aa117e7cd566b6ecdb4243b1a6404683394ab3dbea0a52645e1ad63c06061",
+        "04.tif": "6529cb8a043c88a55aab0634011cc31a447347317a2390ded78cc45e4507e400"
+      },
+      "tiff_files_on": {
+        "00.tif": "7c424b8733b786cd54a81d8f8be3e8cdce06701b8c3c760cb118808385e3d1e8",
+        "01.tif": "aa2ab9383d74435c3e7a11bc937cc23766a258659a1e7ca4ae513ae719d71888",
+        "02.tif": "df053ab1c723af5e1eaf926f2bf537320f94f4f541aec0819fe7a36a97299f21",
+        "03.tif": "e14aa117e7cd566b6ecdb4243b1a6404683394ab3dbea0a52645e1ad63c06061",
+        "04.tif": "6529cb8a043c88a55aab0634011cc31a447347317a2390ded78cc45e4507e400"
+      },
+      "actual_offset_interval": [
+        -2.0,
+        2.0
+      ],
+      "rows_captured": 112
+    }
+  ],
+  "refusal_cases": [
+    "rotate",
+    "flip",
+    "resume",
+    "pre",
+    "multipart",
+    "zarr",
+    "composite"
+  ],
+  "normal_flip_exact_stack_reversal": true,
+  "level_scale_exact": true,
+  "paired_pixels": 940800,
+  "physical_sheet": "NOT_VERIFIED",
+  "ink": "NOT_RUN",
+  "new_letters": 0,
+  "paid_compute_usd": 0,
+  "full_upstream_CI": "NOT_RUN",
+  "independent_adoption": "NOT_ESTABLISHED"
+}

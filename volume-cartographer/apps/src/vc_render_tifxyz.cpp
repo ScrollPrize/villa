@@ -1,4 +1,5 @@
 #include <iostream>
+#include "SamplingGridCapture.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -642,6 +643,7 @@ static void renderBands(
     int numParts, int partId,
     int cvType,
     uint32_t bandH,
+    vc::render::SamplingGridCapture* samplingGrid,
     WriteFn&& writeSlices)
 {
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
@@ -670,6 +672,15 @@ static void renderBands(
 
         cv::Mat_<cv::Vec3f> base, dirs;
         prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+
+        if (samplingGrid) {
+            samplingGrid->appendBand(int(y0), base.rows, base.cols, allOffsets,
+                [&](int r, int c) {
+                    const auto& p = base(r, c);
+                    const auto& n = dirs(r, c);
+                    return vc::render::SamplingGridCapture::Pixel{p[0], p[1], p[2], n[0], n[1], n[2]};
+                });
+        }
 
         std::vector<cv::Mat> slices;
 
@@ -1136,6 +1147,7 @@ int main(int argc, char *argv[])
         ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
         ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
+        ("sampling-grid-output", po::value<std::string>(), "Fresh directory for final sampling rays; single-part unrotated TIFF-only render, crop <=262144 pixels")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
         ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
         ("flatten-iterations", po::value<int>()->default_value(10), "ABF++ iterations")
@@ -1340,6 +1352,15 @@ int main(int argc, char *argv[])
     int flip_axis = parsed["flip"].as<int>();
     g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
+
+    const bool wantSamplingGrid = parsed.count("sampling-grid-output") > 0;
+    if (wantSamplingGrid && (!wantTif || wantZarr || numParts != 1 || pre_flag || resumeFlag ||
+                            isCompositeMode || rotate_angle != 0.0 || flip_axis != -1 ||
+                            num_slices < 1 || num_slices > 65536 ||
+                            accumOffsets.size() > 65536u / std::size_t(num_slices))) {
+        logPrintf(stderr, "Error: sampling-grid capture requires a bounded, non-composite, unrotated, single-part TIFF-only render without --resume/--pre\n");
+        return EXIT_FAILURE;
+    }
 
     // --- Load affines ---
     AffineTransform affineTransform;
@@ -1620,6 +1641,23 @@ int main(int argc, char *argv[])
 
         const int rotQuad = rotQuadGlobal;
 
+        std::unique_ptr<vc::render::SamplingGridCapture> samplingGrid;
+        std::filesystem::path samplingGridDir;
+        if (wantSamplingGrid) {
+            try {
+                samplingGrid = std::make_unique<vc::render::SamplingGridCapture>(
+                    tgt_size.height, tgt_size.width, group_idx, crop.x, crop.y);
+                samplingGridDir = parsed["sampling-grid-output"].as<std::string>();
+                // Reserve a new directory before rendering. Never overwrite a
+                // prior capture. An interrupted run leaves no complete grid.json.
+                if (!std::filesystem::create_directory(samplingGridDir))
+                    throw std::runtime_error("sampling-grid output must be a fresh directory");
+            } catch (const std::exception& e) {
+                logPrintf(stderr, "Error: %s\n", e.what());
+                return false;
+            }
+        }
+
         // Determine output dtype
         const bool useU16 = output_is_u16 && !isCompositeMode;
         const int cvType = useU16 ? CV_16UC1 : CV_8UC1;
@@ -1829,16 +1867,33 @@ int main(int argc, char *argv[])
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
+                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, samplingGrid.get(), writerFn);
                 else
                     renderBands<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
-                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
+                        compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, samplingGrid.get(), writerFn);
             }
 
             tifWriters.clear();
+        }
+
+        if (samplingGrid) {
+            try {
+                // Promote only a complete, flushed file. A write failure leaves
+                // a .partial artifact, not a success-looking capture.
+                const auto partial = samplingGridDir / "grid.json.partial";
+                std::ofstream out(partial);
+                out.exceptions(std::ios::badbit | std::ios::failbit);
+                samplingGrid->writeJson(out);
+                out.close();
+                std::filesystem::rename(partial, samplingGridDir / "grid.json");
+                logPrintf(stdout, "Sampling rays captured in %s (not a surface-safety verdict)\n", samplingGridDir.string().c_str());
+            } catch (const std::exception& e) {
+                logPrintf(stderr, "Error writing sampling capture: %s\n", e.what());
+                return false;
+            }
         }
 
         // ---- Zarr pyramid + attrs ----

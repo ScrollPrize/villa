@@ -1,0 +1,30 @@
+{
+  "status": "PASS",
+  "paired_pixels_verified": 940800,
+  "byte_identical_tiff_pairs": 35,
+  "python_tests_passed": 27,
+  "ctest_target": "test_sampling_grid_capture: 1/1 passed",
+  "refusal_modes_passed": 10,
+  "invalid_pixel_control_count": 97,
+  "first_run_failures_preserved": true,
+  "physical_sheet_identity": "NOT_VERIFIED",
+  "ink_or_letters": "NOT_RUN",
+  "upstream_full_CI": "NOT_RUN",
+  "independent_adoption": "NOT_ESTABLISHED",
+  "files_sha256": {
+    "run_build.py": "3e6924cb709a86c42c2deb8a812ad614e92655fbb333de05d34b1ec197304135",
+    "real_ct_replay.py": "1a813e51b0d73c9e3525333fa95730127566ad8bbbd88544c99b399f49ea7c5a",
+    "real_ct_replay_v2.py": "731139b701c075c2b47b25a2dd13b2beb167a73a0ebaa1f321aceed157d41724",
+    "real_ct_replay_initial.py": "207964908a46af12dde0fa4afda067df2e5bc8b55de4ba08e24896e655058ec4",
+    "final_controls.py": "c699ac3e07dbbe836bfabf7f612f343de2907a201b9703152dec952c9f29a588",
+    "verify_final.py": "5fafde1ea11a566f95b962c9784d0c22bbbf997b0c7dd9bf4af24e35c5791df7",
+    "real-ct-v2/PROTOCOL.json": "a4eab1624fe19a096e57cacaefa1128e2b74d8582244044e16befbe4f8210e9b",
+    "real-ct-v2/RESULTS.json": "a8fafb3760e1b6325dd39220f92f849a10a893bfae7a980a395e73ff5d2ae87e",
+    "real-ct-v2/CAPTURE_IDENTITY.png": "7e142b03d50d73221698018b6f9c648c39af3183c3c86e31369caf83cd931c63",
+    "dependency-setup-v1/build/bin/vc_render_tifxyz": "fa903e43d56aff20f07449884adcbf85d13879f8517da1fe0eb31e2c2e428707",
+    "dependency-setup-v1/build/core/libvc_core.so": "be7f98bcca9536f9ceeb8ca123bca63be4bca06cac7e3f633a5ac63154212f9a",
+    "dependency-setup-v1/build/core/libvc_flattening.so": "814f1504e6959b998d755d6697d065b35a716047b4aca89b94ff7e12ac257421",
+    "dependency-setup-v1/build/utils/libutils.so": "67adf7d0de7d81f787815d5dc277c51e491ee4ce7ceb890bae0164a30e28d419",
+    "dependency-setup-v1/build/utils/libutils_c3d_codec.so": "2718242033f5b3eacca699ce64219a476a1f0502776465f7ee237768859c12b3"
+  }
+}

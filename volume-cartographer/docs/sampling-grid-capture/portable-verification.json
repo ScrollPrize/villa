@@ -1,0 +1,87 @@
+{
+  "status": "PORTABLE_SOURCE_PACKAGE_VERIFIED_LOCAL_ONLY",
+  "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+  "numpy": "2.4.6",
+  "script_sha256": "e8badf3ce15f19bfd0b333a3b9a2c10c119cd8f0a9618c50006e53b3d6cf82f1",
+  "portable_tests": 34,
+  "legacy_workspace_tests": 27,
+  "shared_function_AST_identity": [
+    "triangulate",
+    "area_coefficients",
+    "quadratic_minimum",
+    "evaluate",
+    "report_grid",
+    "read_capture",
+    "report_capture"
+  ],
+  "legacy_callers_import_same_function_objects": true,
+  "fixed_reports_preserved": [
+    {
+      "case": "native",
+      "capture_sha256": "553b2c6e720e2bcead04b83a62fc6c7cf4f0343e23485f4edc08f20868ca35ae",
+      "frozen_report_sha256": "89348c800f6491a5bfbfe342331f858504d0773e896f061bbbb21e89566444ea",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "normal-flip",
+      "capture_sha256": "36d9dd2c65690c955c24bc35174a60682ca8d8904d755e21b6507aa2528ceb0d",
+      "frozen_report_sha256": "3d5e35faca9bdc37fde258dfef19e43facb9c9da52f8eb6476c23dd4cb28d50a",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "accumulation",
+      "capture_sha256": "1b98c0550ac7e7145642dc60e4d065da04a188b8af8f21191fb52d2b884cf6d4",
+      "frozen_report_sha256": "f95d61de477bb4b31094ebaf3247174ed824f9b6269dbec993aa80fa2aba4e33",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "two-bands",
+      "capture_sha256": "5df618759fb158ff7e2d418be70b8ca1cd4d5d794c8d8500d14a4c750d666468",
+      "frozen_report_sha256": "3cbff4758c33c59e3169d6e312fcaa2858ba164d4e668dcd6a39c30d516e3942",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "affine",
+      "capture_sha256": "f3fff42ae83b85f984f8edee32825cc27291aba0ea6ea6db352613b1fed5d0e9",
+      "frozen_report_sha256": "1da6de9cd7b3f5a9c54b3347e963985c63570a25200bb33221ec6a06ae23756c",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "level-one",
+      "capture_sha256": "b5ff023381bc276c22b122945b5bbea10ca356504f0d199c34a8bfedb6110d8a",
+      "frozen_report_sha256": "d25a1593db4b048ae7e6561e79564645cf188a8360288c0311f7e40f9c1c368f",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "segmentation-scale",
+      "capture_sha256": "553b2c6e720e2bcead04b83a62fc6c7cf4f0343e23485f4edc08f20868ca35ae",
+      "frozen_report_sha256": "89d6f0ef61c858a5bb821146e47521cd70aa3c1890772ef2a81af1e19905ab9d",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "historical-original",
+      "capture_sha256": "9b22ed711450167817d647e8c26dc2c6fa434496b0cd47c8bd8b94e7e117f08b",
+      "frozen_report_sha256": "99a5530c633dfef4606e90a8d526e9d69e77f22dc88e3adf0c52be8bf098496c",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    },
+    {
+      "case": "historical-source-normal",
+      "capture_sha256": "df9230c42cb6c778b43b7b02d89d20958eb1b4a6ac4d0982be6acb352fef5f20",
+      "frozen_report_sha256": "752a60616e9dca38bd98be74d67299f451ea08d7007efbc96356e480f75fecf9",
+      "all_report_fields_equal_except_path_and_added_code_hashes": true
+    }
+  ],
+  "combined_patch_forward_reverse_checks": "PASS_ON_RETAINED_PINNED_BASE_FILES",
+  "full_checkout_CI": "NOT_RUN",
+  "new_renderer_build": "NOT_RUN_CPP_UNCHANGED",
+  "new_CT_rendering": "NOT_RUN_REUSED_FROZEN_CAPTURES",
+  "archive_bytes": 48166,
+  "archive_sha256": "86502a0ebd07ebc50f86c3cd8c0c066fe257bc821b6bfa4a883c273b7aa65c04",
+  "archive_deterministic": true,
+  "new_installs": 0,
+  "paid_compute_usd": 0,
+  "new_model_prompts": 0,
+  "new_public_actions": 0,
+  "letters_recovered": 0
+}

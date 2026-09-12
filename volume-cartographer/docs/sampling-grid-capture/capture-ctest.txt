@@ -1,0 +1,10 @@
+Test project /out/build
+    Start 2: test_sampling_grid_capture
+1/1 Test #2: test_sampling_grid_capture .......   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+vc-core    =   0.03 sec*proc (1 test)
+
+Total Test time (real) =   0.07 sec
