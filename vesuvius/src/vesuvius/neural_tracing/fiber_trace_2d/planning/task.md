@@ -1,9 +1,4 @@
-# Current snapshot test-loss versus tracing comparison
+# Combined training low-LR continuation
 
-Freeze current EMA0.999, current EMA0.99, current raw from active combined training,
-then evaluate in that order on existing50fiber/100direction workload. Record exact
-samples/step/testloss/hash. Training staysalive with manager pauses only.
-After EACH evaluation print full per-scroll tables against Classic and latest
-best99/best999 pair plus completed current entries. Highlight best/ties; each
-scroll20% overallweight. Omit pooledscore. Compare testloss to tracing performance
-without claiming a reliable correlation from this small set. Preserve artifacts.
+Stop current combinedtraining safely and resume latestraw at0.1xLR (0.001).
+Retain optimizer/EMA state, dataset/sampling/eval/2Mupdate cap andmanager support.
