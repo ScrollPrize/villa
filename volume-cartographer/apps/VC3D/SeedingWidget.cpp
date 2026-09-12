@@ -634,13 +634,15 @@ void SeedingWidget::updateCurrentZSlice(int z)
 
 void SeedingWidget::onClearPreviewClicked()
 {
-    _point_collection->clearCollection(_point_collection->getCollectionId("ray_preview"));
+    if (const auto id = _point_collection->getCollectionId("ray_preview"))
+        _point_collection->clearCollection(*id);
     infoLabel->setText("Preview points cleared.");
 }
 
 void SeedingWidget::onClearPeaksClicked()
 {
-    _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
+    if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
+        _point_collection->clearCollection(*id);
     infoLabel->setText("Peak points cleared.");
 }
 
@@ -670,7 +672,8 @@ bool SeedingWidget::previewRaysHeadless(QString* errorMessage)
         return false;
     }
 
-    _point_collection->clearCollection(_point_collection->getCollectionId("ray_preview"));
+    if (const auto id = _point_collection->getCollectionId("ray_preview"))
+        _point_collection->clearCollection(*id);
 
     const double angleStep = angleStepSpinBox->value();
     const int numSteps = static_cast<int>(360.0 / angleStep);
@@ -740,7 +743,8 @@ bool SeedingWidget::castRaysHeadless(QString* errorMessage)
     }
 
     // Reset previous peaks
-    _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
+    if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
+        _point_collection->clearCollection(*id);
 
     // Capture all UI parameters before going to background
     const double angleStep = angleStepSpinBox->value();
@@ -1432,8 +1436,10 @@ void SeedingWidget::finalizeSeedingBatch()
 void SeedingWidget::onResetPointsClicked()
 {
     if (_point_collection) {
-        _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
-        _point_collection->clearCollection(_point_collection->getCollectionId("seeding_seeds"));
+        if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
+            _point_collection->clearCollection(*id);
+        if (const auto id = _point_collection->getCollectionId("seeding_seeds"))
+            _point_collection->clearCollection(*id);
     }
     
     // Clear paths
@@ -1478,7 +1484,8 @@ void SeedingWidget::updateParameterPreview()
     auto& center_point = focus_points[0].p;
 
     // Clear previous preview points
-    _point_collection->clearCollection(_point_collection->getCollectionId("seeding_preview"));
+    if (const auto id = _point_collection->getCollectionId("seeding_preview"))
+        _point_collection->clearCollection(*id);
     
     // Get parameters
     const double angleStep = angleStepSpinBox->value();
@@ -1555,7 +1562,8 @@ void SeedingWidget::analyzePaths()
     }
     
     // Reset previous peaks
-    _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
+    if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
+        _point_collection->clearCollection(*id);
     
     // Compute distance transform once
     computeDistanceTransform();

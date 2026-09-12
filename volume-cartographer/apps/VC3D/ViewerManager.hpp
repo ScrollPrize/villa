@@ -100,6 +100,13 @@ public:
     std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
     std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
+    // Withhold raw-path viewport chunk demand from frames the SurfaceCache
+    // fully serves, so tile fills are not starved behind interactive fetches
+    // (see VolumeViewerBase::setPreferSurfaceTileFills). Applied to every
+    // viewer this manager owns; workspaces where the flattened view is the
+    // primary pane (Spiral) enable it on their own manager only.
+    void setPreferSurfaceTileFills(bool enabled);
+
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
@@ -340,6 +347,7 @@ private:
 
     std::size_t _surfaceCacheBudgetBytes{0};
     std::size_t _overlaySurfaceCacheBudgetBytes{0};
+    bool _preferSurfaceTileFills{false};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};

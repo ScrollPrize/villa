@@ -273,7 +273,7 @@ int main(int argc, char** argv)
         PointCollections coll;
         const std::string name = "selfcross-transverse";
         coll.addCollection(name);
-        coll.setCollectionColor(coll.getCollectionId(name),
+        coll.setCollectionColor(coll.getCollectionId(name).value(),
                                 cv::Vec3f(1.0f, 0.1f, 0.1f));
         std::vector<cv::Vec3f> pts;
         for (int d = 0; d < 2 && (int)pts.size() < cap; ++d)

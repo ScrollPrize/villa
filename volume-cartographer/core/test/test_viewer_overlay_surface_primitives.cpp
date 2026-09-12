@@ -11,9 +11,11 @@
 #include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
 #include "overlays/FiberOverlayController.hpp"
+#include "overlays/PointsOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/ui/VCCollection.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -48,6 +50,33 @@ public:
         view_.setScene(&scene_);
     }
 
+    std::optional<SurfaceProjection> projectVolumePoint(
+        const cv::Vec3f& point) const override
+    {
+        ++projectionCalls_;
+        return SurfaceProjection{point[0], point[1], 0.0f, false};
+    }
+    QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const override
+    {
+        return surfaceCoordsToScene(projection.u, projection.v);
+    }
+    SurfaceProjectionContext surfaceProjectionContext() const override
+    {
+        SurfaceProjectionContext context;
+        context.surface = surface_.get();
+        context.patchIndexGeneration = projectionGeneration_;
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surface_.get())) {
+            context.planeOrigin = plane->origin();
+            context.planeBasisX = plane->basisX();
+            context.planeBasisY = plane->basisY();
+        }
+        return context;
+    }
+    // Test hooks: how many times the expensive half of the mapping ran, and a
+    // way to invalidate it the way a patch-index rebuild would.
+    int projectionCalls() const { return projectionCalls_; }
+    void resetProjectionCalls() { projectionCalls_ = 0; }
+    void bumpProjectionGeneration() { ++projectionGeneration_; }
     QPointF volumeToScene(const cv::Vec3f& point) override
     {
         return {point[0] * surfaceScale_ + surfaceOffset_.x(),
@@ -85,7 +114,8 @@ public:
         surfaceOffset_ = offset;
     }
     std::shared_ptr<Volume> currentVolume() const override { return {}; }
-    VCCollection* pointCollection() const override { return nullptr; }
+    VCCollection* pointCollection() const override { return pointCollection_; }
+    void setPointCollection(VCCollection* collection) { pointCollection_ = collection; }
 
     float getCurrentScale() const override { return 1.0f; }
     float dsScale() const override { return 1.0f; }
@@ -123,9 +153,11 @@ public:
     void setOverlayComposite(const OverlayCompositeSettings&) override {}
     void reloadPerfSettings() override {}
 
-    uint64_t highlightedPointId() const override { return 0; }
-    uint64_t selectedPointId() const override { return 0; }
-    uint64_t selectedCollectionId() const override { return 0; }
+    std::optional<vc::PointRef> highlightedPoint() const override { return highlightedPoint_; }
+    std::optional<vc::PointRef> selectedPoint() const override { return selectedPoint_; }
+    std::optional<uint64_t> selectedCollectionId() const override { return selectedCollection_; }
+    void setHighlightedPoint(std::optional<vc::PointRef> point) { highlightedPoint_ = point; }
+    void setSelectedPoint(std::optional<vc::PointRef> point) { selectedPoint_ = point; }
     bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return false; }
     double sameWrapAnnotationPolylineOpacity() const override { return 1.0; }
@@ -210,7 +242,42 @@ private:
     ActiveSegmentationHandle activeSegmentation_;
     std::map<std::string, std::vector<QGraphicsItem*>> overlayGroups_;
     std::string surfName_{"fake"};
+    VCCollection* pointCollection_{nullptr};
+    std::optional<vc::PointRef> highlightedPoint_;
+    std::optional<vc::PointRef> selectedPoint_;
+    std::optional<uint64_t> selectedCollection_;
+    mutable int projectionCalls_{0};
+    std::uint64_t projectionGeneration_{0};
 };
+
+// The points overlay batches its dots into one retained item, so per-dot radii
+// are no longer readable from scene item bounds. Assert on the primitives the
+// controller emits instead -- that is what the radii actually mean.
+class ProbePointsOverlayController final : public PointsOverlayController {
+public:
+    using PointsOverlayController::PointsOverlayController;
+
+    std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitivesFor(
+        VolumeViewerBase* viewer)
+    {
+        OverlayBuilder builder(viewer);
+        collectPrimitives(viewer, builder);
+        return builder.takePrimitives();
+    }
+};
+
+std::vector<ViewerOverlayControllerBase::PointPrimitive> pointPrimitives(
+    const std::vector<ViewerOverlayControllerBase::OverlayPrimitive>& primitives)
+{
+    std::vector<ViewerOverlayControllerBase::PointPrimitive> points;
+    for (const auto& primitive : primitives) {
+        if (const auto* point =
+                std::get_if<ViewerOverlayControllerBase::PointPrimitive>(&primitive)) {
+            points.push_back(*point);
+        }
+    }
+    return points;
+}
 
 class ChainTestController final : public ViewerOverlayControllerBase {
 public:
@@ -219,6 +286,8 @@ public:
     using ViewerOverlayControllerBase::polylineBreakDistance;
     using ViewerOverlayControllerBase::addBrokenLineStrips;
     using ViewerOverlayControllerBase::renderPointChain;
+    using ViewerOverlayControllerBase::filterPointsNearViewerSurface;
+    using ViewerOverlayControllerBase::filterPointsNearViewerSurfaceCached;
 
 protected:
     void collectPrimitives(VolumeViewerBase*, OverlayBuilder&) override {}
@@ -230,6 +299,347 @@ class ViewerOverlaySurfacePrimitivesTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    // The cached filter must be a drop-in for the uncached one: same surviving
+    // points, same scene positions, same opacities.
+    void cachedSurfaceFilterMatchesUncachedFilter()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        std::vector<cv::Vec3f> points;
+        for (int i = 0; i < 40; ++i) {
+            points.emplace_back(static_cast<float>(i), static_cast<float>(i % 7),
+                                static_cast<float>(i % 5) * 0.5f);
+        }
+
+        ChainTestController controller;
+        controller.attachViewer(&viewer);
+
+        std::vector<float> uncachedOpacities;
+        const auto uncached = controller.filterPointsNearViewerSurface(
+            &viewer, points, 4.0f, &uncachedOpacities);
+        std::vector<float> cachedOpacities;
+        const auto cached = controller.filterPointsNearViewerSurfaceCached(
+            &viewer, 1, 1, points, 4.0f, &cachedOpacities);
+
+        QCOMPARE(cached.sourceIndices, uncached.sourceIndices);
+        QCOMPARE(cached.scenePoints.size(), uncached.scenePoints.size());
+        QCOMPARE(cachedOpacities.size(), uncachedOpacities.size());
+        QVERIFY(!cached.scenePoints.empty());
+        for (std::size_t i = 0; i < cached.scenePoints.size(); ++i) {
+            QCOMPARE(cached.scenePoints[i], uncached.scenePoints[i]);
+            QCOMPARE(cachedOpacities[i], uncachedOpacities[i]);
+            QCOMPARE(cached.volumePoints[i], uncached.volumePoints[i]);
+        }
+    }
+
+    // Panning and zooming must reuse the projections and only re-run the cheap
+    // camera half -- that is the whole point of the split.
+    void cachedSurfaceFilterSkipsProjectionAfterCameraMove()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        std::vector<cv::Vec3f> points;
+        for (int i = 0; i < 12; ++i) {
+            points.emplace_back(static_cast<float>(i), 1.0f, 0.0f);
+        }
+
+        ChainTestController controller;
+        controller.attachViewer(&viewer);
+
+        viewer.resetProjectionCalls();
+        const auto first = controller.filterPointsNearViewerSurfaceCached(
+            &viewer, 7, 1, points, 4.0f, nullptr);
+        const int coldCalls = viewer.projectionCalls();
+        QCOMPARE(coldCalls, static_cast<int>(points.size()));
+        QVERIFY(!first.scenePoints.empty());
+
+        // Same camera: served entirely from the cache.
+        const auto again = controller.filterPointsNearViewerSurfaceCached(
+            &viewer, 7, 1, points, 4.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), coldCalls);
+        QCOMPARE(again.scenePoints, first.scenePoints);
+
+        // Moving the camera still re-maps to scene, without reprojecting.
+        viewer.setSurfaceSceneTransform(4.0, QPointF(30.0, 40.0));
+        const auto moved = controller.filterPointsNearViewerSurfaceCached(
+            &viewer, 7, 1, points, 4.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), coldCalls);
+        QCOMPARE(moved.sourceIndices, first.sourceIndices);
+        QVERIFY(moved.scenePoints != first.scenePoints);
+        QCOMPARE(moved.scenePoints.front(),
+                 viewer.surfaceCoordsToScene(points[first.sourceIndices.front()][0],
+                                             points[first.sourceIndices.front()][1]));
+    }
+
+    // Each invalidation key has to actually invalidate, or the overlay goes
+    // stale after a preview swap instead of crashing visibly.
+    void cachedSurfaceFilterRecomputesWhenItsInputsChange()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        const std::vector<cv::Vec3f> points{{0.0f, 0.0f, 0.0f},
+                                            {1.0f, 1.0f, 0.0f},
+                                            {2.0f, 2.0f, 0.0f}};
+        ChainTestController controller;
+        controller.attachViewer(&viewer);
+
+        viewer.resetProjectionCalls();
+        controller.filterPointsNearViewerSurfaceCached(&viewer, 3, 1, points, 4.0f, nullptr);
+        int calls = viewer.projectionCalls();
+        QCOMPARE(calls, 3);
+
+        // Patch-index generation.
+        viewer.bumpProjectionGeneration();
+        controller.filterPointsNearViewerSurfaceCached(&viewer, 3, 1, points, 4.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), calls + 3);
+        calls = viewer.projectionCalls();
+
+        // Distance tolerance.
+        controller.filterPointsNearViewerSurfaceCached(&viewer, 3, 1, points, 9.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), calls + 3);
+        calls = viewer.projectionCalls();
+
+        // Content revision (the points themselves changed underneath).
+        controller.filterPointsNearViewerSurfaceCached(&viewer, 3, 2, points, 9.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), calls + 3);
+        calls = viewer.projectionCalls();
+
+        // A moved plane keeps its Surface pointer, so the frame is part of
+        // the identity too.
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 5.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+        controller.filterPointsNearViewerSurfaceCached(&viewer, 3, 2, points, 9.0f, nullptr);
+        QCOMPARE(viewer.projectionCalls(), calls + 3);
+    }
+
+    // Point primitives are grouped by style into shared path items. The
+    // bucketed lookup must produce exactly the groups the old linear scan did.
+    void pointPrimitivesGroupByStyle()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+
+        auto styleWithAlpha = [](int alpha) {
+            ViewerOverlayControllerBase::OverlayStyle style;
+            style.penColor = QColor(255, 255, 255, 200);
+            style.brushColor = QColor(10, 20, 30, alpha);
+            style.penWidth = 1.5;
+            return style;
+        };
+
+        // Identical styles collapse into one item.
+        std::vector<ViewerOverlayControllerBase::OverlayPrimitive> uniform;
+        for (int i = 0; i < 25; ++i) {
+            ViewerOverlayControllerBase::PointPrimitive point;
+            point.position = QPointF(i, i);
+            point.radius = 3.0;
+            point.style = styleWithAlpha(255);
+            uniform.emplace_back(point);
+        }
+        ViewerOverlayControllerBase::applyPrimitives(&viewer, "group_test", uniform);
+        QCOMPARE(viewer.scene().items().size(), 1);
+
+        // Distinct brush alphas -- what the per-point distance fade produces --
+        // stay distinct, one item each.
+        std::vector<ViewerOverlayControllerBase::OverlayPrimitive> faded;
+        for (int i = 0; i < 25; ++i) {
+            ViewerOverlayControllerBase::PointPrimitive point;
+            point.position = QPointF(i, i);
+            point.radius = 3.0;
+            point.style = styleWithAlpha(200 + i);
+            faded.emplace_back(point);
+        }
+        ViewerOverlayControllerBase::applyPrimitives(&viewer, "group_test", faded);
+        QCOMPARE(viewer.scene().items().size(), 25);
+    }
+
+    // Winding labels are dropped on a display-only overlay (the Spiral
+    // same-winding PCLs) and kept everywhere else.
+    void displayOnlyOverlayOmitsWindingLabels()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("winding-points.json"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {
+                    "name": "winding",
+                    "points": {
+                        "0": {"p": [10, 20, 0], "creation_time": 0, "wind_a": 3.0},
+                        "1": {"p": [12, 22, 0], "creation_time": 1, "wind_a": 4.0}
+                    },
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [0.2, 0.8, 1.0]
+                }
+            }
+        })");
+        file.close();
+
+        VCCollection collection;
+        QVERIFY(collection.loadFromJSON(path.toStdString()));
+
+        auto textItemCount = [](const QGraphicsScene& scene) {
+            int count = 0;
+            for (const QGraphicsItem* item : scene.items()) {
+                if (item->type() == QGraphicsSimpleTextItem::Type) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        FakeViewer displayViewer;
+        displayViewer.graphicsView()->resize(800, 600);
+        displayViewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+        PointsOverlayController displayOnly(&collection, nullptr, true);
+        displayOnly.attachViewer(&displayViewer);
+        QCOMPARE(textItemCount(displayViewer.scene()), 0);
+
+        FakeViewer annotationViewer;
+        annotationViewer.graphicsView()->resize(800, 600);
+        annotationViewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+        annotationViewer.setPointCollection(&collection);
+        PointsOverlayController annotating(&collection, nullptr, false);
+        annotating.attachViewer(&annotationViewer);
+        QCOMPARE(textItemCount(annotationViewer.scene()), 2);
+    }
+
+    void displayOnlyPointZeroUsesNormalRadius()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("points.json"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {
+                    "name": "display",
+                    "points": {"0": {"p": [10, 20, 0], "creation_time": 0}},
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [0.2, 0.8, 1.0]
+                }
+            }
+        })");
+        file.close();
+
+        VCCollection collection;
+        QVERIFY(collection.loadFromJSON(path.toStdString()));
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        ProbePointsOverlayController controller(&collection, nullptr, true);
+        controller.attachViewer(&viewer);
+
+        // Point id 0 must not be mistaken for "the selected point" and drawn
+        // enlarged; a display-only overlay has no selection at all.
+        const auto points = pointPrimitives(controller.primitivesFor(&viewer));
+        QCOMPARE(points.size(), std::size_t{1});
+        QCOMPARE(points.front().radius, 5.0);
+        QCOMPARE(points.front().style.penWidth, 1.5);
+
+        const QPointF scenePosition = viewer.surfaceCoordsToScene(10.0f, 20.0f);
+        const QPointF devicePosition =
+            viewer.graphicsView()->viewportTransform().map(scenePosition);
+        const QSet<qulonglong> allowed{0};
+        const auto hit = controller.displayPointHitAt(
+            &viewer, devicePosition, 8.0, allowed);
+        QVERIFY(hit.has_value());
+        QCOMPARE(hit->ref, (vc::PointRef{0, 0}));
+        QCOMPARE(hit->scenePosition, scenePosition);
+        QVERIFY(!controller.displayPointHitAt(
+            &viewer, devicePosition, 8.0, QSet<qulonglong>{7}).has_value());
+
+        viewer.graphicsView()->setTransform(QTransform::fromScale(2.0, 2.0));
+        controller.refreshViewer(&viewer);
+        const QPointF transformedDevicePosition =
+            viewer.graphicsView()->viewportTransform().map(scenePosition);
+        const auto transformedHit = controller.displayPointHitAt(
+            &viewer, transformedDevicePosition, 8.0, allowed);
+        QVERIFY(transformedHit.has_value());
+        QCOMPARE(transformedHit->ref, (vc::PointRef{0, 0}));
+        QCOMPARE(transformedHit->devicePosition, transformedDevicePosition);
+
+        controller.setHiddenCollectionIds(QSet<qulonglong>{0});
+        QVERIFY(!controller.displayPointHitAt(
+            &viewer, devicePosition, 8.0, allowed).has_value());
+    }
+
+    void compositePointSelectionOnlyEnlargesTheExactPoint()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("duplicate-points.json"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {
+                    "name": "first",
+                    "points": {"0": {"p": [10, 20, 0], "creation_time": 0}},
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [1, 0, 0]
+                },
+                "7": {
+                    "name": "second",
+                    "points": {"0": {"p": [30, 20, 0], "creation_time": 0}},
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [0, 1, 0]
+                }
+            }
+        })");
+        file.close();
+
+        VCCollection collection;
+        QVERIFY(collection.loadFromJSON(path.toStdString()));
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setPointCollection(&collection);
+        viewer.setSelectedPoint(vc::PointRef{0, 0});
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        ProbePointsOverlayController controller(&collection);
+        controller.attachViewer(&viewer);
+
+        // Both collections hold a point with id 0; only the one in the
+        // selected collection may be enlarged.
+        const auto points = pointPrimitives(controller.primitivesFor(&viewer));
+        QCOMPARE(points.size(), std::size_t{2});
+        int normal = 0;
+        int selected = 0;
+        QPointF selectedPosition;
+        for (const auto& point : points) {
+            if (std::abs(point.radius - 5.0) < 1e-9) {
+                ++normal;
+            } else if (std::abs(point.radius - 7.0) < 1e-9) {
+                ++selected;
+                selectedPosition = point.position;
+            }
+        }
+        QCOMPARE(normal, 1);
+        QCOMPARE(selected, 1);
+        QCOMPARE(selectedPosition, viewer.surfaceCoordsToScene(10.0f, 20.0f));
+    }
+
     void fiberStylesUseDistinctMatchingColors()
     {
         const QColor first = FiberOverlayController::fiberColor(1);
@@ -283,6 +693,78 @@ private slots:
 
         controller.setVisible(false);
         QCOMPARE(viewer.scene().items().size(), 0);
+    }
+
+    void fiberOverlayUsesTheSameViewerScaleForDrawingAndHitTesting()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(10.0, QPointF{1.0, 2.0});
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        FiberOverlayController controller;
+        controller.attachViewer(&viewer);
+        controller.setViewerBaseToViewerFactor(&viewer, 0.25);
+        controller.setChains({
+            FiberOverlayController::Chain{7, {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}},
+        });
+        controller.setVisible(true);
+
+        QCOMPARE(controller.viewerBaseToViewerFactor(&viewer), 0.25);
+        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 11.0) < 0.75);
+        const auto hit = controller.hitTestControlPoint(
+            &viewer, QPointF{11.0, 2.0}, 1.0);
+        QVERIFY(hit.has_value());
+        QCOMPARE(hit->fiberId, uint64_t{7});
+        QCOMPARE(hit->controlPointIndex, 1);
+
+        controller.setViewerBaseToViewerFactor(&viewer, 0.5);
+        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 21.0) < 0.75);
+        const auto movedHit = controller.hitTestControlPoint(
+            &viewer, QPointF{21.0, 2.0}, 1.0);
+        QVERIFY(movedHit.has_value());
+        QCOMPARE(movedHit->controlPointIndex, 1);
+    }
+
+    void fiberOverlayUsesTheOwningWorkspacePatchIndex()
+    {
+        cv::Mat_<cv::Vec3f> grid(30, 30);
+        for (int row = 0; row < grid.rows; ++row) {
+            for (int col = 0; col < grid.cols; ++col) {
+                grid(row, col) = cv::Vec3f(static_cast<float>(col),
+                                           static_cast<float>(row), 0.0f);
+            }
+        }
+        auto spiralSurface = std::make_shared<QuadSurface>(
+            grid, cv::Vec2f(1.0f, 1.0f));
+
+        ViewerManager mainManager(nullptr, nullptr);
+        ViewerManager spiralManager(nullptr, nullptr);
+        spiralManager.surfacePatchIndex()->rebuild({spiralSurface}, 0.0f, false);
+        QVERIFY(mainManager.surfacePatchIndex()->empty());
+        QVERIFY(spiralManager.surfacePatchIndex()->containsSurface(spiralSurface));
+
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(1.0, QPointF{});
+        viewer.setCurrentSurface(spiralSurface);
+
+        FiberOverlayController controller;
+        controller.bindToViewerManager(&mainManager);
+        controller.attachViewer(&viewer, &spiralManager);
+        controller.setChains({
+            FiberOverlayController::Chain{
+                42, {{5, 10, 0}, {10, 10, 0}, {15, 10, 0}}},
+        });
+        controller.setVisible(true);
+
+        QCOMPARE(viewer.scene().items().size(), 2);
+        const auto hit = controller.hitTestControlPoint(
+            &viewer, QPointF{-4.5, -4.5}, 1.0);
+        QVERIFY(hit.has_value());
+        QCOMPARE(hit->fiberId, uint64_t{42});
+        QCOMPARE(hit->controlPointIndex, 1);
     }
 
     void surfacePrimitivesUseViewerSurfaceTransform()

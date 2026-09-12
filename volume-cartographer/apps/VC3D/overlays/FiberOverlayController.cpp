@@ -1,5 +1,7 @@
 #include "FiberOverlayController.hpp"
 
+#include "OverlayBatchItem.hpp"
+
 #include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -15,145 +17,12 @@
 #include <cmath>
 #include <unordered_map>
 
-namespace
-{
-
-QPen penForStyle(const ViewerOverlayControllerBase::OverlayStyle& style)
-{
-    QPen pen(style.penColor);
-    pen.setWidthF(style.penWidth);
-    pen.setStyle(style.penStyle);
-    pen.setCapStyle(style.penCap);
-    pen.setJoinStyle(style.penJoin);
-    if (!style.dashPattern.empty()) {
-        QVector<qreal> pattern;
-        pattern.reserve(static_cast<int>(style.dashPattern.size()));
-        for (qreal value : style.dashPattern) {
-            pattern.append(value);
-        }
-        pen.setDashPattern(pattern);
-    }
-    return pen;
-}
-
-class FiberBatchItem final : public QGraphicsObject
-{
-public:
-    enum class Content {
-        Lines,
-        Points,
-    };
-
-    explicit FiberBatchItem(Content content)
-        : _content(content)
-    {
-        setAcceptedMouseButtons(Qt::NoButton);
-        setFlag(QGraphicsItem::ItemUsesExtendedStyleOption, true);
-    }
-
-    QRectF boundingRect() const override { return _bounds; }
-
-    void setPrimitives(const std::vector<ViewerOverlayControllerBase::OverlayPrimitive>& primitives)
-    {
-        std::vector<DrawCommand> commands;
-        commands.reserve(primitives.size());
-        QRectF bounds;
-        bool haveBounds = false;
-
-        auto append = [&](QPainterPath path,
-                          const ViewerOverlayControllerBase::OverlayStyle& style) {
-            if (path.isEmpty()) {
-                return;
-            }
-            DrawCommand command;
-            command.path = std::move(path);
-            command.pen = penForStyle(style);
-            command.brush = QBrush(style.brushColor);
-            const qreal padding = std::max<qreal>(0.5, command.pen.widthF() * 0.5) + 1.0;
-            command.bounds = command.path.boundingRect().adjusted(
-                -padding, -padding, padding, padding);
-            if (!haveBounds) {
-                bounds = command.bounds;
-                haveBounds = true;
-            } else {
-                bounds = bounds.united(command.bounds);
-            }
-            commands.push_back(std::move(command));
-        };
-
-        for (const auto& primitive : primitives) {
-            if (_content == Content::Lines) {
-                const auto* line =
-                    std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitive);
-                if (!line || line->points.size() < 2) {
-                    continue;
-                }
-                QPainterPath path(line->points.front());
-                for (std::size_t i = 1; i < line->points.size(); ++i) {
-                    path.lineTo(line->points[i]);
-                }
-                if (line->closed) {
-                    path.closeSubpath();
-                }
-                append(std::move(path), line->style);
-            } else {
-                const auto* point =
-                    std::get_if<ViewerOverlayControllerBase::PointPrimitive>(&primitive);
-                if (!point || point->radius <= 0.0) {
-                    continue;
-                }
-                QPainterPath path;
-                path.addEllipse(point->position, point->radius, point->radius);
-                append(std::move(path), point->style);
-            }
-        }
-
-        prepareGeometryChange();
-        _commands = std::move(commands);
-        _bounds = haveBounds ? bounds : QRectF{};
-        update();
-    }
-
-    void paint(QPainter* painter,
-               const QStyleOptionGraphicsItem* option,
-               QWidget* /*widget*/) override
-    {
-        if (!painter) {
-            return;
-        }
-        painter->save();
-        const QRectF exposed = option ? option->exposedRect : _bounds;
-        for (const DrawCommand& command : _commands) {
-            if (!exposed.isEmpty() && !command.bounds.intersects(exposed)) {
-                continue;
-            }
-            painter->setPen(command.pen);
-            painter->setBrush(command.brush);
-            painter->drawPath(command.path);
-        }
-        painter->restore();
-    }
-
-private:
-    struct DrawCommand {
-        QPainterPath path;
-        QPen pen;
-        QBrush brush;
-        QRectF bounds;
-    };
-
-    Content _content;
-    std::vector<DrawCommand> _commands;
-    QRectF _bounds;
-};
-
-} // namespace
 
 struct FiberOverlayController::PersistentItems
 {
     struct ViewerItems {
-        QPointer<FiberBatchItem> lines;
-        QPointer<FiberBatchItem> points;
+        QPointer<OverlayBatchItem> lines;
+        QPointer<OverlayBatchItem> points;
     };
 
     std::unordered_map<VolumeViewerBase*, ViewerItems> viewers;
@@ -170,11 +39,63 @@ FiberOverlayController::~FiberOverlayController() = default;
 void FiberOverlayController::setChains(std::vector<Chain> chains)
 {
     clearPointChainProjectionCache();
+    _transformedChains.clear();
     _chains = std::move(chains);
     if (_chains.empty()) {
         _visible = false;
     }
     refreshAll();
+}
+
+void FiberOverlayController::setViewerBaseToViewerFactor(
+    VolumeViewerBase* viewer, double factor)
+{
+    if (!viewer || !(factor > 0.0) || !std::isfinite(factor)) {
+        return;
+    }
+    const auto found = _viewerFactors.find(viewer);
+    if (found != _viewerFactors.end() && found->second == factor) {
+        return;
+    }
+    _viewerFactors[viewer] = factor;
+    _transformedChains.erase(viewer);
+    clearPointChainProjectionCache();
+    refreshViewer(viewer);
+}
+
+double FiberOverlayController::viewerBaseToViewerFactor(
+    VolumeViewerBase* viewer) const
+{
+    const auto found = _viewerFactors.find(viewer);
+    return found == _viewerFactors.end() ? 1.0 : found->second;
+}
+
+void FiberOverlayController::detachViewer(VolumeViewerBase* viewer)
+{
+    _viewerFactors.erase(viewer);
+    _transformedChains.erase(viewer);
+    ViewerOverlayControllerBase::detachViewer(viewer);
+}
+
+const std::vector<FiberOverlayController::Chain>&
+FiberOverlayController::chainsForViewer(VolumeViewerBase* viewer) const
+{
+    const double factor = viewerBaseToViewerFactor(viewer);
+    if (factor == 1.0) {
+        return _chains;
+    }
+    if (auto found = _transformedChains.find(viewer);
+        found != _transformedChains.end()) {
+        return found->second;
+    }
+    std::vector<Chain> transformed = _chains;
+    const float scale = static_cast<float>(factor);
+    for (auto& chain : transformed) {
+        for (auto& point : chain.points) {
+            point *= scale;
+        }
+    }
+    return _transformedChains.emplace(viewer, std::move(transformed)).first->second;
 }
 
 void FiberOverlayController::setViewDistance(double distance)
@@ -246,7 +167,7 @@ FiberOverlayController::hitTestControlPoint(VolumeViewerBase* viewer,
     std::optional<ControlPointHit> best;
     qreal bestDistanceSq = maxDistancePx * maxDistancePx;
     std::vector<float> opacities;
-    for (const Chain& chain : _chains) {
+    for (const Chain& chain : chainsForViewer(viewer)) {
         const FilteredPoints filtered =
             projectedPointChain(viewer, chain.points, _viewDistance, &opacities);
         for (std::size_t i = 0; i < filtered.scenePoints.size(); ++i) {
@@ -273,12 +194,31 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         return;
     }
 
-    for (std::size_t index = 0; index < _chains.size(); ++index) {
-        const Chain& chain = _chains[index];
+    const auto& viewerChains = chainsForViewer(viewer);
+    // When link rings are shown, keep each ringed chain's projection from the
+    // first pass instead of projecting it a second time below.
+    struct RingSource {
+        const Chain* chain{nullptr};
+        FilteredPoints filtered;
+        std::vector<float> opacities;
+    };
+    std::vector<RingSource> ringSources;
+
+    for (std::size_t index = 0; index < viewerChains.size(); ++index) {
+        const Chain& chain = viewerChains[index];
         const uint64_t colorId =
             (_showLinked && chain.colorId != 0) ? chain.colorId : chain.id;
         const PointChainStyle style = fiberStyle(fiberColor(colorId), _viewDistance);
-        renderPointChain(viewer, builder, chain.points, style);
+        const bool needsRings = _showLinked && !chain.pointLinkStates.empty();
+        if (!needsRings) {
+            renderPointChain(viewer, builder, chain.points, style);
+            continue;
+        }
+        RingSource source;
+        source.chain = &chain;
+        renderPointChain(viewer, builder, chain.points, style, std::nullopt,
+                         &source.filtered, &source.opacities);
+        ringSources.push_back(std::move(source));
     }
 
     if (!_showLinked) {
@@ -286,25 +226,22 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     }
 
     // Linked-control-point rings, appended after every chain's primitives so
-    // they paint last (FiberBatchItem draws commands in insertion order).
+    // they paint last (OverlayBatchItem draws commands in insertion order).
     // Colors match the Line Annotation GUI's branch control-point markers.
-    std::vector<float> opacities;
-    for (const Chain& chain : _chains) {
-        if (chain.pointLinkStates.empty()) {
-            continue;
-        }
-        const FilteredPoints filtered =
-            projectedPointChain(viewer, chain.points, _viewDistance, &opacities);
+    for (const RingSource& source : ringSources) {
+        const Chain& chain = *source.chain;
+        const FilteredPoints& filtered = source.filtered;
+        const std::vector<float>& opacities = source.opacities;
         for (std::size_t i = 0; i < filtered.scenePoints.size(); ++i) {
             const float opacity = i < opacities.size() ? opacities[i] : 1.0f;
             if (opacity <= 0.0f || i >= filtered.sourceIndices.size()) {
                 continue;
             }
-            const std::size_t source = filtered.sourceIndices[i];
-            if (source >= chain.pointLinkStates.size()) {
+            const std::size_t sourceIndex = filtered.sourceIndices[i];
+            if (sourceIndex >= chain.pointLinkStates.size()) {
                 continue;
             }
-            const uint8_t state = chain.pointLinkStates[source];
+            const uint8_t state = chain.pointLinkStates[sourceIndex];
             if (state == 0) {
                 continue;
             }
@@ -332,6 +269,10 @@ void FiberOverlayController::applyOverlayPrimitives(
         return;
     }
 
+    std::vector<OverlayLineCommand> lineCommands;
+    std::vector<OverlayPointCommand> pointCommands;
+    buildOverlayBatchCommands(primitives, lineCommands, pointCommands);
+
     auto& items = _persistentItems->viewers[viewer];
     if (!items.lines || !items.points) {
         // A viewer may clear all overlay groups independently. QPointer lets
@@ -346,12 +287,12 @@ void FiberOverlayController::applyOverlayPrimitives(
             return;
         }
 
-        auto* lines = new FiberBatchItem(FiberBatchItem::Content::Lines);
-        auto* points = new FiberBatchItem(FiberBatchItem::Content::Points);
+        auto* lines = new OverlayBatchItem();
+        auto* points = new OverlayBatchItem();
         lines->setZValue(94.0);
         points->setZValue(95.0);
-        lines->setPrimitives(primitives);
-        points->setPrimitives(primitives);
+        lines->setLineCommands(std::move(lineCommands));
+        points->setPointCommands(std::move(pointCommands));
 
         scene->addItem(lines);
         scene->addItem(points);
@@ -361,8 +302,8 @@ void FiberOverlayController::applyOverlayPrimitives(
         return;
     }
 
-    items.lines->setPrimitives(primitives);
-    items.points->setPrimitives(primitives);
+    items.lines->setLineCommands(std::move(lineCommands));
+    items.points->setPointCommands(std::move(pointCommands));
 }
 
 void FiberOverlayController::clearOverlay(VolumeViewerBase* viewer) const

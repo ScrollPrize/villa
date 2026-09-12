@@ -1,4 +1,5 @@
 #include "SpiralReloadComparison.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralSessionSync.hpp"
 
 #include <QJsonObject>
@@ -9,6 +10,37 @@ class SpiralReloadComparisonTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void FiberCasConflictPreservesCurrentRevisionForRetry()
+    {
+        const QJsonObject conflict{
+            {"error", "fiber revision conflict"},
+            {"current_revision", "revision-2"},
+        };
+        const QString current =
+            vc3d::spiralFiberConflictRevision(conflict);
+
+        QCOMPARE(current, QStringLiteral("revision-2"));
+        QVERIFY(vc3d::spiralFiberUploadNeedsCasRetry(
+            current, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(
+            {}, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(current, {}));
+    }
+
+    void FiberInputIdIsTheFileStemNotTheRuntimeId()
+    {
+        // The service commits fibers to paths.fibers/<id>.json and the
+        // fitter identifies dataset fibers by stem, so uploading by stem
+        // replaces the resident fiber instead of adding "<number>.json".
+        QCOMPARE(vc3d::spiralFiberInputId(
+                     QStringLiteral("/data/fibers/sean_20260901T120000_3.json")),
+                 QStringLiteral("sean_20260901T120000_3"));
+        QCOMPARE(vc3d::spiralFiberInputId(
+                     QStringLiteral("/data/fibers/scroll.a.json")),
+                 QStringLiteral("scroll.a"));
+        QVERIFY(vc3d::spiralFiberInputId(QString()).isEmpty());
+    }
+
     void CheckpointLoadInitializesWithoutProfileOverrides()
     {
         const QJsonObject request{

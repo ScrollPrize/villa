@@ -2327,7 +2327,7 @@ void SurfacePanelController::connectFilterSignals()
         connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
             applyFilters();
         });
-        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](vc::PointRef) {
             applyFilters();
         });
     }

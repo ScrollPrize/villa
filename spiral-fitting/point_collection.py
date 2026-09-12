@@ -541,6 +541,88 @@ def link_points_to_patches(
     return links
 
 
+def link_unattached_points_to_patches(
+    point_collections: Dict[int, Dict[str, Any]],
+    all_patches: Dict[str, Patch],
+    new_patches: Dict[str, Patch],
+    tolerance: float = 10.0,
+    surface_index_tolerance: Optional[float] = None,
+    distance_scale: float = 1.0,
+    general_hit_policy: str = 'nearest',
+) -> Dict[int, int]:
+    """Offer still-unattached points of resident collections to newly added patches.
+
+    Points already carrying ``on_patch`` keep their attachment; only points
+    without one are linked, and only against ``new_patches`` (a subset of
+    ``all_patches``). Because an unattached point was already rejected by every
+    other patch, this yields the same attachments a fresh start over
+    ``all_patches`` would, at the cost of indexing the new patches only.
+
+    ``all_patches`` is consulted only to resolve "between_patches__XXX__YYY"
+    collections to their named pair (see ``link_points_to_patches``): such a
+    collection attaches to whichever of its named patches are new, and never to
+    an unrelated new patch.
+
+    Returns ``{collection_id: newly attached point count}`` for the collections
+    that gained at least one attachment.
+    """
+    if not new_patches:
+        return {}
+    general_shadows: Dict[int, Dict[str, Any]] = {}
+    between_shadows = []
+    shadows: Dict[int, Dict[str, Any]] = {}
+    for collection_id, collection in point_collections.items():
+        unattached = {
+            point_id: point for point_id, point in collection['points'].items()
+            if 'on_patch' not in point
+        }
+        if not unattached:
+            continue
+        # A shadow shares the point dicts, so attachments land on the resident
+        # collection; the container is separate so nothing else is touched.
+        shadow = {
+            'name': collection.get('name', ''),
+            'metadata': collection.get('metadata', {}),
+            'points': unattached,
+        }
+        shadows[collection_id] = shadow
+        targets = _resolve_between_patches_targets(collection, all_patches)
+        if targets is None:
+            general_shadows[collection_id] = shadow
+        else:
+            new_targets = {
+                patch_id: patch for patch_id, patch in targets.items()
+                if patch_id in new_patches
+            }
+            if new_targets:
+                between_shadows.append((collection_id, shadow, new_targets))
+
+    links: Dict[str, List[PointPatchLink]] = {}
+    use_surface_index = (surface_index_tolerance is not None
+                         and can_use_surface_index_backend(new_patches))
+    subset_tolerance = (surface_index_tolerance / distance_scale
+                        if use_surface_index else tolerance)
+    for collection_id, shadow, new_targets in between_shadows:
+        _link_collection_to_patch_subset(
+            links, collection_id, shadow, new_targets, subset_tolerance)
+    if general_shadows:
+        link_points_to_patches(
+            new_patches,
+            general_shadows,
+            tolerance=tolerance,
+            surface_index_tolerance=surface_index_tolerance,
+            distance_scale=distance_scale,
+            general_hit_policy=general_hit_policy,
+        )
+
+    gained: Dict[int, int] = {}
+    for collection_id, shadow in shadows.items():
+        count = sum(1 for point in shadow['points'].values() if 'on_patch' in point)
+        if count:
+            gained[collection_id] = count
+    return gained
+
+
 def normalise_pcl_winding_annotations(point_collections):
     # Per-pcl: if every point has a winding annotation, leave alone; if none has one, set them all to 0;
     # if mixed, print a warning and strip the unannotated points.

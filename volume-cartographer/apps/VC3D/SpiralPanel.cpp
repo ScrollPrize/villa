@@ -42,6 +42,9 @@
 
 namespace {
 const QString kLocalhostProfileId = QStringLiteral("localhost");
+const QString kPointViewToleranceKey =
+    QStringLiteral("spiral/point_collection_view_tolerance");
+constexpr double kDefaultPointViewTolerance = 10.0;
 // Marks a checkpoint entry that names a file on this computer rather than one
 // the service advertised; such an entry is uploaded before it can be loaded.
 constexpr int kLocalCheckpointRole = Qt::UserRole + 1;
@@ -483,6 +486,56 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
 
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        auto* toggle = new QCheckBox(
+            tr("Show %1 PCLs").arg(vc3d::spiral::pclRoleDisplayName(role)),
+            _displayDialog);
+        toggle->setObjectName(role == vc3d::spiral::PclRole::Relative
+                                  ? QStringLiteral("spiralShowRelativeWindingPcls")
+                                  : QStringLiteral("spiralShowSameWindingPcls"));
+        toggle->setEnabled(false);
+        toggle->setToolTip(tr("No compatible %1 artifact is available")
+                               .arg(vc3d::spiral::pclRoleDisplayName(role)));
+        connect(toggle, &QCheckBox::toggled, this, [this, role](bool shown) {
+            emit pclOverlayChanged(role, shown);
+        });
+        displayDialogLayout->addWidget(toggle);
+        _showPclOverlays[vc3d::spiral::pclRoleIndex(role)] = toggle;
+    }
+
+    auto* pointToleranceRow = new QWidget(_displayDialog);
+    auto* pointToleranceLayout = new QHBoxLayout(pointToleranceRow);
+    pointToleranceLayout->setContentsMargins(0, 0, 0, 0);
+    _pointViewTolerance = new QDoubleSpinBox(pointToleranceRow);
+    _pointViewTolerance->setObjectName(
+        QStringLiteral("spiralPointViewTolerance"));
+    _pointViewTolerance->setRange(0.0, 10000.0);
+    _pointViewTolerance->setDecimals(1);
+    _pointViewTolerance->setSingleStep(1.0);
+    _pointViewTolerance->setSuffix(tr(" vx"));
+    _pointViewTolerance->setToolTip(
+        tr("Maximum distance from the preview surface at which same-winding "
+           "and relative-winding point markers are shown"));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _pointViewTolerance->setValue(
+            settings.value(kPointViewToleranceKey,
+                           kDefaultPointViewTolerance).toDouble());
+    }
+    pointToleranceLayout->addWidget(
+        new QLabel(tr("Point surface tolerance"), pointToleranceRow));
+    pointToleranceLayout->addWidget(_pointViewTolerance);
+    pointToleranceLayout->addStretch(1);
+    connect(_pointViewTolerance,
+            QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double tolerance) {
+                QSettings settings(vc3d::settingsFilePath(),
+                                   QSettings::IniFormat);
+                settings.setValue(kPointViewToleranceKey, tolerance);
+                emit pointViewToleranceChanged(tolerance);
+            });
+    displayDialogLayout->addWidget(pointToleranceRow);
+
     auto* intersectionStrideRow = new QWidget(_displayDialog);
     auto* intersectionStrideLayout = new QHBoxLayout(intersectionStrideRow);
     intersectionStrideLayout->setContentsMargins(0, 0, 0, 0);
@@ -749,13 +802,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _commitInputs = new QPushButton(tr("Commit current inputs"), runContents);
     _commitInputs->setEnabled(false);
     _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
+    _addInputs = new QPushButton(tr("Add to current fit"), runContents);
+    _addInputs->setToolTip(tr("Snapshot and upload all ready local drawing drafts"));
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
-    _removeInput->setToolTip(tr("Remove the selected input before it joins the fit; "
-                                "inputs that already joined need a session reload"));
+    _removeInput->setToolTip(tr("Remove a pending input before it is queued; queued "
+                                "or incorporated inputs cannot be removed"));
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
+    commitRow->addWidget(_addInputs);
     commitRow->addWidget(_commitInputs);
     commitRow->addWidget(_removeInput);
     commitRow->addStretch(1);
@@ -1253,10 +1309,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                   tr("Move the added inputs into the dataset? Patches go to "
                                      "verified_patches/, fibers to fibers/, and PCL documents "
                                      "merge into their conventional role file (control-point "
-                                     "lines go to drawn_control_points.json; "
-                                     "same-winding point collections go to same_windings.json)."))
+                                     "lines go to drawn_control_points.json; same-winding "
+                                     "point collections go to same_windings.json; "
+                                     "relative-winding point collections go to "
+                                     "relative_windings.json)."))
             != QMessageBox::Yes) return;
-        _service->commitInputs();
+        emit addDraftsRequested(true);
+    });
+    connect(_addInputs, &QPushButton::clicked, this, [this]() {
+        emit addDraftsRequested(false);
     });
     connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
         const QListWidgetItem* item = _ephemeralList->currentItem();
@@ -1579,6 +1640,54 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
 void SpiralPanel::setLossMapLegend(const QString& text)
 {
     if (_lossMapLegend) _lossMapLegend->setText(text);
+}
+
+void SpiralPanel::setLocalDraftsReady(bool ready)
+{
+    _localDraftsReady = ready;
+    if (_addInputs) _addInputs->setEnabled(_connected && _hasSession && ready);
+    if (_commitInputs)
+        _commitInputs->setEnabled(_connected && _hasSession
+                                  && (ready || _uncommittedCount > 0));
+}
+
+void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
+                                         bool available, const QString& reason)
+{
+    auto* toggle = _showPclOverlays[vc3d::spiral::pclRoleIndex(role)];
+    if (!toggle) return;
+    toggle->setEnabled(available);
+    if (!available) toggle->setChecked(false);
+    QString help;
+    if (!available) {
+        help = reason.isEmpty()
+            ? tr("No compatible %1 artifact is available")
+                  .arg(vc3d::spiral::pclRoleDisplayName(role))
+            : reason;
+    } else if (role == vc3d::spiral::PclRole::Relative) {
+        help = tr("Show relative-winding PCLs with their winding labels. "
+                  "Left-click a point to activate its editable collection; E "
+                  "adds a new collection (winding 0, 1, 2, ... per point) or "
+                  "appends to the active one, on the flattened view or any "
+                  "plane view; F flips the winding direction; Delete removes "
+                  "the collection after confirmation; Escape exits placement "
+                  "and clears the active PCL.");
+    } else {
+        help = tr("Show same-winding PCLs. Left-click a point to activate its "
+                  "editable collection; Q adds a new collection or appends to "
+                  "the active one, on the flattened view or any plane view; F "
+                  "reverses the active PCL; Delete removes it after "
+                  "confirmation; Escape exits placement and clears the active "
+                  "PCL.");
+    }
+    toggle->setToolTip(help);
+}
+
+double SpiralPanel::pointViewTolerance() const
+{
+    return _pointViewTolerance
+        ? _pointViewTolerance->value()
+        : kDefaultPointViewTolerance;
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
@@ -2103,11 +2212,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
     _ephemeralCount = ephemeral.size();
     int pendingCount = 0;
+    int queuedCount = 0;
     _uncommittedCount = 0;
     for (const QJsonValue& value : ephemeral) {
         const QJsonObject input = value.toObject();
         if (input.value(QStringLiteral("state")).toString() == QStringLiteral("pending"))
             ++pendingCount;
+        if (input.value(QStringLiteral("state")).toString() == QStringLiteral("queued"))
+            ++queuedCount;
         if (!input.value(QStringLiteral("committed")).toBool())
             ++_uncommittedCount;
     }
@@ -2125,8 +2237,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             const QJsonObject input = value.toObject();
             const QString kind = input.value(QStringLiteral("kind")).toString();
             const QString id = input.value(QStringLiteral("id")).toString();
-            QString label = tr("%1 %2 — %3")
-                .arg(kind, id, input.value(QStringLiteral("state")).toString());
+            const QString inputState =
+                input.value(QStringLiteral("state")).toString();
+            QString stateLabel = inputState;
+            if (inputState == QStringLiteral("queued"))
+                stateLabel = tr("queued for next optimizer step");
+            else if (inputState == QStringLiteral("pending"))
+                stateLabel = tr("pending for next Run");
+            QString label = tr("%1 %2 — %3").arg(kind, id, stateLabel);
             if (input.value(QStringLiteral("committed")).toBool())
                 label += tr(", committed");
             const QString role = input.value(QStringLiteral("role")).toString();
@@ -2134,19 +2252,32 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             auto* item = new QListWidgetItem(label, _ephemeralList);
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
-            item->setData(Qt::UserRole + 2, input.value(QStringLiteral("state")).toString());
+            item->setData(Qt::UserRole + 2, inputState);
+            const QString incorporationError =
+                input.value(QStringLiteral("error")).toString();
+            if (!incorporationError.isEmpty()) {
+                item->setToolTip(tr("Input incorporation failed: %1")
+                                     .arg(incorporationError));
+                label += tr(": %1").arg(incorporationError);
+                item->setText(label);
+            }
             if (kind == selectedKind && id == selectedId) _ephemeralList->setCurrentItem(item);
         }
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(commitAvailable);
+    _commitInputs->setEnabled(commitAvailable || _localDraftsReady);
+    _addInputs->setEnabled(_connected && _hasSession && _localDraftsReady);
     if (_ephemeralCount > 0 && !commitAvailable && _uncommittedCount > 0)
         _commitHint->setText(tr("Commit unavailable: %1")
                                  .arg(status.value(QStringLiteral("commit_unavailable_reason")).toString()));
+    else if (queuedCount > 0 && pendingCount > 0)
+        _commitHint->setText(
+            tr("Queued inputs join before the next optimizer step; pending inputs "
+               "wait for the next Run"));
+    else if (queuedCount > 0)
+        _commitHint->setText(tr("Queued inputs join before the next optimizer step"));
     else if (pendingCount > 0)
-        _commitHint->setText(state == QStringLiteral("Running")
-            ? tr("Pending inputs join the fit when this run pauses and the next run starts")
-            : tr("Pending inputs join the fit on the next run"));
+        _commitHint->setText(tr("Pending inputs join the fit on the next Run"));
     else
         _commitHint->clear();
 }

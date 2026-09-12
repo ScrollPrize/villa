@@ -18,7 +18,9 @@
 
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "volume_viewers/SurfaceProjection.hpp"
 #include "vc/core/types/Sampling.hpp"
+#include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class CVolumeViewerView;
@@ -54,6 +56,25 @@ public:
     };
 
     // --- Coordinate transforms ---
+    //
+    // volumeToScene() is the composition of the two halves below. The split
+    // exists because the halves have very different costs and very different
+    // dependencies: projecting a volume point onto the displayed surface is a
+    // nearest-point search over that surface, and depends only on the surface,
+    // the patch index and the displayed depth band; turning that projection
+    // into a scene point is a handful of multiply-adds that depend on the
+    // camera. Overlays that redraw on every pan/zoom cache the first half and
+    // re-run only the second.
+
+    // SurfaceProjection / SurfaceProjectionContext live in
+    // volume_viewers/SurfaceProjection.hpp; see it for what the split is for.
+
+    // nullopt when the point does not project onto the displayed surface.
+    virtual std::optional<SurfaceProjection> projectVolumePoint(
+        const cv::Vec3f& vol_point) const = 0;
+    virtual QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const = 0;
+    virtual SurfaceProjectionContext surfaceProjectionContext() const = 0;
+
     virtual QPointF volumeToScene(const cv::Vec3f& vol_point) = 0;
     virtual cv::Vec3f sceneToVolume(const QPointF& scenePoint) const = 0;
     virtual cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const = 0;
@@ -125,6 +146,10 @@ public:
     virtual void setSegmentationEditActive(bool active) = 0;
     virtual void setSegmentationIntersectionDeferral(bool active) = 0;
     virtual void setSegmentationCursorMirroring(bool enabled) = 0;
+    // Suppress only this viewer's local mouse crosshair while a controller
+    // supplies a more specific cursor cue. Linked cursor projections remain
+    // independently controlled by cursor mirroring.
+    virtual void setLocalCursorCrosshairSuppressed(bool) {}
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
@@ -140,10 +165,17 @@ public:
     // QuadSurface view ignore both.
     virtual void setSurfaceCacheBudgets(std::size_t, std::size_t) {}
 
+    // When the SurfaceCache band covers a frame, stop publishing that frame's
+    // raw-path viewport chunk demand so the (background-priority) tile fills
+    // are not starved by interactive fetches for a sampling path the frame
+    // never executes. Off by default; enabled by workspaces where the
+    // flattened view is the primary pane (the Spiral workspace).
+    virtual void setPreferSurfaceTileFills(bool) {}
+
     // --- Interaction state ---
-    virtual uint64_t highlightedPointId() const = 0;
-    virtual uint64_t selectedPointId() const = 0;
-    virtual uint64_t selectedCollectionId() const = 0;
+    virtual std::optional<vc::PointRef> highlightedPoint() const = 0;
+    virtual std::optional<vc::PointRef> selectedPoint() const = 0;
+    virtual std::optional<uint64_t> selectedCollectionId() const = 0;
     virtual bool isPointDragActive() const = 0;
     virtual bool isSameWrapAnnotationModeEnabled() const = 0;
     virtual double sameWrapAnnotationPolylineOpacity() const = 0;

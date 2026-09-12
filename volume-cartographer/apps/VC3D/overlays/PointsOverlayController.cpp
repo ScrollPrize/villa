@@ -1,17 +1,24 @@
 #include "PointsOverlayController.hpp"
 
+#include "OverlayBatchItem.hpp"
+#include "ScreenSpacePointIndex.hpp"
+#include "../volume_viewers/CVolumeViewerView.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 
+#include <QGraphicsScene>
+#include <QPointer>
 #include <QtGlobal>
 #include <QTimer>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 namespace
 {
@@ -70,27 +77,199 @@ std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& co
 
 } // namespace
 
-PointsOverlayController::PointsOverlayController(VCCollection* collection, QObject* parent)
-    : ViewerOverlayControllerBase(kOverlayGroupPoints, parent)
+struct PointsOverlayController::PersistentItems
+{
+    struct ViewerItems {
+        QPointer<OverlayBatchItem> lines;
+        QPointer<OverlayBatchItem> points;
+        std::vector<DisplayPointHit> hitRecords;
+        ScreenSpacePointIndex hitIndex;
+    };
+
+    std::unordered_map<VolumeViewerBase*, ViewerItems> viewers;
+};
+
+namespace
+{
+
+// Several display-only controllers can share one viewer (the spiral
+// workspace keeps one per editable PCL role). Viewers replace and clear
+// overlay items by group key, so each instance needs its own key or one
+// controller's refresh deletes another's items.
+std::string displayOnlyOverlayGroupKey()
+{
+    static std::atomic<unsigned> counter{0};
+    return "display_only_point_collection_overlay_"
+           + std::to_string(counter.fetch_add(1));
+}
+
+} // namespace
+
+PointsOverlayController::PointsOverlayController(VCCollection* collection, QObject* parent,
+                                                 bool displayOnly)
+    : ViewerOverlayControllerBase(displayOnly
+                                      ? displayOnlyOverlayGroupKey()
+                                      : std::string(kOverlayGroupPoints),
+                                  parent)
+    , _persistentItems(std::make_unique<PersistentItems>())
     , _collection(collection)
+    , _displayOnly(displayOnly)
 {
     connectCollectionSignals();
+}
+
+void PointsOverlayController::applyOverlayPrimitives(
+    VolumeViewerBase* viewer,
+    std::vector<OverlayPrimitive> primitives)
+{
+    if (!viewer || primitives.empty()) {
+        clearOverlay(viewer);
+        return;
+    }
+
+    std::vector<OverlayLineCommand> lineCommands;
+    std::vector<OverlayPointCommand> pointCommands;
+    if (!buildOverlayBatchCommands(primitives, lineCommands, pointCommands)) {
+        // Winding labels (and anything else the batch item does not paint)
+        // fall back to the general materialization, which renders them
+        // exactly as before. Only the label-free case -- the display-only
+        // point clouds that made this overlay slow -- takes the fast path.
+        // Keep the hit index collectPrimitives just built for this viewer:
+        // the labelled relative-winding PCLs are hit-tested and selected
+        // through it, and dropping it here made them unclickable. Only the
+        // retained batch items go.
+        if (_persistentItems && viewer) {
+            const auto found = _persistentItems->viewers.find(viewer);
+            if (found != _persistentItems->viewers.end()) {
+                found->second.lines.clear();
+                found->second.points.clear();
+            }
+        }
+        ViewerOverlayControllerBase::clearOverlay(viewer);
+        ViewerOverlayControllerBase::applyOverlayPrimitives(viewer, std::move(primitives));
+        return;
+    }
+
+    auto& items = _persistentItems->viewers[viewer];
+    if (!items.lines || !items.points) {
+        // A viewer may clear all overlay groups independently. QPointer lets
+        // us detect that and recreate the retained pair safely on demand.
+        if (items.lines || items.points) {
+            ViewerOverlayControllerBase::clearOverlay(viewer);
+        }
+
+        QGraphicsScene* scene = viewerScene(viewer);
+        if (!scene) {
+            clearOverlay(viewer);
+            return;
+        }
+
+        auto* lines = new OverlayBatchItem();
+        auto* points = new OverlayBatchItem();
+        lines->setZValue(kPolylineZValue);
+        points->setZValue(kZValue);
+        lines->setLineCommands(std::move(lineCommands));
+        points->setPointCommands(std::move(pointCommands));
+
+        scene->addItem(lines);
+        scene->addItem(points);
+        viewer->setOverlayGroup(overlayGroupKey(), {lines, points});
+        items.lines = lines;
+        items.points = points;
+        return;
+    }
+
+    items.lines->setLineCommands(std::move(lineCommands));
+    items.points->setPointCommands(std::move(pointCommands));
+}
+
+void PointsOverlayController::clearOverlay(VolumeViewerBase* viewer) const
+{
+    if (_persistentItems && viewer) {
+        _persistentItems->viewers.erase(viewer);
+    }
+    ViewerOverlayControllerBase::clearOverlay(viewer);
+}
+
+void PointsOverlayController::setCoordinateScale(double scale)
+{
+    if (!std::isfinite(scale) || scale <= 0.0) return;
+    if (std::abs(_coordinateScale - scale) < 1.0e-12) return;
+    _coordinateScale = scale;
+    _orderedCollections.clear();
+    ++_pointsRevision;
+    refreshAll();
+}
+
+void PointsOverlayController::setHiddenCollectionIds(const QSet<qulonglong>& ids)
+{
+    if (_hiddenCollectionIds == ids) return;
+    _hiddenCollectionIds = ids;
+    refreshAll();
+}
+
+const PointsOverlayController::OrderedCollection&
+PointsOverlayController::orderedCollection(
+    uint64_t collectionId, const PointCollections::Collection& collection) const
+{
+    auto found = _orderedCollections.find(collectionId);
+    if (found != _orderedCollections.end() &&
+        found->second.coordinateScale == _coordinateScale) {
+        return found->second;
+    }
+
+    OrderedCollection ordered;
+    ordered.coordinateScale = _coordinateScale;
+    ordered.points = orderedCollectionPoints(collection);
+    ordered.scaledPositions.reserve(ordered.points.size());
+    for (const ColPoint& colPoint : ordered.points) {
+        ordered.scaledPositions.push_back(colPoint.p * static_cast<float>(_coordinateScale));
+    }
+    return _orderedCollections.insert_or_assign(collectionId, std::move(ordered))
+        .first->second;
+}
+
+void PointsOverlayController::setVisible(bool visible)
+{
+    if (_visible == visible) return;
+    _visible = visible;
+    refreshAll();
+}
+
+void PointsOverlayController::setShowWindingLabels(bool show)
+{
+    if (_showWindingLabels == show) return;
+    _showWindingLabels = show;
+    refreshAll();
+}
+
+std::optional<PointsOverlayController::DisplayPointHit>
+PointsOverlayController::displayPointHitAt(
+    VolumeViewerBase* viewer, const QPointF& devicePosition, qreal radius,
+    const QSet<qulonglong>& allowedCollectionIds) const
+{
+    if (!_displayOnly || !_visible || !viewer || allowedCollectionIds.isEmpty()
+        || !_persistentItems) return std::nullopt;
+    const auto found = _persistentItems->viewers.find(viewer);
+    if (found == _persistentItems->viewers.end()) return std::nullopt;
+    // The hit index is rebuilt by every collectPrimitives pass and erased
+    // with clearOverlay, so it is current whether the points were drawn by
+    // the retained batch items or by the label-capable fallback path.
+    const auto& items = found->second;
+    const auto hit = items.hitIndex.closest(
+        devicePosition, radius, [&items, &allowedCollectionIds](std::size_t index) {
+            return index < items.hitRecords.size()
+                && allowedCollectionIds.contains(
+                    items.hitRecords[index].ref.collectionId);
+        });
+    return hit && *hit < items.hitRecords.size()
+        ? std::optional<DisplayPointHit>(items.hitRecords[*hit])
+        : std::nullopt;
 }
 
 PointsOverlayController::~PointsOverlayController()
 {
     disconnectCollectionSignals();
-}
-
-void PointsOverlayController::setCollection(VCCollection* collection)
-{
-    if (_collection == collection) {
-        return;
-    }
-    disconnectCollectionSignals();
-    _collection = collection;
-    connectCollectionSignals();
-    refreshAll();
 }
 
 void PointsOverlayController::setViewTolerance(double tolerance)
@@ -103,18 +282,37 @@ void PointsOverlayController::setViewTolerance(double tolerance)
     refreshAll();
 }
 
+void PointsOverlayController::setCollection(VCCollection* collection)
+{
+    if (_collection == collection) {
+        return;
+    }
+    disconnectCollectionSignals();
+    _collection = collection;
+    connectCollectionSignals();
+    _orderedCollections.clear();
+    ++_pointsRevision;
+    refreshAll();
+}
+
 bool PointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return _collection && viewer;
+    return _visible && _collection && viewer;
 }
 
 void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
+    PersistentItems::ViewerItems* viewerItems = nullptr;
+    if (_displayOnly && _persistentItems && viewer) {
+        viewerItems = &_persistentItems->viewers[viewer];
+        viewerItems->hitRecords.clear();
+        viewerItems->hitIndex.clear();
+    }
     if (!_collection || !viewer) {
         return;
     }
 
-    if (viewer->pointCollection() != _collection) {
+    if (!_displayOnly && viewer->pointCollection() != _collection) {
         return;
     }
 
@@ -123,15 +321,19 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         return;
     }
 
-    const uint64_t highlightId = viewer->highlightedPointId();
-    const uint64_t selectedId = viewer->selectedPointId();
-    const bool drawSameWrapPolylines = viewer->isSameWrapAnnotationModeEnabled();
+    const std::optional<vc::PointRef> highlighted = _displayOnly
+        ? std::nullopt : viewer->highlightedPoint();
+    const std::optional<vc::PointRef> selected = _displayOnly
+        ? std::nullopt : viewer->selectedPoint();
+    const bool drawSameWrapPolylines = !_displayOnly
+        && viewer->isSameWrapAnnotationModeEnabled();
+    auto* graphicsView = _displayOnly ? viewer->graphicsView() : nullptr;
 
     for (const auto& [collectionId, collection] : collections) {
+        if (_hiddenCollectionIds.contains(collectionId)) continue;
         const cv::Vec3f collectionColor = collection.color;
         const bool absoluteWinding = collection.metadata.absolute_winding_number;
         struct Entry {
-            cv::Vec3f world;
             uint64_t pointId;
             float opacity{1.0f};
             bool isHighlighted{false};
@@ -140,30 +342,43 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             QString label;
         };
 
-        std::vector<cv::Vec3f> positions;
+        const OrderedCollection& ordered = orderedCollection(collectionId, collection);
+        const std::vector<cv::Vec3f>& positions = ordered.scaledPositions;
         std::vector<Entry> entries;
-        positions.reserve(collection.points.size());
-        entries.reserve(collection.points.size());
+        entries.reserve(ordered.points.size());
 
-        for (const ColPoint& colPoint : orderedCollectionPoints(collection)) {
+        for (const ColPoint& colPoint : ordered.points) {
             Entry entry;
-            entry.world = colPoint.p;
             entry.pointId = colPoint.id;
-            entry.isHighlighted = colPoint.id == highlightId;
-            entry.isSelected = colPoint.id == selectedId;
-            if (!std::isnan(colPoint.winding_annotation)) {
+            const vc::PointRef ref{collectionId, colPoint.id};
+            entry.isHighlighted = highlighted && *highlighted == ref;
+            entry.isSelected = selected && *selected == ref;
+            // A display-only overlay (the Spiral same-winding PCLs) draws whole
+            // point clouds rather than a handful of annotations. One text item
+            // per point flushes the point-batching groups in applyPrimitives,
+            // costing two QGraphicsItems per point; the labels are not
+            // actionable there, so skip them unless the overlay asked for
+            // them (relative-winding PCLs, whose annotations are the display).
+            if ((!_displayOnly || _showWindingLabels)
+                && !std::isnan(colPoint.winding_annotation)) {
                 const QString text = formatWinding(colPoint.winding_annotation, absoluteWinding);
                 entry.hasLabel = !text.isEmpty();
                 entry.label = text;
             }
 
-            positions.push_back(entry.world);
             entries.push_back(std::move(entry));
         }
 
         std::vector<float> opacities;
-        auto filtered = filterPointsNearViewerSurface(viewer, positions,
-                                                      static_cast<float>(_viewTolerance), &opacities);
+        auto filtered = filterPointsNearViewerSurfaceCached(
+            viewer, collectionId, _pointsRevision, positions,
+            static_cast<float>(_viewTolerance), &opacities);
+        if (viewerItems) {
+            const std::size_t hitCount = viewerItems->hitRecords.size()
+                + filtered.scenePoints.size();
+            viewerItems->hitRecords.reserve(hitCount);
+            viewerItems->hitIndex.reserve(hitCount);
+        }
         for (size_t i = 0; i < filtered.sourceIndices.size(); ++i) {
             entries[filtered.sourceIndices[i]].opacity = opacities[i];
         }
@@ -204,6 +419,17 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             style.penColor.setAlphaF(entry.opacity);
 
             builder.addPoint(scenePos, radius, style);
+
+            if (viewerItems && graphicsView) {
+                const std::size_t hitIndex = viewerItems->hitRecords.size();
+                const QPointF devicePosition =
+                    graphicsView->viewportTransform().map(scenePos);
+                viewerItems->hitRecords.push_back({
+                    vc::PointRef{collectionId, entry.pointId}, scenePos,
+                    devicePosition, toColor(collectionColor, 1.0f)});
+                viewerItems->hitIndex.insert({
+                    devicePosition, collectionId, entry.pointId, hitIndex});
+            }
 
             if (entry.hasLabel) {
                 OverlayStyle textStyle;
@@ -257,6 +483,15 @@ void PointsOverlayController::handleCollectionMutated()
     // per-point and batch signals, and a batch add fires pointAdded N times plus
     // pointsAdded once. Coalesce the resulting refreshes onto a single deferred
     // call so a burst of signals in one event-loop turn triggers one refreshAll().
+    // The ordered-point and surface-projection caches are keyed on a revision
+    // that has to move before the deferred rebuild reads them, not when it
+    // runs -- a mutation and its rebuild are separated by an event-loop turn.
+    // Dropping the projection cache outright also reclaims entries for
+    // collections that have been removed; the revision bump would have forced
+    // every surviving entry to recompute anyway.
+    _orderedCollections.clear();
+    clearSurfacePointsCache();
+    ++_pointsRevision;
     if (_refreshPending) {
         return;
     }

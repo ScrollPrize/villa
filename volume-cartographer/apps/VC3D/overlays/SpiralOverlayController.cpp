@@ -18,6 +18,8 @@ void SpiralOverlayController::publishRunDiff(std::shared_ptr<QuadSurface> surfac
 {
     _runDiffSurface = std::move(surface);
     _runDiffImage = std::move(image);
+    _runDiffPixmap = _runDiffImage.isNull() ? QPixmap()
+                                            : QPixmap::fromImage(_runDiffImage);
     refreshAll();
 }
 
@@ -26,6 +28,8 @@ void SpiralOverlayController::publishLossMap(std::shared_ptr<QuadSurface> surfac
 {
     _lossMapSurface = std::move(surface);
     _lossMapImage = std::move(image);
+    _lossMapPixmap = _lossMapImage.isNull() ? QPixmap()
+                                            : QPixmap::fromImage(_lossMapImage);
     _lossMapOpacity = std::clamp(opacity, 0.0, 1.0);
     refreshAll();
 }
@@ -36,6 +40,31 @@ void SpiralOverlayController::publishWindingTransitions(
 {
     _transitionSurface = std::move(surface);
     _transitionCurves = std::move(curves);
+
+    // Grid-to-surface is a fixed affine of the published surface, so do it here
+    // instead of rebuilding the same vectors on every pan/zoom tick.
+    _transitionSurfaceSegments.clear();
+    if (_transitionSurface) {
+        const cv::Vec2f scale = _transitionSurface->scale();
+        const cv::Vec3f center = _transitionSurface->center();
+        if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
+            _transitionSurfaceSegments.reserve(_transitionCurves.size());
+            for (const WindingTransitionCurve& curve : _transitionCurves) {
+                std::vector<std::vector<cv::Vec2f>> segments;
+                segments.reserve(curve.segments.size());
+                for (const std::vector<cv::Vec2f>& segment : curve.segments) {
+                    std::vector<cv::Vec2f> surfacePoints;
+                    surfacePoints.reserve(segment.size());
+                    for (const cv::Vec2f& point : segment) {
+                        surfacePoints.emplace_back(point[0] / scale[0] - center[0],
+                                                   point[1] / scale[1] - center[1]);
+                    }
+                    segments.push_back(std::move(surfacePoints));
+                }
+                _transitionSurfaceSegments.push_back(std::move(segments));
+            }
+        }
+    }
     refreshAll();
 }
 
@@ -50,10 +79,13 @@ void SpiralOverlayController::reset()
 {
     _runDiffSurface.reset();
     _runDiffImage = {};
+    _runDiffPixmap = {};
     _lossMapSurface.reset();
     _lossMapImage = {};
+    _lossMapPixmap = {};
     _transitionSurface.reset();
     _transitionCurves.clear();
+    _transitionSurfaceSegments.clear();
     refreshAll();
 }
 
@@ -95,7 +127,8 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             const qreal scaleX = std::hypot(columnStep.x(), columnStep.y());
             const qreal scaleY = std::hypot(rowStep.x(), rowStep.y());
             if (scaleX > 1e-6 && scaleY > 1e-6)
-                builder.addImage(_runDiffImage, origin, scaleX, scaleY, 1.0, 65.0);
+                builder.addImage(_runDiffImage, _runDiffPixmap, origin, scaleX,
+                                 scaleY, 1.0, 65.0);
         }
     }
 
@@ -115,19 +148,14 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             const qreal scaleX = std::hypot(columnStep.x(), columnStep.y());
             const qreal scaleY = std::hypot(rowStep.x(), rowStep.y());
             if (scaleX > 1e-6 && scaleY > 1e-6)
-                builder.addImage(_lossMapImage, origin, scaleX, scaleY,
-                                 _lossMapOpacity, 66.0);
+                builder.addImage(_lossMapImage, _lossMapPixmap, origin, scaleX,
+                                 scaleY, _lossMapOpacity, 66.0);
         }
     }
 
     if (hasTransitionsFor(viewer)) {
         const cv::Vec2f scale = _transitionSurface->scale();
-        const cv::Vec3f center = _transitionSurface->center();
         if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
-            auto gridToSurface = [scale, center](const cv::Vec2f& gridColumnRow) {
-                return cv::Vec2f(gridColumnRow[0] / scale[0] - center[0],
-                                 gridColumnRow[1] / scale[1] - center[1]);
-            };
             // The overlay is re-collected on every pan/zoom, so each label
             // can chase the viewport: it sits on the boundary point closest
             // to the viewport's vertical center and is clamped into view
@@ -138,7 +166,11 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
                     view->mapToScene(view->viewport()->rect()).boundingRect();
             const QFont labelFont;
             const QFontMetricsF labelMetrics(labelFont);
-            for (const WindingTransitionCurve& curve : _transitionCurves) {
+            for (std::size_t curveIndex = 0;
+                 curveIndex < _transitionCurves.size()
+                 && curveIndex < _transitionSurfaceSegments.size();
+                 ++curveIndex) {
+                const WindingTransitionCurve& curve = _transitionCurves[curveIndex];
                 // A jump straight to a non-adjacent winding is a mapping
                 // anomaly worth spotting, so it gets the warning color.
                 const bool adjacent =
@@ -151,12 +183,9 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
                 style.z = 67.0;
                 QPointF labelAnchor;
                 qreal labelCost = std::numeric_limits<qreal>::max();
-                for (const std::vector<cv::Vec2f>& segment : curve.segments) {
-                    if (segment.size() < 2) continue;
-                    std::vector<cv::Vec2f> surfacePoints;
-                    surfacePoints.reserve(segment.size());
-                    for (const cv::Vec2f& point : segment)
-                        surfacePoints.push_back(gridToSurface(point));
+                for (const std::vector<cv::Vec2f>& surfacePoints :
+                     _transitionSurfaceSegments[curveIndex]) {
+                    if (surfacePoints.size() < 2) continue;
                     builder.addSurfaceLineStrip(surfacePoints, false, style);
                     for (const cv::Vec2f& surfacePoint : surfacePoints) {
                         const QPointF scene = viewer->surfaceCoordsToScene(

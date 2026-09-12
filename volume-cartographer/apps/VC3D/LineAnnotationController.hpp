@@ -48,6 +48,8 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
 {
@@ -260,6 +262,27 @@ public:
                                              int,
                                              int)>;
 
+    struct ResolvedFiberOptimizationInputs {
+        std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> baseNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> fiberDataset;
+        std::shared_ptr<vc::fiber_tracer::FiberPredictionField> predictions;
+        std::string normalManifestLocation;
+        std::string fiberManifestLocation;
+        double traceToBaseScale = 1.0;
+    };
+
+    struct HeadlessFiberOptimizationRequest {
+        std::vector<cv::Vec3d> controlPointsL0;
+        ResolvedFiberOptimizationInputs inputs;
+        std::filesystem::path destinationFiberSource;
+        std::function<bool()> shouldSave;
+    };
+    using HeadlessFiberCompletion =
+        std::function<void(bool, const QString&, uint64_t)>;
+
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
                              QWidget* parentWidget,
@@ -401,6 +424,17 @@ public:
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
 
+    bool registerExternalFiberSource(const std::filesystem::path& source,
+                                     QString* errorMessage = nullptr);
+    void unregisterExternalFiberSource(const std::filesystem::path& source);
+    [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
+        resolveFiberOptimizationInputs(
+            const std::string& fallbackNormalLocation,
+            const std::string& fallbackFiberLocation,
+            QString* errorMessage = nullptr) const;
+    void optimizeAndSaveFiberHeadless(HeadlessFiberOptimizationRequest request,
+                                      HeadlessFiberCompletion completion);
+
     // Bumped whenever the project's umbilicus attachment changes. Cheap to
     // read, so holders of geometry placed relative to the umbilicus can compare
     // it lazily instead of being signalled.
@@ -474,6 +508,7 @@ private:
         std::string startedAt;
         uint64_t sequence = 0;
         std::string fileName;
+        std::filesystem::path sourceRoot;
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
@@ -486,6 +521,10 @@ private:
         std::vector<std::string> tags;
         vc3d::line_annotation::FiberOptimizationMode optimizationMode =
             vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        // Coordinate domain in which control_points and line_points are
+        // stored. New Spiral-created fibers record the fiber manifest's L0
+        // shape so a downsampled active volume can display them correctly.
+        std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
         bool needsSave = false;
     };
 
@@ -820,6 +859,9 @@ private:
     [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
+    [[nodiscard]] cv::Vec3f fiberBasePointFromViewer(
+        const std::string& surfaceName,
+        cv::Vec3f volumePoint) const;
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber isn't loaded.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
@@ -837,6 +879,13 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    // Drop fibers that are the same fiber seen through several sources (or
+    // identical geometry under another name); records link aliases so branch
+    // links written against a dropped copy still resolve to the survivor.
+    void dedupeLoadedFiberSources(std::vector<StoredFiber>& fibers,
+                                  const std::vector<std::filesystem::path>& sourcePreference);
+    [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
+                                                 const std::string& branchFileName) const;
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
     // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
@@ -864,6 +913,14 @@ private:
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    // Base grid the fiber's stored geometry lives in: the shape stored in the
+    // fiber itself, else the manifest its trace spans recorded, else the
+    // package's selected fiber-inference dataset (see
+    // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
@@ -1065,6 +1122,9 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::vector<std::filesystem::path> _externalFiberSources;
+    // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
+    std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
@@ -1191,6 +1251,11 @@ private:
     };
     mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
         _storageSnapshotCache;
+    // Resolved manifest location -> base_shape_zyx. Opening a fiber session
+    // re-reads the manifest otherwise; successes only, so a failed (moved or
+    // remote) location is retried next time.
+    mutable std::unordered_map<std::string, std::array<std::size_t, 3>>
+        _fiberManifestBaseShapeCache;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

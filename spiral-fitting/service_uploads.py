@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import hashlib
 from http import HTTPStatus
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,7 +31,8 @@ from typing import Callable, Optional
 
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
-from fit_session import PCL_ROLE_CONVENTIONS, validate_checkpoint_container
+from fit_session import (EDITABLE_PCL_ROLE_VALUES, PCL_ROLE_CONVENTIONS,
+                         validate_checkpoint_container)
 from vc3d_fiber_format_adapter import parse_vc3d_fiber_format
 
 
@@ -47,6 +49,14 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Role -> conventional filename for ephemeral PCL uploads, from the
 # declarative fit-input catalog.
+# Staged replace/delete of one committed editable-role collection.
+PCL_MUTATION_OPERATIONS = frozenset({"replace_collection", "delete_collection"})
+# Not an upload: a committed editable-role addition whose collections the
+# resident fit already holds under resident ids only. The fitter applies the
+# committed collection ids as the collections' logical identities so later
+# replace/delete mutations can find them.
+PCL_ASSIGN_COLLECTION_IDS = "assign_collection_ids"
+
 PCL_ROLE_FILES = {
     role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
 
@@ -58,10 +68,13 @@ def _utc_stamp():
 class Upload:
     __slots__ = ("upload_id", "session_id", "kind", "role", "input_id",
                  "manifest", "staging_dir", "received", "record", "created",
-                 "lock")
+                 "lock", "base_revision", "revision", "operation",
+                 "target_collection_id", "base_source_revision")
 
     def __init__(self, upload_id, session_id, kind, role, input_id, manifest,
-                 staging_dir):
+                 staging_dir, base_revision=None, revision=None,
+                 operation=None, target_collection_id=None,
+                 base_source_revision=None):
         self.upload_id = upload_id
         self.session_id = session_id
         self.kind = kind
@@ -73,6 +86,11 @@ class Upload:
         self.record = None
         self.created = time.time()
         self.lock = threading.Lock()
+        self.base_revision = base_revision
+        self.revision = revision
+        self.operation = operation
+        self.target_collection_id = target_collection_id
+        self.base_source_revision = base_source_revision
 
     def declared_bytes(self):
         return sum(entry["size"] for entry in self.manifest.values())
@@ -134,7 +152,79 @@ def _load_single_json(directory, kind):
         raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
 
 
-def _validate_upload_content(kind, role, directory):
+def _validate_replacement_document(document, target_collection_id, role=None):
+    collections = document.get("collections")
+    if not isinstance(collections, dict) \
+            or list(collections) != [target_collection_id]:
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "A replacement upload must contain exactly its target collection")
+    collection = collections[target_collection_id]
+    if not isinstance(collection, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The replacement collection is malformed")
+    if ("id" in collection
+            and str(collection["id"]) != target_collection_id):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The replacement collection id does not match its target")
+    if collection.get("windings_linked"):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "Linked collections cannot be replaced safely")
+    points = collection.get("points")
+    if not isinstance(points, dict) or len(points) < 2:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "A replacement collection needs at least two points")
+    expected = [str(index) for index in range(len(points))]
+    if set(points) != set(expected):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "Replacement point ids must be contiguous from zero")
+    previous_time = None
+    for point_id in expected:
+        point = points[point_id]
+        if not isinstance(point, dict) or point.get("links"):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Linked points cannot be replaced safely")
+        position = point.get("p")
+        if not isinstance(position, list) or len(position) != 3 \
+                or any(not isinstance(value, (int, float))
+                       or isinstance(value, bool) or not math.isfinite(value)
+                       for value in position):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Replacement point {point_id} has an invalid position")
+        creation_time = point.get("creation_time")
+        if not isinstance(creation_time, (int, float)) \
+                or isinstance(creation_time, bool) \
+                or not math.isfinite(creation_time):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Replacement points need numeric creation_time values")
+        if previous_time is not None and creation_time <= previous_time:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Replacement creation_time values must strictly increase")
+        previous_time = creation_time
+        if role == "relative":
+            # The fitter drops unannotated points from a partially annotated
+            # collection, so a relative replacement must annotate every point.
+            winding = point.get("wind_a")
+            if not isinstance(winding, (int, float)) \
+                    or isinstance(winding, bool) or not math.isfinite(winding):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Relative-winding replacement point {point_id} needs a "
+                    "finite wind_a annotation")
+
+
+def _validate_deletion_document(document, target_collection_id):
+    collections = document.get("collections")
+    if not isinstance(collections, dict) \
+            or list(collections) != [target_collection_id] \
+            or not isinstance(collections[target_collection_id], dict):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "A deletion upload must contain exactly its target collection")
+
+
+def _validate_upload_content(kind, role, directory, *, operation=None,
+                             target_collection_id=None):
     if kind == "patch":
         _validate_patch_content(directory)
         return
@@ -170,20 +260,37 @@ def _validate_upload_content(kind, role, directory):
             raise ApiError(HTTPStatus.BAD_REQUEST, "PCL upload contains no collections")
         if role not in PCL_ROLE_FILES:
             raise ApiError(HTTPStatus.BAD_REQUEST, "PCL uploads must declare a valid role")
+        if operation == "replace_collection":
+            _validate_replacement_document(document, target_collection_id, role)
+        elif operation == "delete_collection":
+            _validate_deletion_document(document, target_collection_id)
         return
     raise ApiError(HTTPStatus.BAD_REQUEST, f"Unknown input kind {kind!r}")
 
 
-def _merge_pcl_documents(existing, incoming):
-    """Merge the incoming multi-collection document into the existing one."""
+def _merge_pcl_documents_assigning(existing, incoming):
+    """Merge the incoming multi-collection document into the existing one.
+
+    Returns the merged document and the mapping from each incoming
+    collection key to the key it received in the merged document: the
+    identity an editable-role collection has from now on.
+    """
     merged = dict(existing)
     collections = dict(existing.get("collections", {}))
     next_id = max((int(key) for key in collections), default=-1) + 1
-    for _, collection in sorted(incoming.get("collections", {}).items(),
-                                key=lambda item: int(item[0])):
+    assigned = {}
+    for key, collection in sorted(incoming.get("collections", {}).items(),
+                                  key=lambda item: int(item[0])):
         collections[str(next_id)] = collection
+        assigned[str(int(key))] = str(next_id)
         next_id += 1
     merged["collections"] = collections
+    return merged, assigned
+
+
+def _merge_pcl_documents(existing, incoming):
+    """Merge the incoming multi-collection document into the existing one."""
+    merged, _ = _merge_pcl_documents_assigning(existing, incoming)
     return merged
 
 
@@ -223,7 +330,7 @@ def _copy_publish(source, destination, keep_source=False):
 # ----------------------------------------------------------------------
 
 #: Has the resident fit taken this input yet?
-INCORPORATION_STATES = ("pending", "incorporated", "error")
+INCORPORATION_STATES = ("pending", "queued", "incorporated", "error")
 #: Does the dataset hold a copy of it yet?
 PERSISTENCE_STATES = ("ephemeral", "committed")
 
@@ -247,16 +354,38 @@ class EphemeralInput:
     incorporation: str = "pending"
     persistence: str = "ephemeral"
     error: Optional[str] = None
+    # Fibers are stable logical inputs. ``revision`` is the newest accepted
+    # content, while the incorporated/committed fields describe the resident
+    # runtime and dataset independently.
+    revision: Optional[str] = None
+    incorporated_revision: Optional[str] = None
+    committed_revision: Optional[str] = None
+    auto_commit: bool = False
+    error_revision: Optional[str] = None
+    revision_errors: dict = field(default_factory=dict)
+    operation: Optional[str] = None
+    target_collection_id: Optional[str] = None
+    base_source_revision: Optional[str] = None
+    # Editable-role additions: the collection ids the dataset file gave this
+    # upload's collections at commit, keyed by the uploaded collection key.
+    committed_collection_ids: Optional[dict] = None
 
     @classmethod
     def from_record(cls, record):
         return cls(
             id=record["id"], kind=record["kind"], role=record.get("role"),
             path=record["path"], bytes=record["bytes"],
-            upload_id=record.get("upload_id"))
+            upload_id=record.get("upload_id"),
+            revision=record.get("revision"),
+            operation=record.get("operation"),
+            target_collection_id=record.get("target_collection_id"),
+            base_source_revision=record.get("base_source_revision"))
 
     @property
     def committed(self):
+        if self.kind == "fiber":
+            return (self.revision is not None
+                    and self.committed_revision == self.revision)
         return self.persistence == "committed"
 
     @property
@@ -266,7 +395,18 @@ class EphemeralInput:
     @property
     def settled(self):
         """Committed and incorporated: nothing is left to do with it."""
-        return self.committed and self.incorporated
+        # Ordinary inputs can leave the ledger. Fibers remain as reconnectable
+        # revision cursors even after their current content settles.
+        return self.kind != "fiber" and self.committed and self.incorporated
+
+    @property
+    def carries_collection_identity(self):
+        """An editable-role addition whose committed collection ids the
+        resident fit must learn before it can be considered done."""
+        return (self.kind == "pcl"
+                and self.role in EDITABLE_PCL_ROLE_VALUES
+                and self.committed_collection_ids is not None
+                and self.operation in (None, PCL_ASSIGN_COLLECTION_IDS))
 
     def payload(self):
         """The plain record the fitter (and its DDP children) receive."""
@@ -277,12 +417,57 @@ class EphemeralInput:
         }
         if self.upload_id is not None:
             record["upload_id"] = self.upload_id
+        if self.kind == "fiber":
+            record.update({
+                "revision": self.revision,
+                "incorporated_revision": self.incorporated_revision,
+                "committed_revision": self.committed_revision,
+                "auto_commit": self.auto_commit,
+                "operation": ("replace" if self.incorporated_revision
+                              else "add"),
+            })
+        if self.operation in PCL_MUTATION_OPERATIONS:
+            record.update({
+                "operation": self.operation,
+                "target_collection_id": self.target_collection_id,
+                "base_source_revision": self.base_source_revision,
+            })
+        elif self.operation:
+            record["operation"] = self.operation
+        if self.committed_collection_ids is not None:
+            record["committed_collection_ids"] = dict(
+                self.committed_collection_ids)
         return record
 
     def status_entry(self):
-        return {"id": self.id, "kind": self.kind, "role": self.role,
-                "state": self.incorporation, "bytes": self.bytes,
-                "committed": self.committed}
+        result = {"id": self.id, "kind": self.kind, "role": self.role,
+                  "state": self.incorporation, "bytes": self.bytes,
+                  "committed": self.committed}
+        if self.error:
+            result["error"] = self.error
+        if self.kind == "fiber":
+            result.update({
+                "revision": self.revision,
+                "incorporated_revision": self.incorporated_revision,
+                "committed_revision": self.committed_revision,
+                "auto_commit": self.auto_commit,
+            })
+            if self.error_revision:
+                result["error_revision"] = self.error_revision
+            if self.revision_errors:
+                result["revision_errors"] = dict(self.revision_errors)
+        if self.operation in PCL_MUTATION_OPERATIONS:
+            result.update({
+                "operation": self.operation,
+                "target_collection_id": self.target_collection_id,
+                "base_source_revision": self.base_source_revision,
+            })
+        elif self.operation:
+            result["operation"] = self.operation
+        if self.committed_collection_ids is not None:
+            result["committed_collection_ids"] = dict(
+                self.committed_collection_ids)
+        return result
 
 
 class EphemeralLedger:
@@ -326,6 +511,21 @@ class EphemeralLedger:
             self._records.append(entry)
         return entry
 
+    def revise_fiber(self, record):
+        """Install a CAS-validated newest fiber revision on its logical row."""
+        with self._lock:
+            entry = self.find("fiber", record["id"])
+            if entry is None:
+                return self.add(record)
+            entry.path = record["path"]
+            entry.bytes = record["bytes"]
+            entry.upload_id = record.get("upload_id")
+            entry.revision = record.get("revision")
+            entry.incorporation = "pending"
+            entry.error = None
+            entry.error_revision = None
+            return entry
+
     def find(self, kind, input_id):
         with self._lock:
             return next((record for record in self._records
@@ -352,12 +552,31 @@ class EphemeralLedger:
             return [record for record in self._records
                     if record.incorporation == "pending"]
 
+    def claim_pending(self):
+        """Atomically reserve pending inputs in deterministic ledger order."""
+        with self._lock:
+            records = [record for record in self._records
+                       if record.incorporation == "pending"]
+            for record in records:
+                record.incorporation = "queued"
+                record.error = None
+            return records
+
+    def return_pending(self, records):
+        """Return still-queued claims to the next-Run pool."""
+        with self._lock:
+            for record in records:
+                if record in self._records and record.incorporation == "queued":
+                    record.incorporation = "pending"
+                    record.error = None
+
     def uncommitted(self):
         """Inputs the dataset has no copy of yet."""
         with self._lock:
             return [record for record in self._records
                     if not record.committed
-                    and record.incorporation in ("pending", "incorporated")]
+                    and record.incorporation in
+                    ("pending", "queued", "incorporated")]
 
     def committed_not_incorporated(self):
         """Committed inputs the resident fit has not taken yet."""
@@ -373,19 +592,115 @@ class EphemeralLedger:
             return [record for record in self._records
                     if (record.kind, record.id) in wanted]
 
-    def mark_incorporated(self, records, error=None):
-        """Record the outcome of one incorporation attempt."""
+    def mark_incorporated(self, records, error=None, delivered_identities=()):
+        """Record the outcome of one incorporation attempt.
+
+        ``delivered_identities`` names the ``(kind, id)`` records whose
+        payload carried their committed collection ids into the fitter.
+        """
+        delivered = set(delivered_identities)
         with self._lock:
             for record in records:
                 record.incorporation = "error" if error else "incorporated"
                 record.error = error
+                if not error:
+                    self._settle_collection_identity(record, delivered)
+                if record.kind == "fiber":
+                    if error:
+                        record.error_revision = record.revision
+                        record.revision_errors[record.revision] = error
+                    else:
+                        record.incorporated_revision = record.revision
+                        record.error_revision = None
+                        record.revision_errors.pop(record.revision, None)
             if error is None:
                 self._drop_settled()
 
-    def mark_committed(self, records):
+    def mark_outcomes(self, outcomes, delivered_identities=()):
+        """Apply per-record runtime outcomes keyed by (kind, id)."""
+        by_identity = {
+            (outcome.get("kind"), outcome.get("id")): outcome
+            for outcome in outcomes
+        }
+        delivered = set(delivered_identities)
+        with self._lock:
+            for record in self._records:
+                outcome = by_identity.get((record.kind, record.id))
+                if outcome is None:
+                    continue
+                state = outcome.get("state")
+                if state not in ("incorporated", "error"):
+                    continue
+                if record.kind == "fiber":
+                    outcome_revision = outcome.get("revision", record.revision)
+                    if state == "incorporated":
+                        record.incorporated_revision = outcome_revision
+                        record.revision_errors.pop(outcome_revision, None)
+                    else:
+                        record.error_revision = outcome_revision
+                        record.revision_errors[outcome_revision] = outcome.get("error")
+                    # A newer save may have arrived while this revision was in
+                    # flight. Its pending/queued state must not be overwritten
+                    # by the older outcome.
+                    if outcome_revision != record.revision:
+                        continue
+                record.incorporation = state
+                record.error = outcome.get("error") if state == "error" else None
+                if record.kind == "fiber" and state == "incorporated":
+                    record.error_revision = None
+                if state == "incorporated":
+                    self._settle_collection_identity(record, delivered)
+            self._drop_settled()
+
+    def _settle_collection_identity(self, record, delivered):
+        """After an incorporation: an editable-role addition whose committed
+        collection ids did not ride along in its payload goes back to
+        pending as an identity assignment. Caller holds the lock."""
+        if (record.carries_collection_identity
+                and (record.kind, record.id) not in delivered):
+            self._schedule_collection_identity_locked(record)
+
+    def _schedule_collection_identity_locked(self, record):
+        record.operation = PCL_ASSIGN_COLLECTION_IDS
+        record.incorporation = "pending"
+        record.error = None
+
+    def collection_identity_assignments(self):
+        """Committed additions the resident fit has yet to learn the ids of."""
+        with self._lock:
+            return [record for record in self._records
+                    if record.operation == PCL_ASSIGN_COLLECTION_IDS
+                    and record.incorporation == "pending"]
+
+    def mark_committed(self, records, fiber_revisions=None,
+                       collection_ids=None):
+        """Record a dataset commit.
+
+        ``collection_ids`` maps ``(kind, id)`` of editable-role additions to
+        the collection ids the dataset file gave their collections. An
+        addition the fit already incorporated under resident ids alone is
+        scheduled as an identity assignment instead of leaving the ledger.
+        """
+        fiber_revisions = dict(fiber_revisions or {})
+        collection_ids = dict(collection_ids or {})
         with self._lock:
             for record in records:
                 record.persistence = "committed"
+                assigned = collection_ids.get((record.kind, record.id))
+                if assigned is not None:
+                    record.committed_collection_ids = dict(assigned)
+                    if record.incorporated:
+                        self._schedule_collection_identity_locked(record)
+                if record.kind == "fiber":
+                    committed_revision = fiber_revisions.get(
+                        (record.kind, record.id), record.revision)
+                    record.committed_revision = committed_revision
+                    record.auto_commit = True
+                    if (record.error_revision == committed_revision
+                            and str(record.error or "").startswith(
+                                "Automatic commit failed:")):
+                        record.error = None
+                        record.error_revision = None
             self._drop_settled()
 
     def _drop_settled(self):
@@ -420,10 +735,14 @@ class UploadEnvironment:
     require_session: Callable[[], None]
     #: Checkpoint the loaded session resumed from; protected from retention.
     active_checkpoint: Callable[[], str] = lambda: ""
-    #: Raise ApiError when a new ephemeral input may not be accepted
-    #: (duplicate id, exhausted quota). Called with (kind, id, declared).
-    reserve_ephemeral: Callable[[str, str, int], None] = \
-        lambda kind, input_id, declared: None
+    #: Raise ApiError when an input/revision may not be accepted. Called with
+    #: (kind, id, declared bytes, base revision, content revision).
+    reserve_ephemeral: Callable[[str, str, int, Optional[str], Optional[str]], None] = \
+        lambda kind, input_id, declared, base_revision, revision: None
+    #: CAS and link-safety validation for an editable-role collection
+    #: replacement. Called with (role, target collection id, base revision).
+    validate_pcl_replacement: Callable[[str, str, str], None] = \
+        lambda role, target_collection_id, base_source_revision: None
 
 
 @dataclass
@@ -539,12 +858,45 @@ class UploadManager:
                                "A PCL upload must declare its role")
         else:
             role = None
+        operation = request.get("operation")
+        target_collection_id = request.get("target_collection_id")
+        base_source_revision = request.get("base_source_revision")
+        if operation is not None:
+            if kind != "pcl" or role not in EDITABLE_PCL_ROLE_VALUES \
+                    or operation not in {
+                        "replace_collection", "delete_collection"}:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Collection mutations are only valid for same_winding or "
+                    "relative PCL uploads")
+            target_collection_id = str(target_collection_id or "")
+            if not re.fullmatch(r"0|[1-9][0-9]*", target_collection_id):
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               "target_collection_id must be a decimal collection id")
+            if not isinstance(base_source_revision, str) \
+                    or not re.fullmatch(r"[0-9a-f]{64}", base_source_revision):
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               "base_source_revision must be a SHA-256 digest")
+        elif target_collection_id is not None or base_source_revision is not None:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Collection mutation fields require an operation")
         input_id = str(request.get("id") or "").strip()
         if not _SAFE_ID.match(input_id):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "The input id must be a single safe path component")
         manifest = _validate_upload_manifest(request)
         declared = sum(entry["size"] for entry in manifest.values())
+        base_revision = request.get("base_revision")
+        if base_revision is not None and not isinstance(base_revision, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "base_revision must be a string or null")
+        if kind != "fiber" and base_revision is not None:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "base_revision is only valid for fiber uploads")
+        # Fibers contain exactly one JSON file, so its manifest digest is an
+        # opaque, deterministic content revision without another file pass.
+        revision = (next(iter(manifest.values()))["sha256"]
+                    if kind == "fiber" and len(manifest) == 1 else None)
         if kind == "checkpoint":
             with self._lock:
                 # Resume checkpoints are needed before a session exists, so
@@ -596,11 +948,29 @@ class UploadManager:
                     }
             else:
                 self.environment.require_session()
-                self.environment.reserve_ephemeral(kind, input_id, declared)
+                if operation in {"replace_collection", "delete_collection"}:
+                    self.environment.validate_pcl_replacement(
+                        role, target_collection_id, base_source_revision)
+                    if any(
+                            pending.record is None
+                            and pending.operation in {
+                                "replace_collection", "delete_collection"}
+                            and pending.role == role
+                            and pending.target_collection_id == target_collection_id
+                            for pending in self.uploads.values()):
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            "A replacement for this collection is already uploading")
+                self.environment.reserve_ephemeral(
+                    kind, input_id, declared, base_revision, revision)
             upload_id = secrets.token_hex(16)
             staging = self.staging_root() / upload_id
             upload = Upload(upload_id, self.environment.session_id(), kind,
-                            role, input_id, manifest, staging)
+                            role, input_id, manifest, staging,
+                            base_revision=base_revision, revision=revision,
+                            operation=operation,
+                            target_collection_id=target_collection_id,
+                            base_source_revision=base_source_revision)
             self.uploads[upload_id] = upload
         staging.mkdir(parents=True, exist_ok=True)
         return {"upload_id": upload_id, "accepted": True}
@@ -680,7 +1050,14 @@ class UploadManager:
                                "The upload is missing declared files",
                                [{"field": name, "message": "File was not uploaded"}
                                 for name in missing])
-            _validate_upload_content(upload.kind, upload.role, upload.staging_dir)
+            if upload.operation in {"replace_collection", "delete_collection"}:
+                self.environment.validate_pcl_replacement(
+                    upload.role, upload.target_collection_id,
+                    upload.base_source_revision)
+            _validate_upload_content(
+                upload.kind, upload.role, upload.staging_dir,
+                operation=upload.operation,
+                target_collection_id=upload.target_collection_id)
             if upload.kind == "checkpoint":
                 record = self._publish_checkpoint(upload)
                 upload.record = record
@@ -692,15 +1069,26 @@ class UploadManager:
             kind_dir.mkdir(parents=True, exist_ok=True)
             if upload.kind == "patch":
                 published = kind_dir / upload.input_id
+            elif upload.kind == "fiber":
+                revision_dir = kind_dir / upload.input_id
+                revision_dir.mkdir(parents=True, exist_ok=True)
+                published = revision_dir / f"{upload.revision}.json"
+                single = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
             else:
                 published = kind_dir / f"{upload.input_id}.json"
                 single = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
             if published.exists():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "An ephemeral input with this id already exists")
+                if upload.kind == "fiber":
+                    # A duplicate-content retry through a fresh upload ID is
+                    # harmless. Leave publication to the service CAS check.
+                    single.unlink(missing_ok=True)
+                    shutil.rmtree(upload.staging_dir, ignore_errors=True)
+                else:
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   "An ephemeral input with this id already exists")
             if upload.kind == "patch":
                 os.replace(upload.staging_dir, published)
-            else:
+            elif not published.exists():
                 os.replace(single, published)
                 shutil.rmtree(upload.staging_dir, ignore_errors=True)
             record = {
@@ -712,6 +1100,15 @@ class UploadManager:
                 "state": "pending",
                 "upload_id": upload.upload_id,
             }
+            if upload.kind == "fiber":
+                record["base_revision"] = upload.base_revision
+                record["revision"] = upload.revision
+            if upload.operation:
+                record.update({
+                    "operation": upload.operation,
+                    "target_collection_id": upload.target_collection_id,
+                    "base_source_revision": upload.base_source_revision,
+                })
             upload.record = record
         return FinalizedUpload(upload.kind, dict(record))
 
