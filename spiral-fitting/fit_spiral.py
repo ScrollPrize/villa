@@ -3998,6 +3998,8 @@ class FitContext:
             metadata['logical_input_kind'] = role
             metadata['logical_input_id'] = committed_id
             metadata['logical_input_revision'] = None
+            metadata['committed_source_file'] = conventional_pcl_document_path(
+                getattr(getattr(self, 'paths', None), 'dataset_root', ''), role)
 
         for cid, committed_id in by_resident_id.items():
             assign(self.regular_pcl_catalog[cid].setdefault('metadata', {}),
@@ -4406,7 +4408,9 @@ class FitContext:
                         raise RuntimeError(
                             f'{role or "legacy"} PCL inputs are disabled for '
                             'this session')
-                    loaded = load_point_collection(path) or {}
+                    loaded = record.get('_loaded_collections')
+                    if loaded is None:
+                        loaded = load_point_collection(path) or {}
                     if not loaded:
                         raise RuntimeError(f'PCL document {input_id!r} contains no collections')
                     editable_role = role in EDITABLE_PCL_ROLE_VALUES
@@ -4417,6 +4421,11 @@ class FitContext:
                         replacing_editable = True
                         continue
                     committed_ids = record.get('committed_collection_ids')
+                    committed_source = record.get('committed_source_file')
+                    if editable_role and committed_source is None:
+                        committed_source = conventional_pcl_document_path(
+                            getattr(getattr(self, 'paths', None), 'dataset_root', ''),
+                            role) or path
                     for source_key, pcl in loaded.items():
                         committed_id = (committed_ids or {}).get(str(source_key))
                         if (editable_role and committed_id is not None
@@ -4424,6 +4433,11 @@ class FitContext:
                                     'replace_collection', 'delete_collection')
                                 and any(_logical_identity(item.get('metadata', {}))
                                         == (role, str(committed_id))
+                                        and os.path.realpath(
+                                            item.get('metadata', {}).get(
+                                                'committed_source_file')
+                                            or item.get('source_file', ''))
+                                        == os.path.realpath(committed_source)
                                         for item in (
                                             list(getattr(self, 'regular_pcl_catalog', {}).values())
                                             + list(new_regular_collections.values())))):
@@ -4487,6 +4501,7 @@ class FitContext:
                                     'logical_input_kind': role,
                                     'logical_input_id': str(committed_id),
                                     'logical_input_revision': None,
+                                    'committed_source_file': committed_source,
                                 })
                         new_collections[collection_id] = pcl
                         new_regular_collections[collection_id] = pcl
@@ -4832,22 +4847,14 @@ class FitContext:
                     found.append(path)
         return found
 
-    def _enable_pcl_role_inputs(self, role):
-        """Load a role's documents into the resident fit (Run boundary).
-
-        The documents are committed dataset content, so every collection
-        keeps its source id as its logical id exactly as a build-time load
-        would give it; the live-incorporation path does the linking,
-        classification and view derivation. The session's input manifest
-        gains the documents it loaded. No influence window: this is a
-        supervision source coming back, not an interactive addition.
-        """
+    def _prepare_pcl_role_inputs(self, role):
+        """Read and validate a role before any Run participation changes."""
         documents = self._pcl_role_document_paths(role)
         if not documents:
             print(f'{pcl_role_toggle_key(role)} enabled, but no '
                   f'{role.value} document exists for this dataset; nothing '
                   'to load until one is uploaded or committed')
-            return
+            return []
         records = []
         for path in documents:
             loaded = load_point_collection(path) or {}
@@ -4860,9 +4867,20 @@ class FitContext:
                 'role': role.value,
                 'path': path,
                 'id': f'{role.value}-document:{path}',
+                'committed_source_file': path,
+                '_loaded_collections': loaded,
                 'committed_collection_ids': {
                     str(source_id): source_id for source_id in loaded},
             })
+        if records and self.config['pcl_sampling_weights'] is not None:
+            build_pcl_sampling_strata(
+                (record['path'] for record in records), self.config)
+        return records
+
+    def _enable_pcl_role_inputs(self, role, records=None):
+        """Load validated role documents without an influence window."""
+        if records is None:
+            records = self._prepare_pcl_role_inputs(role)
         if not records:
             return
         self._incorporate_prevalidated_interactive_inputs(
@@ -4967,6 +4985,14 @@ class FitContext:
         old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
+            # Validate every enabling role before disabling any resident
+            # supervision. Reuse the parsed documents during incorporation.
+            prepared_roles = {
+                role: self._prepare_pcl_role_inputs(role)
+                for role in RUN_MUTABLE_PCL_ROLES
+                if pcl_role_toggle_key(role) in changed
+                and self.config[pcl_role_toggle_key(role)]
+            }
             if cadence_changed:
                 if cadence_keys <= changed and (
                         int(config['theta_crossing_map_update_interval'])
@@ -5150,7 +5176,7 @@ class FitContext:
                 if pcl_role_toggle_key(role) not in changed:
                     continue
                 if self.config[pcl_role_toggle_key(role)]:
-                    self._enable_pcl_role_inputs(role)
+                    self._enable_pcl_role_inputs(role, prepared_roles[role])
                 else:
                     self._disable_pcl_role_inputs(role)
                 rederived_views = True

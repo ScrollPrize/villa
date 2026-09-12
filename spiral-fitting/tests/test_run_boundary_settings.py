@@ -305,13 +305,14 @@ def test_enabling_a_role_without_a_document_changes_nothing(tmp_path):
 
 
 @pytest.mark.parametrize('role', [PclRole.SAME_WINDING, PclRole.RELATIVE])
-def test_role_toggle_restores_all_explicit_documents(tmp_path, role):
+@pytest.mark.parametrize('collection_ids', [(5, 6), (0, 0)])
+def test_role_toggle_restores_all_explicit_documents(tmp_path, role, collection_ids):
     key = pcl_role_toggle_key(role)
     context = _role_context(tmp_path, **{key: False})
     documents = [
-        _pcl_document(tmp_path / f'custom-{cid}.json', cid,
+        _pcl_document(tmp_path / f'custom-{index}.json', cid,
                       [[0, 0, 10], [4, 0, 12], [8, 0, 14]])
-        for cid in (5, 6)]
+        for index, cid in enumerate(collection_ids)]
     context._configured_pcl_sources = tuple(
         PclInputSpec(document, role) for document in documents)
 
@@ -468,3 +469,36 @@ def test_pending_committed_addition_is_not_duplicated_after_role_enable(tmp_path
     assert len(context.unattached_pcl_strips) == 1
     assert context.next_id == next_id
     assert context.unattached_pcl_strips[0]["logical_input_id"] == "5"
+
+
+def test_failed_role_switch_preserves_resident_supervision(tmp_path):
+    context = _role_context(
+        tmp_path, input_use_pcl_same_winding=False,
+        input_use_pcl_relative=False)
+    points = [[0, 0, 10], [4, 0, 12], [8, 0, 14]]
+    _pcl_document(tmp_path / "same_windings.json", 0, points)
+    relative = tmp_path / "relative_windings.json"
+    _pcl_document(relative, 0, points)
+    context.apply_config({"input_use_pcl_same_winding": True}, current_iteration=0)
+    catalog = dict(context.regular_pcl_catalog)
+    strips = list(context.unattached_pcl_strips)
+    groups = list(context.unattached_strip_sampling_groups)
+    paths = context.paths
+    next_id = context.next_id
+    context.config["pcl_sampling_weights"] = {"same_windings": 1.0}
+    context._build_theta_crossing_map.reset_mock()
+    context._rebuild_pcl_sampling_strata.reset_mock()
+
+    with pytest.raises(KeyError, match="relative_windings"):
+        context.apply_config({"input_use_pcl_same_winding": False,
+                              "input_use_pcl_relative": True}, current_iteration=0)
+
+    assert context.config["input_use_pcl_same_winding"] is True
+    assert context.config["input_use_pcl_relative"] is False
+    assert context.paths == paths
+    assert context.next_id == next_id
+    assert context.regular_pcl_catalog == catalog
+    assert list(context.unattached_pcl_strips) == strips
+    assert context.unattached_strip_sampling_groups == groups
+    context._build_theta_crossing_map.assert_not_called()
+    context._rebuild_pcl_sampling_strata.assert_not_called()

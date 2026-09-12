@@ -2422,13 +2422,22 @@ class ServiceState:
                     resolved, error=error, delivered_identities=delivered)
             self._enqueue_live_incorporation_locked(
                 self.ephemeral_records.collection_identity_assignments())
+            self.status_generation += 1
+
+        self._auto_commit_incorporated_fibers(resolved)
+        for record in resolved:
+            if record.kind == "fiber":
+                self._cleanup_fiber_revision_files(record)
+
+    def _auto_commit_incorporated_fibers(self, records):
+        """Catch up tracked fibers, reporting persistence failures non-fatally."""
+        with self.lock:
             automatic = [
-                (record, record.revision) for record in resolved
+                (record, record.revision) for record in records
                 if record.kind == "fiber" and record.auto_commit
                 and record.incorporated_revision == record.revision
                 and record.committed_revision != record.revision
             ]
-            self.status_generation += 1
 
         for record, revision in automatic:
             try:
@@ -2452,10 +2461,6 @@ class ServiceState:
                         record.error = None
                         record.error_revision = None
                         self.status_generation += 1
-
-        for record in resolved:
-            if record.kind == "fiber":
-                self._cleanup_fiber_revision_files(record)
 
     def _dispatch_live_incorporation(self, generation):
         """Coalesce finalized records and hand each batch to the runtime."""
@@ -2760,6 +2765,13 @@ class ServiceState:
                     for record in fiber_records.values():
                         self._cleanup_fiber_revision_files(record)
             commit_lock.release()
+        # A newer revision may have finished incorporation before this first
+        # explicit commit enabled auto-commit. Recheck after releasing the
+        # dataset lock, which automatic persistence acquires independently.
+        self._auto_commit_incorporated_fibers(
+            snapshot.record for snapshot in snapshots
+            if snapshot.kind == "fiber")
+        response = {**response, **self.status()}
         refreshed_roles = sorted({
             snapshot.role for snapshot in snapshots
             if snapshot.kind == "pcl"

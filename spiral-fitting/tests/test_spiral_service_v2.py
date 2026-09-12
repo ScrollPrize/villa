@@ -3228,6 +3228,12 @@ class CommitTests(unittest.TestCase):
         self.assertIsNone(record.error_revision)
 
     def test_fiber_commit_uses_immutable_revision_snapshot(self):
+        self._check_fiber_commit_revision_race(incorporate=False)
+
+    def test_first_fiber_commit_catches_up_revision_incorporated_during_copy(self):
+        self._check_fiber_commit_revision_race(incorporate=True)
+
+    def _check_fiber_commit_revision_race(self, *, incorporate):
         first = self._finalize("fiber", "fiber-9", FIBER_FILES)
         first_path = Path(first["path"])
         record = self.state.ephemeral_records.find("fiber", "fiber-9")
@@ -3263,6 +3269,12 @@ class CommitTests(unittest.TestCase):
             # Idle cleanup must retain the source captured by the in-flight
             # commit even though it is no longer the logical current path.
             self.assertTrue(first_path.exists())
+            if incorporate:
+                with self.state.lock:
+                    payloads = self.state._snapshot_incorporation_locked([record])
+                self.state._finish_incorporation(payloads)
+                self.assertFalse(record.auto_commit)
+                self.assertEqual(record.incorporated_revision, second["revision"])
             release.set()
             thread.join(5)
 
@@ -3270,11 +3282,12 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(
             (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
-            FIBER_FILES["fiber.json"])
+            revised["fiber.json"] if incorporate else FIBER_FILES["fiber.json"])
         self.assertEqual(record.revision, second["revision"])
-        self.assertEqual(record.committed_revision, first["revision"])
+        self.assertEqual(record.committed_revision,
+                         second["revision"] if incorporate else first["revision"])
         self.assertTrue(record.auto_commit)
-        self.assertFalse(record.committed)
+        self.assertEqual(record.committed, incorporate)
 
     def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)
