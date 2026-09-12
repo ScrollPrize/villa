@@ -25,6 +25,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
+from koine_machines.common.accelerator import (
+    AUTOCAST_DEVICE_TYPES,
+    DEVICE_CHOICES,
+    log_device,
+    select_device,
+)
 from koine_machines.common.disk_cache import wrap_store_with_disk_cache
 from koine_machines.data.normal_pooled_sample import (
     _maybe_select_flat_pixels_for_native_crop_via_stored_resolution,
@@ -141,12 +147,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
-        help="CUDA autocast dtype. 'auto' reads checkpoint config.mixed_precision.",
+        help="Autocast dtype for CUDA or MPS inference. 'auto' reads checkpoint config.mixed_precision.",
     )
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
-    parser.add_argument("--gpus", default=None, help="Comma-separated CUDA ids. Multiple ids use DataParallel.")
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Backend to run inference on. 'auto' prefers CUDA, then MPS (Apple Silicon), then CPU.",
+    )
+    parser.add_argument("--gpus", default=None, help="Comma-separated CUDA ids. Multiple ids use DataParallel. CUDA only; use --device to reach MPS.")
     parser.add_argument("--foreground-channel", type=int, default=1, help="Foreground class for C>1 softmax outputs. Default: 1.")
     parser.add_argument("--plan-only", action="store_true", help="Build and print the chunk/patch plan without loading the model or writing output.")
     parser.add_argument("--max-target-chunks", type=int, default=None, help="Limit output to the first N target chunks after sorting by z/y/x. Useful for quick validation runs.")
@@ -806,18 +818,11 @@ def prepare_model(
     gpu_ids: Sequence[int],
     compile_model: bool,
     compile_mode: str,
+    device_preference: str = "auto",
 ) -> tuple[ModelBundle, torch.device, bool]:
     gpu_ids = tuple(int(v) for v in gpu_ids)
-    if gpu_ids:
-        if not torch.cuda.is_available():
-            raise ValueError("--gpus was provided, but CUDA is not available.")
-        count = int(torch.cuda.device_count())
-        invalid = [gpu_id for gpu_id in gpu_ids if gpu_id >= count]
-        if invalid:
-            raise ValueError(f"Requested unavailable CUDA ids {invalid}; visible CUDA device count is {count}.")
-        device = torch.device(f"cuda:{gpu_ids[0]}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device(device_preference, gpu_ids=gpu_ids)
+    log_device(device)
 
     model = bundle.model.to(device)
     compile_enabled = bool(compile_model)
@@ -1213,11 +1218,11 @@ def run_inference(
 ) -> None:
     variants = tta_variants(tta_enabled)
     LOGGER.info("TTA variants=%d%s", len(variants), " (7 flips + original)" if tta_enabled else "")
-    autocast_enabled = device.type == "cuda"
+    autocast_enabled = device.type in AUTOCAST_DEVICE_TYPES
     if autocast_enabled and bundle.amp_dtype is not None:
-        LOGGER.info("CUDA autocast dtype=%s", str(bundle.amp_dtype).replace("torch.", ""))
+        LOGGER.info("%s autocast dtype=%s", device.type, str(bundle.amp_dtype).replace("torch.", ""))
     amp_context = (
-        torch.autocast(device_type="cuda", enabled=True, dtype=bundle.amp_dtype)
+        torch.autocast(device_type=device.type, enabled=True, dtype=bundle.amp_dtype)
         if autocast_enabled
         else nullcontext()
     )
@@ -1379,6 +1384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_ids=args.gpu_ids,
         compile_model=bool(args.compile_model),
         compile_mode=str(args.compile_mode),
+        device_preference=getattr(args, "device", "auto"),
     )
     LOGGER.info(
         "Using device=%s compile=%s batch_size=%d num_workers=%d target=%s output=%s",

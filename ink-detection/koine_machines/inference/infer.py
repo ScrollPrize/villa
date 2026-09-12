@@ -27,6 +27,13 @@ import zarr
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from koine_machines.common.accelerator import (
+    AUTOCAST_DEVICE_TYPES,
+    DEVICE_CHOICES,
+    log_device,
+    select_device,
+)
+
 
 LOGGER = logging.getLogger("inference_ome_zarr")
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
@@ -459,7 +466,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
         help=(
-            "Autocast dtype for CUDA inference. "
+            "Autocast dtype for accelerated (CUDA or MPS) inference. "
             "'auto' reads checkpoint config.mixed_precision when available; "
             "'default' uses PyTorch's default autocast dtype."
         ),
@@ -472,11 +479,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum number of mirror TTA variants to evaluate per forward pass. Defaults to all variants.",
     )
     parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help=(
+            "Backend to run inference on. 'auto' prefers CUDA, then MPS (Apple Silicon), "
+            "then CPU."
+        ),
+    )
+    parser.add_argument(
         "--gpus",
         default=None,
         help=(
             "Comma-separated CUDA device ids to use for inference, for example 0 or 0,1,2,3. "
-            "When multiple GPUs are provided, each inference batch is split across those devices."
+            "When multiple GPUs are provided, each inference batch is split across those devices. "
+            "CUDA only; use --device to reach MPS."
         ),
     )
     parser.add_argument("--compile-mode", default="reduce-overhead")
@@ -1274,7 +1291,7 @@ def checkpoint_amp_dtype(payload: Any, checkpoint_path: Path | str) -> torch.dty
     mixed_precision = config.get("mixed_precision")
     if mixed_precision is None:
         LOGGER.info(
-            "Checkpoint %s config does not define mixed_precision; using default CUDA autocast dtype.",
+            "Checkpoint %s config does not define mixed_precision; using the backend default autocast dtype.",
             checkpoint_path,
         )
         return None
@@ -1296,14 +1313,14 @@ def checkpoint_amp_dtype(payload: Any, checkpoint_path: Path | str) -> torch.dty
         return torch.bfloat16
     if mixed_precision in {"no", "none", "false", "off", "disabled"}:
         LOGGER.info(
-            "Checkpoint %s config.mixed_precision=%r does not specify an AMP dtype; using default CUDA autocast dtype.",
+            "Checkpoint %s config.mixed_precision=%r does not specify an AMP dtype; using the backend default autocast dtype.",
             checkpoint_path,
             mixed_precision,
         )
         return None
 
     LOGGER.warning(
-        "Checkpoint %s has unsupported config.mixed_precision=%r; using default CUDA autocast dtype.",
+        "Checkpoint %s has unsupported config.mixed_precision=%r; using the backend default autocast dtype.",
         checkpoint_path,
         mixed_precision,
     )
@@ -1422,19 +1439,8 @@ def prepare_model_for_inference(
     requested_gpu_ids = tuple(int(gpu_id) for gpu_id in getattr(args, "gpu_ids", []))
     compile_enabled = bool(args.compile_model)
 
-    if requested_gpu_ids:
-        if not torch.cuda.is_available():
-            raise ValueError("--gpus was provided, but CUDA is not available in this environment.")
-        available_gpu_count = int(torch.cuda.device_count())
-        invalid_gpu_ids = [gpu_id for gpu_id in requested_gpu_ids if gpu_id >= available_gpu_count]
-        if invalid_gpu_ids:
-            raise ValueError(
-                f"Requested CUDA device ids {invalid_gpu_ids!r} are unavailable; "
-                f"visible device count is {available_gpu_count}."
-            )
-        device = torch.device(f"cuda:{requested_gpu_ids[0]}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device(getattr(args, "device", "auto"), gpu_ids=requested_gpu_ids)
+    log_device(device)
 
     configured_model.model = configured_model.model.to(device)
 
@@ -1472,15 +1478,19 @@ def run_block_inference(
     tta_axes: Sequence[int] = (),
     tta_batch_size: int | None = None,
 ) -> None:
-    autocast_enabled = bool(amp and device.type == "cuda")
+    autocast_enabled = bool(amp and device.type in AUTOCAST_DEVICE_TYPES)
     logged_resize = False
     tta_axes = tuple(int(axis) for axis in tta_axes)
     if autocast_enabled:
         if amp_dtype is None:
-            LOGGER.info("CUDA autocast enabled for inference with default dtype.")
+            LOGGER.info(
+                "%s autocast enabled for inference with the backend default dtype.",
+                device.type,
+            )
         else:
             LOGGER.info(
-                "CUDA autocast enabled for inference with dtype=%s.",
+                "%s autocast enabled for inference with dtype=%s.",
+                device.type,
                 str(amp_dtype).replace("torch.", ""),
             )
     else:
@@ -1498,7 +1508,7 @@ def run_block_inference(
         mask = mask.astype(np.float32, copy=False)
     patch_h, patch_w = weight_map.shape
     amp_context = (
-        torch.autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
+        torch.autocast(device_type=device.type, enabled=True, dtype=amp_dtype)
         if autocast_enabled
         else nullcontext()
     )
