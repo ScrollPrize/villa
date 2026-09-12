@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import flow_grad_smoothing
 import flow_triton
 
 
@@ -263,6 +264,15 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
 
 
 
+def _low_res_width(sigma_hr_cells, low_res_sigma_hr_cells):
+    # The low-resolution lattice's own along-sheet width when one is set,
+    # else the shared physical width.
+    if low_res_sigma_hr_cells is not None and float(low_res_sigma_hr_cells) > 0.0:
+        return float(low_res_sigma_hr_cells)
+    return float(sigma_hr_cells)
+
+
+
 def _rk4_sampler_loop(y, sampler, h, n_steps):
     # Plain RK4 over one stationary velocity sampler; the eager reference for
     # every fused path and the no-grad evaluation path (no adjoint sweep will
@@ -471,6 +481,26 @@ class CartesianFlowField(nn.Module):
             hr_param.grad = hr_grad
         else:
             hr_param.grad.add_(hr_grad)
+
+    def smooth_grad_(self, sigma_hr_cells, across_sigma_hr_cells=0.0,
+                     low_res_sigma_hr_cells=0.0):
+        """Gaussian-smooth both lattices' gradients in place (isotropic).
+
+        ``sigma_hr_cells`` is the width in nominal high-resolution cells;
+        coarse cells are ``spatial_scale_factor`` times larger, so they see
+        the same flow-frame width in their own cell units unless
+        ``low_res_sigma_hr_cells`` (also in high-resolution cells, 0 = same
+        as ``sigma_hr_cells``) gives it a width of its own.
+        ``across_sigma_hr_cells`` is accepted for signature parity with the
+        cylindrical lattice and ignored: a Cartesian lattice has no
+        across-winding axis to smooth differently.
+        """
+        for level, flow in enumerate(self.flows):
+            if flow.grad is None:
+                continue
+            scale = self.spatial_scale_factor if level == 0 else 1
+            along = _low_res_width(sigma_hr_cells, low_res_sigma_hr_cells) if level == 0 else sigma_hr_cells
+            flow_grad_smoothing.smooth_cartesian_(flow.grad, float(along) / scale)
 
 
 class CylindricalFlowField(nn.Module):
@@ -748,3 +778,27 @@ class CylindricalFlowField(nn.Module):
                 outputs,
                 [leaf.grad for _, leaf in pending if leaf.grad is not None],
             )
+
+    def smooth_grad_(self, sigma_hr_cells, across_sigma_hr_cells=0.0,
+                     low_res_sigma_hr_cells=0.0):
+        """Gaussian-smooth both lattices' gradients in place: ``sigma_hr_cells``
+        along z and around each ring (approximating along-sheet directions)
+        and ``across_sigma_hr_cells`` across rings; see
+        flow_grad_smoothing.smooth_cylindrical_.
+
+        All widths are in nominal high-resolution cells (ring arc spacing
+        is approximate because angular cell counts are rounded). Coarse
+        cells are ``spatial_scale_factor`` times larger, so they see the same
+        flow-frame widths in their own cell units, except that
+        ``low_res_sigma_hr_cells`` (0 = same as ``sigma_hr_cells``) gives it
+        an along-sheet width of its own.
+        """
+        tables = ((self._lr_num_phi, self._lr_offsets), (self._hr_num_phi, self._hr_offsets))
+        for level, (flow, (num_phi, offsets)) in enumerate(zip(self.flows, tables)):
+            if flow.grad is None:
+                continue
+            scale = self.spatial_scale_factor if level == 0 else 1
+            along = _low_res_width(sigma_hr_cells, low_res_sigma_hr_cells) if level == 0 else sigma_hr_cells
+            flow_grad_smoothing.smooth_cylindrical_(
+                flow.grad, num_phi, offsets, float(along) / scale,
+                float(across_sigma_hr_cells) / scale)

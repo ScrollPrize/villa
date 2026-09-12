@@ -171,6 +171,19 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "pcl_fiber_link_side_margin_voxels": 0.5,
     "pcl_fiber_link_model_direction_step": 10000,
 })
+# The flow-gradient conditioning settings postdate durable checkpoints;
+# missing means off, which is exactly the earlier behaviour.
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "optimizer_flow_grad_smoothing": False,
+    "optimizer_flow_grad_smoothing_sigma_voxels": 32.0,
+    "optimizer_flow_lazy_moments": False,
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": 0.0,
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": 0.0,
+    "model_flow_field_low_res_lr_scale": 1.0,
+    "optimizer_flow_shared_second_moment": False,
+    "optimizer_flow_shared_second_moment_clip_quantile": 0.99,
+    "optimizer_flow_grad_clip_median_multiple": 0.0,
+})
 
 _PCL_LINK_DESCRIPTIONS = {
     "pcl_link_distance_tolerance": (
@@ -227,6 +240,69 @@ _GAP_EXPANDER_DESCRIPTIONS = {
         "minimum-spacing loss remains the separate geological preference."),
     "model_gap_expander_softplus_bias": (
         "Bias of the stable lower-bounded softplus gap parameterisation."),
+}
+
+_OPTIMIZER_DESCRIPTIONS = {
+    # See README.md, "Flow-gradient conditioning", for literature precedents
+    # and the limitations of these custom combinations.
+    "optimizer_flow_grad_smoothing": (
+        "Gaussian-smooth flow gradients before the optimizer step. The loss "
+        "is unchanged, but Adam scaling and masks mean the resulting update "
+        "need not retain the kernel profile. Cylindrical smoothing runs "
+        "along z and around rings, with optional separate across-ring smoothing."),
+    "optimizer_flow_grad_smoothing_sigma_voxels": (
+        "Standard deviation in scroll-voxel units of the flow frame: along "
+        "z and around cylindrical rings, or isotropically for Cartesian "
+        "lattices. These lattice directions approximate sheet directions. "
+        "Used for both lattices unless the low-resolution override is set. "
+        "Divide by model_flow_voxel_resolution for fine-cell units; coarse "
+        "cells are six times wider. Very small widths become identity kernels. "
+        "Effective widths are logged at startup when smoothing is enabled."),
+    "optimizer_flow_grad_smoothing_across_sigma_voxels": (
+        "Standard deviation in scroll-voxel units for smoothing across "
+        "cylindrical rings at matching angles. This approximates coupling "
+        "across windings; it does not identify sheet boundaries. 0 disables "
+        "across-ring smoothing. Ignored for Cartesian lattices."),
+    "optimizer_flow_grad_smoothing_low_res_sigma_voxels": (
+        "Along-sheet smoothing width for the coarse lattice alone; 0 uses "
+        "the fine lattice's width in scroll-voxel units. For example, at the "
+        "default 16-voxel fine spacing, 32 voxels is 2 fine cells but about "
+        "0.33 coarse cells. The across-ring width is not affected."),
+    "optimizer_flow_shared_second_moment": (
+        "Use one Adam denominator across cells and components of each "
+        "lattice slab, separately for each flow stage and coarse/fine lattice. "
+        "Preserves relative first-moment magnitudes before lazy masking and "
+        "weight decay, rather than normalizing each entry independently. "
+        "The denominator uses a winsorised mean of positive stored second "
+        "moments. Full per-entry state is retained; the flag can change "
+        "between runs."),
+    "optimizer_flow_shared_second_moment_clip_quantile": (
+        "Quantile of positive second-moment entries, estimated from a "
+        "fixed-stride sample, used to cap values before averaging the full "
+        "slab for the shared denominator. Limits outliers' effect on the "
+        "common scale. 1 disables the cap; an empty positive sample also "
+        "leaves values uncapped."),
+    "model_flow_field_low_res_lr_scale": (
+        "Coarse flow learning-rate multiplier relative to the scheduled "
+        "base rate, independent of the fine flow multiplier. Shared second "
+        "moments can change update sizes; use the logged increments to assess "
+        "the scale. 0 freezes coarse values, including weight decay, but "
+        "moments may still update. Read every step by the fitter; currently "
+        "classified as a model-rebuild setting by the configuration catalog."),
+    "optimizer_flow_grad_clip_median_multiple": (
+        "Clip individual gradient components at this multiple of the median "
+        "nonzero absolute component value, per lattice slab, estimated from "
+        "a fixed-stride sample. Runs after DDP averaging and nonfinite "
+        "sanitization, before smoothing and optimizer moments. Limits spike "
+        "propagation but can suppress valid corrections and change vector "
+        "direction. 0 disables clipping. Logs the bound and clipped fraction."),
+    "optimizer_flow_lazy_moments": (
+        "Use SparseAdam-style masked updates on dense flow gradients: "
+        "entries with zero gradient after conditioning and influence masks "
+        "retain their moments and receive no gradient update. Smoothing can "
+        "activate entries without direct samples. Preserves history through "
+        "quiet steps, including stale momentum, and does not correct first "
+        "touch scaling. Configured weight decay still applies everywhere."),
 }
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
@@ -307,6 +383,7 @@ _MODEL_STRUCTURE_KEYS = frozenset({
 })
 
 _RUN_MUTABLE_MODEL_KEYS = frozenset({
+    "model_flow_field_low_res_lr_scale",
     "model_num_flow_integration_steps",
     "model_flow_field_high_res_lr_scale_initial",
     "model_flow_field_high_res_lr_scale_final",
@@ -487,6 +564,9 @@ def _field_spec(key, default):
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
     elif key in _PCL_LINK_DESCRIPTIONS:
         spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
+
+    elif key in _OPTIMIZER_DESCRIPTIONS:
+        spec["description"] = _OPTIMIZER_DESCRIPTIONS[key]
     return spec
 
 
@@ -503,6 +583,17 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
+        # Flow-lattice gradient conditioning (see _OPTIMIZER_DESCRIPTIONS).
+        # All are read live every step, so they apply at a run boundary
+        # without a rebuild. Off by default.
+        self.optimizer_flow_grad_smoothing = False
+        self.optimizer_flow_grad_smoothing_sigma_voxels = 32.0
+        self.optimizer_flow_grad_smoothing_across_sigma_voxels = 0.0
+        self.optimizer_flow_grad_smoothing_low_res_sigma_voxels = 0.0
+        self.optimizer_flow_lazy_moments = False
+        self.optimizer_flow_shared_second_moment = False
+        self.optimizer_flow_shared_second_moment_clip_quantile = 0.99
+        self.optimizer_flow_grad_clip_median_multiple = 0.0
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         # Stationary velocity fields composed in sequence, held as the slabs
@@ -516,6 +607,9 @@ class Config:
         self.model_flow_field_high_res_lr_scale_final = 0.2
         self.model_flow_field_high_res_lr_ramp_start_step = 0
         self.model_flow_field_high_res_lr_ramp_steps = 1
+        # Both flow lattices' LRs are optimizer_learning_rate times their
+        # scale; the low-resolution one had no scale of its own before.
+        self.model_flow_field_low_res_lr_scale = 1.0
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
         # The physical winding estimate and the allocated transform capacity

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import pyro.distributions
 from einops import rearrange
 
+import flow_grad_smoothing
 import gap_triton
 import sample_spiral
 from flow_fields import CartesianFlowField, CylindricalFlowField
@@ -576,6 +577,38 @@ class SpiralAndTransform(nn.Module):
     def get_dr_per_winding(self):
         return lower_bounded_dr(
             self.dr_per_winding_logit, self.gap_min_gap)
+
+    def smooth_flow_grad_(self, sigma_voxels, across_sigma_voxels=0.0,
+                          low_res_sigma_voxels=0.0):
+        """Gaussian-smooth the flow lattices' gradients in place.
+
+        ``sigma_voxels`` is the z/around-ring width for cylindrical lattices
+        (isotropic for Cartesian), ``across_sigma_voxels`` the across-ring
+        width (cylindrical only), and ``low_res_sigma_voxels`` a coarse-lattice
+        override for the first width (0 = same as ``sigma_voxels``). Directions
+        approximate along/across-sheet directions; see flow_grad_smoothing.
+        All widths use scroll-voxel units of the flow frame, not distances
+        measured on the deformed sheet. Convert using the nominal fine cell
+        width model_flow_voxel_resolution; each field scales for its coarse
+        lattice.
+        Applies to every flow stage. Call after apply_accumulated_field_grad
+        (and after any all-reduce) and before the optimizer step.
+        """
+        cell_voxels = float(self.cfg['model_flow_voxel_resolution'])
+        self.flow_field.smooth_grad_(
+            float(sigma_voxels) / cell_voxels,
+            float(across_sigma_voxels) / cell_voxels,
+            float(low_res_sigma_voxels or 0.0) / cell_voxels)
+
+    def describe_flow_grad_smoothing(self, sigma_voxels, across_sigma_voxels=0.0,
+                                     low_res_sigma_voxels=0.0):
+        """The effective smoothing widths per lattice, for the startup log."""
+        return flow_grad_smoothing.describe_widths(
+            sigma_voxels, across_sigma_voxels,
+            float(self.cfg['model_flow_voxel_resolution']),
+            self.flow_field.spatial_scale_factor,
+            self.cfg['model_flow_field_type'],
+            low_res_along_voxels=low_res_sigma_voxels)
 
     def get_shared_transform_tensors(self):
         """The tiny graph paths every evaluation of one transform instance
