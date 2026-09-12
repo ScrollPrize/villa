@@ -5,5 +5,5 @@
 - [x] Historical loss audit and shared observational evaluation (backend caveat documented).
 - [x] EMA update, snapshot and managed handoff integration.
 - [x] CPU and manager-controlled GPU validation/overhead measurement.
-- [ ] Regular2M-step config and managed launch verified.
-- [ ] Documentation and commits.
+- [x] Regular2M-step config and managed launch verified through update400.
+- [x] Documentation and implementation committed c4ef954c4; launch results recorded.

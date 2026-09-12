@@ -6,6 +6,12 @@ is 128, physical maximum 16/GPU, limit 2,000,000 optimizer updates. Test and
 checkpoint intervals are 100 updates; retained snapshots are every 10,000.
 Runs and TensorBoard events go under `/ephemeral/hendrik/fiber3d_train2/runs`.
 
+Started run: `s1a_nml_128_sd1_16x8_ema_20260912_111221` (implementation
+`c4ef954c4`). Automatic calibration finished and the same run continued
+adaptively; verified through update 400 / 51,200 samples. The conservative
+measured allocation selects physical batch 8/GPU with two microbatches, retaining
+global batch 128. Warm managed test passes cost about 5.1 s per 100 updates.
+
 ```bash
 source /home/hendrik/.venv_las/bin/activate
 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json

@@ -31,3 +31,18 @@
   All6evaluation variants:initial14.30s,subsequent2.817/2.982/2.906s; emitted
   current/best/numbered snapshots for raw and bothEMA tracks. No training
   architecture/augmentation change. Extra evaluation cost reported separately.
+- Snapshot/TB audit of smoke passed: both exports exactly equal their raw
+  checkpoint EMA states,3updates each; all12requested raw/EMA angle/loss tags
+  plus existing detailed current tags present. Implementation committed c4ef954c4.
+- Approved production-start launched root1359679 with automatic manager handling.
+  Run: /ephemeral/hendrik/fiber3d_train2/runs/
+  s1a_nml_128_sd1_16x8_ema_20260912_111221.
+  Log: runs/.launches/s1a_nml_128_sd1_16x8_ema-20260912_111218/train.log.
+  Startup measured real microbatches1/2/4/8/16, retained all15updates, saved
+  profile f5673d079f07bbaa38a4467fc475fe11b36645083b3c4308bbafb87fc891bec7.json.
+  Adaptive task26f08c32-91c1-4c6e-bd5b-e0dca525db5e running on8GPUs/128CPU,
+  calibrated choice B8/GPU with2microbatches/global128 (config cap16).
+- Verified update400/51200samples at LR.01, all6eval variants. Warm managed tests
+  5.067/5.058/5.131s at updates200/300/400; recent fw_bw_step~0.5s includes
+  two physical microbatches, not isolated GPU-kernel timing. Run stays active
+  toward2000000updates; no further reproduction trials or training changes.
