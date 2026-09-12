@@ -65,8 +65,7 @@ class Worker:
         torch.manual_seed(int(training.get("initialization_seed", 0)))
         self.model = train.build_fiber_trace_3d_model(raw).to("cuda:0")
         if self.options.get("checkpoint"):
-            snapshot = torch.load(self.options["checkpoint"], map_location="cpu", weights_only=False)
-            self.model.load_state_dict(snapshot["model"], strict=True)
+            train._load_snapshot(self.options["checkpoint"], model=self.model, map_location="cpu")
         self.precision = train._mixed_precision_config_from_training(training, torch.device("cuda:0"))
         self.raw = raw
         self.indices = tuple(range(rank, (self.options["samples"] + self.config.batch_size - 1)

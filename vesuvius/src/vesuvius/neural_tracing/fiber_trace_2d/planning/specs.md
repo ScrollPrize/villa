@@ -1,5 +1,21 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Historical Fiber3D evaluation experiments
+
+- Optional training.test_batch_size fixes positive logical test batch size
+  independently of the training batch; test_sampling_strategy independently
+  selects the existing sampler. Defaults preserve existing behavior.
+- Optional test_output_upsample=trilinear|nearest evaluates ordinary low-resolution
+  probability outputs on the full input grid using the same full-resolution target
+  builder and loss. Trilinear uses align_corners=false. Training predictions,
+  targets and gradients are unchanged; conditioned models reject this option.
+- Reproduction runs record old event updates as samples*64 and new events directly
+  on the sample axis. Historical test batch-row means and partial-batch weighting
+  remain fixed. Dense/CP and spatial-sampling differences are different metrics,
+  not convergence regressions until compared on identical evaluation contracts.
+- GPU experiments use existing manager-exclusive ownership and tree/session-aware
+  cleanup. No adaptive/accumulated SyncBN claim and no manager-protocol changes.
+
 ## Dynamic per-GPU inference batches (2026-09-11)
 
 - inference.max_batch_size is a positive integer model-batch cap per GPU, default1. Shared tiled worker takes the first descriptor and drains only immediately available descriptors up to the cap. No batch-fill delay, fixed queue partitions, extra staging files or replacement accumulator. Actual capacity is also bounded by ready inputs and available result slots.

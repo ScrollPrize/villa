@@ -78,6 +78,7 @@ def start():
         lease.cohort = child
         lease.authorize()
         guard = StopGuard(grace_seconds=15)
+        (folder / 'guard.json').write_text(json.dumps(process_identity(guard.process.pid)))
         registered = set()
         def observe():
             child.observe()
@@ -124,6 +125,19 @@ def status(stop=False):
     print(folder, state, flush=True)
     if stop and state == 'alive':
         os.kill(identity['pid'], signal.SIGTERM)
+    if stop:
+        deadline = time.monotonic() + 45
+        while True:
+            identities = [identity]
+            if (folder / 'guard.json').exists():
+                identities.append(json.loads((folder / 'guard.json').read_text()))
+            survivors = [row for row in identities if process_state(row, os.getuid()) != 'dead']
+            if not survivors:
+                print('controller and cleanup guard exited', flush=True)
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'cleanup not confirmed; ownership must be retained: {survivors}')
+            time.sleep(.2)
     log = folder / 'train.log'
     if log.exists():
         with log.open('rb') as stream:
@@ -132,6 +146,7 @@ def status(stop=False):
 
 
 def summarize():
+    plot_rows = []
     for folder in sorted(OUTPUT.glob('repro*')):
         log = folder / 'train.log'
         if not log.exists():
@@ -148,15 +163,72 @@ def summarize():
                   'result':json.loads((folder/'result.json').read_text()) if (folder/'result.json').exists() else None}
         (folder / 'summary.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2), flush=True)
+        plot_rows.append((folder.name, rows))
+    if plot_rows:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        historical = json.loads((OUTPUT / 's1a_128_1_single_8x8_20260729_075013.scalars.json').read_text())
+        old = [r for r in historical['test/angle_mean_deg'] if r['step'] * 64 <= 300800]
+        fig, ax = plt.subplots(figsize=(10,5))
+        ax.plot([r['step']*64 for r in old], [r['value'] for r in old], label='Historical Jul29: CP test')
+        for name, rows in plot_rows:
+            ax.plot([r['samples'] for r in rows], [r['angle'] for r in rows], label=name.split('-2026')[0])
+        ax.axhline(20, color='gray', linestyle='--')
+        ax.axvspan(200000,300800,color='gray',alpha=.1)
+        ax.set(xlabel='Global training samples', ylabel='Historical test mean angle (degrees)', xlim=(0,300800))
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(OUTPUT / 'convergence.svg')
+        plt.close(fig)
+
+
+def evaluate():
+    """Use the existing managed benchmark, with immutable per-ablation settings."""
+    from vesuvius.neural_tracing.fiber_trace_3d.evaluation_benchmark import main as benchmark
+    options = json.loads(CONTROL.read_text())['evaluation']
+    raw = json.loads((ROOT / options['config']).read_text())
+    def merge(target, updates):
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = value
+    merge(raw, options.get('overrides', {}))
+    folder = OUTPUT / ('eval-' + options['name'] + '-' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
+    folder.mkdir(parents=True)
+    config = folder / 'config.json'
+    config.write_text(json.dumps(raw, indent=2))
+    (folder / 'control.json').write_text(json.dumps(options, indent=2))
+    (folder / 'source.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True))
+    argv = ['--reference',str(config),'--checkpoint',options['checkpoint'],
+            '--output',str(folder),'--backend','pipeline','--devices','all',
+            '--samples',str(options.get('samples',128)),
+            '--batch-size',str(options.get('batch_size',8)),
+            '--passes','1','--cpu-workers','32','--timeout','300']
+    (folder / 'command.json').write_text(json.dumps(argv))
+    print('evaluation:',folder, flush=True)
+    result = benchmark(argv)
+    for report in folder.glob('evaluation-*.json'):
+        data = json.loads(report.read_text())
+        rows = [row for rank in data['ranks'] for pass_record in rank for row in pass_record['metrics']]
+        metrics = {key:statistics.mean(row[1][key] for row in rows) for key in rows[0][1]}
+        (folder / 'summary.json').write_text(json.dumps(metrics, indent=2))
+        print('metrics:',json.dumps(metrics), flush=True)
+    return result
 
 
 def inspect():
     import torch
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    for name in ['s1a_128_1_single_8x8_20260729_075013',
-                 's1a_128_1_single_8x8_20260730_063937']:
-        run = HISTORICAL / name
+    runs = [HISTORICAL / name for name in ['s1a_128_1_single_8x8_20260729_075013',
+                 's1a_128_1_single_8x8_20260730_063937']]
+    runs.append(Path('/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_128_sd1_16x8_20260912_062932'))
+    for run in runs:
+        name = run.name
+        if (OUTPUT / f'{name}.scalars.json').exists():
+            continue
         checkpoint = torch.load(run / 'snapshots/current.pt', map_location='cpu',
                                 weights_only=False, mmap=True)
         metadata = {k: v for k, v in checkpoint.items()
@@ -175,7 +247,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -188,6 +260,8 @@ def main():
         result = input_manifest(json.loads((folder / 'config.json').read_text()))
         (folder / 'inputs.json').write_text(json.dumps(result, indent=2))
         print({key: len(rows) for key, rows in result.items()})
+    elif args.command == 'evaluate':
+        evaluate()
     else:
         status(stop=args.command == 'stop')
 

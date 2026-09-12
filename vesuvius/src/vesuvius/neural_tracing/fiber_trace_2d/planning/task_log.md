@@ -33,3 +33,8 @@
   checkpoint and remove evaluation changes on same weights before claiming cause.
   Inputs manifest:8NML files,1JSON test file (hashes archived; historical snapshot
   had no annotation hashes,so exact historical byte identity cannot be proven).
+- At217600samples control17.82deg vs historical18.29189deg. Reproduction achieved
+  at a matched point;finishwindow and audit metric before identifying cause.
+- CPU run20260912_104231_239475:29passed22.64s including stop confirmation refusing
+  success while cleanup guard remains alive. Checkpoint evaluation reuses the
+  common training checkpoint loader rather than a separate restore implementation.

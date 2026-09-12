@@ -34,3 +34,25 @@ def test_checkpoint_evaluation_parser():
                                '--checkpoint','weights.pt','--batch-size','8'])
     assert args.checkpoint.name == 'weights.pt'
     assert args.batch_size == 8
+
+
+def test_experiment_stop_requires_guard_exit(tmp_path, monkeypatch):
+    import importlib.util
+    import json
+    from pathlib import Path
+    import villa_gpu_manager.processes as processes
+    path = Path(__file__).resolve().parents[2] / 'scripts/fiber3d_experiment.py'
+    spec = importlib.util.spec_from_file_location('repro_runner_test', path)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    monkeypatch.setattr(runner, 'OUTPUT', tmp_path)
+    folder = tmp_path / 'run'
+    folder.mkdir()
+    (tmp_path / 'latest').write_text(str(folder))
+    (folder / 'controller.json').write_text(json.dumps({'pid':1}))
+    (folder / 'guard.json').write_text(json.dumps({'pid':2}))
+    monkeypatch.setattr(processes, 'process_state', lambda row, uid: 'alive' if row['pid']==2 else 'dead')
+    ticks = iter([0,46])
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: next(ticks))
+    with pytest.raises(RuntimeError, match='ownership must be retained'):
+        runner.status(stop=True)
