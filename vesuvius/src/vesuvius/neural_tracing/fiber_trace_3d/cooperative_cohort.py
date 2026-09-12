@@ -23,7 +23,7 @@ class FiberCohort:
                  queue_depth=2, writer_factory=None, resume_checkpoint=None,
                  drain_timeout=300.0, training_overrides=None, calibration_observations=(),
                  startup_microbatch_size=None, startup_reserve_bytes=4 * 1024**3,
-                 on_startup_observation=None):
+                 on_startup_observation=None, on_process_start=None):
         from villa_gpu_manager.cohort import ProcessCohort
         if type(queue_depth) is not int or queue_depth < 1:
             raise ValueError("GPU input queue depth must be positive")
@@ -91,7 +91,7 @@ class FiberCohort:
                 measure_startup_memory=startup_microbatch_size is not None,
             )
             self.gpu = ProcessCohort(factory, grant, state, environment=native_thread_environment(),
-                                     on_unit=self._completed_unit)
+                                     on_unit=self._completed_unit, on_process_start=on_process_start)
             self._gpu_pids = {row["pid"] for row in self.gpu.processes}
             if calibration_observations or startup_microbatch_size is not None:
                 from villa_gpu_manager.processes import NvidiaMonitor

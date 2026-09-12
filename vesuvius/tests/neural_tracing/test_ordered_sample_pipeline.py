@@ -1,12 +1,42 @@
 from __future__ import annotations
 
 import os
+import multiprocessing as mp
 import time
 from dataclasses import dataclass
 
 import pytest
 
 from vesuvius.neural_tracing.ordered_sample_pipeline import OrderedTwoStageSamplePipeline
+
+
+def _poison_counter(counter, ready):
+    counter.get_lock().acquire()
+    ready.send(True)
+    os._exit(0)
+
+
+def test_close_does_not_acquire_dead_worker_counter_lock():
+    pipeline = _shared_pipeline(item_count=1)
+    context = mp.get_context("spawn")
+    counter = context.Value("q", 7)
+    parent, child = context.Pipe()
+    process = context.Process(target=_poison_counter, args=(counter, child))
+    process.start()
+    try:
+        assert parent.poll(10) and parent.recv()
+        process.join(timeout=5)
+        assert process.exitcode == 0
+        pipeline._shared_admission_highwater = counter
+        pipeline.close()
+        assert pipeline.admission_highwater == 7
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        parent.close()
+        child.close()
+        pipeline.close()
 
 
 @dataclass(frozen=True)

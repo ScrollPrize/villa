@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Reserved fixed entrypoint for manager-controlled training experiments.
+# Implementation and subcommands will be added before running experiments.
+set -euo pipefail
+echo 'Experiment launcher reserved; no experiment started. Subcommands are not implemented yet.'

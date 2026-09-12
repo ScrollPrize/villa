@@ -92,6 +92,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
     import torch
     from villa_gpu_manager.client import Client
     from villa_gpu_manager.supervisor import Supervisor
+    from villa_gpu_manager.stop_guard import StopGuard
     from .cooperative_cohort import FiberCohort
     from .cooperative_logging import WriterHub
     from .sample_broker import CanonicalSampleBroker
@@ -177,14 +178,17 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
                 sample_index_limit=training.get("max_sample_index", 0),
                 defer_cuda_value_augmentation=_training_cuda_value_augmentation(training),
                 training_overrides=overrides,
+                on_process_start=stop_guard.register,
             )
-        return FiberCohort(config_path=config_path, grant=grant, state=state, broker=broker,
+        cohort = FiberCohort(config_path=config_path, grant=grant, state=state, broker=broker,
             calibration=settings.calibration, queue_depth=settings.queue_depth,
             writer_factory=hub.proxy_factory, resume_checkpoint=resume, training_overrides=overrides,
             calibration_observations=training["cooperative"].get("memory_calibration", {}).get("observations", ()),
             startup_microbatch_size=startup.microbatch_size if startup is not None else None,
             startup_reserve_bytes=startup.reserve_bytes if startup is not None else 4 * 1024**3,
-            on_startup_observation=observe_startup if startup is not None else None)
+            on_startup_observation=observe_startup if startup is not None else None,
+            on_process_start=stop_guard.register)
+        return cohort
 
     client = Client(settings.socket)
     supervisor = Supervisor(client, label=str(training.get("run_name", config_path.stem)),
@@ -192,16 +196,19 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         pausable=startup is None, adaptable=startup is None,
         disconnect_grace_seconds=60 if startup is None else None)
     interrupted = False
+    stop_guard = StopGuard()
 
     def stop(_signum, _frame):
         nonlocal interrupted
         interrupted = True
+        stop_guard.stop()
         supervisor.stop("interrupted")
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     last_status = None
     try:
         while True:
+            stop_guard.check()
             if supervisor.error is None:
                 try:
                     hub.poll()
@@ -249,7 +256,10 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         # release is claimed until actual joins have succeeded.
         # Execute every cleanup even if a writer/queue close raises. Register
         # in reverse order: workers must join before their CPU resources close.
+        if not stop_guard.stopping:
+            stop_guard.stop()
         with ExitStack() as cleanup:
+            cleanup.callback(stop_guard.close)
             for sig, handler in previous.items():
                 cleanup.callback(signal.signal, sig, handler)
             if supervisor.state is not None:

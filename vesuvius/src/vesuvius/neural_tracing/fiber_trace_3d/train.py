@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics as _LossStatistics
 from vesuvius.neural_tracing.fiber_trace_3d.embedding import embedding_statistics
 from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
-    ComponentGradientAccumulator, validate_sample_independent_model,
+    NormalizedGradientAccumulator,
+    validate_target_only_loss_config, validate_sample_independent_model,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.training_state import (
     TrainingBoundary, capture_handoff, restore_handoff,
@@ -51,6 +52,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     collate_fiber_trace_3d_samples,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
+    MacroBatchTargetSource,
     FiberTrace3DCudaBatchPipeline,
     FiberTrace3DTrainingBatchPipeline,
     VirtualBatchSampleIndex,
@@ -1335,6 +1337,10 @@ def compute_losses(
     embeddings: torch.Tensor | None = None,
     _return_statistics: bool = False,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
+    # TODO: replace prediction-dependent global counts before re-enabling these modes.
+    if embeddings is not None or output.shape[1] != 7:
+        raise ValueError("Embedding and ordinary multi-branch losses are temporarily unsupported: "
+                         "fix target-only normalization so other samples' predictions cannot change loss weights.")
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
     assert batch.direction_target_sparse is not None
@@ -2684,6 +2690,7 @@ def run_training(
 ) -> None:
     if unmanaged and manager_socket is not None:
         raise ValueError("--unmanaged cannot be combined with --manager-socket")
+    validate_target_only_loss_config(_load_raw_config(config_path))
     if not unmanaged:
         _require_single_process_cli_mode("cooperative training (do not use torchrun)")
         from .cooperative_training import run_cooperative_training
@@ -2719,6 +2726,7 @@ def training_units(
     wait for permission; ordinary training exhausts this same iterator.
     """
     raw_config = _load_raw_config(config_path)
+    validate_target_only_loss_config(raw_config)
     source_fingerprint = config_fingerprint(raw_config)
     if training_overrides is not None:
         raw_config = {**raw_config, "training": {**raw_config.get("training", {}), **training_overrides}}
@@ -2808,6 +2816,12 @@ def training_units(
     if "initialization_seed" in training:
         torch.manual_seed(int(training["initialization_seed"]))
     raw_model = build_fiber_trace_3d_model(raw_config)
+    if getattr(raw_model, "embedding_channels", 0) or (
+        not _model_uses_conditioned_decoder(raw_model)
+        and int(getattr(raw_model, "direction_branch_count", 1)) != 1
+    ):
+        raise ValueError("Embedding and ordinary multi-branch training are temporarily unsupported; "
+                         "TODO: implement target-only loss normalization before re-enabling them.")
     sync_batchnorm = _distributed_should_use_sync_batchnorm(
         distributed,
         enabled=training.get("sync_batchnorm", True),
@@ -3509,6 +3523,13 @@ def training_units(
     train_iterator = train_dataloader = batch_source if batch_source is not None else queued_train
     admit_training_until_test(start_step)
 
+    target_only_accumulation = bounded_accumulation
+    if target_only_accumulation and optimizer_microbatch_count > 0:
+        train_iterator = train_dataloader = MacroBatchTargetSource(
+            train_iterator, config=loader.config, device=device,
+            output_stride=_model_output_stride(raw_model), batch_sizes=optimizer_microbatch_takes,
+            conditioned=_model_uses_conditioned_decoder(raw_model))
+
     cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
     if cuda_batch_depth > 0 and optimizer_microbatch_count > 0:
         if train_iterator is None:
@@ -3640,14 +3661,19 @@ def training_units(
             batch: FiberTrace3DBatch | None = None
             loss_statistics: _LossStatistics | None = None
             component_accumulator = None
-            if bounded_accumulation:
-                component_accumulator = ComponentGradientAccumulator(
-                    raw_model,
-                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0,
-                    protect_fp16=mixed_precision.dtype == torch.float16,
-                )
+            def normalized_accumulator(counts):
+                accumulator = NormalizedGradientAccumulator(raw_model, counts,
+                    direction_weight=direction_weight, presence_weight=presence_weight,
+                    positive_query_weight=conditioned_loss_options["positive_query_weight"],
+                    negative_query_weight=conditioned_loss_options["negative_query_weight"],
+                    distributed=distributed.enabled,
+                    loss_scale=float(grad_scaler.get_scale()) if scaler_enabled else 1.0)
                 if scaler_enabled:
-                    grad_scaler.scale(component_accumulator.statistics[0])
+                    grad_scaler.scale(accumulator.statistics[0])
+                return accumulator
+
+            if target_only_accumulation and optimizer_microbatch_count == 0:
+                component_accumulator = normalized_accumulator(torch.zeros(3, device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
                     (step - 1) * optimizer_microbatch_count + microbatch_index + 1
@@ -3702,6 +3728,11 @@ def training_units(
                     raise RuntimeError(
                         "training batch size differs from the canonical partition"
                     )
+                if target_only_accumulation and component_accumulator is None:
+                    if next_batch.normalization_counts is None:
+                        raise RuntimeError("missing pre-forward effective-batch normalization counts")
+                    with profile.stage("target_count_sync"):
+                        component_accumulator = normalized_accumulator(next_batch.normalization_counts)
                 if batch is None:
                     batch = next_batch
                 sync_context = (
@@ -3732,7 +3763,7 @@ def training_units(
                             # Initialize GradScaler's device-local scale state;
                             # actual scaled VJPs are built by the accumulator.
                             grad_scaler.scale(next_statistics.direction_sum)
-                        with profile.stage("component_backward"):
+                        with profile.stage("backward"):
                             component_accumulator.add(next_statistics)
                         loss_statistics = component_accumulator.statistics
                     else:
@@ -3746,13 +3777,7 @@ def training_units(
             assert component_accumulator is not None or batch is not None and loss_statistics is not None
             with profile.stage("loss_stat_sync"):
                 if component_accumulator is not None:
-                    loss_statistics = component_accumulator.reduce_and_assign(
-                        direction_weight=direction_weight,
-                        presence_weight=presence_weight,
-                        positive_query_weight=conditioned_loss_options["positive_query_weight"],
-                        negative_query_weight=conditioned_loss_options["negative_query_weight"],
-                        distributed=distributed.enabled,
-                    )
+                    loss_statistics = component_accumulator.reduce_and_assign()
                 loss_tensors = _finalize_loss_statistics(
                     loss_statistics,
                     direction_weight=direction_weight,

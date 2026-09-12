@@ -283,9 +283,12 @@ def _shared_worker_main(
     worker_busy: Any,
     elastic_workers: bool,
     admitted_frontier: Any,
+    own_session: bool,
 ) -> None:
     """Claim eligible work without a coordinator round trip."""
 
+    if own_session:
+        os.setsid()
     _set_native_thread_limits()
     stage = "startup"
     index = -1
@@ -476,6 +479,8 @@ class OrderedTwoStageSamplePipeline:
         elastic_workers: bool = False,
         initial_active_workers: int | None = None,
         manual_admission: bool = False,
+        own_worker_sessions: bool = False,
+        on_process_start=None,
     ) -> None:
         for name, value in (
             ("item_count", item_count),
@@ -646,6 +651,7 @@ class OrderedTwoStageSamplePipeline:
                             self._worker_busy,
                             self.elastic_workers,
                             self._admitted_frontier,
+                            own_worker_sessions,
                         ),
                         name=f"ordered-sample-shared-{worker_id}",
                     )
@@ -653,6 +659,8 @@ class OrderedTwoStageSamplePipeline:
                     child.close()
                     self.processes.append(process)
                     self.controls.append(parent)
+                    if on_process_start is not None:
+                        on_process_start([process.pid])
             for worker_id in range(0 if self.shared_pool else int(stage1_workers)):
                 parent, child = self.context.Pipe(duplex=False)
                 process = self.context.Process(
@@ -944,20 +952,29 @@ class OrderedTwoStageSamplePipeline:
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
         self.stop_event.set()
         self.start_event.set()
         deadline = time.monotonic() + 5.0
         for process in self.processes:
             remaining = max(0.0, deadline - time.monotonic())
             process.join(timeout=remaining)
-        for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self.processes:
-            process.join(timeout=2.0)
+        for method in ("terminate", "kill"):
+            for process in self.processes:
+                if process.is_alive():
+                    getattr(process, method)()
+            deadline = time.monotonic() + 2.0
+            for process in self.processes:
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+            if not any(process.is_alive() for process in self.processes):
+                break
+        survivors = [process.pid for process in self.processes if process.is_alive()]
+        if survivors:
+            self.closed = False
+            raise RuntimeError(f"loader processes could not be stopped; resources remain held: {survivors}")
         if self.shared_pool:
-            self.admission_highwater = int(self._shared_admission_highwater.value)
+            # Never acquire a lock a terminated worker may have owned. This is
+            # diagnostic-only and all writers have now exited.
+            self.admission_highwater = int(self._shared_admission_highwater.get_obj().value)
             self.shared_stage1_counts = {
                 worker_id: int(self._shared_stage1_count_array[worker_id])
                 for worker_id in range(self.shared_workers)
@@ -978,13 +995,11 @@ class OrderedTwoStageSamplePipeline:
         for data_queue in (self.raw_queue, self.result_queue):
             if data_queue is None:
                 continue
-            try:
-                while True:
-                    data_queue.get_nowait()
-            except (queue.Empty, EOFError, OSError):
-                pass
+            # No consumer remains. Draining can block on a partial pickle frame
+            # after forced termination; feeder joins can likewise wait forever.
+            data_queue.cancel_join_thread()
             data_queue.close()
-            data_queue.join_thread()
+        self.closed = True
 
     def __enter__(self) -> "OrderedTwoStageSamplePipeline":
         return self

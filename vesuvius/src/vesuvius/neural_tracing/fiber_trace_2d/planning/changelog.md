@@ -1,3 +1,13 @@
+## 2026-09-12 — Single-backward training and bounded stop
+
+- Target-only prepass and one backward for ordinary one-branch/conditioned
+  bounded training. Embedding/multi-branch losses temporarily error pending
+  target-only normalization; inference compatibility retained. Matched one-H100
+  B4 BF16 model/loss test16.25→38.93samples/s (not end-to-end throughput).
+- Loader shutdown avoids abandoned queue joins/dead-owner counter locks, with
+  shared TERM/KILL deadlines. Independent client stop guard tracks explicit
+  compute sessions including orphans, preserving shared manager ownership.
+
 ## 2026-09-12 — Merge embedding into retrain
 
 - Integrated committed embedding1f24f17d2 into retrain while preserving latest28k/best11k evaluation results. No code conflicts; archived both active task histories and reconciled five planning files. Dense scroll-balanced JSON supervision, unified cooperative queues/startup calibration and responsive manager/recovery changes retained. Validation and merge details in current task log.

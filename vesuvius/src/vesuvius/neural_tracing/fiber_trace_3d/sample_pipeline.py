@@ -347,7 +347,8 @@ class FiberTrace3DSampleQueue:
     """
 
     def __init__(self, *, sources, workers, slot_count, initial_in_flight,
-                 load_affinity_workers=None, initial_active_workers=None, profile=False):
+                 load_affinity_workers=None, initial_active_workers=None, profile=False,
+                 own_worker_sessions=False, on_process_start=None):
         if not sources:
             raise ValueError("sample queue requires at least one source")
         self.sources = dict(sources)
@@ -375,7 +376,8 @@ class FiberTrace3DSampleQueue:
             result_queue_capacity=max(1, min(slot_count, workers)),
             max_in_flight=slot_count, initial_in_flight=min(slot_count, max(1, initial_in_flight)),
             shared_stage1_affinity_workers=load_affinity_workers,
-            transport=self.transport, manual_admission=True)
+            transport=self.transport, manual_admission=True, own_worker_sessions=own_worker_sessions,
+            on_process_start=on_process_start)
         self._lock = threading.RLock()
         self._next = 0
         self._owned = set()
@@ -640,6 +642,72 @@ def apply_deferred_batch_augmentation(batch, config, *, mode):
     return replace(batch, volume=volume, deferred_augmentation_params=None, deferred_blur_kernels=None)
 
 
+class MacroBatchTargetSource:
+    """Bounded host staging and geometry-only normalization prepass.
+
+    The value augmentation suffix changes images only. Reuse the real target
+    voxelizer on the training device with a storage-free final-shape image view.
+    Never transfer the real image or run the model in this prepass.
+    """
+
+    def __init__(self, source, *, config, device, output_stride, batch_sizes, conditioned=False):
+        self.source, self.config = source, config
+        self.device, self.output_stride = device, output_stride
+        self.batch_sizes = tuple(batch_sizes)
+        self.conditioned = conditioned
+        if not self.batch_sizes or any(n <= 0 for n in self.batch_sizes):
+            raise ValueError("target source requires nonempty local microbatches")
+        self.pending = []
+        self.prepare_geometry = lambda operation: operation()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.pending:
+            prepared = []
+            counts = torch.zeros(3)
+            for size in self.batch_sizes:
+                raw = next(self.source)
+                try:
+                    # Queue views release/reuse their slots on next(); take
+                    # ownership before returning credits, including geometry.
+                    batch = replace(raw, **{name: value.clone() for name, value in vars(raw).items()
+                                           if isinstance(value, torch.Tensor)})
+                finally:
+                    self.source.release_current()
+                if batch.volume.shape[0] != size:
+                    raise RuntimeError("target prepass microbatch differs from canonical partition")
+                counts += self.prepare_geometry(lambda: self._counts(batch))
+                prepared.append(batch)
+            local_counts = counts.cpu()
+            self.pending = [replace(batch, normalization_counts=local_counts) for batch in reversed(prepared)]
+        return self.pending.pop()
+
+    def _counts(self, batch):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
+            geometry = replace(batch, volume=torch.empty(0), valid_mask=None).to(self.device)
+            geometry = replace(geometry, volume=torch.empty(1, device=self.device).expand(
+                len(batch.volume), 1, *self.config.patch_shape_zyx))
+            targets = materialize_targets(geometry, self.config, output_stride=self.output_stride)
+            indices = targets.direction_indices_bzyx
+            if self.conditioned:
+                return targets.presence_target.new_tensor((indices.shape[0] * 12,
+                    torch.unique(indices[:, 0]).numel() * 2, len(batch.volume) * 2)).cpu()
+            counts = torch.stack((
+                targets.presence_target.new_tensor(indices.shape[0] * 6),
+                targets.presence_target.new_tensor(torch.unique(indices[:, 0]).numel()),
+                (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()))
+            return counts.cpu()
+
+    def release_current(self):
+        pass  # Returned batches own storage, not shared-slot leases.
+
+    def close(self):
+        self.source.close()
+        self.pending.clear()
+
+
 class FiberTrace3DCudaBatchPipeline:
     """Prepare two future training batches on a dedicated CUDA stream."""
 
@@ -676,6 +744,8 @@ class FiberTrace3DCudaBatchPipeline:
         self._submit_lock = threading.Lock()
         self._closed = False
         self.max_pinned_bytes = 0
+        if isinstance(source, MacroBatchTargetSource):
+            source.prepare_geometry = self._prepare_geometry
         self._thread = threading.Thread(
             target=self._run,
             name="fiber3d-cuda-batch-preparation",
@@ -731,6 +801,18 @@ class FiberTrace3DCudaBatchPipeline:
                     pinned_bytes=_batch_tensor_bytes(pinned),
                 )
         return None
+
+    def _prepare_geometry(self, operation):
+        # Queue reads remain outside this lock: evaluation may need the same
+        # queue's credits while the producer waits at its admission boundary.
+        while self._wait_until_running():
+            with self._submit_lock:
+                with self._pause_condition:
+                    if self._paused:
+                        continue
+                with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
+                    return operation()
+        raise StopIteration
 
     def _run(self) -> None:
         try:

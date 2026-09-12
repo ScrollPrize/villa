@@ -634,21 +634,28 @@
   Pinned transfer and CUDA stream ownership cover eligibility as well as input.
   Normals and exclusion do not run in the model forward. Pair loss uses FP32
   arithmetic on the model's device while model autocast policy remains unchanged.
-- Bounded accumulation allocates two additional FP32 numerator-gradient banks
-  only for embedding-enabled models. Embedding counts/gradients reduce at the
-  effective-update boundary, including zero-work ranks; ordinary training uses
-  the same sufficient statistics. Checkpoint configs retain embedding settings.
+- Embedding losses are temporarily disabled with an explicit TODO error until
+  their global normalization is target-only. Checkpoint configs retain embedding settings.
   Enabling embeddings invalidates an old cooperative memory calibration.
   Conditioned-decoder embeddings and embedding Zarr publication are not provided
   by this training feature; default inference products remain unchanged.
 
 - `training.bounded_gradient_accumulation` is opt-in and defaults false. The
-  experimental fixed-cohort path rejects batch-dependent normalization and
-  uses three FP32 numerator-gradient banks with end-update SUM reduction and
-  global component counts, retaining only one microbatch graph. It reuses the
-  existing loss functions, optimizer, test and snapshot semantics. FP16 local
-  VJP scaling uses actual counts, with reversible overflow attenuation rather
-  than dense-volume count bounds. CUDA equivalence/performance validation is
+  fixed-cohort path rejects batch-dependent normalization. Ordinary single-branch
+  and conditioned training prepare target-derived counts before any forward,
+  SUM-reduces those counts and performs one combined backward per microbatch.
+  The prepass reuses the target voxelizer on the training device with only
+  compact geometry, not image transfers, model forwards or value augmentation.
+  Host copies own at most one local macro-batch of staged inputs plus existing
+  CUDA lookahead, releasing shared queue leases immediately. Gradient SUM and
+  observed-count validation occur at the update boundary; no full-batch graph
+  is retained. FP32 master parameters/gradient reduction and configured autocast
+  remain unchanged. Zero-work ranks join both count and gradient reductions.
+  Embedding and ordinary multi-branch losses temporarily raise explicit errors:
+  TODO target-only normalization before re-enabling them. Inference remains
+  supported. Conditioned counts retain two positive queries and two dense
+  negative groups per sample. No component-backward production fallback exists.
+  CUDA equivalence/performance validation is
   still required before production use. This option alone does not enable
   dynamic GPU reconfiguration.
 - Fiber3D training defaults to the CPU supervisor with a measured config-matched

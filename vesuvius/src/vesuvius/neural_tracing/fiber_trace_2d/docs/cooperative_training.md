@@ -13,8 +13,9 @@ Validation used GPUs 0/1 only, below 20 GiB/GPU; other configurations need calib
   process identities, journal recovery, CPU conformance tests.
 - `fiber_trace_3d/loss_statistics.py`: the shared statistics used by the existing
   trainer and bounded accumulation; no copied loss implementation.
-- `gradient_accumulation.py`: three FP32 numerator-gradient banks, one graph at
-  a time, end-update SUM reductions, preserved global loss normalization.
+- `gradient_accumulation.py`: target-normalized single backward for ordinary
+  one-branch and conditioned training; unsupported losses fail explicitly.
+  One graph at a time, preserved global loss normalization.
 - `cooperative_resources.py`: explicitly calibrated memory bounds and canonical
   effective-batch partitions, including unequal VRAM grants. No implicit estimate.
 
@@ -26,28 +27,41 @@ This enables bounded activation memory in the **existing fixed-cohort** trainer;
 arbitrary/partial physical batches and zero-work ranks are supported in the shared
 trainer. Physical partitioning does not change the effective batch's sample IDs.
 
-Each microbatch contributes gradients of direction, positive-presence and
-negative-presence numerators separately. Only at the effective-update boundary
-are gradient banks and counts globally summed and normalized. There are no DDP
-forward/backward hooks in this mode. The existing finalizer, clipping, optimizer,
-test and snapshot handling stay shared. Three FP32 banks cost 12 bytes/trainable
-parameter, plus combined gradients and optimizer state, and up to three VJPs
-per microbatch. At the capped reference microbatch 2/GPU, the bounded path measured
-about 16 global samples/s across two H100 GPUs. This is not the earlier larger-
-microbatch, graph-retaining trainer's performance ceiling.
+Ordinary one-branch and conditioned training prepare the local macro-batch's
+normalization counts before its first forward. The prepass uses the same target
+voxelizer/device and compact geometry with a storage-free image view; it does
+not run the model, transfer input images or rerun value augmentation. Counts are
+globally summed once. Each microbatch then performs one combined backward, and
+gradients are SUM-reduced once per update. An observed-count check prevents a
+mismatched prepass from silently changing the loss. CPU queue slots are copied
+into bounded owned host staging and promptly released; GPU inputs/graphs remain
+microbatch-bounded. Geometry CUDA work honors the preparer's pause/stream barrier.
 
-Local actual counts normalize VJPs before backward; FP32 banks undo that scaling.
-Dense-volume bounds cannot safely normalize sparse FP16 gradients. FP16 retries
-locally overflowing VJPs with reversible power-of-two attenuation, keeping only
-the current graph and leaving the global scaler unchanged. CPU numerical tests
-and small CUDA numerical tests cover this. Changed floating-point order does not
-promise bitwise-identical trajectories across different GPU/microbatch counts.
+Embedding and ordinary multi-branch losses are temporarily rejected at training
+startup and evaluation loss entrypoints. TODO: make their global denominators
+target-only before re-enabling them. Their inference models remain usable.
+Conditioned counts are 12 per GT voxel, two positive groups per GT-positive sample,
+and two negative groups per sample, including empty-GT samples. No production
+component-backward fallback remains. The old accumulator remains a numerical/
+performance reference only. Floating-point trajectories are not bitwise identical
+across GPU/microbatch counts.
+
+### Stopping
+
+Ctrl-C/TERM requests graceful stopping. An independent client-owned process
+enforces a 15-second deadline, then TERM/KILL with five-second stages. A second
+request accelerates escalation. It tracks registered compute sessions, including
+orphan descendants, never the supervisor's shared manager service. Loader cleanup
+uses shared deadlines and avoids abandoned queue feeder joins and dead-owner
+counter locks. Unkillable kernel-I/O survivors are reported; the guard does not
+kill the root to fake release. Forced stopping can lose updates since the last
+persisted checkpoint. The manager wire protocol is unchanged.
 
 ### Precision and numerical validation
 
 Production honors `training.mixed_precision` unchanged: BF16 model operations
 remain under the shared trainer's BF16 autocast. FP32 master parameters, optimizer
-state and component gradient banks are deliberate. Loss/reduction operations
+state and gradient reductions are deliberate. Loss/reduction operations
 may also use FP32 for stability; this is not an all-BF16 pipeline.
 `cooperative_reference_validation.py` optionally sets `mixed_precision="off"`
 in **generated test configs only** to isolate summation from BF16 kernel effects.

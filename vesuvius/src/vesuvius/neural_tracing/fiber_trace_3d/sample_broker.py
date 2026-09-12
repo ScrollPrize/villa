@@ -36,7 +36,7 @@ class CanonicalSampleBroker:
     def create(cls, *, config_path, loader_config, start_step, max_steps,
                effective_batch_size, workers, slot_count, initial_in_flight,
                sample_index_limit=None, defer_cuda_value_augmentation=None, profile=False,
-               training_overrides=None):
+               training_overrides=None, on_process_start=None):
         from pathlib import Path
         from .loader import FiberTrace3DLoader, config_from_mapping
         from .train import _load_raw_config, _make_test_loader_raw_config, _resolve_dense_test_selection
@@ -59,7 +59,8 @@ class CanonicalSampleBroker:
         _validate_capacity(slot_count, effective_batch_size, count, batch)
         queue = FiberTrace3DSampleQueue(sources=sources, workers=workers,
             slot_count=slot_count, initial_in_flight=initial_in_flight,
-            initial_active_workers=0, profile=profile)
+            initial_active_workers=0, profile=profile, own_worker_sessions=True,
+            on_process_start=on_process_start)
         return cls(queue, effective_batch_size=effective_batch_size, start_step=start_step,
             max_steps=max_steps, test_interval=interval, test_sample_count=count,
             test_batch_size=batch, test_start_sample_index=offset)

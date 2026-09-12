@@ -1,7 +1,7 @@
 {
-  "suites": ["arc-sampling"],
+  "suites": ["loss-regression", "single-backward", "cuda-arc", "cuda-cohort"],
   "native_build": false,
-  "gpu_devices": ["0"],
+  "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,
   "output_root": "/ephemeral/hendrik/fiber3d_train2/cooperative-tests",
   "reference": {"phase": "calibrate", "steps": 6, "microbatch_sizes": [1, 2], "cpu_workers": 8}

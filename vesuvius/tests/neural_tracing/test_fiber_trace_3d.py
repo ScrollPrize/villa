@@ -715,6 +715,10 @@ def test_bounded_gradients_match_actual_fiber_loss(branches) -> None:
     torch.manual_seed(19)
     model = torch.nn.Sequential(torch.nn.Conv3d(1, 7 * branches, 1), torch.nn.Sigmoid())
     oracle = copy.deepcopy(model)
+    if branches != 1:
+        with pytest.raises(ValueError, match="temporarily unsupported"):
+            compute_losses(oracle(batch.volume), batch, direction_weight=2, presence_weight=3)
+        return  # TODO: restore multi-branch gradient oracle with target-only normalization.
     compute_losses(oracle(batch.volume), batch, direction_weight=2, presence_weight=3,
                    branch_selection_mode="train_offset_grid_min_fraction")["total"].backward()
     accumulator = ComponentGradientAccumulator(model)
@@ -4503,6 +4507,7 @@ def test_3d_fiber_inference_storage_bounds_include_odd_edge_chunks() -> None:
     assert output_region == (0, 0, 0, 65, 33, 5)
 
 
+@pytest.mark.xfail(raises=ValueError, strict=True, reason="TODO: multi-branch losses disabled until target-only normalization")
 def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
     target_dir = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
@@ -4569,6 +4574,7 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
     assert output.grad[0, 13, 0, 0, 1] != 0.0
 
 
+@pytest.mark.xfail(raises=ValueError, strict=True, reason="TODO: multi-branch losses disabled until target-only normalization")
 def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
     target_dir = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
@@ -4653,11 +4659,9 @@ def test_3d_presence_loss_ignores_legacy_mask_field() -> None:
     target_dir = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
     )[0]
-    output = torch.zeros((1, 14, 1, 1, 2), dtype=torch.float32)
+    output = torch.zeros((1, 7, 1, 1, 2), dtype=torch.float32)
     output[0, 0:6, 0, 0, 0] = target_dir
-    output[0, 7:13, 0, 0, 0] = target_dir
     output[0, 6, 0, 0, :] = torch.tensor([0.8, 0.4], dtype=torch.float32)
-    output[0, 13, 0, 0, :] = torch.tensor([0.9, 0.3], dtype=torch.float32)
     output.requires_grad_()
     batch = FiberTrace3DBatch(
         volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
@@ -4687,10 +4691,8 @@ def test_3d_presence_loss_ignores_legacy_mask_field() -> None:
     losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
     losses["total"].backward()
 
-    assert output.grad[0, 6, 0, 0, 0] == 0.0
-    assert output.grad[0, 13, 0, 0, 0] != 0.0
+    assert output.grad[0, 6, 0, 0, 0] != 0.0
     assert output.grad[0, 6, 0, 0, 1] != 0.0
-    assert output.grad[0, 13, 0, 0, 1] != 0.0
 
 
 def test_3d_fiber_model_uses_batchnorm_by_default() -> None:
@@ -4929,11 +4931,9 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
 
 
 def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
-    output = torch.zeros((2, 14, 1, 1, 3), dtype=torch.float32)
+    output = torch.zeros((2, 7, 1, 1, 3), dtype=torch.float32)
     output[0, 6, 0, 0, :] = torch.tensor([0.2, 0.8, 0.4], dtype=torch.float32)
-    output[0, 13, 0, 0, :] = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32)
     output[1, 6, 0, 0, :] = torch.tensor([0.7, 0.0, 0.0], dtype=torch.float32)
-    output[1, 13, 0, 0, :] = torch.tensor([0.6, 0.0, 0.0], dtype=torch.float32)
     presence_mask = torch.tensor(
         [
             [True, True, True],
@@ -4970,13 +4970,11 @@ def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
     expected = torch.stack(
         [
             -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean(),
-            -torch.log(1.0 - torch.tensor([0.1, 0.1, 0.1])).mean(),
             -torch.log(1.0 - torch.tensor([0.7, 0.0, 0.0])).mean(),
-            -torch.log(1.0 - torch.tensor([0.6, 0.0, 0.0])).mean(),
         ]
     ).mean()
     global_mean = -torch.log(
-        1.0 - torch.tensor([0.2, 0.8, 0.4, 0.1, 0.1, 0.1, 0.7, 0.6])
+        1.0 - torch.tensor([0.2, 0.8, 0.4, 0.7])
     ).mean()
     assert torch.allclose(losses["presence"], expected)
     assert not torch.allclose(losses["presence"], global_mean)

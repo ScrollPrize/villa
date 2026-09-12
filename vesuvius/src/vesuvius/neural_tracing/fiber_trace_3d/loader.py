@@ -428,6 +428,9 @@ class FiberTrace3DBatch:
     profile_timings_ms: dict[str, float] | None = None
     embedding_geometry: tuple[EmbeddingGeometry | None, ...] | None = None
 
+    # Local effective-batch target counts, prepared before model forward.
+    normalization_counts: torch.Tensor | None = None
+
     def to(
         self,
         device: torch.device | str,
@@ -435,6 +438,7 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
             embedding_geometry=None if self.embedding_geometry is None else tuple(
                 None if item is None else replace(item, eligible=item.eligible.to(device, non_blocking=non_blocking))
                 for item in self.embedding_geometry),
@@ -509,6 +513,7 @@ class FiberTrace3DBatch:
 
         return replace(
             self,
+            normalization_counts=pin(self.normalization_counts),
             embedding_geometry=None if self.embedding_geometry is None else tuple(
                 None if item is None else replace(item, eligible=pin(item.eligible))
                 for item in self.embedding_geometry),
