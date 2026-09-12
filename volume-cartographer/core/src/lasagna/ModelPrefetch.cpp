@@ -6,13 +6,214 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <string_view>
 #include <unordered_set>
 
 namespace vc::lasagna {
 
+namespace {
+bool finitePoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+}
+
+ModelPrefetchProjection modelPrefetchProjection()
+{
+    static const auto mode = [] {
+        const char* setting = std::getenv("VC3D_LINE_MODEL_PROJECTION");
+        const std::string_view value = setting ? setting : "straight";
+        if (value == "guided") return ModelPrefetchProjection::Guided;
+        if (value == "curved") return ModelPrefetchProjection::Curved;
+        return ModelPrefetchProjection::Straight;
+    }();
+    return mode;
+}
+
+const char* modelPrefetchProjectionName()
+{
+    switch (modelPrefetchProjection()) {
+    case ModelPrefetchProjection::Guided: return "guided";
+    case ModelPrefetchProjection::Curved: return "curved";
+    default: return "straight";
+    }
+}
+
+ModelPrefetchPredictor::ModelPrefetchPredictor(
+    ModelPrefetchWindowOptions options, ModelPrefetchReference reference)
+    : options_(options)
+{
+    if (options_.projection == ModelPrefetchProjection::Straight ||
+        !(reference.scale > 0) || !std::isfinite(reference.scale))
+        return;
+    const size_t count = std::min<size_t>(2048, reference.points.size());
+    reference_.reserve(count);
+    arcs_.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t index = reference.reverse ? reference.points.size() - 1 - i : i;
+        const auto point = reference.points[index] * reference.scale;
+        // Keep only the valid oriented prefix: no shortcut across invalid data
+        // and no distant endpoint appended after the input-inspection limit.
+        if (!finitePoint(point)) break;
+        const double distance = reference_.empty() ? 0 : cv::norm(point - reference_.back());
+        if (!std::isfinite(distance)) break;
+        if (!reference_.empty() && distance <= 1e-12) continue;
+        const double arc = arcs_.empty() ? 0 : arcs_.back() + distance;
+        if (!std::isfinite(arc)) break;
+        reference_.push_back(point);
+        arcs_.push_back(arc);
+    }
+    if (!reference_.empty()) matchedOrigin_ = reference_.front();
+}
+
+void ModelPrefetchPredictor::observe(const cv::Vec3d& origin, const cv::Vec3d& direction)
+{
+    if (historySize_ != 0) {
+        const auto displacement = origin - history_[historySize_ - 1].origin;
+        const double distance = cv::norm(displacement);
+        if (distance < options_.refreshDistance / 8) return;
+        if (distance > options_.refreshDistance * 2 ||
+            displacement.dot(direction) < distance * 0.5 ||
+            direction.dot(history_[historySize_ - 1].direction) < 0.5)
+            historySize_ = 0; // reversal or discontinuous leading-beam jump
+    }
+    if (historySize_ == history_.size()) {
+        std::move(history_.begin() + 1, history_.end(), history_.begin());
+        --historySize_;
+    }
+    history_[historySize_++] = {origin, direction};
+}
+
+bool ModelPrefetchPredictor::followReference(
+    const cv::Vec3d& origin, const cv::Vec3d& direction, double ahead,
+    std::vector<cv::Vec3d>& points)
+{
+    if (reference_.size() < 2 || ahead <= 0) return false;
+    // Cursor starts at the known control end, never at a global nearest point.
+    // Monotone progress and a bounded arc interval avoid jumping across distant
+    // self-approaches. Equal-distance ties retain the earlier segment.
+    const double allowance = std::clamp(2 * cv::norm(origin - matchedOrigin_),
+        options_.refreshDistance, options_.refreshDistance * 4);
+    const double limit = progress_ + allowance;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    size_t best = cursor_;
+    double bestProgress = progress_;
+    cv::Vec3d anchor;
+    for (size_t i = cursor_, steps = 0; i + 1 < reference_.size() && steps < 128; ++i, ++steps) {
+        if (arcs_[i] > limit) break;
+        const double length = arcs_[i + 1] - arcs_[i];
+        const auto tangent = (reference_[i + 1] - reference_[i]) / length;
+        if (tangent.dot(direction) < 0.5) continue;
+        const double low = std::max(0.0, progress_ - arcs_[i]);
+        const double high = std::min(length, limit - arcs_[i]);
+        if (high < low) continue;
+        const double along = std::clamp((origin - reference_[i]).dot(tangent), low, high);
+        const auto projected = reference_[i] + tangent * along;
+        const double distance = cv::norm(projected - origin);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = i;
+            bestProgress = arcs_[i] + along;
+            anchor = projected;
+        }
+    }
+    if (!std::isfinite(bestDistance) || bestDistance > options_.corridor.radius) return false;
+    cursor_ = best;
+    progress_ = bestProgress;
+    matchedOrigin_ = origin;
+    const auto offset = origin - anchor;
+    points = {origin};
+    auto point = anchor;
+    for (size_t i = best, steps = 0; i + 1 < reference_.size() && steps < 128 && ahead > 0; ++i, ++steps) {
+        const auto delta = reference_[i + 1] - point;
+        const double length = cv::norm(delta);
+        if (length <= 1e-12) continue;
+        const double advance = std::min(length, ahead);
+        point += delta * (advance / length);
+        points.push_back(point + offset); // continuous at the actual trace origin
+        ahead -= advance;
+    }
+    return points.size() > 1;
+}
+
+bool ModelPrefetchPredictor::extrapolateCurve(
+    const cv::Vec3d& origin, const cv::Vec3d& direction, double ahead,
+    std::vector<cv::Vec3d>& points) const
+{
+    if (historySize_ < 4 || ahead <= 0) return false;
+    cv::Vec3d rotation{0, 0, 0};
+    double totalTurn = 0, distance = 0;
+    for (size_t i = 1; i < historySize_; ++i) {
+        const auto turn = history_[i - 1].direction.cross(history_[i].direction);
+        rotation += turn;
+        totalTurn += cv::norm(turn);
+        distance += cv::norm(history_[i].origin - history_[i - 1].origin);
+    }
+    const double coherentTurn = cv::norm(rotation);
+    if (coherentTurn < 0.01 || coherentTurn < 0.75 * totalTurn || distance <= 0)
+        return false; // noisy alternating turns do not justify a curved forecast
+    const auto axis = rotation / coherentTurn;
+    // Cap the undamped turn at 30 degrees; damping caps integrated turn at 15.
+    const double rate = std::min(coherentTurn / distance, 0.5235987755982988 / ahead);
+    points = {origin};
+    auto point = origin;
+    auto tangent = direction;
+    const double step = ahead / 8;
+    for (int i = 0; i < 8; ++i) {
+        const double angle = rate * step * (1 - (i + 0.5) / 8);
+        const auto next = tangent * std::cos(angle) + axis.cross(tangent) * std::sin(angle) +
+            axis * (axis.dot(tangent) * (1 - std::cos(angle)));
+        const auto middle = tangent + next;
+        point += middle * (step / cv::norm(middle));
+        points.push_back(point);
+        tangent = next;
+    }
+    return true;
+}
+
+std::optional<ModelPrefetchPrediction> ModelPrefetchPredictor::update(
+    const cv::Vec3d& origin, const cv::Vec3d& direction, double remainingDistance)
+{
+    if (!finitePoint(origin) || !finitePoint(direction) || !std::isfinite(remainingDistance) ||
+        !(options_.lookahead > 0) || !std::isfinite(options_.lookahead) ||
+        !(options_.corridor.radius >= 0) || !std::isfinite(options_.corridor.radius) ||
+        !(options_.refreshDistance > 0) || !std::isfinite(options_.refreshDistance))
+        return std::nullopt;
+    const double displacement = cv::norm(origin - plannedOrigin_);
+    const bool guided = options_.projection != ModelPrefetchProjection::Straight;
+    const double norm = cv::norm(direction);
+    if (guided && (!(norm > 0) || !std::isfinite(norm))) return std::nullopt;
+    const auto unit = guided ? direction / norm : direction;
+    if (options_.projection == ModelPrefetchProjection::Curved) observe(origin, unit);
+    // A matched reference plan already includes its bends. Keep distance-only
+    // refresh while following it; an unmatched forecast can refresh on turns.
+    // A stale reference is reconsidered at the next bounded distance refresh.
+    const bool turn = guided && planned_ && !plannedReference_ &&
+        displacement >= options_.refreshDistance / 4 &&
+        unit.dot(plannedDirection_) < 0.9659258262890683; // accumulated turn >15 degrees
+    if (planned_ && displacement < options_.refreshDistance && !turn) return std::nullopt;
+    const double ahead = std::clamp(remainingDistance, 0.0, options_.lookahead);
+    ModelPrefetchPrediction prediction;
+    prediction.turnRefresh = turn;
+    prediction.reference = guided && followReference(origin, unit, ahead, prediction.points);
+    prediction.referenceFallback = guided && ahead > 0 && reference_.size() >= 2 && !prediction.reference;
+    prediction.curved = !prediction.reference && options_.projection == ModelPrefetchProjection::Curved &&
+        extrapolateCurve(origin, unit, ahead, prediction.points);
+    if (!prediction.reference && !prediction.curved)
+        prediction.points = {origin, origin + direction * ahead};
+    planned_ = true;
+    plannedReference_ = prediction.reference;
+    plannedOrigin_ = origin;
+    plannedDirection_ = unit;
+    return prediction;
+}
+
 ModelPrefetchWindow::ModelPrefetchWindow(std::vector<ModelPrefetchSource> sources,
-                                       ModelPrefetchWindowOptions options)
-    : sources_(std::move(sources)), options_(options)
+                                       ModelPrefetchWindowOptions options,
+                                       ModelPrefetchReference reference)
+    : sources_(std::move(sources)), options_(options),
+      predictor_(options, modelPrefetchEnabled() && std::any_of(sources_.begin(), sources_.end(),
+          [](const auto& source) { return source.remote; }) ? reference : ModelPrefetchReference{})
 {
     std::erase_if(sources_, [](const auto& source) { return !source.remote; });
     if (!modelPrefetchEnabled() || !std::isfinite(options_.lookahead) ||
@@ -30,12 +231,15 @@ ModelPrefetchReport ModelPrefetchWindow::advance(
         return delta;
     const auto started = std::chrono::steady_clock::now();
     try {
-        if (!plan_ || cv::norm(origin - plannedOrigin_) >= options_.refreshDistance) {
-            const double ahead = std::clamp(remainingDistance, 0.0, options_.lookahead);
-            plan_ = std::make_unique<ModelPrefetchPlan>(sources_,
-                std::vector<cv::Vec3d>{origin, origin + direction * ahead}, options_.corridor);
-            plannedOrigin_ = origin;
+        if (auto prediction = predictor_.update(origin, direction, remainingDistance)) {
+            plan_ = std::make_unique<ModelPrefetchPlan>(sources_, prediction->points, options_.corridor);
+            delta.replans = 1;
+            delta.turnRefreshes = prediction->turnRefresh;
+            delta.referencePlans = prediction->reference;
+            delta.referenceFallbacks = prediction->referenceFallback;
+            delta.curvaturePlans = prediction->curved;
         }
+        if (!plan_) return delta;
         const auto before = plan_->report();
         (void)plan_->pump(cancelled);
         delta.submitted = plan_->report().submitted - before.submitted;
@@ -53,12 +257,6 @@ ModelPrefetchReport ModelPrefetchWindow::advance(
 namespace {
 
 using vc::render::ChunkKey;
-
-bool finitePoint(const cv::Vec3d& point)
-{
-    return std::isfinite(point[0]) && std::isfinite(point[1]) &&
-           std::isfinite(point[2]);
-}
 
 // Clip in source-voxel coordinates before computing step counts or converting
 // to integer chunk coordinates. Long off-volume tails must not consume the

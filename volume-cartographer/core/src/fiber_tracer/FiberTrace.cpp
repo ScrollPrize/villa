@@ -2172,7 +2172,8 @@ public:
                        const vc::lasagna::NormalSampler* normals,
                        FiberTraceProfile* profile,
                        const cv::Vec3d& target,
-                       std::optional<double> lengthLimit)
+                       std::optional<double> lengthLimit,
+                       vc::lasagna::ModelPrefetchReference reference)
         : target_(target), lengthLimit_(lengthLimit), profile_(profile)
     {
         if (!vc::lasagna::modelPrefetchEnabled())
@@ -2185,7 +2186,9 @@ public:
                 auto normalSources = sampler->prefetchSources();
                 sources.insert(sources.end(), normalSources.begin(), normalSources.end());
             }
-            window_.emplace(std::move(sources));
+            vc::lasagna::ModelPrefetchWindowOptions options;
+            options.projection = vc::lasagna::modelPrefetchProjection();
+            window_.emplace(std::move(sources), options, reference);
         } catch (...) {
             // Optional source discovery/allocation must not change fallback.
         }
@@ -2199,11 +2202,21 @@ public:
         const double remaining = lengthLimit_
             ? *lengthLimit_ - static_cast<double>(beam.tracedLength)
             : cv::norm(target_ - origin);
-        const auto delta = window_->advance(origin, toVec3d(beam.previousStepDirection), remaining);
+        // Smoothed, read-only beam history reduces forecast churn on sibling
+        // swaps. Straight mode retains the original instantaneous direction.
+        const auto direction = vc::lasagna::modelPrefetchProjection() ==
+                vc::lasagna::ModelPrefetchProjection::Straight
+            ? beam.previousStepDirection : beam.historyDirection;
+        const auto delta = window_->advance(origin, toVec3d(direction), remaining);
         if (profile_) {
             profile_->modelPrefetchSubmitted += delta.submitted;
             profile_->modelPrefetchRejected += delta.rejected;
             profile_->modelPrefetchMs += delta.planningMs;
+            profile_->modelPrefetchReplans += delta.replans;
+            profile_->modelPrefetchTurnRefreshes += delta.turnRefreshes;
+            profile_->modelPrefetchReferencePlans += delta.referencePlans;
+            profile_->modelPrefetchReferenceFallbacks += delta.referenceFallbacks;
+            profile_->modelPrefetchCurvaturePlans += delta.curvaturePlans;
         }
     }
 
@@ -2220,7 +2233,8 @@ private:
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
     std::string phase,
-    std::optional<double> traceLengthLimitVoxels = std::nullopt)
+    std::optional<double> traceLengthLimitVoxels = std::nullopt,
+    vc::lasagna::ModelPrefetchReference prefetchReference = {})
 {
     const TraceVec start = toTraceVec(request.startPoint);
     const TraceVec target = toTraceVec(request.targetPoint);
@@ -2267,7 +2281,7 @@ private:
     }
     const TraceVec startDirection = startPrediction.direction;
     TraceModelPrefetch modelPrefetch(predictions, normalSampler, profile,
-                                     request.targetPoint, traceLengthLimitVoxels);
+                                     request.targetPoint, traceLengthLimitVoxels, prefetchReference);
 
     const float distance = traceLengthLimitVoxels.has_value()
         ? static_cast<float>(*traceLengthLimitVoxels)
@@ -4742,7 +4756,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress)
+    const FiberTraceProgressCallback& progress,
+    vc::lasagna::ModelPrefetchReference prefetchReference)
 {
     if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
         throw std::invalid_argument(
@@ -4774,7 +4789,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         normalSampler,
         progress,
         "extrapolation",
-        distanceVoxels);
+        distanceVoxels,
+        prefetchReference);
 }
 
 double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,
@@ -4851,10 +4867,15 @@ FiberTraceSegmentResult traceFiberSegment(
     reverseOneWay.budgetSpanVoxels = span;
     reverseOneWay.config = config;
 
+    const size_t first = std::min(request.startIndex, request.targetIndex);
+    const size_t last = std::max(request.startIndex, request.targetIndex);
+    const auto reference = std::span<const cv::Vec3d>(request.referenceLine).subspan(first, last - first + 1);
     result.forward = traceOneWayCore(
-        predictions, forwardOneWay, normalSampler, progress, "forward");
+        predictions, forwardOneWay, normalSampler, progress, "forward", std::nullopt,
+        {reference, request.startIndex > request.targetIndex});
     result.reverse = traceOneWayCore(
-        predictions, reverseOneWay, normalSampler, progress, "reverse");
+        predictions, reverseOneWay, normalSampler, progress, "reverse", std::nullopt,
+        {reference, request.targetIndex > request.startIndex});
 
     const TraceMeetingFusion fusion =
         fuseTraceMeetings(result.forward, result.reverse, config);

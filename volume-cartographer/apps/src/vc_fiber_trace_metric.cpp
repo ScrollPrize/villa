@@ -663,6 +663,7 @@ int main(int argc, char** argv)
         }
         std::cout << "native_trace2cp_readers adaptive=" << !options.modelReaders.has_value()
                   << " configured_max=" << options.modelReaders.value_or(64) << '\n';
+        std::cout << "native_trace2cp_prefetch projection=" << vc::lasagna::modelPrefetchProjectionName() << '\n';
         const auto remoteBefore = vc::lasagna::remoteStoreStats();
 
         vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;
@@ -978,6 +979,11 @@ int main(int argc, char** argv)
                   << " model_prefetch_ms=" << profile.modelPrefetchMs
                   << " model_prefetch_submitted=" << profile.modelPrefetchSubmitted
                   << " model_prefetch_rejected=" << profile.modelPrefetchRejected
+                  << " model_prefetch_replans=" << profile.modelPrefetchReplans
+                  << " model_prefetch_turn_refreshes=" << profile.modelPrefetchTurnRefreshes
+                  << " model_prefetch_reference_plans=" << profile.modelPrefetchReferencePlans
+                  << " model_prefetch_reference_fallbacks=" << profile.modelPrefetchReferenceFallbacks
+                  << " model_prefetch_curvature_plans=" << profile.modelPrefetchCurvaturePlans
                   << '\n';
         // Separate from optimizer timing. A benchmark can wait for optional
         // reads to finish before snapshotting process-wide model-store counters.
