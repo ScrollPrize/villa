@@ -915,6 +915,27 @@ void publishSegmentDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
+// True if any component of a [[lo], [hi]] bbox is exactly the tifxyz -1
+// missing-point marker. A stored bbox like that was taken over the raw grid,
+// marker included (villa #1618), so it describes the grid, not the surface.
+bool bboxCarriesMissingMarker(const nlohmann::json& bbox)
+{
+    if (!bbox.is_array()) {
+        return false;
+    }
+    for (const auto& corner : bbox) {
+        if (!corner.is_array()) {
+            continue;
+        }
+        for (const auto& value : corner) {
+            if (value.is_number() && value.get<double>() == -1.0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 nlohmann::json placeholderMetadata(
     const OpenDataSample& sample,
     const OpenDataSegment& segment,
@@ -934,7 +955,19 @@ nlohmann::json placeholderMetadata(
             }
         }
     }
-    if (segment.properties.is_object()) {
+    // The catalogue derives every volume_coverage[*].bbox_transformed from the
+    // stored bbox. When that one carries the marker, so does each derived box,
+    // pushed through the downscale or transform (villa #1734): -4 on the
+    // segment's own volume, an arbitrary number on any other. QuadSurface::bbox()
+    // recomputes from the points only when low[0] == -1 exactly, so it would
+    // trust those. Leave the key out instead: with no stored bbox the extent
+    // is computed from the valid points once the surface is loaded, the same
+    // fallback #1731 gave the Python reader.
+    const bool storedBboxCarriesMarker =
+        bboxCarriesMissingMarker(meta.value("bbox", nlohmann::json()));
+    if (storedBboxCarriesMarker) {
+        meta.erase("bbox");
+    } else if (segment.properties.is_object()) {
         const auto coverage = segment.properties.find("volume_coverage");
         if (coverage != segment.properties.end() && coverage->is_object()) {
             const auto target = coverage->find(coordinateVolumeId);

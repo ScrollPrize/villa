@@ -736,6 +736,138 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
     std::filesystem::remove_all(cacheRoot);
 }
 
+namespace {
+
+// The fixture sample plus a second volume reachable by transform, so that
+// reconciling writes both a source placeholder (vol1) and a generated one
+// (vol2); each seeds its bbox from volume_coverage[<that volume>].
+OpenDataSample sampleWithGeneratedTarget()
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+    return sample;
+}
+
+nlohmann::json readMetaJson(const std::filesystem::path& segmentDir)
+{
+    std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    return nlohmann::json::parse(metaIn);
+}
+
+} // namespace
+
+TEST_CASE("OpenDataSegmentCache placeholders drop a bbox derived from the -1 marker")
+{
+    // villa #1618: 28 published PHercParis4 surfaces store a bbox taken over
+    // the raw grid, so its lower corner is the tifxyz missing-point marker on
+    // the axes whose true minimum is positive (x and z here; y is genuine).
+    // villa #1734: the catalogue pushes that corner through the segment's
+    // downscale (2 in this fixture) on its own volume, and through the volume
+    // transform elsewhere. Neither result is -1, so QuadSurface::bbox() would
+    // trust it instead of measuring the points.
+    auto sample = sampleWithGeneratedTarget();
+    auto& segment = sample.segments.front();
+    segment.raw["creation"]["metadata"]["bbox"] = nlohmann::json::array({
+        nlohmann::json::array({-1.0, -281.3, -1.0}),
+        nlohmann::json::array({5401.2, 6047.1, 18020.9})});
+    segment.properties["volume_coverage"]["vol1"]["bbox_transformed"] =
+        nlohmann::json::array({
+            nlohmann::json::array({-2.0, -562.6, -2.0}),
+            nlohmann::json::array({10802.4, 12094.2, 36041.8})});
+    segment.properties["volume_coverage"]["vol2"]["bbox_transformed"] =
+        nlohmann::json::array({
+            nlohmann::json::array({8.0, -542.6, 28.0}),
+            nlohmann::json::array({10812.4, 12114.2, 36071.8})});
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+        ("vc_open_data_marker_bbox_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+
+    const auto result = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    CHECK(result.attachedSegmentEntries == 2);
+    const auto sourceDir = openDataCanonicalSegmentCacheDirectory(
+        cacheRoot, sample, segment);
+    const auto generatedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, segment, "vol2");
+    REQUIRE(isOpenDataSegmentPlaceholder(sourceDir));
+    REQUIRE(isOpenDataSegmentPlaceholder(generatedDir));
+
+    // Was [[-2, -562.6, -2], ...] and [[8, -542.6, 28], ...]: the marker, scaled
+    // and shifted, which QuadSurface::bbox() would not recognise as unset.
+    CHECK_FALSE(readMetaJson(sourceDir).contains("bbox"));
+    CHECK_FALSE(readMetaJson(generatedDir).contains("bbox"));
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSegmentCache placeholders keep a bbox derived from an honest one")
+{
+    // Control: a stored bbox with no marker is trusted exactly as before, and
+    // each placeholder is seeded from its own volume's bbox_transformed.
+    auto sample = sampleWithGeneratedTarget();
+    auto& segment = sample.segments.front();
+    segment.raw["creation"]["metadata"]["bbox"] = nlohmann::json::array({
+        nlohmann::json::array({2824.2, 2809.4, 2980.8}),
+        nlohmann::json::array({5401.2, 6047.1, 18020.9})});
+    const auto ownVolumeBox = nlohmann::json::array({
+        nlohmann::json::array({5648.4, 5618.8, 5961.6}),
+        nlohmann::json::array({10802.4, 12094.2, 36041.8})});
+    const auto targetVolumeBox = nlohmann::json::array({
+        nlohmann::json::array({5658.4, 5638.8, 5991.6}),
+        nlohmann::json::array({10812.4, 12114.2, 36071.8})});
+    segment.properties["volume_coverage"]["vol1"]["bbox_transformed"] = ownVolumeBox;
+    segment.properties["volume_coverage"]["vol2"]["bbox_transformed"] = targetVolumeBox;
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+        ("vc_open_data_honest_bbox_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+
+    const auto result = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    CHECK(result.attachedSegmentEntries == 2);
+    const auto sourceDir = openDataCanonicalSegmentCacheDirectory(
+        cacheRoot, sample, segment);
+    const auto generatedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, segment, "vol2");
+    REQUIRE(isOpenDataSegmentPlaceholder(sourceDir));
+    REQUIRE(isOpenDataSegmentPlaceholder(generatedDir));
+
+    CHECK(readMetaJson(sourceDir).at("bbox") == ownVolumeBox);
+    CHECK(readMetaJson(generatedDir).at("bbox") == targetVolumeBox);
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("VolumePkg aggregate open-data folders deduplicate segment lineage")
 {
     const auto root = std::filesystem::temp_directory_path() /
