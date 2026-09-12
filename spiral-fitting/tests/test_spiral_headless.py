@@ -28,7 +28,7 @@ from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             SaveCheckpointCommand, collective_view)
 import spiral_helpers
 from spiral_helpers import compute_winding_range_and_input_extents
-from spiral_service import ServiceState
+from spiral_service import EphemeralLedger, ServiceState
 from tifxyz import save_combined_tifxyz
 
 
@@ -1302,6 +1302,52 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual([command.kind for command in session._commands],
                          ["configure", "incorporate"])
         self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
+
+    def test_failed_configuration_returns_queued_inputs_without_a_step(self):
+        session = self._idle_session(completed=10)
+        session._warnings = []
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session.requested_config = {"loss_weight_fiber_directions": 0.0}
+        session._run_config = dict(session.requested_config)
+        session._context = SimpleNamespace(apply_config=mock.Mock(
+            side_effect=ValueError("no resident fiber samples")))
+        service = ServiceState.__new__(ServiceState)
+        service.lock = threading.RLock()
+        service.ephemeral_records = EphemeralLedger(service.lock)
+        service.status_generation = 0
+        service._enqueue_live_incorporation_locked = mock.Mock()
+        entry = service.ephemeral_records.add({
+            "id": "new-patch", "kind": "patch", "path": "/uploads/patch",
+            "bytes": 0})
+        records = [record.payload()
+                   for record in service.ephemeral_records.claim_pending()]
+        self.assertEqual(entry.incorporation, "queued")
+        callback = mock.Mock(wraps=service._finish_incorporation)
+        session.run(20, pending_inputs=records, mark_incorporated=callback,
+                    run_config={"loss_weight_fiber_directions": 1.0})
+        configure = session._commands.pop(0)
+        incorporate = session._commands[0]
+        prevalidate = PrevalidateIncorporationCommand(records=records)
+        session._commands.append(prevalidate)
+        session._live_reservation_iteration = 10
+
+        session._run_configuration(configure)
+
+        callback.assert_called_once_with(records, no_future_step=True)
+        self.assertEqual(entry.incorporation, "pending")
+        self.assertEqual(service.ephemeral_records.claim_pending(), [entry])
+        for command in (incorporate, prevalidate):
+            self.assertTrue(command.done.is_set())
+            self.assertEqual(command.result,
+                             {"no_future_step": True, "outcomes": []})
+        self.assertIn("no resident fiber samples", configure.error)
+        self.assertEqual(session._commands, [])
+        self.assertEqual(session._state, SessionState.Idle)
+        self.assertEqual(session._pending, 0)
+        self.assertEqual(session._target, 10)
+        self.assertIsNone(session._live_reservation_iteration)
+        self.assertEqual(session._run_config["loss_weight_fiber_directions"], 0.0)
 
     def test_incorporation_warnings_reach_the_session_status(self):
         # The context takes the inputs but reports what it could not honour;

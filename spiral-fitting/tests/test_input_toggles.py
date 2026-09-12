@@ -67,6 +67,7 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
     assert context.winding_inference_path is None
     assert context.shell_path is None
     assert context.pcl_input_specs == []
+    assert context._configured_pcl_sources == paths.pcls
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234
 

@@ -1397,9 +1397,11 @@ class InteractiveFitSession:
                     SessionState.Idle, IDLE_PHASE,
                     reason="run configuration failed")
             for queued in abandoned:
-                queued.cancel(
-                    f"cancelled by failed configure command "
-                    f"{command.command_id}")
+                if isinstance(queued, IncorporateCommand):
+                    if queued.mark_incorporated is not None:
+                        queued.mark_incorporated(
+                            queued.records, no_future_step=True)
+                queued.complete(no_future_step=True, outcomes=[])
             command.fail(error)
             self._publish_status()
         else:

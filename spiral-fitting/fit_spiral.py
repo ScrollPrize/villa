@@ -1414,6 +1414,9 @@ class FitContext:
         })
         self.scroll = scroll
         self.paths = paths
+        # Role toggles edit the resident manifest, but must retain the
+        # explicitly configured sources for subsequent enables.
+        self._configured_pcl_sources = tuple(paths.pcls)
         self.interactive_driver = interactive_driver
         self.progress = progress
         self.resume_path = resume_path or None
@@ -4796,7 +4799,9 @@ class FitContext:
         document, existing files only, in that order without duplicates."""
         paths = getattr(self, 'paths', None)
         candidates = [
-            spec.path for spec in (getattr(paths, 'pcls', None) or ())
+            spec.path for spec in (
+                getattr(self, '_configured_pcl_sources', ())
+                + tuple(getattr(paths, 'pcls', None) or ()))
             if spec.role is role
         ]
         conventional = conventional_pcl_document_path(

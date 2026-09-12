@@ -13,7 +13,8 @@ import pytest
 import torch
 
 from config import Config
-from fit_session import PclInputSpec, PclRole, SpiralInputPaths
+from fit_session import (PclInputSpec, PclRole, SpiralInputPaths,
+                         pcl_role_toggle_key)
 from fit_spiral import FitContext, _UnattachedPclStripList
 
 
@@ -301,6 +302,30 @@ def test_enabling_a_role_without_a_document_changes_nothing(tmp_path):
     assert context.regular_pcl_catalog == {}
     assert context.paths.pcls == ()
     context._rebuild_pcl_sampling_strata.assert_not_called()
+
+
+@pytest.mark.parametrize('role', [PclRole.SAME_WINDING, PclRole.RELATIVE])
+def test_role_toggle_restores_all_explicit_documents(tmp_path, role):
+    key = pcl_role_toggle_key(role)
+    context = _role_context(tmp_path, **{key: False})
+    documents = [
+        _pcl_document(tmp_path / f'custom-{cid}.json', cid,
+                      [[0, 0, 10], [4, 0, 12], [8, 0, 14]])
+        for cid in (5, 6)]
+    context._configured_pcl_sources = tuple(
+        PclInputSpec(document, role) for document in documents)
+
+    for _ in range(2):
+        context.apply_config({key: True}, current_iteration=0)
+        assert context.paths.pcls == context._configured_pcl_sources
+        assert {pcl['source_file'] for pcl in
+                context.regular_pcl_catalog.values()} == set(documents)
+        assert len(context.unattached_pcl_strips) == 2
+
+        context.apply_config({key: False}, current_iteration=0)
+        assert context.paths.pcls == ()
+        assert context.regular_pcl_catalog == {}
+        assert list(context.unattached_pcl_strips) == []
 
 
 def test_disabling_a_role_drops_its_committed_and_uploaded_collections(tmp_path):
