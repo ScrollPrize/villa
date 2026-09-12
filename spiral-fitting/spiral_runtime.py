@@ -23,7 +23,8 @@ import traceback
 from typing import Any, ClassVar, Mapping
 import uuid
 
-from fit_session import (AUTOSAVE_CHECKPOINT_NAME, ScrollSpec, SessionState,
+from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
+                         ScrollSpec, SessionState,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
@@ -1661,6 +1662,8 @@ class InteractiveFitSession:
             run_step = max(0, self._completed - run_start)
         self._progress_reporter().update(run_step)
         self._publish_status()
+        autosave_wanted = (getattr(self, "publishes_outputs", True)
+                           and getattr(self, "_autosave_on_pause", True))
         if pause:
             if self._context is not None:
                 self._context.clear_interactive_influence()
@@ -1668,26 +1671,54 @@ class InteractiveFitSession:
             # and does nothing else. Exporting a preview is a request of its
             # own: it costs minutes, and a client that wants one after a
             # pause asks for one.
-            if (getattr(self, "publishes_outputs", True)
-                    and getattr(self, "_autosave_on_pause", True)):
+            if autosave_wanted:
                 self._transition(SessionState.Saving, "Autosaving checkpoint")
-                self._progress_reporter().begin(
-                    "saving_checkpoint", "Autosaving checkpoint",
-                    detail="checkpoint_autosave.ckpt")
-                autosave = str(
-                    Path(self._output_path) / AUTOSAVE_CHECKPOINT_NAME)
-                self._context.save_checkpoint(autosave, self._completed)
-                # Name the file beside itself. An always-loaded service picks
-                # its startup autosave from these sidecars alone: the output
-                # root it belongs to, the dataset it was fit against, and how
-                # far it got. Without one the checkpoint is inert.
-                write_autosave_metadata(
-                    autosave,
-                    session_namespace=self.paths.output_directory,
-                    dataset_root=self.paths.dataset_root,
-                    completed_iterations=self._completed)
+                self._write_autosave()
             self._progress_reporter().clear()
             self._transition(SessionState.Idle, IDLE_PHASE)
+        elif (autosave_wanted
+              and self._completed % AUTOSAVE_INTERVAL_ITERATIONS == 0):
+            # A long run refreshes the same autosave at a fixed cadence so a
+            # crash mid-run loses at most one interval. The session stays
+            # Running; only the phase says what the fitter thread is doing.
+            self._transition(SessionState.Running, "Autosaving checkpoint")
+            try:
+                self._write_autosave()
+            except Exception as exc:
+                # The previous autosave is intact (the write is a temp file
+                # plus an atomic replace), so a failed refresh is a warning
+                # on the status rather than the end of the run.
+                with self._condition:
+                    self._warnings.append(
+                        f"Autosave at iteration {self._completed} failed: "
+                        f"{type(exc).__name__}: {exc}")
+            self._progress_reporter().clear()
+            self._begin_optimization_progress()
+            self._transition(SessionState.Running, "Optimizing")
+
+    def _write_autosave(self):
+        """Refresh ``checkpoint_autosave.ckpt`` and its sidecar in place.
+
+        The previous autosave is only ever replaced by ``os.replace`` after
+        the new archive is fully written and fsynced (see
+        ``FitContext.save_checkpoint``), so an interrupted write leaves the
+        last good checkpoint untouched. The sidecar follows the same rule.
+        """
+        self._progress_reporter().begin(
+            "saving_checkpoint", "Autosaving checkpoint",
+            detail=AUTOSAVE_CHECKPOINT_NAME)
+        autosave = str(Path(self._output_path) / AUTOSAVE_CHECKPOINT_NAME)
+        self._context.save_checkpoint(autosave, self._completed)
+        # Name the file beside itself. An always-loaded service picks its
+        # startup autosave from these sidecars alone: the output root it
+        # belongs to, the dataset it was fit against, and how far it got.
+        # Without one the checkpoint is inert.
+        write_autosave_metadata(
+            autosave,
+            session_namespace=self.paths.output_directory,
+            dataset_root=self.paths.dataset_root,
+            completed_iterations=self._completed)
+        return autosave
 
     def _publish_preview(self, diagnostics=False):
         with self._condition:

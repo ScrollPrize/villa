@@ -883,6 +883,9 @@ def validate_checkpoint_container(path: str | Path) -> None:
 # service advertises autosaves as checkpoints but does not select one itself.
 
 AUTOSAVE_CHECKPOINT_NAME = "checkpoint_autosave.ckpt"
+# Both the headless fitter and the interactive runtime refresh their
+# resumable checkpoint at this cadence, in addition to any final write.
+AUTOSAVE_INTERVAL_ITERATIONS = 1000
 AUTOSAVE_METADATA_NAME = "checkpoint_autosave.json"
 AUTOSAVE_METADATA_SCHEMA = "spiral-autosave/1"
 _AUTOSAVE_DIGEST_CHUNK = 1 << 20
