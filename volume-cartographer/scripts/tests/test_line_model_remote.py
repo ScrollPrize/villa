@@ -6,35 +6,11 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_line_model_remote import (
-    binary_artifacts, inventory, merge_payloads, payload_difference, result_signature,
-    summarize, validate_manifest, verified_run)
+    binary_artifacts, inventory, merge_payloads, result_signature, validate_manifest, verified_run)
 from benchmark_line_model_prefetch import parse_metric_output, write_json
 
 
 class RemoteBenchmarkTests(unittest.TestCase):
-    def test_summary_includes_optional_projection_and_observed_traffic_metrics(self):
-        metrics = dict.fromkeys(('trace_wall_s', 'remote_bytes', 'span_trace_ms',
-                                'reinit_ms', 'tail_trace_ms', 'report_prefetch_ms'), '1')
-        rows = [dict(mode=mode, process_wall_s=1, metrics=metrics,
-                     profile=dict(model_prefetch_replans=2),
-                     observed_payload_difference=dict(extra_observed_bytes=30))
-                for mode in ('cold', 'warm')]
-        summary = summarize(rows)
-        self.assertEqual(summary['cold']['model_prefetch_replans']['mean'], 2)
-        self.assertEqual(summary['warm']['extra_observed_bytes']['median'], 30)
-        self.assertNotIn('model_prefetch_reference_plans', summary['cold'])
-
-    def test_observed_traffic_comparison_excludes_metadata(self):
-        reference = {'normal/array/0/0/0': {'bytes': 100},
-                     'normal/array/0/0/1': {'bytes': 20}}
-        current = {'normal/array/0/0/0': {'bytes': 100},
-                   'normal/array/0/0/2': {'bytes': 30},
-                   'normal/model.json': {'bytes': 40},
-                   'normal/.lasagna-zarr-metadata/array/.zarray': {'bytes': 50}}
-        self.assertEqual(payload_difference(current, reference), dict(
-            extra_observed_objects=1, extra_observed_bytes=30,
-            absent_reference_objects=1, absent_reference_bytes=20))
-
     def test_library_only_changes_are_detected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

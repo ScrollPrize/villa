@@ -10874,8 +10874,6 @@ void LineAnnotationController::startFiberModeOptimization(
                         "trace_corner_pin_inclusive_ms={:.0f} trace_corner_gather_score_ms={:.0f} "
                         "trace_model_prefetch_ms={:.1f} trace_model_prefetch_submitted={} "
                         "trace_model_prefetch_rejected={} "
-                        "projection={} prefetch_replans={} prefetch_turn_refreshes={} "
-                        "prefetch_reference_plans={} prefetch_reference_fallbacks={} prefetch_curvature_plans={} "
                         "trace_score_ms={:.0f} report_ceres_ms={:.0f} "
                         "report_prefetch_ms={:.0f} report_chunk_dependencies={} "
                         "span_remote_kib={} reinit_remote_kib={} tail_remote_kib={} "
@@ -10897,12 +10895,6 @@ void LineAnnotationController::startFiberModeOptimization(
                         traceProfile.modelPrefetchMs,
                         traceProfile.modelPrefetchSubmitted,
                         traceProfile.modelPrefetchRejected,
-                        vc::lasagna::modelPrefetchProjectionName(),
-                        traceProfile.modelPrefetchReplans,
-                        traceProfile.modelPrefetchTurnRefreshes,
-                        traceProfile.modelPrefetchReferencePlans,
-                        traceProfile.modelPrefetchReferenceFallbacks,
-                        traceProfile.modelPrefetchCurvaturePlans,
                         traceProfile.candidateScoreSeconds * 1000.0,
                         task.result.report.ceresSolveMs,
                         task.result.report.normalChunkPrefetchMs +

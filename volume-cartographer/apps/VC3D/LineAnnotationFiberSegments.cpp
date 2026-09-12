@@ -485,12 +485,6 @@ int replaceOpenTailsWithNative(
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
         const auto traceTail = [&](int endpoint, int inner) {
-            // Already constructed geometry is optional guidance only. The
-            // bounded conversion/copy is inside the tracer's optional catch.
-            const bool reverse = endpoint < inner;
-            const auto reference = reverse
-                ? std::span<const cv::Vec3d>(finalPoints).first(static_cast<size_t>(endpoint) + 1)
-                : std::span<const cv::Vec3d>(finalPoints).subspan(static_cast<size_t>(endpoint));
             return vc::fiber_tracer::traceFiberExtrapolation(
                 *request.predictions,
                 coordinates.baseToTrace(finalPoints[static_cast<size_t>(endpoint)]),
@@ -498,8 +492,7 @@ int replaceOpenTailsWithNative(
                     coordinates.baseToTrace(finalPoints[static_cast<size_t>(inner)]),
                 extrapolationTrace,
                 request.traceConfig,
-                request.traceNormalSampler, {},
-                {reference, reverse, 1.0 / coordinates.traceToBaseScale});
+                request.traceNormalSampler);
         };
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
         std::string leftException;

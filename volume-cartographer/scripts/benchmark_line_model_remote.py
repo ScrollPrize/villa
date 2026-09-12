@@ -60,20 +60,6 @@ def merge_payloads(known, current):
         known[key] = value
 
 
-def payload_difference(current, reference):
-    """Observed-set comparison, NOT demand-hit or arrival-before-use telemetry.
-
-    The disabled reference still does legacy normal prefetch. Count extra keys
-    relative to that observed set without labelling them certainly unused.
-    """
-    def data_key(key):
-        return '.lasagna-zarr-metadata/' not in key and not key.endswith('.json')
-    extra = [v for k, v in current.items() if data_key(k) and k not in reference]
-    missing = [v for k, v in reference.items() if data_key(k) and k not in current]
-    return dict(extra_observed_objects=len(extra), extra_observed_bytes=sum(v['bytes'] for v in extra),
-                absent_reference_objects=len(missing), absent_reference_bytes=sum(v['bytes'] for v in missing))
-
-
 def result_signature(trace, profile):
     return digest(dict(trace=canonical_trace(trace),
                        message=normalized_message(trace['optimization']['message']),
@@ -135,17 +121,6 @@ def summarize(rows):
             values = [float(r[field] if field in r else r['metrics'][field]) for r in selected]
             summary[mode][field] = dict(mean=statistics.mean(values), min=min(values),
                                        median=statistics.median(values), max=max(values))
-        for source, fields in (
-            ('profile', ('model_prefetch_ms', 'model_prefetch_replans',
-                         'model_prefetch_turn_refreshes', 'model_prefetch_reference_plans',
-                         'model_prefetch_reference_fallbacks', 'model_prefetch_curvature_plans')),
-            ('observed_payload_difference', ('extra_observed_objects', 'extra_observed_bytes',
-                                            'absent_reference_objects', 'absent_reference_bytes'))):
-            for field in fields:
-                if all(field in row.get(source, {}) for row in selected):
-                    values = [float(row[source][field]) for row in selected]
-                    summary[mode][field] = dict(mean=statistics.mean(values), min=min(values),
-                                               median=statistics.median(values), max=max(values))
     return summary
 
 
@@ -159,12 +134,8 @@ def main():
     parser.add_argument('--warmup-ms', type=int, default=0, help='Saved-corridor warmup before timed solve, 0..10000.')
     parser.add_argument('--dirty-span', type=int, help='Zero-based saved CP span; omitted means full retrace.')
     parser.add_argument('--prefetch', type=int, choices=(0, 1), required=True)
-    parser.add_argument('--projection', choices=('straight', 'guided', 'curved'),
-                        help='Confirm explicit projection mode with an updated binary.')
     parser.add_argument('--timeout-s', type=positive_finite_seconds, default=300)
     parser.add_argument('--compare-run', action='append', type=Path, default=[])
-    parser.add_argument('--payload-reference-run', type=Path,
-                        help='Compatible disabled run: compare observed payload sets, not true demand hit rates.')
     args = parser.parse_args()
     if min(args.trials, args.threads, args.model_readers) < 1:
         parser.error('trials, threads and readers must be positive')
@@ -194,31 +165,14 @@ def main():
     provenance = dict(input_hashes=inventory(inputs), dirty_span=args.dirty_span,
                       threads=args.threads, model_readers=args.model_readers, cache_gib=0.5,
                       legacy_read_workers=os.environ.get('VC_LASAGNA_READ_WORKERS', 'default'))
-    run_configuration = dict(
+    write_json(output / 'configuration.json', dict(
         **provenance, source=str(source), binary=str(binary),
         binary_sha256=file_sha256(binary), prefetch=args.prefetch, trials=args.trials,
         binary_artifacts=artifacts,
-        projection=args.projection or 'straight',
         warmup_ms=args.warmup_ms,
         environment=dict(OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS='1'),
-        warm_definition='Fresh process, disk cache from paired cold run; decoded caches start empty.')
+        warm_definition='Fresh process, disk cache from paired cold run; decoded caches start empty.'))
     signatures, payloads = set(), {}
-    reference_payloads = None
-    if args.payload_reference_run:
-        configuration, prior = verified_run(args.payload_reference_run)
-        if configuration['prefetch'] != 0 or any(configuration[key] != value for key, value in provenance.items()):
-            raise ValueError('payload reference must be a compatible prefetch-disabled run')
-        reference_payloads = {}
-        for row in prior:
-            signatures.add(row['result_signature'])
-            merge_payloads(reference_payloads, json.loads((args.payload_reference_run / row['inventory']).read_text()))
-        merge_payloads(payloads, reference_payloads)
-        reference_inventory = output / 'payload-reference.cache.json'
-        write_json(reference_inventory, reference_payloads)
-        run_configuration['payload_reference'] = dict(
-            run=str(args.payload_reference_run.resolve()), inventory=reference_inventory.name,
-            inventory_sha256=file_sha256(reference_inventory))
-    write_json(output / 'configuration.json', run_configuration)
     for other in args.compare_run:
         configuration, prior = verified_run(other)
         if any(configuration[key] != value for key, value in provenance.items()):
@@ -251,7 +205,6 @@ def main():
             completed = subprocess.run(command, capture_output=True, text=True,
                 timeout=args.timeout_s, env={**os.environ, 'AGENTS_AGENT_MODE': '1',
                     'VC3D_LINE_MODEL_PREFETCH': str(args.prefetch),
-                    'VC3D_LINE_MODEL_PROJECTION': args.projection or 'straight',
                     'OMP_NUM_THREADS': str(args.threads), 'OPENBLAS_NUM_THREADS': '1'})
             elapsed = time.perf_counter() - started
             (output / (stem + '.stdout')).write_text(completed.stdout)
@@ -268,8 +221,6 @@ def main():
             expected_span = str(args.dirty_span if args.dirty_span is not None else -1)
             if metrics.get('dirty_span') != expected_span:
                 raise ValueError('dirty span not confirmed by binary')
-            if args.projection is not None and metrics.get('projection') != args.projection:
-                raise ValueError('projection mode not confirmed by binary')
             if metrics.get('pending_requests') != '0' or metrics.get('remote_failures') != '0':
                 raise ValueError('incomplete remote accounting or failed model reads')
             parsed = json.loads(trace.read_text())
@@ -278,8 +229,6 @@ def main():
             row['inventory'] = stem + '.cache.json'
             cached = inventory(cache)
             write_json(output / row['inventory'], cached)
-            if reference_payloads is not None:
-                row['observed_payload_difference'] = payload_difference(cached, reference_payloads)
             merge_payloads(payloads, cached)
             signatures.add(row['result_signature'])
             write_json(output / 'results.json', results)

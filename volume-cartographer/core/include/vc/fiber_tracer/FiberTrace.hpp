@@ -83,11 +83,6 @@ struct FiberTraceProfile {
     double modelPrefetchMs = 0.0;
     size_t modelPrefetchSubmitted = 0;
     size_t modelPrefetchRejected = 0;
-    size_t modelPrefetchReplans = 0;
-    size_t modelPrefetchTurnRefreshes = 0;
-    size_t modelPrefetchReferencePlans = 0;
-    size_t modelPrefetchReferenceFallbacks = 0;
-    size_t modelPrefetchCurvaturePlans = 0;
 };
 
 struct FiberTraceConfig {
@@ -546,8 +541,7 @@ struct CandidateScoreDebug {
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
-    const FiberTraceProgressCallback& progress = {},
-    vc::lasagna::ModelPrefetchReference prefetchReference = {});
+    const FiberTraceProgressCallback& progress = {});
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold
