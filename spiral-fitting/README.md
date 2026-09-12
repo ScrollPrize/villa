@@ -160,6 +160,19 @@ layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
 
+## Flow stages
+
+`model_num_flow_stages` sets how many stationary velocity fields the flow
+diffeomorphism composes. The stages are the slabs of the flow lattices'
+leading axis (`flow_field.flows.{0,1}` are `[stages, 3, ...]`), integrated in
+order by one fused kernel launch per direction; the inverse runs the slabs
+backwards in reverse order. One stage is the original single-field model.
+Checkpoints written with the earlier per-stage module layout
+(`extra_flow_fields.*`) are migrated on load, Adam moments included
+(`checkpoint_migrations.merge_flow_stage_lattices`). The retired
+`model_num_flow_timesteps` key is dropped from old configurations on load;
+checkpoints with a time axis longer than 1 are rejected.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same

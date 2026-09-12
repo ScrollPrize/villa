@@ -48,8 +48,9 @@ from ddp_helpers import (
     process_context,
 )
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
-                    Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
+                    RETIRED_CONFIG_KEYS, Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
+                                   merge_flow_stage_lattices,
                                    migrate_legacy_gap_parameterization)
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
                          RUN_MUTABLE_PCL_ROLES,
@@ -3521,17 +3522,11 @@ class FitContext:
         # Optimizer and checkpoint helpers
         # ==========================================================================
 
-        # Keep every stage's low- and high-resolution lattices in distinct groups
-        # so the HR learning-rate scale is an optimizer setting, not a multiplier
-        # in the model's forward path.
-        self.low_res_flow_params = [
-            flow_field.flows[0]
-            for flow_field in self.spiral_and_transform.flow_fields
-        ]
-        self.high_res_flow_params = [
-            flow_field.flows[1]
-            for flow_field in self.spiral_and_transform.flow_fields
-        ]
+        # Keep the low- and high-resolution lattices (every flow stage is a
+        # slab of each) in distinct groups so the HR learning-rate scale is an
+        # optimizer setting, not a multiplier in the model's forward path.
+        self.low_res_flow_params = [self.spiral_and_transform.flow_field.flows[0]]
+        self.high_res_flow_params = [self.spiral_and_transform.flow_field.flows[1]]
         flow_field_params = self.low_res_flow_params + self.high_res_flow_params
         self.gap_expander_params = list(self.spiral_and_transform.gap_expander_params.parameters())
         linear_params = [self.spiral_and_transform.linear_logits]
@@ -3881,7 +3876,7 @@ class FitContext:
             # without mutating the caller's checkpoint. load_checkpoint()
             # performs the same migration only after this verdict succeeds.
             checkpoint = expand_gap_checkpoint_capacity(
-                migrate_legacy_gap_parameterization(checkpoint),
+                migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
                 self.config['model_gap_expander_capacity_windings'])
         except ValueError as exc:
             reasons.append(str(exc))
@@ -3983,9 +3978,10 @@ class FitContext:
             # Checkpoints store the durable subset of the schema, so the key
             # set compares against that subset. z_begin/z_end joined the schema
             # after many checkpoints were written and are owned by the session
-            # request either way, so exactly those two may be absent.
+            # request either way, so exactly those two may be absent; a
+            # retired key is dropped, not refused (config.RETIRED_CONFIG_KEYS).
             durable_schema = set(durable_config(dict(self.config)))
-            unknown = set(checkpoint_cfg) - durable_schema
+            unknown = set(checkpoint_cfg) - durable_schema - RETIRED_CONFIG_KEYS
             missing = durable_schema - set(checkpoint_cfg) - (
                 {'z_begin', 'z_end'} | set(BACKFILLABLE_CONFIG_DEFAULTS))
             if unknown or missing:
@@ -4147,7 +4143,7 @@ class FitContext:
 
     def load_checkpoint(self, checkpoint):
         checkpoint = expand_gap_checkpoint_capacity(
-            migrate_legacy_gap_parameterization(checkpoint),
+            migrate_legacy_gap_parameterization(merge_flow_stage_lattices(checkpoint)),
             self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
@@ -5780,11 +5776,8 @@ class FitContext:
 
         self.step_timer.stop('fwd')
         self.step_timer.start('bwd')
-        # Flush every stage's sparse-accumulated field gradient into its parameters.
-        for flow_field in self.spiral_and_transform.flow_fields:
-            apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
-            if apply_accumulated_field_grad is not None:
-                apply_accumulated_field_grad()
+        # Flush the sparse-accumulated field gradient into the flow parameters.
+        self.spiral_and_transform.flow_field.apply_accumulated_field_grad()
         # Propagate the leaf gradients the family backwards accumulated on the
         # shared transform paths through the real parameters, exactly once.
         shared_transform_pending = [

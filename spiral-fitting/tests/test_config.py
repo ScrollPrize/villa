@@ -171,6 +171,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
 
 def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage([]) == "model"
+    assert rebuild_stage(["model_num_flow_stages"]) == "model"
     assert rebuild_stage(["model_num_flow_integration_steps"]) == "model"
     assert rebuild_stage(["model_num_flow_integration_steps",
                           "model_linear_z_resolution"]) == "model"

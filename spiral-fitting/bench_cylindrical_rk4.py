@@ -90,7 +90,7 @@ def _worker(args):
         events[0].record()
         flow.zero_grad(set_to_none=True)
         points.grad = None
-        integrate = flow.get_time_invariant_integrator()
+        integrate = flow.get_integrator()
         events[1].record()
         output = integrate(points, h, args.steps)
         events[2].record()
