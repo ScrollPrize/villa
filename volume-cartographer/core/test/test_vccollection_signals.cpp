@@ -27,11 +27,11 @@ TEST_CASE("mutations emit the expected signals")
     c.updatePoint(p);
     CHECK(changed.count() == 1);
 
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
     c.renameCollection(cid, "b");
     CHECK(colChanged.count() >= 1);
 
-    c.removePoint(p.id);
+    c.removePoint({p.collectionId, p.id});
     CHECK(removed.count() == 1);
 
     c.clearAll();

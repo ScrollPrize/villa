@@ -7,8 +7,30 @@
 #include <cmath>
 #include <optional>
 #include <filesystem>
+#include <functional>
 
 #include "utils/Json.hpp"
+
+namespace vc {
+struct PointRef
+{
+    uint64_t collectionId{0};
+    uint64_t pointId{0};
+
+    friend bool operator==(const PointRef&, const PointRef&) = default;
+};
+} // namespace vc
+
+template<>
+struct std::hash<vc::PointRef>
+{
+    std::size_t operator()(const vc::PointRef& ref) const noexcept
+    {
+        const std::size_t first = std::hash<uint64_t>{}(ref.collectionId);
+        const std::size_t second = std::hash<uint64_t>{}(ref.pointId);
+        return first ^ (second + 0x9e3779b9U + (first << 6U) + (first >> 2U));
+    }
+};
 
 
 struct ColPoint
@@ -60,13 +82,13 @@ public:
     ColPoint addPoint(const std::string& collectionName, const cv::Vec3f& point);
     void addPoints(const std::string& collectionName, const std::vector<cv::Vec3f>& points);
     void updatePoint(const ColPoint& point);
-    void removePoint(uint64_t pointId);
+    void removePoint(vc::PointRef point);
 
     void clearCollection(uint64_t collectionId);
     void clearAll();
     void renameCollection(uint64_t collectionId, const std::string& newName);
 
-    uint64_t getCollectionId(const std::string& name) const;
+    std::optional<uint64_t> getCollectionId(const std::string& name) const;
     const std::unordered_map<uint64_t, Collection>& getAllCollections() const;
     void setCollectionMetadata(uint64_t collectionId, const CollectionMetadata& metadata);
     void setCollectionColor(uint64_t collectionId, const cv::Vec3f& color);
@@ -76,7 +98,8 @@ public:
     void removeCollectionTag(uint64_t collectionId, const std::string& key);
     std::optional<std::string> getCollectionTag(uint64_t collectionId, const std::string& key) const;
     void setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds);
-    std::optional<ColPoint> getPoint(uint64_t pointId) const;
+    std::optional<ColPoint> getPoint(vc::PointRef point) const;
+    std::vector<vc::PointRef> findPointRefs(uint64_t pointId) const;
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;
     void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
@@ -110,8 +133,8 @@ protected:
     virtual void onPointAdded(const ColPoint&) {}
     virtual void onPointsAdded(const std::vector<ColPoint>&) {}
     virtual void onPointChanged(const ColPoint&) {}
-    virtual void onPointRemoved(uint64_t) {}
-    virtual void onPointsRemoved(const std::vector<uint64_t>&) {}
+    virtual void onPointRemoved(vc::PointRef) {}
+    virtual void onPointsRemoved(const std::vector<vc::PointRef>&) {}
 
 private:
     uint64_t getNextPointId();
@@ -121,7 +144,6 @@ private:
     uint64_t findOrCreateCollectionByName(const std::string& name);
 
     std::unordered_map<uint64_t, Collection> _collections;
-    std::unordered_map<uint64_t, ColPoint> _points;
     utils::Json _fileMetadata = utils::Json::object();
     uint64_t _next_point_id = 1;
     uint64_t _next_collection_id = 1;

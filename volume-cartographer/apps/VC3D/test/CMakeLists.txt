@@ -1,5 +1,25 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
 
+add_executable(test_line_annotation_coordinate_scale
+    test_line_annotation_coordinate_scale.cpp)
+
+set_target_properties(test_line_annotation_coordinate_scale PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_line_annotation_coordinate_scale PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_line_annotation_coordinate_scale PRIVATE
+    vc_lasagna
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME line_annotation_coordinate_scale
+    COMMAND test_line_annotation_coordinate_scale)
+vc_register_test_target(test_line_annotation_coordinate_scale)
+vc_register_ctest(line_annotation_coordinate_scale
+    test_line_annotation_coordinate_scale)
+
 add_executable(test_vc_settings
     test_vc_settings.cpp)
 
@@ -58,6 +78,87 @@ target_link_libraries(test_spiral_reload_comparison PRIVATE
 add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
 vc_register_test_target(test_spiral_reload_comparison)
 vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
+
+add_executable(test_fiber_source_dedupe
+    test_fiber_source_dedupe.cpp)
+
+set_target_properties(test_fiber_source_dedupe PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_source_dedupe PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_source_dedupe PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_source_dedupe COMMAND test_fiber_source_dedupe)
+vc_register_test_target(test_fiber_source_dedupe)
+vc_register_ctest(fiber_source_dedupe test_fiber_source_dedupe)
+
+add_executable(test_spiral_artifact_pins
+    test_spiral_artifact_pins.cpp)
+
+set_target_properties(test_spiral_artifact_pins PROPERTIES
+    AUTOMOC ON)
+
+target_include_directories(test_spiral_artifact_pins PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_artifact_pins PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME spiral_artifact_pins COMMAND test_spiral_artifact_pins)
+vc_register_test_target(test_spiral_artifact_pins)
+vc_register_ctest(spiral_artifact_pins test_spiral_artifact_pins)
+
+add_executable(test_spiral_point_placement_mode
+    test_spiral_point_placement_mode.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralBrushCursorWidget.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralBrushCursorWidget.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralPointPlacementMode.hpp)
+
+set_target_properties(test_spiral_point_placement_mode PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_spiral_point_placement_mode PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_point_placement_mode PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME spiral_point_placement_mode COMMAND test_spiral_point_placement_mode)
+vc_register_test_target(test_spiral_point_placement_mode)
+vc_register_ctest(spiral_point_placement_mode test_spiral_point_placement_mode)
+set_tests_properties(spiral_point_placement_mode PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_spiral_point_collection_edit
+    test_spiral_point_collection_edit.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralPointCollectionEdit.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralPointCollectionEdit.hpp)
+
+set_target_properties(test_spiral_point_collection_edit PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_spiral_point_collection_edit PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_point_collection_edit PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME spiral_point_collection_edit COMMAND test_spiral_point_collection_edit)
+vc_register_test_target(test_spiral_point_collection_edit)
+vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit)
+set_tests_properties(spiral_point_collection_edit PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_download_queue_stats
     test_download_queue_stats.cpp

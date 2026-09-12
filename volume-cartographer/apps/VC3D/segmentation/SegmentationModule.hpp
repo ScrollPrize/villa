@@ -176,8 +176,7 @@ public:
     void setRotationHandleHitTester(std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> tester);
 
     struct NearestPointResult {
-        uint64_t pointId{0};
-        uint64_t collectionId{0};
+        std::optional<vc::PointRef> point;
         float distance{std::numeric_limits<float>::max()};
     };
 
@@ -218,6 +217,7 @@ public:
 
 public slots:
     void setSelectedAnnotationCollection(uint64_t collectionId);
+    void clearSelectedAnnotationCollection();
 
 signals:
     void editingEnabledChanged(bool enabled);
@@ -235,9 +235,10 @@ signals:
     // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
     void approvalMaskSaved(const std::string& segmentId);
-    void annotationPointSelected(uint64_t pointId);
+    void annotationPointSelected(vc::PointRef point);
+    void annotationSelectionCleared();
     void annotationCollectionSelected(uint64_t collectionId);
-    void annotationPointFocused(uint64_t pointId);
+    void annotationPointFocused(vc::PointRef point);
 
 private:
     friend class SegmentationLineTool;
@@ -328,8 +329,11 @@ private:
     void refreshOverlay();
     void updateCorrectionsWidget();
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
+    void clearActiveCorrectionCollection();
     uint64_t createCorrectionCollection(bool announce);
-    void handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId = 0);
+    void handleCorrectionPointAdded(
+        const cv::Vec3f& worldPos,
+        std::optional<uint64_t> collectionId = std::nullopt);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
     void beginCorrectionDrag(int row, int col, VolumeViewerBase* viewer, const cv::Vec3f& worldPos);
     void updateCorrectionDrag(const cv::Vec3f& worldPos);
@@ -461,7 +465,7 @@ private:
     int _pendingGridOffsetRowDelta{0};
     CorrectionDragState _correctionDrag;
     PointMoveDragState _pointMoveDrag;
-    uint64_t _selectedAnnotationCollectionId{0};
+    std::optional<uint64_t> _selectedAnnotationCollectionId;
     QSet<VolumeViewerBase*> _attachedViewers;
 
     std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> _rotationHandleHitTester;

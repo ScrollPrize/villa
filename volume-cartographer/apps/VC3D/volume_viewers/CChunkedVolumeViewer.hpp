@@ -167,9 +167,9 @@ public:
     void setSegmentationCursorMirroring(bool enabled) override;
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
-    uint64_t highlightedPointId() const override { return _highlightedPointId; }
-    uint64_t selectedPointId() const override { return _selectedPointId; }
-    uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
+    std::optional<vc::PointRef> highlightedPoint() const override { return _highlightedPoint; }
+    std::optional<vc::PointRef> selectedPoint() const override { return _selectedPoint; }
+    std::optional<uint64_t> selectedCollectionId() const override { return _selectedCollectionId; }
     bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
     double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
@@ -234,12 +234,17 @@ public:
         emit overlaysUpdated();
     }
 
+    std::optional<SurfaceProjection> projectVolumePoint(
+        const cv::Vec3f& volPoint) const override;
+    QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const override;
+    SurfaceProjectionContext surfaceProjectionContext() const override;
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
     [[nodiscard]] std::optional<SceneVolumeSample> sampleSceneVolume(const QPointF& scenePoint) const;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const override;
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override { return surfaceToScene(surfX, surfY); }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) override;
+    void setLocalCursorCrosshairSuppressed(bool suppressed) override;
     QPointF lastScenePosition() const override { return _lastScenePos; }
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
@@ -278,6 +283,7 @@ public:
     }
     void reloadPerfSettings() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
+    void setPreferSurfaceTileFills(bool enabled) override;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -305,7 +311,9 @@ public slots:
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t collectionId);
-    void onPointSelected(uint64_t pointId);
+    void clearCollectionSelection();
+    void onPointSelected(vc::PointRef point);
+    void clearPointSelection();
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
     void setSameWrapAnnotationPolylineOpacity(double opacity);
@@ -336,8 +344,8 @@ signals:
                                     Qt::KeyboardModifiers modifiers);
     void sendLineAnnotationSeedRequested(cv::Vec3f volLoc, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
-    void pointSelected(uint64_t pointId);
-    void pointClicked(uint64_t pointId);
+    void pointSelected(vc::PointRef point);
+    void pointClicked(vc::PointRef point);
     void overlaysUpdated();
     void renderFrameSubmitted(std::uint64_t serial);
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
@@ -382,6 +390,9 @@ private:
     void updateContentBounds();
     QPointF surfaceToScene(float surfX, float surfY, float wPx = 0.0f) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
+    // Signed depth band along the surface normal that the view currently
+    // displays; gates which volume points project onto a quad surface.
+    void quadProjectDepthBand(float& depthLo, float& depthHi) const;
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
@@ -486,6 +497,7 @@ private:
     // projected=true draws the greyed-out variant used when a linked cursor
     // point lies off this pane's plane (e.g. after a normal-offset scroll).
     void updateCursorCrosshair(const QPointF& scenePos, bool projected = false);
+    void updateLocalCursorCrosshair(const QPointF& scenePos);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -590,6 +602,8 @@ private:
     std::shared_ptr<vc::render::SurfaceGeometryTileCache> _surfaceGeometryTiles;
     std::size_t _surfaceCacheBudgetBytes = 0;
     std::size_t _overlaySurfaceCacheBudgetBytes = 0;
+    // See VolumeViewerBase::setPreferSurfaceTileFills.
+    bool _preferSurfaceTileFills = false;
     // Identity the live caches were built for.
     Volume* _surfaceCacheVolume = nullptr;
     Surface* _surfaceCacheSurface = nullptr;
@@ -773,6 +787,7 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     bool _cursorCrosshairProjected = false;
+    bool _localCursorCrosshairSuppressed = false;
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
@@ -791,9 +806,9 @@ private:
     };
     MeasurementState _measurement;
 
-    uint64_t _highlightedPointId = 0;
-    uint64_t _selectedCollectionId = 0;
-    uint64_t _selectedPointId = 0;
+    std::optional<vc::PointRef> _highlightedPoint;
+    std::optional<uint64_t> _selectedCollectionId;
+    std::optional<vc::PointRef> _selectedPoint;
 
     SameWrapAnnotationTool _sameWrapAnnotation;
     double _sameWrapAnnotationPolylineOpacity = 0.75;

@@ -41,10 +41,19 @@ private:
 
     std::shared_ptr<QuadSurface> _runDiffSurface;
     QImage _runDiffImage;
+    // Converted once per publish rather than on every pan/zoom rebuild.
+    QPixmap _runDiffPixmap;
     bool _runDiffVisible = false;
     std::shared_ptr<QuadSurface> _lossMapSurface;
     QImage _lossMapImage;
+    QPixmap _lossMapPixmap;
     qreal _lossMapOpacity = 0.8;
     std::shared_ptr<QuadSurface> _transitionSurface;
     std::vector<WindingTransitionCurve> _transitionCurves;
+    // Published curves converted from grid to surface coordinates once, rather
+    // than on every pan/zoom rebuild. Parallel to _transitionCurves; each entry
+    // holds one curve's segments. The label anchor still has to be chosen per
+    // rebuild -- it deliberately chases the viewport -- but that now costs one
+    // affine map per point instead of a conversion plus a map.
+    std::vector<std::vector<std::vector<cv::Vec2f>>> _transitionSurfaceSegments;
 };

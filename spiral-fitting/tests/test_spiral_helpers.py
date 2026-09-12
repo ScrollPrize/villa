@@ -2,16 +2,24 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
+import torch
 
+from config import Config, FitConfig
 from spiral_helpers import (
     _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX,
     _resolve_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
     load_fiber_point_collection,
     resolve_outer_winding_idx_and_notes,
+)
+from fit_spiral import (
+    FitContext,
+    _UnattachedPclStripList,
+    materialize_fiber_fit_inputs,
 )
 from tifxyz import load_tifxyz
 
@@ -68,6 +76,590 @@ class FiberPointCollectionTests(unittest.TestCase):
             collection = load_fiber_point_collection(path, collection_id=7)
 
             self.assertIsNone(collection)
+
+    @staticmethod
+    def _linked_member(collection_id, logical_id, targets, x_offset,
+                       attached=True):
+        points = {
+            point_id: {
+                "id": point_id,
+                "collectionId": collection_id,
+                "p": [x_offset + point_id, 0.0, 0.0],
+                "zyx": np.asarray([0.0, 0.0, x_offset + point_id],
+                              dtype=np.float32),
+                "winding_annotation": float("nan"),
+                **({"on_patch": {"id": f"patch-{logical_id}"}}
+                   if attached else {}),
+            }
+            for point_id in range(2)
+        }
+        return {
+            "id": collection_id,
+            "file_basename": f"{logical_id}.json",
+            "sampling_group": "fibers",
+            "metadata": {
+                "logical_input_id": logical_id,
+                "logical_input_kind": "fiber",
+                "winding_is_absolute": False,
+            },
+            "points": points,
+            "kept_orig_indices": np.asarray([0, 1]),
+            "control_line_indices": np.asarray([0, 1]),
+            "branches": [
+                {
+                    "local_index": local_index,
+                    "branch_file": f"{target_id}.json",
+                    "branch_index": target_index,
+                    "pending": False,
+                }
+                for local_index, target_id, target_index in targets
+            ],
+        }
+
+    def _materialize(self, catalog, spacing=0):
+        patches = {
+            f"patch-{logical_id}": object() for logical_id in catalog
+        }
+        return materialize_fiber_fit_inputs(
+            catalog, patches, z_begin=-10, z_end=10, z_margin=0,
+            min_point_spacing=spacing)
+
+    def test_catalog_materializes_branching_and_loop_closing_graphs(self):
+        catalog = {
+            "a": self._linked_member(
+                10, "a", [(0, "b", 0), (1, "c", 0)], 0),
+            "b": self._linked_member(
+                11, "b", [(0, "a", 0), (1, "c", 1)], 10),
+            "c": self._linked_member(
+                12, "c", [(0, "a", 1), (1, "b", 1)], 20),
+        }
+
+        cross, strips, groups, links, components = self._materialize(catalog)
+
+        self.assertEqual(len(cross), 1)
+        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
+                         ["a", "b", "c"])
+        self.assertEqual(len(links), 3)
+        self.assertEqual(len(components), 1)
+        self.assertEqual(len(strips), 3)
+        self.assertEqual(groups, ["fibers"] * 3)
+        self.assertEqual(len(cross[0]["chain"].extra_edges), 1)
+
+    def test_revision_replaces_one_catalog_value_and_rebuilds_all_views(self):
+        a = self._linked_member(10, "a", [(0, "b", 0)], 0)
+        b = self._linked_member(
+            11, "b", [(0, "a", 0), (1, "c", 0)], 10)
+        c = self._linked_member(12, "c", [(0, "b", 1)], 20)
+        catalog = {"a": a, "b": b, "c": c}
+        self._materialize(catalog)
+
+        revised_a = self._linked_member(10, "a", [], 100)
+        candidate = dict(catalog)
+        candidate["a"] = revised_a
+        cross, strips, _, links, _ = self._materialize(candidate, spacing=1000)
+
+        self.assertEqual(revised_a["id"], a["id"])
+        self.assertEqual(list(candidate), ["a", "b", "c"])
+        self.assertEqual(len(cross), 1)
+        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
+                         ["a", "b", "c"])
+        merged_points = list(cross[0]["points"].values())
+        self.assertTrue(any(point is revised_a["points"][0]
+                            for point in merged_points))
+        self.assertFalse(any(point is a["points"][0]
+                             for point in merged_points))
+        self.assertTrue(any(point is b["points"][0]
+                            for point in merged_points))
+        self.assertTrue(any(point is c["points"][0]
+                            for point in merged_points))
+        # B's authoritative reciprocal record keeps A-B active, and junction
+        # points survive even though the strip spacing exceeds its full length.
+        self.assertEqual(len(links), 2)
+        strips_by_id = {strip["id"]: strip for strip in strips}
+        self.assertIn(0, strips_by_id[10]["link_points"])
+        self.assertIn(0, strips_by_id[11]["link_points"])
+        self.assertEqual(sum(
+            strip["logical_input_id"] == "a" for strip in strips), 1)
+
+    def test_batched_reciprocal_removal_separates_component(self):
+        catalog = {
+            "a": self._linked_member(10, "a", [], 0),
+            "b": self._linked_member(11, "b", [], 10),
+        }
+
+        cross, strips, _, links, components = self._materialize(catalog)
+
+        self.assertEqual(links, [])
+        self.assertEqual(components, [])
+        self.assertEqual(len(cross), 2)
+        self.assertEqual(strips, [])
+
+    def test_new_fiber_links_to_resident_and_materialization_is_deterministic(self):
+        resident = self._linked_member(10, "a", [], 0)
+        added = self._linked_member(11, "b", [(0, "a", 0)], 10)
+        catalog = {"a": resident, "b": added}
+
+        first = self._materialize(catalog)
+        second = self._materialize(catalog)
+
+        self.assertEqual(len(first[3]), 1)
+        self.assertEqual(first[3], second[3])
+        self.assertEqual(first[4], second[4])
+        self.assertEqual(
+            [pcl["metadata"] for pcl in first[0]],
+            [pcl["metadata"] for pcl in second[0]])
+        for left, right in zip(first[1], second[1]):
+            self.assertEqual(left["id"], right["id"])
+            self.assertEqual(left["link_points"], right["link_points"])
+            np.testing.assert_array_equal(left["zyxs"], right["zyxs"])
+
+    def test_live_revision_keeps_regular_pcl_views_and_stable_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            revised_path = Path(temporary) / "staged-content-hash.json"
+            revised_path.write_text(json.dumps({
+                "control_points": [[400, 0, 0], [404, 0, 0]],
+                "line_points": [[400, 0, 0], [404, 0, 0]],
+            }))
+            resident = self._linked_member(20, "a", [], 0, attached=False)
+            regular_cross = {
+                "id": 1, "metadata": {"input_role": "same_winding"},
+                "points": {}, "sampling_group": "regular",
+            }
+            regular_strip = {
+                "id": 2, "logical_input_kind": None,
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {"a": resident}
+            context.next_id = 21
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = [regular_cross]
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [regular_strip])
+            context.unattached_strip_sampling_groups = ["regular"]
+            context.resolved_links = []
+            context.link_components = []
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.interactive_dt_resume_iteration = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{
+                        "kind": "fiber", "id": "a",
+                        "path": str(revised_path), "revision": "r2",
+                        "operation": "replace",
+                    }],
+                    {"influence_enabled": False},
+                    current_iteration=10, target_iteration=20)
+
+            self.assertIs(context.cross_patch_pcls[0], regular_cross)
+            self.assertIs(context.unattached_pcl_strips[0], regular_strip)
+            self.assertEqual(context.unattached_strip_sampling_groups[0],
+                             "regular")
+            self.assertEqual(context.next_id, 21)
+            self.assertEqual(context.fiber_catalog["a"]["id"], 20)
+            self.assertEqual(context.fiber_catalog["a"]["file_basename"],
+                             "a.json")
+            self.assertEqual(
+                context.fiber_catalog["a"]["points"][0]["p"],
+                [100.0, 0.0, 0.0])
+
+    def test_live_same_winding_replacement_swaps_one_logical_pcl(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            replacement_path = Path(temporary) / "replacement.json"
+            replacement_path.write_text(json.dumps({
+                "vc_pointcollections_json_version": "1",
+                "collections": {
+                    "5": {
+                        "id": 5,
+                        "name": "replacement",
+                        "points": {
+                            "0": {"id": 0, "collectionId": 5,
+                                  "p": [0, 0, 10], "creation_time": 1},
+                            "1": {"id": 1, "collectionId": 5,
+                                  "p": [4, 0, 12], "creation_time": 2},
+                        },
+                    },
+                },
+            }))
+            old_cross = {
+                "id": 5,
+                "metadata": {
+                    "logical_input_kind": "same_winding",
+                    "logical_input_id": "5",
+                    "resident_collection_id": 17,
+                },
+                "points": {},
+                "sampling_group": "old-source",
+            }
+            old_strip = {
+                "id": 17,
+                "logical_input_kind": "same_winding",
+                "logical_input_id": "5",
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+            unrelated_strip = {
+                "id": 22,
+                "logical_input_kind": None,
+                "logical_input_id": None,
+                "zyxs": np.ones((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {}
+            context.next_id = 30
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = [old_cross]
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [old_strip, unrelated_strip])
+            context.unattached_strip_sampling_groups = [
+                "old-source", "unrelated"]
+            context.resolved_links = []
+            context.link_components = []
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.run_dt_resume_iteration = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{
+                        "kind": "pcl", "id": "replacement-upload",
+                        "path": str(replacement_path),
+                        "role": "same_winding",
+                        "operation": "replace_collection",
+                        "target_collection_id": "5",
+                        "base_source_revision": "source-r1",
+                    }],
+                    {"influence_enabled": False})
+
+            logical_cross = [
+                pcl for pcl in context.cross_patch_pcls
+                if pcl.get("metadata", {}).get("logical_input_kind")
+                == "same_winding"
+                and str(pcl.get("metadata", {}).get("logical_input_id")) == "5"
+            ]
+            logical_strips = [
+                strip for strip in context.unattached_pcl_strips
+                if strip.get("logical_input_kind") == "same_winding"
+                and str(strip.get("logical_input_id")) == "5"
+            ]
+            self.assertEqual(logical_cross, [])
+            self.assertEqual(len(logical_strips), 1)
+            self.assertEqual(logical_strips[0]["id"], 17)
+            np.testing.assert_array_equal(
+                logical_strips[0]["zyxs"], [[10, 0, 0], [12, 0, 4]])
+            self.assertIn(unrelated_strip, context.unattached_pcl_strips)
+            self.assertNotIn(old_strip, context.unattached_pcl_strips)
+            self.assertEqual(context.next_id, 30)
+            context.dt_target_cache_manager.reset.assert_called_once_with()
+            context._rebuild_pcl_sampling_strata.assert_called_once_with()
+            context._build_theta_crossing_map.assert_called_once_with()
+
+    def test_live_relative_replacement_swaps_only_its_own_role(self):
+        # Collection ids are per role file: a relative replacement of
+        # collection "5" must leave a resident same-winding collection "5"
+        # alone, and the swapped strip keeps its winding annotations.
+        with tempfile.TemporaryDirectory() as temporary:
+            replacement_path = Path(temporary) / "replacement.json"
+            replacement_path.write_text(json.dumps({
+                "vc_pointcollections_json_version": "1",
+                "collections": {
+                    "5": {
+                        "id": 5,
+                        "name": "wraps",
+                        "points": {
+                            "0": {"id": 0, "collectionId": 5, "wind_a": 0,
+                                  "p": [0, 0, 10], "creation_time": 1},
+                            "1": {"id": 1, "collectionId": 5, "wind_a": 1,
+                                  "p": [4, 0, 12], "creation_time": 2},
+                        },
+                    },
+                },
+            }))
+            old_relative_strip = {
+                "id": 17,
+                "logical_input_kind": "relative",
+                "logical_input_id": "5",
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.array([3.0, 4.0], dtype=np.float32),
+            }
+            same_winding_strip = {
+                "id": 18,
+                "logical_input_kind": "same_winding",
+                "logical_input_id": "5",
+                "zyxs": np.ones((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {}
+            context.next_id = 30
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = []
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [old_relative_strip, same_winding_strip])
+            context.unattached_strip_sampling_groups = [
+                "old-relative", "same-winding"]
+            context.resolved_links = []
+            context.link_components = []
+            context.regular_pcl_catalog = {}
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.run_dt_resume_iteration = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{
+                        "kind": "pcl", "id": "replacement-upload",
+                        "path": str(replacement_path),
+                        "role": "relative",
+                        "operation": "replace_collection",
+                        "target_collection_id": "5",
+                        "base_source_revision": "source-r1",
+                    }],
+                    {"influence_enabled": False})
+
+            relative_strips = [
+                strip for strip in context.unattached_pcl_strips
+                if strip.get("logical_input_kind") == "relative"
+                and str(strip.get("logical_input_id")) == "5"
+            ]
+            self.assertEqual(len(relative_strips), 1)
+            self.assertEqual(relative_strips[0]["id"], 17)
+            np.testing.assert_array_equal(
+                relative_strips[0]["zyxs"], [[10, 0, 0], [12, 0, 4]])
+            np.testing.assert_array_equal(
+                relative_strips[0]["windings"], [0.0, 1.0])
+            self.assertIn(same_winding_strip, context.unattached_pcl_strips)
+            self.assertNotIn(old_relative_strip, context.unattached_pcl_strips)
+            self.assertEqual(context.next_id, 30)
+            catalog = list(context.regular_pcl_catalog.values())
+            self.assertEqual(len(catalog), 1)
+            self.assertEqual(catalog[0]["metadata"]["logical_input_kind"],
+                             "relative")
+            self.assertEqual(catalog[0]["metadata"]["input_role"], "relative")
+
+    def test_live_same_winding_deletion_removes_only_its_logical_pcl(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            deletion_path = Path(temporary) / "deletion.json"
+            deletion_path.write_text(json.dumps({
+                "vc_pointcollections_json_version": "1",
+                "collections": {"5": {"name": "delete", "points": {
+                    "0": {"p": [0, 0, 10], "creation_time": 1},
+                    "1": {"p": [4, 0, 12], "creation_time": 2},
+                }}},
+            }))
+            old_cross = {
+                "id": 5,
+                "metadata": {"logical_input_kind": "same_winding",
+                             "logical_input_id": "5",
+                             "resident_collection_id": 17},
+                "points": {}, "sampling_group": "old-source",
+            }
+            old_strip = {
+                "id": 17, "logical_input_kind": "same_winding",
+                "logical_input_id": "5",
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+            unrelated_strip = {
+                "id": 22, "logical_input_kind": None,
+                "logical_input_id": None,
+                "zyxs": np.ones((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {}
+            context.next_id = 30
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = [old_cross]
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [old_strip, unrelated_strip])
+            context.unattached_strip_sampling_groups = [
+                "old-source", "unrelated"]
+            context.resolved_links = []
+            context.link_components = []
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.run_dt_resume_iteration = None
+            context.influence_state = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{"kind": "pcl", "id": "delete-upload",
+                      "path": str(deletion_path), "role": "same_winding",
+                      "operation": "delete_collection",
+                      "target_collection_id": "5",
+                      "base_source_revision": "source-r1"}],
+                    {"influence_enabled": False})
+
+            self.assertEqual(context.cross_patch_pcls, [])
+            self.assertEqual(list(context.unattached_pcl_strips),
+                             [unrelated_strip])
+            self.assertEqual(context.unattached_strip_sampling_groups,
+                             ["unrelated"])
+            self.assertEqual(context.next_id, 30)
+            context.dt_target_cache_manager.reset.assert_called_once_with()
+            context._rebuild_pcl_sampling_strata.assert_called_once_with()
+            context._build_theta_crossing_map.assert_called_once_with()
+
+
+    def _editable_context(self, cross_patch, strips, groups):
+        context = FitContext.__new__(FitContext)
+        context.config = FitConfig(Config({
+            "z_begin": 0, "z_end": 200,
+        }).as_dict())
+        context.fiber_catalog = {}
+        context.next_id = 30
+        context.verified_patches = {}
+        context.verified_patches_list = []
+        context.cross_patch_pcls = list(cross_patch)
+        context.unattached_pcl_strips = _UnattachedPclStripList(list(strips))
+        context.unattached_strip_sampling_groups = list(groups)
+        context.resolved_links = []
+        context.link_components = []
+        context.link_distance_tolerance = 2.5
+        context.dt_target_cache_manager = mock.Mock()
+        context._rebuild_pcl_sampling_strata = mock.Mock()
+        context._build_theta_crossing_map = mock.Mock(return_value=[])
+        context._trusted_geometry_from_active_inputs = mock.Mock(
+            return_value=torch.empty((0, 3)))
+        context.run_dt_resume_iteration = None
+        context.influence_state = None
+        return context
+
+    def test_live_addition_carrying_committed_ids_is_deletable_by_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            document = {
+                "vc_pointcollections_json_version": "1",
+                "collections": {"5": {"name": "added", "points": {
+                    "0": {"p": [0, 0, 10], "creation_time": 1},
+                    "1": {"p": [4, 0, 12], "creation_time": 2},
+                }}},
+            }
+            addition_path = Path(temporary) / "addition.json"
+            addition_path.write_text(json.dumps(document))
+            deletion_path = Path(temporary) / "deletion.json"
+            deletion_path.write_text(json.dumps(document))
+            context = self._editable_context([], [], [])
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                # Committed before incorporation: the dataset file gave the
+                # uploaded collection "5" the id "9".
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{"kind": "pcl", "id": "add-upload",
+                      "path": str(addition_path), "role": "same_winding",
+                      "committed_collection_ids": {"5": "9"}}],
+                    {"influence_enabled": False})
+                self.assertEqual(len(context.unattached_pcl_strips), 1)
+                strip = context.unattached_pcl_strips[0]
+                self.assertEqual(strip["id"], 30)
+                self.assertEqual((strip["logical_input_kind"],
+                                  strip["logical_input_id"]),
+                                 ("same_winding", "9"))
+                catalog = context.regular_pcl_catalog[30]["metadata"]
+                self.assertEqual(catalog["ephemeral_input_id"], "add-upload")
+                self.assertEqual(catalog["ephemeral_collection_key"], "5")
+                self.assertEqual(catalog["logical_input_id"], "9")
+                # A later deletion of committed collection "9" finds it.
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{"kind": "pcl", "id": "delete-upload",
+                      "path": str(deletion_path), "role": "same_winding",
+                      "operation": "delete_collection",
+                      "target_collection_id": "9",
+                      "base_source_revision": "source-r2"}],
+                    {"influence_enabled": False})
+            self.assertEqual(list(context.unattached_pcl_strips), [])
+            self.assertEqual(context.unattached_strip_sampling_groups, [])
+            self.assertEqual(context.regular_pcl_catalog, {})
+
+    def test_identity_assignment_rekeys_every_resident_view(self):
+        added_metadata = {
+            "input_role": "same_winding",
+            "resident_collection_id": 17,
+            "ephemeral_input_id": "add-upload",
+            "ephemeral_collection_key": "5",
+        }
+        cross = {"id": 17, "metadata": dict(added_metadata), "points": {},
+                 "sampling_group": "staged"}
+        strip = {"id": 17, "logical_input_kind": None,
+                 "logical_input_id": None, "logical_input_revision": None,
+                 "zyxs": np.zeros((2, 3), dtype=np.float32),
+                 "windings": np.zeros(2, dtype=np.float32)}
+        other_strip = {"id": 22, "logical_input_kind": None,
+                       "logical_input_id": None,
+                       "zyxs": np.ones((2, 3), dtype=np.float32),
+                       "windings": np.zeros(2, dtype=np.float32)}
+        context = self._editable_context(
+            [cross], [strip, other_strip], ["staged", "unrelated"])
+        context.regular_pcl_catalog = {
+            17: {"id": 17, "metadata": dict(added_metadata), "points": {}}}
+        context.influence_state = mock.Mock()
+        # The staged copy is gone by now; the assignment must not need it.
+        with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                mock.patch.object(torch.cuda, "set_rng_state_all"):
+            result = context.incorporate_interactive_inputs(
+                [{"kind": "pcl", "id": "add-upload", "role": "same_winding",
+                  "path": "/nowhere/gone.json",
+                  "operation": "assign_collection_ids",
+                  "committed_collection_ids": {"5": "9"}}],
+                {"influence_enabled": False},
+                current_iteration=0, target_iteration=0)
+        self.assertEqual(result["outcomes"][0]["state"], "incorporated")
+        for metadata in (cross["metadata"],
+                         context.regular_pcl_catalog[17]["metadata"]):
+            self.assertEqual((metadata["logical_input_kind"],
+                              metadata["logical_input_id"]),
+                             ("same_winding", "9"))
+        self.assertEqual((strip["logical_input_kind"],
+                          strip["logical_input_id"]), ("same_winding", "9"))
+        self.assertIsNone(other_strip["logical_input_kind"])
+        context.influence_state.rename_logical_contribution_.assert_called_once_with(
+            ("pcl", 17), ("same_winding", "9"))
+        # Metadata only: no pools were rebuilt.
+        context._rebuild_pcl_sampling_strata.assert_not_called()
+        context._build_theta_crossing_map.assert_not_called()
 
 
 class TifxyzMetadataTests(unittest.TestCase):
