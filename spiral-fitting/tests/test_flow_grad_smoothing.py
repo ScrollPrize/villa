@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flow_grad_smoothing
 from config import Config
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import (BSplineCylindricalFlowField, BSplineFlowField,
+                         CartesianFlowField, CylindricalFlowField)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 from transforms import SpiralAndTransform
 
@@ -113,12 +114,20 @@ def test_cylindrical_smooths_z_and_wraps_rings_without_mixing_them():
     torch.testing.assert_close(constant, torch.full_like(constant, 1.5))
 
 
-@pytest.mark.parametrize('kind', ['cartesian', 'cylindrical'])
+@pytest.mark.parametrize(
+    'kind', ['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
 def test_field_smooth_grad_scales_width_for_the_low_res_lattice(kind, monkeypatch):
-    if kind == 'cartesian':
-        field = CartesianFlowField(torch.tensor([24, 24, 24]), spatial_scale_factor=4)
-    else:
-        field = CylindricalFlowField((24, 24, 24), spatial_scale_factor=4)
+    cls = {
+        'cartesian': CartesianFlowField,
+        'cylindrical': CylindricalFlowField,
+        'bspline': BSplineFlowField,
+        'bspline_cylindrical': BSplineCylindricalFlowField,
+    }[kind]
+    field = cls(torch.tensor([24, 24, 24]), spatial_scale_factor=4, num_stages=2)
+    # The b-spline control-point lattices are Cartesian grids, smoothed like
+    # the trilinear Cartesian lattice; the cylindrical b-spline shares the
+    # ragged cylindrical layout.
+    kind = 'cylindrical' if kind.endswith('cylindrical') else 'cartesian'
     for flow in field.flows:
         flow.grad = torch.randn_like(flow)
     seen = []

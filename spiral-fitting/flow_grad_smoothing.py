@@ -380,7 +380,7 @@ def describe_widths(along_voxels, across_voxels, cell_voxels, spatial_scale_fact
     if low_res_along_voxels is not None and float(low_res_along_voxels) > 0.0:
         report += f' (LR {float(low_res_along_voxels):g} voxels)'
     report += f' = {per_lattice(along_voxels, low_res_along_voxels)}'
-    if field_type == 'cylindrical':
+    if field_type in ('cylindrical', 'bspline_cylindrical'):
         report += (f'; across rings {float(across_voxels):g} voxels = '
                    f'{per_lattice(across_voxels)}')
     elif float(across_voxels) > 0.0:
