@@ -68,3 +68,30 @@ def test_monitor_waits_for_ema_best_and_binds_launch(runner, monkeypatch, tmp_pa
     stopped.assert_called_once_with(identity)
     result = json.loads((launch / 'sample_stop_result.json').read_text())
     assert result['snapshot_samples'] == 601600
+
+
+def test_campaign_failure_stops_owned_detached_training(runner, monkeypatch, tmp_path):
+    initial = tmp_path / 'raw'
+    initial.mkdir()
+    (initial / 'selection.json').write_text(json.dumps({'run':'s1a'}))
+    control = tmp_path / 'control.json'
+    control.write_text(json.dumps({'comparison':{
+        'output':str(tmp_path / 'campaign'), 's1a_raw_evaluation':str(initial),
+        'stages':[{'name':'s1a', 'existing_run':'s1a', 'config':'s1.json', 'variants':[]},
+                  {'name':'json', 'config':'json.json', 'variants':[]}]
+    }}))
+    monkeypatch.setattr(runner, 'CONTROL', control)
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **kw: json.dumps({'global_result':{}}))
+    folder = tmp_path / 'launch'
+    folder.mkdir()
+    identity = {'pid':123, 'start_us':456, 'boot_us':789}
+    (folder / 'controller.json').write_text(json.dumps(identity))
+    process = Mock()
+    process.poll.side_effect = RuntimeError('injected failure')
+    monkeypatch.setattr(runner, 'production_start', lambda *a: (folder, process))
+    stopped = Mock()
+    monkeypatch.setattr(runner, 'stop_production_identity', stopped)
+    with pytest.raises(RuntimeError, match='injected'):
+        runner.comparison()
+    stopped.assert_called_once_with(identity)
+    assert 'injected' in json.loads((tmp_path / 'campaign/comparison.json').read_text())['error']

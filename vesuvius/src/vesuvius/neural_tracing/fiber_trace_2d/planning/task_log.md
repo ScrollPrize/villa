@@ -25,3 +25,17 @@
   5b359ed861fcccb491d3cf35fd159795aabce762f46ac54237bfdd1dfd6c00c9.
   Full50fiber100direction preflightpassed; exclusive224CPU/8GPU task
   79c3e3bb-01bf-45c9-bb79-202f382e922e acquired. Evaluation in progress.
+- RawS1a evaluation finished exit0, complete100directions:4341failures,
+  mean1.8197608781mm,median0.0980952981mm (complete reference partitions).
+- Campaign running through approved `run_fiber3d_experiment comparison`, tool
+  session20448. Durable report:
+  /ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/comparison.json.
+  S1aEMA selecteddecay.99 at3000updates/384000samples,testloss2.4918093085;
+  SHA4f7b875e116332202a5eb762c2a7229280a8b7631326e3340f898a76c523cdf7.
+- Independent campaign review verified six-way audit/raw-state resume and found
+  abnormal-exit cleanup gap; fixed ownership-bound stop and added CPU regression.
+  Final sampler/controller suite30passed2CUDA-skipped; added campaign cleanup
+  test brings controller suite to5passed1.08s. CUDA skips concern unchanged target
+  kernels; actual evaluation is manager-exclusive8GPU.
+- Commits9388f982a(group/configs),bc183cfc3(controller/docs). No outcomes for
+  pendingJSON/combined trainings or other evaluations claimed yet.
