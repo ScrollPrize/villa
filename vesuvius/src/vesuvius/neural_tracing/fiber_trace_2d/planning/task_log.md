@@ -39,3 +39,15 @@
   kernels; actual evaluation is manager-exclusive8GPU.
 - Commits9388f982a(group/configs),bc183cfc3(controller/docs). No outcomes for
   pendingJSON/combined trainings or other evaluations claimed yet.
+- S1aEMA complete100directions/exit0:3572failures,mean2.2008600380mm,
+  median0.0762288451mm. Both raw/EMA artifacts independently audited.
+- FreshJSON-only run started:
+  /ephemeral/hendrik/fiber3d_train2/runs/compare_5scroll_128_sd1_16x8_ema_600k_20260912_123713.
+  Root1426267, managedcalibrationtask8dc1834e-81ac-42fe-bf3b-78637fda2a39.
+  Initialtest and first9updates passed; target4700updates. Campaign owns bounded
+  shutdown and will proceed through both JSON evaluations, combined training,
+  both combined evaluations, then raw-state continuation of trace-metric winner.
+- JSON calibration completed, adaptive task7154b406-9b78-4339-8449-bdee2cd86272
+  running. First scheduled12800sample/update100 test completed37.512s.
+  Campaign remains active; JSON/combined results and final continuation are
+  pending, not claimed complete. No further manual start commands required.

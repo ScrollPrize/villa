@@ -39,3 +39,19 @@ prepare/validate-full/full logs and trace_audit.json under its output root.
 Continuation uses the original winning-stage config with2Mupdates and resumes
 that run's current raw state, including EMA history. It does not substitute the
 best EMA inference weights into an unrelated optimizer state.
+
+## In-progress results (2026-09-12)
+
+S1a stopped601600samples. Both selected checkpoints completed the identical
+50fiber/100direction evaluation and raw-artifact audit:
+
+| Selection | Checkpoint samples | Mean segment mm | Restarts |
+|---|---:|---:|---:|
+| S1a best raw |358400|1.819761|4341|
+| S1a best EMA(.99) |384000|2.200860|3572|
+
+JSON-only is now running as
+compare_5scroll_128_sd1_16x8_ema_600k_20260912_123713 under the regular runs root.
+Remaining evaluations and winner selection are pending. The active campaign
+report is
+/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/comparison.json.
