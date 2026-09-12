@@ -20,6 +20,39 @@
     "samples": 128,
     "overrides": {}
   },
+  "comparison": {
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912",
+    "s1a_raw_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "stages": [
+      {
+        "name": "s1a_600k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json",
+        "existing_run": "/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_128_sd1_16x8_ema_20260912_111221",
+        "variants": ["ema"]
+      },
+      {
+        "name": "json_600k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_compare_5scroll_ema_600k.json",
+        "variants": ["raw", "ema"]
+      },
+      {
+        "name": "combined_500k",
+        "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_compare_5scroll_s1a_ema_500k.json",
+        "variants": ["raw", "ema"]
+      }
+    ]
+  },
+  "trace_evaluation": {
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/s1a_nml_128_sd1_16x8_ema_20260912_111221",
+    "variant": "raw",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json"
+  },
+  "production_stop": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/s1a_nml_128_sd1_16x8_ema-20260912_111218",
+    "samples": 600000
+  },
   "production": {
     "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json"
   }

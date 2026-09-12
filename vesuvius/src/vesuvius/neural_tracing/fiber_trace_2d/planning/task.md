@@ -1,11 +1,3 @@
-# Long S1a training with historical observation and EMA
+# Short training comparison
 
-Reproduction is complete (cffe3cde9). Keep modern training/data/augmentation and
-current test metrics. Start fresh S1a NML training in the regular
-/ephemeral/hendrik/fiber3d_train2/runs directory for2000000 optimizer updates.
-Add historical average angle and total loss as additional observation-only test
-metrics, not replacements or checkpoint-selection inputs. Add inexpensive EMA
-tracks, separately evaluated and saved so their quality can be compared later.
-Preserve manager-controlled automatic calibration/pause/resize and resumability.
-Measure overhead before launching; all GPU tests use manager allocations and
-the already approved configurable experiment/test launchers.
+Stop current S1a EMA training at approximately600000 samples. Train fresh five-scroll JSON-only to600000, then combined five-scroll JSON+S1a NML to500000. Combined sampling: every scroll20%; Paris4 JSON10% and NML10%, distance-proportional within each group. Select best raw and best EMA by test losses for each run; evaluate all six on locked50fiber bidirectional inference/tracing, then resume most promising run. Use manager and approved launcher.

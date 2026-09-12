@@ -1,52 +1,23 @@
-# Plan: historical observation, EMA and regular training
+# Short training comparison plan
 
-1. Freeze reproduction findings in cffe3cde9. Inspect current and historical
-   evaluator/loss, snapshot and managed RAM handoff contracts. Old metrics use
-   CP-only historical JSON/control-point stream, logical batch8 and full-grid
-   predictions/targets. Audit historical total-loss differences explicitly;
-   share existing loss primitives rather than duplicate the trainer.
-2. Add opt-in observational historical test source to the same source-tagged
-   sample queue and broker. Keep current test/loss_total and angle unchanged.
-   Reuse evaluator and resumable test waves for raw and EMA models. Preserve
-   completed rows/logging flags across pause/resize; no synchronous new loader.
-   Historical metrics do not select raw/EMA best snapshots or schedule learning.
-3. Add configured EMA decays0.99 and0.999, fixed decay from initialized weights,
-   FP32 shadows and foreach updates once per successful optimizer update.
-   Copy nonfloating buffers; no change to BF16 forward/backward. Validate unique
-   decays in(0,1). Raw checkpoint contains all EMA state/counters/best metrics;
-   RAM handoff and replica verification preserve it. Legacy checkpoints may
-   initialize new tracks explicitly with a startup message, never fake history.
-4. Evaluate EMA on both current and historical tests using temporary weight
-   copies, restore raw weights before every yielded manager boundary and in
-   exception cleanup. Save independent current/best/retained EMA snapshots at
-   existing snapshot boundaries; EMA best uses its current dense test loss.
-   EMA exports identify decay/update count and are inference-only (reject
-   accidental optimizer resume from EMA exports). Raw snapshots remain resumable.
-5. CPU regressions: EMA/reference, skipped optimizer step, validation,
-   snapshot/handoff restoration and raw restoration on exceptions; queue sources,
-   historical definition, observational isolation and test-wave continuation.
-   Approved manager-exclusive CUDA test measures EMA overhead versus raw,
-   validates BF16/checkpoint inference plus pause/resize state. Short real
-   pipeline test measures all six evaluations and regular stepping.
-6. New config based on train_s1a_nml_16x8.json, LR.01/global128/B16 perGPU,
-   max_steps2000000, regular run_path, test/checkpoint100, raw+EMA historical
-   metrics. Extend approved experiment launcher for normal managed production
-   start (no outer exclusive lease), record PID/log/config. Launch fresh run,
-   verify calibration and actual progress/TB/snapshots, leave it running.
+1. Add identity-bound sample-limit monitor to approved experiment controller. Bind saved launch, never mutable latest. Stop after complete evaluation AND snapshots at4700updates=601600samples. Use existing bounded TERM cleanup; test on CPU.
+2. Prepare fresh five-scroll JSON601600 and combined JSON+NML499200 with same modern model, LR.01, global128, EMA.99/.999, regular run root, held-out five-scroll tests. Add optional per-dataset sampling_group and sampling_group_weight: choose scroll uniformly, then group by its explicit mass, then distance uniformly within group. Paris4 JSON/NML each half its20%; default ungrouped sampling must retain identical RNG and outputs. Reject missing/inconsistent group weights. Tests verify20% scrolls,10% subgroups and length-proportional fibers, including both Paris4 JSON directories grouped together.
+3. Run sequential managed trainings; record configs/data identities and realized counts.
+4. Freeze best raw and lowest-test-loss best EMA across decays for each run using existing live-evaluation helper. Reuse locked50fiber/100direction evaluator, fresh namespaces, exclusive manager ownership. Six evaluations.
+5. Compare complete-reference mean segment length and per-scroll failures; resume winning run from resumable raw state, retaining EMA history. EMA inference exports cannot restore optimizer.
 
 ## Spec update
-Document optional historical observation contract, fixed-decay EMA recurrence,
-update frequency, snapshot export/resume rules, managed handoff and memory
-accounting. Retain modern training/default metrics and locked manager protocol.
+
+No model/loss numerics or manager protocol changes. Optional explicit sampling groups affect only requested grouped datasets; ungrouped sampling stays identical. Stop controls bind immutable launch identity and wait for completed snapshot publication, never kill a replacement. Record approximate sample boundaries. Best-test-loss selection remains unchanged.
 
 ## Docs updates
-Document config keys, TB tags, snapshot names, run directory and approved start/
-status/stop workflow. Brief current-task log and final changelog with measured
-overhead and exact CPU/GPU commands. Independent review before implementation.
 
-## Risks and acceptance
-Do not equate legacy presence loss with current loss without checking old source.
-Report remaining input-backend discrepancy. Extra testing costs scale with
-evaluations even when per-update EMA is cheap; report separately. Extra memory
-must enter automatic calibration, not reuse an old profile. Training launch is
-completion, not waiting for2M updates. No further training ablations.
+Document stop control and comparison commands/checkpoint provenance/results.
+
+## Validation
+
+CPU monitor tests for boundaries and identity; existing evaluation preflight; inspect checkpoint counts/EMA and complete100directions for every evaluation. Confirm manager resources released after stop.
+
+## Changelog
+
+Record comparison outcome and selected continuation; previous EMA task remains in committed history.

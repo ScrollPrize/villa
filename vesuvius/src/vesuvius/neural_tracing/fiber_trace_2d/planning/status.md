@@ -1,9 +1,10 @@
-# Historical observation and EMA status
+# Short training comparison
 
-- [x] Task and plan written; reproduction archived.
-- [x] Independent plan review; state/queue identity and calibration safeguards accepted.
-- [x] Historical loss audit and shared observational evaluation (backend caveat documented).
-- [x] EMA update, snapshot and managed handoff integration.
-- [x] CPU and manager-controlled GPU validation/overhead measurement.
-- [x] Regular2M-step config and managed launch verified through update400.
-- [x] Documentation and implementation committed c4ef954c4; launch results recorded.
+- [x] Inspect active run; record task and plan.
+- [x] Independent plan review.
+- [x] Arm identity-bound S1a stop near600k.
+- [x] Verify completed stop and released resources.
+- [x] Clarify third condition: combinedJSON/NML; Paris4weights10%/10%.
+- [ ] Complete subsequent600k/500k runs.
+- [ ] Freeze best raw/EMA and complete six tracing evaluations.
+- [ ] Compare/resume winner and document.
