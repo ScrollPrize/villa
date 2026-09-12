@@ -9,6 +9,8 @@ import time
 import threading
 import re
 import statistics
+import glob
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +18,19 @@ ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = Path('/ephemeral/hendrik/fiber3d_train2/reproduction')
 HISTORICAL = Path('/ephemeral/hendrik/fiber3d_train/runs')
 CONTROL = Path(__file__).with_name('fiber3d_experiment.json')
+
+
+def input_manifest(raw):
+    result = {}
+    for key in ('datasets', 'test_datasets'):
+        rows = []
+        for dataset in raw.get(key, []):
+            for filename in sorted(glob.glob(dataset['fiber_glob'])):
+                path = Path(filename)
+                rows.append({'path':str(path), 'bytes':path.stat().st_size,
+                             'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
+        result[key] = rows
+    return result
 
 
 def start():
@@ -36,6 +51,7 @@ def start():
     folder = OUTPUT / (control['stage'] + '-' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
     folder.mkdir()
     (folder / 'config.json').write_text(json.dumps(raw, indent=2))
+    (folder / 'inputs.json').write_text(json.dumps(input_manifest(raw), indent=2))
     (folder / 'control.json').write_text(json.dumps(control, indent=2))
     (folder / 'source.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True)
                                     + subprocess.check_output(['git', 'diff'], cwd=ROOT, text=True))
@@ -159,7 +175,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -167,6 +183,11 @@ def main():
         start()
     elif args.command == 'summarize':
         summarize()
+    elif args.command == 'inputs':
+        folder = Path((OUTPUT / 'latest').read_text())
+        result = input_manifest(json.loads((folder / 'config.json').read_text()))
+        (folder / 'inputs.json').write_text(json.dumps(result, indent=2))
+        print({key: len(rows) for key, rows in result.items()})
     else:
         status(stop=args.command == 'stop')
 

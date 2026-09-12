@@ -28,3 +28,8 @@
   loading,for matched old/current evaluation on identical weights. CPU regression
   run20260912_102303_668873:28passed22.38s. Historical current.pt expected
   testangle19.782318deg atupdate19200; will verify evaluator before conclusions.
+- Stage00 first observed<20degree historical test:19.76at96000samples. No BN,
+  decoder,augmentation or batch/LR restoration yet. Finish300800then audit old
+  checkpoint and remove evaluation changes on same weights before claiming cause.
+  Inputs manifest:8NML files,1JSON test file (hashes archived; historical snapshot
+  had no annotation hashes,so exact historical byte identity cannot be proven).
