@@ -133,9 +133,11 @@ def dilate_label_batch_with_edt(
     labels_np = (
         labels_BCZYX.detach().to(device="cpu", dtype=host_dtype).numpy().copy()
     )
-    valid_np = valid_B1ZYX.detach().to(device="cpu").numpy()
+    # Threshold before the host copy: the validity mask arrives in the label
+    # dtype, and NumPy has no bfloat16.
+    valid_np = (valid_B1ZYX.detach() > 0).to(device="cpu").numpy()
     for batch_index in range(labels_np.shape[0]):
-        valid_ZYX = valid_np[batch_index, 0] > 0
+        valid_ZYX = valid_np[batch_index, 0]
         for channel_index in range(labels_np.shape[1]):
             label_ZYX = labels_np[batch_index, channel_index]
             source_ZYX = (label_ZYX == 1) & valid_ZYX

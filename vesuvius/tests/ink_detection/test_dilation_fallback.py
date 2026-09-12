@@ -96,11 +96,14 @@ def test_edt_fallback_handles_empty_and_full_labels_and_valid_rank():
     assert dilate_label_batch_with_edt(empty, valid_BZYX, None) is empty
 
 
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.bool, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.uint8, torch.bool, torch.float16, torch.bfloat16]
+)
 def test_edt_fallback_preserves_integer_bool_and_half_dtypes(dtype):
     labels = torch.zeros(1, 1, 1, 3, 3, dtype=dtype)
     labels[..., 1, 1] = 1
-    valid = torch.ones(1, 1, 1, 3, 3, dtype=torch.uint8)
+    # apply_label_dilation hands over a validity mask in the label dtype.
+    valid = torch.ones(1, 1, 1, 3, 3, dtype=dtype)
 
     output = dilate_label_batch_with_edt(labels, valid, 1.0)
 
@@ -109,6 +112,27 @@ def test_edt_fallback_preserves_integer_bool_and_half_dtypes(dtype):
         [[[[[0, 1, 0], [1, 1, 1], [0, 1, 0]]]]], dtype=dtype
     )
     assert torch.equal(output, expected)
+
+
+def test_apply_label_dilation_accepts_bfloat16_batches_on_cpu():
+    labels = torch.zeros(1, 1, 1, 1, 5, dtype=torch.bfloat16)
+    labels[..., 2] = 1
+    supervision = torch.zeros_like(labels)
+    supervision[..., 0] = 1
+
+    output = apply_label_dilation(
+        {"inklabels": labels, "supervision_mask": supervision}, 1.0, 1.0
+    )
+
+    assert output["inklabels"].dtype == torch.bfloat16
+    assert output["supervision_mask"].dtype == torch.bfloat16
+    assert torch.equal(
+        output["inklabels"].float(), torch.tensor([[[[[0.0, 1.0, 1.0, 1.0, 0.0]]]]])
+    )
+    assert torch.equal(
+        output["supervision_mask"].float(),
+        torch.tensor([[[[[1.0, 1.0, 1.0, 1.0, 0.0]]]]]),
+    )
 
 
 def test_dispatcher_uses_edt_on_cpu_and_warns_once(caplog):
@@ -176,6 +200,28 @@ def test_edt_fallback_matches_cucim_on_cuda(distance):
     with_edt = dilate_label_batch_with_edt(labels, valid, distance)
 
     assert torch.equal(with_cucim.cpu(), with_edt)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_dispatcher_selects_cucim_for_cuda_tensors(monkeypatch, caplog):
+    pytest.importorskip("cupy")
+    pytest.importorskip("cucim")
+
+    def _must_not_run(labels, valid, distance):
+        raise AssertionError("CUDA tensors with a working cuCIM must not fall back")
+
+    monkeypatch.setattr(dilation_module, "dilate_label_batch_with_edt", _must_not_run)
+    generator = torch.Generator().manual_seed(7)
+    labels = (torch.rand(1, 1, 9, 21, 23, generator=generator) < 0.03).float().cuda()
+    valid = torch.ones_like(labels)
+
+    with caplog.at_level(logging.WARNING, logger=dilation_module.__name__):
+        output = dilate_label_batch(labels, valid, 2.0)
+
+    assert output.device == labels.device
+    assert torch.equal(output, dilate_label_batch_with_cucim(labels, valid, 2.0))
+    assert dilation_module._cucim_unavailable is False
+    assert not [r for r in caplog.records if "edt fallback" in r.getMessage()]
 
 
 def test_cucim_path_still_refuses_cpu_tensors_with_the_typed_error():
