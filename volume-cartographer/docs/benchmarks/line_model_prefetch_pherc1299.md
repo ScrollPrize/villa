@@ -231,7 +231,9 @@ VC3D_LINE_MODEL_PREFETCH=1 VC3D_LINE_PERF_LOG=1 volume-cartographer/build/bin/VC
 
 Set `VC3D_LINE_MODEL_PREFETCH=0` to bypass the moving/corridor prefetch and the
 new parallel reinit tails at startup. No raw-scan volume is read by this benchmark.
-Nothing has been published or installed; the original fiber/cache are unchanged.
+At the time of these measurements, nothing had been published or installed;
+the original fiber/cache were unchanged. For subsequent main-merge validation
+and branch publication, see the [PR draft and agent handoff](../pr-drafts/line-annotation-model-prefetch.md).
 macOS/arm64 runtime behavior has not been measured on this Ubuntu machine.
 
 The source fiber SHA-256 is
