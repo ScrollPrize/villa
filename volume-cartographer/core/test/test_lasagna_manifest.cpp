@@ -5,6 +5,9 @@
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
+#include <utils/zarr.hpp>
+
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -18,6 +21,12 @@ fs::path makeTmpDir(const std::string& tag)
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;
+}
+
+bool requireNetwork()
+{
+    const char* value = std::getenv("VC_TEST_REQUIRE_NETWORK");
+    return value && value[0] && value[0] != '0';
 }
 
 class ConstantNormalSampler final : public vc::lasagna::NormalSampler {
@@ -407,6 +416,42 @@ TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
     (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
     CHECK(fetches == 2);
     CHECK(fs::is_regular_file(first.manifest().manifestPath));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
+{
+    if (!requireNetwork()) {
+        MESSAGE("Set VC_TEST_REQUIRE_NETWORK=1 to run the public S3 smoke test");
+        return;
+    }
+
+    const auto dir = makeTmpDir("public-s3-auth-fallback");
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = dir;
+    options.remoteAuth.access_key = "AKIAIOSFODNN7EXAMPLE";
+    options.remoteAuth.secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    options.remoteAuth.session_token = "malformed-session-token";
+    options.remoteAuth.region = "us-east-1";
+
+    const std::string location =
+        "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/representations/"
+        "predictions/fibers/20260102150214-fibers-20260801084232-L1/"
+        "PHerc0139-20260102150214-las-sd1-92481a4c.lasagna.json";
+    try {
+        const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
+            location, options);
+        const auto* presence = dataset.manifest().groupForChannel("presence");
+        REQUIRE(presence != nullptr);
+        const auto array = vc::lasagna::openLasagnaChannelArray(
+            dataset.manifest(), *presence, 1);
+        CHECK(array.metadata().ndim() == 3);
+        CHECK(array.metadata().shape ==
+              std::vector<std::size_t>{9620, 3314, 3314});
+    } catch (const std::exception& error) {
+        fs::remove_all(dir);
+        FAIL("public S3 Lasagna fallback failed: " << error.what());
+    }
     fs::remove_all(dir);
 }
 

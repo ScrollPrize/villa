@@ -26,7 +26,6 @@
 #include <optional>
 
 #include "VCSettings.hpp"
-#include "RemoteVolumeCachePaths.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -702,6 +701,25 @@ bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
         path.string()).empty();
 }
 
+bool isSelectedEditableOpenDataSegmentsEntry(
+    const VolumePkg& pkg,
+    const vc::project::Entry& entry)
+{
+    if (!vc::project::hasEntryTag(entry, "open-data-editable") ||
+        vc::project::isLocationRemote(entry.location)) {
+        return false;
+    }
+    const auto selectedPath = pkg.outputSegmentsPath();
+    if (selectedPath.empty()) {
+        return false;
+    }
+    const auto entryPath = vc::project::resolveLocalPath(
+        entry.location, pkg.path().parent_path());
+    std::error_code error;
+    return std::filesystem::equivalent(selectedPath, entryPath, error) &&
+           !error;
+}
+
 std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
                                                        const std::string& loadedVolumeId)
 {
@@ -736,6 +754,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
 
     const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
     const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
+    const vc::project::Entry* targetMatch = nullptr;
     const vc::project::Entry* sourceMatch = nullptr;
 
     for (const auto& entry : pkg.segmentEntries()) {
@@ -743,15 +762,24 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
             continue;
         }
         if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
-            return &entry;
+            if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                return &entry;
+            }
+            if (!targetMatch) {
+                targetMatch = &entry;
+            }
+            continue;
         }
-        if (!sourceMatch &&
-            std::find(entry.tags.begin(), entry.tags.end(), sourceTag) != entry.tags.end()) {
-            sourceMatch = &entry;
+        if (std::find(entry.tags.begin(), entry.tags.end(), sourceTag) !=
+            entry.tags.end()) {
+            if (!sourceMatch ||
+                isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                sourceMatch = &entry;
+            }
         }
     }
 
-    return sourceMatch;
+    return targetMatch ? targetMatch : sourceMatch;
 }
 
 const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumePkg& pkg,
@@ -763,16 +791,26 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
     if (!coordinateSpace.empty()) {
         const std::string coordinateTag =
             "vc-open-data-coordinate-space:" + coordinateSpace;
+        const vc::project::Entry* coordinateMatch = nullptr;
         for (const auto& entry : pkg.segmentEntries()) {
             if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
                 std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
                     entry.tags.end()) {
-                if (matchedCatalogVolumeId) {
-                    *matchedCatalogVolumeId =
-                        openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+                if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
+                    coordinateMatch = &entry;
+                    break;
                 }
-                return &entry;
+                if (!coordinateMatch) {
+                    coordinateMatch = &entry;
+                }
             }
+        }
+        if (coordinateMatch && matchedCatalogVolumeId) {
+            *matchedCatalogVolumeId =
+                openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+        }
+        if (coordinateMatch) {
+            return coordinateMatch;
         }
         // Explicitly identified assets must never fall back to lineage-only
         // association, because native and virtual views share that lineage.
@@ -2612,7 +2650,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2621,7 +2659,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 for (uint64_t fiberId : fiberIds) {
                     _fiberIntersectionCache.pruneFiber(fiberId);
                 }
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
@@ -2684,14 +2722,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
     auto updatePersistentCacheSpace = [this]() {
-        auto root = vc3d::remoteCacheRootForState(_state);
-        if (_state) {
-            if (const auto volume = _state->currentVolume();
-                volume && !volume->remoteCacheRoot().empty()) {
-                root = volume->remoteCacheRoot();
-            }
-        }
-        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root);
+        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(
+            vc3d::remoteCachePathFs());
         if (!budget)
             return;
         const auto stats = budget->stats();
@@ -4193,7 +4225,6 @@ CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
     const std::shared_ptr<Volume>& volume,
     const QString& location,
     std::vector<std::string> tags,
-    const QString& remoteCacheRoot,
     const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg() || !volume) {
@@ -4203,8 +4234,7 @@ CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
     const auto result = _state->vpkg()->attachPreparedVolume(
         location.toStdString(),
         std::move(tags),
-        volume,
-        remoteCacheRoot.toStdString());
+        volume);
     if (result == VolumePkg::AttachVolumeResult::VolumeIdConflict)
         return VolumeAttachResult::VolumeIdConflict;
 
@@ -5116,6 +5146,18 @@ void CWindow::updateAtlasFiberDocks()
 
     tree->collapseAll();
     updateOptimizeEnabled();
+}
+
+void CWindow::scheduleAtlasSearchDockRefresh()
+{
+    if (_atlasSearchDockRefreshQueued) {
+        return;
+    }
+    _atlasSearchDockRefreshQueued = true;
+    QTimer::singleShot(50, this, [this]() {
+        _atlasSearchDockRefreshQueued = false;
+        updateAtlasSearchDocks();
+    });
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -8224,12 +8266,43 @@ void CWindow::CreateWidgets(void)
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
+    const QRegularExpression coordinateTriple(
+        "^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$");
+    ui.focusBBoxMin->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMin));
+    ui.focusBBoxMax->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMax));
+    connect(ui.focusBBoxMin, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.focusBBoxMax, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.chkFocusBBox, &QCheckBox::toggled,
+            this, &CWindow::onFocusBoundsToggled);
+    connect(_state, &CState::focusBoundsChanged,
+            this, &CWindow::refreshFocusBoundsUi);
+    connect(_state, &CState::volumeChanged, this,
+            [this](std::shared_ptr<Volume>, const std::string&) {
+                refreshFocusBoundsUi();
+            });
+    refreshFocusBoundsUi();
+
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         bool showOverlays = settings.value(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS,
                                            vc3d::settings::viewer::SHOW_AXIS_OVERLAYS_DEFAULT).toBool();
         QSignalBlocker blocker(chkAxisOverlays);
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
+    }
+    // Deliberately not persisted: the coordinate frame gizmo is on by default
+    // every session, matching the checkbox's designer state.
+    if (auto* chkCoordinateFrames = ui.chkCoordinateFrames) {
+        connect(chkCoordinateFrames, &QCheckBox::toggled, this, [](bool show) {
+            for (auto* manager : ViewerManager::allManagers()) {
+                if (manager) {
+                    manager->setShowCoordinateFrames(show);
+                }
+            }
+        });
     }
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
@@ -8666,7 +8739,8 @@ bool CWindow::OpenVolume(const QString& path,
     std::shared_ptr<VolumePkg> package;
     QString loadError;
     try {
-        package = VolumePkg::load(aVpkgPath.toStdString());
+        vc::project::LoadOptions options;
+        package = VolumePkg::load(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
         loadError = QString::fromUtf8(e.what());
@@ -10197,6 +10271,104 @@ void CWindow::onManualLocationChanged()
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();
     }
+}
+
+void CWindow::refreshFocusBoundsUi()
+{
+    if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
+        return;
+    }
+
+    std::optional<Rect3D> bounds = _state ? _state->focusBounds() : std::nullopt;
+    if (!bounds && _state && _state->currentVolume()) {
+        const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+        bounds = Rect3D{{0.0f, 0.0f, 0.0f},
+                        {static_cast<float>(std::max(0, width - 1)),
+                         static_cast<float>(std::max(0, height - 1)),
+                         static_cast<float>(std::max(0, depth - 1))}};
+    }
+
+    const QSignalBlocker checkBlocker(ui.chkFocusBBox);
+    const QSignalBlocker minBlocker(ui.focusBBoxMin);
+    const QSignalBlocker maxBlocker(ui.focusBBoxMax);
+    ui.chkFocusBBox->setChecked(_state && _state->focusBoundsEnabled());
+    const bool haveVolume = _state && _state->currentVolume();
+    ui.chkFocusBBox->setEnabled(haveVolume);
+    ui.focusBBoxMin->setEnabled(haveVolume);
+    ui.focusBBoxMax->setEnabled(haveVolume);
+    if (!bounds) {
+        ui.focusBBoxMin->clear();
+        ui.focusBBoxMax->clear();
+        return;
+    }
+    const auto formatPoint = [](const cv::Vec3f& point) {
+        return QStringLiteral("%1, %2, %3")
+            .arg(static_cast<int>(std::lround(point[0])))
+            .arg(static_cast<int>(std::lround(point[1])))
+            .arg(static_cast<int>(std::lround(point[2])));
+    };
+    ui.focusBBoxMin->setText(formatPoint(bounds->low));
+    ui.focusBBoxMax->setText(formatPoint(bounds->high));
+}
+
+void CWindow::onFocusBoundsEdited()
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto parsePoint = [](const QString& text) -> std::optional<cv::Vec3f> {
+        const QStringList parts = text.trimmed().split(',');
+        if (parts.size() != 3) {
+            return std::nullopt;
+        }
+        cv::Vec3f point;
+        for (int axis = 0; axis < 3; ++axis) {
+            bool ok = false;
+            const int value = parts[axis].trimmed().toInt(&ok);
+            if (!ok) {
+                return std::nullopt;
+            }
+            point[axis] = static_cast<float>(value);
+        }
+        return point;
+    };
+
+    auto low = parsePoint(ui.focusBBoxMin->text());
+    auto high = parsePoint(ui.focusBBoxMax->text());
+    if (!low || !high) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f volumeHigh{
+        static_cast<float>(std::max(0, width - 1)),
+        static_cast<float>(std::max(0, height - 1)),
+        static_cast<float>(std::max(0, depth - 1))};
+    for (int axis = 0; axis < 3; ++axis) {
+        (*low)[axis] = std::clamp((*low)[axis], 0.0f, volumeHigh[axis]);
+        (*high)[axis] = std::clamp((*high)[axis], 0.0f, volumeHigh[axis]);
+    }
+    _state->setFocusBounds(Rect3D{*low, *high});
+    refreshFocusBoundsUi();
+}
+
+void CWindow::onFocusBoundsToggled(bool enabled)
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+    if (enabled && !_state->focusBounds()) {
+        onFocusBoundsEdited();
+        if (!_state->focusBounds()) {
+            refreshFocusBoundsUi();
+            return;
+        }
+    }
+    _state->setFocusBoundsEnabled(enabled);
 }
 
 void CWindow::onZoomIn()

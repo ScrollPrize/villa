@@ -35,6 +35,8 @@ set(srcs
     FiberMapWorkspace.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
+    FiberWindingSolver.cpp
+    FiberWindingSolver.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
     AnnotationFrame.hpp
@@ -105,7 +107,6 @@ set(srcs
     elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
-    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
