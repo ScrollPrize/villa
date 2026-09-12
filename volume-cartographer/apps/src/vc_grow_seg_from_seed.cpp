@@ -11,6 +11,7 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/util/OpenMPConfig.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
@@ -203,6 +204,12 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
 
 int main(int argc, char *argv[])
 {
+    // Must happen before the first parallel region. See OpenMPConfig.hpp:
+    // a static initializer in OpenCV turns on dynamic team sizing, which
+    // makes libgomp shrink every team -- to a single thread once the load
+    // average reaches the thread cap -- regardless of "thread_limit".
+    vc::core::util::disableOpenMPDynamicTeams();
+
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
     Json params;
