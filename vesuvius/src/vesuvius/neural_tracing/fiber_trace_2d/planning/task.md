@@ -7,3 +7,9 @@ continuation at601600 and resume it afterward. Print full per-scroll and pooled
 raw/EMA statistics for all three matched-budget conditions, retaining500k as
 supplementary history. Best selection includes the parent run, never later-than-
 cutoff snapshots.
+
+Report refinement: include the saved classic baseline and give each scroll20%
+weight in the overall score (arithmetic mean of per-scroll mean segment lengths).
+Do not show the old pooled overall score in the new report. Preserve per-scroll
+raw/EMA distributions and distinguish classic's longer training budget. This is
+reporting only; do not change or stop the active training.

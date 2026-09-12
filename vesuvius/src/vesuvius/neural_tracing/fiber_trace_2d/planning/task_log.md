@@ -1,5 +1,16 @@
 # Short training comparison log
 
+- Reporting refinement: re-audited classic100directions; verified same five
+  scrolls, counts and reference lengths against all six modern evaluations.
+  New report uses only equal-scroll arithmetic mean (20% each) for overall score;
+  preserves per-scroll distributions and highlights best/tied values per metric.
+  Scores: Classic5.722681, NMLraw2.482426/EMA3.053523,
+  JSONraw4.930175/EMA6.307615, combinedraw5.367841/EMA6.202080mm.
+  JSONEMA now ranks first. Saved docs/training_sample_comparison_equal_scroll.md;
+  old pooled score omitted there. No GPU work or active-training changes.
+  Independent review checked all210 per-scroll cells/highlights and seven macro
+  scores against source data: no errors. git diff --check passed.
+
 - Corrected combined601600 evaluation complete: raw3.025668mm/2571restarts;
   EMA0.99 3.986955mm/1927restarts. Both chosen at4600/588800 by test loss;
   both completed100directions and independent raw-artifact audits. All matched-

@@ -12,3 +12,4 @@
 - [x] Independent follow-up review and eight CPU controller tests.
 - [x] Finish two managed combined601600 evaluations and resume training.
 - [x] Report complete per-scroll/raw/EMA matched-budget comparison.
+- [x] Add classic and equal20%-per-scroll report, omit pooled score and bold best/ties.

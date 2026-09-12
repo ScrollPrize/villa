@@ -25,6 +25,18 @@ No model/loss numerics or manager protocol changes. Optional explicit sampling g
 
 ## Docs updates
 
+### Equal-scroll report refinement
+
+Re-audit classic's saved100-direction artifacts with the existing helper. Verify
+identical scroll identities, direction counts and reference lengths across all
+seven evaluations. Compute score=sum(per-scroll mean segment mm)/5; do not average
+percentiles or include the old pooled score in the new report. Write a separate
+classic+raw/EMA comparison document including per-scroll distributions, sample
+counts, checkpoint provenance and unequal classic training-budget caveat. Validate
+every per-scroll mean against length/(restarts+directions), then independently
+review calculations/interpretation. No training or production evaluator changes,
+GPU use or inference reruns; retain original audit artifacts as source evidence.
+
 Document stop control and comparison commands/checkpoint provenance/results.
 
 ## Validation
