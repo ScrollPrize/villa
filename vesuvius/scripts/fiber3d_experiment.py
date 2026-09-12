@@ -92,21 +92,26 @@ def evaluate_frozen(selection, template, output):
 EMA_SERIES = [('current999', 'current_ema_0p999.pt', 0.999),
               ('best999', 'best_ema_0p999.pt', 0.999),
               ('best99', 'best_ema_0p99.pt', 0.99)]
+SNAPSHOT_VARIANTS = [*EMA_SERIES, ('current99', 'current_ema_0p99.pt', 0.99),
+                     ('current', 'current.pt', None)]
 
 
-def freeze_ema_selection(run, filename, decay, cache):
+def freeze_snapshot_selection(run, filename, decay, cache):
     import math
     import torch
     from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
     path = run / 'snapshots' / filename
     frozen, digest = freeze_checkpoint(path, cache)
     payload = torch.load(frozen, map_location='cpu', weights_only=True, mmap=True)
-    expected_metric = 'test_' + filename.split('_', 1)[1][:-3] + '/loss_total'
-    if (payload.get('snapshot_kind') != 'ema' or
-            payload.get('ema_metadata', {}).get('decay') != decay or
-            payload.get('metric_name') != expected_metric or
+    expected_metric = ('test/loss_total' if decay is None else
+                       'test_' + filename.split('_', 1)[1][:-3] + '/loss_total')
+    kind_matches = ((payload.get('snapshot_kind') in (None, 'raw') and
+                     'ema_metadata' not in payload) if decay is None else
+                    (payload.get('snapshot_kind') == 'ema' and
+                     payload.get('ema_metadata', {}).get('decay') == decay))
+    if (not kind_matches or payload.get('metric_name') != expected_metric or
             not math.isfinite(float(payload['metric']))):
-        raise ValueError(f'EMA snapshot metadata mismatch: {path}')
+        raise ValueError(f'snapshot metadata mismatch: {path}')
     selected = dict(path=str(path), metric=float(payload['metric']), metric_name=payload['metric_name'],
                     step=int(payload['step']), samples=int(payload['samples_seen']), decay=decay)
     return dict(run=str(run), selected=selected, candidates=[selected],
@@ -116,12 +121,12 @@ def freeze_ema_selection(run, filename, decay, cache):
 def trace_series_prepare():
     from villa_gpu_manager.processes import process_state
     settings = json.loads(CONTROL.read_text())['trace_series']
-    available = {name: (name, filename, decay) for name, filename, decay in EMA_SERIES}
-    variants = settings.get('variants', list(available))
+    available = {name: (name, filename, decay) for name, filename, decay in SNAPSHOT_VARIANTS}
+    variants = settings.get('variants', [name for name, _, _ in EMA_SERIES])
     if (not isinstance(variants, list) or not variants or
             any(not isinstance(name, str) or name not in available for name in variants) or
             len(set(variants)) != len(variants)):
-        raise ValueError('variants must be a nonempty unique list of supported EMA names')
+        raise ValueError('variants must be a nonempty unique list of supported snapshot names')
     identity = json.loads((Path(settings['launch']) / 'controller.json').read_text())
     if process_state(identity, os.getuid()) != 'alive':
         raise RuntimeError('expected live training root; no automatic restart')
@@ -129,7 +134,7 @@ def trace_series_prepare():
     root.mkdir(parents=True, exist_ok=False)
     entries = []
     for name, filename, decay in (available[name] for name in variants):
-        selection = freeze_ema_selection(Path(settings['run']), filename, decay, root / 'frozen')
+        selection = freeze_snapshot_selection(Path(settings['run']), filename, decay, root / 'frozen')
         entries.append(dict(name=name, status='pending', selection=selection))
         print(f'frozen {name}: {selection}', flush=True)
     state = dict(settings=settings, training_identity=identity, entries=entries,

@@ -166,13 +166,29 @@ def test_exact_ema_freeze_reads_metadata_from_frozen_copy(runner, monkeypatch, t
         return dict(snapshot_kind='ema', ema_metadata={'decay':.999},
                     metric_name='test_ema_0p999/loss_total', metric=.3, step=100, samples_seen=12800)
     monkeypatch.setattr(torch, 'load', load)
-    result = runner.freeze_ema_selection(tmp_path, 'current_ema_0p999.pt', .999, tmp_path)
+    result = runner.freeze_snapshot_selection(tmp_path, 'current_ema_0p999.pt', .999, tmp_path)
     assert result['selected']['step'] == 100 and result['sha256'] == 'digest'
     with pytest.raises(ValueError, match='metadata'):
-        runner.freeze_ema_selection(tmp_path, 'best_ema_0p99.pt', .99, tmp_path)
+        runner.freeze_snapshot_selection(tmp_path, 'best_ema_0p99.pt', .99, tmp_path)
 
 
-@pytest.mark.parametrize('variants', [None, ['best99', 'best999']])
+def test_exact_raw_freeze_accepts_training_ema_state_not_ema_export(runner, monkeypatch, tmp_path):
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate
+    frozen = tmp_path / 'frozen.pt'
+    monkeypatch.setattr(live_evaluate, 'freeze_checkpoint', lambda *a: (frozen, 'digest'))
+    payload = dict(ema={'tracks':{}}, metric_name='test/loss_total', metric=.4,
+                   step=200, samples_seen=25600)
+    monkeypatch.setattr(torch, 'load', lambda *a, **kw: payload)
+    result = runner.freeze_snapshot_selection(tmp_path, 'current.pt', None, tmp_path)
+    assert result['selected']['decay'] is None
+    assert result['selected']['samples'] == 25600
+    payload['snapshot_kind'] = 'ema'
+    with pytest.raises(ValueError, match='metadata'):
+        runner.freeze_snapshot_selection(tmp_path, 'current.pt', None, tmp_path)
+
+
+@pytest.mark.parametrize('variants', [None, ['best99', 'best999'], ['current999', 'current99', 'current']])
 def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path, variants):
     import villa_gpu_manager.processes as processes
     launch = tmp_path / 'launch'
@@ -189,13 +205,15 @@ def test_series_prepares_all_exact_variants_without_training_mutations(runner, m
     def freeze(run, filename, decay, cache):
         seen.append((filename, decay))
         return {'frozen':filename}
-    monkeypatch.setattr(runner, 'freeze_ema_selection', freeze)
+    monkeypatch.setattr(runner, 'freeze_snapshot_selection', freeze)
     stop, start = Mock(side_effect=AssertionError('must not stop')), Mock(side_effect=AssertionError('must not restart'))
     monkeypatch.setattr(runner, 'stop_production_identity', stop)
     monkeypatch.setattr(runner, 'production_start', start)
     runner.trace_series_prepare()
     expected = ([('current_ema_0p999.pt', .999), ('best_ema_0p999.pt', .999), ('best_ema_0p99.pt', .99)]
-                if variants is None else [('best_ema_0p99.pt', .99), ('best_ema_0p999.pt', .999)])
+                if variants is None else
+                ([('best_ema_0p99.pt', .99), ('best_ema_0p999.pt', .999)] if variants[0] == 'best99' else
+                 [('current_ema_0p999.pt', .999), ('current_ema_0p99.pt', .99), ('current.pt', None)]))
     assert seen == expected
     assert [e['status'] for e in json.loads((tmp_path / 'series/series.json').read_text())['entries']] == ['pending'] * len(expected)
     stop.assert_not_called()
@@ -208,7 +226,7 @@ def test_series_invalid_variants_fail_before_freezing(runner, monkeypatch, tmp_p
     control.write_text(json.dumps({'trace_series':{'variants':variants}}))
     monkeypatch.setattr(runner, 'CONTROL', control)
     freeze = Mock(side_effect=AssertionError('must not freeze'))
-    monkeypatch.setattr(runner, 'freeze_ema_selection', freeze)
+    monkeypatch.setattr(runner, 'freeze_snapshot_selection', freeze)
     with pytest.raises(ValueError, match='variants'):
         runner.trace_series_prepare()
     freeze.assert_not_called()
@@ -288,6 +306,10 @@ def test_equal_scroll_report_and_bolding(runner, monkeypatch):
     doc = comparison_markdown(rows)
     assert '| B | **40.000** |' in doc
     assert '| B | **49** | **40.000** | **1.000** | **0.1000** | **10.000** | **0** |' in doc
+    rows[0]['selection'] = dict(selected=dict(step=1, samples=128, metric=.4), sha256='hash')
+    assert '| A | 1 | 128 | unknown | 0.400000 |' in comparison_markdown(rows)
+    rows[0]['selection']['selected']['decay'] = None
+    assert '| A | 1 | 128 | raw | 0.400000 |' in comparison_markdown(rows)
     rows[1]['metrics']['scrolls'][SCROLLS[0]]['directions'] = 2
     with pytest.raises(ValueError, match='coverage'):
         comparison_markdown(rows)

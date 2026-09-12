@@ -45,9 +45,8 @@ def comparison_markdown(rows):
     lines = ['# Equal-scroll tracing comparison', '',
              'Overall score: arithmetic mean of the five per-scroll means, **20% each**.',
              'Lengths are mm. Best/tied values are bold; old pooled overall scores are omitted.',
-             'Classic is longer-trained; NML/JSON/Combined raw/EMA rows use the600k cutoff.',
-             'Prior EMA series and new EMA rows use their separately recorded later-run checkpoints.',
-             'New EMA rows are frozen from the later training run; checkpoint ages are listed below.', '',
+             'Classic is longer-trained; modern checkpoint ages are recorded below or in their source reports.',
+             'This comparison does not match training budgets.', '',
              '## Overall', '', '| Model | Equal-scroll score ↑ |', '|---|---:|']
     for row, score in zip(rows, scores):
         lines.append(f"| {row['name']} | {cell(score, max(scores), 3)} |")
@@ -64,12 +63,13 @@ def comparison_markdown(rows):
                 best = (max if higher else min)(r['metrics']['scrolls'][scroll][key] for r in rows)
                 values.append(cell(row['metrics']['scrolls'][scroll][key], best, digits))
             lines.append(f"| {row['name']} | " + ' | '.join(values) + ' |')
-    lines += ['', '## New checkpoint provenance', '',
+    lines += ['', '## Checkpoint provenance', '',
               '| Label | Step | Samples | Decay | Test loss |', '|---|---:|---:|---:|---:|']
     for row in rows:
         if 'selection' in row:
             s = row['selection']['selected']
-            lines.append(f"| {row['name']} | {s['step']} | {s['samples']} | {s['decay']} | {s['metric']:.6f} |")
+            decay = s.get('decay', 'unknown')
+            lines.append(f"| {row['name']} | {s['step']} | {s['samples']} | {'raw' if decay is None else decay} | {s['metric']:.6f} |")
     lines += ['', '## Evaluation sources', '']
     for row in rows:
         lines.append(f"- {row['name']}: `{row['output']}`")
@@ -84,7 +84,11 @@ def series_report(state):
     rows = []
     for baseline in state['settings']['baselines']:
         summary = json.loads((Path(baseline['output']) / 'full/summary.json').read_text())
-        rows.append(dict(baseline, metrics=complete_report(summary)))
+        row = dict(baseline, metrics=complete_report(summary))
+        selection_path = Path(baseline['output']) / 'selection.json'
+        if selection_path.exists():
+            row['selection'] = json.loads(selection_path.read_text())
+        rows.append(row)
     for entry in state['entries']:
         if entry['status'] == 'done':
             rows.append(dict(name='New ' + entry['name'], output=entry['output'],
