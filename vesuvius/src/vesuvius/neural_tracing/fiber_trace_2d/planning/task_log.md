@@ -24,3 +24,7 @@
 - Old blur: isotropic sigma.5 always with aug; directional Bernoulli.5, fixed
   sigma_along1.5/across.25. Old validity mask is source coverage/bounds, used for
   image stats and final zeroing/negative-presence eligibility,not GTbackground.
+- Existing evaluation benchmark now accepts --checkpoint with strict state-dict
+  loading,for matched old/current evaluation on identical weights. CPU regression
+  run20260912_102303_668873:28passed22.38s. Historical current.pt expected
+  testangle19.782318deg atupdate19200; will verify evaluator before conclusions.

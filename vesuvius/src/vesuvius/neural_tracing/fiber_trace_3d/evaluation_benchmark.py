@@ -13,6 +13,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--evaluation-only", action="store_true")
     p.add_argument("--reference", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Evaluate saved weights instead of random initialization")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--backend", choices=("dataloader", "pipeline", "sync"), default="pipeline")
     p.add_argument("--devices", default="all")
@@ -62,6 +64,9 @@ class Worker:
             training, loader_sample_count=self.loader.sample_count, default_count=0)
         torch.manual_seed(int(training.get("initialization_seed", 0)))
         self.model = train.build_fiber_trace_3d_model(raw).to("cuda:0")
+        if self.options.get("checkpoint"):
+            snapshot = torch.load(self.options["checkpoint"], map_location="cpu", weights_only=False)
+            self.model.load_state_dict(snapshot["model"], strict=True)
         self.precision = train._mixed_precision_config_from_training(training, torch.device("cuda:0"))
         self.raw = raw
         self.indices = tuple(range(rank, (self.options["samples"] + self.config.batch_size - 1)
@@ -102,7 +107,8 @@ class Worker:
             conditioned_loss_options=train._conditioned_loss_options_from_training(self.raw["training"]),
             mixed_precision=self.precision, global_batch_indices=self.indices,
             batch_iterator=self.iterator, profile_times=times,
-            microbatch_size=self.options["microbatch_size"])
+            microbatch_size=self.options["microbatch_size"],
+            output_upsample=self.raw["training"].get("test_output_upsample"))
         torch.cuda.synchronize()
         elapsed = time.monotonic() - started
         if self.options["backend"] == "pipeline":
@@ -164,6 +170,7 @@ def main(argv=None):
         budget = min(20 * 1024**3, *(inventory["gpus"][gpu] for gpu in devices))
         grant = {"cpu_cores": args.cpu_workers, "gpus": {gpu: budget for gpu in devices}}
         options = vars(args) | {"reference": str(args.reference.resolve()), "output": str(args.output)}
+        options["checkpoint"] = str(args.checkpoint.resolve()) if args.checkpoint else None
         with ExclusiveTask(socket, grant, label="fiber-evaluation-profile", priority=100) as lease:
             with tempfile.TemporaryDirectory(prefix="fiber-eval-") as directory:
                 cohort = None

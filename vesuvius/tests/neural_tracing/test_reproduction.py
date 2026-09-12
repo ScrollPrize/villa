@@ -26,3 +26,11 @@ def test_historical_output_grid(mode):
     x = torch.ones(2,7,16,16,16)
     assert _model_output_stride(wrapped) == 1
     torch.testing.assert_close(wrapped(x), x)
+
+
+def test_checkpoint_evaluation_parser():
+    from vesuvius.neural_tracing.fiber_trace_3d.evaluation_benchmark import parser
+    args = parser().parse_args(['--reference','config.json','--output','/tmp/eval',
+                               '--checkpoint','weights.pt','--batch-size','8'])
+    assert args.checkpoint.name == 'weights.pt'
+    assert args.batch_size == 8
