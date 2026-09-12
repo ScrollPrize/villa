@@ -155,7 +155,7 @@ def summarize():
         for match in re.finditer(r'^test samples=(\d+) update=(\d+).*?angle_mean_deg=([\d.]+)',
                                  log.read_text(), re.MULTILINE):
             rows.append({'samples':int(match[1]), 'update':int(match[2]), 'angle':float(match[3])})
-        window = [r for r in rows if 200000 <= r['samples'] <= 300800]
+        window = [r for r in rows if 200000 <= r['samples'] <= 300000]
         report = {'experiment':folder.name, 'latest':rows[-1:] or None, 'window':window,
                   'window_mean':statistics.mean(r['angle'] for r in window) if window else None,
                   'window_median':statistics.median(r['angle'] for r in window) if window else None,

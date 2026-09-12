@@ -1,14 +1,23 @@
 {
-  "stage":"repro00_modern_oldtest",
-  "config":"vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro00_modern_oldtest.json",
-  "devices":[0,1,2,3,4,5,6,7],
-  "timeout_seconds":14400,
+  "stage": "repro00_modern_oldtest",
+  "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro00_modern_oldtest.json",
+  "devices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "timeout_seconds": 14400,
   "evaluation": {
-    "name":"historical-checkpoint-audit",
-    "config":"vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro_historical_evaluation.json",
-    "checkpoint":"/ephemeral/hendrik/fiber3d_train/runs/s1a_128_1_single_8x8_20260729_075013/snapshots/current.pt",
-    "batch_size":8,
-    "samples":128,
-    "overrides":{}
+    "name": "modern-current-evaluation",
+    "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_16x8.json",
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/reproduction/runs/repro00_modern_oldtest_20260912_101739/snapshots/current.pt",
+    "batch_size": 16,
+    "samples": 128,
+    "overrides": {}
   }
 }
