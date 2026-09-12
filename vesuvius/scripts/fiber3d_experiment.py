@@ -42,12 +42,17 @@ def trace_evaluate(settings=None):
     if settings is None:
         settings = json.loads(CONTROL.read_text())['trace_evaluation']
     run = Path(settings['run'])
-    paths = [run / 'snapshots/best.pt'] if settings['variant'] == 'raw' else sorted((run / 'snapshots').glob('best_ema_*.pt'))
+    runs = [run, *map(Path, settings.get('additional_runs', []))]
+    paths = [path for source in runs for path in (
+        [source / 'snapshots/best.pt'] if settings['variant'] == 'raw'
+        else sorted((source / 'snapshots').glob('best_ema_*.pt')))]
     if settings['variant'] not in ('raw', 'ema') or not paths:
         raise ValueError('need raw or ema selection and corresponding best snapshots')
     candidates = []
     for path in paths:
         payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+        if int(payload['samples_seen']) > int(settings.get('max_samples', 2**63 - 1)):
+            raise ValueError(f'checkpoint is beyond comparison cutoff: {path}')
         metric = float(payload['metric'])
         if not math.isfinite(metric):
             raise ValueError(f'nonfinite checkpoint metric: {path}')
@@ -75,6 +80,36 @@ def trace_evaluate(settings=None):
             subprocess.run([sys.executable, str(script), mode, '--config', str(config)],
                            cwd=ROOT, check=True, stdout=log, stderr=subprocess.STDOUT)
     return output
+
+
+def comparison_followup():
+    """Evaluate a completed sample-boundary stop, then continue the same run."""
+    settings = json.loads(CONTROL.read_text())['comparison_followup']
+    launch = Path(settings['launch'])
+    stopped = json.loads((launch / 'sample_stop_result.json').read_text())
+    if stopped['snapshot_samples'] != settings['max_samples']:
+        raise ValueError('follow-up stop does not match requested sample boundary')
+    from villa_gpu_manager.processes import process_state
+    if process_state(stopped['identity'], os.getuid()) != 'dead':
+        raise RuntimeError('follow-up training root has not stopped')
+    root = Path(settings['output'])
+    root.mkdir(parents=True, exist_ok=False)
+    report = {'stop': stopped, 'evaluations': []}
+    for variant in ('raw', 'ema'):
+        output = trace_evaluate(dict(run=stopped['run'], additional_runs=[settings['parent_run']],
+            variant=variant, max_samples=settings['max_samples'], template=settings['template'],
+            output=str(root / variant)))
+        script = ROOT / 'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/trace_restart_analysis_20260911.py'
+        audit = subprocess.check_output([sys.executable, str(script), str(output / 'full')], cwd=ROOT, text=True)
+        (output / 'trace_audit.json').write_text(audit)
+        report['evaluations'].append(dict(variant=variant, output=str(output),
+            selection=json.loads((output / 'selection.json').read_text()), metrics=json.loads(audit)))
+        (root / 'report.json').write_text(json.dumps(report, indent=2))
+    folder, process = production_start(settings['continuation_config'],
+        resume=Path(stopped['run']) / 'snapshots/current.pt')
+    report['continuation'] = {'launch': str(folder), 'pid': process.pid}
+    (root / 'report.json').write_text(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2), flush=True)
 
 
 def production_start(config_path=None, resume=None):
@@ -528,7 +563,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -538,6 +573,8 @@ def main():
         trace_evaluate()
     elif args.command == 'comparison':
         comparison()
+    elif args.command == 'comparison-followup':
+        comparison_followup()
     elif args.command == 'production-start':
         production_start()
     elif args.command == 'production-status':

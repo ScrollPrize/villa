@@ -95,3 +95,62 @@ def test_campaign_failure_stops_owned_detached_training(runner, monkeypatch, tmp
         runner.comparison()
     stopped.assert_called_once_with(identity)
     assert 'injected' in json.loads((tmp_path / 'campaign/comparison.json').read_text())['error']
+
+
+@pytest.mark.parametrize('variant', ['raw', 'ema'])
+def test_followup_selection_includes_parent_and_enforces_cutoff(runner, monkeypatch, tmp_path, variant):
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate
+    name = 'best.pt' if variant == 'raw' else 'best_ema_0p99.pt'
+    for source in ('parent', 'continued'):
+        snapshots = tmp_path / source / 'snapshots'
+        snapshots.mkdir(parents=True)
+        (snapshots / name).touch()
+    template = tmp_path / 'template.json'
+    template.write_text(json.dumps({'evaluation':{}}))
+    settings = dict(run=str(tmp_path / 'continued'), additional_runs=[str(tmp_path / 'parent')],
+        variant=variant, max_samples=601600, template=str(template), output=str(tmp_path / 'eval'))
+    def load(path, **kwargs):
+        parent = path.parent.parent.name == 'parent'
+        return dict(metric=1 if parent else 2, step=3900 if parent else 4700,
+            samples_seen=499200 if parent else 601600,
+            metric_name='test/loss_total' if variant == 'raw' else 'test_ema_0p99/loss_total')
+    monkeypatch.setattr(torch, 'load', load)
+    monkeypatch.setattr(live_evaluate, 'freeze_checkpoint', lambda path, dest: (path, 'sha'))
+    monkeypatch.setattr(runner.subprocess, 'run', Mock())
+    runner.trace_evaluate(settings)
+    selection = json.loads((tmp_path / 'eval/selection.json').read_text())
+    assert len(selection['candidates']) == 2
+    assert selection['selected']['samples'] == 499200
+    settings['max_samples'] = 600000
+    with pytest.raises(ValueError, match='cutoff'):
+        runner.trace_evaluate(settings)
+
+
+def test_followup_resumes_raw_current_only_after_both_audits(runner, monkeypatch, tmp_path):
+    import villa_gpu_manager.processes as processes
+    launch = tmp_path / 'launch'
+    launch.mkdir()
+    (launch / 'sample_stop_result.json').write_text(json.dumps(
+        dict(snapshot_samples=601600, run=str(tmp_path / 'continued'), identity={'pid':123})))
+    settings = dict(launch=str(launch), max_samples=601600, parent_run='parent',
+        template='template', output=str(tmp_path / 'eval'), continuation_config='continue.json')
+    control = tmp_path / 'control.json'
+    control.write_text(json.dumps({'comparison_followup':settings}))
+    monkeypatch.setattr(runner, 'CONTROL', control)
+    monkeypatch.setattr(processes, 'process_state', lambda *a: 'dead')
+    calls = []
+    def evaluate(options):
+        calls.append(options['variant'])
+        output = Path(options['output'])
+        output.mkdir()
+        (output / 'selection.json').write_text('{}')
+        return output
+    monkeypatch.setattr(runner, 'trace_evaluate', evaluate)
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **kw: '{}')
+    def start(config, resume):
+        assert calls == ['raw', 'ema']
+        assert resume == tmp_path / 'continued/snapshots/current.pt'
+        return tmp_path / 'next', Mock(pid=456)
+    monkeypatch.setattr(runner, 'production_start', start)
+    runner.comparison_followup()

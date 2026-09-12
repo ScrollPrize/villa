@@ -50,8 +50,16 @@
     "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json"
   },
   "production_stop": {
-    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/s1a_nml_128_sd1_16x8_ema-20260912_111218",
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_155840",
     "samples": 600000
+  },
+  "comparison_followup": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_155840",
+    "parent_run": "/ephemeral/hendrik/fiber3d_train2/runs/compare_5scroll_s1a_128_sd1_16x8_ema_500k_20260912_142427",
+    "max_samples": 601600,
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
     "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json"

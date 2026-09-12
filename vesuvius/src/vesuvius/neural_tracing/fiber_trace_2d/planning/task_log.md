@@ -1,5 +1,29 @@
 # Short training comparison log
 
+- Corrected combined601600 evaluation complete: raw3.025668mm/2571restarts;
+  EMA0.99 3.986955mm/1927restarts. Both chosen at4600/588800 by test loss;
+  both completed100directions and independent raw-artifact audits. All matched-
+  budget per-scroll/distribution/provenance tables saved in docs/training_sample_comparison.md.
+- CombinedEMA beats JSONEMA pooledmean22.0%, but gain mainlyParis4; JSONEMA
+  remains better on0139/0332/1451. Do not imply uniform improvement acrossscrolls.
+- Follow-up runner exited0 and launched managed continuation root1975660 from
+  saved4700 rawcurrent, optimizer/EMA retained, LR.01/2Mupdates. Launch164113.
+- Independent code review found no current blocker. Reusable-controller limits:
+  missing continuation rawbest fails loudly even with valid parent; resume trusts
+  identity-bound verified stop record. Neither applies to this completed run.
+
+- Initial six evaluations completed: mean segment mm raw/EMA: NML1.81976/2.20086,
+  JSON2.75070/3.26792, combined500k2.19369/3.69527. Combined won and resumed
+  from raw3900 state (optimizer/all EMA retained), not EMA export weights.
+- User corrected combined500k typo to600k. Earlier conversational promise had
+  not armed a watcher; corrected now before cutoff. Identity-bound watcher
+  verified601600/update4700 snapshots and stopped continuation root1798618.
+- Follow-up controller reuses managed evaluation, includes parent/continuation
+  best candidates and rejects beyond-cutoff snapshots; resumes raw current only
+  after both audits. Independent review completed. CPU tests8passed1.60s.
+- Full per-scroll/raw/EMA report requested, including pooled distributions, not
+  averages of per-scroll percentiles. Two additional evaluations now running.
+
 - Active S1a EMA run20260912_111221 at460800samples/update3600. Next scheduled evaluation above600k is4700updates=601600samples.
 - Third condition repeats five-scroll; requested clarification. No speculative dataset selected.
 - Reuse50fiber/100direction workflow documented in docs/benchmarks/collection_182306_latest_best_full_20260912.md.
