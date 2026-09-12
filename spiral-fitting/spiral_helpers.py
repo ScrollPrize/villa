@@ -147,16 +147,40 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
-def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
+def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
-    # JSONs. line_points is the dense traced polyline; the control points lie
-    # exactly on it, and the tracer extends it ~150 points past the first and
+    # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
+    # is the dense traced polyline; the control points lie exactly on it, and the tracer extends it ~150 points past the first and
     # last control point. We fit against the dense polyline, trimmed to the
     # first-to-last control point span so the dangling ends don't act as
     # constraints.
     with open(path, 'r') as f:
         data = json.load(f)
+
+    source_shape = data.get('coordinate_base_shape_zyx')
+    if source_shape is not None:
+        for name, shape in (('coordinate_base_shape_zyx', source_shape),
+                            ('base_shape_zyx', base_shape_zyx)):
+            if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
+                           or v <= 0 for v in shape)):
+                raise ValueError(f'{name} must contain three positive integers')
+        # Match VC3D's published domains: pyramids may round extents up or
+        # down, and same-level shapes may use inclusive maximum coordinates.
+        # Use the dyadic scale, not a ratio of rounded dimensions.
+        scales = []
+        for exponent in range(-5, 6):
+            factor = 2 ** abs(exponent)
+            large, small = ((source_shape, base_shape_zyx) if exponent <= 0
+                            else (base_shape_zyx, source_shape))
+            if all((abs(a - b) <= 1 if exponent == 0 else
+                    b in ((a + factor - 1) // factor, max(1, a // factor)))
+                   for a, b in zip(large, small)):
+                scales.append(2.0 ** exponent)
+        if len(scales) != 1:
+            raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
+        coordinate_scale = scales[0]
 
     if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
@@ -269,7 +293,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     return collection
 
 
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
     if not path:
         return {}, next_id
     fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
@@ -282,7 +306,9 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
     skipped = 0
     for fiber_path in fiber_paths:
         try:
-            pcl = load_fiber_point_collection(fiber_path, next_id, min_point_spacing=min_point_spacing)
+            pcl = load_fiber_point_collection(
+                fiber_path, next_id, min_point_spacing=min_point_spacing,
+                base_shape_zyx=base_shape_zyx)
         except Exception as e:
             print(f'WARNING: failed to load fiber {fiber_path}: {e}')
             skipped += 1

@@ -67,6 +67,36 @@ class FiberPointCollectionTests(unittest.TestCase):
             points = [point["p"] for point in collection["points"].values()]
             np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
 
+    def test_declared_coordinate_domain_overrides_legacy_scale(self):
+        for shape, expected_scale in (([101, 201, 301], 1),
+                                      ([100, 200, 300], 1),
+                                      ([202, 402, 602], .5),
+                                      ([403, 803, 1203], .25),
+                                      ([405, 805, 1205], .25),
+                                      ([51, 101, 151], 2)):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as directory:
+                path = self._write_fiber(directory, {
+                    "control_points": [[4, 8, 12], [20, 24, 28]],
+                    "line_points": [],
+                    "coordinate_base_shape_zyx": shape,
+                })
+                pcl = load_fiber_point_collection(
+                    path, 7, min_point_spacing=0,
+                    base_shape_zyx=[101, 201, 301])
+                np.testing.assert_array_equal(
+                    [point['p'] for point in pcl['points'].values()],
+                    np.array([[4, 8, 12], [20, 24, 28]]) * expected_scale)
+
+    def test_declared_coordinate_domain_requires_compatible_dataset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_fiber(directory, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "coordinate_base_shape_zyx": [100, 200, 300],
+            })
+            for shape in (None, [100, 100, 300], [0, 200, 300]):
+                with self.subTest(shape=shape), self.assertRaises(ValueError):
+                    load_fiber_point_collection(path, 7, base_shape_zyx=shape)
+
     def test_skips_fibers_without_control_points(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self._write_fiber(temporary, {

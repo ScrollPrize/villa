@@ -604,6 +604,7 @@ class ServiceState:
         # source snapshots.
         self._committing_inputs = set()
         self._committing_fiber_revisions = set()
+        self._incorporating_fiber_revisions = {}
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
@@ -1565,7 +1566,7 @@ class ServiceState:
             # records; the ledger maps them back to its own entries when the
             # incorporation outcome arrives.
             claimed = self.ephemeral_records.claim_pending()
-            pending = [record.payload() for record in claimed]
+            pending = self._snapshot_incorporation_locked(claimed)
 
             def mark_incorporated(records, error=None, outcomes=None,
                                   no_future_step=False):
@@ -1589,6 +1590,7 @@ class ServiceState:
             target = session.run(iterations, **run_arguments)
         except BaseException:
             with self.lock:
+                self._release_incorporation_locked(pending)
                 self.ephemeral_records.return_pending(claimed)
                 self._active_run_influence = None
             raise
@@ -2377,6 +2379,26 @@ class ServiceState:
             args=(generation,), name="spiral-live-inputs", daemon=True,
         ).start()
 
+    def _snapshot_incorporation_locked(self, records):
+        """Pin immutable payload revisions while their runtime commands own them."""
+        payloads = [record.payload() for record in records]
+        for payload in payloads:
+            if payload.get("kind") == "fiber":
+                key = (payload["id"], payload.get("revision"))
+                self._incorporating_fiber_revisions[key] = (
+                    self._incorporating_fiber_revisions.get(key, 0) + 1)
+        return payloads
+
+    def _release_incorporation_locked(self, payloads):
+        for payload in payloads:
+            if payload.get("kind") == "fiber":
+                key = (payload["id"], payload.get("revision"))
+                count = self._incorporating_fiber_revisions.get(key, 0)
+                if count > 1:
+                    self._incorporating_fiber_revisions[key] = count - 1
+                else:
+                    self._incorporating_fiber_revisions.pop(key, None)
+
     def _finish_incorporation(self, records, *, error=None, outcomes=None,
                               no_future_step=False):
         """Apply a runtime outcome; persistence remains non-fatal."""
@@ -2388,6 +2410,7 @@ class ServiceState:
             if record.get("committed_collection_ids") is not None
         }
         with self.lock:
+            self._release_incorporation_locked(records)
             resolved = self.ephemeral_records.resolve(records)
             if no_future_step:
                 self.ephemeral_records.return_pending(resolved)
@@ -2454,12 +2477,14 @@ class ServiceState:
                 running = (session is not None
                            and session.status().get("state")
                            == SessionState.Running)
+                payloads = (self._snapshot_incorporation_locked(batch)
+                            if running and hasattr(session, "incorporate_live")
+                            else [])
             if not running or not hasattr(session, "incorporate_live"):
                 with self.lock:
                     self.ephemeral_records.return_pending(batch)
                     self.status_generation += 1
                 continue
-            payloads = [record.payload() for record in batch]
             try:
                 result = session.incorporate_live(payloads, influence)
             except Exception as exc:
@@ -2490,6 +2515,10 @@ class ServiceState:
             protected.update(
                 revision for input_id, revision
                 in self._committing_fiber_revisions
+                if input_id == record.id)
+            protected.update(
+                revision for input_id, revision
+                in self._incorporating_fiber_revisions
                 if input_id == record.id)
             directory = Path(record.path).parent
             if not directory.is_dir():

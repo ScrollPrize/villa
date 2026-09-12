@@ -449,3 +449,22 @@ def test_visualisation_slice_count_is_read_live():
         fit_spiral.FitContext._MODEL_STAGE_ATTRIBUTES)
     assert 'output_num_slices_for_visualization' in inspect.getsource(
         fit_spiral.FitContext._prepare_png_visualization_inputs)
+
+
+def test_pending_committed_addition_is_not_duplicated_after_role_enable(tmp_path):
+    context = _role_context(tmp_path, input_use_pcl_same_winding=False)
+    points = [[0, 0, 10], [4, 0, 12], [8, 0, 14]]
+    _pcl_document(tmp_path / "same_windings.json", 5, points)
+    upload = _pcl_document(tmp_path / "upload.json", 9, points)
+    with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+            mock.patch.object(torch.cuda, "set_rng_state_all"):
+        context.apply_config({"input_use_pcl_same_winding": True}, current_iteration=0)
+        next_id = context.next_id
+        context._incorporate_prevalidated_interactive_inputs(
+            [{"kind": "pcl", "id": "pending-upload", "path": upload,
+              "role": "same_winding", "committed_collection_ids": {"9": 5}}],
+            {"influence_enabled": False})
+    assert len(context.regular_pcl_catalog) == 1
+    assert len(context.unattached_pcl_strips) == 1
+    assert context.next_id == next_id
+    assert context.unattached_pcl_strips[0]["logical_input_id"] == "5"

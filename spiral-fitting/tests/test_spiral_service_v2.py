@@ -3145,6 +3145,30 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(status["ephemeral_inputs"][0]["kind"], "fiber")
         self.assertTrue(status["ephemeral_inputs"][0]["auto_commit"])
 
+    def test_cleanup_retains_every_inflight_fiber_revision(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        revisions = [first]
+        for generation in (2, 3):
+            document = json.loads(FIBER_FILES["fiber.json"])
+            document["generation"] = generation
+            revisions.append(self.state.finalize_upload(_upload_input(
+                self.state, "fiber", "fiber-9",
+                {"fiber.json": json.dumps(document).encode()},
+                base_revision=revisions[-1]["revision"]))["input"])
+            if generation == 2:
+                with self.state.lock:
+                    live = self.state._snapshot_incorporation_locked([record])
+        live_path = Path(live[0]["path"])
+        mark(pending)
+        self.assertTrue(live_path.is_file())
+        self.assertEqual(json.loads(live_path.read_text())["generation"], 2)
+        self.state._finish_incorporation(live, error="test failure")
+        self.assertFalse(live_path.exists())
+        self.assertEqual(self.state._incorporating_fiber_revisions, {})
+
     def test_committed_fiber_revision_auto_commits_after_incorporation(self):
         first = self._finalize("fiber", "fiber-9", FIBER_FILES)
         record = self.state.ephemeral_records.find("fiber", "fiber-9")

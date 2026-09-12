@@ -1885,6 +1885,7 @@ class FitContext:
             self.fibers_path,
             next_id,
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+            base_shape_zyx=getattr(self, 'base_shape_zyx', None),
         )
         # All fibers (horizontal, vertical, and merged link components) form one
         # sampling group, rather than one group per source file like the regular pcls.
@@ -4043,7 +4044,8 @@ class FitContext:
                 raise ValueError('fiber inputs are disabled for this session')
             pcl = load_fiber_point_collection(
                 path, self.next_id,
-                min_point_spacing=self.config['pcl_fiber_min_point_spacing'])
+                min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+                base_shape_zyx=getattr(self, 'base_shape_zyx', None))
             if pcl is None:
                 raise ValueError(f'Fiber {input_id!r} has no usable control points')
             groups = ['fibers']
@@ -4380,7 +4382,8 @@ class FitContext:
                     pcl = load_fiber_point_collection(
                         path, collection_id,
                         min_point_spacing=self.config[
-                            'pcl_fiber_min_point_spacing'])
+                            'pcl_fiber_min_point_spacing'],
+                        base_shape_zyx=getattr(self, 'base_shape_zyx', None))
                     if pcl is None:
                         raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
                     pcl['source_file'] = path
@@ -4415,6 +4418,18 @@ class FitContext:
                         continue
                     committed_ids = record.get('committed_collection_ids')
                     for source_key, pcl in loaded.items():
+                        committed_id = (committed_ids or {}).get(str(source_key))
+                        if (editable_role and committed_id is not None
+                                and record.get('operation') not in (
+                                    'replace_collection', 'delete_collection')
+                                and any(_logical_identity(item.get('metadata', {}))
+                                        == (role, str(committed_id))
+                                        for item in (
+                                            list(getattr(self, 'regular_pcl_catalog', {}).values())
+                                            + list(new_regular_collections.values())))):
+                            # Enabling the role may already have loaded this
+                            # committed addition from its dataset document.
+                            continue
                         replacement = (
                             editable_role
                             and record.get('operation') == 'replace_collection')
