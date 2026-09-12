@@ -275,6 +275,19 @@ dimensions differ from the Spiral grid. If flattening or artifact mapping
 fails, the service reports the publication error and VC3D keeps displaying the
 previous successfully published preview.
 
+Every checkpoint and every raw preview export carry a content digest of the
+model state that placed the surface (`model_state_sha256`: live parameters,
+frozen constraint-bake epochs and run window). The service records each
+published preview under that digest in
+`<output>/.spiral-published/preview-index.json`. When the fitter reports that
+its resident model equals a checkpoint - after a save, an in-session load or a
+startup resume - the service re-shows the flattened surface it already
+published for that digest instead of waiting for a new export and flatten, and
+pins that surface against the fixed-count preview retention for as long as the
+checkpoint file exists. A checkpoint saved without a published preview, or one
+whose preview has already been pruned, gets nothing back; request a preview as
+before.
+
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.

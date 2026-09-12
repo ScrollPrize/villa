@@ -1302,16 +1302,30 @@ def _build_spliced_overlay(
     dr_per_winding,
     patch_atlas,
     patch_evaluation,
+    *,
+    first_winding=0,
 ):
+    """Overwrite ``scroll_zyxs`` with patch geometry wherever a patch that
+    passes the splicing profile covers the grid.
+
+    ``scroll_zyxs`` is ``[z, theta, 3]`` over the windings
+    ``first_winding .. first_winding + len(num_thetas_by_winding) - 1``
+    laid side by side along the theta axis; ``num_thetas_by_winding[k]``
+    is the theta count of winding ``first_winding + k``.
+    """
     started = time.perf_counter()
     device = scroll_zyxs.device
     dr = dr_per_winding.detach()
-    num_windings = len(num_thetas_by_winding)
+    first_winding = int(first_winding)
+    num_windings = first_winding + len(num_thetas_by_winding)
+    # Index the offset/count tables by absolute winding: windings below the
+    # grid's first one have no columns and are excluded from eligibility.
+    num_thetas_full = [0] * first_winding + [int(n) for n in num_thetas_by_winding]
     winding_offsets_t = torch.cat([
         torch.zeros([1], dtype=torch.long, device=device),
-        torch.cumsum(torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device), dim=0),
+        torch.cumsum(torch.tensor(num_thetas_full, dtype=torch.long, device=device), dim=0),
     ])
-    num_thetas_t = torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device)
+    num_thetas_t = torch.tensor(num_thetas_full, dtype=torch.long, device=device)
 
     profile = patch_evaluation.profiles['splicing']
     eligible_patches = (profile.satisfied_patches
@@ -1319,7 +1333,7 @@ def _build_spliced_overlay(
     packed_patch_indices = patch_evaluation.patch_indices
     target_winding_cpu = patch_evaluation.target_winding_indices.cpu()
     eligible = (eligible_patches[packed_patch_indices]
-                & (target_winding_cpu >= 0)
+                & (target_winding_cpu >= first_winding)
                 & (target_winding_cpu < num_windings))
     eligible_indices = torch.where(eligible)[0]
     if eligible_indices.numel() == 0:
@@ -1500,6 +1514,8 @@ def save_combined_preview(
     base_shape_zyx=None,
     progress=None,
     input_extent_transform=None,
+    patch_atlas=None,
+    patch_satisfaction_evaluation=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna.
 
@@ -1517,6 +1533,15 @@ def save_combined_preview(
     derived: after a constraint-bake reset the resident inputs live in baked
     space and are read through the live chain, while the surface is pulled
     back through the composed frozen+live chain.
+
+    When ``patch_satisfaction_evaluation`` (from
+    ``evaluate_patch_satisfaction_packed`` with the splicing profile) and its
+    ``patch_atlas`` are given, the transformed surface is spliced onto the
+    satisfied patches exactly as the final ``_spliced`` meshes are: wherever
+    such a patch covers the grid, its own geometry replaces the model's. The
+    caller passes ``None`` only when the resident patches are not in true
+    scroll space (after a constraint bake), where splicing would write
+    baked-space coordinates into a scroll-space surface.
     """
     if input_extent_transform is None:
         input_extent_transform = slice_to_spiral_transform
@@ -1561,14 +1586,14 @@ def save_combined_preview(
         dtype=torch.float32,
         device=dr_per_winding.device,
     )
-    winding_grids = {}
-    total_windings = last_winding - first_winding + 1
+    preview_windings = list(range(first_winding, last_winding + 1))
+    winding_scrolls = []
+    total_windings = len(preview_windings)
     if progress is not None:
         progress.begin(
             'exporting_preview', 'Transforming preview windings',
             step=0, total_steps=total_windings, unit='windings')
-    for winding_number, winding in enumerate(
-            range(first_winding, last_winding + 1), start=1):
+    for winding_number, winding in enumerate(preview_windings, start=1):
         yxs = spiral_yxs_by_winding[winding]
         if yxs.shape[0] < 2:
             raise RuntimeError(f'Preview winding {winding} has fewer than two theta samples')
@@ -1583,9 +1608,32 @@ def save_combined_preview(
         scroll = torch.cat(pieces, dim=0).reshape_as(spiral)
         outside = (scroll[..., 0] < z_begin) | (scroll[..., 0] >= z_end)
         scroll[outside] = -1.0
-        winding_grids[winding] = scroll.cpu().numpy().astype(np.float32)
+        winding_scrolls.append(scroll)
         if progress is not None:
             progress.update(winding_number, detail=f'winding {winding}')
+
+    if patch_satisfaction_evaluation is not None:
+        # Same splice as save_mesh's `_spliced` variant: the windings are
+        # laid side by side along theta, the satisfied patches are
+        # rasterized over them, then the grid is split back per winding.
+        if progress is not None:
+            progress.begin(
+                'exporting_preview', 'Splicing patches into preview surface')
+        num_thetas_by_winding = [
+            int(scroll.shape[1]) for scroll in winding_scrolls]
+        combined_scroll = torch.cat(winding_scrolls, dim=1)
+        _build_spliced_overlay(
+            combined_scroll, num_thetas_by_winding, z0, grid_spacing,
+            slice_to_spiral_transform, dr_per_winding,
+            patch_atlas, patch_satisfaction_evaluation,
+            first_winding=first_winding,
+        )
+        winding_scrolls = list(
+            torch.split(combined_scroll, num_thetas_by_winding, dim=1))
+    winding_grids = {
+        winding: scroll.cpu().numpy().astype(np.float32)
+        for winding, scroll in zip(preview_windings, winding_scrolls)
+    }
 
     if progress is not None:
         progress.begin(

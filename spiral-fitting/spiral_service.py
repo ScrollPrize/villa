@@ -80,6 +80,7 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS,
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
+from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
 from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_DIRNAME,
                              UploadEnvironment, UploadManager)
@@ -522,6 +523,11 @@ class ServiceState:
         self._next_preview_iteration = None
         self._automatic_previews_disabled = False
         self._automatic_preview_generations = set()
+        # The checkpoint the fitter last reported its resident model equal
+        # to (see InteractiveFitSession.status()["checkpoint_state"]); a
+        # change here pins that checkpoint's published preview and re-shows
+        # it when one exists.
+        self._checkpoint_state = None
         self.config_catalog = Config.catalog()
         self.session_revision = 0
         if self._output_root() is not None:
@@ -1324,6 +1330,7 @@ class ServiceState:
         self._next_preview_iteration = None
         self._automatic_previews_disabled = False
         self._automatic_preview_generations.clear()
+        self._checkpoint_state = None
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
@@ -1438,6 +1445,11 @@ class ServiceState:
         # publication itself is background work and must never hold the fit.
         try:
             self._maybe_register_artifacts(status)
+        except Exception as exc:
+            print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+        try:
+            self._note_checkpoint_state(status)
         except Exception as exc:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
@@ -1588,15 +1600,36 @@ class ServiceState:
             ref = index("spiral-preview", published.manifest_path.parent,
                         published.manifest_path.name,
                         "Indexing preview files")
+            model_state = (published.raw_manifest or {}).get(
+                "model_state_sha256")
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
                     self._preview.error = None
                     self._preview.source_fit_iteration = (
                         published.source_fit_iteration)
+                    self._preview.model_state_sha256 = model_state
                 self.status_generation += 1
+            # Remember which model state this surface belongs to, so a
+            # checkpoint load that lands on it can re-show it (see
+            # _note_checkpoint_state) instead of flattening it again.
+            preview_index = self._published_preview_index()
+            if preview_index is not None and model_state:
+                try:
+                    preview_index.record(
+                        model_state,
+                        manifest_path=published.manifest_path,
+                        session_id=session_id, generation=preview_generation,
+                        source_fit_iteration=published.source_fit_iteration)
+                except Exception as exc:
+                    self.events.append(
+                        "log", "Could not index the published preview by "
+                        f"model state: {type(exc).__name__}: {exc}",
+                        severity="warning", source="service",
+                        operation="publishing_preview")
             self.artifacts.prune(
-                "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
+                "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT,
+                retain=self._retain_pinned_previews())
 
             # The overlays are a second, optional wave. Their failure is
             # reported as a warning, not as a failed preview: the surface is
@@ -1677,6 +1710,112 @@ class ServiceState:
                     target=self._publish_preview_artifact,
                     args=(next_status,), name="spiral-preview-publish",
                     daemon=True).start()
+
+    def _published_preview_index(self):
+        """The on-disk model-state index for this session's output root."""
+        with self.lock:
+            paths = self.session_paths
+        if paths is None or not paths.output_directory:
+            return None
+        return PublishedPreviewIndex(paths.output_directory)
+
+    def _retain_pinned_previews(self):
+        """A prune exemption for surfaces a saved checkpoint still names."""
+        preview_index = self._published_preview_index()
+        if preview_index is None:
+            return None
+        try:
+            pinned = preview_index.pinned_roots()
+        except Exception:
+            return None
+        if not pinned:
+            return None
+        return lambda artifact: Path(artifact.root).resolve(
+            strict=False) in pinned
+
+    def _note_checkpoint_state(self, status):
+        """React to the fitter naming the checkpoint its model now equals.
+
+        Runs on the fitter thread, so it only records the change; the index
+        write and any artifact registration happen on a background thread.
+        A save pins that checkpoint's published surface against retention.
+        A load or resume also re-shows that surface, when the service has
+        one, so the client sees the restored model at once rather than after
+        a fresh export and flatten.
+        """
+        state = status.get("checkpoint_state")
+        if not isinstance(state, dict):
+            return
+        path = str(state.get("path") or "")
+        digest = str(state.get("model_state_sha256") or "")
+        if not path or not digest:
+            return
+        with self.lock:
+            key = (path, digest)
+            if self._checkpoint_state == key or self.session_id is None:
+                return
+            self._checkpoint_state = key
+            session_id = self.session_id
+            shown = self._preview.model_state_sha256
+        threading.Thread(
+            target=self._restore_published_preview,
+            args=(session_id, path, digest, shown,
+                  state.get("completed_iterations")),
+            name="spiral-preview-restore", daemon=True).start()
+
+    def _restore_published_preview(self, session_id, checkpoint_path, digest,
+                                   shown_digest, completed_iterations):
+        preview_index = self._published_preview_index()
+        if preview_index is None:
+            return
+        try:
+            preview_index.pin(checkpoint_path, digest)
+            if shown_digest == digest:
+                # The surface on display already is this model state.
+                return
+            entry = preview_index.lookup(digest)
+            if entry is None:
+                return
+            manifest_path = Path(str(entry["manifest_path"]))
+            root = manifest_path.parent
+            # One directory, one artifact: re-use a registration this
+            # session already holds rather than letting two prunes race
+            # over the same files. A directory another session registered
+            # is shared read-only; that owner never prunes it again.
+            ref = self.artifacts.find("spiral-preview", root, session_id)
+            if ref is None:
+                unclaimed = self.artifacts.find("spiral-preview", root) is None
+                with self.lock:
+                    generation = self._preview.completed_generation
+                ref = self.artifacts.register_directory(
+                    "spiral-preview", session_id, generation, root,
+                    manifest_path.name,
+                    delete_root_on_prune=unclaimed, hash_workers=4)
+            with self.lock:
+                if self.session_id != session_id:
+                    return
+                self._preview.artifact = ref
+                self._preview.diagnostics_artifact = None
+                self._preview.error = None
+                self._preview.source_fit_iteration = entry.get(
+                    "source_fit_iteration")
+                self._preview.model_state_sha256 = digest
+                self.status_generation += 1
+            self.events.append(
+                "log",
+                f"Preview restored from the surface published for "
+                f"{Path(checkpoint_path).name}"
+                + (f" (iteration {completed_iterations})"
+                   if completed_iterations is not None else ""),
+                source="service", operation="publishing_preview")
+        except Exception as exc:
+            print(f"SPIRAL_PREVIEW_ERROR restore: {type(exc).__name__}: "
+                  f"{exc}", file=sys.stderr, flush=True)
+            self.events.append(
+                "log", "Could not restore the published preview for "
+                f"{Path(checkpoint_path).name}: {type(exc).__name__}: {exc}",
+                severity="warning", source="service",
+                operation="publishing_preview")
 
     def _update_preview_publish(self, generation, **values):
         with self.lock:

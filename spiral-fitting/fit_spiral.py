@@ -72,7 +72,7 @@ def _startup_resource_suffix(started_at=None):
 
 from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
-from checkpoint_io import load_checkpoint_cpu
+from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
@@ -145,6 +145,7 @@ from spiral_helpers import (
     save_combined_preview,
 )
 from satisfaction_metrics import (
+    evaluate_patch_satisfaction_packed,
     get_patch_satisfied_areas as _get_patch_satisfied_areas,
     get_unattached_pcl_satisfied_counts as _get_unattached_pcl_satisfied_counts,
     metrics_config,
@@ -3311,9 +3312,24 @@ class FitContext:
     # Checkpoint save/load
     # ==========================================================================
 
+    def model_state_digest(self):
+        """Content identity of the surface the resident model places.
+
+        Stamped into every checkpoint and every raw preview manifest. Two
+        artifacts carrying the same digest were produced from byte-identical
+        live parameters, frozen-epoch stack and run window, so the host may
+        re-show the flattened preview it already holds for a checkpoint it is
+        asked to load instead of flattening the same surface again.
+        """
+        return model_state_sha256(
+            self.spiral_and_transform.state_dict(),
+            getattr(self, 'frozen_epochs', None) or (),
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+
     def _checkpoint_payload(self, completed_iterations):
         return {
             'schema_version': 2,
+            'model_state_sha256': self.model_state_digest(),
             'gap_parameterization_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
@@ -3782,6 +3798,37 @@ class FitContext:
         self.interactive_influence_loss_weight = 0.0
         self.interactive_influence_anchor_samples = 0
 
+    def _preview_splice_evaluation(self, live_transform, dr_per_winding,
+                                   progress):
+        """The patch-satisfaction evaluation the preview splice reads.
+
+        The preview surface is spliced onto the satisfied patches like the
+        final ``_spliced`` meshes. That needs the patches in true scroll
+        space: after a constraint bake the resident inputs are in baked
+        space and an interactive session keeps no pristine copies, so the
+        splice is skipped (returning ``None``) until the frozen stack is
+        gone rather than writing baked-space coordinates into the surface.
+        """
+        if getattr(self, 'frozen_epochs', ()):
+            print(f'preview: patch splice skipped; resident inputs are in '
+                  f'baked space after {len(self.frozen_epochs)} constraint '
+                  'bake(s)')
+            return None
+        if not self.verified_patches_list:
+            return None
+        progress.begin(
+            'exporting_preview', 'Evaluating patches for preview splice',
+            detail=f'{len(self.verified_patches_list):,} patches')
+        started = time.perf_counter()
+        evaluation = evaluate_patch_satisfaction_packed(
+            live_transform, dr_per_winding,
+            self.verified_patches_list, self.patch_atlas,
+            self.z_begin, self.z_end, include_splicing=True,
+        )
+        print(f'preview: evaluated {len(self.verified_patches_list):,} '
+              f'patches for splice in {time.perf_counter() - started:.2f}s')
+        return evaluation
+
     def export_preview(self, generation_path, surface_id, *, diagnostics=False):
         """Write one preview generation; optionally with its loss overlays.
 
@@ -3798,9 +3845,18 @@ class FitContext:
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
         try:
+            # The preview surface must land in true scroll space, so after
+            # any constraint bake it is pulled back through the composed
+            # frozen+live chain; the resident inputs that bound its winding
+            # range are in baked space and are read through the live chain.
+            live_transform = \
+                self.spiral_and_transform.get_slice_to_spiral_transform()
+            dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+            splice_evaluation = self._preview_splice_evaluation(
+                live_transform, dr_per_winding, progress)
             manifest = save_combined_preview(
-                self.spiral_and_transform.get_slice_to_spiral_transform(),
-                self.spiral_and_transform.get_dr_per_winding(),
+                live_transform,
+                dr_per_winding,
                 self.verified_patches_list,
                 self.unattached_pcl_strips,
                 generation_path,
@@ -3813,7 +3869,14 @@ class FitContext:
                 surface_id=surface_id,
                 base_shape_zyx=self.base_shape_zyx,
                 progress=progress,
+                input_extent_transform=live_transform,
+                patch_atlas=self.patch_atlas,
+                patch_satisfaction_evaluation=splice_evaluation,
             )
+            # The same identity the checkpoint written at this boundary
+            # carries, so the host can pair the two later.
+            manifest = dict(manifest)
+            manifest['model_state_sha256'] = self.model_state_digest()
             if not diagnostics:
                 return manifest
             diagnostic_weights = {
