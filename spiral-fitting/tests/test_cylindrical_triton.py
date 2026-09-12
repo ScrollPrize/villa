@@ -6,7 +6,11 @@ import torch
 
 import flow_triton
 import transforms
-from flow_fields import CylindricalFlowField
+from flow_fields import BSplineCylindricalFlowField, CylindricalFlowField
+
+# Both interpolants share the fused kernels (flow_triton CUBIC switch), so
+# every fused-vs-eager check runs for each.
+FIELD_CLASSES = [CylindricalFlowField, BSplineCylindricalFlowField]
 
 
 def _manual_rk4(sampler, points, h, n_steps):
@@ -20,9 +24,9 @@ def _manual_rk4(sampler, points, h, n_steps):
     return y
 
 
-def _make_flow(device='cpu', seed=7):
+def _make_flow(device='cpu', seed=7, cls=CylindricalFlowField):
     torch.manual_seed(seed)
-    flow = CylindricalFlowField((12, 16, 16), spatial_scale_factor=4).to(device)
+    flow = cls((12, 16, 16), spatial_scale_factor=4).to(device)
     with torch.no_grad():
         flow.flows[0].uniform_(-0.015, 0.015)
         flow.flows[1].uniform_(-0.006, 0.006)
@@ -103,12 +107,13 @@ cuda = pytest.mark.skipif(
 
 
 @cuda
+@pytest.mark.parametrize('cls', FIELD_CLASSES)
 @pytest.mark.parametrize('n_steps', [1, 3])
 @pytest.mark.parametrize('h', [-0.08, 0.08])
-def test_fused_matches_eager_forward_and_adjoint(monkeypatch, n_steps, h):
+def test_fused_matches_eager_forward_and_adjoint(monkeypatch, cls, n_steps, h):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
-    fused = _make_flow('cuda', seed=23)
-    eager = _make_flow('cuda', seed=23)
+    fused = _make_flow('cuda', seed=23, cls=cls)
+    eager = _make_flow('cuda', seed=23, cls=cls)
     eager.load_state_dict(fused.state_dict())
     generator = torch.Generator(device='cuda').manual_seed(41)
     random_points = torch.rand(97, 3, generator=generator, device='cuda') * 1.4 - 0.2
@@ -138,10 +143,11 @@ def test_fused_matches_eager_forward_and_adjoint(monkeypatch, n_steps, h):
 
 
 @cuda
-def test_two_fused_backwards_share_accumulators(monkeypatch):
+@pytest.mark.parametrize('cls', FIELD_CLASSES)
+def test_two_fused_backwards_share_accumulators(monkeypatch, cls):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
-    fused = _make_flow('cuda', seed=29)
-    eager = _make_flow('cuda', seed=29)
+    fused = _make_flow('cuda', seed=29, cls=cls)
+    eager = _make_flow('cuda', seed=29, cls=cls)
     eager.load_state_dict(fused.state_dict())
     a = torch.rand(43, 3, device='cuda', requires_grad=True)
     b = torch.rand(37, 3, device='cuda', requires_grad=True)
@@ -162,10 +168,11 @@ def test_two_fused_backwards_share_accumulators(monkeypatch):
 
 
 @cuda
-def test_fused_field_gradients_do_not_require_point_gradients(monkeypatch):
+@pytest.mark.parametrize('cls', FIELD_CLASSES)
+def test_fused_field_gradients_do_not_require_point_gradients(monkeypatch, cls):
     monkeypatch.setenv('FIT_SPIRAL_TRITON', '1')
-    fused = _make_flow('cuda', seed=31)
-    eager = _make_flow('cuda', seed=31)
+    fused = _make_flow('cuda', seed=31, cls=cls)
+    eager = _make_flow('cuda', seed=31, cls=cls)
     eager.load_state_dict(fused.state_dict())
     points = torch.rand(53, 3, device='cuda')
     output = fused.get_integrator()(points, 0.1, 1)

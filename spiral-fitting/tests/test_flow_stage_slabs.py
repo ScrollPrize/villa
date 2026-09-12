@@ -185,7 +185,8 @@ def _eager_reference(field, points, h, n_steps, reverse, monkeypatch):
 
 
 @cuda
-@pytest.mark.parametrize('kind', ['cartesian', 'cylindrical', 'bspline'])
+@pytest.mark.parametrize(
+    'kind', ['cartesian', 'cylindrical', 'bspline', 'bspline_cylindrical'])
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('coalesce', ['0', '1'])
 def test_fused_multi_slab_matches_eager(monkeypatch, kind, reverse, coalesce):

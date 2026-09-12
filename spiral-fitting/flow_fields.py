@@ -727,6 +727,10 @@ class CylindricalFlowField(_DirectSampledFlowField):
     # Note: near r=0 the cylindrical basis is degenerate; ring 0 holds a single cell that is
     # pinned to zero.
 
+    # Interpolant the fused kernel evaluates (flow_triton CUBIC switch);
+    # BSplineCylindricalFlowField flips it.
+    _cubic = False
+
     def __init__(self, resolution, spatial_scale_factor=6, num_stages=1, direct_lr=False):
         # resolution is interpreted as the equivalent cartesian (Z, Y, X) voxel shape; the
         # cylindrical lattice sizes are derived from it. direct_lr is accepted for
@@ -765,8 +769,15 @@ class CylindricalFlowField(_DirectSampledFlowField):
             nn.Parameter(torch.zeros([self.num_stages, 3, nz_lr, int(lr_offsets[-1])])),
             nn.Parameter(torch.zeros([self.num_stages, 3, nz_hr, int(hr_offsets[-1])])),
         ])
+        # Fused-backward gradient buffers in the parameter layout; they
+        # become the parameters' gradients (apply_accumulated_field_grad).
         self._lr_grad_acc = None
         self._hr_grad_acc = None
+        # The cubic kernels scatter into padded channels-last buffers
+        # ([num_stages, nz, total_phi, 4], flow_triton's cubic lattice
+        # section) that are permuted into the above at apply time.
+        self._lr_scatter_acc = None
+        self._hr_scatter_acc = None
         self._pending_fused = False
 
     @staticmethod
@@ -878,17 +889,17 @@ class CylindricalFlowField(_DirectSampledFlowField):
                 acc_low = acc_high = None
                 if training_field:
                     assert self._pending_field_graphs is None
-                    if self._lr_grad_acc is None or self._lr_grad_acc.shape != low.shape:
-                        self._lr_grad_acc = torch.zeros_like(low)
-                    else:
-                        self._lr_grad_acc.zero_()
-                    if self._hr_grad_acc is None or self._hr_grad_acc.shape != high.shape:
-                        self._hr_grad_acc = torch.zeros_like(high)
-                    else:
-                        self._hr_grad_acc.zero_()
-                    acc_low, acc_high = self._lr_grad_acc, self._hr_grad_acc
+                    acc_low, acc_high = self._fused_accumulators(low, high)
                     self._pending_fused = True
-                fused_fields = (low.contiguous(), high.contiguous())
+                if self._cubic:
+                    # Channels-last copies for the cubic kernels' read path,
+                    # one per lattice per get_integrator call (amortised
+                    # across the integrator's calls, like the accumulators).
+                    fused_fields = (
+                        low.permute(0, 2, 3, 1).contiguous(),
+                        high.permute(0, 2, 3, 1).contiguous())
+                else:
+                    fused_fields = (low.contiguous(), high.contiguous())
                 fused_accs = (acc_low, acc_high)
 
             low, high = fused_fields
@@ -896,13 +907,45 @@ class CylindricalFlowField(_DirectSampledFlowField):
             return flow_triton.rk4_cylindrical_integrate(
                 y_flat, low, self._lr_num_phi, self._lr_offsets,
                 high, self._hr_num_phi, self._hr_offsets,
-                acc_low, acc_high, h, n_steps, reverse)
+                acc_low, acc_high, h, n_steps, reverse, cubic=self._cubic)
 
         return integrate
+
+    @staticmethod
+    def _zeroed_buffer(current, shape, like, zero=True):
+        if current is None or tuple(current.shape) != tuple(shape):
+            return torch.zeros(shape, dtype=like.dtype, device=like.device)
+        if zero:
+            current.zero_()
+        return current
+
+    def _fused_accumulators(self, low, high):
+        # The (zeroed) buffers the fused backward scatters this iteration's
+        # field gradients into. Trilinear kernels scatter straight into the
+        # parameter-layout buffers; cubic kernels into the padded
+        # channels-last ones, in which case the parameter-layout buffers
+        # are only the permute targets (overwritten at apply time, so not
+        # zeroed here).
+        cubic = self._cubic
+        self._lr_grad_acc = self._zeroed_buffer(
+            self._lr_grad_acc, low.shape, low, zero=not cubic)
+        self._hr_grad_acc = self._zeroed_buffer(
+            self._hr_grad_acc, high.shape, high, zero=not cubic)
+        if not cubic:
+            return self._lr_grad_acc, self._hr_grad_acc
+        self._lr_scatter_acc = self._zeroed_buffer(
+            self._lr_scatter_acc, (*low.shape[:1], *low.shape[2:], 4), low)
+        self._hr_scatter_acc = self._zeroed_buffer(
+            self._hr_scatter_acc, (*high.shape[:1], *high.shape[2:], 4), high)
+        return self._lr_scatter_acc, self._hr_scatter_acc
 
     def apply_accumulated_field_grad(self):
         if self._pending_fused:
             self._pending_fused = False
+            if self._cubic:
+                for grad, scatter in ((self._lr_grad_acc, self._lr_scatter_acc),
+                                      (self._hr_grad_acc, self._hr_scatter_acc)):
+                    grad.copy_(scatter[..., :3].permute(0, 3, 1, 2))
             _adopt_accumulated_grads_((
                 (self.flows[0], self._lr_grad_acc),
                 (self.flows[1], self._hr_grad_acc)))
@@ -1074,9 +1117,13 @@ class BSplineCylindricalFlowField(CylindricalFlowField):
     # exactly away from the axis. Because the cubic stencil spans rings
     # r-1 .. r+2 and below-axis taps clamp to the pinned zero ring, the axis
     # pin suppresses the field over roughly two rings rather than one.
-    # Eager-only: there is no fused Triton path for this interpolant, so
-    # get_integrator is overridden to the sampler-based RK4 loop (the
-    # inherited integrator would run the trilinear kernel).
+    # Integration reuses CylindricalFlowField's machinery: the fused Triton
+    # kernels compiled with CUBIC=True (flow_triton._cylb_* lattice samplers,
+    # fed channels-last lattice copies and padded channels-last gradient
+    # accumulators) on CUDA, the eager sampler loop over _sample_lattice
+    # elsewhere.
+
+    _cubic = True
 
     @staticmethod
     def _sample_lattice(field, ring_num_phi, ring_offsets, normalised_zyx):
@@ -1110,8 +1157,3 @@ class BSplineCylindricalFlowField(CylindricalFlowField):
         weights = wz[:, None, None, :] * wp[None] * wr[None, None]  # 4z, 4p, 4r, n
         sampled = (values * weights[None]).sum(dim=(1, 2, 3))  # 3, n local components
         return _cylindrical_local_to_cartesian(sampled, phi, orig_shape)
-
-    def get_integrator(self):
-        # The inherited fused Triton RK4 kernel evaluates the trilinear
-        # interpolant; the cubic lattice has no fused path.
-        return self._eager_integrator()

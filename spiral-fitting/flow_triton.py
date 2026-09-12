@@ -1056,14 +1056,25 @@ if _HAS_TRITON:
                          lo_ptr, lo_num_phi_ptr, lo_offsets_ptr,
                          loNZ, loNR, loTOTAL,
                          hi_ptr, hi_num_phi_ptr, hi_offsets_ptr,
-                         hiNZ, hiNR, hiTOTAL, lane_mask):
+                         hiNZ, hiNR, hiTOTAL, CUBIC: tl.constexpr, lane_mask):
+        # CUBIC selects the tricubic B-spline interpolant (_cylb_sample_lattice,
+        # BSplineCylindricalFlowField) over the trilinear one; it is a
+        # compile-time constant, so each variant is its own kernel.
         qy, qx, raw, radius, phi, sin_phi, cos_phi, on_axis = _cyl_coords(py, px)
-        lz, lr, lp = _cyl_sample_lattice(
-            pz, radius, phi, lo_ptr, lo_num_phi_ptr, lo_offsets_ptr,
-            loNZ, loNR, loTOTAL, lane_mask)
-        hz, hr, hp = _cyl_sample_lattice(
-            pz, radius, phi, hi_ptr, hi_num_phi_ptr, hi_offsets_ptr,
-            hiNZ, hiNR, hiTOTAL, lane_mask)
+        if CUBIC:
+            lz, lr, lp = _cylb_sample_lattice(
+                pz, radius, phi, lo_ptr, lo_num_phi_ptr, lo_offsets_ptr,
+                loNZ, loNR, loTOTAL, lane_mask)
+            hz, hr, hp = _cylb_sample_lattice(
+                pz, radius, phi, hi_ptr, hi_num_phi_ptr, hi_offsets_ptr,
+                hiNZ, hiNR, hiTOTAL, lane_mask)
+        else:
+            lz, lr, lp = _cyl_sample_lattice(
+                pz, radius, phi, lo_ptr, lo_num_phi_ptr, lo_offsets_ptr,
+                loNZ, loNR, loTOTAL, lane_mask)
+            hz, hr, hp = _cyl_sample_lattice(
+                pz, radius, phi, hi_ptr, hi_num_phi_ptr, hi_offsets_ptr,
+                hiNZ, hiNR, hiTOTAL, lane_mask)
         vz = lz + hz
         vr = lr + hr
         vp = lp + hp
@@ -1078,7 +1089,7 @@ if _HAS_TRITON:
                          hi_base, hi_num_phi_ptr, hi_offsets_ptr,
                          hiNZ, hiNR, hiTOTAL,
                          N, h, h_half, h_sixth, n_steps, num_slabs,
-                         REVERSE: tl.constexpr,
+                         REVERSE: tl.constexpr, CUBIC: tl.constexpr,
                          STORE_STAGES: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
@@ -1102,7 +1113,7 @@ if _HAS_TRITON:
             k1z, k1y, k1x = _cyl_sample_pair(
                 yz, yy, yx,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, loNZ, loNR, loTOTAL,
-                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, m)
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, CUBIC, m)
             x2z, x2y, x2x = yz + h_half * k1z, yy + h_half * k1y, yx + h_half * k1x
             if STORE_STAGES:
                 s = (step * 4 + 1) * N.to(tl.int64)
@@ -1112,7 +1123,7 @@ if _HAS_TRITON:
             k2z, k2y, k2x = _cyl_sample_pair(
                 x2z, x2y, x2x,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, loNZ, loNR, loTOTAL,
-                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, m)
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, CUBIC, m)
             x3z, x3y, x3x = yz + h_half * k2z, yy + h_half * k2y, yx + h_half * k2x
             if STORE_STAGES:
                 s = (step * 4 + 2) * N.to(tl.int64)
@@ -1122,7 +1133,7 @@ if _HAS_TRITON:
             k3z, k3y, k3x = _cyl_sample_pair(
                 x3z, x3y, x3x,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, loNZ, loNR, loTOTAL,
-                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, m)
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, CUBIC, m)
             x4z, x4y, x4x = yz + h * k3z, yy + h * k3y, yx + h * k3x
             if STORE_STAGES:
                 s = (step * 4 + 3) * N.to(tl.int64)
@@ -1132,7 +1143,7 @@ if _HAS_TRITON:
             k4z, k4y, k4x = _cyl_sample_pair(
                 x4z, x4y, x4x,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, loNZ, loNR, loTOTAL,
-                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, m)
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hiNZ, hiNR, hiTOTAL, CUBIC, m)
             yz += h_sixth * (((k1z + 2.0 * k2z) + 2.0 * k3z) + k4z)
             yy += h_sixth * (((k1y + 2.0 * k2y) + 2.0 * k3y) + k4y)
             yx += h_sixth * (((k1x + 2.0 * k2x) + 2.0 * k3x) + k4x)
@@ -1210,19 +1221,29 @@ if _HAS_TRITON:
                        loNZ, loNR, loTOTAL,
                        hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr,
                        hiNZ, hiNR, hiTOTAL,
-                       HAS_ACC: tl.constexpr, lane_mask):
+                       HAS_ACC: tl.constexpr, CUBIC: tl.constexpr, lane_mask):
         qy, qx, raw, radius, phi, sin_phi, cos_phi, on_axis = _cyl_coords(py, px)
         glz = gz
         glr = gy * sin_phi + gx * cos_phi
         glp = gy * cos_phi - gx * sin_phi
-        lvz, lvr, lvp, lgz, lgr, lgp = _cyl_bwd_lattice(
-            glz, glr, glp, pz, radius, phi,
-            lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr,
-            loNZ, loNR, loTOTAL, HAS_ACC, lane_mask)
-        hvz, hvr, hvp, hgz, hgr, hgp = _cyl_bwd_lattice(
-            glz, glr, glp, pz, radius, phi,
-            hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr,
-            hiNZ, hiNR, hiTOTAL, HAS_ACC, lane_mask)
+        if CUBIC:
+            lvz, lvr, lvp, lgz, lgr, lgp = _cylb_bwd_lattice(
+                glz, glr, glp, pz, radius, phi,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr,
+                loNZ, loNR, loTOTAL, HAS_ACC, lane_mask)
+            hvz, hvr, hvp, hgz, hgr, hgp = _cylb_bwd_lattice(
+                glz, glr, glp, pz, radius, phi,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr,
+                hiNZ, hiNR, hiTOTAL, HAS_ACC, lane_mask)
+        else:
+            lvz, lvr, lvp, lgz, lgr, lgp = _cyl_bwd_lattice(
+                glz, glr, glp, pz, radius, phi,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr,
+                loNZ, loNR, loTOTAL, HAS_ACC, lane_mask)
+            hvz, hvr, hvp, hgz, hgr, hgp = _cyl_bwd_lattice(
+                glz, glr, glp, pz, radius, phi,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr,
+                hiNZ, hiNR, hiTOTAL, HAS_ACC, lane_mask)
         vr, vp = lvr + hvr, lvp + hvp
         out_y = vr * sin_phi + vp * cos_phi
         out_x = vr * cos_phi - vp * sin_phi
@@ -1245,13 +1266,21 @@ if _HAS_TRITON:
                          hi_base, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_base,
                          hiNZ, hiNR, hiTOTAL,
                          N, h, h_half, h_sixth, n_steps, num_slabs,
-                         REVERSE: tl.constexpr,
+                         REVERSE: tl.constexpr, CUBIC: tl.constexpr,
                          HAS_ACC: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
         m = i < N
         lo_stride = loNZ.to(tl.int64) * loTOTAL * 3
         hi_stride = hiNZ.to(tl.int64) * hiTOTAL * 3
+        # The cubic accumulator is padded to 4 channels (see the cubic
+        # lattice section); the trilinear one has the field's own layout.
+        if CUBIC:
+            lo_acc_stride = loNZ.to(tl.int64) * loTOTAL * _CYLB_ACC_CH
+            hi_acc_stride = hiNZ.to(tl.int64) * hiTOTAL * _CYLB_ACC_CH
+        else:
+            lo_acc_stride = lo_stride
+            hi_acc_stride = hi_stride
         gz = tl.load(grad_y_ptr + i * 3, mask=m, other=0.0)
         gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
         gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
@@ -1259,12 +1288,10 @@ if _HAS_TRITON:
             slab = step // n_steps
             if REVERSE:
                 slab = num_slabs - 1 - slab
-            lo_off = slab.to(tl.int64) * lo_stride
-            hi_off = slab.to(tl.int64) * hi_stride
-            lo_ptr = lo_base + lo_off
-            hi_ptr = hi_base + hi_off
-            lo_acc_ptr = lo_acc_base + lo_off
-            hi_acc_ptr = hi_acc_base + hi_off
+            lo_ptr = lo_base + slab.to(tl.int64) * lo_stride
+            hi_ptr = hi_base + slab.to(tl.int64) * hi_stride
+            lo_acc_ptr = lo_acc_base + slab.to(tl.int64) * lo_acc_stride
+            hi_acc_ptr = hi_acc_base + slab.to(tl.int64) * hi_acc_stride
             s1 = (step * 4) * N.to(tl.int64)
             s2 = (step * 4 + 1) * N.to(tl.int64)
             s3 = (step * 4 + 2) * N.to(tl.int64)
@@ -1277,7 +1304,7 @@ if _HAS_TRITON:
                 g6z, g6y, g6x, pz, py, px,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr, loNZ, loNR, loTOTAL,
                 hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr, hiNZ, hiNR, hiTOTAL,
-                HAS_ACC, m)
+                HAS_ACC, CUBIC, m)
             pz = tl.load(stages_ptr + (s3 + i) * 3, mask=m, other=0.0)
             py = tl.load(stages_ptr + (s3 + i) * 3 + 1, mask=m, other=0.0)
             px = tl.load(stages_ptr + (s3 + i) * 3 + 2, mask=m, other=0.0)
@@ -1286,7 +1313,7 @@ if _HAS_TRITON:
                 pz, py, px,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr, loNZ, loNR, loTOTAL,
                 hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr, hiNZ, hiNR, hiTOTAL,
-                HAS_ACC, m)
+                HAS_ACC, CUBIC, m)
             pz = tl.load(stages_ptr + (s2 + i) * 3, mask=m, other=0.0)
             py = tl.load(stages_ptr + (s2 + i) * 3 + 1, mask=m, other=0.0)
             px = tl.load(stages_ptr + (s2 + i) * 3 + 2, mask=m, other=0.0)
@@ -1295,7 +1322,7 @@ if _HAS_TRITON:
                 pz, py, px,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr, loNZ, loNR, loTOTAL,
                 hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr, hiNZ, hiNR, hiTOTAL,
-                HAS_ACC, m)
+                HAS_ACC, CUBIC, m)
             pz = tl.load(stages_ptr + (s1 + i) * 3, mask=m, other=0.0)
             py = tl.load(stages_ptr + (s1 + i) * 3 + 1, mask=m, other=0.0)
             px = tl.load(stages_ptr + (s1 + i) * 3 + 2, mask=m, other=0.0)
@@ -1304,7 +1331,7 @@ if _HAS_TRITON:
                 pz, py, px,
                 lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr, loNZ, loNR, loTOTAL,
                 hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr, hiNZ, hiNR, hiTOTAL,
-                HAS_ACC, m)
+                HAS_ACC, CUBIC, m)
             gz = ((gz + b4z) + b3z + b2z) + b1z
             gy = ((gy + b4y) + b3y + b2y) + b1y
             gx = ((gx + b4x) + b3x + b2x) + b1x
@@ -1549,21 +1576,40 @@ class TritonRK4DirectIntegrate(torch.autograd.Function):
         return grad_pts, None, None, None, None, None, None, None, None, None
 
 
+def cyl_defer_enabled():
+    # Joint per-RK4-step field-gradient scatter in the cubic cylindrical
+    # adjoint (_rk4cb_bwd_deferred_kernel) instead of one atomic burst per
+    # stage. Point gradients are unchanged; the accumulator differs only in
+    # addend association (atomics-order class).
+    return os.environ.get('FIT_SPIRAL_CYL_DEFER', '1') != '0'
+
+
+def _cyl_geometry(field, cubic):
+    # (nz, total_phi) of a packed cylindrical lattice tensor: the parameter
+    # layout [slabs, 3, nz, total_phi] for the trilinear kernels, the
+    # channels-last [slabs, nz, total_phi, 3] copy for the cubic ones.
+    if cubic:
+        return field.shape[1], field.shape[2]
+    return field.shape[2], field.shape[3]
+
+
 def _run_cylindrical_fwd(y0, low, low_num_phi, low_offsets,
                          high, high_num_phi, high_offsets,
-                         h, n_steps, reverse, stages):
+                         h, n_steps, reverse, cubic, stages):
     n = y0.shape[0]
     out = torch.empty_like(y0)
     if n > 0:
+        lo_nz, lo_total = _cyl_geometry(low, cubic)
+        hi_nz, hi_total = _cyl_geometry(high, cubic)
         _rk4c_fwd_kernel[(triton.cdiv(n, _CYL_BLOCK),)](
             y0, out, stages if stages is not None else out,
             low, low_num_phi, low_offsets,
-            low.shape[2], low_num_phi.numel(), low.shape[3],
+            lo_nz, low_num_phi.numel(), lo_total,
             high, high_num_phi, high_offsets,
-            high.shape[2], high_num_phi.numel(), high.shape[3],
+            hi_nz, high_num_phi.numel(), hi_total,
             n, float(h), float(h / 2), float(h / 6), int(n_steps),
             int(low.shape[0]),
-            REVERSE=bool(reverse),
+            REVERSE=bool(reverse), CUBIC=bool(cubic),
             STORE_STAGES=stages is not None, BLOCK=_CYL_BLOCK,
         )
     return out
@@ -1571,21 +1617,28 @@ def _run_cylindrical_fwd(y0, low, low_num_phi, low_offsets,
 
 def rk4_cylindrical_integrate(y0, low, low_num_phi, low_offsets,
                               high, high_num_phi, high_offsets,
-                              acc_low, acc_high, h, n_steps, reverse=False):
+                              acc_low, acc_high, h, n_steps, reverse=False,
+                              cubic=False):
     """Integrate a pair of packed cylindrical flow lattices, slab by slab.
 
-    ``low`` / ``high`` are [slabs, 3, nz, total_phi]; the slabs are applied in
-    order (reverse order with ``reverse``).
+    The slabs are applied in order (reverse order with ``reverse``).
+    ``cubic`` samples the lattices with the tricubic B-spline interpolant of
+    BSplineCylindricalFlowField instead of the trilinear one, and changes
+    the tensor layouts: trilinear takes ``low`` / ``high`` in the parameter
+    layout [slabs, 3, nz, total_phi] and accumulators of the same shape;
+    cubic takes channels-last copies [slabs, nz, total_phi, 3] and padded
+    channels-last accumulators [slabs, nz, total_phi, 4] (see the cubic
+    lattice section above).
     """
     if torch.is_grad_enabled() and (
             y0.requires_grad or low.requires_grad or high.requires_grad):
         return TritonRK4CylindricalIntegrate.apply(
             y0, low, low_num_phi, low_offsets,
             high, high_num_phi, high_offsets,
-            acc_low, acc_high, h, n_steps, reverse)
+            acc_low, acc_high, h, n_steps, reverse, cubic)
     return _run_cylindrical_fwd(
         y0.contiguous(), low, low_num_phi, low_offsets,
-        high, high_num_phi, high_offsets, h, n_steps, reverse, None)
+        high, high_num_phi, high_offsets, h, n_steps, reverse, cubic, None)
 
 
 class TritonRK4CylindricalIntegrate(torch.autograd.Function):
@@ -1594,13 +1647,14 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, y0, low, low_num_phi, low_offsets,
                 high, high_num_phi, high_offsets,
-                acc_low, acc_high, h, n_steps, reverse):
+                acc_low, acc_high, h, n_steps, reverse, cubic):
         ctx.set_materialize_grads(False)
         y0 = y0.contiguous()
         stages = _stage_buffer(y0, low.shape[0], n_steps)
         out = _run_cylindrical_fwd(
             y0, low, low_num_phi, low_offsets,
-            high, high_num_phi, high_offsets, h, n_steps, reverse, stages)
+            high, high_num_phi, high_offsets, h, n_steps, reverse, cubic,
+            stages)
         ctx.save_for_backward(
             low, low_num_phi, low_offsets,
             high, high_num_phi, high_offsets, stages)
@@ -1608,12 +1662,13 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
         ctx.h = float(h)
         ctx.n_steps = int(n_steps)
         ctx.reverse = bool(reverse)
+        ctx.cubic = bool(cubic)
         return out
 
     @staticmethod
     def backward(ctx, grad_y):
         if grad_y is None:
-            return (None,) * 12
+            return (None,) * 13
         (low, low_num_phi, low_offsets,
          high, high_num_phi, high_offsets, stages) = ctx.saved_tensors
         grad_y = grad_y.contiguous()
@@ -1622,20 +1677,28 @@ class TritonRK4CylindricalIntegrate(torch.autograd.Function):
         acc_low, acc_high = ctx.accs
         if n > 0:
             has_acc = acc_low is not None
-            _rk4c_bwd_kernel[(triton.cdiv(n, _CYL_BLOCK),)](
+            lo_nz, lo_total = _cyl_geometry(low, ctx.cubic)
+            hi_nz, hi_total = _cyl_geometry(high, ctx.cubic)
+            args = (
                 grad_y, grad_pts, stages,
                 low, low_num_phi, low_offsets,
                 acc_low if has_acc else low,
-                low.shape[2], low_num_phi.numel(), low.shape[3],
+                lo_nz, low_num_phi.numel(), lo_total,
                 high, high_num_phi, high_offsets,
                 acc_high if has_acc else high,
-                high.shape[2], high_num_phi.numel(), high.shape[3],
+                hi_nz, high_num_phi.numel(), hi_total,
                 n, ctx.h, float(ctx.h / 2), float(ctx.h / 6), ctx.n_steps,
                 int(low.shape[0]),
-                REVERSE=ctx.reverse,
-                HAS_ACC=has_acc, BLOCK=_CYL_BLOCK,
             )
-        return (grad_pts,) + (None,) * 11
+            grid = (triton.cdiv(n, _CYL_BLOCK),)
+            if ctx.cubic and has_acc and cyl_defer_enabled():
+                _rk4cb_bwd_deferred_kernel[grid](
+                    *args, REVERSE=ctx.reverse, BLOCK=_CYL_BLOCK)
+            else:
+                _rk4c_bwd_kernel[grid](
+                    *args, REVERSE=ctx.reverse, CUBIC=ctx.cubic,
+                    HAS_ACC=has_acc, BLOCK=_CYL_BLOCK)
+        return (grad_pts,) + (None,) * 12
 
 
 if _HAS_TRITON:
@@ -2019,3 +2082,419 @@ class TritonRK4BSplineIntegrate(torch.autograd.Function):
                 HAS_ACC=acc_lo is not None, BLOCK=_BLOCK,
             )
         return grad_pts, None, None, None, None, None, None, None
+
+
+if _HAS_TRITON:
+
+    # ---- cubic cylindrical lattice: 4x4x4 stencil on the packed ragged
+    # lattice (BSplineCylindricalFlowField._sample_lattice) ----
+    # Cubic along z and r with edge-clamped tap indices, periodic cubic along
+    # phi within each ring, each of the four stencil rings using its own phi
+    # parameterisation. Ring 0 (the pinned axis ring) is masked out of both
+    # the value reads and the gradient scatter, which is how the fused path
+    # reproduces the eager sampler's zeroed r=0 slice.
+    #
+    # Memory layout. With 64 taps per lattice per stage this interpolant is
+    # bound by memory transactions, so the kernels read field VALUES from
+    # channels-last copies [slabs, nz, total_phi, 3]: a tap's three
+    # components share one 32-byte sector and a ring row's four phi taps are
+    # 48 contiguous bytes, instead of twelve sectors three planes apart. The
+    # gradient ACCUMULATOR is channels-last as well and padded to four
+    # channels, [slabs, nz, total_phi, 4], so each tap's scatter is one
+    # 16-byte vector atomic (atom.v4.f32, sm_90+); CylindricalFlowField
+    # permutes it back to the parameter layout once per iteration. Measured
+    # on an RTX 5090 at the 330x31103 lattice of a 32-voxel production fit,
+    # the value gathers run 2.2x and the scatter 2.8x faster than the planar
+    # layout (scratch micro-benchmark, 2026-09-10).
+    #
+    # Deferred scatter (FIT_SPIRAL_CYL_DEFER, default on). The four stage
+    # points of one RK4 step usually share a stencil cell (the per-step
+    # displacement is a fraction of a cell), so instead of four 64-tap
+    # atomic bursts per lattice per step, _rk4cb_bwd_deferred_kernel first
+    # runs the four stages' point-gradient sweeps (loads only), then
+    # scatters all four at once over the union of their stencil boxes with
+    # per-tap sums of the stages' weighted gradients. The union degrades
+    # gracefully: stages that drifted into neighbouring cells widen the
+    # loops by the drift and contribute zero weight outside their own box.
+    # bench_cylindrical_rk4 (RTX 5090 shared with a fit, 330x200x200, 9
+    # steps, 2.4M points, p50): cubic fwd 251 -> 77 ms and bwd 1063 -> 499 ms
+    # from the layout, bwd 499 -> 124 ms from the deferral (its best case:
+    # the benchmark's near-zero field never drifts stages apart), against
+    # 34 / 211 ms for the trilinear kernels. The deferred kernel compiles to
+    # 248 registers with no spills.
+
+    _CYLB_ACC_CH = tl.constexpr(4)
+
+    @triton.jit
+    def _cylb_ring_phi(phi, nphi):
+        # Continuous phi index on a ring of nphi cells: floor cell (as
+        # int32, wrapped into [0, nphi) -- phi can round to exactly 2pi),
+        # its fraction and the ring's index-per-radian scale.
+        pscale = nphi.to(tl.float32) / _TWO_PI_F32
+        pc = phi * pscale
+        p0f = tl.math.floor(pc)
+        p0 = p0f.to(tl.int32)
+        p0 = tl.where(p0 >= nphi, p0 - nphi, p0)
+        return p0, pc - p0f, pscale
+
+    @triton.jit
+    def _cylb_wrap(p, nphi):
+        # Cyclic wrap of a tap index in [-nphi, 2*nphi) into [0, nphi) by
+        # compare-and-add. Same result as the eager path's Python modulo for
+        # every unpinned ring (all have >= 6 cells) without the integer
+        # division; ring 0's taps are masked, so its index only has to be
+        # finite.
+        p = tl.where(p < 0, p + nphi, p)
+        return tl.where(p >= nphi, p - nphi, p)
+
+    @triton.jit
+    def _cylb_wrap_diff(d, nphi):
+        # Signed cyclic difference of two cell indices on a ring, in
+        # [-nphi/2, nphi/2].
+        half = nphi // 2
+        d = tl.where(d > half, d - nphi, d)
+        return tl.where(d < -half, d + nphi, d)
+
+    @triton.jit
+    def _cylb_select4(w0, w1, w2, w3, idx):
+        # w[idx] for idx in 0..3, else 0: a stage's weight at a union tap
+        # outside its own stencil box.
+        return tl.where(idx == 0, w0,
+                        tl.where(idx == 1, w1,
+                                 tl.where(idx == 2, w2,
+                                          tl.where(idx == 3, w3, 0.0))))
+
+    @triton.jit
+    def _cylb_load_tap(field_ptr, idx, mask):
+        # The three components of flat cell idx from a channels-last slab.
+        base = field_ptr + idx * 3
+        a = tl.load(base, mask=mask, other=0.0)
+        b = tl.load(base + 1, mask=mask, other=0.0)
+        c = tl.load(base + 2, mask=mask, other=0.0)
+        return a, b, c
+
+    @triton.jit
+    def _cylb_scatter_tap(acc_ptr, idx, az, ar, ap, mask):
+        # One 16-byte vector atomic per tap into the padded channels-last
+        # accumulator: the [BLOCK, 4] block is contiguous and 16-byte
+        # aligned along its channel axis, so Triton emits atom.v4.f32; the
+        # padding lane adds 0.
+        lane = tl.arange(0, 4)[None, :]
+        vals = tl.where(lane == 0, az[:, None],
+                        tl.where(lane == 1, ar[:, None],
+                                 tl.where(lane == 2, ap[:, None], 0.0)))
+        ptrs = acc_ptr + (idx * _CYLB_ACC_CH)[:, None] + lane
+        tl.atomic_add(ptrs, vals, mask=mask[:, None])
+
+    @triton.jit
+    def _cylb_sample_lattice(pz, radius, phi, field_ptr, num_phi_ptr,
+                             offsets_ptr, NZ, NR, TOTAL, lane_mask):
+        # field_ptr :: channels-last [nz, total_phi, 3] slab.
+        zn = pz * 2.0 - 1.0
+        zc = ((zn + 1.0) * 0.5) * (NZ - 1).to(tl.float32)
+        zc = tl.minimum(tl.maximum(zc, 0.0), (NZ - 1).to(tl.float32))
+        z0f = tl.math.floor(zc)
+        z0 = z0f.to(tl.int32)
+        wz0, wz1, wz2, wz3 = _bspline_weights(zc - z0f)
+
+        rc = radius * (NR - 1).to(tl.float32)
+        r0f = tl.math.floor(rc)
+        r0 = r0f.to(tl.int32)
+        wr0, wr1, wr2, wr3 = _bspline_weights(rc - r0f)
+        v0 = tl.zeros(pz.shape, dtype=tl.float32)
+        v1 = tl.zeros(pz.shape, dtype=tl.float32)
+        v2 = tl.zeros(pz.shape, dtype=tl.float32)
+        for dr in range(4):
+            ring = tl.minimum(tl.maximum(r0 + (dr - 1), 0), NR - 1)
+            wr = tl.where(dr == 0, wr0, tl.where(dr == 1, wr1, tl.where(dr == 2, wr2, wr3)))
+            nphi = tl.load(num_phi_ptr + ring, mask=lane_mask, other=1).to(tl.int32)
+            offset = tl.load(offsets_ptr + ring, mask=lane_mask, other=0).to(tl.int64)
+            p0, fp, pscale = _cylb_ring_phi(phi, nphi)
+            wp0, wp1, wp2, wp3 = _bspline_weights(fp)
+            load_mask = lane_mask & (ring != 0)
+            for dz in range(4):
+                z = tl.minimum(tl.maximum(z0 + (dz - 1), 0), NZ - 1)
+                wz = tl.where(dz == 0, wz0, tl.where(dz == 1, wz1, tl.where(dz == 2, wz2, wz3)))
+                wrz = wr * wz
+                row = z.to(tl.int64) * TOTAL + offset
+                for dp in tl.static_range(4):
+                    pp = _cylb_wrap(p0 + (dp - 1), nphi)
+                    wp = wp0 if dp == 0 else (wp1 if dp == 1 else (wp2 if dp == 2 else wp3))
+                    w = wrz * wp
+                    a, b, c = _cylb_load_tap(field_ptr, row + pp, load_mask)
+                    v0 += a * w
+                    v1 += b * w
+                    v2 += c * w
+        return v0, v1, v2
+
+    @triton.jit
+    def _cylb_bwd_lattice(glz, glr, glp, pz, radius, phi,
+                          field_ptr, num_phi_ptr, offsets_ptr, acc_ptr,
+                          NZ, NR, TOTAL, HAS_ACC: tl.constexpr, lane_mask):
+        # Same contract as _cyl_bwd_lattice for the cubic interpolant: the
+        # sampled local components, the gradient w.r.t. the continuous z and
+        # r lattice coordinates (already scaled to pz / radius) and w.r.t.
+        # phi; dL/d(control points) scattered into the padded channels-last
+        # acc. Tap-index clamping and wrapping are piecewise-constant (no
+        # gradient); the z clamp contributes torch.clamp's inclusive
+        # in-range mask.
+        zn = pz * 2.0 - 1.0
+        zraw = ((zn + 1.0) * 0.5) * (NZ - 1).to(tl.float32)
+        zc = tl.minimum(tl.maximum(zraw, 0.0), (NZ - 1).to(tl.float32))
+        z0f = tl.math.floor(zc)
+        z0 = z0f.to(tl.int32)
+        fz = zc - z0f
+        wz0, wz1, wz2, wz3 = _bspline_weights(fz)
+        dz0, dz1, dz2, dz3 = _bspline_dweights(fz)
+
+        rc = radius * (NR - 1).to(tl.float32)
+        r0f = tl.math.floor(rc)
+        r0 = r0f.to(tl.int32)
+        fr = rc - r0f
+        wr0, wr1, wr2, wr3 = _bspline_weights(fr)
+        dr0, dr1, dr2, dr3 = _bspline_dweights(fr)
+        vz = tl.zeros(pz.shape, tl.float32)
+        vr = tl.zeros(pz.shape, tl.float32)
+        vp = tl.zeros(pz.shape, tl.float32)
+        gzcoord = tl.zeros(pz.shape, tl.float32)
+        grcoord = tl.zeros(pz.shape, tl.float32)
+        gphi = tl.zeros(pz.shape, tl.float32)
+        for dr in range(4):
+            ring = tl.minimum(tl.maximum(r0 + (dr - 1), 0), NR - 1)
+            wr = tl.where(dr == 0, wr0, tl.where(dr == 1, wr1, tl.where(dr == 2, wr2, wr3)))
+            dwr = tl.where(dr == 0, dr0, tl.where(dr == 1, dr1, tl.where(dr == 2, dr2, dr3)))
+            nphi = tl.load(num_phi_ptr + ring, mask=lane_mask, other=1).to(tl.int32)
+            offset = tl.load(offsets_ptr + ring, mask=lane_mask, other=0).to(tl.int64)
+            p0, fp, pscale = _cylb_ring_phi(phi, nphi)
+            wp0, wp1, wp2, wp3 = _bspline_weights(fp)
+            dp0, dp1, dp2, dp3 = _bspline_dweights(fp)
+            value_mask = lane_mask & (ring != 0)
+            for dz in range(4):
+                z = tl.minimum(tl.maximum(z0 + (dz - 1), 0), NZ - 1)
+                wz = tl.where(dz == 0, wz0, tl.where(dz == 1, wz1, tl.where(dz == 2, wz2, wz3)))
+                dwz = tl.where(dz == 0, dz0, tl.where(dz == 1, dz1, tl.where(dz == 2, dz2, dz3)))
+                row = z.to(tl.int64) * TOTAL + offset
+                for dp in tl.static_range(4):
+                    pp = _cylb_wrap(p0 + (dp - 1), nphi)
+                    wp = wp0 if dp == 0 else (wp1 if dp == 1 else (wp2 if dp == 2 else wp3))
+                    dwp = dp0 if dp == 0 else (dp1 if dp == 1 else (dp2 if dp == 2 else dp3))
+                    w = (wr * wz) * wp
+                    idx = row + pp
+                    a, b, c = _cylb_load_tap(field_ptr, idx, value_mask)
+                    vz += a * w
+                    vr += b * w
+                    vp += c * w
+                    dot = (a * glz + b * glr) + c * glp
+                    gzcoord += dot * ((dwz * wr) * wp)
+                    grcoord += dot * ((wz * dwr) * wp)
+                    gphi += (dot * ((wz * wr) * dwp)) * pscale
+                    if HAS_ACC:
+                        _cylb_scatter_tap(acc_ptr, idx, glz * w, glr * w, glp * w, value_mask)
+        zmask = (zraw >= 0.0) & (zraw <= (NZ - 1).to(tl.float32))
+        return (vz, vr, vp,
+                gzcoord * zmask.to(tl.float32) * (NZ - 1).to(tl.float32),
+                grcoord * (NR - 1).to(tl.float32), gphi)
+
+    @triton.jit
+    def _cylb_stage_local(gz, gy, gx, pz, py, px, NZ, NR):
+        # Per-stage inputs of the joint scatter: the stage's upstream
+        # gradient in the local (z, r, phi) basis, its z / r stencil cells
+        # and fractions and its angle -- computed exactly as _cyl_bwd_stage
+        # and _cylb_bwd_lattice do for the per-stage scatter.
+        qy, qx, raw, radius, phi, sin_phi, cos_phi, on_axis = _cyl_coords(py, px)
+        glr = gy * sin_phi + gx * cos_phi
+        glp = gy * cos_phi - gx * sin_phi
+        zn = pz * 2.0 - 1.0
+        zc = ((zn + 1.0) * 0.5) * (NZ - 1).to(tl.float32)
+        zc = tl.minimum(tl.maximum(zc, 0.0), (NZ - 1).to(tl.float32))
+        z0f = tl.math.floor(zc)
+        rc = radius * (NR - 1).to(tl.float32)
+        r0f = tl.math.floor(rc)
+        return gz, glr, glp, z0f.to(tl.int32), zc - z0f, r0f.to(tl.int32), rc - r0f, phi
+
+    @triton.jit
+    def _cylb_scatter_step(g1z, g1y, g1x, p1z, p1y, p1x,
+                           g2z, g2y, g2x, p2z, p2y, p2x,
+                           g3z, g3y, g3x, p3z, p3y, p3x,
+                           g4z, g4y, g4x, p4z, p4y, p4x,
+                           num_phi_ptr, offsets_ptr, acc_ptr, NZ, NR, TOTAL,
+                           lane_mask):
+        # Joint dL/d(control points) scatter of one RK4 step's four stages
+        # (gradient g_s at stage point p_s) into one lattice's accumulator.
+        # Each tap of the union of the stages' 4x4x4 boxes receives the sum
+        # over stages of g_s * w_s(tap), w_s being zero outside stage s's own
+        # box; so every stage's contribution is exactly the per-stage
+        # scatter's, merged in registers before the atomic. Loop extents
+        # are block-wide maxima of the per-lane union sizes; lanes with a
+        # smaller union mask their extra taps off.
+        az, ar, ap, az0, afz, ar0, afr, aphi = _cylb_stage_local(g1z, g1y, g1x, p1z, p1y, p1x, NZ, NR)
+        bz, br, bp, bz0, bfz, br0, bfr, bphi = _cylb_stage_local(g2z, g2y, g2x, p2z, p2y, p2x, NZ, NR)
+        cz, cr, cp, cz0, cfz, cr0, cfr, cphi = _cylb_stage_local(g3z, g3y, g3x, p3z, p3y, p3x, NZ, NR)
+        dz, dr, dp, dz0, dfz, dr0, dfr, dphi = _cylb_stage_local(g4z, g4y, g4x, p4z, p4y, p4x, NZ, NR)
+        awz0, awz1, awz2, awz3 = _bspline_weights(afz)
+        bwz0, bwz1, bwz2, bwz3 = _bspline_weights(bfz)
+        cwz0, cwz1, cwz2, cwz3 = _bspline_weights(cfz)
+        dwz0, dwz1, dwz2, dwz3 = _bspline_weights(dfz)
+        awr0, awr1, awr2, awr3 = _bspline_weights(afr)
+        bwr0, bwr1, bwr2, bwr3 = _bspline_weights(bfr)
+        cwr0, cwr1, cwr2, cwr3 = _bspline_weights(cfr)
+        dwr0, dwr1, dwr2, dwr3 = _bspline_weights(dfr)
+
+        zmin = tl.minimum(tl.minimum(az0, bz0), tl.minimum(cz0, dz0))
+        zmax = tl.maximum(tl.maximum(az0, bz0), tl.maximum(cz0, dz0))
+        rmin = tl.minimum(tl.minimum(ar0, br0), tl.minimum(cr0, dr0))
+        rmax = tl.maximum(tl.maximum(ar0, br0), tl.maximum(cr0, dr0))
+        # Stage box offsets within the union.
+        azo, bzo, czo, dzo = az0 - zmin, bz0 - zmin, cz0 - zmin, dz0 - zmin
+        aro, bro, cro, dro = ar0 - rmin, br0 - rmin, cr0 - rmin, dr0 - rmin
+        ZE = tl.max(zmax - zmin, axis=0) + 4
+        RE = tl.max(rmax - rmin, axis=0) + 4
+        for j in range(RE):
+            ring = tl.minimum(tl.maximum(rmin - 1 + j, 0), NR - 1)
+            nphi = tl.load(num_phi_ptr + ring, mask=lane_mask, other=1).to(tl.int32)
+            offset = tl.load(offsets_ptr + ring, mask=lane_mask, other=0).to(tl.int64)
+            ari, bri, cri, dri = j - aro, j - bro, j - cro, j - dro
+            awr = _cylb_select4(awr0, awr1, awr2, awr3, ari)
+            bwr = _cylb_select4(bwr0, bwr1, bwr2, bwr3, bri)
+            cwr = _cylb_select4(cwr0, cwr1, cwr2, cwr3, cri)
+            dwr = _cylb_select4(dwr0, dwr1, dwr2, dwr3, dri)
+            acov = (ari >= 0) & (ari < 4)
+            bcov = (bri >= 0) & (bri < 4)
+            ccov = (cri >= 0) & (cri < 4)
+            dcov = (dri >= 0) & (dri < 4)
+            # Each stage's phi cell on this ring's parameterisation; the
+            # union along phi is built around stage 1's cell, with stages
+            # not covering this ring pulled to it so they don't widen it.
+            ap0, afp, apscale = _cylb_ring_phi(aphi, nphi)
+            bp0, bfp, bpscale = _cylb_ring_phi(bphi, nphi)
+            cp0, cfp, cpscale = _cylb_ring_phi(cphi, nphi)
+            dp0, dfp, dpscale = _cylb_ring_phi(dphi, nphi)
+            awp0, awp1, awp2, awp3 = _bspline_weights(afp)
+            bwp0, bwp1, bwp2, bwp3 = _bspline_weights(bfp)
+            cwp0, cwp1, cwp2, cwp3 = _bspline_weights(cfp)
+            dwp0, dwp1, dwp2, dwp3 = _bspline_weights(dfp)
+            bd = tl.where(bcov, _cylb_wrap_diff(bp0 - ap0, nphi), 0)
+            cd = tl.where(ccov, _cylb_wrap_diff(cp0 - ap0, nphi), 0)
+            dd = tl.where(dcov, _cylb_wrap_diff(dp0 - ap0, nphi), 0)
+            pmin = tl.minimum(tl.minimum(bd, cd), tl.minimum(dd, 0))
+            pmax = tl.maximum(tl.maximum(bd, cd), tl.maximum(dd, 0))
+            apo, bpo, cpo, dpo = -pmin, bd - pmin, cd - pmin, dd - pmin
+            pbase = ap0 + pmin - 1  # first union cell, like zmin - 1 / rmin - 1
+            PE = tl.max(pmax - pmin, axis=0) + 4
+            ring_mask = lane_mask & (ring != 0)
+            for i in range(ZE):
+                z = tl.minimum(tl.maximum(zmin - 1 + i, 0), NZ - 1)
+                azi, bzi, czi, dzi = i - azo, i - bzo, i - czo, i - dzo
+                awzr = _cylb_select4(awz0, awz1, awz2, awz3, azi) * awr
+                bwzr = _cylb_select4(bwz0, bwz1, bwz2, bwz3, bzi) * bwr
+                cwzr = _cylb_select4(cwz0, cwz1, cwz2, cwz3, czi) * cwr
+                dwzr = _cylb_select4(dwz0, dwz1, dwz2, dwz3, dzi) * dwr
+                acovz = acov & (azi >= 0) & (azi < 4)
+                bcovz = bcov & (bzi >= 0) & (bzi < 4)
+                ccovz = ccov & (czi >= 0) & (czi < 4)
+                dcovz = dcov & (dzi >= 0) & (dzi < 4)
+                row = z.to(tl.int64) * TOTAL + offset
+                for k in range(PE):
+                    pp = _cylb_wrap(pbase + k, nphi)
+                    api, bpi, cpi, dpi = k - apo, k - bpo, k - cpo, k - dpo
+                    aw = awzr * _cylb_select4(awp0, awp1, awp2, awp3, api)
+                    bw = bwzr * _cylb_select4(bwp0, bwp1, bwp2, bwp3, bpi)
+                    cw = cwzr * _cylb_select4(cwp0, cwp1, cwp2, cwp3, cpi)
+                    dw = dwzr * _cylb_select4(dwp0, dwp1, dwp2, dwp3, dpi)
+                    active = ring_mask & (
+                        (acovz & (api >= 0) & (api < 4))
+                        | (bcovz & (bpi >= 0) & (bpi < 4))
+                        | (ccovz & (cpi >= 0) & (cpi < 4))
+                        | (dcovz & (dpi >= 0) & (dpi < 4)))
+                    sz = ((az * aw + bz * bw) + cz * cw) + dz * dw
+                    sr = ((ar * aw + br * bw) + cr * cw) + dr * dw
+                    sp = ((ap * aw + bp * bw) + cp * cw) + dp * dw
+                    _cylb_scatter_tap(acc_ptr, row + pp, sz, sr, sp, active)
+
+    @triton.jit
+    def _rk4cb_bwd_deferred_kernel(grad_y_ptr, grad_pts_ptr, stages_ptr,
+                                   lo_base, lo_num_phi_ptr, lo_offsets_ptr, lo_acc_base,
+                                   loNZ, loNR, loTOTAL,
+                                   hi_base, hi_num_phi_ptr, hi_offsets_ptr, hi_acc_base,
+                                   hiNZ, hiNR, hiTOTAL,
+                                   N, h, h_half, h_sixth, n_steps, num_slabs,
+                                   REVERSE: tl.constexpr, BLOCK: tl.constexpr):
+        # _rk4c_bwd_kernel (CUBIC, HAS_ACC) with the field-gradient scatter
+        # deferred to one joint _cylb_scatter_step per lattice per RK4 step.
+        # The point-gradient recursion is unchanged: each stage's
+        # _cyl_bwd_stage runs without HAS_ACC, and the stage gradients /
+        # points it consumed are handed to the joint scatter afterwards.
+        pid = tl.program_id(0)
+        i = pid * BLOCK + tl.arange(0, BLOCK)
+        m = i < N
+        lo_stride = loNZ.to(tl.int64) * loTOTAL * 3
+        hi_stride = hiNZ.to(tl.int64) * hiTOTAL * 3
+        lo_acc_stride = loNZ.to(tl.int64) * loTOTAL * _CYLB_ACC_CH
+        hi_acc_stride = hiNZ.to(tl.int64) * hiTOTAL * _CYLB_ACC_CH
+        gz = tl.load(grad_y_ptr + i * 3, mask=m, other=0.0)
+        gy = tl.load(grad_y_ptr + i * 3 + 1, mask=m, other=0.0)
+        gx = tl.load(grad_y_ptr + i * 3 + 2, mask=m, other=0.0)
+        for step in range(n_steps * num_slabs - 1, -1, -1):
+            slab = step // n_steps
+            if REVERSE:
+                slab = num_slabs - 1 - slab
+            lo_ptr = lo_base + slab.to(tl.int64) * lo_stride
+            hi_ptr = hi_base + slab.to(tl.int64) * hi_stride
+            lo_acc_ptr = lo_acc_base + slab.to(tl.int64) * lo_acc_stride
+            hi_acc_ptr = hi_acc_base + slab.to(tl.int64) * hi_acc_stride
+            s1 = (step * 4) * N.to(tl.int64)
+            s2 = (step * 4 + 1) * N.to(tl.int64)
+            s3 = (step * 4 + 2) * N.to(tl.int64)
+            s4 = (step * 4 + 3) * N.to(tl.int64)
+            g6z, g6y, g6x = gz * h_sixth, gy * h_sixth, gx * h_sixth
+            p4z = tl.load(stages_ptr + (s4 + i) * 3, mask=m, other=0.0)
+            p4y = tl.load(stages_ptr + (s4 + i) * 3 + 1, mask=m, other=0.0)
+            p4x = tl.load(stages_ptr + (s4 + i) * 3 + 2, mask=m, other=0.0)
+            g4z, g4y, g4x = g6z, g6y, g6x
+            b4z, b4y, b4x = _cyl_bwd_stage(
+                g4z, g4y, g4x, p4z, p4y, p4x,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_ptr, loNZ, loNR, loTOTAL,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_ptr, hiNZ, hiNR, hiTOTAL,
+                False, True, m)
+            p3z = tl.load(stages_ptr + (s3 + i) * 3, mask=m, other=0.0)
+            p3y = tl.load(stages_ptr + (s3 + i) * 3 + 1, mask=m, other=0.0)
+            p3x = tl.load(stages_ptr + (s3 + i) * 3 + 2, mask=m, other=0.0)
+            g3z, g3y, g3x = g6z * 2.0 + b4z * h, g6y * 2.0 + b4y * h, g6x * 2.0 + b4x * h
+            b3z, b3y, b3x = _cyl_bwd_stage(
+                g3z, g3y, g3x, p3z, p3y, p3x,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_ptr, loNZ, loNR, loTOTAL,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_ptr, hiNZ, hiNR, hiTOTAL,
+                False, True, m)
+            p2z = tl.load(stages_ptr + (s2 + i) * 3, mask=m, other=0.0)
+            p2y = tl.load(stages_ptr + (s2 + i) * 3 + 1, mask=m, other=0.0)
+            p2x = tl.load(stages_ptr + (s2 + i) * 3 + 2, mask=m, other=0.0)
+            g2z, g2y, g2x = (g6z * 2.0 + b3z * h_half, g6y * 2.0 + b3y * h_half,
+                             g6x * 2.0 + b3x * h_half)
+            b2z, b2y, b2x = _cyl_bwd_stage(
+                g2z, g2y, g2x, p2z, p2y, p2x,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_ptr, loNZ, loNR, loTOTAL,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_ptr, hiNZ, hiNR, hiTOTAL,
+                False, True, m)
+            p1z = tl.load(stages_ptr + (s1 + i) * 3, mask=m, other=0.0)
+            p1y = tl.load(stages_ptr + (s1 + i) * 3 + 1, mask=m, other=0.0)
+            p1x = tl.load(stages_ptr + (s1 + i) * 3 + 2, mask=m, other=0.0)
+            g1z, g1y, g1x = g6z + b2z * h_half, g6y + b2y * h_half, g6x + b2x * h_half
+            b1z, b1y, b1x = _cyl_bwd_stage(
+                g1z, g1y, g1x, p1z, p1y, p1x,
+                lo_ptr, lo_num_phi_ptr, lo_offsets_ptr, lo_ptr, loNZ, loNR, loTOTAL,
+                hi_ptr, hi_num_phi_ptr, hi_offsets_ptr, hi_ptr, hiNZ, hiNR, hiTOTAL,
+                False, True, m)
+            _cylb_scatter_step(
+                g1z, g1y, g1x, p1z, p1y, p1x, g2z, g2y, g2x, p2z, p2y, p2x,
+                g3z, g3y, g3x, p3z, p3y, p3x, g4z, g4y, g4x, p4z, p4y, p4x,
+                lo_num_phi_ptr, lo_offsets_ptr, lo_acc_ptr, loNZ, loNR, loTOTAL, m)
+            _cylb_scatter_step(
+                g1z, g1y, g1x, p1z, p1y, p1x, g2z, g2y, g2x, p2z, p2y, p2x,
+                g3z, g3y, g3x, p3z, p3y, p3x, g4z, g4y, g4x, p4z, p4y, p4x,
+                hi_num_phi_ptr, hi_offsets_ptr, hi_acc_ptr, hiNZ, hiNR, hiTOTAL, m)
+            gz = ((gz + b4z) + b3z + b2z) + b1z
+            gy = ((gy + b4y) + b3y + b2y) + b1y
+            gx = ((gx + b4x) + b3x + b2x) + b1x
+        tl.store(grad_pts_ptr + i * 3, gz, mask=m)
+        tl.store(grad_pts_ptr + i * 3 + 1, gy, mask=m)
+        tl.store(grad_pts_ptr + i * 3 + 2, gx, mask=m)

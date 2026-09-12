@@ -1,9 +1,11 @@
+import os
 import unittest
 
 import numpy as np
 import scipy.ndimage
 import torch
 
+import flow_triton
 from flow_fields import BSplineCylindricalFlowField
 
 
@@ -168,10 +170,10 @@ class BSplineCylindricalGradientTests(unittest.TestCase):
         torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
         self.assertIsNone(flow._pending_field_graphs)
 
-    def test_integrator_matches_manual_sampler_loop(self):
-        # The override must run the CUBIC sampler loop, not the inherited
-        # trilinear fused/eager integrator; two slabs, walked forward and
-        # in reverse order.
+    def test_eager_integrator_matches_manual_sampler_loop(self):
+        # On CPU the inherited integrator runs the eager slab loop over the
+        # CUBIC sampler (not the trilinear one); two slabs, walked forward
+        # and in reverse order.
         torch.manual_seed(13)
         flow = BSplineCylindricalFlowField(torch.tensor([12, 12, 12]), num_stages=2)
         with torch.no_grad():
@@ -194,6 +196,50 @@ class BSplineCylindricalGradientTests(unittest.TestCase):
                         k4 = sampler(y + h * k3)
                         y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
             torch.testing.assert_close(integrated, y)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and flow_triton._HAS_TRITON,
+    'needs CUDA and triton')
+class BSplineCylindricalTritonTests(unittest.TestCase):
+    # Kernel-level fused-vs-eager checks (edge points, adjoint, shared
+    # accumulators) run in tests/test_cylindrical_triton.py for both
+    # interpolants; this is the end-to-end model check.
+
+    def test_full_model_grads_match_eager_path(self):
+        from tests.test_vram_reductions import (
+            _make_small_spiral_model, _sample_scroll_points)
+
+        def run(disable_triton):
+            model = _make_small_spiral_model(23, 'bspline_cylindrical', device='cuda')
+            points = _sample_scroll_points(41, 5).cuda()
+            previous = os.environ.get('FIT_SPIRAL_TRITON')
+            os.environ['FIT_SPIRAL_TRITON'] = '0' if disable_triton else '1'
+            try:
+                transform = model.get_slice_to_spiral_transform()
+                loss = (transform(points)[..., 1:].norm(dim=-1)
+                        / model.get_dr_per_winding()).mean()
+                loss.backward()
+            finally:
+                if previous is None:
+                    os.environ.pop('FIT_SPIRAL_TRITON', None)
+                else:
+                    os.environ['FIT_SPIRAL_TRITON'] = previous
+            model.flow_field.apply_accumulated_field_grad()
+            return loss.detach(), {
+                name: p.grad for name, p in model.named_parameters()}
+
+        eager_loss, eager_grads = run(disable_triton=True)
+        triton_loss, triton_grads = run(disable_triton=False)
+
+        torch.testing.assert_close(triton_loss, eager_loss, rtol=1e-4, atol=1e-7)
+        for name, eager_grad in eager_grads.items():
+            triton_grad = triton_grads[name]
+            if eager_grad is None and triton_grad is None:
+                continue
+            torch.testing.assert_close(
+                triton_grad, eager_grad, rtol=2e-3, atol=1e-5,
+                msg=lambda base, name=name: f'{name}: {base}')
 
 
 if __name__ == '__main__':
