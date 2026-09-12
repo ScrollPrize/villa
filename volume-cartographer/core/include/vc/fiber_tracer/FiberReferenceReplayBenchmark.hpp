@@ -76,8 +76,11 @@ struct FiberReferenceReplaySummary {
     double lengthWeightedSuccessPercent = 0.0;
     double failureFreeCasesPercent = 0.0;
     double failuresPerDirectedMillimeter = 0.0;
+    // Pooled full reference length / (totalFailures + directedCases), including
+    // every direction's successful terminal partition. Empty summaries use 0.
     double meanSegmentLengthBaseVoxels = 0.0;
     double meanSegmentLengthMillimeters = 0.0;
+    // Relative to the total directed reference length, not per-fiber success.
     double meanSegmentLengthPercent = 0.0;
     std::vector<std::pair<std::string, std::size_t>> failureReasons;
 };

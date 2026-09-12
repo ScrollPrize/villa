@@ -451,10 +451,13 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         totalFailures += summary.totalFailures;
     }
     vc::core::util::atomicWriteString(output / "summary.json", Json{
-        {"version", 1}, {"completed", true}, {"cases", cases.size()}, {"workers", workers},
+        {"version", 2}, {"metric_definition", "complete-reference-partition-v1"},
+        {"completed", true}, {"cases", cases.size()}, {"workers", workers},
         {"directed_reference_length_mm", directedLengthMm}, {"failures", totalFailures},
         {"failures_per_directed_mm", totalFailures / directedLengthMm},
-        {"mean_segment_length_mm", directedLengthMm / (totalFailures + 1)},
+        {"reliability_segments", totalFailures + cases.size()},
+        {"mean_segment_length_mm", directedLengthMm / (totalFailures + cases.size())},
+        {"mean_segment_length_percent", 100.0 / (totalFailures + cases.size())},
         {"wall_seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
         {"config", persistedConfig}, {"effective_trace", cli::traceConfigJson(trace)}, {"sources", summaries}}.dump(2) + "\n");
     return 0;

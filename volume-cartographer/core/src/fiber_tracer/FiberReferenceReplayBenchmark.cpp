@@ -303,7 +303,7 @@ FiberReferenceReplaySummary summarizeFiberReferenceReplay(std::size_t selectedSo
         summary.failuresPerDirectedMillimeter =
             static_cast<double>(summary.totalFailures) / (summary.directedReferenceLengthBaseVoxels * baseToMillimeters);
     if (summary.directedReferenceLengthBaseVoxels > 0.0) {
-        const double segmentCount = static_cast<double>(summary.totalFailures + 1);
+        const double segmentCount = static_cast<double>(summary.totalFailures + summary.directedCases);
         summary.meanSegmentLengthBaseVoxels = summary.directedReferenceLengthBaseVoxels / segmentCount;
         summary.meanSegmentLengthMillimeters = summary.meanSegmentLengthBaseVoxels * baseToMillimeters;
         summary.meanSegmentLengthPercent = 100.0 * summary.meanSegmentLengthBaseVoxels / summary.directedReferenceLengthBaseVoxels;
@@ -359,7 +359,8 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
         reasons[reason] = count;
     return {
         {"format", "vc_fiber_reference_replay_benchmark"},
-        {"version", 4},
+        {"version", 5},
+        {"metric_definition", "complete-reference-partition-v1"},
         {"tracer", tracer},
         {"coordinates",
          {
@@ -399,7 +400,7 @@ nlohmann::json fiberReferenceReplayBenchmarkJson(
              {"length_weighted_success_percent", summary.lengthWeightedSuccessPercent},
              {"failure_free_cases_percent", summary.failureFreeCasesPercent},
              {"failures_per_directed_mm", summary.failuresPerDirectedMillimeter},
-             {"reliability_segments", summary.totalFailures + 1},
+             {"reliability_segments", summary.totalFailures + summary.directedCases},
              {"mean_segment_length_base_voxels", summary.meanSegmentLengthBaseVoxels},
              {"mean_segment_length_mm", summary.meanSegmentLengthMillimeters},
              {"mean_segment_length_percent", summary.meanSegmentLengthPercent},
