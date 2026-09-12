@@ -56,6 +56,10 @@ class CpuBroker:
     def end_test(self, step):
         assert step * self.effective_batch_size == self.frontier
 
+    def select_test_source(self, step, source):
+        assert step * self.effective_batch_size == self.frontier
+        assert source == "historical"
+
     def test_batch(self, step, indices):
         assert step * self.effective_batch_size == self.frontier
         return self.batch(indices)
@@ -109,12 +113,14 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
         "optimizer_global_batch_size": 5, "max_steps": 3, "initialization_seed": 17,
         "run_path": str(tmp_path), "run_datestr": "test", "tensorboard_enabled": True,
         "scalar_log_interval": 1,
+        "ema_decays": [0.99, 0.999],
         "test_interval": 100, "checkpoint_interval": 100, "sample_vis_interval": 1,
         "sample_pipeline_workers": 2}}
     if resume_during_test:
         # Four original test groups: first two are completed on two ranks,
         # remaining groups resume on one rank through the real test RPC.
         config["test_datasets"] = [{"name": "in-memory-fixture"}]
+        config["historical_test_datasets"] = [{"name": "in-memory-fixture"}]
         config["training"]["test_control_points"] = 8
         config["training"]["test_trace2cp_enabled"] = False
     path = tmp_path / "config.json"
@@ -168,6 +174,7 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             assert payload["progress"]["samples_seen"] == target * 5
             assert payload["progress"]["optimizer_global_batch_size"] == 5
             assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
+            assert all(track["updates"] == target for track in payload["ema"]["tracks"].values())
             if resume_during_test and target == 0:
                 assert len(payload["progress"]["pending_test"]["rows"]) == 2
         finally:
@@ -196,6 +203,10 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
         for key, values in expected["optimizer"]["state"].items():
             for name, value in values.items():
                 torch.testing.assert_close(actual["optimizer"]["state"][key][name], value, rtol=1e-5, atol=1e-6)
+        for name, track in expected["ema"]["tracks"].items():
+            assert actual["ema"]["tracks"][name]["updates"] == track["updates"] == 3
+            for key, value in track["model"].items():
+                torch.testing.assert_close(actual["ema"]["tracks"][name]["model"][key], value, rtol=1e-5, atol=1e-6)
     finally:
         if not reference.closed:
             reference.abort()
@@ -208,6 +219,8 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
     assert events.count(("closed", None)) == 1
     if resume_during_test:
         assert any(event[0] == "image" for event in events)
+        for prefix in ("test_historical", "test_ema_0p99", "test_historical_ema_0p999"):
+            assert sum(event[0] == prefix + "/loss_total" for event in events) == 1
     assert not torch.cuda.is_initialized()
 
 

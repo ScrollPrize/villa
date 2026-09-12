@@ -19,5 +19,8 @@
     "batch_size": 16,
     "samples": 128,
     "overrides": {}
+  },
+  "production": {
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json"
   }
 }

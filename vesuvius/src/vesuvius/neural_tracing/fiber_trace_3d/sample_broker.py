@@ -13,7 +13,7 @@ def _validate_capacity(slots, effective_batch_size, test_sample_count, test_batc
 class CanonicalSampleBroker:
     def __init__(self, queue, *, effective_batch_size, start_step, max_steps,
                  test_interval=0, test_sample_count=0, test_batch_size=1,
-                 test_start_sample_index=0, initial_test=True):
+                 test_start_sample_index=0, initial_test=True, test_sources=None):
         _validate_capacity(queue.pipeline.max_in_flight, effective_batch_size,
                            test_sample_count, test_batch_size)
         self.queue = queue
@@ -24,6 +24,8 @@ class CanonicalSampleBroker:
         self.test_interval = test_interval
         self.test_start = test_start_sample_index
         self.test_count = test_sample_count
+        self.test_sources = {"test": (test_sample_count, test_start_sample_index), **(test_sources or {})}
+        self.test_source = "test"
         self.test_step = start_step if self.test_count and initial_test else None
         self._train = {}
         self._test = {}
@@ -47,6 +49,7 @@ class CanonicalSampleBroker:
         sources = {"train": SampleQueueSource(loader_config, "random", sample_index_limit,
                                               defer_cuda_value_augmentation)}
         count, offset, batch = 0, 0, 1
+        test_sources = {}
         interval = int(training.get("test_interval", 0))
         if raw.get("test_datasets") and interval > 0:
             config = config_from_mapping(_make_test_loader_raw_config(raw, training),
@@ -56,6 +59,14 @@ class CanonicalSampleBroker:
                 loader_sample_count=loader.sample_count, default_count=0)
             batch = config.batch_size
             sources["test"] = SampleQueueSource(config, mode)
+        from .historical_evaluation import historical_test_config
+        historical = historical_test_config(raw)
+        if historical is not None and interval > 0:
+            config = config_from_mapping(historical, config_dir=Path(config_path).resolve().parent)
+            historical_count = FiberTrace3DLoader(config).sample_count
+            sources["historical"] = SampleQueueSource(config, "random")
+            test_sources["historical"] = (historical_count, 0)
+            _validate_capacity(slot_count, effective_batch_size, historical_count, config.batch_size)
         _validate_capacity(slot_count, effective_batch_size, count, batch)
         queue = FiberTrace3DSampleQueue(sources=sources, workers=workers,
             slot_count=slot_count, initial_in_flight=initial_in_flight,
@@ -63,7 +74,7 @@ class CanonicalSampleBroker:
             on_process_start=on_process_start)
         return cls(queue, effective_batch_size=effective_batch_size, start_step=start_step,
             max_steps=max_steps, test_interval=interval, test_sample_count=count,
-            test_batch_size=batch, test_start_sample_index=offset)
+            test_batch_size=batch, test_start_sample_index=offset, test_sources=test_sources)
 
     @property
     def ready(self):
@@ -73,7 +84,7 @@ class CanonicalSampleBroker:
         self.queue.poll(limit)
         if self.test_step is not None:
             while self._next_test < self.test_start + self.test_count:
-                ticket = self.queue.submit("test", (self._next_test,))
+                ticket = self.queue.submit(self.test_source, (self._next_test,))
                 if ticket is None:
                     break
                 self._test[self._next_test] = ticket[0]
@@ -107,7 +118,7 @@ class CanonicalSampleBroker:
             raise ValueError("test request outside canonical test selection")
         for index in indices:
             if index not in self._test and index in self._test_done:
-                ticket = self.queue.submit("test", (index,))
+                ticket = self.queue.submit(self.test_source, (index,))
                 if ticket is None:
                     return None
                 self._test[index] = ticket[0]
@@ -137,6 +148,21 @@ class CanonicalSampleBroker:
         if self.test_step != step or self._test_released != self.test_count or self._test:
             raise RuntimeError("test phase ended with unconsumed sample ownership")
         self.test_step = None
+        self.test_source = "test"
+        self.test_count, self.test_start = self.test_sources["test"]
+        self._next_test = self.test_start
+        self._test_released = 0
+        self._test_done.clear()
+
+    def select_test_source(self, step, source):
+        if self.test_step != step or source not in self.test_sources:
+            raise RuntimeError("invalid test source/phase selection")
+        if source == self.test_source:
+            return
+        if self._test or self._test_released != self.test_count:
+            raise RuntimeError("cannot switch test source with unconsumed sample ownership")
+        self.test_source = source
+        self.test_count, self.test_start = self.test_sources[source]
         self._next_test = self.test_start
         self._test_released = 0
         self._test_done.clear()

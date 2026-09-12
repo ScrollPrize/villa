@@ -1,5 +1,5 @@
 {
-  "suites": ["reproduction"],
+  "suites": ["ema"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

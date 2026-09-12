@@ -65,6 +65,12 @@ def test_test_rows_keep_logical_normalization_with_physical_microbatches(channel
     model = torch.nn.Conv3d(1, channels, 1)
     options = dict(device=torch.device("cpu"), start_sample_index=0,
                    sample_count=5, direction_weight=1.0, presence_weight=1.0)
+    if channels != 7:
+        # Target-only normalization intentionally disabled these modes before
+        # the EMA work; assert the explicit guard rather than old support.
+        with pytest.raises(ValueError, match="temporarily unsupported"):
+            train._evaluate_dense_loss_rows(model, loader, **options)
+        return
     expected = train._evaluate_dense_loss_rows(model, loader, **options)
     actual = train._evaluate_dense_loss_rows(model, loader, microbatch_size=physical_size, **options)
     assert [index for index, _ in actual] == [0, 1]

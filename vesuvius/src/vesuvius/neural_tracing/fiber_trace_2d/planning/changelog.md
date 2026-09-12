@@ -1,3 +1,15 @@
+## 2026-09-12 — EMA and historical training observations
+
+- Optional EMA0.99/.999 with separately tested/current/best/kept exports, raw
+  resumable snapshots and managed RAM state. Foreach FP32 averaging preserves
+  BF16 model computation; two tracks cost0.617ms/update in one-H100 B4 test.
+- Additional historical CP/full-grid/central-presence-loss test source uses
+  the existing shared queue; raw and EMA share each loaded batch. Historical
+  metrics do not select best checkpoints. Old source-availability-mask behavior
+  is not reproduced by the modern loader and is explicitly documented.
+- Regular2M-update S1a config plus approved managed production launcher; see
+  docs/training_ema_historical.md for tags, snapshots, commands and measurements.
+
 ## 2026-09-12 — Historical S1a reproduction
 
 - Modern GN/quarter-resolution/augmentation training recovers historical test

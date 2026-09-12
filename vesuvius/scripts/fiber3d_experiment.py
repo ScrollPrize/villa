@@ -22,7 +22,7 @@ CONTROL = Path(__file__).with_name('fiber3d_experiment.json')
 
 def input_manifest(raw):
     result = {}
-    for key in ('datasets', 'test_datasets'):
+    for key in ('datasets', 'test_datasets', 'historical_test_datasets'):
         rows = []
         for dataset in raw.get(key, []):
             for filename in sorted(glob.glob(dataset['fiber_glob'])):
@@ -31,6 +31,87 @@ def input_manifest(raw):
                              'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
         result[key] = rows
     return result
+
+
+def production_start():
+    """Start the ordinary adaptive trainer, with no outer exclusive reservation."""
+    from villa_gpu_manager.processes import process_identity, process_state
+    control = json.loads(CONTROL.read_text())['production']
+    config_path = (ROOT / control['config']).resolve()
+    config = json.loads(config_path.read_text())
+    root = Path(config['training']['run_path']) / '.launches'
+    root.mkdir(parents=True, exist_ok=True)
+    latest = root / 'latest'
+    if latest.exists():
+        previous = Path(latest.read_text())
+        identity = json.loads((previous / 'controller.json').read_text())
+        if process_state(identity, os.getuid()) != 'dead':
+            raise RuntimeError(f'previous production launch is still alive: {previous}')
+    folder = root / (config['training']['run_name'] + '-' + datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
+    folder.mkdir()
+    (folder / 'config.json').write_text(json.dumps(config, indent=2))
+    (folder / 'inputs.json').write_text(json.dumps(input_manifest(config), indent=2))
+    command = [sys.executable, '-m', 'vesuvius.neural_tracing.fiber_trace_3d.train', str(config_path)]
+    (folder / 'command.json').write_text(json.dumps(command))
+    (folder / 'source.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT,text=True)
+        + subprocess.check_output(['git','diff'], cwd=ROOT,text=True))
+    with (folder / 'train.log').open('w') as log:
+        process = subprocess.Popen(command, cwd=ROOT, env=dict(os.environ, PYTHONUNBUFFERED='1'),
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    identity = process_identity(process.pid)
+    (folder / 'controller.json').write_text(json.dumps(identity))
+    latest.write_text(str(folder))
+    print(f'managed training root={process.pid} log={folder / "train.log"}', flush=True)
+
+
+def production_status(stop=False):
+    from villa_gpu_manager.processes import process_state
+    control = json.loads(CONTROL.read_text())['production']
+    config = json.loads((ROOT / control['config']).read_text())
+    root = Path(config['training']['run_path']) / '.launches'
+    folder = Path((root / 'latest').read_text())
+    identity = json.loads((folder / 'controller.json').read_text())
+    if stop and process_state(identity, os.getuid()) != 'dead':
+        os.kill(identity['pid'], signal.SIGTERM)
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline and process_state(identity, os.getuid()) != 'dead':
+            time.sleep(.1)
+        if process_state(identity, os.getuid()) != 'dead':
+            raise RuntimeError('managed training root has not exited; inspect its bounded stop guard, do not start a replacement')
+    print('production:', folder, 'state:', process_state(identity, os.getuid()))
+    with (folder / 'train.log').open('rb') as stream:
+        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 10000))
+        print(stream.read().decode(errors='replace'))
+
+
+def audit_latest():
+    """CPU-only verification of written snapshot variants and TensorBoard tags."""
+    import torch
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    folder = Path((OUTPUT / 'latest').read_text())
+    text = (folder / 'train.log').read_text()
+    run = Path(re.findall(r'run_dir=(\S+)', text)[-1])
+    raw = torch.load(run / 'snapshots/current.pt', map_location='cpu', weights_only=True, mmap=True)
+    variants = {}
+    for name, track in raw['ema']['tracks'].items():
+        export = torch.load(run / 'snapshots' / f'current_{name}.pt',
+                            map_location='cpu', weights_only=True, mmap=True)
+        assert export['snapshot_kind'] == 'ema' and 'optimizer' not in export
+        assert export['step'] == raw['step']
+        for key, tensor in track['model'].items():
+            assert torch.equal(tensor, export['model'][key]), (name, key)
+        variants[name] = {key: track[key] for key in ('decay','updates','start_step','best_metric')}
+    events = EventAccumulator(str(run), size_guidance={'scalars':0})
+    events.Reload()
+    tags = events.Tags()['scalars']
+    for prefix in ('test','test_historical',*[f'test_{name}' for name in variants],
+                   *[f'test_historical_{name}' for name in variants]):
+        for metric in ('loss_total','angle_mean_deg'):
+            assert prefix + '/' + metric in tags
+    report = {'run':str(run),'step':raw['step'],'variants':variants,
+              'test_tags':[tag for tag in tags if tag.startswith('test')]}
+    (folder / 'snapshot_audit.json').write_text(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2))
 
 
 def start():
@@ -247,10 +328,18 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
+    elif args.command == 'production-start':
+        production_start()
+    elif args.command == 'production-status':
+        production_status()
+    elif args.command == 'production-stop':
+        production_status(stop=True)
+    elif args.command == 'audit-latest':
+        audit_latest()
     elif args.command == 'start':
         start()
     elif args.command == 'summarize':

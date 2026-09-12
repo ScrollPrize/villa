@@ -36,15 +36,19 @@ def config_fingerprint(config):
                                     allow_nan=False).encode()).hexdigest()
 
 
-def model_optimizer_payload(model, optimizer, grad_scaler=None):
+def model_optimizer_payload(model, optimizer, grad_scaler=None, ema=None):
     """Common payload; callers choose disk serialization or CPU RAM ownership."""
     result = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
     if grad_scaler is not None and grad_scaler.is_enabled():
         result["grad_scaler"] = grad_scaler.state_dict()
+    if ema is not None and ema.tracks:
+        result["ema"] = ema.state_dict()
     return result
 
 
 def restore_model_optimizer(payload, *, model, optimizer=None, grad_scaler=None):
+    if optimizer is not None and payload.get("snapshot_kind") == "ema":
+        raise ValueError("EMA snapshots are inference-only; resume from the raw current.pt snapshot")
     model.load_state_dict(payload.get("model", payload))
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
@@ -72,13 +76,13 @@ def cpu_clone(value):
     raise TypeError(f"unsupported handoff state value {type(value).__name__}")
 
 
-def capture_handoff(*, model, optimizer, progress, grad_scaler=None, cuda_device=None):
+def capture_handoff(*, model, optimizer, progress, grad_scaler=None, cuda_device=None, ema=None):
     """Called at a completed unit boundary after stopping asynchronous prep.
 
     CUDA RNG is accessed only when the GPU worker explicitly supplies its own
     device. A CPU-only caller never probes CUDA availability or initializes it.
     """
-    payload = cpu_clone(model_optimizer_payload(model, optimizer, grad_scaler))
+    payload = cpu_clone(model_optimizer_payload(model, optimizer, grad_scaler, ema))
     payload["progress"] = cpu_clone(progress)
     payload["rng"] = {
         "python": random.getstate(), "numpy": np.random.get_state(),

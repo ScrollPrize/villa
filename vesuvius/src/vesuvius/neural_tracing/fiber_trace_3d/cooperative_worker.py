@@ -31,11 +31,11 @@ class QueueBatchSource:
             raise RuntimeError("managed evaluation requires the shared sample broker")
         return _QueueTestBatches(self, step, global_batch_indices, batch_size, start_sample_index, sample_count)
 
-    def _test_boundary(self, kind, step):
+    def _test_boundary(self, kind, step, details=()):
         connection = self.test_connection
         if connection is None:
             raise RuntimeError("managed tests require shared sample phase coordination")
-        connection.send((kind, step, ()))
+        connection.send((kind, step, details))
         while not connection.poll(0.1):
             if self.stopped.is_set():
                 raise RuntimeError("sample source closed during test phase transition")
@@ -49,6 +49,9 @@ class QueueBatchSource:
 
     def end_test(self, step):
         self._test_boundary("end-test", step)
+
+    def select_test_source(self, step, source):
+        self._test_boundary("select-test", step, (source,))
 
     def __iter__(self):
         return self

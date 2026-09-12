@@ -223,8 +223,8 @@ class FiberCohort:
                 kind, step, indices = connection.recv()
                 if kind == "release-test":
                     self.broker.release_test(step, indices)
-                elif kind in ("begin-test", "end-test") and rank not in self._test_boundaries:
-                    self._test_boundaries[rank] = (kind, step)
+                elif kind in ("begin-test", "end-test", "select-test") and rank not in self._test_boundaries:
+                    self._test_boundaries[rank] = (kind, step, indices)
                 elif kind == "test" and rank not in self._test_pending:
                     self._test_pending[rank] = (kind, step, indices)
                 else:
@@ -239,9 +239,11 @@ class FiberCohort:
             boundaries = list(self._test_boundaries.values())
             if any(row != boundaries[0] for row in boundaries):
                 raise RuntimeError("GPU ranks disagree on sample phase boundary")
-            kind, step = boundaries[0]
+            kind, step, details = boundaries[0]
             if kind == "begin-test":
                 self.broker.begin_test(step)
+            elif kind == "select-test":
+                self.broker.select_test_source(step, *details)
             else:
                 self.broker.end_test(step)
             for connection in self._test_connections:

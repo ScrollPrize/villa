@@ -1,5 +1,28 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## EMA and historical observation
+
+- Optional training.ema_decays are unique finite values in(0,1). FP32 shadows
+  start from initialized/restored raw weights and update with fixed decay once
+  per successful optimizer update; skipped FP16 updates do not advance them.
+  BF16 model execution and raw optimizer math remain unchanged.
+- Raw snapshots and managed RAM handoffs retain all EMA weights, counters,
+  initialization update and per-track best metrics. Replica checks include EMA.
+  EMA inference exports have explicit kind/decay metadata and no optimizer;
+  ordinary training resume from an EMA export is an error.
+- Each EMA best is selected by its current dense test loss. Additional
+  historical metrics are observational and never select best checkpoints.
+  Existing raw test scalars/checkpoint-selection semantics are unchanged.
+- Optional historical_test_datasets use CP-only control-point tests, batch8,
+  no augmentation, trilinear full-grid predictions and central historical
+  presence loss region. Modern source loading lacks old source-validity masks;
+  report this in startup/config/docs, never promise bit-exact old results.
+- Raw and EMA evaluations share loaded batches and source-tagged queue workers.
+  Historical source leases and resumable rows are distinct. Weight swaps copy
+  existing storage and restore raw parameters/buffers/modes before every yield
+  or exception escape. Additional memory participates in automatic calibration.
+- See docs/training_ema_historical.md for config, tags, snapshot naming and tests.
+
 ## Historical Fiber3D evaluation experiments
 
 - Optional training.test_batch_size fixes positive logical test batch size

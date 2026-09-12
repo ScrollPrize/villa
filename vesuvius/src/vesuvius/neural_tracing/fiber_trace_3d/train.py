@@ -24,6 +24,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics as _LossStatistics
 from vesuvius.neural_tracing.fiber_trace_3d.embedding import embedding_statistics
+from vesuvius.neural_tracing.fiber_trace_3d.ema import ModelEMA
+from vesuvius.neural_tracing.fiber_trace_3d.historical_evaluation import (
+    historical_test_config, historical_presence_mask,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
     NormalizedGradientAccumulator,
     validate_target_only_loss_config, validate_sample_independent_model,
@@ -1343,6 +1347,7 @@ def compute_losses(
     branch_selection_mode: str = "eval_voxel",
     embeddings: torch.Tensor | None = None,
     _return_statistics: bool = False,
+    presence_loss_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
     # TODO: replace prediction-dependent global counts before re-enabling these modes.
     if embeddings is not None or output.shape[1] != 7:
@@ -1436,12 +1441,14 @@ def compute_losses(
         positive_group_sum.scatter_add_(
             0,
             positive_group_index,
-            positive_presence_bce,
+            positive_presence_bce if presence_loss_mask is None else positive_presence_bce * presence_loss_mask[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]],
         )
         positive_group_count.scatter_add_(
             0,
             positive_group_index,
-            torch.ones_like(positive_presence_bce),
+            torch.ones_like(positive_presence_bce) if presence_loss_mask is None else presence_loss_mask[
+                indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]].to(positive_presence_bce.dtype),
         )
         positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
             positive_group_sum,
@@ -1473,6 +1480,8 @@ def compute_losses(
 
     presence_target = batch.presence_target.unsqueeze(1).expand_as(pred_presences)
     negative_mask = presence_target <= 0.5
+    if presence_loss_mask is not None:
+        negative_mask = negative_mask & presence_loss_mask.unsqueeze(1)
     negative_presence_bce = _safe_probability_bce(
         pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
         torch.zeros_like(pred_presences),
@@ -1774,10 +1783,12 @@ def _save_snapshot(
     metric: float | None,
     metric_name: str | None = None,
     sample_progress: _SampleProgress | None = None,
+    ema: ModelEMA | None = None,
+    ema_name: str | None = None,
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
-        **model_optimizer_payload(snapshot_model, optimizer, grad_scaler),
+        **model_optimizer_payload(snapshot_model, optimizer, grad_scaler, ema),
         "step": int(step),
         "config": _json_safe(config),
         "metric": metric,
@@ -1786,6 +1797,13 @@ def _save_snapshot(
     if sample_progress is not None:
         payload["samples_seen"] = sample_progress.at(step)
         payload["optimizer_global_batch_size"] = sample_progress.global_batch_size
+    if ema_name is not None:
+        track = ema.tracks[ema_name]
+        payload["model"] = track["model"]
+        payload["snapshot_kind"] = "ema"
+        payload["ema_metadata"] = {key: value for key, value in track.items() if key != "model"}
+        for key in ("optimizer", "grad_scaler", "ema"):
+            payload.pop(key, None)
     torch.save(payload, path)
 
 
@@ -1818,7 +1836,7 @@ def _load_snapshot(
     payload = torch.load(path, map_location=map_location)
     if progress_metadata is not None and isinstance(payload, dict):
         progress_metadata.update({
-            key: payload[key] for key in ("samples_seen", "optimizer_global_batch_size", "config")
+            key: payload[key] for key in ("samples_seen", "optimizer_global_batch_size", "config", "ema")
             if key in payload
         })
     restore_model_optimizer(payload, model=model, optimizer=optimizer, grad_scaler=grad_scaler)
@@ -2245,6 +2263,32 @@ class _FullResolutionEvaluation(torch.nn.Module):
 
 
 @torch.no_grad()
+def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
+                           direction_weight, presence_weight, mixed_precision,
+                           conditioned_loss_options=None, prediction_observer=None,
+                           historical=False):
+    """Shared per-logical-batch evaluation, including bounded physical splits."""
+    take = int(batch.volume.shape[0])
+    size = take if microbatch_size is None else microbatch_size
+    statistics = None
+    for offset in range(0, take, size):
+        physical = _slice_batch(batch, offset, min(take, offset + size)).to(device)
+        physical = materialize_targets(physical, config, output_stride=_model_output_stride(model))
+        if historical:
+            physical = replace(physical, presence_mask=historical_presence_mask(physical, config))
+        with _autocast_context(mixed_precision):
+            part = _forward_loss_statistics(model, physical,
+                conditioned_loss_options=conditioned_loss_options, training_loss=False,
+                prediction_observer=prediction_observer, historical_presence_mask=historical)
+        statistics = part if statistics is None else statistics + part
+    options = conditioned_loss_options or {}
+    return _finalize_loss_statistics(statistics,
+        direction_weight=direction_weight, presence_weight=presence_weight,
+        positive_query_weight=options.get("positive_query_weight", 1.0),
+        negative_query_weight=options.get("negative_query_weight", 1.0))
+
+
+@torch.no_grad()
 def _evaluate_dense_loss_rows(
     model: torch.nn.Module,
     loader: FiberTrace3DLoader,
@@ -2266,8 +2310,11 @@ def _evaluate_dense_loss_rows(
     microbatch_size: int | None = None,
     profile_times: dict[str, list[float]] | None = None,
     output_upsample: str | None = None,
+    ema: ModelEMA | None = None,
+    historical: bool = False,
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
+    raw_model = model
     if output_upsample is not None:
         model = _FullResolutionEvaluation(model, output_upsample)
     batch_size = int(loader.config.batch_size)
@@ -2362,31 +2409,17 @@ def _evaluate_dense_loss_rows(
                 take=take,
             )
         forward_started = time.monotonic()
-        if microbatch_size is None:
-            with _autocast_context(mixed_precision):
-                loss_tensors = _forward_loss_tensors(
-                    model, batch, direction_weight=direction_weight,
-                    presence_weight=presence_weight,
-                    conditioned_loss_options=conditioned_loss_options, training_loss=False,
-                    prediction_observer=prediction_observer,
-                )
-        else:
-            statistics = None
-            for offset in range(0, take, microbatch_size):
-                physical = _slice_batch(batch, offset, min(take, offset + microbatch_size)).to(device)
-                physical = materialize_targets(physical, loader.config, output_stride=_model_output_stride(model))
-                with _autocast_context(mixed_precision):
-                    part = _forward_loss_statistics(model, physical,
-                        conditioned_loss_options=conditioned_loss_options, training_loss=False,
-                        prediction_observer=prediction_observer)
-                statistics = part if statistics is None else statistics + part
-                del physical
-            options = conditioned_loss_options or {}
-            loss_tensors = _finalize_loss_statistics(
-                statistics, direction_weight=direction_weight, presence_weight=presence_weight,
-                positive_query_weight=options.get("positive_query_weight", 1.0),
-                negative_query_weight=options.get("negative_query_weight", 1.0),
-            )
+        batch_options = dict(device=device, microbatch_size=microbatch_size,
+            direction_weight=direction_weight, presence_weight=presence_weight,
+            mixed_precision=mixed_precision, conditioned_loss_options=conditioned_loss_options,
+            historical=historical)
+        loss_tensors = _evaluate_loaded_batch(model, batch, loader.config,
+            **batch_options, prediction_observer=prediction_observer)
+        ema_rows = {}
+        for name in (() if ema is None else ema.tracks):
+            with ema.apply(raw_model, name):
+                values = _evaluate_loaded_batch(model, batch, loader.config, **batch_options)
+                ema_rows.update({f"{name}/{key}": value for key, value in _losses_to_float_dict(values).items()})
         _diagnostic_cuda_synchronize(
             diagnostics,
             phase="dense-test-cuda-sync",
@@ -2412,6 +2445,7 @@ def _evaluate_dense_loss_rows(
                 consumed=consumed,
             )
         rows = _losses_to_float_dict(loss_tensors)
+        rows.update(ema_rows)
         timed_stage("forward", forward_started)
         if diagnostics is not None:
             diagnostics.marker(
@@ -2557,6 +2591,7 @@ def _forward_loss_tensors(
     conditioned_loss_options: dict[str, float] | None = None,
     training_loss: bool,
     prediction_observer: Any | None = None,
+    historical_presence_mask: bool = False,
 ) -> dict[str, torch.Tensor]:
     if _model_uses_conditioned_decoder(model):
         return compute_conditioned_losses(
@@ -2576,6 +2611,7 @@ def _forward_loss_tensors(
         output,
         batch,
         embeddings=result["embeddings"] if use_embeddings else None,
+        presence_loss_mask=batch.presence_mask if historical_presence_mask else None,
         direction_weight=direction_weight,
         presence_weight=presence_weight,
         branch_selection_mode=(
@@ -2591,6 +2627,7 @@ def _forward_loss_statistics(
     conditioned_loss_options: dict[str, float] | None = None,
     training_loss: bool = True,
     prediction_observer: Any | None = None,
+    historical_presence_mask: bool = False,
 ) -> _LossStatistics:
     if _model_uses_conditioned_decoder(model):
         result = compute_conditioned_losses(
@@ -2612,6 +2649,7 @@ def _forward_loss_statistics(
             output,
             batch,
             embeddings=prediction["embeddings"] if use_embeddings else None,
+            presence_loss_mask=batch.presence_mask if historical_presence_mask else None,
             direction_weight=1.0,
             presence_weight=1.0,
             branch_selection_mode="train_offset_grid_min_fraction" if training_loss else "eval_voxel",
@@ -2836,6 +2874,13 @@ def training_units(
         if physical_microbatch_sizes is not None:
             test_config = replace(test_config, volume_io_threads=1, volume_decode_threads=1, volume_sample_threads=1)
         test_loader = FiberTrace3DLoader(test_config)
+    historical_loader = None
+    historical_raw = historical_test_config(raw_config)
+    if historical_raw is not None:
+        if test_loader is None:
+            raise ValueError("historical tests require the regular test_datasets as well")
+        historical_loader = FiberTrace3DLoader(config_from_mapping(
+            historical_raw, config_dir=Path(config_path).resolve().parent))
     trace2cp_cfg = _trace2cp_3d_config(raw_config)
     trace2cp_loader = (
         _make_trace2cp_geometry_loader(raw_config, trace2cp_cfg)
@@ -2924,6 +2969,13 @@ def training_units(
             broadcast_buffers=ddp_broadcast_buffers,
         )
     train_model: torch.nn.Module | None = None
+    ema = ModelEMA(raw_model, training.get("ema_decays", ()), start_step=start_step)
+    saved_ema = (handoff or {}).get("ema", progress_metadata.pop("ema", None))
+    if saved_ema is not None:
+        ema.load_state_dict(saved_ema)
+    elif ema.tracks and distributed.is_main:
+        print(f"fiber EMA: initialized at update={start_step} decays={training['ema_decays']} (no earlier EMA history)", flush=True)
+    del saved_ema
     run_datestr = str(
         (handoff_progress or {}).get("run_datestr")
         or training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2962,6 +3014,16 @@ def training_units(
     _distributed_barrier(distributed)
     effective_config = _json_safe(raw_config)
     effective_training = effective_config.setdefault("training", {})
+    if historical_loader is not None:
+        effective_training["historical_evaluation_contract"] = {
+            "sampling": "control_points", "logical_batch_size": 8,
+            "output_upsample": "trilinear", "presence_region": "historical_central_patch",
+            "source_validity": "modern_backend_no_historical_availability_mask",
+            "observation_only": True,
+        }
+        if distributed.is_main:
+            print("fiber historical test: CP/full-grid/central presence region; observation only. "
+                  "Modern source loading does not reproduce historical missing-data validity masks.", flush=True)
     effective_training["test_hang_diagnostics_enabled_config"] = (
         test_hang_diagnostics_config
     )
@@ -3223,6 +3285,8 @@ def training_units(
                     defer_cuda_value_augmentation=cuda_value_augmentation)}
         if test_loader is not None:
             sources["test"] = SampleQueueSource(test_loader.config, sample_mode=test_sample_mode)
+        if historical_loader is not None:
+            sources["historical"] = SampleQueueSource(historical_loader.config, sample_mode="random")
         sample_queue = FiberTrace3DSampleQueue(
             sources=sources, workers=local_workers, slot_count=local_slots,
             initial_in_flight=min(local_slots, max(1, int(training.get("sample_pipeline_initial_in_flight", 16)))),
@@ -3240,14 +3304,17 @@ def training_units(
             queued_train.set_limit(min(pipeline_batch_count,
                 max(0, next_test - start_step) * optimizer_microbatch_count))
 
-    def queued_evaluation(indices, at_step):
-        batches = queued_test_batches(indices, batch_size=test_loader.config.batch_size,
-            sample_count=test_control_points, start_sample_index=test_start_sample_index)
+    def queued_evaluation(indices, at_step, *, source="test", evaluation_loader=None, count=None, offset=None):
+        evaluation_loader = evaluation_loader or test_loader
+        count = test_control_points if count is None else count
+        offset = test_start_sample_index if offset is None else offset
+        batches = queued_test_batches(indices, batch_size=evaluation_loader.config.batch_size,
+            sample_count=count, start_sample_index=offset)
         if sample_queue is not None:
-            return QueuedBatchView(sample_queue, "test", batches)
+            return QueuedBatchView(sample_queue, source, batches)
         return batch_source.test_batches(step=at_step, global_batch_indices=indices,
-            batch_size=test_loader.config.batch_size, sample_count=test_control_points,
-            start_sample_index=test_start_sample_index)
+            batch_size=evaluation_loader.config.batch_size, sample_count=count,
+            start_sample_index=offset)
     best_metric = float((handoff_progress or {}).get("best_metric", math.inf))
     pending_test = (handoff_progress or {}).get("pending_test")
     cuda_batch_pipeline: FiberTrace3DCudaBatchPipeline | None = None
@@ -3261,6 +3328,7 @@ def training_units(
             writer.flush()
         return capture_handoff(
             model=raw_model, optimizer=optimizer, grad_scaler=grad_scaler,
+            ema=ema,
             cuda_device=device if device.type == "cuda" else None,
             progress={"step": step, "effective_batch_size": optimizer_global_batch_size,
                       "sample_frontier": step * optimizer_global_batch_size,
@@ -3270,24 +3338,37 @@ def training_units(
                       "pending_test": pending_test, "config_fingerprint": source_fingerprint},
         )
 
+    ema_test_metrics = {}
+
     def save_test_snapshots(test_step, metric, metric_name, *, initial=False):
         nonlocal best_metric
         if metric is None:
             return
-        destinations = []
-        if not initial:
-            if test_step % checkpoint_interval == 0:
-                destinations.append(snapshot_dir / "current.pt")
-            if kept_snapshot_interval > 0 and test_step % kept_snapshot_interval == 0:
-                destinations.append(snapshot_dir / f"step_{test_step:08d}.pt")
-        if initial or metric < best_metric:
-            best_metric = float(metric)
-            destinations.append(snapshot_dir / "best.pt")
-        for path in destinations:
+        planned = []
+        tracks = [(None, metric, metric_name, best_metric)]
+        tracks.extend((name, ema_test_metrics[name], f"test_{name}/loss_total", track["best_metric"])
+                      for name, track in ema.tracks.items())
+        for name, value, value_name, previous_best in tracks:
+            suffix = "" if name is None else f"_{name}"
+            filenames = []
+            if not initial:
+                if test_step % checkpoint_interval == 0:
+                    filenames.append(f"current{suffix}.pt")
+                if kept_snapshot_interval > 0 and test_step % kept_snapshot_interval == 0:
+                    filenames.append(f"step_{test_step:08d}{suffix}.pt")
+            if initial or value < previous_best:
+                if name is None:
+                    best_metric = float(value)
+                else:
+                    ema.tracks[name]["best_metric"] = float(value)
+                filenames.append(f"best{suffix}.pt")
+            planned.extend((filename, name, value, value_name) for filename in filenames)
+        # Update every track's best before serializing the resumable raw state.
+        for filename, name, value, value_name in planned:
             if distributed.is_main:
-                _save_snapshot(path, model=raw_model, optimizer=optimizer, step=test_step,
-                               config=raw_config, metric=metric, metric_name=metric_name,
-                               grad_scaler=grad_scaler, sample_progress=sample_progress)
+                _save_snapshot(snapshot_dir / filename, model=raw_model, optimizer=optimizer,
+                    step=test_step, config=raw_config, metric=value, metric_name=value_name,
+                    grad_scaler=grad_scaler, sample_progress=sample_progress, ema=ema, ema_name=name)
             _distributed_barrier(distributed)
 
     if distributed.is_main:
@@ -3331,8 +3412,15 @@ def training_units(
             flush=True,
         )
 
+    def log_observation(prefix, values, step):
+        print(f"{prefix} samples={sample_progress.at(step)} update={step} "
+              f"loss_total={values['total']:.6f} angle_mean_deg={values['angle_mean_deg']:.2f}", flush=True)
+        if writer is not None:
+            writer.add_scalar(f"{prefix}/loss_total", values["total"], step)
+            writer.add_scalar(f"{prefix}/angle_mean_deg", values["angle_mean_deg"], step)
+
     def run_configured_tests(step: int, *, initial=False):
-        nonlocal pending_test
+        nonlocal pending_test, ema_test_metrics
         assert diagnostics is not None
         test_started = time.monotonic()
         if physical_microbatch_sizes is not None and pending_test is None:
@@ -3340,6 +3428,49 @@ def training_units(
                             "dense_logged": False, "elapsed": 0.0}
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
+        def collect_evaluation(evaluation_loader, options, *, source, rows_key, visualization=None):
+            nonlocal test_started
+            count, offset = options["sample_count"], options["start_sample_index"]
+            total = math.ceil(count / evaluation_loader.config.batch_size)
+            completed = set()
+            if pending_test is not None:
+                if pending_test["step"] != step:
+                    raise ValueError("pending test belongs to a different optimizer step")
+                completed = {int(index) for index, _ in pending_test.setdefault(rows_key, [])}
+            remaining = [index for index in range(total) if index not in completed]
+            if remaining and batch_source is not None and source != "test":
+                batch_source.select_test_source(step, source)
+            wave_size = distributed.world_size if pending_test is not None else max(1, total)
+            all_rows = []
+            for start in range(0, len(remaining), wave_size):
+                indices = remaining[start:start + wave_size][distributed.rank::distributed.world_size]
+                iterator = queued_evaluation(indices, step, source=source,
+                    evaluation_loader=evaluation_loader, count=count, offset=offset)
+                try:
+                    local = _evaluate_dense_loss_rows(raw_model, evaluation_loader, **options,
+                        ema=ema, global_batch_indices=indices, batch_iterator=iterator,
+                        microbatch_size=(min(loader.config.batch_size,
+                            evaluation_microbatch_size or loader.config.batch_size)
+                            if pending_test is not None else evaluation_microbatch_size))
+                finally:
+                    iterator.close()
+                rows = _distributed_gather_dense_test_rows(local, distributed)
+                if pending_test is None:
+                    all_rows.extend(rows)
+                    continue
+                rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
+                pending_test[rows_key].extend(rows)
+                if visualization is not None:
+                    sheets = _distributed_broadcast_object(
+                        visualization.sheets if distributed.is_main else None, distributed)
+                    pending_test["visualization_sheets"] = sheets
+                    visualization.sheets = sheets
+                pending_test["elapsed"] += _distributed_broadcast_object(
+                    time.monotonic() - test_started if distributed.is_main else None, distributed)
+                yield TrainingBoundary(step, False, capture_boundary, "test")
+                test_started = time.monotonic()
+            return pending_test[rows_key] if pending_test is not None else all_rows
+
         try:
             if batch_source is not None:
                 batch_source.begin_test(step)
@@ -3364,54 +3495,9 @@ def training_units(
                     output_upsample=training.get("test_output_upsample"),
                     prediction_observer=test_visualization if distributed.is_main and writer is not None and test_vis_due else None,
                 )
-                if physical_microbatch_sizes is not None:
-                    if pending_test["step"] != step:
-                        raise ValueError("pending test belongs to a different optimizer step")
-                    completed = {int(index) for index, _ in pending_test["rows"]}
-                    total_groups = math.ceil(test_control_points / test_loader.config.batch_size)
-                    remaining = [index for index in range(total_groups) if index not in completed]
-                    for start in range(0, len(remaining), distributed.world_size):
-                        # One original logical group per rank is a bounded test
-                        # unit. All completed rows survive repartition in RAM.
-                        wave = remaining[start:start + distributed.world_size]
-                        capture_pending = test_vis_due and len(test_visualization.sheets) < test_sample_vis_count
-                        indices = wave[distributed.rank:distributed.rank + 1]
-                        dense_iterator = queued_evaluation(indices, step)
-                        try:
-                            local_rows = _evaluate_dense_loss_rows(
-                                raw_model, test_loader, **options, global_batch_indices=indices,
-                                batch_iterator=dense_iterator,
-                                microbatch_size=min(loader.config.batch_size, evaluation_microbatch_size or loader.config.batch_size),
-                            )
-                        finally:
-                            dense_iterator.close()
-                        rows = _distributed_gather_dense_test_rows(local_rows, distributed)
-                        rows = _distributed_broadcast_object(rows if distributed.is_main else None, distributed)
-                        pending_test["rows"].extend(rows)
-                        # Keep only small CPU images in every rank's handoff,
-                        # so resizing never needs to reload or re-infer samples.
-                        if capture_pending:
-                            sheets = _distributed_broadcast_object(
-                                test_visualization.sheets if distributed.is_main else None, distributed)
-                            pending_test["visualization_sheets"] = sheets
-                            test_visualization.sheets = sheets
-                        elapsed = time.monotonic() - test_started
-                        pending_test["elapsed"] += _distributed_broadcast_object(
-                            elapsed if distributed.is_main else None, distributed)
-                        yield TrainingBoundary(step, False, capture_boundary, "test")
-                        test_started = time.monotonic()
-                    gathered_rows = pending_test["rows"]
-                else:
-                    dense_iterator = queued_evaluation(test_batch_indices, step)
-                    try:
-                        local_rows = _evaluate_dense_loss_rows(
-                            raw_model, test_loader, **options,
-                            global_batch_indices=test_batch_indices, batch_iterator=dense_iterator,
-                            microbatch_size=evaluation_microbatch_size,
-                        )
-                    finally:
-                        dense_iterator.close()
-                    gathered_rows = _distributed_gather_dense_test_rows(local_rows, distributed)
+                gathered_rows = yield from collect_evaluation(
+                    test_loader, options, source="test", rows_key="rows",
+                    visualization=test_visualization if test_vis_due else None)
                 if distributed.is_main:
                     test_losses = _mean_dense_test_rows(gathered_rows)
                     metric = float(test_losses["total"])
@@ -3447,8 +3533,33 @@ def training_units(
                     and (pending_test is None or not pending_test["dense_logged"])
                 ):
                     test_visualization.write(writer, "test_sample_3d/principal_slices", step)
+                ema_test_metrics = _distributed_broadcast_object(
+                    {name: test_losses[f"{name}/total"] for name in ema.tracks}
+                    if distributed.is_main else None, distributed)
+                if distributed.is_main and (pending_test is None or not pending_test["dense_logged"]):
+                    for name in ema.tracks:
+                        values = {key.split("/", 1)[1]: value for key, value in test_losses.items()
+                                  if key.startswith(name + "/")}
+                        log_observation(f"test_{name}", values, step)
             if pending_test is not None:
                 pending_test["dense_logged"] = True
+            if historical_loader is not None and test_interval > 0:
+                historical_options = dict(
+                    device=device, start_sample_index=0, sample_count=historical_loader.sample_count,
+                    sample_mode="random", direction_weight=direction_weight, presence_weight=presence_weight,
+                    mixed_precision=mixed_precision, diagnostics=diagnostics, diagnostic_step=step,
+                    output_upsample="trilinear", historical=True)
+                historical_rows = yield from collect_evaluation(historical_loader,
+                    historical_options, source="historical", rows_key="historical_rows")
+                if distributed.is_main and (pending_test is None or not pending_test.get("historical_logged")):
+                    historical_losses = _mean_dense_test_rows(historical_rows)
+                    log_observation("test_historical", historical_losses, step)
+                    for name in ema.tracks:
+                        values = {key.split("/", 1)[1]: value for key, value in historical_losses.items()
+                                  if key.startswith(name + "/")}
+                        log_observation(f"test_historical_{name}", values, step)
+                if pending_test is not None:
+                    pending_test["historical_logged"] = True
             trace2cp_metric = None
             if physical_microbatch_sizes is not None and trace2cp_cfg.enabled and test_interval > 0:
                 # Trace geometry stays CPU-side; a CP-to-next-CP segment is a
@@ -3869,12 +3980,18 @@ def training_units(
                     )
             if scaler_enabled:
                 assert grad_scaler is not None
+                scale_before = grad_scaler.get_scale() if ema.tracks else None
                 with profile.stage("optimizer"):
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
+                optimizer_updated = not ema.tracks or grad_scaler.get_scale() >= scale_before
             else:
                 with profile.stage("optimizer"):
                     optimizer.step()
+                optimizer_updated = True
+            if ema.tracks and optimizer_updated:
+                with profile.stage("ema"):
+                    ema.update(raw_model)
             losses: dict[str, float] | None = None
             if scalar_metrics_due:
                 with profile.stage("scalar_reduce_sync"):

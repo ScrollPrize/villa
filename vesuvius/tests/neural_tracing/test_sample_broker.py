@@ -14,6 +14,7 @@ def _queue(slots=4):
                                    "patch_shape_zyx": [8, 8, 8]})
     owner = FiberTrace3DSampleQueue(sources={
         "train": SampleQueueSource(loader.config),
+        "historical": SampleQueueSource(loader.config),
         "test": SampleQueueSource(loader.config)}, workers=2,
         slot_count=slots, initial_in_flight=2, load_affinity_workers=1)
     return owner, loader
@@ -75,6 +76,31 @@ def test_broker_preserves_leases_and_reserves_test_execution_order_at_tiny_capac
             broker.commit(step + 1)
             broker.set_worker_limit(1)
         assert not owner.pipeline.leased
+    finally:
+        broker.close()
+
+
+def test_historical_source_is_distinct_and_survives_partial_resume():
+    owner, _ = _queue()
+    broker = CanonicalSampleBroker(owner, effective_batch_size=4, start_step=0,
+        max_steps=1, test_interval=1, test_sample_count=2, test_batch_size=2,
+        test_sources={"historical": (3, 0)})
+    try:
+        with pytest.raises(RuntimeError, match="unconsumed"):
+            broker.select_test_source(0, "historical")
+        _await(broker, lambda: broker.test_batch(0, (0, 1)))
+        broker.release_test(0, (0, 1))
+        broker.select_test_source(0, "historical")
+        assert broker._test_released == 0
+        _await(broker, lambda: broker.test_batch(0, (0, 1)))
+        broker.release_test(0, (0, 1))
+        broker.begin_test(0)
+        broker.select_test_source(0, "historical")
+        assert broker._test_released == 2
+        _await(broker, lambda: broker.test_batch(0, (2,)))
+        broker.release_test(0, (2,))
+        broker.end_test(0)
+        assert broker.test_source == "test" and broker.test_count == 2
     finally:
         broker.close()
 
