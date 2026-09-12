@@ -38,3 +38,21 @@
 - CPU run20260912_104231_239475:29passed22.64s including stop confirmation refusing
   success while cleanup guard remains alive. Checkpoint evaluation reuses the
   common training checkpoint loader rather than a separate restore implementation.
+- Completed stage00:300800samples,2350updates,exit0,1637.94s including tests/startup
+  (183.65samples/s over8H100). Final historical-definition angle18.76deg;
+  200k–300k window15observations mean20.772deg versus historical25.075deg.
+- Fixed final modern checkpoint under current evaluation gives25.3122deg;
+  historical-definition evaluation gives18.76deg. Thus changing only evaluation
+  produces a6.55degree apparent regression. Artifact: reproduction/
+  eval-modern-current-evaluation-20260912_1046*/summary.json (exact directory
+  discoverable by prefix; raw report evaluation-pipeline-1789210019019353389.json).
+- Historical checkpoint audit:20.676deg versus archived19.782deg; old total loss
+  is NOT yet reproduced (current computation0.6873 versus archived1.1536).
+  Historical input/backend and presence-loss compatibility remain a caveat,
+  not evidence that the unchanged modern training regressed.
+- User accepted evaluation as the explanation and explicitly ended reproduction.
+  No SyncBN/decoder/augmentation/batch/mask training ablations were necessary;
+  skipped per early-stop criterion. Stage branch/commits and artifact configs,
+  input hashes, logs, scalars, convergence.svg retained for inspection.
+  Next task: regular2M-step training with additional observational historical
+  metrics and EMA testing/snapshots; not implemented by this reproduction task.

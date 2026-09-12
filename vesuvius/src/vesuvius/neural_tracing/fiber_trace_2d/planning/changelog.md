@@ -1,3 +1,15 @@
+## 2026-09-12 — Historical S1a reproduction
+
+- Modern GN/quarter-resolution/augmentation training recovers historical test
+  performance without training changes:17.82deg at217600samples versus18.29old;
+  final18.76deg at300800.8H100 run completes in1637.94s including testing/startup.
+- Same modern final checkpoint measures25.31deg with current evaluation instead
+  of18.76historical-definition. User accepted evaluation mismatch as explanation;
+  further training ablations skipped under requested early-stop criterion.
+- Branch fiber-repro/stage00-modern-oldtest and reproduction artifacts retained;
+  evaluation tooling on fiber-repro/evaluation-ablations. Historical checkpoint
+  audit differs by0.89deg and historical total-loss compatibility is not proven.
+
 ## 2026-09-12 — Single-backward training and bounded stop
 
 - Target-only prepass and one backward for ordinary one-branch/conditioned
