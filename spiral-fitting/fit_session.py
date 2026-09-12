@@ -105,7 +105,11 @@ from config import Config
 # ``relative`` role, so both editable PCL roles share one client workflow.
 # API 33 separates immutable transfers from revisioned input batches and
 # requires a dataset editing owner for service mutations.
-API_VERSION = 33
+# Version 34 adds service-owned background preview schedules, source-iteration
+# preview provenance, and active/pending publication state. Preview capture is
+# an all-rank fit boundary, while flattening and artifact publication continue
+# independently of the client connection and the next Run.
+API_VERSION = 34
 
 
 class SessionState(str, Enum):

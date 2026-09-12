@@ -26,6 +26,7 @@ manifest it must diff against and then replace).
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import hashlib
 import json
 import math
@@ -54,6 +55,39 @@ LASAGNA_CONFIG_NAME = "flatten_fast_nofilter.json"
 # being written; the job status does not distinguish that phase.
 _LASAGNA_SAVING_MARKER = "[fit] peak GPU memory:"
 _LASAGNA_PORT_LINE = re.compile(r"listening on http://[^:]+:(\d+)")
+
+
+def _flatten_request_body(config, surface_ref, *, surface_id, publish_root,
+                          model_output):
+    """The one ``/optimize`` request a preview generation makes.
+
+    Every generation is flattened from scratch with the configured profile;
+    the request carries no state from any previous generation.
+    """
+    config = copy.deepcopy(config)
+    config["external_surfaces"] = [surface_ref]
+    return {
+        "config": config,
+        "job_spec": {
+            "config": config,
+            "linked_surfaces": [surface_ref],
+        },
+        "single_segment": True,
+        "config_name": LASAGNA_CONFIG_NAME,
+        "output_name": surface_id,
+        "output_dir": str(publish_root),
+        "model_output": str(model_output),
+        "embed_job_metadata": False,
+        "omit_model": True,
+        # The published preview only ever consumes the tifxyz and the
+        # .flatten-map.npy sidecar; the checkpoint file itself was written,
+        # loaded twice, and then deleted unread. A service that understands
+        # this flag skips all of that; an older one ignores it and the unlink
+        # in publish() still cleans up.
+        "omit_model_output": True,
+        "export_flatten_map": True,
+        "source": "Spiral host service",
+    }
 
 
 def _find_lasagna_service():
@@ -478,13 +512,19 @@ class PreviewPublication:
     with it. Every field is guarded by the owning service's lock.
     """
 
-    __slots__ = ("generation", "completed_generation", "session_id",
+    __slots__ = ("generation", "manifest", "completed_generation", "session_id",
                  "artifact", "diagnostics_artifact", "error", "process",
-                 "previous_raw_manifest", "stage_started", "progress")
+                 "previous_raw_manifest", "stage_started", "progress",
+                 "source_fit_iteration", "active_source_fit_iteration",
+                 "pending_generation", "pending_manifest",
+                 "pending_source_fit_iteration", "pending_diagnostics")
 
     def __init__(self):
         #: Generation currently being published, or 0 when nothing is.
         self.generation = 0
+        #: Raw manifest currently being published. Retained explicitly so a
+        #: session replacement can remove work that has not yet been adopted.
+        self.manifest = None
         #: Highest generation the host has finished handling (published or
         #: failed); a generation is never published twice.
         self.completed_generation = 0
@@ -502,11 +542,22 @@ class PreviewPublication:
         self.previous_raw_manifest = None
         self.stage_started = None
         self.progress = None
+        self.source_fit_iteration = None
+        self.active_source_fit_iteration = None
+        self.pending_generation = 0
+        self.pending_manifest = None
+        self.pending_source_fit_iteration = None
+        self.pending_diagnostics = False
 
     def reset_session_scope(self):
         """Forget everything session-scoped; return the raw manifest to drop."""
-        previous_raw = self.previous_raw_manifest
+        stale_raw = tuple(dict.fromkeys(
+            value for value in (
+                self.previous_raw_manifest, self.manifest,
+                self.pending_manifest)
+            if value))
         self.generation = 0
+        self.manifest = None
         self.completed_generation = 0
         self.session_id = None
         self.artifact = None
@@ -515,22 +566,52 @@ class PreviewPublication:
         self.previous_raw_manifest = None
         self.stage_started = None
         self.progress = None
-        return previous_raw
+        self.source_fit_iteration = None
+        self.active_source_fit_iteration = None
+        self.pending_generation = 0
+        self.pending_manifest = None
+        self.pending_source_fit_iteration = None
+        self.pending_diagnostics = False
+        return stale_raw
 
-    def claim(self, session_id, generation):
+    def claim(self, session_id, generation, *, manifest=None,
+              source_fit_iteration=None, diagnostics=False):
         """Take ownership of one generation, or refuse a stale/duplicate one."""
-        if (not generation
-                or generation <= self.completed_generation
-                or generation <= self.generation):
+        if not generation or generation <= self.completed_generation:
+            return False
+        if self.generation:
+            if generation > self.generation and generation >= self.pending_generation:
+                self.pending_generation = generation
+                self.pending_manifest = str(manifest) if manifest else None
+                self.pending_source_fit_iteration = source_fit_iteration
+                self.pending_diagnostics = bool(diagnostics)
             return False
         self.generation = generation
+        self.manifest = str(manifest) if manifest else None
         self.session_id = session_id
+        self.active_source_fit_iteration = source_fit_iteration
         self.error = None
         # Overlays belong to one generation. Retiring them here keeps a newer
         # surface from being drawn with the previous generation's diagnostics
         # while its own are still being mapped.
         self.diagnostics_artifact = None
         return True
+
+    def take_pending(self):
+        """Promote the newest coalesced raw snapshot after active publication."""
+        if not self.pending_generation or not self.pending_manifest:
+            return None
+        pending = {
+            "preview_generation": self.pending_generation,
+            "preview_manifest_path": self.pending_manifest,
+            "current_iteration": self.pending_source_fit_iteration,
+            "preview_diagnostics": self.pending_diagnostics,
+        }
+        self.pending_generation = 0
+        self.pending_manifest = None
+        self.pending_source_fit_iteration = None
+        self.pending_diagnostics = False
+        return pending
 
     def owns(self, generation):
         return self.generation == generation and generation != 0
@@ -553,6 +634,8 @@ class PreviewPublication:
         self.completed_generation = max(self.completed_generation, generation)
         if self.generation == generation:
             self.generation = 0
+            self.manifest = None
+            self.active_source_fit_iteration = None
         self.progress = None
         self.stage_started = None
 
@@ -590,11 +673,11 @@ class PublishedPreview:
 
     __slots__ = ("manifest_path", "surface_id", "generation", "raw_manifest",
                  "raw_manifest_path", "publish_parent", "correspondence",
-                 "flattened_valid")
+                 "flattened_valid", "source_fit_iteration")
 
     def __init__(self, *, manifest_path, surface_id, generation, raw_manifest,
                  raw_manifest_path, publish_parent, correspondence,
-                 flattened_valid):
+                 flattened_valid, source_fit_iteration=None):
         self.manifest_path = manifest_path
         self.surface_id = surface_id
         self.generation = generation
@@ -603,6 +686,7 @@ class PublishedPreview:
         self.publish_parent = publish_parent
         self.correspondence = correspondence
         self.flattened_valid = flattened_valid
+        self.source_fit_iteration = source_fit_iteration
 
     def release(self):
         """Drop the flatten arrays once no diagnostics wave will need them."""
@@ -782,23 +866,9 @@ class LasagnaPublisher:
                         "Temporary Lasagna service failed to start"
                         + (f" (exit {code})" if code is not None else ""))
                 port = port_holder["port"]
-                config["external_surfaces"] = [surface_ref]
-                request_body = {
-                    "config": config,
-                    "job_spec": {
-                        "config": config,
-                        "linked_surfaces": [surface_ref],
-                    },
-                    "single_segment": True,
-                    "config_name": LASAGNA_CONFIG_NAME,
-                    "output_name": surface_id,
-                    "output_dir": str(publish_root),
-                    "model_output": str(model_output),
-                    "embed_job_metadata": False,
-                    "omit_model": True,
-                    "export_flatten_map": True,
-                    "source": "Spiral host service",
-                }
+                request_body = _flatten_request_body(
+                    config, surface_ref, surface_id=surface_id,
+                    publish_root=publish_root, model_output=model_output)
                 accepted = _fit_service_json(
                     port, "/optimize", request_body, timeout=60)
                 fit_job_id = str(accepted.get("job_id") or "")
@@ -808,11 +878,11 @@ class LasagnaPublisher:
                 self._stage(
                     "running", "Flattening preview surface",
                     step=0, total_steps=0, overall_progress=0.0)
-
                 while True:
                     if not self._session_valid():
                         raise RuntimeError(
-                            "The Spiral session changed while publishing its preview")
+                            "The Spiral session changed while publishing "
+                            "its preview")
                     fit_status = _fit_service_json(
                         port, f"/jobs/{fit_job_id}", timeout=15)
                     state = str(fit_status.get("state") or "")
@@ -828,11 +898,12 @@ class LasagnaPublisher:
                     if state == "finished":
                         break
                     if state == "cancelled":
-                        raise RuntimeError("Lasagna preview flatten was cancelled")
-                    if state == "error":
                         raise RuntimeError(
-                            str(fit_status.get("error")
-                                or "Lasagna flatten failed"))
+                            "Lasagna preview flatten was cancelled")
+                    if state == "error":
+                        raise RuntimeError(str(
+                            fit_status.get("error")
+                            or "Lasagna flatten failed"))
                     time.sleep(0.5)
 
                 flattened_metadata_path = flattened_surface / "meta.json"
@@ -940,6 +1011,8 @@ class LasagnaPublisher:
                 # the surface must not wait for them, and a surface manifest
                 # that named files nobody has mapped yet would be a lie.
                 published["loss_maps"] = []
+                published["source_fit_iteration"] = manifest.get(
+                    "source_fit_iteration")
                 published.pop("winding_column_ranges", None)
                 published.pop("components", None)
                 if run_diff is None:
@@ -972,7 +1045,9 @@ class LasagnaPublisher:
                     raw_manifest_path=preview_manifest_path,
                     publish_parent=publish_parent,
                     correspondence=correspondence,
-                    flattened_valid=flattened_valid)
+                    flattened_valid=flattened_valid,
+                    source_fit_iteration=manifest.get(
+                        "source_fit_iteration"))
         finally:
             stop_process_group(process)
             if publish_root is not None:
