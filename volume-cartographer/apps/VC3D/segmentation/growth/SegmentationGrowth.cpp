@@ -623,8 +623,11 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = surface->meta.contains("area_vx2") ? surface->meta["area_vx2"].get_double() : -1.0;
-    const double previousAreaCm2 = surface->meta.contains("area_cm2") ? surface->meta["area_cm2"].get_double() : -1.0;
+    // Other writers state an unknown area as null rather than omitting the key
+    // (merge_concat_runs.py, for one), so read leniently: anything that is not
+    // a number means "not established".
+    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
+    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {
@@ -632,10 +635,10 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
         surface->meta["area_vx2"] = areaVx2;
 
         double areaCm2 = std::numeric_limits<double>::quiet_NaN();
-        if (voxelSize > 0.0) {
-            const double areaUm2 = areaVx2 * voxelSize * voxelSize;
-            areaCm2 = areaUm2 * 1e-8;
-        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 >= 0.0) {
+        if (const auto derived = vc::surface::areaCm2FromVox2(areaVx2, voxelSize)) {
+            areaCm2 = *derived;
+        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 > 0.0) {
+            // Rescaling a surface whose physical scale was already established.
             const double cm2PerVx2 = previousAreaCm2 / previousAreaVx2;
             areaCm2 = areaVx2 * cm2PerVx2;
         }
@@ -643,10 +646,13 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
         if (std::isfinite(areaCm2)) {
             surface->meta["area_cm2"] = areaCm2;
         } else {
-            // Fall back to assuming the geometry is in microns and convert directly.
-            const double assumedAreaCm2 = areaVx2 * 1e-8;
-            surface->meta["area_cm2"] = assumedAreaCm2;
-            qCWarning(lcSegGrowth) << "Fallback surface area conversion applied due to missing voxel size metadata";
+            // No voxel size and no established scale to carry forward. Leave
+            // area_cm2 absent: a guessed physical area is worse than none,
+            // because nothing downstream can tell it apart from a real one.
+            if (surface->meta.contains("area_cm2")) {
+                surface->meta.erase("area_cm2");
+            }
+            qCWarning(lcSegGrowth) << "Surface area left in voxels only: volume reports no voxel size";
         }
     }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import hashlib
+import math
 import os
 from pathlib import Path
 import sys
@@ -14,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 
 class _RasterRequest(ctypes.Structure):
@@ -32,6 +33,7 @@ class _RasterRequest(ctypes.Structure):
         ("source_valid", ctypes.c_void_p),
         ("filled_uv_rows", ctypes.c_void_p),
         ("filled_uv_cols", ctypes.c_void_p),
+        ("filled_uv_anchor_distance", ctypes.c_void_p),
         ("source_validity", ctypes.c_void_p),
         ("output_source_indices", ctypes.c_void_p),
         ("output_validity", ctypes.c_void_p),
@@ -51,7 +53,9 @@ class _RasterRequest(ctypes.Structure):
         ("label_offset_y", ctypes.c_double),
         ("label_offset_x", ctypes.c_double),
         ("max_distance", ctypes.c_double),
+        ("max_seam_distance", ctypes.c_double),
         ("fill_seams", ctypes.c_uint32),
+        ("has_seam_limit", ctypes.c_uint32),
         ("has_source_validity", ctypes.c_uint32),
         ("abi_version", ctypes.c_uint32),
     ]
@@ -62,6 +66,7 @@ class _RasterResult(ctypes.Structure):
         ("target_surface_valid", ctypes.c_int64),
         ("measured_pixels", ctypes.c_int64),
         ("seam_filled_pixels", ctypes.c_int64),
+        ("seam_blocked_pixels", ctypes.c_int64),
         ("inherited_filled_pixels", ctypes.c_int64),
     ]
 
@@ -74,6 +79,7 @@ class NativeTileResult:
     target_surface_valid: int
     measured_pixels: int
     seam_filled_pixels: int
+    seam_blocked_pixels: int
     inherited_filled_pixels: int
 
 
@@ -230,6 +236,8 @@ class NativeRasterizer:
         max_distance: float,
         filled_uv_rows: Optional[NDArray] = None,
         filled_uv_cols: Optional[NDArray] = None,
+        filled_uv_anchor_distance: Optional[NDArray] = None,
+        max_seam_distance: float = math.inf,
         source_validity: Optional[NDArray] = None,
     ) -> None:
         library = load_native_library()
@@ -248,6 +256,11 @@ class NativeRasterizer:
         )
         self.filled_uv_cols = (
             None if filled_uv_cols is None else _double_array(filled_uv_cols)
+        )
+        self.filled_uv_anchor_distance = (
+            None
+            if filled_uv_anchor_distance is None
+            else _double_array(filled_uv_anchor_distance)
         )
         self.source_validity = (
             None if source_validity is None else _byte_array(source_validity)
@@ -271,6 +284,18 @@ class NativeRasterizer:
                 raise ValueError("filled UV and target shapes differ")
             if self.filled_uv_cols.shape != self.target_valid.shape:
                 raise ValueError("filled UV and target shapes differ")
+        if self.filled_uv_anchor_distance is not None:
+            if self.filled_uv_rows is None:
+                raise ValueError(
+                    "a seam anchor distance requires the filled UV fields"
+                )
+            if self.filled_uv_anchor_distance.shape != self.target_valid.shape:
+                raise ValueError("seam anchor distance and target shapes differ")
+            if not math.isfinite(max_seam_distance):
+                raise ValueError(
+                    "a seam anchor distance requires a finite seam limit"
+                )
+        self.max_seam_distance = float(max_seam_distance)
         self.label_shape = int(label_shape[0]), int(label_shape[1])
         self.output_shape = int(output_shape[0]), int(output_shape[1])
         self.label_offset_yx = (
@@ -297,6 +322,7 @@ class NativeRasterizer:
             _pointer(self.source_valid),
             _pointer(self.filled_uv_rows),
             _pointer(self.filled_uv_cols),
+            _pointer(self.filled_uv_anchor_distance),
             _pointer(self.source_validity),
             _pointer(source_indices),
             _pointer(validity),
@@ -316,7 +342,13 @@ class NativeRasterizer:
             self.label_offset_yx[0],
             self.label_offset_yx[1],
             self.max_distance,
+            (
+                self.max_seam_distance
+                if self.filled_uv_anchor_distance is not None
+                else 0.0
+            ),
             int(self.filled_uv_rows is not None),
+            int(self.filled_uv_anchor_distance is not None),
             int(self.source_validity is not None),
             ABI_VERSION,
         )
@@ -335,5 +367,6 @@ class NativeRasterizer:
             target_surface_valid=int(result.target_surface_valid),
             measured_pixels=int(result.measured_pixels),
             seam_filled_pixels=int(result.seam_filled_pixels),
+            seam_blocked_pixels=int(result.seam_blocked_pixels),
             inherited_filled_pixels=int(result.inherited_filled_pixels),
         )

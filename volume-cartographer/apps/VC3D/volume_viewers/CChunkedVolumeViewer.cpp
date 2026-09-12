@@ -870,6 +870,22 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     emit overlaysUpdated();
 }
 
+void CChunkedVolumeViewer::setPinnedSurfaceY(std::optional<float> surfaceY)
+{
+    if (surfaceY && !std::isfinite(*surfaceY)) {
+        surfaceY.reset();
+    }
+    _pinnedSurfacePtrY = surfaceY;
+    if (_closing || !_pinnedSurfacePtrY || _surfacePtrY == *_pinnedSurfacePtrY) {
+        return;
+    }
+    _genCacheDirty = true;
+    // submitRender's syncCameraTransform moves the camera onto the pin and
+    // refreshes the measurement overlay.
+    submitRender("camera pinned");
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& state)
 {
     if (_closing) {
@@ -1808,6 +1824,14 @@ void CChunkedVolumeViewer::setSegmentationIntersectionDeferral(bool active)
 
 void CChunkedVolumeViewer::syncCameraTransform()
 {
+    // Every render submission and repaint passes through here before the
+    // camera is captured, so this is the one place the pinned row is
+    // enforced: pans keep only their X component, zooms end up anchored on
+    // the pinned row at the cursor's X, and resets / centering / applied
+    // camera states land back on it.
+    if (_pinnedSurfacePtrY) {
+        _surfacePtrY = *_pinnedSurfacePtrY;
+    }
     _camSurfX = _surfacePtrX;
     _camSurfY = _surfacePtrY;
     _camScale = _scale;

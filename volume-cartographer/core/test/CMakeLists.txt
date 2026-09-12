@@ -69,6 +69,10 @@ vc_add_test(NAME test_smoke LIBS doctest::doctest)
 vc_add_test(NAME test_model_prefetch LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_remote_prefetch LIBS doctest::doctest vc_lasagna)
 
+vc_add_test(NAME test_surface_area_units)
+
+vc_add_test(NAME test_voxel_size_metadata)
+
 vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
@@ -866,6 +870,17 @@ if(TARGET vc_tifxyz_selfcross)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
     add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
+
+if(TARGET vc_render_tifxyz)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_logging
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_logging.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
+    vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)

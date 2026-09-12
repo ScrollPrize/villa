@@ -239,6 +239,42 @@ class CoverageGuardTests(unittest.TestCase):
                 report["logical_output_bytes"] * 1024,
             )
 
+    def test_fill_seams_writes_the_anchor_distance_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.args(root)
+            args.tile_size = 16
+            args.minimum_mapping_coverage = 0.0
+            args.rasterizer = "python"
+            args.fill_seams = True
+            source = plane()
+            label = np.asarray([[1, 2], [3, 4]], dtype=np.uint8)
+            with (
+                mock.patch.object(
+                    transfer,
+                    "load_surface",
+                    side_effect=[source, source],
+                ),
+                mock.patch.object(
+                    transfer,
+                    "read_image",
+                    return_value=label,
+                ),
+            ):
+                report = transfer.run_single(args)
+
+            sidecar = root / "output.seam_anchor.tif"
+            anchors = tifffile.imread(sidecar)
+            self.assertEqual(anchors.dtype, np.float32)
+            # Stored-grid resolution, one distance per target vertex; a
+            # fully measured mapping has every vertex at distance zero.
+            self.assertEqual(anchors.shape, (2, 2))
+            np.testing.assert_array_equal(anchors, np.zeros((2, 2)))
+            self.assertEqual(report["seam_anchor"], "matched")
+            self.assertEqual(
+                report["seam_anchor_distance_output"], str(sidecar)
+            )
+
     def test_final_guard_runs_before_any_output_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -282,6 +318,100 @@ class CoverageGuardTests(unittest.TestCase):
 
         write_image.assert_not_called()
         self.assertFalse((root / "output.tif").exists())
+
+
+class AutomaticMaxDistanceTests(unittest.TestCase):
+    @staticmethod
+    def grid(height: int, width: int, pitch: float) -> Surface:
+        rows, cols = np.meshgrid(
+            np.arange(height, dtype=np.float32) * pitch,
+            np.arange(width, dtype=np.float32) * pitch,
+            indexing="ij",
+        )
+        return Surface(
+            x=cols,
+            y=rows,
+            z=np.full((height, width), 10.0, dtype=np.float32),
+        )
+
+    def test_radius_follows_the_target_pitch_only(self) -> None:
+        target = self.grid(8, 8, 4.0)
+        identity = np.eye(4)
+
+        # A source sampled twice as finely describes the same surface more
+        # accurately. It must not shrink the radius: matching is
+        # point-to-triangle, so the source's tessellation is not what the
+        # radius has to tolerate.
+        for source_pitch in (2.0, 4.0, 8.0):
+            with self.subTest(source_pitch=source_pitch):
+                resolved, report = transfer._resolve_max_distance(
+                    None, self.grid(8, 8, source_pitch), target, identity
+                )
+                self.assertAlmostEqual(resolved, 0.75 * 4.0, places=6)
+                self.assertAlmostEqual(
+                    report["automatic_max_distance"], 0.75 * 4.0, places=6
+                )
+                self.assertAlmostEqual(report["target_spacing"], 4.0, places=6)
+                self.assertAlmostEqual(
+                    report["source_spacing_in_target_coordinates"],
+                    source_pitch,
+                    places=6,
+                )
+
+    def test_explicit_request_wins_and_is_still_reported(self) -> None:
+        resolved, report = transfer._resolve_max_distance(
+            1.25, self.grid(8, 8, 2.0), self.grid(8, 8, 4.0), np.eye(4)
+        )
+
+        self.assertEqual(resolved, 1.25)
+        self.assertAlmostEqual(
+            report["automatic_max_distance"], 0.75 * 4.0, places=6
+        )
+
+    def test_coarser_source_is_flagged_but_not_denser(self) -> None:
+        # The target-keyed radius knows nothing about a coarse source
+        # triangulation's chordal error, so only that direction warns.
+        target = self.grid(8, 8, 4.0)
+        for source_pitch, expected in ((8.0, True), (4.0, False), (2.0, False)):
+            with self.subTest(source_pitch=source_pitch):
+                _, report = transfer._resolve_max_distance(
+                    None, self.grid(8, 8, source_pitch), target, np.eye(4)
+                )
+                self.assertEqual(
+                    report["source_coarser_than_target"], expected
+                )
+
+
+class MappingPreflightDisagreementTests(unittest.TestCase):
+    def test_disagreeing_target_region_is_flagged(self) -> None:
+        source = AutomaticMaxDistanceTests.grid(16, 16, 1.0)
+        target = AutomaticMaxDistanceTests.grid(16, 16, 1.0)
+        # Half the target sits far off the source surface: a re-flattened
+        # or extended segment, not sampling noise.
+        target.z[:, 8:] += 50.0
+
+        report = transfer._mapping_preflight(
+            source, target, np.eye(4), 0.75,
+            nearest_vertices=4, sample_limit=256,
+        )
+
+        self.assertTrue(report["suspected_mesh_disagreement"])
+        self.assertGreaterEqual(
+            report["distance_max_over_max_distance"],
+            transfer.MESH_DISAGREEMENT_RATIO,
+        )
+
+    def test_healthy_pair_is_not_flagged(self) -> None:
+        source = AutomaticMaxDistanceTests.grid(16, 16, 1.0)
+        target = AutomaticMaxDistanceTests.grid(16, 16, 1.0)
+
+        report = transfer._mapping_preflight(
+            source, target, np.eye(4), 0.75,
+            nearest_vertices=4, sample_limit=256,
+        )
+
+        self.assertFalse(report["suspected_mesh_disagreement"])
+        self.assertEqual(report["mapping_coverage"], 1.0)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <functional>
@@ -89,9 +90,12 @@ public:
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
-        QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
-        QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
+        // One item per link state (kLinkStateCount, indexed by
+        // linkStateIndex): the projected X of a linked fiber and the
+        // connector from the local control point, both in that state's colour.
+        static constexpr size_t kLinkStateCount = 4;
+        std::array<QGraphicsPathItem*, kLinkStateCount> branchLinkFiberIntersections{};
+        std::array<QGraphicsPathItem*, kLinkStateCount> fiberIntersectionConnectors{};
         QGraphicsPathItem* ghostControlPointPrev = nullptr;
         QGraphicsPathItem* ghostControlPointNext = nullptr;
     };
@@ -138,7 +142,9 @@ public:
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {});
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
+        std::function<QString(uint64_t)> fiberDisplayNameForId = {});
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -209,11 +215,11 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
-    void generatedControlPointBranchRequested(const std::string& surfaceName,
-                                              size_t controlPointIndex,
-                                              cv::Vec3f linkedControlPoint,
-                                              bool openAfterCreate,
-                                              cv::Vec3f linkDirection);
+    // New fiber seeded at volumePoint, seed control point linked to the
+    // designated link candidate; linkDirection is the clicked view's normal.
+    void generatedNewLineAnnotationLinkedToCandidateRequested(const std::string& surfaceName,
+                                                              cv::Vec3f volumePoint,
+                                                              cv::Vec3f linkDirection);
     void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
                                                    int branchControlPointIndex);
     void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,
@@ -345,6 +351,12 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
+    // Ctrl+Shift+wheel in the current cut: slide the cut plane straight along
+    // its normal by the arclength the marker advances, WITHOUT re-posing it on
+    // the model line, so a point can be placed where the true fiber is when the
+    // model prediction has diverged. The side cut and strips stay where they
+    // are; any along-line navigation snaps the plane back.
+    bool shiftCurrentCutStraightAheadByScrollSteps(int steps);
     bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
     bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
                                                 CChunkedVolumeViewer* viewer,
@@ -354,9 +366,8 @@ private:
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
     // "B": zero every accumulated normal offset — the side cut plane's and
-    // both strips' surface offsets. The current cut cannot accumulate one
-    // (Shift-scroll steps along the line there) but is reset with the side
-    // cut for symmetry.
+    // both strips' surface offsets — and snap a straight-ahead displaced
+    // current cut (Ctrl+Shift-scroll) back onto the model line.
     void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
@@ -560,6 +571,12 @@ private:
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
     double _currentCutNormalOffsetVx = 0.0;
+    // Set while Ctrl+Shift+wheel has slid the current cut plane off the model
+    // line; cleared wherever the plane is re-posed from the line.
+    bool _currentCutStraightAheadActive = false;
+    // Translation sign along the plane normal, fixed at the gesture's first
+    // notch (see straightAheadDirection).
+    double _currentCutStraightAheadDirection = 1.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     // Generation-based deduplication of the coalesced overlay refresh: every

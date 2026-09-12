@@ -316,6 +316,15 @@ void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints);
 
+// The controlled span of a fiber: linePoints from the first control's line
+// index to the last control's (inclusive), mapped with the ordered scan above.
+// Empty when there are no controls or the scan fails (no controlled span), a
+// single point for one control. Used to hide other fibers' extrapolated tails
+// in the line annotation views.
+[[nodiscard]] std::vector<cv::Vec3d> linePointsBetweenOuterControlPoints(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<cv::Vec3d>& controlPoints);
+
 // Keep the complete path between the outer controls, but shorten open tails
 // near focusBounds. One outside sample per tail is retained as bounded
 // overshoot. Control indices and the display anchor are rebased in place.

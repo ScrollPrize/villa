@@ -1582,6 +1582,21 @@ std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     return lineIndices;
 }
 
+std::vector<cv::Vec3d> linePointsBetweenOuterControlPoints(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<cv::Vec3d>& controlPoints)
+{
+    if (controlPoints.empty()) {
+        return {};
+    }
+    const auto indices = orderedControlPointLineIndices(controlPoints, linePoints);
+    if (!indices || indices->empty()) {
+        return {};
+    }
+    return std::vector<cv::Vec3d>(linePoints.begin() + static_cast<std::ptrdiff_t>(indices->front()),
+                                  linePoints.begin() + static_cast<std::ptrdiff_t>(indices->back()) + 1);
+}
+
 bool constrainLineOpenTailsToBounds(
     vc::lasagna::LineModel& line,
     std::vector<LineControlPoint>& controls,

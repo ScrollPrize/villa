@@ -924,13 +924,25 @@ def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float |
 		mdl.cyl_shell_current_height_step = step
 
 
-def _require_manifest_init_shell_dir(prep_params: dict) -> str:
-	value = prep_params.get("init_shell_dir", None)
+def _require_init_shell_dir(
+	prep_params: dict, *, override: str | None = None
+) -> str:
+	value = (
+		override
+		if isinstance(override, str) and override.strip()
+		else prep_params.get("init_shell_dir", None)
+	)
 	if value is None:
-		raise ValueError("shell-dir-crop init requires .lasagna.json key 'init_shell_dir'")
+		raise ValueError(
+			"shell-dir-crop init requires --init-shell-dir or "
+			".lasagna.json key 'init_shell_dir'"
+		)
 	if not isinstance(value, str) or not value.strip():
-		raise ValueError("shell-dir-crop init requires non-empty string .lasagna.json key 'init_shell_dir'")
-	return str(value)
+		raise ValueError(
+			"shell-dir-crop init requires a non-empty --init-shell-dir or "
+			".lasagna.json key 'init_shell_dir'"
+		)
+	return value.strip()
 
 
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
@@ -1538,7 +1550,10 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
 	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
-		raise ValueError("do not set top-level config key 'init_shell_dir'; shell-dir-crop reads it from --input .lasagna.json")
+		raise ValueError(
+			"do not set top-level config key 'init_shell_dir'; put 'init-shell-dir' "
+			"under 'args' or pass --init-shell-dir"
+		)
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	_t = _stage_start("probe_preprocessed_data")
@@ -1665,7 +1680,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 		if corr_points_3d_for_roi is None or corr_points_3d_for_roi.points_xyz_winda.shape[0] <= 0:
 			raise ValueError("corr-point-roi requires nonempty corr_points")
 		from init_shell_index import InitShellIndex
-		init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+		init_shell_dir = _require_init_shell_dir(
+			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
 		if device.type == "cuda":
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
@@ -1849,7 +1865,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 				shell_quality_analysis,
 				trim_shell_surface_rows_by_quality,
 			)
-			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+			init_shell_dir = _require_init_shell_dir(
+				prep_params, override=data_cfg.init_shell_dir)
 			if corr_point_roi_init is not None:
 				shell_index = corr_point_roi_shell_index if corr_point_roi_shell_index is not None else InitShellIndex.from_directory(init_shell_dir)
 				closest = corr_point_roi_init.closest
