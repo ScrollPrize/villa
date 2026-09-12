@@ -36,6 +36,7 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "retrain-merge": ["../lasagna/tests/test_demand_predict3d.py", "../lasagna/tests/test_dynamic_inference_batching.py", "../lasagna/tests/test_inference_profiling.py", "tests/neural_tracing/test_replay_metrics.py", "tests/neural_tracing/test_managed_evaluation.py", "tests/neural_tracing/test_cached_trace_profile.py", "tests/neural_tracing/test_live_inference_profile.py", "tests/neural_tracing/test_native_bbox_read.py"],
     "cuda-arc": ["tests/neural_tracing/test_arc_sampling.py", "-k", "cuda_dense", "-s"],
     "arc-sampling": ["tests/neural_tracing/test_arc_sampling.py", "tests/neural_tracing/test_collection_training_config.py"],
     "sampling-regression": ["tests/neural_tracing/test_fiber_trace_3d.py", "tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_fiber_embeddings.py"],

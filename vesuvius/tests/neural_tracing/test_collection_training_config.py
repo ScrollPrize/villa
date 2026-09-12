@@ -18,6 +18,7 @@ def test_collection_training_config():
     baseline = json.loads((CONFIGS / "train_s1a_nml_8gpu_fast.json").read_text())
     assert not load_config(CONFIG).embedding.enabled
     assert raw["training"]["learning_rate"] == 0.01
+    assert raw["training"]["max_steps"] == 2000000
     assert raw["training"]["optimizer_global_batch_size"] == 128
     assert raw["batch_size"] == 16
     assert raw.pop("sampling_strategy") == "scroll_balanced_arclength"
@@ -30,8 +31,11 @@ def test_collection_training_config():
     for field in ("datasets", "test_datasets", "embedding"):
         raw.pop(field, None)
         baseline.pop(field, None)
-    raw["training"].pop("run_name")
-    baseline["training"].pop("run_name")
+    # The S1a config is also used for LR/continuation experiments; the new
+    # collection retains its explicitly asserted initial LR and duration.
+    for field in ("run_name", "learning_rate", "max_steps"):
+        raw["training"].pop(field)
+        baseline["training"].pop(field)
     assert raw == baseline
 
 

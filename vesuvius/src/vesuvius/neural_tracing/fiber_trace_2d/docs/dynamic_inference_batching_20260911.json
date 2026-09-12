@@ -1,0 +1,97 @@
+{
+  "measurement": "four-fiber pilot, not full-set tuning",
+  "runs": [
+    {
+      "cap": 1,
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b1_20260911_v1/full",
+      "wall": 28.371700832620263,
+      "native": 19.453653936,
+      "tiles": 545,
+      "calls": 545,
+      "hist": {
+        "1": 545
+      },
+      "worker": 98.62280729599297,
+      "rate": 44.20884093183936,
+      "wallrate": 153.6742554040717,
+      "alloc": 4.530735015869141,
+      "reserved": 5.654296875,
+      "failures": 26,
+      "published": 142,
+      "batch_min": 0.17107448168098927,
+      "batch_median": 0.17515048012137413,
+      "batch_max": 0.4398382492363453
+    },
+    {
+      "cap": 2,
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b2_20260911_v1/full",
+      "wall": 26.22401573136449,
+      "native": 17.092826768,
+      "tiles": 545,
+      "calls": 288,
+      "hist": {
+        "1": 31,
+        "2": 257
+      },
+      "worker": 75.07170678675175,
+      "rate": 58.077805695626324,
+      "wallrate": 166.25981484541842,
+      "alloc": 8.88425064086914,
+      "reserved": 12.654296875,
+      "failures": 25,
+      "published": 143,
+      "batch_min": 0.1717680599540472,
+      "batch_median": 0.2546272585168481,
+      "batch_max": 0.8871893249452114
+    },
+    {
+      "cap": 4,
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b4_20260911_v1/full",
+      "wall": 28.711569348350167,
+      "native": 19.218663161,
+      "tiles": 546,
+      "calls": 170,
+      "hist": {
+        "1": 44,
+        "2": 1,
+        "4": 125
+      },
+      "worker": 67.05299028940499,
+      "rate": 65.1425086509555,
+      "wallrate": 152.13379481296084,
+      "alloc": 23.599043369293213,
+      "reserved": 27.787109375,
+      "failures": 22,
+      "published": 143,
+      "batch_min": 0.1718601156026125,
+      "batch_median": 0.4341825693845749,
+      "batch_max": 1.0548516269773245
+    },
+    {
+      "cap": 8,
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_four_dynamic256_b8_20260911_v1/full",
+      "wall": 25.093934448435903,
+      "native": 15.896393105,
+      "tiles": 540,
+      "calls": 103,
+      "hist": {
+        "1": 38,
+        "2": 2,
+        "3": 1,
+        "7": 1,
+        "8": 61
+      },
+      "worker": 58.00073691643773,
+      "rate": 74.48181229531393,
+      "wallrate": 172.15315553154576,
+      "alloc": 35.0053186416626,
+      "reserved": 54.671875,
+      "failures": 22,
+      "published": 140,
+      "batch_min": 0.17211762256920338,
+      "batch_median": 0.7338925935328007,
+      "batch_max": 1.1221951600164175
+    }
+  ],
+  "cap16": "OOM; see inference_incomplete.json and accompanying report"
+}

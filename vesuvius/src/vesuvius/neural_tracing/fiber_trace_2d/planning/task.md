@@ -1,3 +1,4 @@
-# Scroll-balanced dense collection supervision
+# Merge retrain branch
 
-Enable dense polyline supervision per JSON dataset for the five-scroll collection, train and test. Supervise only the selected fiber. Choose scroll uniformly, then continuous distance uniformly across its fiber collection. Fixed repeatable test locations. Preserve fast shared queue, model, losses, LR and manager.
+Merge fiber-training-retrain into fiber-training-embedding, preserving dense
+scroll-balanced sampling, manager fixes and incoming tracing/inference features.

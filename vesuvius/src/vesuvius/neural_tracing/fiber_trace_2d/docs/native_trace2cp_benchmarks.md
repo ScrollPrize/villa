@@ -1,5 +1,26 @@
 # Native 3D Trace2CP Benchmarks
 
+> Current five-scroll results use **complete reference segments including terminals**, not the older failure-only or whole-corpus F+1 metrics below. See the [corrected comparison](benchmarks/complete_segments_20260911.md) and [latest best5k full comparison](benchmarks/collection_182306_best5k_full_20260911.md). Historical tables below are retained as legacy records, not current headline metrics.
+
+
+## Current full five-scroll native/live benchmark
+
+- 2026-09-11: [run20260911_182306 best3k, full50fiber/100direction comparison, all paired metrics](benchmarks/collection_182306_best3k_full_20260911.md).
+  Mean before restart3.298736mm, median0.137113mm, P05/P95 0.001733/17.413631mm;
+  2144failures,404.521s coordinator. Better than previous collection17k
+  (2885failures/2.486310mm), still behind classic globally (1995/3.427927mm).
+  Frozen request-time best weights, fresh inference; training resumed after exclusive test.
+- 2026-09-11: [collection best17k full50fiber/100direction comparison and percentiles](benchmarks/collection_best17k_full_20260911.md).
+  Mean before restart2.486310mm versus classic3.427927mm;2885 versus1995failures;
+  coordinator400.888s versus516.699s. Native-stride4 supported without production changes.
+  Faster but worse tracing overall; classic remains the quality baseline.
+- 2026-09-11: [classic full50fiber/100direction baseline, percentiles, committed implementation, data/checkpoint and exact command](benchmarks/classic_full_5scroll_20260911.md).
+  Mean before restart3.427927mm, median0.179913mm, P05/P95 0.001170/17.669912mm;
+  coordinator516.699s with8GPUs. Historical corpus-reliability score4.048877mm is a separate metric.
+  The older paul4 rows below use a different cohort/protocol and are not matched comparisons.
+
+## Historical benchmarks
+
 Wall time is the shell `time` real value. CPU time is `user + sys`. Error rates
 come from the final aggregate tracer output.
 

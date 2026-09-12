@@ -2,6 +2,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
+#include "FiberTraceEvaluationCli.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -238,7 +239,10 @@ void clearProgressLine()
 int main(int argc, char** argv)
 {
     try {
+        if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay"))
+            return runFiberTraceEvaluationCli(argc, argv);
         const CliOptions options = parseArgs(argc, argv);
+        vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.cacheBytes);
 
         vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;
         datasetOptions.remoteCacheRoot = options.remoteCacheDir;
@@ -255,8 +259,7 @@ int main(int argc, char** argv)
         predictionManifest.workingToBaseScale = workingToBaseScale;
         const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
         const vc::fiber_tracer::FiberPredictionField predictions(
-            dataset,
-            options.cacheBytes);
+            dataset);
 
         std::optional<vc::lasagna::LasagnaDataset> normalDataset;
         std::optional<vc::lasagna::LasagnaNormalSampler> normalSampler;
@@ -267,8 +270,7 @@ int main(int argc, char** argv)
             options.normalManifest,
             normalDatasetOptions));
         normalSampler.emplace(
-            *normalDataset,
-            vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+            *normalDataset);
         const vc::lasagna::NormalSampler* normalSamplerPtr = &*normalSampler;
 
         const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);

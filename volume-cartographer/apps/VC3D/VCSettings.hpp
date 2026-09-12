@@ -4,12 +4,14 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
+#include "vc/core/util/GlobalCacheRoot.hpp"
 
 namespace vc3d {
 
 // Single source of truth for where downloaded remote-volume chunks land.
 //
-// Priority — first match wins:
+// Priority — first match wins (shared with headless consumers):
+//   0. explicit host override in <VC3D_CONFIG_DIR or ~/.VC3D>/cache.json
 //   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
 //   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
 //   3. `suggestion` if non-empty
@@ -27,38 +29,16 @@ namespace vc3d {
 // The chosen path is created on disk before return.
 inline QString remoteCachePath(const QString& suggestion = {})
 {
-    for (const QString& root : {QStringLiteral("/volpkgs"),
-                                QStringLiteral("/ephemeral")}) {
-        QFileInfo fi(root);
-        if (!fi.exists()) {
-            continue;
-        }
-        if (!fi.isDir()) {
-            qFatal("remoteCachePath: %s exists but is not a directory",
-                   qUtf8Printable(root));
-        }
-        // QFileInfo::isWritable() is unreliable on some FUSE/NFS mounts,
-        // so probe by trying to create the cache subtree.
-        const QString p = root + "/remote_cache";
-        if (!QDir().mkpath(p)) {
-            qFatal("remoteCachePath: %s exists but remote_cache/ cannot be "
-                   "created (check ownership/perms — must be writable by "
-                   "this user)",
-                   qUtf8Printable(root));
-        }
-        if (!QFileInfo(p).isWritable()) {
-            qFatal("remoteCachePath: %s is not writable by this user",
-                   qUtf8Printable(p));
-        }
+    try {
+        const auto path = vc::core::util::globalCacheRoot(suggestion.trimmed().toStdString());
+        const auto p = QString::fromStdString(path.string());
+        if (!QDir().mkpath(p) || !QFileInfo(p).isWritable())
+            qFatal("remoteCachePath: %s is not writable by this user", qUtf8Printable(p));
         return p;
+    } catch (const std::exception& error) {
+        qFatal("remoteCachePath: %s", error.what());
     }
-
-    QString p = suggestion.trimmed();
-    if (p.isEmpty()) {
-        p = QDir::homePath() + "/.VC3D/remote_cache";
-    }
-    QDir().mkpath(p);
-    return p;
+    return {}; // qFatal does not return
 }
 
 inline QString settingsFilePath()

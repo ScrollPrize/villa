@@ -136,12 +136,10 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
 
 class LasagnaNormalSampler::Impl {
 public:
-    Impl(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
+    Impl(const LasagnaDataset& dataset)
         : gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
-        , options_(options)
-        , cache_(sharedLasagnaChannelChunkCache(options.maxCachedBytes))
     {
         const LasagnaDatasetManifest& manifest = dataset.manifest();
         auto nxFuture = std::async(std::launch::async,
@@ -174,7 +172,7 @@ public:
 
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value() || *gradMag < 0.0) {
             return std::nullopt;
         }
@@ -186,7 +184,7 @@ public:
         if (!predDt_.has_value()) {
             return std::nullopt;
         }
-        return sampleLasagnaChannel(*predDt_, *cache_, volumePoint);
+        return sampleLasagnaChannel(*predDt_, volumePoint);
     }
 
     [[nodiscard]] bool hasPredDtChannel() const
@@ -228,9 +226,9 @@ public:
             if (alignWithNormal) {
                 const cv::Vec3d direction = delta * (1.0 / distanceVx);
                 const auto n0 = sampleLasagnaCompactAxisTensor(
-                    nx_, ny_, *cache_, p0);
+                    nx_, ny_, p0);
                 const auto n1 = sampleLasagnaCompactAxisTensor(
-                    nx_, ny_, *cache_, p1);
+                    nx_, ny_, p1);
                 if (!n0.has_value() || !n1.has_value() ||
                     length(*n0) <= kEpsilon || length(*n1) <= kEpsilon) {
                     return std::numeric_limits<double>::infinity();
@@ -431,7 +429,7 @@ public:
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"};
         }
@@ -439,7 +437,7 @@ public:
             return {{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, *cache_, volumePoint);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint);
         if (!normal.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"};
         }
@@ -451,7 +449,7 @@ public:
 
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"},
                     cv::Matx33d::zeros(),
@@ -463,7 +461,7 @@ public:
                     false};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, *cache_, volumePoint);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint);
         if (!normal.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                     cv::Matx33d::zeros(),
@@ -498,7 +496,7 @@ public:
             appendLasagnaInterpolationChunkKeys(ny_, point, nyKeys);
         }
 
-        std::vector<LasagnaChannelChunkCache::PrefetchRequest> requests;
+        std::vector<LasagnaPrefetchRequest> requests;
         requests.reserve(gradMagKeys.size() + nxKeys.size() + nyKeys.size());
         const size_t keyCount = std::max({
             gradMagKeys.size(), nxKeys.size(), nyKeys.size()});
@@ -514,7 +512,7 @@ public:
             }
         }
         (void)withDerivative;
-        return cache_->prefetchInterleaved(requests);
+        return vc::lasagna::prefetchLasagnaChunks(requests);
     }
 
     [[nodiscard]] std::array<const LasagnaChannelCornerSampler*, 3>
@@ -674,9 +672,8 @@ public:
             return report;
         }
 
-        const size_t readWorkers = lasagnaReadWorkersPerChannel();
         const size_t batchWorkers =
-            normalBatchWorkerCount(volumePoints.size(), parallelThreads, readWorkers);
+            normalBatchWorkerCount(volumePoints.size(), parallelThreads, lasagnaReadWorkersPerChannel());
         const bool sharedSpatialGrid =
             sameLasagnaSamplingGrid(gradMag_, nx_) &&
             sameLasagnaSamplingGrid(gradMag_, ny_);
@@ -854,18 +851,18 @@ public:
             deduplicateLasagnaChunkKeysInPlace(nyKeys);
         }
 
-        LasagnaChannelChunkCache::ResolvedChunkMap gradMagChunks;
-        LasagnaChannelChunkCache::ResolvedChunkMap nxChunks;
-        LasagnaChannelChunkCache::ResolvedChunkMap nyChunks;
+        LasagnaResolvedChunks gradMagChunks;
+        LasagnaResolvedChunks nxChunks;
+        LasagnaResolvedChunks nyChunks;
         auto gradMagPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(
-                gradMag_, *gradMag_.array, gradMagKeys, readWorkers, gradMagChunks);
+            return vc::lasagna::resolveLasagnaChunks(
+                gradMag_, gradMagKeys, gradMagChunks);
         });
         auto nxPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(nx_, *nx_.array, nxKeys, readWorkers, nxChunks);
+            return vc::lasagna::resolveLasagnaChunks(nx_, nxKeys, nxChunks);
         });
         auto nyPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(ny_, *ny_.array, nyKeys, readWorkers, nyChunks);
+            return vc::lasagna::resolveLasagnaChunks(ny_, nyKeys, nyChunks);
         });
         const NormalPrefetchReport gradMagReport = gradMagPrefetch.get();
         const NormalPrefetchReport nxReport = nxPrefetch.get();
@@ -998,17 +995,14 @@ private:
     LasagnaChannelBinding gradMag_;
     std::optional<LasagnaChannelBinding> predDt_;
     double gradMagDecodeScale_ = 1000.0;
-    LasagnaNormalSamplerOptions options_;
-    std::shared_ptr<LasagnaChannelChunkCache> cache_;
     std::unique_ptr<LasagnaChannelCornerSampler> gradMagCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nxCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nyCorners_;
 };
 
 LasagnaNormalSampler::LasagnaNormalSampler(
-    const LasagnaDataset& dataset,
-    LasagnaNormalSamplerOptions options)
-    : impl_(std::make_unique<Impl>(dataset, options))
+    const LasagnaDataset& dataset)
+    : impl_(std::make_unique<Impl>(dataset))
 {
 }
 

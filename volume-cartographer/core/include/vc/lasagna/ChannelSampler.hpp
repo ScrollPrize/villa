@@ -2,6 +2,8 @@
 
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/LocalChunkCache.hpp"
 
 #include <array>
 #include <cstddef>
@@ -40,17 +42,13 @@ struct LasagnaChannelChunkKeyHash {
     [[nodiscard]] size_t operator()(const LasagnaChannelChunkKey& key) const noexcept;
 };
 
-struct LasagnaCachedChunk {
-    std::vector<uint8_t> values;
-    std::array<size_t, 3> dimsZYX{0, 0, 0};
-};
-
 struct LasagnaChannelBinding {
     const LasagnaChannelGroup* group = nullptr;
     uint32_t arrayId = 0;
     size_t channelIndex = 0;
     std::filesystem::path path;
     std::shared_ptr<utils::ZarrArray> array;
+    std::shared_ptr<vc::render::ChunkCache> chunkSource;
     std::array<size_t, 3> shapeZYX{0, 0, 0};
     std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacing = 1.0;
@@ -77,92 +75,30 @@ struct LasagnaCubeRequest {
     double fy = 0.0;
     double fz = 0.0;
     std::array<LasagnaChannelChunkKey, 8> keys{};
-    std::array<std::shared_ptr<const LasagnaCachedChunk>, 8> chunks{};
+    std::array<vc::render::ChunkResult, 8> chunks{};
 };
 
-class LasagnaChannelChunkCache {
-public:
-    using ResolvedChunkMap = std::unordered_map<
-        LasagnaChannelChunkKey,
-        std::shared_ptr<const LasagnaCachedChunk>,
-        LasagnaChannelChunkKeyHash>;
-    using PrefetchRequest = std::pair<const LasagnaChannelBinding*, LasagnaChannelChunkKey>;
+using LasagnaResolvedChunks = std::unordered_map<
+    LasagnaChannelChunkKey, vc::render::ChunkResult, LasagnaChannelChunkKeyHash>;
+using LasagnaPrefetchRequest = std::pair<const LasagnaChannelBinding*, LasagnaChannelChunkKey>;
 
-    struct Stats {
-        size_t cachedBytes = 0;
-        size_t capacityBytes = 0;
-        size_t cachedChunks = 0;
-        size_t loadsInFlight = 0;
-    };
-
-    explicit LasagnaChannelChunkCache(size_t capacityBytes);
-
-    [[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> get(
-        const LasagnaChannelBinding& binding,
-        const utils::ZarrArray& array,
-        const LasagnaChannelChunkKey& key) const;
-
-    [[nodiscard]] NormalPrefetchReport prefetchResolved(
-        const LasagnaChannelBinding& binding,
-        const utils::ZarrArray& array,
-        const std::vector<LasagnaChannelChunkKey>& keys,
-        size_t maxWorkers,
-        ResolvedChunkMap& resolved) const;
-
-    [[nodiscard]] NormalPrefetchReport prefetchInterleaved(
-        const std::vector<PrefetchRequest>& requests) const;
-
-    [[nodiscard]] Stats stats() const;
-
-private:
-    struct Entry {
-        std::shared_ptr<const LasagnaCachedChunk> bytes;
-        std::list<LasagnaChannelChunkKey>::iterator lruIt;
-    };
-
-    struct InFlightLoad;
-
-    [[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> load(
-        const LasagnaChannelBinding& binding,
-        const utils::ZarrArray& array,
-        const LasagnaChannelChunkKey& key) const;
-
-    void store(LasagnaChannelChunkKey key,
-               std::shared_ptr<const LasagnaCachedChunk> bytes) const;
-    void trim() const;
-
-    size_t capacityBytes_ = 512ULL * 1024ULL * 1024ULL;
-    mutable size_t cachedBytes_ = 0;
-    mutable std::shared_mutex mutex_;
-    mutable std::list<LasagnaChannelChunkKey> lru_;
-    mutable std::unordered_map<LasagnaChannelChunkKey, Entry, LasagnaChannelChunkKeyHash> entries_;
-    mutable std::unordered_map<
-        LasagnaChannelChunkKey,
-        std::shared_ptr<InFlightLoad>,
-        LasagnaChannelChunkKeyHash> inFlight_;
-};
+// Scheduling, payload ownership, coalescing and budgets belong to ChunkCacheService.
+[[nodiscard]] NormalPrefetchReport resolveLasagnaChunks(
+    const LasagnaChannelBinding& binding,
+    const std::vector<LasagnaChannelChunkKey>& keys, LasagnaResolvedChunks& resolved);
+[[nodiscard]] NormalPrefetchReport prefetchLasagnaChunks(
+    const std::vector<LasagnaPrefetchRequest>& requests);
 
 class LasagnaLocalChunkResolver {
 public:
-    LasagnaLocalChunkResolver(
-        const LasagnaChannelBinding& binding,
-        const LasagnaChannelChunkCache& cache);
-
+    explicit LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding);
     void resolve(LasagnaCubeRequest& request);
 
 private:
-    [[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> resolveKey(
-        const LasagnaChannelChunkKey& key);
-
-    const LasagnaChannelBinding* binding_ = nullptr;
-    const LasagnaChannelChunkCache* cache_ = nullptr;
-    LasagnaChannelChunkKey lastKey_{};
-    std::shared_ptr<const LasagnaCachedChunk> lastChunk_;
-    bool hasLast_ = false;
-    std::array<LasagnaChannelChunkKey, 16> keys_{};
-    std::array<std::shared_ptr<const LasagnaCachedChunk>, 16> chunks_{};
-    size_t size_ = 0;
-    size_t next_ = 0;
+    [[nodiscard]] vc::render::ChunkResult resolveKey(const LasagnaChannelChunkKey& key);
+    vc::render::LocalChunkCache local_;
+    int requested_ = 0;
+    int errors_ = 0;
 };
 
 struct LasagnaPreparedCompactPoint {
@@ -201,6 +137,8 @@ public:
     LasagnaChannelCornerSampler& operator=(const LasagnaChannelCornerSampler&) = delete;
     LasagnaChannelCornerSampler(LasagnaChannelCornerSampler&&) noexcept;
     LasagnaChannelCornerSampler& operator=(LasagnaChannelCornerSampler&&) noexcept;
+
+    [[nodiscard]] bool sharesSamplingGrid(const LasagnaChannelCornerSampler& other) const noexcept;
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(
         const std::vector<cv::Vec3f>& volumePoints,
@@ -250,8 +188,6 @@ private:
     bool collectLocalityStats = false);
 
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
-[[nodiscard]] std::shared_ptr<LasagnaChannelChunkCache>
-sharedLasagnaChannelChunkCache(size_t capacityBytes);
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
@@ -297,7 +233,7 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
 
 void assignResolvedLasagnaCubeRequestChunks(
     LasagnaCubeRequest& request,
-    const LasagnaChannelChunkCache::ResolvedChunkMap& resolved);
+    const LasagnaResolvedChunks& resolved);
 
 void appendUniqueLasagnaCubeRequestChunkKeys(
     const LasagnaCubeRequest& request,
@@ -313,7 +249,6 @@ void appendLasagnaInterpolationChunkKeys(
 
 [[nodiscard]] std::optional<double> sampleLasagnaChannel(
     const LasagnaChannelBinding& binding,
-    const LasagnaChannelChunkCache& cache,
     const cv::Vec3d& volumePoint);
 
 [[nodiscard]] std::optional<double> sampleLasagnaChannel(
@@ -323,7 +258,6 @@ void appendLasagnaInterpolationChunkKeys(
 [[nodiscard]] std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     const LasagnaChannelBinding& nxBinding,
     const LasagnaChannelBinding& nyBinding,
-    const LasagnaChannelChunkCache& cache,
     const cv::Vec3d& volumePoint);
 
 [[nodiscard]] std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(

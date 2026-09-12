@@ -6,6 +6,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import wraps
 import json
+import itertools
+import mmap
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
@@ -281,6 +283,21 @@ class _MmapBandDescriptor:
 	paths: tuple[str, ...]
 	shape_zyx: tuple[int, int, int]
 	dtype: str = "float32"
+	chunk_side: int = 0  # zero: existing circular-Z layout; positive: full-volume bricks
+	prefault: bool = False
+
+	def __post_init__(self):
+		if self.chunk_side < 0:
+			raise ValueError("negative mmap chunk side")
+		if self.prefault and not self.chunk_side:
+			raise ValueError("writable prefault requires chunk-major layout")
+
+	@property
+	def storage_shape(self) -> tuple[int, ...]:
+		if not self.chunk_side:
+			return self.shape_zyx
+		b = self.chunk_side
+		return tuple((n + b - 1) // b for n in self.shape_zyx) + (b, b, b)
 
 	@property
 	def ring_depth(self) -> int:
@@ -526,7 +543,7 @@ class ModelAdapter(Protocol):
 		...
 
 	def run_tile_inference(self, model: Any, tile: torch.Tensor, *, device: torch.device) -> Any:
-		"""Run one normalized tile through the model and return raw model output."""
+		"""Run normalized B,1,D,H,W input; opt-in batching must preserve B in products."""
 		...
 
 	def product_tensors_from_output(self, raw_output: Any) -> Mapping[str, torch.Tensor]:
@@ -611,6 +628,23 @@ def _downscaled_tile_clip(local_pos: int, sd: int, tile_down: int, out_size: int
 	src0 = max(0, -start)
 	src1 = src0 + (dst1 - dst0)
 	return dst0, dst1, src0, src1
+
+
+def blend_ramp(length: int, border: int, overlap: int) -> np.ndarray:
+	"""Shared tile blend weights for sequential and arbitrary-demand admission."""
+	pad = max(0, int(border))
+	ramp = np.zeros(length, dtype=np.float32)
+	core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
+	core_len = core_end - core_start
+	if core_len <= 0:
+		return ramp
+	core = np.ones(core_len, dtype=np.float32)
+	ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
+	if ov:
+		edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
+		core[:ov], core[-ov:] = edges, edges[::-1]
+	ramp[core_start:core_end] = core
+	return ramp
 
 
 def _build_tile_positions(size: int, tile: int, stride: int) -> list[int]:
@@ -1009,7 +1043,10 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 		if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
 			shutil.copy2(zarray_src, zarray_dst)
 
-		tmp_arr = zarr.open(tmp_path, mode="r+")
+		# Persist computed fill chunks too: absence is not durable completion.
+		write_options = ({"config": {"write_empty_chunks": True}}
+			if int(zarr.__version__.split(".")[0]) >= 3 else {"write_empty_chunks": True})
+		tmp_arr = zarr.open(tmp_path, mode="r+", **write_options)
 		tmp_arr[z0:z1, y0:y1, x0:x1] = data
 
 		for cz in range(z0, z1, chunk_size):
@@ -1280,13 +1317,13 @@ class _Predict3dProgressEmitter:
 		self._last_done = 0
 		self._line_open = False
 
-	def emit(self, status: str, *, done: int, total: int) -> None:
+	def emit(self, status: str, *, done: int, total: int, force: bool = False) -> None:
 		now = float(self._clock())
 		changed = int(done) != self._last_done
 		self._last_done = int(done)
-		if not changed:
+		if not changed and not force:
 			return
-		if int(done) >= int(total) or now - self._last_history >= self._history_seconds:
+		if force or int(done) >= int(total) or now - self._last_history >= self._history_seconds:
 			print(("\r" if self._line_open else "") + status, flush=True)
 			self._line_open = False
 			self._last_refresh = now
@@ -2178,6 +2215,52 @@ def _limit_native_worker_threads():
 		return None
 
 
+def _mmap_populate_write_advice():
+	if not sys.platform.startswith("linux") or not hasattr(mmap.mmap, "madvise"):
+		raise RuntimeError("accumulator prefault requires Linux MADV_POPULATE_WRITE support")
+	# Linux UAPI value; Python builds against older headers may omit the name.
+	return getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+def _prefault_mmap_brick(array, view, descriptor):
+	"""Populate one whole writable brick once per owner mapping; timed with its add."""
+	brick_bytes = descriptor.chunk_side ** 3 * array.dtype.itemsize
+	offset = view.__array_interface__["data"][0] - array.__array_interface__["data"][0]
+	offset = offset // brick_bytes * brick_bytes
+	seen = getattr(array, "_demand_prefaulted_offsets", None)
+	if seen is None:
+		seen = array._demand_prefaulted_offsets = set()
+	if offset in seen:
+		return
+	start = offset // mmap.PAGESIZE * mmap.PAGESIZE
+	end = min(array.nbytes, ((offset + brick_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE)
+	# Full files use offset=0; the view can cover only a small part of the brick.
+	if array.offset != 0:
+		raise ValueError("prefault requires a zero-offset full-file mmap")
+	try:
+		array._mmap.madvise(_mmap_populate_write_advice(), start, end - start)
+	except OSError as error:
+		raise RuntimeError(f"MADV_POPULATE_WRITE failed for accumulator brick: {error}") from error
+	seen.add(offset)  # Failed/partial advice must not suppress a retry.
+
+
+def _chunk_major_views(array, descriptor, bounds):
+	"""Yield 3D brick views and matching region-relative slices, shared by read/add."""
+	b = descriptor.chunk_side
+	starts, stops = bounds[::2], bounds[1::2]
+	if b <= 0 or any(not 0 <= lo <= hi <= n for lo, hi, n in zip(starts, stops, descriptor.shape_zyx)):
+		raise ValueError("invalid chunk-major region")
+	if any(lo == hi for lo, hi in zip(starts, stops)):
+		return
+	for index in itertools.product(*(range(lo // b, (hi - 1) // b + 1) for lo, hi in zip(starts, stops))):
+		origin = tuple(i * b for i in index)
+		lo = tuple(max(a, o) for a, o in zip(starts, origin))
+		hi = tuple(min(a, o + b) for a, o in zip(stops, origin))
+		local = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, origin))
+		relative = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, starts))
+		yield array[index + local], relative
+
+
 def _read_mmap_band_chunk(
 	descriptor: _MmapBandDescriptor,
 	channel: int,
@@ -2189,10 +2272,14 @@ def _read_mmap_band_chunk(
 	if arr is None:
 		arr = np.memmap(
 			path, dtype=np.dtype(descriptor.dtype), mode="r",
-			shape=descriptor.shape_zyx,
+			shape=descriptor.storage_shape,
 		)
 		cache[path] = arr
 	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
+	if descriptor.chunk_side:
+		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
+			out[relative] = view
+		return out
 	offset = 0
 	logical = int(z0)
 	while logical < int(z1):
@@ -2221,7 +2308,12 @@ def _accumulator_native_module():
 def _add_accumulator_view(destination: np.ndarray, source: np.ndarray) -> str:
 	"""Add float32 source into an f16/f32 destination, using native code when installed."""
 	module = _accumulator_native_module()
-	if module:
+	if module and destination.strides[-1] == destination.dtype.itemsize:
+		# Pyramid downsampling can return a strided X view. The native kernel
+		# accepts strided Z/Y rows, but requires contiguous values within X.
+		# Copying the source preserves exact values and per-add f16 rounding.
+		if source.strides[-1] != source.dtype.itemsize:
+			source = np.ascontiguousarray(source)
 		module.add_inplace(destination, source)
 		return str(module.backend())
 	# NumPy is the portable no-extension fallback.  For float16 destinations it
@@ -2240,8 +2332,15 @@ def _add_mmap_band_chunk(
 	path = descriptor.paths[int(channel)]
 	arr = cache.get(path)
 	if arr is None:
-		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.shape_zyx)
+		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.storage_shape)
 		cache[path] = arr
+	if descriptor.chunk_side:
+		backend = "numpy"
+		for view, relative in _chunk_major_views(arr, descriptor, (z0, z1, y0, y1, x0, x1)):
+			if descriptor.prefault:
+				_prefault_mmap_brick(arr, view, descriptor)
+			backend = _add_accumulator_view(view, source[relative])
+		return backend
 	offset = 0
 	logical = int(z0)
 	backend = "numpy"
@@ -2264,6 +2363,31 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	return int(value % int(worker_count))
 
 
+def _execute_accumulate_process_task(task, shms, mmaps) -> str:
+	"""Shared task executor for whole-volume and demand accumulation workers."""
+	shm = shms.get(task.result_spec.shm_name)
+	if shm is None:
+		shm = _attach_shared_memory(task.result_spec.shm_name)
+		shms[task.result_spec.shm_name] = shm
+	layouts = {layout.name: layout for layout in task.result_spec.layouts}
+	lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
+	pz0, pz1, py0, py1, px0, px1 = task.source
+	weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+	backend = _add_mmap_band_chunk(
+		task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
+	)
+	accumulators = dict(task.accumulators)
+	for name in task.dirty_products:
+		product = _slot_array(shm, layouts[f"product:{name}"])
+		for channel in range(int(product.shape[0])):
+			backend = _add_mmap_band_chunk(
+				accumulators[name], channel,
+				lz0, lz1, ly0, ly1, lx0, lx1,
+				product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
+			)
+	return backend
+
+
 def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> None:
 	_native_limits = _limit_native_worker_threads()
 	shms: dict[str, shared_memory.SharedMemory] = {}
@@ -2275,26 +2399,7 @@ def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> Non
 				break
 			started = time.perf_counter()
 			try:
-				shm = shms.get(task.result_spec.shm_name)
-				if shm is None:
-					shm = _attach_shared_memory(task.result_spec.shm_name)
-					shms[task.result_spec.shm_name] = shm
-				layouts = {layout.name: layout for layout in task.result_spec.layouts}
-				lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
-				pz0, pz1, py0, py1, px0, px1 = task.source
-				weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
-				backend = _add_mmap_band_chunk(
-					task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
-				)
-				accumulators = dict(task.accumulators)
-				for name in task.dirty_products:
-					product = _slot_array(shm, layouts[f"product:{name}"])
-					for channel in range(int(product.shape[0])):
-						backend = _add_mmap_band_chunk(
-							accumulators[name], channel,
-							lz0, lz1, ly0, ly1, lx0, lx1,
-							product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
-						)
+				backend = _execute_accumulate_process_task(task, shms, mmaps)
 				result_queue.put((
 					"result", task.task_id, task.event_seq, worker_index, backend,
 					time.perf_counter() - started,
@@ -2390,6 +2495,22 @@ def _flush_process_main(
 				mmap_obj.close()
 
 
+def _ready_inference_batch(work_queue, first, max_batch_size):
+	"""Take available descriptors only; never wait to fill a model batch."""
+	batch = [first]
+	stop = False
+	while len(batch) < max_batch_size:
+		try:
+			item = work_queue.get_nowait()
+		except queue.Empty:
+			break
+		if item is None:
+			stop = True
+			break
+		batch.append(item)
+	return batch, stop
+
+
 def _multi_gpu_worker_main(
 	worker_index: int,
 	device_text: str,
@@ -2404,8 +2525,12 @@ def _multi_gpu_worker_main(
 	work_queue,
 	result_queue,
 	profile_pipeline: bool = False,
+	max_batch_size: int = 1,
+	report_batches: bool = False,
 ) -> None:
-	"""Persistent spawned GPU worker; queues carry descriptors only."""
+	"""Shared worker for serial-tile and dynamic-batch descriptor schedulers."""
+	if type(max_batch_size) is not int or max_batch_size < 1:
+		raise ValueError("max_batch_size must be a positive integer")
 	_native_limits = _limit_native_worker_threads()
 	device = torch.device(device_text)
 	if device.type == "cuda":
@@ -2438,47 +2563,74 @@ def _multi_gpu_worker_main(
 			task = work_queue.get()
 			if task is None:
 				break
-			seq, coord, input_slot, result_slot, needed_names = task
+			batch, stop = _ready_inference_batch(work_queue, task, max_batch_size)
+			seq, coord = task[:2]
 			started = time.perf_counter()
 			try:
 				profile = {} if profile_pipeline else None
-				input_layout = input_specs[input_slot].layouts[0]
-				tile_np = _slot_array(inputs[input_slot], input_layout)
 				cuda_events = {}
+				input_cuda_events = {"h2d": [], "cuda_convert": []}
 				if profile is not None and device.type == "cuda":
-					for name in ("h2d", "cuda_convert", "adapter_preprocess", "model_inference", "output"):
+					for name in ("adapter_preprocess", "model_inference", "output"):
 						cuda_events[name] = (
 							torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True),
 						)
-				if device.type == "cuda":
-					source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
-					if cuda_events:
-						cuda_events["h2d"][0].record()
-					stage_started = time.perf_counter()
-					compact = source.to(device)
-					if profile is not None:
-						profile["compact_h2d_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["h2d"][1].record()
-					# Pageable shared-memory H2D is synchronous, so this slot is now reusable.
-					result_queue.put(("input_released", seq, input_slot, worker_index))
-					if cuda_events:
-						cuda_events["cuda_convert"][0].record()
-					stage_started = time.perf_counter()
-					if compact.dtype == torch.uint16:
-						tile = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
-					elif compact.dtype == torch.uint8:
-						tile = compact.to(torch.float32).div_(255.0)
+				# Keep integer conversion independent for mixed uint8/uint16
+				# sources. Do not retain B separate float tiles plus a cat copy.
+				tile = None
+				for index, item in enumerate(batch):
+					seq, coord, input_slot, result_slot, needed_names = item[:5]
+					input_layout = input_specs[input_slot].layouts[0]
+					if len(item) == 6:
+						input_dtype = np.dtype(item[5])
+						if input_dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+							raise TypeError("unsupported demand tile dtype")
+						input_layout = replace(input_layout, dtype=input_dtype.str)
+						if input_layout.offset + input_layout.nbytes > input_specs[input_slot].nbytes:
+							raise ValueError("demand tile exceeds its shared slot")
+					tile_np = _slot_array(inputs[input_slot], input_layout)
+					if device.type == "cuda":
+						source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
+						if cuda_events:
+							for name in input_cuda_events:
+								input_cuda_events[name].append((torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)))
+							input_cuda_events["h2d"][-1][0].record()
+						stage_started = time.perf_counter()
+						compact = source.to(device)
+						if profile is not None:
+							profile["compact_h2d_wall_s"] = profile.get("compact_h2d_wall_s", 0.0) + time.perf_counter() - stage_started
+						if cuda_events:
+							input_cuda_events["h2d"][-1][1].record()
+						# Synchronous pageable H2D finished reading the shared
+						# input. Subsequent conversion uses GPU-owned compact.
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+						if cuda_events:
+							input_cuda_events["cuda_convert"][-1][0].record()
+						stage_started = time.perf_counter()
+						if compact.dtype == torch.uint16:
+							converted = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
+						elif compact.dtype == torch.uint8:
+							converted = compact.to(torch.float32).div_(255.0)
+						else:
+							raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
+						if profile is not None:
+							profile["cuda_convert_submit_wall_s"] = profile.get("cuda_convert_submit_wall_s", 0.0) + time.perf_counter() - stage_started
+						del compact, source
 					else:
-						raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
-					if profile is not None:
-						profile["cuda_convert_submit_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["cuda_convert"][1].record()
-				else:
-					stage_started = time.perf_counter()
-					tile = _input_tile_to_device(tile_np, device)
-					if profile is not None:
-						profile["cpu_convert_wall_s"] = time.perf_counter() - stage_started
-					result_queue.put(("input_released", seq, input_slot, worker_index))
+						stage_started = time.perf_counter()
+						converted = _input_tile_to_device(tile_np, device)
+						if profile is not None:
+							profile["cpu_convert_wall_s"] = profile.get("cpu_convert_wall_s", 0.0) + time.perf_counter() - stage_started
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+					if len(batch) == 1:
+						tile = converted
+					else:
+						if tile is None:
+							tile = torch.empty((len(batch), *converted.shape[1:]), dtype=converted.dtype, device=device)
+						tile[index:index + 1].copy_(converted)
+					del converted
+					if cuda_events:
+						input_cuda_events["cuda_convert"][-1][1].record()
 				preprocess = getattr(model_adapter, "preprocess_tile", None)
 				if cuda_events:
 					cuda_events["adapter_preprocess"][0].record()
@@ -2500,26 +2652,28 @@ def _multi_gpu_worker_main(
 						cuda_events["output"][0].record()
 				stage_started = time.perf_counter()
 				tensors = model_adapter.product_tensors_from_output(raw_output)
-				for name in needed_names:
+				# Validate every item before publishing any result descriptor.
+				for name in {name for item in batch for name in item[4]}:
 					observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
-					if observed_shape != expected_native_shape:
+					if tensors[name].shape[0] != len(batch) or observed_shape != expected_native_shape:
 						raise ValueError(
-							f"product {name!r} native tile shape {observed_shape} does not match "
-							f"model native output stride {native_output_stride} expected shape "
-							f"{expected_native_shape}"
+							f"product {name!r} batch/native tile shape {tuple(tensors[name].shape)} "
+							f"does not match batch {len(batch)}, native stride {native_output_stride}, "
+							f"expected shape {expected_native_shape}"
 						)
-				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
-				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
-				for sd in needed_scales:
-					weight = weights_by_scale[sd]
-					_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weight.detach().cpu().numpy()
-				for name in needed_names:
-					sd = int(product_scales[name])
-					weighted = tensors[name][0] * w_native
-					remaining_scaledown = sd // native_output_stride
-					if remaining_scaledown > 1:
-						weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
-					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+				for index, item in enumerate(batch):
+					result_slot, needed_names = item[3:5]
+					layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
+					for sd in sorted({int(product_scales[name]) for name in needed_names}):
+						_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weights_by_scale[sd].detach().cpu().numpy()
+					for name in needed_names:
+						sd = int(product_scales[name])
+						weighted = tensors[name][index] * w_native
+						remaining_scaledown = sd // native_output_stride
+						if remaining_scaledown > 1:
+							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
+						_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+						del weighted
 				if profile is not None:
 					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started
 					if cuda_events:
@@ -2528,20 +2682,32 @@ def _multi_gpu_worker_main(
 				if device.type == "cuda":
 					torch.cuda.synchronize(device)
 				finished = time.perf_counter()
+				elapsed = finished - started
 				if profile is not None:
 					profile["terminal_sync_wall_s"] = finished - sync_started
-					profile["worker_total_wall_s"] = finished - started
+					profile["worker_total_wall_s"] = elapsed
 					for name, (event_start, event_end) in cuda_events.items():
 						profile[f"{name}_cuda_s"] = event_start.elapsed_time(event_end) / 1000.0
-					result_queue.put((
-						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
-						finished - started, profile, finished,
-					))
-				else:
-					result_queue.put((
-						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
-						finished - started,
-					))
+					for name, pairs in input_cuda_events.items():
+						if pairs:
+							profile[f"{name}_cuda_s"] = sum(start.elapsed_time(end) for start, end in pairs) / 1000.0
+					# Preserve the existing per-tile aggregate accounting.
+					profile = {name: value / len(batch) for name, value in profile.items()}
+					profile["batch_size"] = len(batch)
+				if report_batches:
+					result_queue.put(("batch", worker_index, {
+						"size": len(batch), "seconds": elapsed,
+						"cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
+						"cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0,
+					}))
+				for item in batch:
+					seq, coord, _, result_slot, needed_names = item[:5]
+					result = ("result", seq, coord, result_slot, tuple(needed_names), worker_index, elapsed / len(batch))
+					result_queue.put((*result, profile, finished) if profile is not None else result)
+				# No previous-batch tensors may inflate the next forward peak.
+				del tile, tensors, raw_output
+				if stop:
+					break
 			except BaseException as exc:
 				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
 				break
@@ -2715,21 +2881,7 @@ def run_tiled_inference_3d(
 		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 
-	def _blend_ramp(length: int) -> np.ndarray:
-		ramp = np.zeros(length, dtype=np.float32)
-		core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
-		core_len = core_end - core_start
-		if core_len <= 0:
-			return ramp
-		core = np.ones(core_len, dtype=np.float32)
-		ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
-		if ov:
-			edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
-			core[:ov], core[-ov:] = edges, edges[::-1]
-		ramp[core_start:core_end] = core
-		return ramp
-
-	r = _blend_ramp(int(tile_size))
+	r = blend_ramp(int(tile_size), pad, int(overlap))
 	w_full = None
 	w_native = None
 	w_by_scale = None
@@ -4483,6 +4635,11 @@ def run_tiled_inference_3d(
 					shm.unlink()
 		_complete_pending_flush()
 		_shutdown_flush_workers(terminate=False)
+		# Tile completion can precede asynchronous publication. Refresh once the
+		# final flush is acknowledged even though the tile count is unchanged.
+		if progress is not None:
+			progress_emitter.emit(_predict3d_progress_line(progress),
+				done=int(progress["tiles_done"]), total=int(progress["tiles_total"]), force=True)
 		progress_emitter.finish_line()
 		flush_wall = 0.0 if flush_started_at is None else time.perf_counter() - flush_started_at
 		flush_rate = 0.0 if flush_wall <= 0.0 else flush_chunks_total / flush_wall

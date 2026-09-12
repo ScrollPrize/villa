@@ -244,6 +244,8 @@ vc_add_test(NAME test_fiber_slice_geometry
 vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_normal_alignment
     LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_global_cache_root)
+
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)

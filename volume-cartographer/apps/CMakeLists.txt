@@ -1,3 +1,11 @@
+add_executable(vc_cache_root src/vc_cache_root.cpp)
+target_link_libraries(vc_cache_root PRIVATE vc_core)
+
+if(VC_BUILD_APPS OR VC_BUILD_FIBERLETS)
+    add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp src/FiberTraceEvaluationCli.cpp src/FiberLiveBridge.cpp)
+    target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
+endif()
+
 if(VC_BUILD_FIBERLETS)
     add_executable(vc_fiberlets src/vc_fiberlets.cpp)
     target_link_libraries(vc_fiberlets vc_fiber_tracer vc_lasagna)
@@ -164,9 +172,6 @@ target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
 target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
 
-add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp)
-target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
-
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
 
@@ -283,6 +288,7 @@ target_link_libraries(vc_zarr_download_bench vc_core Boost::program_options)
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
+    vc_cache_root
     vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
     vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj vc_obj_uv_lift
     vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
@@ -320,7 +326,7 @@ if(VC_USE_PCH)
         vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
         vc_calc_surface_metrics
-        vc_lasagna_line_probe vc_lasagna_normal_align vc_fiber_trace_metric vc_fiber_trace_chunk vc_fiberlets vc_lasagna_maxflow_graph vc_atlas_inspect vc_atlas_constraints_export vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
+        vc_cache_root vc_lasagna_line_probe vc_lasagna_normal_align vc_fiber_trace_metric vc_fiber_trace_chunk vc_fiberlets vc_lasagna_maxflow_graph vc_atlas_inspect vc_atlas_constraints_export vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
         vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress

@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "checkpoint": "/home/hendrik/runs/s1a_128_1_single_8x8_20260801_084232/snapshots/best91_5k.pt",
+  "checkpoint_sha256": "f389da7914a6da34506f92204bf5441964e96599339dfe79dfc9c48b67165e17",
+  "split_root": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910",
+  "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260911_unified_cache_v1",
+  "native_binary": "/tmp/vc-live-native-cmake/bin/vc_fiber_trace_metric",
+  "catalog_path": "/tmp/fiber-evaluation-catalog-20260910.json",
+  "devices": "0,1,2,3,4,5,6,7",
+  "pilot_devices": "0",
+  "pilot_source_id": "PHerc0139",
+  "pilot_result": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260910/pilot",
+  "sources": [
+    {
+      "id": "PHerc0139",
+      "sample_id": "PHerc0139",
+      "volume_id": "20260102150214",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 10,
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      }
+    },
+    {
+      "id": "PHerc0332",
+      "sample_id": "PHerc0332",
+      "volume_id": "20251211183505",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 3,
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      }
+    },
+    {
+      "id": "PHerc1229",
+      "sample_id": "PHerc1299",
+      "volume_id": "20260309130042",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 5,
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      }
+    },
+    {
+      "id": "PHerc1451",
+      "sample_id": "PHerc1451",
+      "volume_id": "20260319101107",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 2,
+      "normal": {
+        "kind": "catalogue",
+        "selector": "atlas:20260419180421@L2"
+      }
+    },
+    {
+      "id": "PHercParis4_eval_fibers",
+      "sample_id": "PHercParis4",
+      "volume_id": "20260411134726",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 24,
+      "normal": {
+        "kind": "manager-run",
+        "selector": "PHercParis4-20260411134726-las-sd2-5b17ff6c"
+      }
+    },
+    {
+      "id": "PHercParis4_fibers",
+      "sample_id": "PHercParis4",
+      "volume_id": "20260411134726",
+      "input_volume": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "input_level": 1,
+      "expected_test_count": 6,
+      "normal": {
+        "kind": "manager-run",
+        "selector": "PHercParis4-20260411134726-las-sd2-5b17ff6c"
+      }
+    }
+  ],
+  "evaluation": {
+    "gpu_manager": {
+      "enabled": true,
+      "priority": 100,
+      "label": "fiber-evaluation"
+    },
+    "error_threshold_base_voxels": 20,
+    "inference": {
+      "accumulator_dtype": "float16",
+      "border": 32,
+      "chunk_size": 32,
+      "compressor": "blosc-zstd",
+      "input_workers": 128,
+      "input_slots": 256,
+      "input_io_threads": 64,
+      "input_decode_threads": 8,
+      "result_slots": 128,
+      "accumulator_layout": "chunk-major",
+      "overlap": 96,
+      "precision": "bf16",
+      "scaledown_power": 2,
+      "slots_per_gpu": 1,
+      "tile_size": 512
+    },
+    "match_refine_steps": 1,
+    "render": false,
+    "trace_args": [
+      "--threads",
+      "1",
+      "--beam-width",
+      "8",
+      "--beam-lookahead-steps",
+      "2",
+      "--step-voxels",
+      "4",
+      "--smoothness-normal-weight",
+      "0.1",
+      "--smoothness-tangent-weight",
+      "10"
+    ],
+    "version": 1,
+    "workers": 0,
+    "inference_cache_namespace": "classic_s1_91500_unified_cache_20260911_v1"
+  },
+  "profile": {
+    "kind": "cached-trace",
+    "completed_evaluation": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260911_unified_cache_v1/full",
+    "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_cached_readiness_20260911_v3",
+    "shortest_whole_fibers": 4,
+    "prefix_base_voxels": 128,
+    "readiness_entries_order": [
+      0,
+      4096,
+      4096,
+      0
+    ],
+    "run_timeout_seconds": 300
+  }
+}

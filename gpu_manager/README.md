@@ -178,3 +178,14 @@ of ownership. Context exit aborts/joins remaining owned workers before reporting
 release and finishing. A failed join retains the reservation. It uses the existing
 protocol, not a new scheduling API. Non-cooperating GPU processes remain outside
 the manager's enforcement; callers must still check actual available memory.
+
+`run_exclusive(command, ...)` uses that same lease with a `GatedCommand` adapter.
+It reserves the full managed CPU capacity and selected devices' managed VRAM,
+validates the complete grant, and reports an independent cleanup watchdog before
+authorizing the command. Heterogeneous device capacities are supported through
+the existing proportional CPU request calculation. SIGTERM/HUP cancel and join
+owned workers; connection loss retains the fixed allocation while reconnecting
+with the same task token. Commands must not detach their descendants.
+Application launchers may call `ensure_manager()` first and supply a
+`before_authorize` check for external GPU occupancy. There is no unmanaged
+fallback on bootstrap, admission, or ownership failure.

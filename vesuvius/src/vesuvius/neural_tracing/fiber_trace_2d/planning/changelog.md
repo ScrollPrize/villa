@@ -15,6 +15,210 @@
 - Exclusive-to-adaptive transition uses two registrations without changing the
   locked protocol; user approved this lifecycle. Evaluation retains measured microbatch1.
 
+## 2026-09-11 — Current best5k full five-scroll evaluation
+
+- Evaluated new frozen step5000/640000samples best.pt (2823f517…,dense test loss0.408346925) from runcollection_20260909_5scroll_128_sd1_16x8_20260911_182306. Same50fibers100directions,fresh inference,exclusive8GPUs. Completed402.933s,2411restarts,mean3.218462mm vs same-run3k3.601407mm (10.63%shorter); Paris4 drives regression. Corrected terminal-inclusive mean/median/P05/P95 with all4baselines/per-scroll in docs/benchmarks/collection_182306_best5k_full_20260911.md/.json.100artifacts audited; manager released,training resumed. Config/docs only,previous metric patch preserved.
+
+## 2026-09-11 — Complete reference-segment metric correction
+
+- Supersedes prior failure-only headline statistics and whole-corpus F+1 convention: mean full reference length/(restarts+directed cases); successful terminal segments included in mean and all quantiles. Native source schema5/replay-set2; preserved tracing/diagnostics. Corrected25saved summaries with original backups, audited300main-case artifacts without inference rerun. Corrected global classic/collection17k/collection3k means3.857546/2.707390/3.601407mm; full per-scroll comparison in docs/benchmarks/complete_segments_20260911.md.11native+16CLI+9Python tests passed. Older records below retain their historical explicitly superseded metric definitions.
+
+## 2026-09-11 — Collection run182306 best3k full test
+
+- Captured active training run's best3k/384000samples snapshot (ee4595cd…),
+  evaluated all50testfibers/100directions with fresh inference and exclusive8GPUs.
+  Completed404.521s,2144failures,mean before restart3.298736mm,
+  median0.137113mm,P05/P95 0.001733/17.413631mm. Improved versus previous
+  collection17k but not classic globally. All paired metrics/commands/provenance
+  in docs/benchmarks/collection_182306_best3k_full_20260911.md/.json.
+  No production changes;100artifacts audited,manager released,training resumed.
+
+## 2026-09-11 — Full collection snapshot tracing comparison
+
+- Archived classic per-scroll mean/median/P05/P95 with command/data/snapshot/code revisions in docs/benchmarks/classic_full_5scroll_20260911.md (commitaf1a59c67), linked existing native benchmark log. Deferred GT-heading initialization audit.
+- Collection best17k (native output_stride4) completed all50testfibers/100directions over5scrolls with fresh inference/exclusive8GPUs. Existing shared worker already handles native stride;85focused checks passed. Faster400.888s vs516.699s but worse2885vs1995failures, mean before restart2.486310vs3.427927mm. Classic retained as quality reference; docs/benchmarks/collection_best17k_full_20260911.md/.json contain full provenance/statistics. Read-only audit counts actual terminal suffixes instead of assuming one per direction.
+
+## 2026-09-11 — Dynamic per-GPU inference batching
+
+- Shared tiled worker now supports immediately available dynamic model batches, individual conversion/normalization/result slots and unchanged accumulation. Positive inference.max_batch_size defaults1 and participates in cache identity; actual batch histograms/timings/CUDA peaks recorded. Legacy CLI fixtures repaired and terminal asynchronous-flush progress refreshed;105batching/demand/evaluation/profile tests and64preprocess tests/6subtests passed.
+- Full-set cap8 comparison exposed313s admission-stage overhead in684.879s coordinator time. Exact-order lazy heaps reduce admission to1.35s and coordinator time to516.699s. Matched heap batch1 completes in860.380s: cap8 saves39.95% wall time with78.05% higher normalized worker throughput. All100directions completed in each valid row, fresh inference and identical source membership. Standard classic config now uses256³/cap8 with a fresh namespace; genericAPIdefault1 unchanged.106targeted+64preprocess tests/6subtests passed. Full results and caveats: docs/full_dynamic_inference_batching_20260911.md/.json.
+- Four-fiber implementation/memory pilot caps1/2/4/8 completed fresh:28.372/26.224/28.712/25.094s, summed worker98.623/75.072/67.053/58.001s; cap8 peak35.01GiB allocated/54.67GiB reserved. Cap16OOM before publication, clean abort. No global default changed; full tuning reserved for full collection per user. Details docs/dynamic_inference_batching_20260911.md.
+
+## 2026-09-11 — Four-fiber fresh-inference tile comparison
+
+- Existing approved runner supports explicit filename subsets after full locked collection validation. Four fibers/eight directions completed with fresh inference at512³ and256³, all8GPUs exclusive:34.682s/29.144s coordinator wall,87/537tiles,zero reused predictions,23/22trace failures. Smaller tiles process22.85% fewer voxels but lower voxel-normalized throughput; single-run/cache/blending caveats recorded.23focused tests passed; no default changed. See docs/four_fiber_fresh_inference_20260911.md.
+
+## 2026-09-11 — Canonical batched tracer
+
+- Removed scalar candidate special case at threads1; shared efficient batch/fused paths now apply at any worker count. Exact-grid readiness grouping, valid cube-key collection (no fictitious chunk0), and eligibility-before-gate avoid repeated planning. Numerical change explicitly authorized; within-new-path determinism tested.
+- Cache-only4-direction pilot completed twice in0.982/1.035s, one candidate worker per fiber, zero inference, failures unchanged. Matched old per-direction timings30–52s versus new0.60–1.01s; prior8-way versus new4-way concurrency differs. Original8-case new attempt failed closed on uncached changed-path chunk.318native+77Python tests; report docs/batched_tracer_20260911.md. No full100-case rerun or adaptive worker scheduler implemented.
+
+## 2026-09-11 — Native wait profiling and readiness fast path
+
+- Completed strict cache-only short ABBA comparison through the existing exclusive-manager runner: native mean71.968→65.703s (8.71% less time), bridge entries8986980→243, exact original replay equality, zero inference.318 native/76 Python tests. See docs/cached_trace_profile_20260911.md; preliminary cropped/reserialized pilots are excluded.
+
+- Added per-thread CPU/wait observations through the same approved runner.
+  Kernel denied stack/wait-object attribution; no exact lock claim made.
+- Case-local acknowledged-chunk proofs avoid redundant bridge locks and
+  CPU-permit operations, preserving atomic cancellation and first-read gates.
+  Added opt-in per-case readiness/native stage timing.318 native cases and
+  74 Python tests passed; synthetic bridge calls18→6 with identical traces.
+- Current full evaluation was not interrupted; new code is not hot-injected.
+  Dataset speedup and exact-lock attribution pending an instrumented run.
+  See docs/tracer_wait_profile_20260911.md.
+
+## 2026-09-11 — Unified native fiber/normal decoded cache
+
+- Removed LasagnaChannelChunkCache and its duplicate payload copies, LRU and read pool. Scalar and corner sampling now share regular ChunkCacheService source handles and one native-process decoded budget; extracted the existing bounded local-reference helper for both samplers.
+- Batch evaluation defaults to10% physical RAM and records the effective budget; standalone options configure the service, not individual samplers. Preserved requested-level/readiness/fill and numerical behavior.315 native cases +69 Python tests passed.
+- Authorized full100-direction rerun launched with exclusive manager ownership and a fresh inference namespace, via the unchanged approved runner. Timing pending; details:docs/unified_native_cache_20260911.md.
+
+## 2026-09-11 — Remove artificial live-inference scratch cap
+
+- Removed the64GiB/source cap, touched-byte accounting and per-tile storage
+  polling after they aborted the full evaluation. File-backed accumulators are
+  now uncapped by the application; shared RAM pools remain bounded. Filesystem
+  errors and worker failures still abort without falsely publishing readiness.
+  Full-run restart/timing remains pending; no numerical changes intended.
+
+## 2026-09-11 — Embedding merge and exclusive bbox/inference profile
+
+- Merged fiber-training-embedding preserving embeddings, training sample progress,
+  RAM-only inference and native bbox work. Unified calibration/command exclusive
+  leases while retaining watchdog cleanup; logical224CPU inventory, bootstrap,
+  idle retirement and service-ownership exclusion reviewed/tested.
+- Exclusive8GPU classic profile reached523.19equivalent128³tiles/s versus prior
+  177.86–188.57/s. Coordinator stalls removed; GPU work dominates the buffered
+  40s window, with native-read long-tail waits still needing diagnosis. No claim
+  of full tracer completion or sustained long-run throughput. Tests, conflicts,
+  exact commands and complete breakdown:docs/embedding_manager_merge_profile_20260911.md.
+
+## 2026-09-10 — Unified strict native bbox reads
+
+- Removed duplicate sample_zyx_block API/implementation. read_zyx is the single
+  blocking exact-level native uint8/uint16 bbox reader; read_xyz/slicing delegate.
+  Optional masks/statistics incur no large allocation/per-voxel work when omitted.
+  Missing/outside voxels use declared fill; errors/unresolved/malformed data throw.
+  Allocation/fill/prefetch/copy release the GIL. Python bbox scale fallbacks removed.
+- Inference now reads raw integer full bboxes without the training float adapter.
+  Boundary reflection intentionally changed to declared fill per user instruction.
+  Training-facing interface and arbitrary-coordinate sampling preserved.
+- Installed updated local binding;76targeted tests,3training-adapter tests,
+  expanded24native/profiling tests and native replay wrapper passed. Independent
+  review passed. Post-change GPU comparison blocked by absent manager whose saved
+  224-core inventory conflicts with112physical-core validation; awaiting approval
+  before reconciling shared state. No unmeasured speedup claim.
+- API contract, build/test commands and limitations:
+  docs/unified_bbox_reads_20260910.md.
+
+## 2026-09-10 — Native reader stall diagnosis
+
+- Added opt-in isolated native allocation/read heartbeat controls, disabled by
+  default. No-I/O512³ calls took63.7ms while delaying a2ms Python heartbeat up
+  to65.4ms; C++ buffer initialization occurs before releasing the GIL. Prewarmed
+  native read168ms versus wrapper398ms also exposes integer/float round-trip cost.
+- No optimization implemented yet. GDB attachment denied; source-backed in-process
+  controls used instead. Exact results, sample counts, limitations and commands:
+  docs/live_inference_reader_stalls_20260910.md. Ten profiling tests passed.
+
+## 2026-09-10 — RAM-only demand inference state
+
+- Removed SQLite; existing coordinator dictionaries/sets/deques hold all live
+  scheduling and contribution state. Static provenance and finalized Zarr output
+  remain, with lazy restart validation and safe owned-scratch cleanup. No replacement
+  journal or done markers; unidentified and legacy DB-only roots refused untouched.
+- Sixty targeted tests and independent review passed. Same managed8GPU profile:
+  177.9999→177.8633 fully accumulated128³-equivalent tiles/s: no end-to-end speedup.
+  State updates now0.000275s total, but coordinator waits shifted elsewhere.
+  Commands, stage measurements and integrity/restart limitations are in
+  docs/live_inference_ram_state_20260910.md. Prior manager/profiling history archived
+  in docs/managed_inference_profiling_history_20260910.md.
+
+## 2026-09-10 — Queue visibility checkpoint (paused)
+
+- Shared queue snapshot and short-profile sampled time series added;51 relevant
+  tests pass. Confirmed native block sampler but8 input slots/read threads,
+  independent of128 result slots. No changed scheduling or measured new result.
+- User paused before live JSONL integration and new profile run to commit and
+  merge GPU manager. See docs/live_inference_concurrency_20260910.md.
+
+## 2026-09-10 — Chunk-major accumulator and writable-prefault trial
+
+- Added opt-in contiguous per-output-chunk scratch inside existing channel mmap
+  files, using shared descriptor/read/add helpers and unchanged native arithmetic.
+  Same128 buffers/eight GPUs:113.589→322.899 equivalent128³ input tiles/s (2.84×);
+  mean accumulation task36.392→2.730ms, kernelCPU289.17→43.56s per40s window.
+- Follow-up first-touch MADV_POPULATE_WRITE trial reached336.960 equivalent
+  tiles/s but mean task2.797ms, kernelCPU47.84s and more unfinished publication.
+  No convincing prefault gain; option retained disabled. Profile uses chunk-major,
+  production default remains flat. No full evaluation restart or new syncs.
+- Tests, exact commands, component counters and single-window limitations:
+  docs/live_inference_chunk_major_20260910.md. Existing unrelated changes retained.
+
+## 2026-09-10 — Result-buffer trial and accumulator fault profiling
+
+- Added independent result-slot capacity, retained input counts and production
+  defaults.128 buffers yielded112–114 equivalent128cubed tiles/s, unchanged from
+  8 buffers; extra GPU results accumulated as unfinished backlog.
+- Optional OS profile found289s kernel versus9s user CPU across8 accumulators
+  in40s,19.29million minor faults; native AVX-512 active. Indicates kernel/page
+  fault overhead, not predominantly storage-read waits. No layout fix yet.
+  See docs/live_inference_buffer_experiment_20260910.md for counters, caveats,
+  synchronization audit and reproducible command. No full evaluation restart.
+
+## 2026-09-10 — Demand accumulation simplification
+
+- Removed NPZ staging, canonical-arrival waiting, scratch zero reservation and
+  scratch fsync. Reuse shared chunk-owner accumulation processes directly from
+  RAM, release input slots independently, publish Zarr in background. Demand
+  float addition order may vary as explicitly authorized; sequential unchanged.
+- Corrected owner mapping to hash chunk indices, not voxel coordinates. Final
+  eight-GPU profile:71 tiles/40.003s (1.775/s) versus9/41.485s (0.217/s), observed
+  8.18x with warmer input-cache caveat; mean result queue wait8.132s→0.072s.
+  Tests/review and remaining mmap stalls documented in
+  docs/live_inference_accumulation_fix_20260910.md. No full trace restart.
+- Prior profile/config cleanup is documented in docs/live_inference_profile_20260910.md.
+  Dataset/normal bindings now reside in workload JSON, not scroll-specific CLI flags.
+
+## 2026-09-10 — Native multi-fiber evaluation and on-demand inference
+
+- Classic best91_5k real-checkpoint PHerc0139 pilot completed both directions:
+  0 forward/2 reverse failures,143.65s cold wall,18 inferred tiles,26 ready chunks.
+  User confirmed PHerc1229/1299 identity and Paris4 local normal source;
+  full50-fiber/100-direction cohort launched on eight GPUs, then failed at the
+  600s request timeout (2/100 cases completed); no valid full metrics.
+  Added reproducible preparation/provenance checks, fixed local-only
+  metadata access for remote CT inputs; native fast voxel loading unchanged.
+  See docs/classic_fiber_evaluation_20260910.md; previous implementation validation
+  log preserved in docs/live_inference_implementation_validation_20260910.md.
+
+- Continuation: batch/live `--render` generates strips directly from completed
+  replay objects, default off, retaining the post-hoc API. Ported scoped HiGHS
+  optionality from villa and enabled the evaluator in headless builds. Restored
+  missing registered annotation test and fixed stale replay strip validation to
+  use the shared seven-row/resampled-column geometry. Overlay and failure-marker
+  projection now uses that same position map, tested on long resampled spans. Current-source GCC13
+  CMake build and five native suites pass; 24 Python smoke tests pass. No stuck
+  input cancellation work, as explicitly deferred by the user.
+
+- Added same-core VC3D beam/greedy bidirectional reference replay, stable case
+  artifacts, disconnected exports and post-hoc reference/traced CT strips.
+- Added native batched readiness/control bridge and standalone GPU coordinator,
+  using shared tiled inference with canonical sparse mmap accumulation, durable
+  sibling Zarr publication and source/snapshot-keyed SQLite live cache.
+- Added shared global cache override; host points to
+  `/ephemeral/hendrik/vc3d_cache`, without migrating/deleting old caches.
+- Synthetic offline/live and cold/warm tests pass, including exact scale1/2
+  sequential f16/f32 output parity. Headless native targets now build from source;
+  real-model GPU/perf validation remains pending; concurrency/resource limits are
+  explicit in docs/live_inference_trace_evaluation.md and planning/task_log.md.
+
+## 2026-09-10 — Per-source fiber-length train/test split
+
+- Published reproducible six-source 95/5 split with whole-fiber upward rounding:
+  946 train / 50 test files. Added reusable splitter, source checksums, membership
+  and geometry/branch audit, documentation and seven passing tests. Originals
+  remain unchanged; split directories contain relative symlinks.
 ## 2026-09-10 — Local Fiber3D embeddings
 
 - Calibration now acquires exclusive manager ownership before GPU initialization;
@@ -67,6 +271,7 @@
 - Added an opt-in fast-pipeline S1a NML reproduction config at
   global batch 128 with the recorded LR 0.01 / 100-step warmup recommendation.
   Added launch commands and historical comparison caveats.
+
 
 ## 2026-09-09 — Fiberlets/Fiber3D training integration
 
@@ -2218,6 +2423,12 @@
 - Added a raw-count-derived pre-pruning exact-reference progress plot alongside
   the existing replay and crop-constraint plots.
 
+## 2026-09-10 - Live-inference reference evaluation plan
+
+- Planned a standalone multi-source, bidirectional evaluator around the existing VC3D beam tracer, using shared reference failure/reset metrics, dynamic inference requests and temporary file-backed accumulation under a model/source-keyed live_inference cache.
+- Planned durable geometry for every trace with optional post-hoc JSON/OBJ/CT-strip inspection, without retracing. Training invocation is a later hook; no GUI live integration.
+- Identified required extensions: current greedy-only replay wrapper, asynchronous trace sessions, shared inference demand mode, coherent chunk/dependency ledger and an explicit global cache-root override. Current forced-mount resolver prevents a host config-only relocation; functional implementation/configuration and GPU validation are not yet complete.
+
 ## 2026-09-03 - Optional ambiguity-stopping crop tracing
 
 - Added opt-in pre-commit stopping when a geometrically distinct exact-horizon
@@ -2239,3 +2450,6 @@
   capture. Removed broker visualization fetch and repeated augmentation/forward.
   CPU sheets survive test resize; conditioned panels show actual zero/random
   queries. Reusable no-argument visualization suite: 20 passed, 2 GPU skips.
+# Saved-test analysis — 2026-09-11
+
+- Committed measured native/inference/integration state (75013f6cc, a238c4598, 175e3645b), then audited all100 saved full-cap8 traces without rerunning. Mean failure-ended reference span3.427927mm; per-scroll/collection counts, terminal handling, historical4.048877mm corpus reliability and reproducible calculation in docs/trace_restart_analysis_20260911.md/.json/.py.

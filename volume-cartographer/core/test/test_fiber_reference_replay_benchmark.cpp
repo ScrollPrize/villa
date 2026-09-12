@@ -109,9 +109,9 @@ TEST_CASE("reference replay summary includes successes and explicit voxel scale"
     CHECK(summary.meanFailedSpanLengthMillimeters == doctest::Approx(0.125));
     CHECK(summary.lengthWeightedSuccessPercent == doctest::Approx(87.5));
     CHECK(summary.failuresPerDirectedMillimeter == doctest::Approx(1.0));
-    CHECK(summary.meanSegmentLengthBaseVoxels == doctest::Approx(100.0));
-    CHECK(summary.meanSegmentLengthMillimeters == doctest::Approx(0.5));
-    CHECK(summary.meanSegmentLengthPercent == doctest::Approx(50.0));
+    CHECK(summary.meanSegmentLengthBaseVoxels == doctest::Approx(200.0 / 3.0));
+    CHECK(summary.meanSegmentLengthMillimeters == doctest::Approx(1.0 / 3.0));
+    CHECK(summary.meanSegmentLengthPercent == doctest::Approx(100.0 / 3.0));
     REQUIRE(summary.failureReasons.size() == 1);
     CHECK(summary.failureReasons.front().first == "route_state_limit");
 }
@@ -149,7 +149,63 @@ TEST_CASE("reference replay mean segment length handles zero and multiple failur
     CHECK_THROWS_AS(vc::fiber_tracer::summarizeFiberReferenceReplay(1, incompleteOutcomes, 2.4), std::invalid_argument);
 }
 
-TEST_CASE("reference replay JSON version four preserves failure diagnostics")
+TEST_CASE("reference replay complete partitions include each directed terminal segment")
+{
+    vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
+    outcome.referenceLengthBaseVoxels = 10000.0;
+    outcome.tracedLengthBaseVoxels = 9000.0;
+    outcome.evaluatedThroughBaseVoxels = 10000.0;
+    outcome.evaluationComplete = true;
+    outcome.failures.resize(1);
+    outcome.failures[0].reason = "distance_above_threshold";
+    outcome.failures[0].directionalReferenceArcBaseVoxels = 3000.0;
+    const std::array oneRestart{outcome};
+    const auto single = vc::fiber_tracer::summarizeFiberReferenceReplay(1, oneRestart, 1.0);
+    CHECK(single.meanSegmentLengthMillimeters == doctest::Approx(5.0));
+
+    auto longer = outcome;
+    longer.sourceIndex = 1;
+    longer.reverse = true;
+    longer.referenceLengthBaseVoxels = 20000.0;
+    longer.tracedLengthBaseVoxels = 20000.0;
+    longer.evaluatedThroughBaseVoxels = 20000.0;
+    longer.failureFree = true;
+    longer.failures.clear();
+    const std::array unequalDirections{outcome, longer};
+    const auto pooled = vc::fiber_tracer::summarizeFiberReferenceReplay(2, unequalDirections, 1.0);
+    CHECK(pooled.directedCases == 2);
+    CHECK(pooled.totalFailures == 1);
+    CHECK(pooled.meanSegmentLengthMillimeters == doctest::Approx(10.0));
+    CHECK(pooled.meanSegmentLengthPercent == doctest::Approx(100.0 / 3.0));
+
+    outcome.failureFree = true;
+    outcome.failures.clear();
+    const std::array noFailures{outcome, longer};
+    const auto successful = vc::fiber_tracer::summarizeFiberReferenceReplay(2, noFailures, 1.0);
+    CHECK(successful.meanSegmentLengthMillimeters == doctest::Approx(15.0));
+    CHECK(successful.meanSegmentLengthPercent == doctest::Approx(50.0));
+    const nlohmann::json config{{"error_threshold_base_voxels", 2.0}};
+    const auto json = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
+        successful, noFailures, "fiberlet", config, {}, {0, 0, 0}, {1, 1, 1});
+    CHECK(json.at("summary").at("reliability_segments") == 2);
+}
+
+TEST_CASE("reference replay empty summary has no reliability partitions")
+{
+    const std::vector<vc::fiber_tracer::FiberReferenceReplayOutcome> outcomes;
+    const auto summary = vc::fiber_tracer::summarizeFiberReferenceReplay(2, outcomes, 2.4);
+    CHECK(summary.directedCases == 0);
+    CHECK(summary.sourcesWithoutRuns == 2);
+    CHECK(summary.meanSegmentLengthBaseVoxels == 0.0);
+    CHECK(summary.meanSegmentLengthMillimeters == 0.0);
+    CHECK(summary.meanSegmentLengthPercent == 0.0);
+    const nlohmann::json config{{"error_threshold_base_voxels", 2.0}};
+    const auto json = vc::fiber_tracer::fiberReferenceReplayBenchmarkJson(
+        summary, outcomes, "fiberlet", config, {}, {0, 0, 0}, {1, 1, 1});
+    CHECK(json.at("summary").at("reliability_segments") == 0);
+}
+
+TEST_CASE("reference replay JSON version five preserves failure diagnostics")
 {
     vc::fiber_tracer::FiberReferenceReplayOutcome outcome;
     outcome.referenceLengthBaseVoxels = 10.0;
@@ -177,7 +233,8 @@ TEST_CASE("reference replay JSON version four preserves failure diagnostics")
         summary, outcomes, "fiberlet", commonConfig,
         {{"beam_width", 16}}, {0, 0, 0}, {10, 10, 10});
 
-    CHECK(json.at("version") == 4);
+    CHECK(json.at("version") == 5);
+    CHECK(json.at("metric_definition") == "complete-reference-partition-v1");
     CHECK(json.at("tracer") == "fiberlet");
     CHECK(json.at("backend_config").at("beam_width") == 16);
     CHECK(json.at("summary").at("reliability_segments") == 2);

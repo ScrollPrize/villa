@@ -1,6 +1,6 @@
 {
-  "suites": ["cuda-arc"],
-  "native_build": true,
+  "suites": ["retrain-merge"],
+  "native_build": false,
   "gpu_devices": ["0"],
   "timeout_seconds": 300,
   "output_root": "/ephemeral/hendrik/fiber3d_train2/cooperative-tests",

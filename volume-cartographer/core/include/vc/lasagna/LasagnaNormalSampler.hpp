@@ -18,10 +18,6 @@ namespace vc::lasagna
 
 void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
 
-struct LasagnaNormalSamplerOptions {
-    size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
-};
-
 class LasagnaNormalSampler final : public NormalSampler
 {
 public:
@@ -30,7 +26,7 @@ public:
         bool valid = false;
     };
 
-    explicit LasagnaNormalSampler(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options = {});
+    explicit LasagnaNormalSampler(const LasagnaDataset& dataset);
     ~LasagnaNormalSampler() override;
 
     LasagnaNormalSampler(const LasagnaNormalSampler&) = delete;

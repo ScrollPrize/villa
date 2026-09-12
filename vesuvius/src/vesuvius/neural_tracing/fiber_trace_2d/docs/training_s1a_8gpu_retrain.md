@@ -1,5 +1,32 @@
 # Eight-GPU S1a NML retraining
 
+Current comparison (2026-09-10): LR **0.001**, label **s1a_repro1_lr0p1x**,
+resuming the same `s1a_repro1_20260909_193241/snapshots/current.pt`
+20,000-update checkpoint as the extended LR 0.01 continuation. The limit
+remains 2,000,000 total updates. This supersedes the earlier current-config
+notes below. The resume loader restores optimizer state, then applies the
+configured LR; the already completed warmup is not restarted.
+
+Latest continuation: the run `s1a_repro1_20260909_193241` reached its configured
+20,000-update limit (2,560,000 samples). The config now allows 2,000,000 total
+updates (256,000,000 samples at global batch 128), a 100× increase. Resume with
+`--resume /ephemeral/hendrik/fiber3d_train2/runs/s1a_repro1_20260909_193241/snapshots/current.pt`.
+LR remains 0.01. Earlier run-length/checkpoint references below describe the
+initial reproduction stages.
+
+Current config: restored peak LR **0.01** and run
+label **s1a_repro1**, with the same 100-update warmup. The original
+reproduction settings and LR-tuning recommendation described below used 0.01.
+The launch command is unchanged; new outputs are under
+`/ephemeral/hendrik/fiber3d_train2/runs/s1a_repro1_<timestamp>`.
+
+To continue the first run, append
+`--resume /ephemeral/hendrik/fiber3d_train2/runs/s1a_repro1_20260909_160150/snapshots/current.pt`.
+This checkpoint is update 11,900 (1,523,200 samples, inferred from its saved
+global batch 128). It restores optimizer/model state and continues to update
+20,000 in a new timestamped output directory. The original run's event files
+remain in update units; the continuation uses the new sample axis.
+
 Config: `fiber_trace_3d/configs/train_s1a_nml_8gpu_fast.json`, using the measured shared sample pipeline, async CUDA preparation, and full CUDA value augmentation. Compare with existing historical runs; no new standard-loader run is configured.
 
 The config uses the exact datasets, affine transform, augmentation settings, held-out data and seed from `training_baseline_s1a_20260729.json`: 8 S1a NML files and 1 held-out JSON, Paris4 level 1, 128³ input, GroupNorm, output stride 4, BF16, eager execution, 16 samples/GPU, global batch 128. Run length is 20,000 optimizer updates (2,560,000 samples). LR warms linearly to 0.01 over 100 updates then stays constant. Clipping is disabled. This is the recorded best short fixed-LR verification, not the LR-range minimum (0.08125). Tuning predates global loss normalization, so the recommendation needs this longer verification.

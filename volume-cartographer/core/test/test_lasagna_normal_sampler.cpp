@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/atlas/Atlas.hpp"
@@ -13,6 +14,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <barrier>
 #include <random>
 #include <string>
 #include <vector>
@@ -35,7 +38,7 @@ void createU8Zarr(
     std::vector<size_t> shape,
     std::vector<size_t> chunks,
     const std::vector<uint8_t>* payload,
-    double fillValue = 0.0)
+    std::optional<double> fillValue = 0.0)
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v2;
@@ -531,4 +534,116 @@ TEST_CASE("LasagnaNormalSampler integrates with LineOptimizer")
     CHECK(result.line.points[1].sampledNormal.valid);
     CHECK(result.line.points[1].sampledNormal.normal[2] == doctest::Approx(1.0));
     fs::remove_all(dir);
+}
+
+
+TEST_CASE("Lasagna scalar and corner paths share regular decoded chunks in both warm orders")
+{
+    using namespace vc::lasagna;
+    const auto dir = tmpDir("shared_cache");
+    const auto manifest = dir / "dataset.lasagna.json";
+    writeText(manifest, R"({"version":2,"groups":{
+        "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+    createConstantChunkedU8Zarr(dir / "values.zarr", {8,8,8}, {4,4,4}, 42);
+    const auto dataset = LasagnaDataset::open(manifest);
+    const auto a = bindLasagnaChannel(dataset.manifest(), "nx");
+    const auto b = bindLasagnaChannel(dataset.manifest(), "nx");
+    CHECK(a.chunkSource->sourceId() == b.chunkSource->sourceId());
+    LasagnaChannelCornerSampler corners(b);
+    auto request = prepareLasagnaCubeRequest(a, cv::Vec3d{1,1,1});
+    LasagnaLocalChunkResolver resolver(a);
+    resolver.resolve(request);
+    const auto pin = request.chunks[0].bytes;
+    REQUIRE(pin);
+    CHECK(pin == b.chunkSource->getChunkIfCached(0,0,0,0).bytes);
+    const auto scalarFirstStats = a.chunkSource->stats();
+    std::vector<LasagnaCornerSample> samples;
+    (void)corners.sampleBatch({{1,1,1}}, samples);
+    REQUIRE(samples.size() == 1);
+    CHECK(samples[0].valid);
+    CHECK(samples[0].values[0] == 42);
+    CHECK(b.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin);
+    CHECK(a.chunkSource->stats().decodeAttempts == scalarFirstStats.decodeAttempts);
+
+    (void)corners.sampleBatch({{4,4,4}}, samples);
+    const auto cornerPin = b.chunkSource->getChunkIfCached(0,1,1,1).bytes;
+    REQUIRE(cornerPin);
+    const auto cornerFirstStats = b.chunkSource->stats();
+    const auto value = sampleLasagnaChannel(a, cv::Vec3d{4,4,4});
+    REQUIRE(value);
+    CHECK(*value == 42);
+    CHECK(a.chunkSource->getChunkIfCached(0,1,1,1).bytes == cornerPin);
+    CHECK(a.chunkSource->stats().decodeAttempts == cornerFirstStats.decodeAttempts);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna regular cache coalesces concurrent cold readers and preserves pins on eviction")
+{
+    using namespace vc::lasagna;
+    const auto dir = tmpDir("coalesced_cache");
+    createConstantChunkedU8Zarr(dir / "values.zarr", {4,4,4}, {2,2,2}, 43);
+    const auto manifest = dir / "dataset.lasagna.json";
+    writeText(manifest, R"({"version":2,"groups":{
+        "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+    const auto dataset = LasagnaDataset::open(manifest);
+    const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+    std::barrier start(8);
+    std::vector<std::future<vc::render::ChunkResult>> readers;
+    for (int i=0; i<8; ++i)
+        readers.push_back(std::async(std::launch::async, [&] {
+            start.arrive_and_wait();
+            return binding.chunkSource->getChunkBlocking(0,0,0,0);
+        }));
+    auto pin = readers.front().get();
+    REQUIRE(pin.bytes);
+    for (size_t i=1; i<readers.size(); ++i)
+        CHECK(readers[i].get().bytes == pin.bytes);
+    const auto budget = vc::render::processChunkCacheService()->decodedByteBudget();
+    struct RestoreBudget {
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> budget;
+        size_t bytes;
+        ~RestoreBudget() { budget->setMaximumBytes(bytes); }
+    } restore{budget, budget->maximumBytes()};
+    budget->setMaximumBytes(1);
+    (void)binding.chunkSource->getChunkBlocking(0,1,1,1);
+    // The regular budget protects caller-held pins and continues accounting them.
+    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin.bytes);
+    CHECK(pin.bytes->at(0) == std::byte{43});
+    pin = {};
+    budget->setMaximumBytes(1);
+    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).status == vc::render::ChunkStatus::MissQueued);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna shared cache distinguishes absent fill from stored zero and rejects corrupt chunks")
+{
+    using namespace vc::lasagna;
+    for (const bool stored : {false, true}) {
+        const auto dir = tmpDir(stored ? "stored_zero" : "no_fill");
+        const std::vector<uint8_t> zero(8, 0);
+        createU8Zarr(dir / "values.zarr", {2,2,2}, {2,2,2}, stored ? &zero : nullptr, std::nullopt);
+        const auto manifest = dir / "dataset.lasagna.json";
+        writeText(manifest, R"({"version":2,"groups":{
+            "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+        const auto dataset = LasagnaDataset::open(manifest);
+        const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+        const auto value = sampleLasagnaChannel(binding, cv::Vec3d{0,0,0});
+        CHECK(value.has_value() == stored);
+        if (value) CHECK(*value == 0);
+        fs::remove_all(dir);
+    }
+    for (const bool corrupt : {false, true}) {
+        const auto dir = tmpDir(corrupt ? "corrupt" : "bad_fill");
+        createU8Zarr(dir / "values.zarr", {2,2,2}, {2,2,2}, nullptr, corrupt ? 0 : 300);
+        if (corrupt) writeText(dir / "values.zarr" / "0.0.0", "x");
+        const auto manifest = dir / "dataset.lasagna.json";
+        writeText(manifest, R"({"version":2,"groups":{
+            "v":{"zarr":"values.zarr","scaledown":0,"channels":["nx"]}}})");
+        const auto dataset = LasagnaDataset::open(manifest);
+        CHECK_THROWS([&] {
+            const auto binding = bindLasagnaChannel(dataset.manifest(), "nx");
+            (void)sampleLasagnaChannel(binding, cv::Vec3d{0,0,0});
+        }());
+        fs::remove_all(dir);
+    }
 }

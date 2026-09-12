@@ -1,5 +1,214 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Dynamic per-GPU inference batches (2026-09-11)
+
+- inference.max_batch_size is a positive integer model-batch cap per GPU, default1. Shared tiled worker takes the first descriptor and drains only immediately available descriptors up to the cap. No batch-fill delay, fixed queue partitions, extra staging files or replacement accumulator. Actual capacity is also bounded by ready inputs and available result slots.
+- Per-tile dtype conversion and adapter normalization retain individual sample statistics. Batch tensor is B,1,D,H,W; adapters opting into batching must return B-preserving products. Each result keeps its own original coordinates, requested products and result slot. Input is released after synchronous shared-memory H2D; output readiness still requires complete accumulation/publication. Validate batch/spatial product shape before result descriptors; failures abort the pool, not silently shrink/retry the cap.
+- Batch cap participates in inference cache identity. GPU batch shapes and existing asynchronous float16 accumulation can change low-order values and trajectories; no claim of bit-identical fresh-run results. Precision, blend/filter/finalization rules and tracing parameters stay unchanged.
+- Demand summaries record batch_size_counts, batch_seconds, batches and per-worker CUDA allocation/reservation peaks. Histogram weighted count equals completed tiles after successful drain. Existing worker_seconds and optional per-tile stage timings amortize batch costs across tiles, so aggregate time is not multiplied by batch size. CUDA input-stage events sum separate per-input intervals.
+- Pending inference admission uses per-store lazy priority heaps. The exact ordering remains foreground before background, larger remaining reference length first, then source key and tile coordinates. Only new/promoted pending priorities add heap entries; stale/admitted entries are discarded. Coordinator owns these structures. Cached-only stores expose no pending work. Per-second detailed queue accounting can still scan metadata; this is not a priority-policy change.
+- Successful full-volume progress must refresh finalized output extent after the final asynchronous publication acknowledgement, even if tile count has not changed. This reporting update must not imply publication before flush completion.
+
+## Explicit fresh-inference comparison subsets (2026-09-11)
+
+- Classic runner source.test_fibers optionally selects original filenames only after validating complete locked collection membership, hashes and count. Empty, duplicate, unknown and non-filename entries fail. Default evaluates the entire source.
+- Fresh inference comparisons use distinct single-use inference_cache_namespace values; fetched source CT/normal caches remain shared. Tile-size comparisons report normalized inferred volume and total wall, retain output chunk size, and disclose changed overlap amplification and possible blended prediction differences.
+
+## Canonical batched tracer (2026-09-11)
+
+- Candidate evaluation always uses the shared batch path, including threads1. Compatible prediction/normal grids use fused corners; incompatible grids use separate batches. Generic sources retain the shared virtual batch fallback and concurrency capability limits. Scalar seed sampling remains, not a second candidate evaluator.
+- User explicitly permits numerical differences when replacing the former single-worker scalar candidate path with existing batch arithmetic. No fast-math or precision compiler flags change. New-path thread-count/repetition/live-offline determinism remains required; old serialized replay comparison is recorded rather than enforced only when profile.allow_original_replay_difference is explicitly true. Default strict old-replay comparison remains unchanged.
+- Live readiness planning uses immutable exact-lattice groups, valid interpolation keys and integer-key dedup before path expansion. Both float and double public sampling footprints stay covered. No fictitious unused single-chunk key slots; no repeated pre-gate planning for incompatible fused attempts. Publication acknowledgement/cancellation stays caller-side before internal candidate workers. Profile readiness_plan counters cover profiled batch calls, excluding scalar seeds.
+
+## Cached-only tracer profiling (2026-09-11)
+
+- The approved classic evaluation runner supports profile.kind=cached-trace under its usual exclusive manager grant. It reuses the authenticated native coordinator; a read-only published-store adapter validates completed provenance and channel completeness. Missing inference is an error, never a request to infer or allocate scratch.
+- Diagnostic readiness_cache_entries=0 disables case-local proofs;4096 is the default. Each mode preserves exact replay geometry/failures, publication-before-read checks and cancellation. Repetitions use identical references/settings; required artifact coverage is validated.
+- The short cached workload selects complete short fibers to preserve forward/reverse start points. Prefix cropping is not guaranteed to stay within published inference coverage. No missing-cache fallback or inference is permitted.
+
+## Native Lasagna decoded-cache ownership (2026-09-11)
+
+- FiberPredictionField and LasagnaNormalSampler use regular process-wide ChunkCacheService for scalar and corner paths. Canonical source handles, coalesced reads, uint8 payloads, LRU and decoded-byte budget are shared; no LasagnaChannelChunkCache or sampler-local budget remains.
+- LocalChunkCache is the existing bounded plane-sampler reference helper, extracted for reuse. Cube/batch references pin shared payloads without copying them; the regular budget accounts and protects these pins until released, so outstanding readers can temporarily exceed its ceiling.
+- Samplers never reconfigure the GUI budget. Standalone tools configure their existing cache option at startup; replay-set defaults to10% physical RAM, or an explicit positive decoded_cache_bytes. The effective capacity is recorded in the result config. cache_bytes_per_channel is rejected.
+- Missing chunks use explicit uint8 fill when present; absent fill remains unavailable for scalar sampling. Stored all-zero chunks without declared fill remain real data. Errors are not silently converted to fill. Requested-level/readiness gates and interpolation math are unchanged.
+- This unifies native-process decoded caching, not caches in separate Python inference processes or algorithm-specific non-voxel caches.
+
+## Native live reference evaluation (standalone first)
+
+- Live cases keep thread-confined publication proofs for acknowledged chunks
+  (readiness_cache_entries default4096;0 disables memoization for diagnostics).
+  Local hits avoid shared bridge locks and CPU-permit suspension, but still
+  observe atomic bridge cancellation. Failed acknowledgements never create
+  proofs. Eviction only causes conservative rechecks. This metadata is not a
+  decoded-payload cache and cannot transfer across cases/inference sessions.
+- Optional profile_tracing records per-case readiness counters/timers and
+  existing native trace-stage profiles. Progress callbacks may emit profile
+  lines at10s intervals; these are not stall heartbeats. Completion writes
+  cases/N/profile.json. Timings are inclusive/nested where documented; no
+  tracing decisions, inference parameters or numerical behavior change.
+
+- Classic evaluation uses the exclusive GPU-manager launcher at explicit priority
+  100. Admission precedes model/GPU work; the shared manager may auto-start using
+  logical CPU capacity. Startup/admission failure never falls back unmanaged. Only
+  registered pausable jobs can yield. Fixed non-pausable grants cover the owned
+  non-detaching command process group and an independently reported cleanup
+  watchdog. Release follows verified group cleanup; no manager protocol changes.
+  Calibration and command launchers use the same exact-grant ExclusiveTask lease.
+  Check CPU count and per-device VRAM before gated authorization; reject existing
+  external GPU compute processes. Manager exclusivity is cooperative, not OS-level
+  enforcement against unmanaged processes starting later.
+- Optional inference.input_slots overrides the input-RAM count independently of
+  GPU count; omitted uses devices*slots_per_gpu. Explicit result_slots is
+  recommended when tuning inputs (otherwise result capacity follows input count).
+  Reader futures are bounded by input_workers; remaining unsubmitted tiles stay
+  in the length-priority scheduler. Already admitted reads are non-preemptible.
+  Each pump admits at most16reads and dispatches at most8ready inputs, bounding
+  coordinator work counts, not guaranteeing a wall-clock latency bound.
+- Classic workload uses128tile readers/256input slots/128result slots and
+  chunk-major accumulation; active trace CPU permits are automatic (workers0).
+  Waiting trace threads were already independent of the CPU permit count.
+  Native source-read/decode concurrency is64/8, the process-cache capacities
+  exposed by the current binding. Profile/full share the same reader settings.
+  Live queueJSONL distinguishes pending trace requests, output chunks, queued
+  inference tiles, read futures, GPU submitted, accumulation and publication.
+  Queue counts do not measure hardware utilization. Optional profile.cprofile
+  controls deterministic profiling independently of wall/stage/queue metrics.
+
+- Workload configuration owns collection-to-scroll/scan/CT/normal bindings,
+  checkpoint paths/digests, devices and inference parameters. Executable runners
+  must not contain scroll-specific confirmation arguments or normal-source
+  branches. Original split membership/hashes and prepared config/normal hashes
+  remain validated. Optional isolated profiling reuses shared model/store/worker
+  implementations, reports warmup separately and cannot claim trace completion.
+- `vc_fiber_trace_metric replay-set` evaluates explicit whole fibers in both
+  directions using the same VC3D native beam/greedy search and shared ellipsoid
+  failure/forward-match/reset metrics. Beam checking observes irrevocable common
+  prefixes and selected terminal/fallback paths, not speculative reference-based
+  pruning. Preserve the existing positional CLI and greedy defaults.
+- Optional `--render` on native batch replay and live coordinator (or config
+  `render: true`) renders each completed in-memory replay directly, default off,
+  into `cases/<index>/rendered/`. Share overview/image-writing behavior with the
+  post-hoc API; never reload saved traces for inline rendering. Preflight every
+  source's local concrete uint8 CT metadata before tracing. Rendering failures
+  result in incomplete evaluation; enabling it must not change trace geometry.
+- Persist every completed case's segmented replay/reference JSON/OBJ, failures,
+  reset discontinuities and provenance. `render-replay` consumes saved artifacts
+  and local CT/sheet normals to produce reference/traced top/side strips without
+  inference or retracing. Fiber directions never substitute for sheet normals.
+- Replay strip validation/metadata follows shared LineViewBuilder cross-row
+  constants and its retained LineStripPositionMap; do not assume one ribbon
+  column per input point or historical21-row geometry. Source geometry and
+  generated surface sampling remain unchanged. Overview overlays and failure
+  markers also convert original point positions through the builder's map in
+  both reference and traced strip frames; long-span markers must not shift.
+- `fiber_trace_3d.live_evaluate` coordinates a frozen snapshot and explicit CUDA
+  devices with native replay. Readiness gates precede scalar, batch, corner and
+  prefetch reads. Missing data means waiting, not Zarr fill or geometric failure.
+- First version preserves each case stack in one OS thread (default max256),
+  bounded active CPU permits released while waiting, nested candidate threads1.
+  Control-only authenticated localhost messages bridge Python and C++; no
+  per-voxel Python callback and no copied tracer. Persistent/stackless trace
+  sessions, training hook and live GUI integration are later work.
+- `lasagna.demand_predict3d` is an alternative scheduler/scratch backend around
+  the SAME tiled geometry/model worker/normalization/blend/filter/accumulation/
+  finalization helpers used by sequential inference. Circular-Z/TensorStore/
+  monotone Z-band admission rules below apply to the sequential mode. Demand
+  mode uses native fast-loader sampling and full-logical-shape sparse file-backed
+  mmap inside output Zarr `.live_tmp/session-*`; no dense zero initialization.
+- Optional `inference.accumulator_layout` is `flat` (default) or `chunk-major`.
+  Chunk-major scratch stores output-chunk grid ZYX followed by local brick ZYX,
+  in the same per-channel files. Edge bricks are padded; descriptors retain the
+  logical volume shape. Scratch has no application-imposed byte cap.
+  Shared accumulator/finalizer helpers translate regions, preserving per-add
+  arithmetic. Output Zarr geometry and chunk ownership/tasks do not change.
+  No prefaulting, eager allocation, advice or extra sync accompanies layout alone.
+  Layout participates in cache identity. `profile.accumulator_layout` overrides
+  it only for isolated benchmarks; sequential circular-Z storage stays unchanged.
+- Optional `inference.accumulator_prefault` defaults false and requires
+  chunk-major plus Linux MADV_POPULATE_WRITE support. Each owner advises each
+  channel's full touched brick once, before its first addition; writable advice
+  cost is included in task timings. Root-relative ranges are page-aligned and
+  clipped to mapping size. Failed advice raises and is not marked successful;
+  no read-prefault fallback or advice during finalizer reads. The kernel can
+  allocate sparse backing/page-cache memory, but no explicit zero writes or
+  scratch sync are added. This flag is cache-identified and has a profile-only
+  override. Unsupported platforms/kernels fail explicitly when enabled.
+- Native stride, tile/stride/border alignment and numerical precision remain
+  unchanged. Demand accumulation follows GPU result arrival order, explicitly
+  allowing order-dependent f16/f32 rounding; sequential inference retains its
+  canonical order. Results stay in bounded shared RAM, with NO NPZ staging,
+  scratch zero reservation or scratch fsync. Shared accumulator processes own
+  output chunks (hash chunk-grid indices, not voxel coordinates), apply weight
+  and all raw channels together, and acknowledge before releasing result slots.
+  Input slots release independently after H2D. All touched consumers accumulate, but unrequested
+  partial neighbors MUST NOT schedule their missing contributors. Late requests
+  reuse partial accumulation; each contribution is applied once per session.
+- Optional `inference.result_slots` sizes the result-RAM pool independently of
+  input slots (`devices * slots_per_gpu`); unset preserves the existing count.
+  Profile-only `profile.result_slots` can override it without changing production.
+  Profile reports received versus fully accumulated tiles and beginning/ending
+  backlogs, not GPU throughput alone. Optional Linux accumulator OS profiling
+  reads faults/CPU/storage counters and samples main-thread wait states; missing
+  permissions/platform counters are explicitly absent, not presumed zero.
+- Demand is coalesced and prioritized by approximate remaining length, above
+  reference-segment-intersection prefetch. Prefetch is drained before coordinator
+  completion. First-version priorities are monotone promotions without aging.
+- Cache lives under the shared global root's `live_inference/<source>/<model>`.
+  Optional evaluation `inference_cache_namespace` creates a fresh, single-use
+  `live_inference/_namespaces/<name>/<source>/<model>` prediction tree for timing
+  reruns. It never relocates/clears source CT or normal caches, nor old predictions.
+  Names are1–64ASCII letters/digits/underscore/hyphen, starting alphanumeric;
+  existing namespaces and resolved symlink escapes are rejected. Omitted/null
+  retains normal reusable prediction-cache behavior. It is an operational path
+  choice, not an inference/numerical parameter.
+  Source identity includes locator/revision/metadata/lattice; inference identity
+  includes frozen checkpoint SHA256, effective parameters, relevant code hashes
+  and runtime versions. Require an updated revision for mutable input content.
+- Single-writer coordinator dictionaries, sets and deques track tiles, chunks,
+  priorities and pending/applied contributions entirely in RAM. No database,
+  mutable persistent ledger or per-chunk done markers. One static cache identity
+  JSON records provenance; unidentified payloads and legacy database-only roots
+  are refused without adopting or deleting their contents.
+  Bounded background publication uses the shared finalizer after all contributors
+  acknowledge; only the coordinator marks RAM readiness. Explicit zero chunks
+  are stored. Restart lazily checks all sibling files and decodes requested chunks
+  against expected shape/dtype/chunk geometry, cleans validated owned scratch and
+  rebuilds incomplete work. No whole-volume scan or persistent checksum table.
+  Active ready files are immutable. Before replacing an incomplete sibling group,
+  validate all paths and remove its old siblings so process interruption cannot
+  leave a mixed-generation complete group. This is not a power-loss transactional
+  guarantee; same-size, decodable corruption is not cryptographically detected.
+- Active shared RAM slots remain bounded; file-backed scratch has no configured
+  size cap, touched-byte accounting or per-tile filesystem-space polling.
+  Fresh sparse mmap holes read as zeros, without preallocation. Actual filesystem
+  errors propagate rather than being masked. Disk exhaustion
+  can still cause a worker SIGBUS; worker death aborts instead of marking ready.
+  No silent partial-output eviction. Stuck underlying
+  input-read cancellation is explicitly deferred by the user (not an observed
+  stuck condition or current blocker). Global queued-descriptor bounds and
+  stress/performance validation remain future hardening, not guarantees.
+- The short inference profiler may opt into isolated native-reader responsiveness
+  controls: idle, no-intersection allocation-only reads, prewarmed native reads
+  and full reader-wrapper calls. A separate Python heartbeat and calling-thread
+  timers/fault counters expose blocking without modifying production inference.
+  Heartbeat gaps include GIL and OS scheduling, not exclusive lock attribution.
+  No-intersection controls must assert zero requested source chunks. Record
+  native module identity and sample counts; disable diagnostic controls by default.
+- Initial inputs are explicit zero-translation isotropic ZYX OME power-of-two
+  lattices. No arbitrary crop/affine mapping or coarser pyramid generation yet.
+  Partial manifests require live readiness awareness; ordinary viewers cannot
+  distinguish uncomputed fill. Native summary alone does not establish inference
+  completion; also require coordinator summary and absence of incomplete markers.
+- Shared global root uses explicit `VC3D_CONFIG_DIR/cache.json` (default
+  `~/.VC3D/cache.json`) before legacy mount/suggestion fallback. `vc_cache_root`
+  prints/sets it with writability checking. GUI/native/Python source share this
+  resolver; no automatic migration/deletion of existing caches.
+- HiGHS is optional via `VC_ENABLE_HIGHS` (ON auto-detect, OFF disabled). Without
+  it, LP/MILP labeling throws an explicit availability error. Other tracing,
+  preprocessing and volume access remain usable. The evaluator is available
+  in the headless `VC_BUILD_FIBERLETS` build as well as the GUI apps build.
+
 ## Managed whole-volume Fiberlet inputs
 
 - `las_manager fiberlet run <completed-fiber-run>` resolves the unique regular
@@ -23,8 +232,9 @@
 
 ## Shared 3D Tiled Inference
 
-- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled
-  inference runner used by both Lasagna predict3d and Fiber 3D inference. It owns:
+- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the authoritative sequential
+  inference runner used by both Lasagna predict3d and Fiber 3D inference; live
+  demand reuses its numerical worker/geometry/finalization helpers. It owns:
   canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
   from `_download` metadata, circular Z scratch, output-chunk-only resume,
   temp cleanup, progress formatting, and atomic Zarr chunk writes.
@@ -480,7 +690,8 @@
 - Memory observations must cover the requested GPU count and match model/config,
   GPU model and software identity. Only measured physical batch sizes are admitted;
   unexpected OOM/over-budget driver usage fails rather than changing training.
-  Actual CUDA pause/memory/AMP/performance validation is still pending.
+  Configuration-specific CUDA pause/memory/AMP/performance results are recorded
+  in docs/cooperative_validation.md; broader configurations remain unvalidated.
 
 - Normal 3D training optionally accepts training.profile_enabled (default false).
   Enabled runs write per-rank iteration/stage wall timings and a bounded CPU/CUDA
@@ -1191,9 +1402,24 @@
   be read by direct zarr/raw block slicing in Python. The block sampler must use
   strict requested-level VC3D blocking semantics, report
   `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
-  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
-  follow the existing strict VC3D rendering semantics: black covered pixels and
-  a non-zero `missing_chunks` stat.
+  mark out-of-volume voxels invalid with the declared Zarr fill value. Known-missing
+  requested-level chunks use that same fill value, remain valid in-volume and
+  contribute to `missing_chunks` when statistics are requested. The training block
+  adapter calls the unified `Volume.read_zyx(..., with_mask=True, with_stats=True)`;
+  its float image interface is retained for training. Standalone demand inference
+  calls `Volume.read_zyx` directly, returning native integer arrays without masks,
+  statistics or intermediate float conversion. It reads full bboxes, including
+  declared-fill boundaries, not the previous partial-tile reflect padding.
+- Native bbox Python APIs `read_zyx`/`read_xyz` require the exact scale group even
+  for empty/outside requests. No missing-level fallback argument. `read_xyz` and
+  slicing delegate to the same implementation; the duplicate `sample_zyx_block`
+  API is removed, not aliased. Default return is a C-order uint8/uint16 array.
+  Keyword-only `with_mask`/`with_stats` default false; if either is requested,
+  return `(array, mask-or-None, stats-or-None)`. Auxiliaries incur no large allocation
+  or per-voxel work when disabled. Buffer allocation/fill, dependency/prefetch and
+  copying release the GIL; Python object creation retains it. Logical volume edges
+  bound coverage even when storage chunks are padded. Fetch/decode errors,
+  unresolved blocking results, null data and malformed payload sizes throw.
 - Generic `CoordinateSampler.sample_coords(...)` and
   `sample_coord_batch(...)` remain the correct boundary for arbitrary
   coordinate surfaces such as side/top strips, TTA surfaces, and strip
@@ -6707,18 +6933,27 @@
   mean seeded-span length but not mean failed-span length; an unseeded failure
   contributes a zero failed span. Millimeter conversion requires an explicit
   positive base voxel size.
-- The primary whole-run reliability value is mean segment length. Treat the
-  complete tested directed reference corpus as one interval split into
-  `total_failures + 1` segments, so the value is
-  `sum(full directed reference length) / (total_failures + 1)`. Its percentage
-  is equivalently `100 / (total_failures + 1)`. Only a zero-failure run reports
-  the complete tested length and 100 percent; one failure reports 50 percent.
-  Every failure reason contributes to the count, and the benchmark rejects
-  incomplete directional evaluation before calculating the metric.
-- Version 4 replaces the deprecated `mean_distance_per_failure_*` and
-  `zero_failure_convention_applied` summary fields with
-  `reliability_segments=total_failures+1` and `mean_segment_length_*`.
-- Results use JSON schema version 4 and include tracer identity, common and
+- The primary mean segment length is `sum(full directed reference length) /
+  (total_failures + directed_cases)`. Each independent directed reference is
+  partitioned at its directional failure arcs, from 0 through its full length.
+  Successful terminal spans count, including a zero terminal at an endpoint
+  failure. Repeated failure positions give zero segments. Forced reset advance
+  is included in reference-distance accounting, not claimed as successfully
+  traced length. The partition sum must equal full directed reference length.
+  A 10mm direction with one restart has two segments and mean5mm. Pool segments
+  across cases; never average case means. All failure reasons count; reject
+  incomplete evaluation. Empty summaries use zero count and numeric zero means.
+- Median/P05/P95 use the same complete partition with linear interpolation at
+  `(n-1)*q`. Failure-only, credited seeded-span and physical-path statistics
+  remain explicitly separate diagnostics, never headline quality metrics.
+- Version5 supersedes version4's incorrect whole-corpus `F+1` accounting with
+  `reliability_segments=total_failures+directed_cases` and metric definition
+  `complete-reference-partition-v1`. Replay-set summaries use version2.
+  `mean_segment_length_percent` remains mean divided by total directed length,
+  equivalently `100/(F+C)`: this is not per-fiber success percentage.
+  Saved summaries may be migrated without rerunning traces, retaining original
+  summary bytes/hash and raw failure/geometry data unchanged.
+- Results use JSON schema version5 and include tracer identity, common and
   backend configuration, and every failure's reason, stable
   indices, directional and source-oriented reference arc/fraction, reference
   and optional evaluator position, and optional anisotropic threshold
@@ -6732,8 +6967,10 @@
   `algorithm_revision` separately from `measurement_date`,
   `measurement_revision`, and the reproducible run record. Plot dates are
   algorithm milestones; benchmark table dates remain execution dates.
-- Reference replay plots derive `mean_segment_length_percent` as
-  `100/(failures+1)` after complete evaluation. Crop plots preserve the
+- Historical reference replay plots using `100/(failures+1)` retain their
+  explicitly legacy metric; they are not comparable to current complete-segment
+  reports, which use `100/(failures+directed_cases)`. New replay plots must use
+  the current definition and retain directed-case counts. Crop plots preserve the
   existing problematic-to-retained error ratio but negate it as
   `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
   Pre-pruning reference-accuracy plots derive

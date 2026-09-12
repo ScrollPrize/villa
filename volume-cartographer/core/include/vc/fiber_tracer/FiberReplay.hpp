@@ -1,4 +1,5 @@
 #pragma once
+#include "vc/lasagna/LineViewBuilder.hpp"
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/fiber_tracer/FiberGraph.hpp"
@@ -69,6 +70,7 @@ struct FiberReplayStripComponent {
     std::vector<cv::Vec3d> centerlineBaseXYZ;
     std::shared_ptr<QuadSurface> lineSurface;
     cv::Mat_<uint8_t> texture;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
 };
 
 struct FiberReplayStripTextureSource {
@@ -164,6 +166,23 @@ void renderFiberReplayStripTextures(
     int parallelThreads,
     ::Volume& volume,
     const std::string& sourceLocator);
+
+// Standalone native replay inspection, without graph/fiberlet artifacts.
+[[nodiscard]] nlohmann::json fiberReplayTraceJson(
+    const FiberReplayTraceResult& replay, double normalThresholdBaseVoxels);
+[[nodiscard]] FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document);
+void writeFiberReplayTraceArtifacts(
+    const std::filesystem::path& outputDirectory,
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels,
+    const nlohmann::json& provenance);
+[[nodiscard]] FiberReplayOverview renderFiberReplayTraceOverview(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale, int parallelThreads,
+    ::Volume& volume, const std::string& sourceLocator);
 
 [[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     ::Volume& volume,
