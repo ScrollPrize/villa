@@ -20,7 +20,7 @@ import uuid
 
 import psutil
 
-from .processes import process_identity
+from .processes import process_identity, live_worker_sessions
 from .protocol import MAX_FRAME, decode, encode
 
 
@@ -206,7 +206,7 @@ class ProcessCohort:
 
     def __init__(self, factory, grant, state=None, *, environment=None,
                  on_unit=None, startup_timeout=300.0, unit_timeout=900.0,
-                 drain_timeout=300.0, clock=time.monotonic):
+                 drain_timeout=300.0, clock=time.monotonic, on_process_start=None):
         if state is not None and not isinstance(state, SharedState):
             raise TypeError("cohort restore requires opaque SharedState, not a large spawn argument")
         self._children, self._channels = [], []
@@ -242,6 +242,8 @@ class ProcessCohort:
                     self._children.append(process)
                     self._identities[process.pid] = process_identity(process.pid)
                     self._phases[rank] = "starting"
+                    if on_process_start is not None:
+                        on_process_start([process.pid])
                 finally:
                     child.close()
         except BaseException:
@@ -364,23 +366,7 @@ class ProcessCohort:
         process inspection fails closed; only vanished processes and zombies
         are considered gone. Check leader identity against PID reuse.
         """
-        sessions = set(self._identities)
-        for pid in tuple(sessions):
-            try:
-                if process_identity(pid) != self._identities[pid]:
-                    sessions.remove(pid)
-            except psutil.NoSuchProcess:
-                pass
-        live = set()
-        for process in psutil.process_iter():
-            try:
-                session = os.getsid(process.pid)
-                if session in sessions and process.status() != psutil.STATUS_ZOMBIE:
-                    # Descendants may create a process group, but not a session.
-                    live.add((session, os.getpgid(process.pid)))
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                continue
-        return live
+        return live_worker_sessions(self._identities)
 
     def abort(self):
         """Stop owned worker sessions, including loaders, before claiming release."""

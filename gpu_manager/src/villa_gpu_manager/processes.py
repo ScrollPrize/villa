@@ -43,6 +43,30 @@ def descendants(identity, uid):
         return []
 
 
+def live_worker_sessions(identities):
+    """Owned session/process groups, including orphaned worker descendants.
+
+    Registered workers must create their own session before spawning descendants;
+    descendants must not detach. Inaccessible inspection fails closed.
+    """
+    sessions = set(identities)
+    for pid in tuple(sessions):
+        try:
+            if process_identity(pid) != identities[pid]:
+                sessions.remove(pid)
+        except psutil.NoSuchProcess:
+            pass
+    live = set()
+    for process in psutil.process_iter():
+        try:
+            session = os.getsid(process.pid)
+            if session in sessions and process.status() != psutil.STATUS_ZOMBIE:
+                live.add((session, os.getpgid(process.pid)))
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            continue
+    return live
+
+
 def peer_uid(sock):
     if sys.platform.startswith("linux"):
         return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]

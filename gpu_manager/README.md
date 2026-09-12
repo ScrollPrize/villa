@@ -170,6 +170,15 @@ On Ubuntu/macOS each worker has a dedicated session. Loader descendants must
 remain in that session (no `setsid`/daemon detachment); failure cleanup stops the
 whole owned session, including orphaned loaders, before allowing release.
 
+`StopGuard` is an optional independent **client-owned** termination helper. Register
+each compute session leader immediately after spawning (the cohort's
+`on_process_start` callback supports this), call `check()` in the supervisor loop,
+and call `stop()` on cancellation. It gives graceful cleanup 15 seconds, then
+escalates TERM/KILL with five-second stages. A second stop accelerates escalation.
+Call `close()` only after compute cleanup. Never register the supervisor/manager
+as a compute root. Session descendants must not detach; unkillable survivors are
+reported without claiming release. It does not alter the manager wire protocol.
+
 `ExclusiveTask` is the reference helper for fixed-budget, non-pausable probes.
 It waits for an exact exclusive grant, then the caller assigns a gated
 `ProcessCohort` to `lease.cohort`. `lease.authorize()` confirms applied ownership
