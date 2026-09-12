@@ -1,7 +1,7 @@
 {
-  "suites": ["cpu", "manager"],
-  "native_build": true,
-  "gpu_devices": ["0", "1"],
+  "suites": ["retrain-merge"],
+  "native_build": false,
+  "gpu_devices": ["0"],
   "timeout_seconds": 300,
   "output_root": "/ephemeral/hendrik/fiber3d_train2/cooperative-tests",
   "reference": {"phase": "calibrate", "steps": 6, "microbatch_sizes": [1, 2], "cpu_workers": 8}

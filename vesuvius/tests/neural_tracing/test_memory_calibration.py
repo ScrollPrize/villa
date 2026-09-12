@@ -1,4 +1,6 @@
 from copy import deepcopy
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +26,70 @@ def configuration():
         "memory_calibration": calibration_from_observations(fingerprint, rows, reserve_bytes=10),
     }
     return raw
+
+
+@pytest.mark.parametrize("override,expected", [(None, 107), ("2", 2)])
+def test_probe_is_gated_by_exclusive_lease(monkeypatch, tmp_path, override, expected):
+    from villa_gpu_manager import bootstrap, cohort, exclusive, processes
+    from vesuvius.neural_tracing.fiber_trace_3d import memory_calibration as module, train
+    raw = configuration()
+    raw["training"]["cooperative"]["priority"] = 7
+    monkeypatch.setattr(train, "_load_raw_config", lambda _: raw)
+    grant = {"cpu_cores": 2, "gpus": {"GPU-a": 100}}
+    monkeypatch.setattr(bootstrap, "ensure_manager", lambda _: ("fake", grant))
+    events = []
+    class Lease:
+        def __init__(self, path, allocation, **kwargs):
+            assert kwargs["priority"] == expected
+            assert allocation == grant
+        def __enter__(self):
+            events.append("grant")
+            return self
+        def authorize(self):
+            events.append("authorize")
+        def check(self):
+            events.append("check")
+        def __exit__(self, *args):
+            assert self.cohort.closed
+            events.append("release")
+    class FakeCohort:
+        closed = False
+        ready = True
+        idle = True
+        done = True
+        processes = [{"pid": 123}]
+        def __init__(self, factory, *args, **kwargs):
+            assert events == ["grant"]
+            assert factory.rendezvous.startswith("file://")
+            events.append("spawn")
+            self.state = SimpleNamespace(load=lambda: [{"gpu_uuid": "GPU-a"}], close=lambda: None)
+        def poll(self):
+            assert "authorize" in events
+        def drain(self):
+            self.closed = True
+        def abort(self):
+            self.closed = True
+    class Monitor:
+        def __init__(self, *args, **kwargs):
+            self.last_snapshot = {"GPU-a": {"processes": {}, "total": 100, "used": 0}}
+            self.last_snapshot_at = module.time.monotonic()
+        def poll(self, pids):
+            self.last_snapshot["GPU-a"]["processes"] = {p: 50 for p in pids}
+        def close(self):
+            pass
+    monkeypatch.setattr(exclusive, "ExclusiveTask", Lease)
+    monkeypatch.setattr(cohort, "ProcessCohort", FakeCohort)
+    monkeypatch.setattr(processes, "NvidiaMonitor", Monitor)
+    monkeypatch.setattr(module, "calibration_from_observations", lambda _, rows, **kw: rows)
+    output = tmp_path / "report.json"
+    args = [str(tmp_path / "config.json"), "--gpu-uuids", "GPU-a", "--microbatch-sizes", "1",
+            "--cpu-workers", "2", "--vram-limit-bytes", "100", "--reserve-bytes", "10",
+            "--output", str(output)]
+    if override is not None:
+        args += ["--priority", override]
+    assert module.main(args) == 0
+    assert events == ["grant", "spawn", "authorize", "check", "release"]
+    assert json.loads(output.read_text())[0]["driver_peak_bytes"] == 50
 
 
 def test_calibration_bounds_observations_and_does_not_extrapolate():

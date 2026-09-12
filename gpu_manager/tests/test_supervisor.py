@@ -58,9 +58,9 @@ class LocalClient:
         self.task = response["task"]
         return self.task
 
-    def register(self, label, request):
+    def register(self, label, request, **capabilities):
         return self._call("register", dict(task_id=self.key, token="b" * 64, label=label,
-            root=dict(pid=123, start_us=1, boot_us=1), request=request, reconfigure_mode="full_release"))
+            root=dict(pid=123, start_us=1, boot_us=1), request=request, reconfigure_mode="full_release", **capabilities))
 
     def _task_call(self, op, **body):
         return self._call(op, dict(task_id=self.key, token="b" * 64, **body))
@@ -124,11 +124,12 @@ class FakeCohort:
         self.closed = True
 
 
-def setup():
+def setup(**options):
     client = LocalClient()
     now = [0.0]
+    options.setdefault("reconnect_interval", 1)
     supervisor = Supervisor(client, label="test", request=REQUEST,
-                            cohort_factory=FakeCohort, clock=lambda: now[0])
+                            cohort_factory=FakeCohort, clock=lambda: now[0], **options)
     def tick():
         now[0] += 1
         supervisor.tick()
@@ -191,6 +192,137 @@ def test_lost_applied_reply_drains_and_releases_old_grant():
         supervisor.tick()
     assert old.closed
     assert supervisor.cohort is not old and supervisor.cohort.admitted == 1
+
+
+def test_short_outage_keeps_authorized_work_and_logs_exception(caplog):
+    client, supervisor, tick = setup(disconnect_grace_seconds=60, reconnect_interval=5)
+    old = supervisor.cohort
+    client.offline = True
+    old.complete()
+    tick()
+    assert old.admitted == 2 and not old.draining
+    started = supervisor.disconnected_since
+    for _ in range(10):
+        old.complete()
+        tick()
+    assert supervisor.disconnected_since == started
+    assert len([r for r in caplog.records if "communication error" in r.message]) == 3
+    assert "ConnectionError: offline" in caplog.text
+    client.offline = False
+    for _ in range(5):
+        old.complete()
+        tick()
+    assert supervisor.cohort is old and supervisor.disconnected_since is None
+    assert "communication restored" in caplog.text
+
+
+def test_grace_expires_then_reconnect_resumes_retained_state():
+    client, supervisor, tick = setup(disconnect_grace_seconds=60, reconnect_interval=5)
+    old = supervisor.cohort
+    client.offline = True
+    tick()
+    for _ in range(59):
+        old.complete()
+        tick()
+    assert not old.draining
+    old.complete()
+    tick()
+    assert old.draining and old.idle  # No next unit admitted at the deadline.
+    finished = old.state
+    tick()
+    assert old.closed and supervisor.cohort is None
+    assert client.engine.tasks[client.key]["granted"] == GRANT
+    client.offline = False
+    for _ in range(12):
+        tick()
+    assert supervisor.cohort is not old and supervisor.cohort.state == finished
+    assert supervisor.cohort.authorized and supervisor.cohort.admitted == 1
+
+
+@pytest.mark.parametrize("action", ["pause", "epoch", "stop"])
+def test_explicit_release_epoch_and_stop_override_grace(action):
+    client, supervisor, tick = setup(disconnect_grace_seconds=60, reconnect_interval=1)
+    old = supervisor.cohort
+    client.offline = True
+    tick()
+    if action == "stop":
+        supervisor.stop()
+    else:
+        client.offline = False
+        if action == "pause":
+            client.pause(True)
+        else:
+            client.engine = Engine(GRANT, state=client.engine.state, controller_uids=[os.getuid()],
+                                   inspect=lambda p, uid: "alive", discover=lambda p, uid: [])
+        tick()
+    assert old.draining
+
+
+def test_unconfirmed_applied_report_never_authorizes_offline():
+    client = LocalClient()
+    supervisor = Supervisor(client, label="test", request=REQUEST, cohort_factory=FakeCohort,
+                            disconnect_grace_seconds=60)
+    supervisor.tick()
+    client.lose_report = True
+    supervisor.tick()
+    old = supervisor.cohort
+    assert not old.authorized and old.admitted == 0
+    client.offline = True
+    supervisor.tick()
+    assert old.admitted == 0
+    client.offline = False
+    supervisor.next_poll = 0
+    supervisor.tick()
+    assert supervisor.cohort is old and old.authorized and old.admitted == 1
+
+
+def test_exclusive_nonpausable_calibration_continues_without_new_workers():
+    client = LocalClient()
+    now = [0.0]
+    supervisor = Supervisor(client, label="calibration", request=dict(REQUEST, exclusive=True),
+        cohort_factory=FakeCohort, pausable=False, adaptable=False,
+        disconnect_grace_seconds=None, clock=lambda: now[0])
+    supervisor.tick()
+    now[0] = 1
+    supervisor.tick()
+    old = supervisor.cohort
+    client.offline = True
+    for value in (2, 30, 61, 120):
+        now[0] = value
+        old.complete()
+        supervisor.tick()
+    assert old.admitted == 5 and not old.draining
+    supervisor.restart_cohort()
+    old.complete()
+    now[0] = 130
+    supervisor.tick()
+    assert old.closed and supervisor.cohort is None  # Next size waits for manager.
+
+
+def test_successful_hello_does_not_reset_outage(caplog):
+    client, supervisor, tick = setup(disconnect_grace_seconds=60)
+    old = supervisor.cohort
+    client.connect = lambda: None
+    client.offline = True  # hello succeeds, register/poll fails
+    tick()
+    started = supervisor.disconnected_since
+    for _ in range(60):
+        if not old.idle:
+            old.complete()
+        tick()
+    assert supervisor.disconnected_since == started and old.draining
+
+
+def test_new_epoch_hello_drains_even_if_registration_fails():
+    client, supervisor, tick = setup(disconnect_grace_seconds=60, reconnect_interval=1)
+    old = supervisor.cohort
+    client.offline = True
+    tick()
+    def new_epoch_hello():
+        client.epoch = "new-epoch"
+    client.connect = new_epoch_hello
+    tick()
+    assert old.draining and old.admitted == 1
 
 
 def test_finish_pauses_before_release_to_prevent_immediate_regrant():
@@ -497,3 +629,25 @@ def test_abort_failure_keeps_reservation_and_does_not_acknowledge_release():
     assert supervisor.cohort is cohort and not cohort.closed
     assert client.task["granted"] == GRANT and not client.task["terminal"]
     assert not any(phase in ("failed", "released") for phase, _ in client.reports)
+
+
+def test_exclusive_startup_restart_preserves_state_and_capabilities():
+    client = LocalClient()
+    supervisor = Supervisor(client, label="startup", request={**REQUEST, "exclusive": True},
+                            cohort_factory=FakeCohort, pausable=False, adaptable=False)
+    supervisor.tick()
+    supervisor.next_poll = 0
+    supervisor.tick()
+    old = supervisor.cohort
+    assert not client.task["pausable"] and not client.task["adaptable"]
+    old.complete()
+    supervisor.restart_cohort()
+    for _ in range(8):
+        supervisor.next_poll = 0
+        supervisor.tick()
+        if supervisor.cohort is not None and supervisor.cohort is not old:
+            break
+    assert old.closed
+    assert supervisor.cohort is not old and supervisor.state == 1
+    assert ("released", empty()) in client.reports
+    assert not client.task["pausable"] and not client.task["adaptable"]

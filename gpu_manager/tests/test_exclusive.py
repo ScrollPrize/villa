@@ -281,17 +281,35 @@ time.sleep(60)
 
 import threading
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from villa_gpu_manager.client import Client
 from villa_gpu_manager.exclusive import ExclusiveTask
+from villa_gpu_manager.exclusive_command import ExclusiveCommand
 from villa_gpu_manager.policy import empty
 from villa_gpu_manager.server import Server
 
 
 GRANT = {"cpu_cores": 4, "gpus": {"GPU-fake": 100}}
+
+
+def test_command_starts_only_after_authorization_and_is_joined(manager, tmp_path):
+    marker = tmp_path / "started"
+    with ExclusiveTask(manager, GRANT, label="command-test") as lease:
+        command = ExclusiveCommand([sys.executable, "-c",
+            "import pathlib,time; pathlib.Path(" + repr(str(marker)) + ").touch(); time.sleep(30)"])
+        lease.cohort = command
+        assert command.process is None and not marker.exists()
+        lease.authorize()
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        assert lease.client.poll()["phase"] == "applied"
+    assert command.closed and command.process.poll() is not None
 
 
 @pytest.fixture

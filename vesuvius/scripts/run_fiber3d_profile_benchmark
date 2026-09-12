@@ -18,7 +18,15 @@ done < "${request_file}"
 export AGENTS_AGENT_MODE=1
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
-export PYTHONPATH="${villa_root}/vesuvius${PYTHONPATH:+:${PYTHONPATH}}"
+export MKL_NUM_THREADS=1
+export PYTHONPATH="${villa_root}/gpu_manager/src:${villa_root}/vesuvius/src:${villa_root}/vesuvius:${villa_root}${PYTHONPATH:+:${PYTHONPATH}}"
+
+for argument in "${benchmark_args[@]}"; do
+  if [[ "${argument}" == "--evaluation-only" ]]; then
+    exec "${python_bin}" -m vesuvius.neural_tracing.fiber_trace_3d.evaluation_benchmark \
+      --reference "${reference}" --output "${output_root}" "${benchmark_args[@]}"
+  fi
+done
 
 exec "${python_bin}" \
   -m vesuvius.neural_tracing.fiber_trace_3d.profile_experiment \

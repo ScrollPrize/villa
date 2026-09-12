@@ -1,7 +1,7 @@
 # Cooperative resource management
 
 The approved work spans a reusable [manager](../../../../../../gpu_manager/README.md)
-and Fiber3D training. The opt-in launcher is connected and validated with CPU
+and Fiber3D training. The default managed launcher is connected and validated with CPU
 failure/recovery tests and real S1A CUDA lifecycle/gradient checks. See the
 [validation report](cooperative_validation.md) for measured scope and limitations.
 Validation used GPUs 0/1 only, below 20 GiB/GPU; other configurations need calibration.
@@ -136,7 +136,8 @@ Villa root: `python -m pytest -q gpu_manager/tests`.
 Explicitly install the independent package into the training venv:
 `python -m pip install -e ./gpu_manager` from Villa. Nothing installs or starts a
 service on import. Start the manager on explicitly available GPU UUIDs using its
-README, then run one CPU supervisor, **not torchrun**:
+README if you want to operate it separately. Otherwise normal training starts
+or reuses it automatically. Run one CPU supervisor, **not torchrun**:
 
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json
@@ -148,8 +149,38 @@ location is writable/searchable or a listener is reachable; otherwise it uses
 overrides `training.cooperative.socket`, which overrides that shared default.
 Only explicit `--unmanaged` selects the testing/debug path; failures never fall
 back to unmanaged execution. Do not use a fixed-rank launcher for production.
-The launcher does not silently infer a request or memory estimate from a socket.
-Add this object at `training.cooperative`:
+No `training.cooperative` fields are required. Training reuses a compatible report
+from `<run_path>/.memory-calibrations/<config-fingerprint>.json` (relative run paths
+resolve against the config directory). If none exists, it requests exclusive,
+non-pausable/non-adaptive startup ownership of all managed GPUs. Startup runs the
+real initial evaluation and three real optimizer updates per attempted physical
+microbatch size, ascending from one to the configured target when memory permits.
+The logical macro-batch, samples, optimizer/LR progression and logging remain real:
+there is no discarded probe training or replayed update.
+
+After measurement, it derives maximum CPUs from the
+configured sample worker count capped by manager inventory, GPU count from visible
+compatible devices capped by measured distributed coverage, minimum VRAM from the
+smallest measured microbatch, and maximum VRAM from inventory. Priority defaults
+to zero, non-exclusive. Global batch remains fixed through accumulation.
+
+Set only `training.cooperative.priority` to change training priority without
+specifying resources, for example `"cooperative": {"priority": 10}` within
+`training`. Higher integers take precedence. This shorthand overrides the older
+`training.cooperative.request.priority` field when both are present.
+Calibration defaults to that training priority **plus 100**; its `--priority N`
+sets an exact override. Exclusivity itself never raises priority.
+
+Only an absent/refused socket starts a detached manager, with host-wide inventory,
+the existing ownership lock/journal and GPU monitor. Permission or protocol errors
+never start a replacement or fall back. Logs are in
+`~/.local/state/villa-gpu-manager/`. Existing external GPU use remains blocked by
+the monitor; automatic startup does not grant ownership of somebody else's work.
+An automatically started daemon retires once it has no clients/live tasks for its
+idle grace period; a later training command starts it again safely.
+
+The following `training.cooperative` object is an **optional advanced override**, not
+required setup:
 
 ```json
 {
@@ -176,22 +207,64 @@ shared sample pool. `sample_pipeline_workers` is its maximum size, capped by gra
 remain small and uses the existing bounded ramp. `--resume` starts from a durable
 test snapshot; live reallocations use RAM, not training-step snapshots.
 
-### Memory probe — run only after GPU permission
+### Automatic memory measurement and limits
 
-Reserve idle GPUs before running this bootstrap measurement:
+New startup profiles include allocator/driver observations and a conservative
+train-plus-initial-test envelope, with a 4 GiB reserve. Later dense evaluation
+retains the measured **physical microbatch of one**; logical test grouping and
+metric reduction are unchanged. This cap is conservative, not an evaluation speed
+optimum. Only measured training microbatch sizes are eligible for adaptive grants.
+OOM fails loudly without skipping/replaying a partially completed optimizer update.
+Calibration cannot prove a universal bound for all future data-dependent workloads.
+
+Manager communication failures log the actual exception and retry every5s after
+a failed attempt. Already-authorized adaptive training continues for up to60s of
+continuous outage, then pauses at a safe boundary, joins GPU workers and retains
+state in RAM. After reconnecting, ownership is reconciled before automatic resume.
+Known release directives, epoch changes and explicit stop bypass this grace.
+Exclusive startup calibration can finish its current authorized microbatch size
+offline, but must reconnect before starting a new cohort/size or adaptive task.
+Each synchronous RPC has its own bounded timeout, so attempts can briefly delay
+supervisor dispatch; grace does not make communication asynchronous.
+
+The implementation preserves protocol v1's immutable registration capabilities:
+the exclusive startup registration finishes after its GPU workers join, then an
+adaptive registration continues the same training run with RAM model/optimizer/RNG,
+sample ownership and TensorBoard writer retained. This changes manager task ID,
+not run identity. Re-registration is the approved lifecycle; GPU validation remains
+pending, and current CPU tests do not establish real-GPU performance.
+
+Startup requires configured dense test data and a positive test interval so it can
+measure a complete real evaluation. A missing report never falls back to unmanaged
+execution. All-GPU visibility is required for uncalibrated startup.
+
+### Optional explicit memory probe
+
+Normal training no longer requires this command. It remains available for explicit
+diagnostics/comparison, and unlike automatic startup its updates are probe work.
+
+This measurement automatically connects to or starts the manager, then waits for
+an exclusive grant before authorizing any GPU worker. Other cooperative tasks
+must release first; an unpausable task can block the request until it finishes.
 
 ```bash
-python -m vesuvius.neural_tracing.fiber_trace_3d.memory_calibration CONFIG.json --gpu-uuids GPU-UUID-ONE GPU-UUID-TWO --microbatch-sizes 1 4 8 16 --cpu-workers 8 --steps 3 --vram-limit-bytes 17179869184 --reserve-bytes 4294967296 --output /ephemeral/hendrik/fiber3d_train2/memory-calibration.json
+python -m vesuvius.neural_tracing.fiber_trace_3d.memory_calibration CONFIG.json --gpu-uuids GPU-UUID-ONE GPU-UUID-TWO --microbatch-sizes 1 4 8 16 --cpu-workers 8 --steps 3 --vram-limit-bytes 17179869184 --reserve-bytes 4294967296
 ```
 
-The explicit VRAM limit is required. Shared GPUs are rejected unless
-`--allow-shared` is supplied with authorization; the allowance still applies to
-this probe, not other users' processes. Use the intended maximum GPU count; a one-GPU calibration cannot authorize an
+The explicit VRAM limit is required. There is no unmanaged/shared bypass: external
+compute processes are still rejected, since the manager cannot enforce cooperation.
+Each microbatch-size probe registers as non-pausable/non-adaptable, reports its
+gated workers before authorizing them, and joins them before releasing its grant.
+Manager loss aborts the probe's own workers. Between sizes resources can be reassigned.
+Use the intended maximum GPU count; a one-GPU calibration cannot authorize an
 eight-GPU request. The shared trainer measures cold initialization, configured
 initial tests/visualization, optimizer state, gradient banks, asynchronous prepared
 batches and distributed communicator overhead. A fresh cohort is used per size.
 The report records allocator peaks, polled driver-visible memory, GPU/PyTorch/CUDA
-identity and config fingerprint. Copy its JSON object into `memory_calibration`.
+identity and config fingerprint. By default the report goes to the discoverable
+location above; training reads it automatically. An explicit `--output` remains
+available for experiments; those nonstandard reports require the optional embedded
+`memory_calibration` override. No report is fabricated from model size or free RAM.
 Manager control settings are excluded from the fingerprint; numerical/data config
 changes require recalibration. Only measured batch sizes are selected. The reserve
 is still needed: driver polling can miss transient peaks and other group sizes can
@@ -211,11 +284,16 @@ precision, LR or augmentation. Calibration is not a formal upper-bound proof.
 - `cooperative_training.py`, `cooperative_cohort.py`, `cooperative_worker.py`:
   connect the existing trainer to replaceable GPU processes. Each cohort has a
   fresh process group and exactly its granted UUIDs. The supervisor owns no CUDA.
-- `sample_broker.py` / existing `ordered_sample_pipeline.py`: persistent elastic
-  CPU pool and canonical slots. Current effective-batch slots stay leased until all
+- `sample_pipeline.py` / `sample_broker.py` / `ordered_sample_pipeline.py`: one
+  persistent source-tagged elastic CPU pool for training and dense evaluation.
+  Both managed and unmanaged paths use these factories and queue engine. Current effective-batch slots stay leased until all
   ranks commit; speculative GPU inputs can be discarded without consuming samples.
   Workers finish jobs then park on shrink. One active worker can execute both stages.
   Native compute, volume decoding and sampling use one thread per active worker.
+  Admission stops before scheduled evaluation; future training cannot occupy its
+  required credits. Source-specific tensor banks preserve uint8 deferred training
+  transfers and float32 CPU-normalized evaluation, with one shared ownership bound.
+  Logical test groups must fit the configured slot count; invalid sizes fail early.
 - `training_state.py`: shared snapshot helpers and RAM model/optimizer/scaler/RNG,
   sample frontier, run identity, best metric and pending test rows.
 - `cooperative_logging.py`: one CPU-owned TensorBoard writer across cohorts.
@@ -224,9 +302,9 @@ Dense evaluation preserves original logical groups while physically microbatchin
 It yields after a wave of at most one group per rank; completed rows survive resize.
 Trace evaluation yields between CP segments. Metrics and snapshots are not repeated.
 Test visualization forwards one sample at a time. Managed training visualization
-deterministically reloads the first canonical samples on CPU, independent of rank
-placement; existing CPU augmentation may differ slightly from the optimized CUDA
-augmentation. This affects visualization only, not training inputs or losses.
+reuses the broker's first canonical samples before update commit, independent of
+rank placement, and applies the same deferred augmentation helper as CUDA batch
+preparation. It does not synchronously reload volume data.
 
 Full pause joins all GPU workers/preparation streams/process groups. CPU samples,
 writer and handoff may remain in RAM. Neither `empty_cache()` nor socket EOF proves
@@ -251,3 +329,27 @@ The completed extended case exercised repeated GPU-free pauses, partial VRAM,
 shrink and expansion; further timing repeats were stopped at the user's request.
 Host queue memory is structurally bounded/tested; no long pause-RAM plateau study
 or eight-GPU throughput/convergence claim is made. No unrelated process was stopped.
+# Visualization of actual forward results
+
+Initial and periodic train/test sample sheets use the same bounded observer of
+ordinary loss forwards. Inputs already include augmentation and targets;
+predictions are detached for rendering. No visualization sample request, extra
+forward, reaugmentation, or model-mode change is performed. Train captures up to
+the configured count across rank-zero local microbatches; no-work ranks produce
+no image. Test CPU sheets survive pending-test handoff across resource changes.
+Conditioned sheets show actual zero/random-query outputs, not an extra recurrent
+inference. Scalar/test schedules and loss/gradient calculations are unchanged.
+
+The fixed reusable test command is:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+It accepts no arguments. Edit `vesuvius/scripts/fiber3d_cooperative_tests.json`
+to select named suites; `visualization` runs the CPU-only capture, evaluation,
+broker and integration regressions. The five-minute total limit and per-run
+logs/config snapshots remain active. GPU suites acquire an exclusive,
+non-pausable/non-adaptable manager grant before subprocess startup. They wait
+behind existing non-pausable work; the execution time limit starts after the
+grant. Test descendants are joined before release, including new sessions.

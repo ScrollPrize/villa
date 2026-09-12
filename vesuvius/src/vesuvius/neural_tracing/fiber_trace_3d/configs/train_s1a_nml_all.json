@@ -45,7 +45,7 @@
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_3d_runs",
     "run_name": "s1a_nml_all_3d",
-    "max_steps": 1000000,
+    "max_steps": 2000000,
     "learning_rate": 0.001,
     "scalar_log_interval": 1,
     "sample_vis_interval": 100,

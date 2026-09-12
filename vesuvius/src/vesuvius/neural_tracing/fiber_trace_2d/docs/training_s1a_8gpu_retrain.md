@@ -36,8 +36,9 @@ The fast topology uses 128 total pipeline workers, 87 load-affinity workers, 204
 ## Launch
 
 Production runs must use the cooperative manager, not a fixed-rank launcher.
-The baseline JSON needs a `training.cooperative` resource request and matching
-measured calibration before launch; see [managed setup](cooperative_training.md#managed-launch).
+No manager fields are needed in the baseline JSON. After one manual measured
+calibration, training discovers its report, starts/reuses the manager and derives
+its resource request; see [managed setup](cooperative_training.md#managed-launch).
 For the embedding variant use [the S1a embedding command](local_fiber_embeddings.md#s1a-eight-gpu-training).
 
 ```bash

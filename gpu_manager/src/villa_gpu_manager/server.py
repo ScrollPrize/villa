@@ -138,14 +138,45 @@ class Server:
         self.connections.pop(conn, None)
         conn.close()
 
-    def step(self, timeout=0.25):
+    def _submit(self, conn, state, frame):
+        request = {}
+        response = {"version": VERSION, "id": None, "server_epoch": self.engine.epoch}
+        try:
+            request = decode(frame)
+            response["id"] = request.get("id")
+            require(state["hello"] or request.get("op") == "hello", "hello required", "handshake_required")
+            body = self.engine.dispatch(request, state["uid"])
+            if request.get("op") not in ("hello", "status", "poll"):
+                save_journal(self.journal, self.engine.state)
+            state["hello"] = True
+            response.update(ok=True, body=body)
+        except ProtocolError as exc:
+            response.update(ok=False, error=exc.as_dict())
+        self._respond(conn, state, response)
+
+    def _respond(self, conn, state, response):
+        state["out"].extend(encode(response))
+        require(len(state["out"]) <= MAX_FRAME * 2, "slow client output overflow")
+
+    def _before_io(self):
         if self.monitor is not None:
-            owned = {p["pid"] for t in self.engine.tasks.values() if t["granted"]["gpus"]
-                     for p in t["processes"] if self.engine.inspect(p, t["uid"]) == "alive"}
+            def owned():
+                return {p["pid"] for t in self.engine.tasks.values() if t["granted"]["gpus"]
+                        for p in t["processes"] if self.engine.inspect(p, t["uid"]) == "alive"}
             blocked = self.monitor.poll(owned)
             if blocked != self.engine.blocked_gpus:
                 self.engine.update_blocked_gpus(blocked)
                 save_journal(self.journal, self.engine.state)
+
+    def _after_io(self):
+        now = time.monotonic()
+        if now - self.last_scan >= self.scan_seconds:
+            self.engine.scan_processes()
+            save_journal(self.journal, self.engine.state)
+            self.last_scan = now
+
+    def step(self, timeout=0.25):
+        self._before_io()
         for key, events in self.selector.select(timeout):
             if key.data is None:
                 conn, _ = self.listener.accept()
@@ -178,22 +209,7 @@ class Server:
                         processed += 1
                         frame, _, tail = state["in"].partition(b"\n")
                         state["in"] = bytearray(tail)
-                        request = {}
-                        response = {"version": VERSION, "id": None, "server_epoch": self.engine.epoch}
-                        try:
-                            request = decode(frame)
-                            response["id"] = request.get("id")
-                            require(state["hello"] or request.get("op") == "hello", "hello required", "handshake_required")
-                            body = self.engine.dispatch(request, state["uid"])
-                            # Persistence errors are fatal: do not run with an unjournaled ledger.
-                            if request.get("op") not in ("hello", "status", "poll"):
-                                save_journal(self.journal, self.engine.state)
-                            state["hello"] = True
-                            response.update(ok=True, body=body)
-                        except ProtocolError as exc:
-                            response.update(ok=False, error=exc.as_dict())
-                        state["out"].extend(encode(response))
-                        require(len(state["out"]) <= MAX_FRAME * 2, "slow client output overflow")
+                        self._submit(conn, state, frame)
                     require(len(state["in"]) <= MAX_FRAME, "input overflow")
                     # The synchronous reference client never pipelines. Reject unconsumed
                     # complete-frame floods rather than strand them without a read event.
@@ -210,10 +226,7 @@ class Server:
         for conn, state in list(self.connections.items()):
             if now - state["contact"] > 120:
                 self._drop(conn)  # EOF never releases reservations.
-        if now - self.last_scan >= self.scan_seconds:
-            self.engine.scan_processes()
-            save_journal(self.journal, self.engine.state)
-            self.last_scan = now
+        self._after_io()
 
     def drain(self):
         self.engine.drain()

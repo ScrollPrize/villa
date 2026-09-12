@@ -1,6 +1,27 @@
+## 2026-09-12 — Merge embedding into retrain
+
+- Integrated committed embedding1f24f17d2 into retrain while preserving latest28k/best11k evaluation results. No code conflicts; archived both active task histories and reconciled five planning files. Dense scroll-balanced JSON supervision, unified cooperative queues/startup calibration and responsive manager/recovery changes retained. Validation and merge details in current task log.
+
 ## 2026-09-12 — Latest28k then best11k full evaluations
 
 - Frozen latestcurrent28k/3584000samples(loss0.387998919) andbest11k/1408000samples(loss0.360366457) before sequential fresh-inference50fiber/100direction runs under exclusive8GPU manager. Latest399.916s/2516restarts/mean3.089281mm;best398.684s/2214restarts/mean3.492462mm. Best improves overlastbest5k3.218462mm but remains belowclassic3.857546mm. Full highlighted per-scroll mean/median/P05/P95/counts and runtime comparison in docs/benchmarks/collection_182306_latest_best_full_20260912.md/.json;individual raw reports retained.200artifacts audited,bothcommands exit0,managergrants released,training restored. Config/docs only;codeb32f31a55 unchanged.
+
+## 2026-09-11 — Dense, scroll-balanced collection training
+
+- Added per-dataset dense JSON supervision and deterministic continuous
+  scroll-uniform/arc-length-uniform sampling for train/test in the same loader.
+  Enabled the five-scroll collection; legacy CP defaults remain unchanged.
+
+## 2026-09-11 — Unified training/evaluation loading and startup measurement
+
+- Train and dense evaluation use the same optimized bounded sample queue,
+  including cooperative execution and visualization; phase admission prevents
+  future training work blocking evaluation.
+- Added memory measurement using real initial evaluation and optimizer updates,
+  retaining state across physical microbatch changes. CPU validation:181passed,
+  14GPU-only skipped. GPU validation is pending resource availability.
+- Exclusive-to-adaptive transition uses two registrations without changing the
+  locked protocol; user approved this lifecycle. Evaluation retains measured microbatch1.
 
 ## 2026-09-11 — Current best5k full five-scroll evaluation
 
@@ -207,6 +228,13 @@
   and geometry/branch audit, documentation and seven passing tests. Originals
   remain unchanged; split directories contain relative symlinks.
 ## 2026-09-10 — Local Fiber3D embeddings
+
+- Calibration now acquires exclusive manager ownership before GPU initialization;
+  added training priority shorthand and calibration priority default +100.
+
+- Added automatic manager connection/startup and task-derived CPU/GPU/VRAM
+  requests. Manual calibration reports now have a fingerprinted default path
+  automatically discovered by training, removing manager config preparation.
 
 - Production training now defaults to the cooperative supervisor and shared
   default socket; only explicit --unmanaged permits debug/test bypass. Updated
@@ -2418,6 +2446,18 @@
   selected margin `0.40` with stored quality threshold `0.21` on the reference
   crop after a joint sweep. This tuned point reached 24/24 exact estimates at
   oracle round zero and remains disabled by default.
+## 2026-09-11 — Communication grace for cooperative training
+
+- Log real manager communication errors, retry with retained identity, allow60s
+  adaptive work before safe-boundary pause and resume after ownership reconciliation.
+  Exclusive calibration may finish its current authorized size offline; new workers
+  still require manager confirmation. No wire fields changed.
+## 2026-09-11 — Actual-forward visualization
+
+- Initial and periodic train/test rendering share bounded detached forward-result
+  capture. Removed broker visualization fetch and repeated augmentation/forward.
+  CPU sheets survive test resize; conditioned panels show actual zero/random
+  queries. Reusable no-argument visualization suite: 20 passed, 2 GPU skips.
 # Saved-test analysis — 2026-09-11
 
 - Committed measured native/inference/integration state (75013f6cc, a238c4598, 175e3645b), then audited all100 saved full-cap8 traces without rerunning. Mean failure-ended reference span3.427927mm; per-scroll/collection counts, terminal handling, historical4.048877mm corpus reliability and reproducible calculation in docs/trace_restart_analysis_20260911.md/.json/.py.

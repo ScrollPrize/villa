@@ -29,6 +29,7 @@ class CpuFactory(FiberWorkerFactory):
             return loader_type(config)
 
         train.load_config = lambda _: loader.config
+        train.config_from_mapping = lambda mapping, **kwargs: loader.config
         train.FiberTrace3DLoader = make_loader
         train.build_fiber_trace_3d_model = lambda _: torch.nn.Conv3d(1, 7, 1)
         return super().__call__(rank, grant, state)
@@ -36,6 +37,7 @@ class CpuFactory(FiberWorkerFactory):
 
 class CpuBroker:
     effective_batch_size = 5
+    end_index = 15
 
     def __init__(self):
         from tests.neural_tracing.test_fiber_trace_3d import _loader_with_mapping
@@ -47,6 +49,19 @@ class CpuBroker:
 
     def poll(self):
         pass
+
+    def begin_test(self, step):
+        assert step * self.effective_batch_size == self.frontier
+
+    def end_test(self, step):
+        assert step * self.effective_batch_size == self.frontier
+
+    def test_batch(self, step, indices):
+        assert step * self.effective_batch_size == self.frontier
+        return self.batch(indices)
+
+    def release_test(self, step, indices):
+        assert step * self.effective_batch_size == self.frontier
 
     def batch(self, indices):
         from vesuvius.neural_tracing.fiber_trace_3d.loader import collate_fiber_trace_3d_samples
@@ -68,7 +83,8 @@ class CpuBroker:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypatch, tmp_path, device):
+@pytest.mark.parametrize("resume_during_test", [False, True])
+def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypatch, tmp_path, device, resume_during_test):
     from vesuvius.neural_tracing.fiber_trace_3d import cooperative_cohort
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_logging import WriterHub
     if device == "cuda":
@@ -93,8 +109,14 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
         "optimizer_global_batch_size": 5, "max_steps": 3, "initialization_seed": 17,
         "run_path": str(tmp_path), "run_datestr": "test", "tensorboard_enabled": True,
         "scalar_log_interval": 1,
-        "test_interval": 100, "checkpoint_interval": 100, "sample_vis_interval": 0,
+        "test_interval": 100, "checkpoint_interval": 100, "sample_vis_interval": 1,
         "sample_pipeline_workers": 2}}
+    if resume_during_test:
+        # Four original test groups: first two are completed on two ranks,
+        # remaining groups resume on one rank through the real test RPC.
+        config["test_datasets"] = [{"name": "in-memory-fixture"}]
+        config["training"]["test_control_points"] = 8
+        config["training"]["test_trace2cp_enabled"] = False
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     broker = CpuBroker()
@@ -107,6 +129,9 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
 
         def add_scalar(self, tag, value, step):
             events.append((tag, step))
+
+        def add_image(self, tag, image, step, **kwargs):
+            events.append(("image", tag, step))
 
         def flush(self):
             pass
@@ -124,7 +149,7 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             assert time.monotonic() < deadline, "CPU cohort failed to progress"
             time.sleep(0.002)
 
-    for devices, target in ((first_grant, 1), (second_grant, 3)):
+    for devices, target in ((first_grant, 0 if resume_during_test else 1), (second_grant, 3)):
         cohort = cooperative_cohort.FiberCohort(config_path=path,
             grant={"cpu_cores": 3, "gpus": devices}, state=state, broker=broker,
             calibration=calibration, writer_factory=hub.proxy_factory)
@@ -143,6 +168,8 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
             assert payload["progress"]["samples_seen"] == target * 5
             assert payload["progress"]["optimizer_global_batch_size"] == 5
             assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
+            if resume_during_test and target == 0:
+                assert len(payload["progress"]["pending_test"]["rows"]) == 2
         finally:
             if not cohort.closed:
                 cohort.abort()
@@ -179,6 +206,8 @@ def test_cpu_cohort_queue_training_and_restore_on_different_rank_count(monkeypat
     assert [event[1] for event in events if event[0] == "train/loss_total"] == [5, 10, 15]
     assert events.count(("text", "config/json")) == 1
     assert events.count(("closed", None)) == 1
+    if resume_during_test:
+        assert any(event[0] == "image" for event in events)
     assert not torch.cuda.is_initialized()
 
 
@@ -236,6 +265,7 @@ def test_driver_memory_checks_only_owned_processes_and_fails_closed():
     from vesuvius.neural_tracing.fiber_trace_3d.cooperative_cohort import FiberCohort
     cohort = FiberCohort.__new__(FiberCohort)
     cohort.grant = {"gpus": {"GPU-fake": 100}}
+    cohort._driver_peaks = {"GPU-fake": 0}
     cohort._gpu_pids = {123}
     cohort._authorized_at = time.monotonic()
     monitor = SimpleNamespace(poll=lambda pids: None, last_snapshot_at=time.monotonic(),

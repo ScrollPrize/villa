@@ -2,10 +2,12 @@
 
 Only named test suites run. CUDA suites have small allocator caps in their tests
 (4 GiB numerical oracle; 6 GiB/cohort worker + 4 GiB driver reserve). No unbounded
-reference benchmark is launched by this caller. Suites run sequentially.
+reference benchmark is launched by this caller. GPU suites first reserve the
+whole manager inventory exclusively and non-preemptibly. Suites run sequentially.
 """
 
 from datetime import datetime, timezone
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -34,6 +36,13 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "retrain-merge": ["../lasagna/tests/test_demand_predict3d.py", "../lasagna/tests/test_dynamic_inference_batching.py", "../lasagna/tests/test_inference_profiling.py", "tests/neural_tracing/test_replay_metrics.py", "tests/neural_tracing/test_managed_evaluation.py", "tests/neural_tracing/test_cached_trace_profile.py", "tests/neural_tracing/test_live_inference_profile.py", "tests/neural_tracing/test_native_bbox_read.py"],
+    "cuda-arc": ["tests/neural_tracing/test_arc_sampling.py", "-k", "cuda_dense", "-s"],
+    "arc-sampling": ["tests/neural_tracing/test_arc_sampling.py", "tests/neural_tracing/test_collection_training_config.py"],
+    "sampling-regression": ["tests/neural_tracing/test_fiber_trace_3d.py", "tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_fiber_embeddings.py"],
+    "visualization": ["tests/neural_tracing/test_forward_visualization.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],
+    "unified-loading": ["tests/neural_tracing/test_queued_batches.py", "tests/neural_tracing/test_training_state.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_gradient_accumulation.py"],
+    "unified-managed": ["tests/neural_tracing/test_cooperative_integration.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py", "../gpu_manager/tests/test_supervisor.py"],
     "cpu": CPU_TESTS,
     "manager": ["../gpu_manager/tests"],
     "reference-unit": ["tests/neural_tracing/test_cooperative_reference.py"],
@@ -66,7 +75,7 @@ def main():
         raise ValueError("gpu_devices must be a list of individual device IDs")
     if len(set(devices)) != len(devices):
         raise ValueError("duplicate GPU device")
-    if "cuda-amp" in suites and not devices or "cuda-cohort" in suites and len(devices) != 2:
+    if any(s in suites for s in ("cuda-amp", "cuda-arc")) and not devices or "cuda-cohort" in suites and len(devices) != 2:
         raise ValueError("CUDA oracle needs a device; cohort test needs exactly two")
     timeout = test_budget_seconds(control)
     output = Path(control["output_root"]).expanduser() / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -88,7 +97,7 @@ def main():
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')
             env["PYTHONPATH"] = f"{ROOT / 'vesuvius/scripts/cooperative_test_support'}:" + env["PYTHONPATH"]
-        if suite == "cuda-amp":
+        if suite in ("cuda-amp", "cuda-arc"):
             env.update(CUDA_VISIBLE_DEVICES=devices[0], FIBER_COOPERATIVE_CUDA_TEST="1")
         elif suite in ("cuda-cohort", "cuda-reference"):
             env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(devices)
@@ -123,18 +132,41 @@ def main():
         monitor = None
         peaks = {}
         if suite.startswith("cuda-"):
-            selected = devices[:1] if suite == "cuda-amp" else devices
+            selected = devices[:1] if suite in ("cuda-amp", "cuda-arc") else devices
             uuids = subprocess.check_output(["nvidia-smi", f"--id={','.join(selected)}",
                 "--query-gpu=uuid", "--format=csv,noheader"], text=True, timeout=10).splitlines()
             peaks = {uuid.strip(): 0 for uuid in uuids}
             monitor = NvidiaMonitor({"cpu_cores": 1, "gpus": {gpu: 20 * 1024**3 for gpu in peaks}},
                                     0, interval=0.25)
-        with log.open("w") as stream:
-            process = subprocess.Popen(command, cwd=ROOT / "vesuvius", env=env,
-                                       stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        with ExitStack() as resources, log.open("w") as stream:
+            managed_command = None
+            if suite.startswith("cuda-"):
+                from villa_gpu_manager.bootstrap import ensure_manager
+                from villa_gpu_manager.exclusive import ExclusiveTask
+                from villa_gpu_manager.exclusive_command import ExclusiveCommand
+                wait_started = time.monotonic()
+                manager_socket, inventory = ensure_manager()
+                lease = resources.enter_context(ExclusiveTask(manager_socket, inventory,
+                    label=f"fiber-tests-{suite}", priority=100))
+                # Resource waiting is not test execution time.
+                invocation_started += time.monotonic() - wait_started
+                started = time.monotonic()
+                env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
+                if suite in ("cuda-amp", "cuda-arc"):
+                    env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
+                managed_command = ExclusiveCommand(command, cwd=ROOT / "vesuvius", env=env,
+                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                lease.cohort = managed_command
+                lease.authorize()
+                process = managed_command.process
+            else:
+                process = subprocess.Popen(command, cwd=ROOT / "vesuvius", env=env,
+                                           stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 known_pids = {process.pid}
                 while process.poll() is None:
+                    if managed_command is not None:
+                        managed_command.observe()
                     if time.monotonic() - invocation_started > timeout:
                         raise subprocess.TimeoutExpired(command, timeout)
                     if monitor is not None:
@@ -155,6 +187,9 @@ def main():
                     time.sleep(0.1)
                 code = process.returncode
             except BaseException:
+                if managed_command is not None:
+                    managed_command.abort()
+                    raise
                 # Kill only this test's process group, never the user's training.
                 os.killpg(process.pid, signal.SIGTERM)
                 try:

@@ -8,7 +8,7 @@ from pathlib import Path
 from .client import Client
 from .paths import default_socket_path
 from .processes import NvidiaMonitor, nvidia_inventory
-from .server import Server
+from .process_server import ProcessServer as Server
 
 
 def main(argv=None):
@@ -47,11 +47,10 @@ def main(argv=None):
                     if server.idle_expired():
                         print("No clients or live tasks remain; shutting down.", flush=True)
                         return 0
-                    if server.engine.draining and all(not t["granted"]["gpus"] and not t["granted"]["cpu_cores"]
-                                                       for t in server.engine.tasks.values()):
+                    if server.drained:
                         return 0
                 except KeyboardInterrupt:
-                    if server.engine.draining:
+                    if server.summary["draining"]:
                         print("Forced shutdown: reservations retained in journal; clients must unload.", flush=True)
                         server.close(force=True)
                         return 130
