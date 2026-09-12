@@ -1,4 +1,5 @@
 #include "FiberSourceDedupe.hpp"
+#include "FiberRuntimeIds.hpp"
 
 #include <QtTest/QtTest>
 
@@ -17,6 +18,25 @@ class FiberSourceDedupeTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void RuntimeIdsSurviveSourceChanges()
+    {
+        vc3d::FiberRuntimeIds ids;
+        const auto existing = ids.forFile("/z/package", "fiber.json");
+        const auto branch = ids.forFile("/z/package", "branch.json");
+        const auto added = ids.forFile("/a/spiral", "fiber.json");
+        QVERIFY(added != existing);
+        QCOMPARE(ids.forFile("/z/package", "fiber.json"), existing);
+        QCOMPARE(ids.forFile("/z/package", "branch.json"), branch);
+        // Unregistering a source does not release its IDs. Re-registration
+        // and strict reloads must recover the same identities.
+        const auto later = ids.forFile("/b/spiral", "new.json");
+        QVERIFY(later > added);
+        QCOMPARE(ids.forFile("/a/spiral", "fiber.json"), added);
+        ids.remember("/draft", "unsaved.json", 100);
+        QVERIFY(ids.allocate() > 100);
+        QCOMPARE(ids.forFile("/draft", "unsaved.json"), uint64_t{100});
+    }
+
     void DistinctFibersAreAllKept()
     {
         const auto result = vc3d::dedupeFiberSources(

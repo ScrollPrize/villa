@@ -12671,8 +12671,16 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
 
 void LineAnnotationController::loadFibersForCurrentPackage()
 {
-    // Runtime fiber ids are reassigned per package load; a surviving candidate
-    // could silently point at an unrelated fiber with the same id.
+    // Remember residents and unsaved/open sessions before changing sources.
+    // Keep removed identities reserved so surviving branch references stay safe.
+    for (const auto& fiber : _fibers)
+        _fiberRuntimeIds.remember(fiber.sourceRoot, fiber.fileName, fiber.id);
+    for (const auto& pane : _panes) {
+        if (pane.session)
+            _fiberRuntimeIds.remember(pane.session->fiberSourceRoot,
+                                      pane.session->fiberFileName,
+                                      pane.session->fiberId);
+    }
     _linkCandidate.reset();
     _splitCandidate.reset();
     _fibers.clear();
@@ -12792,9 +12800,8 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     {
         std::unordered_map<std::string, uint64_t> fiberIdByFileName;
         fiberIdByFileName.reserve(loadedFibers.size());
-        uint64_t runtimeId = 1;
         for (auto& fiber : loadedFibers) {
-            fiber.id = runtimeId++;
+            fiber.id = _fiberRuntimeIds.forFile(fiber.sourceRoot, fiber.fileName);
             if (!fiber.fileName.empty()) {
                 fiberIdByFileName[vc3d::fiberSourceFileKey(
                     fiber.sourceRoot, fiber.fileName)] = fiber.id;
@@ -12961,8 +12968,8 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 
 void LineAnnotationController::promptReoptimizationForMergedFibers()
 {
-    // Collected by fileName, not runtime id: ids are densely reassigned on
-    // every reload, and a reload can happen while the modal below spins.
+    // Collected by fileName so removed fibers can be skipped if a reload
+    // happens while the modal below spins.
     std::vector<std::string> tagged;
     for (const auto& fiber : _fibers) {
         if (!fiber.fileName.empty() &&
@@ -13771,16 +13778,15 @@ void LineAnnotationController::attachAtlasPredSnaps(
 
 uint64_t LineAnnotationController::nextFiberId() const
 {
-    uint64_t id = 1;
-    for (const auto& fiber : _fibers) {
-        id = std::max(id, fiber.id + 1);
-    }
+    for (const auto& fiber : _fibers)
+        _fiberRuntimeIds.remember(fiber.sourceRoot, fiber.fileName, fiber.id);
     for (const auto& pane : _panes) {
-        if (pane.session && pane.session->fiberId != 0) {
-            id = std::max(id, pane.session->fiberId + 1);
-        }
+        if (pane.session)
+            _fiberRuntimeIds.remember(pane.session->fiberSourceRoot,
+                                      pane.session->fiberFileName,
+                                      pane.session->fiberId);
     }
-    return id;
+    return _fiberRuntimeIds.allocate();
 }
 
 uint64_t LineAnnotationController::nextFiberSequenceForUsername(const std::string& username) const
@@ -15713,7 +15719,9 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     auto existingIt = session.fiberId == 0 ? _fibers.end() :
         std::find_if(_fibers.begin(), _fibers.end(),
                      [&session](const StoredFiber& existing) {
-                         return existing.id == session.fiberId;
+                         return existing.id == session.fiberId &&
+                                existing.sourceRoot == session.fiberSourceRoot &&
+                                existing.fileName == session.fiberFileName;
                      });
     if (existingIt == _fibers.end()) {
         existingIt = std::find_if(_fibers.begin(), _fibers.end(),
@@ -17188,9 +17196,8 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
     };
     std::unordered_map<std::string, uint64_t> fiberIdByFileName;
     fiberIdByFileName.reserve(fibers.size());
-    uint64_t runtimeId = 1;
     for (auto& fiber : fibers) {
-        fiber.id = runtimeId++;
+        fiber.id = _fiberRuntimeIds.forFile(fiber.sourceRoot, fiber.fileName);
         if (!fiber.fileName.empty()) {
             fiberIdByFileName[sourceFileKey(fiber, fiber.fileName)] = fiber.id;
         }

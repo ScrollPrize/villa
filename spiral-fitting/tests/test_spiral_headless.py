@@ -1103,6 +1103,39 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(session._live_reservation_iteration)
         self.assertEqual(session._state, SessionState.Running)
 
+    def test_live_boundary_selection_and_reservation_are_atomic(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._target = 13
+        session._iteration_in_progress = None
+        session._live_reservation_iteration = None
+        session._live_reservation_epoch = 0
+        reserve = session.reserve_live_incorporation
+        observed = []
+
+        def competing_step(target, epoch):
+            # A fitter thread must not acquire the condition between choosing
+            # this target and reserving it. No timing-dependent sleeps needed.
+            def attempt_step():
+                acquired = session._condition.acquire(blocking=False)
+                observed.append(acquired)
+                if acquired:
+                    session._iteration_in_progress = target
+                    session._condition.release()
+            worker = threading.Thread(target=attempt_step)
+            worker.start()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            return reserve(target, epoch)
+
+        session.reserve_live_incorporation = competing_step
+        session._queue_command = lambda command, timeout: command
+        result = session.incorporate_live([{"id": "fiber-a", "kind": "fiber"}])
+        self.assertEqual(observed, [False])
+        self.assertIsInstance(result, IncorporateCommand)
+        self.assertEqual(result.expected_iteration, 10)
+        self.assertEqual(session._live_reservation_iteration, 10)
+
     def test_live_incorporation_defaults_to_the_operation_timeout(self):
         session = self._idle_session(completed=10)
         session._state = SessionState.Running

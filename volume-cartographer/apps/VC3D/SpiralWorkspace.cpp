@@ -1588,8 +1588,9 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
     request.shouldSave = [saveAllowed]() { return saveAllowed && saveAllowed->load(); };
     QPointer<SpiralWorkspace> self(this);
     _lineAnnotationController->optimizeAndSaveFiberHeadless(
-        std::move(request), [self](bool ok, const QString& message, uint64_t fiberId) {
-            if (!self || !self->_lineAnnotationDraft) return;
+        std::move(request), [self, saveAllowed](bool ok, const QString& message, uint64_t fiberId) {
+            if (!self || !self->_lineAnnotationDraft ||
+                self->_lineAnnotationDraft->saveAllowed != saveAllowed) return;
             if (!ok) {
                 self->_lineAnnotationDraft->optimizing = false;
                 self->statusBar()->showMessage(

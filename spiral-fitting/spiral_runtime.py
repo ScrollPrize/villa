@@ -1743,8 +1743,10 @@ class InteractiveFitSession:
                 if influence_config is None:
                     influence_config = dict(getattr(
                         self, "_active_influence_config", {}))
-            reservation = self.reserve_live_incorporation(
-                target_iteration, reservation_epoch)
+                # Condition uses an RLock: selection and reservation must be
+                # atomic with respect to the fitter starting the next step.
+                reservation = self.reserve_live_incorporation(
+                    target_iteration, reservation_epoch)
             if not reservation.get("reserved"):
                 return {"no_future_step": True, "outcomes": []}
         with self._condition:

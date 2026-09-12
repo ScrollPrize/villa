@@ -1,5 +1,7 @@
 #pragma once
 
+#include "FiberRuntimeIds.hpp"
+
 #include <QObject>
 #include <QPointF>
 #include <QPointer>
@@ -1122,6 +1124,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    mutable vc3d::FiberRuntimeIds _fiberRuntimeIds;
     std::vector<std::filesystem::path> _externalFiberSources;
     // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
     std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
