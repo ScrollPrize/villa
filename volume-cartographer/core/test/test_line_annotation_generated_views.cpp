@@ -3983,3 +3983,67 @@ TEST_CASE("controlled span keeps only the line between the outer control points"
         CHECK(span[2] == a);
     }
 }
+
+TEST_CASE("Generated markers map every position into the downsampled viewer")
+{
+    using namespace vc3d::line_annotation;
+    for (const double scale : {1.0, 0.25}) {
+        GeneratedOverlay::BranchLinkMarker branch;
+        branch.localControlPoint = {120, 240, 360};
+        branch.linkedControlPoint = {160, 280, 400};
+        branch.planePoint = branch.linkedControlPoint;
+        branch.localDirection = {1, 0, 0};
+        branch.linkedDirection = {0, 1, 0};
+        branch.linkedFiberId = 42;
+        scaleGeneratedMarkerForVolume(branch, scale);
+        CHECK(branch.localControlPoint == cv::Vec3f(120, 240, 360) * scale);
+        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * scale);
+        CHECK(branch.planePoint == branch.linkedControlPoint);
+        CHECK(branch.localDirection == cv::Vec3f(1, 0, 0));
+        CHECK(branch.linkedDirection == cv::Vec3f(0, 1, 0));
+        CHECK(branch.linkedFiberId == 42);
+
+        GeneratedOverlay::PredSnapMarker snap;
+        snap.controlPoint = {120, 240, 360};
+        snap.snapPoint = {124, 248, 372};
+        snap.linePosition = 2.5;
+        snap.controlIndex = 3;
+        snap.manual = true;
+        scaleGeneratedMarkerForVolume(snap, scale);
+        CHECK(snap.controlPoint == cv::Vec3f(120, 240, 360) * scale);
+        CHECK(snap.snapPoint == cv::Vec3f(124, 248, 372) * scale);
+        CHECK(snap.linePosition == 2.5);
+        CHECK(snap.controlIndex == 3);
+        CHECK(snap.manual);
+    }
+}
+
+TEST_CASE("Winding queries use the center frame at every volume level")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<cv::Vec3f> basePoints;
+    // Off-origin, z-dependent center exposes both XY and Z frame mismatches.
+    const auto towardCenter = [](const cv::Vec3f& p) -> cv::Vec3f {
+        return {1000.0f + p[2] - p[0], 2000.0f - p[2] - p[1], 0};
+    };
+    for (int i = 0; i < 40; ++i) {
+        const float z = 100.0f + i * 4.0f;
+        const float angle = i * 0.3f;
+        basePoints.push_back({1000.0f + z + 100.0f * std::cos(angle),
+                              2000.0f - z + 100.0f * std::sin(angle), z});
+    }
+    const auto expected = unwrappedGeneratedWindingAngles(basePoints, towardCenter);
+    auto viewerPoints = basePoints;
+    for (auto& point : viewerPoints) {
+        point *= 0.25f;
+    }
+    const auto actual = unwrappedGeneratedWindingAngles(viewerPoints, towardCenter, 4.0f);
+    REQUIRE(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(actual[i] == doctest::Approx(expected[i]));
+    }
+    CHECK(generatedLineIndexRangeWithinWinding(actual, actual.size(), 20.0,
+                                               kGeneratedSideCutHalfWrapAngle) ==
+          generatedLineIndexRangeWithinWinding(expected, expected.size(), 20.0,
+                                               kGeneratedSideCutHalfWrapAngle));
+}

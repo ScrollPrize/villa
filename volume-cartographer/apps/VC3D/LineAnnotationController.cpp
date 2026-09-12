@@ -1506,7 +1506,8 @@ generatedControlMarkers(
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker>
-generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches)
+generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches,
+                           double fiberBaseToVolumeScale)
 {
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> markers;
     markers.reserve(branches.size());
@@ -1526,6 +1527,8 @@ generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBran
             toVec3f(normalizedOrZero(branch.branchControlPointDirection));
         marker.planePoint = marker.linkedControlPoint;
         marker.estimated = false;
+        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
+            marker, fiberBaseToVolumeScale);
         markers.push_back(marker);
     }
     return markers;
@@ -1593,7 +1596,8 @@ void remapCollapsedBranchControlPointIndices(
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
 generatedPredSnapMarkers(const std::vector<vc3d::line_annotation::LineControlPoint>& controls,
-                         const vc::atlas::AtlasPredSnapSet& predSnapSet)
+                         const vc::atlas::AtlasPredSnapSet& predSnapSet,
+                         double fiberBaseToVolumeScale)
 {
     std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
     snapsByControl.reserve(predSnapSet.points.size());
@@ -1620,6 +1624,8 @@ generatedPredSnapMarkers(const std::vector<vc3d::line_annotation::LineControlPoi
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
         marker.manual = it->second->source == vc::atlas::AtlasPredSnapSource::Manual;
+        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
+            marker, fiberBaseToVolumeScale);
         markers.push_back(marker);
     }
     return markers;
@@ -5104,10 +5110,11 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                             views.lineUpVectors = lineUpVectors;
                             views.controlPoints = controlMarkersForSession(*session);
                             views.branchLinePoints = generatedBranchLinePointsForSession(*session);
-                            views.branchLinks = generatedBranchLinkMarkers(session->branches);
+                            views.branchLinks = generatedBranchLinkMarkers(
+                                session->branches, session->fiberBaseToVolumeScale);
                             views.predSnapPoints =
-                                generatedPredSnapMarkers(session->controlPoints,
-                                                         session->predSnapSet);
+                                generatedPredSnapMarkers(session->controlPoints, session->predSnapSet,
+                                                         session->fiberBaseToVolumeScale);
                             vc3d::line_annotation::applyGeneratedOverlay(
                                 chunkedViewer,
                                 surfaceName,
@@ -5233,10 +5240,11 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     views.stripPositionMap = stripPositionMap;
                     views.controlPoints = controlMarkersForSession(*session);
                     views.branchLinePoints = generatedBranchLinePointsForSession(*session);
-                    views.branchLinks = generatedBranchLinkMarkers(session->branches);
+                    views.branchLinks = generatedBranchLinkMarkers(
+                        session->branches, session->fiberBaseToVolumeScale);
                     views.predSnapPoints =
-                        generatedPredSnapMarkers(session->controlPoints,
-                                                 session->predSnapSet);
+                        generatedPredSnapMarkers(session->controlPoints, session->predSnapSet,
+                                                 session->fiberBaseToVolumeScale);
                     auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(
                         views,
                         focus,
@@ -7627,11 +7635,12 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(session));
         pane->dialog->setGeneratedPredSnapPoints(
-            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
+                                     session.fiberBaseToVolumeScale));
     }
 
     const std::string updateEventName = std::string(collapsedControlCount > 1
@@ -8081,7 +8090,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             false,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -8300,7 +8309,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             pane->dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(session),
                 generatedBranchLinePointsForSession(session),
-                generatedBranchLinkMarkers(session.branches),
+                generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
                 true,
                 generatedSpanAlignmentMetricsForSession(session));
         }
@@ -8318,7 +8327,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -8790,7 +8799,7 @@ void LineAnnotationController::handleGeneratedControlPointSplitCandidate(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             false,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -9235,7 +9244,7 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -9356,7 +9365,7 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -9412,7 +9421,8 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
             predDtValue);
         if (pane->dialog) {
             pane->dialog->setGeneratedPredSnapPoints(
-                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
+                                         session.fiberBaseToVolumeScale));
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not save pred-snap point: %1")
@@ -9585,11 +9595,12 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches),
+            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(session));
         pane->dialog->setGeneratedPredSnapPoints(
-            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
+                                     session.fiberBaseToVolumeScale));
     }
 }
 
@@ -12189,11 +12200,14 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         // umbilicus, else the volume center; with neither the angles stay NaN
         // and the side cut shows the whole line as before.
         constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+        // The umbilicus is indexed in annotation coordinates, including z.
+        const float volumeToAnnotationScale =
+            static_cast<float>(annotationFrame().factor);
         cv::Vec2f volumeCenterXY{kNanF, kNanF};
         try {
             if (const auto volume = _state->currentVolume()) {
-                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f,
-                                  static_cast<float>(volume->sliceHeight()) * 0.5f};
+                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f * volumeToAnnotationScale,
+                                  static_cast<float>(volume->sliceHeight()) * 0.5f * volumeToAnnotationScale};
             }
         } catch (...) {
         }
@@ -12213,10 +12227,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                                 0.0f};
                     }
                     return {kNanF, kNanF, kNanF};
-                });
+                },
+                volumeToAnnotationScale);
     }
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
-    generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
+    generatedViews.branchLinks = generatedBranchLinkMarkers(
+        session.branches, session.fiberBaseToVolumeScale);
     generatedViews.seedPoint = seedPoint;
     generatedViews.focusPoint = focusPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
@@ -12232,7 +12248,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         vc3d::line_annotation::generatedControlLinePositionRange(
             generatedViews.controlPoints);
     generatedViews.predSnapPoints =
-        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
+        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
+                                 session.fiberBaseToVolumeScale);
     const double maxLinePosition =
         static_cast<double>(std::max<size_t>(1, session.optimizedLine.points.size()) - 1);
     double initialCenterPosition = std::clamp(session.focusedLinePosition,
@@ -13921,7 +13938,7 @@ void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
         pane.dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(*pane.session),
             generatedBranchLinePointsForSession(*pane.session),
-            generatedBranchLinkMarkers(pane.session->branches),
+            generatedBranchLinkMarkers(pane.session->branches, pane.session->fiberBaseToVolumeScale),
             true,
             generatedSpanAlignmentMetricsForSession(*pane.session));
     }
