@@ -2,6 +2,7 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -295,16 +296,8 @@ private:
     bool _commitAfterBrushUploads = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime
     // fiber id: runtime ids are reassigned whenever the fiber list reloads.
-    struct TrackedFiber {
-        QString path;
-        QString revision;
-        QString snapshotPath;
-        uint64_t latestGeneration = 0;
-        uint64_t sentGeneration = 0;
-        uint64_t inFlightGeneration = 0;
-        bool added = false;
-        bool uploadInFlight = false;
-    };
+    using TrackedFiber = vc3d::SpiralTrackedFiber;
+    bool _fiberUploadsSynchronized = false;
     QHash<QString, TrackedFiber> _trackedFibers;
     QHash<QString, QString> _residentFiberRevisions;
 };

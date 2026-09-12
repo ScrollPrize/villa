@@ -542,12 +542,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                                 .arg(inputId),
                             15000);
                         if (uploadedGeneration == 0) {
+                            it->retryAfterReconnect = true;
                             QTimer::singleShot(0, this, [this, inputId]() {
                                 auto tracked = _trackedFibers.find(inputId);
                                 if (tracked == _trackedFibers.end()
+                                    || !_fiberUploadsSynchronized
                                     || tracked->uploadInFlight)
                                     return;
                                 tracked->uploadInFlight = true;
+                                tracked->retryAfterReconnect = false;
                                 _service->uploadJsonInput(
                                     QStringLiteral("fiber"), tracked->path,
                                     inputId, {}, tracked->revision);
@@ -798,6 +801,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
+                // Disconnect invalidates callbacks from the old connection.
+                if (state == CS::Disconnected) {
+                    _fiberUploadsSynchronized = false;
+                    for (auto& tracked : _trackedFibers)
+                        tracked.abandonUpload();
+                }
                 if (state == CS::Starting || state == CS::Connecting) {
                     _requestedPreviewGeneration = -1;
                     _inputSurfaceGeneration = 0;
@@ -1131,6 +1140,12 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
             uncommittedDrawnPointCollections.insert(
                 input.value(QStringLiteral("id")).toString());
         }
+    }
+    // Resume only after rebuilding CAS bases from the new connection ledger.
+    if (!_fiberUploadsSynchronized && _service->hasActiveSession()) {
+        _fiberUploadsSynchronized = true;
+        const auto ids = _trackedFibers.keys();
+        for (const QString& id : ids) uploadNewestFiberRevision(id);
     }
     if (uncommittedDrawnPointCollections != _visibleUncommittedPointCollectionIds) {
         _visibleUncommittedPointCollectionIds =
@@ -1644,9 +1659,8 @@ void SpiralWorkspace::noteTrackedFiberSaved(
 void SpiralWorkspace::uploadNewestFiberRevision(const QString& inputId)
 {
     auto found = _trackedFibers.find(inputId);
-    if (found == _trackedFibers.end() || !found->added
-        || found->uploadInFlight
-        || found->latestGeneration <= found->sentGeneration)
+    if (found == _trackedFibers.end()
+        || !found->needsUpload(_fiberUploadsSynchronized))
         return;
     const QString root = QDir(provisionalBrushRoot()).filePath(
         QStringLiteral("fiber-revisions"));
@@ -1664,6 +1678,7 @@ void SpiralWorkspace::uploadNewestFiberRevision(const QString& inputId)
     found->snapshotPath = snapshot;
     found->inFlightGeneration = found->latestGeneration;
     found->uploadInFlight = true;
+    found->retryAfterReconnect = false;
     _service->uploadJsonInput(QStringLiteral("fiber"), snapshot,
                               inputId, {}, found->revision);
 }

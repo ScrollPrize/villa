@@ -3,6 +3,7 @@
 #include "SpiralSessionSync.hpp"
 
 #include <QJsonObject>
+#include <QTemporaryFile>
 #include <QtTest/QtTest>
 
 class SpiralReloadComparisonTest final : public QObject
@@ -10,6 +11,50 @@ class SpiralReloadComparisonTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void ReconnectResumesLatestUnsentFiberAfterSynchronization()
+    {
+        QTemporaryFile snapshot;
+        QVERIFY(snapshot.open());
+        const QString snapshotPath = snapshot.fileName();
+        snapshot.close();
+        vc3d::SpiralTrackedFiber fiber;
+        fiber.added = true;
+        fiber.revision = "old-base";
+        fiber.sentGeneration = 1;
+        fiber.inFlightGeneration = 2;
+        fiber.latestGeneration = 3;
+        fiber.uploadInFlight = true;
+        fiber.snapshotPath = snapshotPath;
+        fiber.abandonUpload();
+        QVERIFY(!fiber.uploadInFlight);
+        QCOMPARE(fiber.inFlightGeneration, uint64_t(0));
+        QVERIFY(fiber.snapshotPath.isEmpty());
+        QVERIFY(!QFile::exists(snapshotPath));
+        QCOMPARE(fiber.sentGeneration, uint64_t(1));
+        QCOMPARE(fiber.latestGeneration, uint64_t(3));
+        QVERIFY(!fiber.needsUpload(false));
+        fiber.revision = "synchronized-base";
+        QVERIFY(fiber.needsUpload(true));
+        fiber.uploadInFlight = true;
+        QVERIFY(!fiber.needsUpload(true));
+    }
+
+    void ReconnectRetriesInitialFiberAbsentFromLedger()
+    {
+        vc3d::SpiralTrackedFiber fiber;
+        fiber.uploadInFlight = true;
+        fiber.abandonUpload();
+        fiber.abandonUpload(); // Repeated disconnects preserve the pending save.
+        QVERIFY(!fiber.needsUpload(false));
+        QVERIFY(fiber.needsUpload(true));
+        fiber.retryAfterReconnect = false;
+        fiber.added = true;
+        QVERIFY(!fiber.needsUpload(true));
+        fiber.latestGeneration = 1;
+        QVERIFY(!fiber.needsUpload(false));
+        QVERIFY(fiber.needsUpload(true));
+    }
+
     void FiberCasConflictPreservesCurrentRevisionForRetry()
     {
         const QJsonObject conflict{

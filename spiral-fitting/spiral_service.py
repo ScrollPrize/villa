@@ -40,7 +40,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict, deque
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import errno
@@ -2213,7 +2213,6 @@ class ServiceState:
                            f"The {label} source is not editable")
         current = self._file_sha256(source)
         if current != base_source_revision:
-            self._refresh_pcl_artifact(role, source)
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"The {label} source changed since this draft was created",
@@ -2275,8 +2274,20 @@ class ServiceState:
         return (self.ephemeral_records.bytes_in_use()
                 + self.uploads_manager.staged_ephemeral_bytes())
 
+    @contextmanager
+    def _refresh_conflicting_pcl_upload(self, role):
+        # Validation can run under the upload manager's shared service lock.
+        # Unwind all transfer/service locks before taking a publication lock.
+        try:
+            yield
+        except ApiError as exc:
+            if exc.payload.get("code") == "source_revision_conflict":
+                self._refresh_pcl_artifact(role)
+            raise
+
     def begin_upload(self, request):
-        return {**self._base(), **self.uploads_manager.begin(request)}
+        with self._refresh_conflicting_pcl_upload(request.get("role")):
+            return {**self._base(), **self.uploads_manager.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length):
         received = self.uploads_manager.receive(
@@ -2287,10 +2298,11 @@ class ServiceState:
         # Fiber publication and logical revision installation are one service
         # critical section. Cleanup uses the same lock, so it can never erase
         # content that a concurrent finalizer has published but not installed.
-        upload_kind = self.uploads_manager.get(upload_id).kind
-        scope = self.lock if upload_kind == "fiber" else nullcontext()
-        with scope:
-            return self._finalize_upload(upload_id)
+        upload = self.uploads_manager.get(upload_id)
+        scope = self.lock if upload.kind == "fiber" else nullcontext()
+        with self._refresh_conflicting_pcl_upload(upload.role):
+            with scope:
+                return self._finalize_upload(upload_id)
 
     def _finalize_upload(self, upload_id):
         finalized = self.uploads_manager.finalize(upload_id)

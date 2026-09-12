@@ -1,10 +1,40 @@
 #pragma once
 
+#include <QFile>
 #include <QFileInfo>
+#include <cstdint>
 #include <QJsonObject>
 #include <QString>
 
 namespace vc3d {
+
+struct SpiralTrackedFiber {
+    QString path;
+    QString revision;
+    QString snapshotPath;
+    uint64_t latestGeneration = 0;
+    uint64_t sentGeneration = 0;
+    uint64_t inFlightGeneration = 0;
+    bool added = false;
+    bool uploadInFlight = false;
+    bool retryAfterReconnect = false;
+
+    void abandonUpload()
+    {
+        retryAfterReconnect = retryAfterReconnect || uploadInFlight;
+        uploadInFlight = false;
+        inFlightGeneration = 0;
+        if (!snapshotPath.isEmpty()) QFile::remove(snapshotPath);
+        snapshotPath.clear();
+    }
+
+    bool needsUpload(bool synchronized) const
+    {
+        return synchronized && !uploadInFlight
+            && (retryAfterReconnect
+                || (added && latestGeneration > sentGeneration));
+    }
+};
 
 inline QString spiralFiberConflictRevision(const QJsonObject& failure)
 {

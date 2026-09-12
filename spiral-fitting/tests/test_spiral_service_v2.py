@@ -2302,6 +2302,50 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(stale.exception.payload["current_revision"],
                          self.state._file_sha256(target))
 
+    def test_conflicting_upload_refresh_releases_service_lock(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        document = {"vc_pointcollections_json_version": "1",
+                    "collections": {"3": {"name": "target", "points": {}}}}
+        target.write_text(json.dumps(document))
+        base = self.state._file_sha256(target)
+        files = {"replacement.json": json.dumps(document).encode()}
+        upload_id = _upload_input(
+            self.state, "pcl", "finalize-lock", files,
+            role="same_winding", operation="replace_collection",
+            target_collection_id="3", base_source_revision=base)
+        target.write_text(json.dumps({**document, "external": True}))
+        original_refresh = self.state._refresh_pcl_artifact
+
+        def checked_refresh(role, source_path=None):
+            # A publisher already holding the role lock must still be able
+            # to enter the service critical section while refresh is pending.
+            acquired = threading.Event()
+
+            def publisher():
+                with self.state._pcl_publication_locks[role]:
+                    with self.state.lock:
+                        acquired.set()
+
+            worker = threading.Thread(target=publisher, daemon=True)
+            worker.start()
+            self.assertTrue(acquired.wait(2), "refresh retained the service lock")
+            worker.join(timeout=2)
+            return original_refresh(role, source_path)
+
+        with mock.patch.object(self.state, "_refresh_pcl_artifact",
+                               side_effect=checked_refresh) as refresh:
+            with self.assertRaises(ApiError) as begin_error:
+                _upload_input(
+                    self.state, "pcl", "begin-lock", files,
+                    role="same_winding", operation="replace_collection",
+                    target_collection_id="3", base_source_revision=base)
+            self.assertEqual(begin_error.exception.status, 409)
+            with self.assertRaises(ApiError) as finalize_error:
+                self.state.finalize_upload(upload_id)
+            self.assertEqual(finalize_error.exception.status, 409)
+            self.assertEqual(refresh.call_count, 2)
+
     def test_same_winding_artifact_advertises_revision_and_editability(self):
         self._session()
         target = self.dataset / "same_windings.json"
