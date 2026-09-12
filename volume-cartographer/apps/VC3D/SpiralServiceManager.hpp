@@ -290,6 +290,7 @@ private:
     std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _fetchingPclArtifact;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
+    std::array<quint64, vc3d::spiral::kEditablePclRoles.size()> _pclSequence{};
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastDiagnosticsLocalPath;

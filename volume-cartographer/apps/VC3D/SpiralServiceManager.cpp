@@ -1541,12 +1541,16 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
             || artifactId == _fetchingPclArtifact[slot])
             continue;
         _fetchingPclArtifact[slot] = artifactId;
+        const quint64 sequence = ++_pclSequence[slot];
         const quint64 generation = _connectionGeneration;
         _artifactCache->fetchArtifact(
             sessionId, artifactId,
-            [this, sessionId, role, slot, artifactId, artifactRef, generation](
+            [this, sessionId, role, slot, artifactId, artifactRef, generation, sequence](
                 const QString& entryPath, const QString& error, bool gone) {
                 if (generation != _connectionGeneration) return;
+                // A later snapshot of this role supersedes this download,
+                // including its errors and source revision.
+                if (sequence != _pclSequence[slot]) return;
                 if (_fetchingPclArtifact[slot] == artifactId)
                     _fetchingPclArtifact[slot].clear();
                 if (entryPath.isEmpty()) {

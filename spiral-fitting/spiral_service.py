@@ -557,6 +557,9 @@ class ServiceState:
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,), startup_run=None):
         self.lock = threading.RLock()
+        self._pcl_publication_locks = {
+            role: threading.Lock() for role in EDITABLE_PCL_ROLES
+        }
         self.session = None
         self.session_id = None
         self.session_paths = None
@@ -1216,6 +1219,12 @@ class ServiceState:
         role = PclRole(role)
         if role not in EDITABLE_PCL_ROLES:
             raise ValueError(f"{role.value} PCLs have no display artifact")
+        # Keep snapshot creation, registration, installation and retention in
+        # one role-scoped transaction, including concurrent session refreshes.
+        with self._pcl_publication_locks[role]:
+            return self._publish_pcl_artifact_locked(role, source_path)
+
+    def _publish_pcl_artifact_locked(self, role, source_path):
         with self.lock:
             session_id = self.session_id
             paths = self.session_paths

@@ -349,6 +349,8 @@ class FiberPointCollectionTests(unittest.TestCase):
                 "windings": np.zeros(2, dtype=np.float32),
             }
 
+            old_cross["source_file"] = str(replacement_path)
+
             context = FitContext.__new__(FitContext)
             context.config = FitConfig(Config({
                 "z_begin": 0, "z_end": 200,
@@ -444,6 +446,8 @@ class FiberPointCollectionTests(unittest.TestCase):
                 "windings": np.zeros(2, dtype=np.float32),
             }
 
+            old_relative_strip["source_file"] = str(replacement_path)
+
             context = FitContext.__new__(FitContext)
             context.config = FitConfig(Config({
                 "z_begin": 0, "z_end": 200,
@@ -530,6 +534,8 @@ class FiberPointCollectionTests(unittest.TestCase):
                 "zyxs": np.ones((2, 3), dtype=np.float32),
                 "windings": np.zeros(2, dtype=np.float32),
             }
+            old_cross["source_file"] = str(deletion_path)
+
             context = FitContext.__new__(FitContext)
             context.config = FitConfig(Config({
                 "z_begin": 0, "z_end": 200,
@@ -599,6 +605,50 @@ class FiberPointCollectionTests(unittest.TestCase):
         context.influence_state = None
         return context
 
+    def test_mutations_preserve_overlapping_ids_in_other_documents(self):
+        for operation in ("replace_collection", "delete_collection"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "same_windings.json"
+                upload = Path(tmp) / "upload.json"
+                upload.write_text(json.dumps({
+                    "vc_pointcollections_json_version": "1",
+                    "collections": {"5": {"name": "edit", "points": {
+                        "0": {"p": [0, 0, 10], "creation_time": 1},
+                        "1": {"p": [4, 0, 12], "creation_time": 2},
+                    }}},
+                }))
+                def collection(cid, source):
+                    return {"id": cid, "source_file": str(source), "points": {},
+                            "metadata": {"logical_input_kind": "same_winding",
+                                         "logical_input_id": "5",
+                                         "resident_collection_id": cid}}
+                other = collection(16, Path(tmp) / "other.json")
+                edited = collection(17, target)
+                strips = [{"id": cid, "logical_input_kind": "same_winding",
+                           "logical_input_id": "5"} for cid in (16, 17)]
+                context = self._editable_context([other, edited], strips,
+                                                 ["other", "target"])
+                context.paths = mock.Mock(dataset_root=tmp)
+                context.regular_pcl_catalog = {16: other, 17: edited}
+                with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                        mock.patch.object(torch.cuda, "set_rng_state_all"):
+                    context._incorporate_prevalidated_interactive_inputs(
+                        [{"kind": "pcl", "id": "edit", "path": str(upload),
+                          "role": "same_winding", "operation": operation,
+                          "target_collection_id": "5"}],
+                        {"influence_enabled": False})
+                self.assertIs(context.cross_patch_pcls[0], other)
+                self.assertIs(context.unattached_pcl_strips[0], strips[0])
+                self.assertIs(context.regular_pcl_catalog[16], other)
+                self.assertEqual(context.next_id, 30)
+                if operation == "replace_collection":
+                    self.assertEqual(context.unattached_pcl_strips[1]["id"], 17)
+                    self.assertEqual(context.regular_pcl_catalog[17]["metadata"]
+                                     ["committed_source_file"], str(target))
+                else:
+                    self.assertNotIn(17, context.regular_pcl_catalog)
+                    self.assertEqual(len(context.unattached_pcl_strips), 1)
+
     def test_live_addition_carrying_committed_ids_is_deletable_by_them(self):
         with tempfile.TemporaryDirectory() as temporary:
             document = {
@@ -613,6 +663,7 @@ class FiberPointCollectionTests(unittest.TestCase):
             deletion_path = Path(temporary) / "deletion.json"
             deletion_path.write_text(json.dumps(document))
             context = self._editable_context([], [], [])
+            context.paths = mock.Mock(dataset_root=temporary)
             with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
                     mock.patch.object(torch.cuda, "set_rng_state_all"):
                 # Committed before incorporation: the dataset file gave the

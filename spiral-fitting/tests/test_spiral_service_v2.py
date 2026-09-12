@@ -2328,6 +2328,57 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(descriptor["source_revision"],
                          self.state._file_sha256(target))
 
+    def test_concurrent_pcl_publications_keep_the_advertised_artifact(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        target.write_text('{"collections": {}}')
+        self.state.dataset_resolution = mock.Mock(
+            scroll_spec={"base_shape_zyx": [10, 20, 30]})
+        registered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+        second_registered = threading.Event()
+        real_register = self.state.artifacts.register_directory
+
+        def register(*args, **kwargs):
+            ref = real_register(*args, **kwargs)
+            if not registered.is_set():
+                registered.set()
+                self.assertTrue(release.wait(5))
+            else:
+                second_registered.set()
+            return ref
+
+        def second_publish():
+            second_started.set()
+            return self.state._publish_pcl_artifact(PclRole.SAME_WINDING, target)
+
+        with mock.patch.object(self.state.artifacts, "register_directory", register):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(self.state._publish_pcl_artifact,
+                                    PclRole.SAME_WINDING, target)
+                try:
+                    self.assertTrue(registered.wait(5))
+                    second = pool.submit(second_publish)
+                    self.assertTrue(second_started.wait(5))
+                    self.assertFalse(second_registered.wait(0.1))
+                finally:
+                    release.set()
+                first.result(timeout=5)
+                latest = second.result(timeout=5)
+        self.assertEqual(self.state.pcl_artifacts["same_winding"], latest)
+        artifact, snapshot, _ = self.state.artifacts.acquire_file(
+            latest["id"], "same_windings.json")
+        try:
+            self.assertEqual(snapshot.read_text(), target.read_text())
+        finally:
+            self.state.artifacts.release(artifact)
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "same-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(json.loads(manifests[0].read_text())["source_revision"],
+                         latest["source_revision"])
+
     def test_pcl_artifact_revision_describes_the_snapshot_not_the_live_source(self):
         # Publishing runs without the commit lock. A write landing between
         # the copy and the hash must not advertise the newer document's

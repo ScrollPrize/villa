@@ -4300,6 +4300,23 @@ class FitContext:
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
+    def _editable_resident_ids(self, role, collection_id, source):
+        """Find one document's collection across the catalog and CPU views."""
+        result = set()
+        records = list(getattr(self, 'regular_pcl_catalog', {}).items())
+        records.extend((pcl.get('metadata', {}).get('resident_collection_id'), pcl)
+                       for pcl in self.cross_patch_pcls)
+        records.extend((strip.get('id'), strip)
+                       for strip in self.unattached_pcl_strips)
+        for resident_id, pcl in records:
+            metadata = pcl.get('metadata', pcl)
+            document = metadata.get('committed_source_file') or pcl.get('source_file')
+            if (resident_id is not None and document
+                    and _logical_identity(metadata) == (role, str(collection_id))
+                    and os.path.realpath(document) == os.path.realpath(source)):
+                result.add(resident_id)
+        return result
+
     def _incorporate_prevalidated_interactive_inputs(
             self, records, influence_config=None, *, current_iteration=0,
             target_iteration=0):
@@ -4334,9 +4351,10 @@ class FitContext:
             theta_warnings = []
             new_fibers = []
             # Live replace/delete of editable-role collections. Identities
-            # are (role, source collection id) pairs: ids are per role file.
+            # are resolved to resident ids within their source document.
             replacing_editable = False
             deleting_editable_ids = set()
+            replacing_resident_ids = set()
             candidate_fiber_catalog = dict(self.fiber_catalog)
             candidate_next_id = self.next_id
             # Identity assignments first: a mutation later in this batch may
@@ -4414,18 +4432,22 @@ class FitContext:
                     if not loaded:
                         raise RuntimeError(f'PCL document {input_id!r} contains no collections')
                     editable_role = role in EDITABLE_PCL_ROLE_VALUES
-                    if (editable_role
-                            and record.get('operation') == 'delete_collection'):
-                        deleting_editable_ids.add(
-                            (role, str(record.get('target_collection_id'))))
-                        replacing_editable = True
-                        continue
                     committed_ids = record.get('committed_collection_ids')
                     committed_source = record.get('committed_source_file')
                     if editable_role and committed_source is None:
                         committed_source = conventional_pcl_document_path(
                             getattr(getattr(self, 'paths', None), 'dataset_root', ''),
                             role) or path
+                    if editable_role and record.get('operation') in (
+                            'replace_collection', 'delete_collection'):
+                        resident_ids = sorted(self._editable_resident_ids(
+                            role, record.get('target_collection_id'), committed_source))
+                        replacing_resident_ids.update(resident_ids)
+                        replacing_editable = True
+                        if record.get('operation') == 'delete_collection':
+                            deleting_editable_ids.add(
+                                (role, str(record.get('target_collection_id'))))
+                            continue
                     for source_key, pcl in loaded.items():
                         committed_id = (committed_ids or {}).get(str(source_key))
                         if (editable_role and committed_id is not None
@@ -4449,20 +4471,6 @@ class FitContext:
                             and record.get('operation') == 'replace_collection')
                         if replacement:
                             logical_id = str(record.get('target_collection_id'))
-                            resident_ids = [
-                                pcl.get('metadata', {}).get(
-                                    'resident_collection_id', pcl.get('id'))
-                                for pcl in self.cross_patch_pcls
-                                if pcl.get('metadata', {}).get(
-                                    'logical_input_kind') == role
-                                and str(pcl.get('metadata', {}).get(
-                                    'logical_input_id')) == logical_id
-                            ]
-                            resident_ids.extend(
-                                strip.get('id')
-                                for strip in self.unattached_pcl_strips
-                                if strip.get('logical_input_kind') == role
-                                and str(strip.get('logical_input_id')) == logical_id)
                             collection_id = (resident_ids[0]
                                              if resident_ids
                                              else candidate_next_id)
@@ -4479,6 +4487,7 @@ class FitContext:
                         pcl['metadata']['resident_collection_id'] = collection_id
                         if replacement:
                             pcl['metadata'].update({
+                                'committed_source_file': committed_source,
                                 'logical_input_kind': role,
                                 'logical_input_id': logical_id,
                                 'logical_input_revision': record.get(
@@ -4562,8 +4571,7 @@ class FitContext:
                     cid: pcl for cid, pcl in
                     getattr(self, 'regular_pcl_catalog', {}).items()
                     if cid not in new_regular_collections
-                    and _logical_identity(pcl.get('metadata', {}))
-                    not in deleting_editable_ids
+                    and cid not in replacing_resident_ids
                 }
                 fiber_by_cid = {
                     pcl['id']: pcl
@@ -4640,18 +4648,11 @@ class FitContext:
                     retained_strips = [strip for strip, _ in retained]
                     retained_strip_groups = [group for _, group in retained]
                 if replacing_editable:
-                    replacing_ids = {
-                        _logical_identity(pcl.get('metadata', {}))
-                        for pcl in new_regular_collections.values()
-                        if pcl.get('metadata', {}).get(
-                            'logical_input_kind') in EDITABLE_PCL_ROLE_VALUES
-                    }
-                    replacing_ids.update(deleting_editable_ids)
                     (retained_cross_patch, retained_strips,
                      retained_strip_groups) = _without_regular_records(
                         retained_cross_patch, retained_strips,
                         retained_strip_groups,
-                        lambda identity, _: identity in replacing_ids)
+                        lambda _, resident_id: resident_id in replacing_resident_ids)
                 if new_fibers or fiber_relinked:
                     retained_cross_patch = [
                         pcl for pcl in retained_cross_patch
@@ -4742,8 +4743,7 @@ class FitContext:
                     for cid in [
                             cid for cid, pcl in
                             getattr(self, 'regular_pcl_catalog', {}).items()
-                            if _logical_identity(pcl.get('metadata', {}))
-                            in replacing_ids]:
+                            if cid in replacing_resident_ids]:
                         del self.regular_pcl_catalog[cid]
                 if not hasattr(self, 'regular_pcl_catalog'):
                     self.regular_pcl_catalog = {}
