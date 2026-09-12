@@ -780,3 +780,107 @@ loss. The fitter then loads the conventional `fiber_directions.npz` artifact
 and samples `sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
+
+## Fiber classification
+
+Each fiber strip is tagged at load time (`spiral_helpers.classify_fiber_hv`):
+VC3D's manual H/V tag wins, then its automatic tag when the recorded certainty
+reaches `pcl_vertical_fiber_min_auto_certainty`, then a geometric fallback that
+calls a strip vertical when its z extent is at least
+`pcl_vertical_fiber_min_z_fraction` of its path length. The fit log reports the
+vertical / horizontal / untagged split.
+
+## Vertical-fiber radial offset
+
+Papyrus carries its horizontal fibers on the front face of the sheet (the face
+toward the umbilicus and the lower-winding neighbour) and its vertical fibers
+on the back face, so the two fiber classes sit a few voxels apart along the
+sheet normal and at most one of them can lie on the face the fit targets. The
+strip losses read every fiber as lying *on* the fitted winding, which leaves a
+permanent residual on vertical strips and on every vertical-to-horizontal link
+junction. With `pcl_vertical_fiber_radial_offset_enabled` set, vertical strips
+(as classified by `spiral_helpers.classify_fiber_hv`, see above) carry a
+per-point target offset of `pcl_vertical_fiber_radial_offset_voxels` (default
+4, positive = outward) along the sheet normal of the fitted spiral (the
+scan-space gradient of the fitted winding, not the straight line to the
+umbilicus): the radius loss, the whole-strip DT target, the DT snap, and the
+satisfaction metric all expect those points that far outside the winding, on
+its back face, instead of on it. Horizontal strips and regular point
+collections are never offset.
+
+The offset is a physical scroll-space distance, not a spiral-space constant.
+In spiral space the fitted sheet's normal is the radial direction, so the
+offset acts on the shifted radius, but the scroll-to-spiral map is not an
+isometry (the gap expander rescales the radial coordinate per gap and the flow
+stretches locally), so each point's offset is multiplied by the transform's
+local stretch along the sheet normal, `|J^T n|`
+(`sample_spiral.get_radial_normal_stretch`; the same `J^T` covector transport
+the dense-normals loss uses). `J^T n` is the scan-space gradient of the fitted
+winding, so a positive offset displaces the expected fiber position along it:
+the increasing-winding direction of the fitted spiral at that point, away from
+the umbilicus, which coincides with the line from the umbilicus only where the
+sheet happens to be perpendicular to it. The loss evaluates that stretch for its sampled
+points each step under `no_grad`, the DT target cache and the satisfaction
+metric for the points they read. After a constraint bake the resident geometry
+lives in the frozen stack's output frame, so each vertical strip and fiber
+catalog point also carries `radial_offset_bake_scale`, the product of every
+frozen epoch's normal stretch at the pre-bake point
+(`fit_spiral.accumulate_radial_offset_bake_scale`); ingested inputs pick it up
+when they are pushed through the stack, re-materialised strips inherit it from
+the catalog, and the final scroll-space export drops it because the composed
+transform's Jacobian then carries the whole stretch. The offset travels with
+the strip bundle (`radial_offsets`, resident-frame voxels after the bake
+scale) next to the winding annotations, so linked components mixing both fiber
+classes read as one winding. Unlike the other `pcl_` settings, both keys are
+Run-scoped: a Run that changes them refills every retained strip's offsets from
+its stored vertical/horizontal tag and rebuilds the strip bundle and DT target
+caches, so no fit rebuild is needed. VC3D's spiral panel exposes them as a
+checkbox and a voxel distance next to the fibers path.
+
+## Point-to-patch linking
+
+Every point of every point collection (regular PCLs and fibers) is attached to
+the patch surface it lies on when the inputs load, and again for inputs added
+to a running session. A point attaches when a patch surface is within
+`pcl_link_distance_tolerance` scroll voxels (default 2.5). General collections
+take the largest-area patch within tolerance, then the nearest;
+`between_patches__A__B` collections take the nearest of their named pair.
+Every linking setting applies at a Run boundary. The tolerance and window
+settings re-link every resident collection, regular and fiber, from the
+retained catalogs against the resident patches and re-derive all the
+point-collection views (cross-patch groups and unattached strips); the fiber
+side-rule settings below only affect fibers, so they re-link and
+re-materialise the fibers alone.
+
+`pcl_link_window_points` and `pcl_link_window_min_points` (both default 1)
+gate candidates on their neighbours: a patch the point itself lies within
+tolerance of is eligible only when at least `pcl_link_window_min_points` of the
+centred window of `pcl_link_window_points` consecutive points (id order, the
+point included) also lie within tolerance of it. Eligible candidates are ranked
+as usual, largest area then nearest, so a fiber stays on the big patch its
+neighbours share instead of hopping onto a patch only one point touches. Even
+window counts round up to the next odd count, and at a collection's ends the
+requirement is clipped to the window members available. Points already
+attached to a patch count as window members when a session relinks.
+
+`pcl_fiber_link_side_filter` keeps fibers off patches on the wrong side of the
+sheet, which is how a fiber ends up on an adjacent winding when windings touch.
+The front of a sheet faces inward, toward the umbilicus and the neighbouring
+winding with the lower winding number; horizontal fibers lie on that front
+face and vertical fibers on the back. A vertical fiber (classified as described above) therefore only attaches to a patch whose surface is
+in front of it, a horizontal fiber only to one behind it, and untagged fibers
+and regular collections are unrestricted. A hit is rejected when the projection
+foot lies more than `pcl_fiber_link_side_margin_voxels` (default 0.5) on the
+wrong side of the point along the inward direction; the margin absorbs points
+lying on the traced surface itself.
+
+No fitted transform exists when the inputs load, so the inward direction starts
+as the line to the umbilicus at the point's z, which local deformation can turn
+away from the true sheet normal. Once `pcl_fiber_link_model_direction_step`
+steps (default 10000) have completed, whether run in the session or restored
+from a checkpoint, every fiber is relinked once with the inward direction taken
+from the fitted spiral's decreasing-winding direction (the negative scan-space
+gradient of the fitted winding, `fit_spiral.inward_winding_direction`), and the
+fiber training views are re-materialised. A checkpoint from before that step
+loaded after the switch relinks back under the umbilicus direction at its first
+step.

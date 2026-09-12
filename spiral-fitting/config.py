@@ -27,6 +27,7 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
+    "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
 }
 
@@ -150,7 +151,69 @@ BACKFILLABLE_CONFIG_DEFAULTS.update({
     "model_gap_expander_capacity_windings": DEFAULT_GAP_EXPANDER_CAPACITY,
     "model_gap_expander_min_gap": 1.0,
     "model_gap_expander_softplus_bias": 4.0,
+    # Fiber classification thresholds for radial offsets and patch-side linking.
+    "pcl_vertical_fiber_min_z_fraction": 0.8,
+    "pcl_vertical_fiber_min_auto_certainty": 0.5,
+    # The vertical-fiber radial offset postdates durable checkpoints; missing
+    # means it was off.
+    "pcl_vertical_fiber_radial_offset_enabled": False,
+    "pcl_vertical_fiber_radial_offset_voxels": 4.0,
+    # Unattached-PCL (fiber) DT historically started with the verified-patch
+    # DT; missing means that coupling.
+    "loss_start_unattached_pcl_dt": None,
+    # Point-to-patch linking settings postdate durable checkpoints; missing
+    # means the historical fixed tolerance, single-point choice and no fiber
+    # side rules.
+    "pcl_link_distance_tolerance": 2.5,
+    "pcl_link_window_points": 1,
+    "pcl_link_window_min_points": 1,
+    "pcl_fiber_link_side_filter": False,
+    "pcl_fiber_link_side_margin_voxels": 0.5,
+    "pcl_fiber_link_model_direction_step": 10000,
 })
+
+_PCL_LINK_DESCRIPTIONS = {
+    "pcl_link_distance_tolerance": (
+        "Scroll voxels within which a point collection point attaches to a "
+        "patch surface at load (and on live patch/PCL incorporation). "
+        "General collections take the largest-area patch within tolerance, "
+        "then the nearest; between-patch collections the nearest of their "
+        "named pair. Changing it at a Run boundary relinks every resident "
+        "point collection and rebuilds their views."),
+    "pcl_link_window_points": (
+        "Consecutive points (id order, centred on the point, the point "
+        "included) whose hits on a candidate patch are counted for "
+        "pcl_link_window_min_points. Even counts round up to the next odd "
+        "count; 1 disables the window."),
+    "pcl_link_window_min_points": (
+        "A candidate patch (one the point itself lies within tolerance of) is "
+        "eligible only when at least this many of the window's points lie "
+        "within tolerance of it; eligible candidates are then ranked as usual "
+        "(largest area, then nearest). 1 keeps the single-point choice; the "
+        "requirement is clipped to the window members available at a "
+        "collection's ends. Must not exceed pcl_link_window_points. Changing "
+        "either window setting at a Run boundary relinks every resident "
+        "point collection."),
+    "pcl_fiber_link_side_filter": (
+        "Restrict fibers to patches on the correct side of the sheet: a "
+        "vertical fiber (on the sheet's back) only attaches to a patch whose "
+        "surface lies in front of it (inward: toward the umbilicus / the "
+        "lower-winding neighbour), a horizontal fiber (on the sheet's front) "
+        "only to one behind it. Until "
+        "pcl_fiber_link_model_direction_step steps have run the inward "
+        "direction is the line to the umbilicus; from then on (also when a "
+        "checkpoint that far along is loaded) every fiber is relinked once "
+        "along the fitted spiral's decreasing-winding direction. Changing "
+        "it at a Run boundary relinks every resident fiber."),
+    "pcl_fiber_link_side_margin_voxels": (
+        "Scroll voxels a patch surface may sit on the wrong side of a fiber "
+        "point before the side filter rejects the hit; absorbs points lying "
+        "on the traced surface itself."),
+    "pcl_fiber_link_model_direction_step": (
+        "Completed step from which the fiber side filter takes its inward "
+        "direction from the fitted winding instead of the umbilicus, "
+        "relinking every fiber once at the switch."),
+}
 
 _GAP_EXPANDER_DESCRIPTIONS = {
     "model_gap_expander_num_windings": (
@@ -268,6 +331,8 @@ _INPUT_GATE_KEYS = (frozenset(_INPUT_TOGGLE_DESCRIPTIONS)
 }
 
 _RUN_MUTABLE_PCL_KEYS = frozenset({
+    "pcl_vertical_fiber_radial_offset_enabled",
+    "pcl_vertical_fiber_radial_offset_voxels",
     "pcl_rel_winding_adjacent_patches_only",
     "pcl_stratified_pcl_sampling",
     "pcl_sampling_weights",
@@ -275,6 +340,18 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_use_pending_fiber_links",
     "pcl_unattached_pcl_min_point_spacing",
     "pcl_fiber_min_point_spacing",
+    # The fiber link side rules relink every resident fiber (the fiber
+    # catalog is re-linked against the resident patches and its views
+    # re-materialised); see FitContext._relink_fibers_to_patches. The
+    # tolerance and window settings relink every resident collection, regular
+    # and fiber, and re-derive every view from the retained catalogs; see
+    # FitContext._relink_all_points_to_patches.
+    "pcl_fiber_link_side_filter",
+    "pcl_fiber_link_side_margin_voxels",
+    "pcl_fiber_link_model_direction_step",
+    "pcl_link_distance_tolerance",
+    "pcl_link_window_points",
+    "pcl_link_window_min_points",
 })
 
 NEW_FIT_KEYS = frozenset(
@@ -282,7 +359,8 @@ NEW_FIT_KEYS = frozenset(
     | _MODEL_STRUCTURE_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
-    | {"optimizer_random_seed"}
+    | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
+       "pcl_vertical_fiber_min_z_fraction"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_")
@@ -375,6 +453,8 @@ def _field_spec(key, default):
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
                     "dt_target_update_interval",
+                    "pcl_link_window_points",
+                    "pcl_link_window_min_points",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
@@ -398,6 +478,8 @@ def _field_spec(key, default):
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     elif key in _GAP_EXPANDER_DESCRIPTIONS:
         spec["description"] = _GAP_EXPANDER_DESCRIPTIONS[key]
+    elif key in _PCL_LINK_DESCRIPTIONS:
+        spec["description"] = _PCL_LINK_DESCRIPTIONS[key]
     return spec
 
 
@@ -521,6 +603,25 @@ class Config:
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
+        # Point-to-patch linking (point_collection.link_points_to_patches;
+        # see _PCL_LINK_DESCRIPTIONS). Every point attaches to a patch surface
+        # within this many scroll voxels; window_min_points > 1 additionally
+        # requires that many of a centred window of window_points consecutive
+        # points to lie within tolerance of a candidate before it is eligible.
+        self.pcl_link_distance_tolerance = 2.5
+        self.pcl_link_window_points = 1
+        self.pcl_link_window_min_points = 1
+        # Fiber side rules: vertical fibers (on the sheet's back) attach only
+        # to patches in front of them (inward, toward the umbilicus / lower
+        # winding), horizontal fibers (on the sheet's front) only to patches
+        # behind them, each with a margin for points on the surface itself.
+        # The inward direction comes from the umbilicus until
+        # pcl_fiber_link_model_direction_step steps have run, then from the
+        # fitted winding (every fiber relinks once at the switch, or at the
+        # first step after loading a checkpoint that far along).
+        self.pcl_fiber_link_side_filter = False
+        self.pcl_fiber_link_side_margin_voxels = 0.5
+        self.pcl_fiber_link_model_direction_step = 10000
         # Cross-fiber links ("branches"): same-winding continuations between
         # fibers. When on, linked collections merge into per-component
         # cross-patch pcls with an explicit fiber graph (winding ties propagate
@@ -532,6 +633,29 @@ class Config:
         self.pcl_use_fiber_links = True
         # Include unapproved (pending) links.
         self.pcl_use_pending_fiber_links = False
+        # Vertical/horizontal classification of fiber strips, used for radial
+        # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
+        # tag when the recorded certainty (0..1) reaches the threshold, then a
+        # geometric fallback: a strip whose z extent is at least this fraction
+        # of its path length is vertical.
+        self.pcl_vertical_fiber_min_z_fraction = 0.8
+        self.pcl_vertical_fiber_min_auto_certainty = 0.5
+        # Vertical fibers lie on the back face of the papyrus sheet (the face
+        # away from the umbilicus), a few voxels off the horizontal-fiber
+        # front face the fit targets, along the sheet normal in the
+        # increasing-winding direction of the fitted spiral (the scan-space
+        # winding gradient, not the line to the umbilicus). When enabled,
+        # vertical strips' radius and DT targets sit this many scroll voxels
+        # along that normal outside the winding instead of on it (positive =
+        # increasing winding), so a vertical fiber is satisfied where it
+        # physically is. The
+        # distance is physical: it is converted to spiral radius per point by
+        # the transform's local stretch along the normal (and, after a
+        # constraint bake, by the frozen stack's accumulated stretch), not
+        # applied as a constant in spiral space. Horizontal strips are
+        # untouched.
+        self.pcl_vertical_fiber_radial_offset_enabled = False
+        self.pcl_vertical_fiber_radial_offset_voxels = 4.0
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -631,6 +755,9 @@ class Config:
         self.loss_start_patch_dt = 25000
         self.loss_start_track_dt = 25000
         self.loss_start_unverified_patch_dt = None
+        # First iteration after which the unattached-PCL (fiber strip) DT snap
+        # acts. None follows loss_start_patch_dt, the historical coupling.
+        self.loss_start_unattached_pcl_dt = None
         self.dt_progressive_windings = False
         self.dt_progressive_inner_winding = 20
         self.dt_progressive_steps = 50000

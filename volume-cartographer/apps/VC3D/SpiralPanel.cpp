@@ -298,6 +298,40 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsForm->addRow(tr("PCLs"), pclContainer);
 
     addPathRow(pathsForm, "fibers", tr("Fibers"), true);
+
+    // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
+    // expect them a few voxels radially outside the winding it fits to the
+    // horizontal-fiber face. Both values are pcl_ inputs on the service side and
+    // take effect when the fit is initialized or rebuilt.
+    auto* verticalOffset = new QWidget(pathsContents);
+    auto* verticalOffsetLayout = new QHBoxLayout(verticalOffset);
+    verticalOffsetLayout->setContentsMargins(0, 0, 0, 0);
+    _verticalFiberOffsetEnabled =
+        new QCheckBox(tr("Offset vertical fibers behind the sheet by"), verticalOffset);
+    _verticalFiberOffsetEnabled->setObjectName(
+        QStringLiteral("spiralVerticalFiberOffsetEnabled"));
+    _verticalFiberOffsetEnabled->setChecked(false);
+    _verticalFiberOffsetEnabled->setToolTip(
+        tr("Vertical fibers sit on the back face of the sheet. When checked, the fit "
+           "expects vertical fiber strips this many voxels radially outside the fitted "
+           "winding instead of on it (pcl_vertical_fiber_radial_offset_*). Horizontal "
+           "fibers are unaffected. Applies at the next Run without a rebuild."));
+    _verticalFiberOffsetVoxels = new QDoubleSpinBox(verticalOffset);
+    _verticalFiberOffsetVoxels->setObjectName(
+        QStringLiteral("spiralVerticalFiberOffsetVoxels"));
+    _verticalFiberOffsetVoxels->setRange(0.0, 100.0);
+    _verticalFiberOffsetVoxels->setDecimals(1);
+    _verticalFiberOffsetVoxels->setSingleStep(0.5);
+    _verticalFiberOffsetVoxels->setValue(4.0);
+    _verticalFiberOffsetVoxels->setSuffix(tr(" vx"));
+    _verticalFiberOffsetVoxels->setEnabled(false);
+    connect(_verticalFiberOffsetEnabled, &QCheckBox::toggled,
+            _verticalFiberOffsetVoxels, &QWidget::setEnabled);
+    verticalOffsetLayout->addWidget(_verticalFiberOffsetEnabled);
+    verticalOffsetLayout->addWidget(_verticalFiberOffsetVoxels);
+    verticalOffsetLayout->addStretch(1);
+    pathsForm->addRow(verticalOffset);
+
     addPathRow(pathsForm, "tracks_dbm", tr("Tracks DBM"), false);
 
     _trackLengthBinSampling = new QCheckBox(tr("Sample tracks by length bins"), pathsContents);
@@ -1450,6 +1484,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
+    connect(_verticalFiberOffsetEnabled, &QCheckBox::toggled, this,
+            [this](bool) { refreshReloadRequired(); });
+    connect(_verticalFiberOffsetVoxels, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
         refreshReloadRequired();
     });
@@ -1876,6 +1914,15 @@ QJsonObject SpiralPanel::sessionRequest() const
     // built from unless the checkpoint section replaces it.
     paths["checkpoint"] = _sessionCheckpoint;
     QJsonObject config = sessionAdvancedConfig();
+    // Dedicated controls override the profile for their keys. A checkpoint
+    // session keeps the checkpoint's own durable configuration (see
+    // sessionAdvancedConfig), so they are not injected there.
+    if (_sessionCheckpoint.isEmpty()) {
+        config[QStringLiteral("pcl_vertical_fiber_radial_offset_enabled")] =
+            _verticalFiberOffsetEnabled->isChecked();
+        config[QStringLiteral("pcl_vertical_fiber_radial_offset_voxels")] =
+            _verticalFiberOffsetVoxels->value();
+    }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
                     {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
@@ -1965,6 +2012,14 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
         else
             ++it;
     }
+    // The dedicated vertical-fiber offset controls override the profile for
+    // their keys, as they do in sessionRequest(). The run-boundary filter
+    // below drops them again against a service that still advertises them
+    // as prepared-input settings.
+    config[QStringLiteral("pcl_vertical_fiber_radial_offset_enabled")] =
+        _verticalFiberOffsetEnabled->isChecked();
+    config[QStringLiteral("pcl_vertical_fiber_radial_offset_voxels")] =
+        _verticalFiberOffsetVoxels->value();
     // A Run may alter only fields advertised as run-boundary settings.  The
     // editor also contains structural fields (dense_spacing_mode, z range,
     // model shape, input preparation, ...); sending stale profile values for
@@ -2045,6 +2100,20 @@ void SpiralPanel::writeTrackSamplingControlsToAdvanced()
     refreshReloadRequired();
 }
 
+void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig)
+{
+    const QSignalBlocker enabledBlocker(_verticalFiberOffsetEnabled);
+    const QSignalBlocker voxelsBlocker(_verticalFiberOffsetVoxels);
+    const bool enabled = effectiveConfig
+        .value(QStringLiteral("pcl_vertical_fiber_radial_offset_enabled"))
+        .toBool(false);
+    _verticalFiberOffsetEnabled->setChecked(enabled);
+    _verticalFiberOffsetVoxels->setValue(effectiveConfig
+        .value(QStringLiteral("pcl_vertical_fiber_radial_offset_voxels"))
+        .toDouble(4.0));
+    _verticalFiberOffsetVoxels->setEnabled(enabled);
+}
+
 void SpiralPanel::updateTrackSamplingUi()
 {
     const bool tracksEnabled =
@@ -2120,6 +2189,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _savePngVisualizations->setChecked(
         effectiveConfig.value(QStringLiteral("output_save_png_visualizations"))
             .toBool(false));
+    syncVerticalFiberOffsetControls(effectiveConfig);
     syncTrackSamplingControlsFromAdvanced();
     if (!activeRunConfig.isEmpty())
         applySessionRunConfig(activeRunConfig, sessionGeneration);
@@ -2215,6 +2285,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             effectiveConfig
                 .value(QStringLiteral("output_save_png_visualizations"))
                 .toBool(false));
+        syncVerticalFiberOffsetControls(effectiveConfig);
         syncTrackSamplingControlsFromAdvanced();
         _applyingResolution = false;
         applySessionRunConfig(runConfig, sessionGeneration);
@@ -2562,6 +2633,10 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
     settings.setValue(prefix + "output_save_png_visualizations", _savePngVisualizations->isChecked());
+    settings.setValue(prefix + "vertical_fiber_offset_enabled",
+                      _verticalFiberOffsetEnabled->isChecked());
+    settings.setValue(prefix + "vertical_fiber_offset_voxels",
+                      _verticalFiberOffsetVoxels->value());
     settings.setValue(prefix + "influence_enabled", _influenceEnabled->isChecked());
     settings.setValue(prefix + "influence_z", _influenceZ->value());
     settings.setValue(prefix + "influence_windings", _influenceWindings->value());
@@ -2623,6 +2698,11 @@ void SpiralPanel::restore()
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(
         settings.value(valuePrefix + "output_save_png_visualizations", false).toBool());
+    _verticalFiberOffsetEnabled->setChecked(
+        settings.value(valuePrefix + "vertical_fiber_offset_enabled", false).toBool());
+    _verticalFiberOffsetVoxels->setValue(
+        settings.value(valuePrefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
+    _verticalFiberOffsetVoxels->setEnabled(_verticalFiberOffsetEnabled->isChecked());
     _influenceEnabled->setChecked(settings.value(valuePrefix + "influence_enabled", false).toBool());
     _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
     _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
