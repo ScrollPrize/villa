@@ -74,7 +74,8 @@ def evaluate_frozen(selection, template, output):
     """Single shared invocation path, retaining managed evaluator admission."""
     workload = json.loads((ROOT / template).read_text())
     workload.update(checkpoint=selection['frozen'], checkpoint_sha256=selection['sha256'], output_root=str(output))
-    workload['evaluation']['inference_cache_namespace'] = output.name
+    workload['evaluation']['inference_cache_namespace'] = 'eval-' + hashlib.sha256(
+        str(output.resolve()).encode()).hexdigest()[:48]
     config = output / 'workload.json'
     config.write_text(json.dumps(workload, indent=2))
     (output / 'selection.json').write_text(json.dumps(selection, indent=2))
@@ -115,13 +116,19 @@ def freeze_ema_selection(run, filename, decay, cache):
 def trace_series_prepare():
     from villa_gpu_manager.processes import process_state
     settings = json.loads(CONTROL.read_text())['trace_series']
+    available = {name: (name, filename, decay) for name, filename, decay in EMA_SERIES}
+    variants = settings.get('variants', list(available))
+    if (not isinstance(variants, list) or not variants or
+            any(not isinstance(name, str) or name not in available for name in variants) or
+            len(set(variants)) != len(variants)):
+        raise ValueError('variants must be a nonempty unique list of supported EMA names')
     identity = json.loads((Path(settings['launch']) / 'controller.json').read_text())
     if process_state(identity, os.getuid()) != 'alive':
         raise RuntimeError('expected live training root; no automatic restart')
     root = Path(settings['output'])
     root.mkdir(parents=True, exist_ok=False)
     entries = []
-    for name, filename, decay in EMA_SERIES:
+    for name, filename, decay in (available[name] for name in variants):
         selection = freeze_ema_selection(Path(settings['run']), filename, decay, root / 'frozen')
         entries.append(dict(name=name, status='pending', selection=selection))
         print(f'frozen {name}: {selection}', flush=True)
@@ -130,7 +137,7 @@ def trace_series_prepare():
     (root / 'series.json').write_text(json.dumps(state, indent=2))
 
 
-def trace_series_next():
+def trace_series_next(*, retry_failed=False):
     from villa_gpu_manager.processes import process_state
     from fiber3d_comparison_report import series_report
     root = Path(json.loads(CONTROL.read_text())['trace_series']['output'])
@@ -138,15 +145,23 @@ def trace_series_next():
     state = json.loads(path.read_text())
     entry = next((e for e in state['entries'] if e['status'] != 'done'), None)
     if entry is None:
-        print('all three evaluations complete', flush=True)
+        print('all configured evaluations complete', flush=True)
         return
-    if entry['status'] != 'pending':
+    if retry_failed and entry['status'] != 'failed':
+        raise RuntimeError('explicit retry requires a failed evaluation')
+    if entry['status'] != 'pending' and not retry_failed:
         raise RuntimeError('previous evaluation interrupted/failed; inspect before retrying')
     if process_state(state['training_identity'], os.getuid()) != 'alive':
         raise RuntimeError('training root is no longer alive; no automatic restart')
     output = root / entry['name']
+    if retry_failed:
+        attempts = entry.setdefault('failed_attempts', [])
+        attempts.append(dict(output=entry.get('attempt_output', str(output)), error=entry.get('error')))
+        output = root / f"{entry['name']}-retry{len(attempts)}"
     output.mkdir(exist_ok=False)
     entry['status'] = 'running'
+    entry['attempt_output'] = str(output)
+    entry.pop('error', None)
     path.write_text(json.dumps(state, indent=2))
     try:
         evaluate_frozen(entry['selection'], state['settings']['template'], output)
@@ -651,7 +666,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -667,6 +682,8 @@ def main():
         trace_series_prepare()
     elif args.command == 'trace-series-next':
         trace_series_next()
+    elif args.command == 'trace-series-retry':
+        trace_series_next(retry_failed=True)
     elif args.command == 'production-start':
         production_start()
     elif args.command == 'production-status':

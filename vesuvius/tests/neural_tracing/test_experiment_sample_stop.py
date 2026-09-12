@@ -172,13 +172,17 @@ def test_exact_ema_freeze_reads_metadata_from_frozen_copy(runner, monkeypatch, t
         runner.freeze_ema_selection(tmp_path, 'best_ema_0p99.pt', .99, tmp_path)
 
 
-def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path):
+@pytest.mark.parametrize('variants', [None, ['best99', 'best999']])
+def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path, variants):
     import villa_gpu_manager.processes as processes
     launch = tmp_path / 'launch'
     launch.mkdir()
     (launch / 'controller.json').write_text('{"pid":123}')
     control = tmp_path / 'control.json'
-    control.write_text(json.dumps({'trace_series':dict(launch=str(launch), run='run', output=str(tmp_path / 'series'))}))
+    settings = dict(launch=str(launch), run='run', output=str(tmp_path / 'series'))
+    if variants is not None:
+        settings['variants'] = variants
+    control.write_text(json.dumps({'trace_series':settings}))
     monkeypatch.setattr(runner, 'CONTROL', control)
     monkeypatch.setattr(processes, 'process_state', lambda *a: 'alive')
     seen = []
@@ -190,10 +194,24 @@ def test_series_prepares_all_exact_variants_without_training_mutations(runner, m
     monkeypatch.setattr(runner, 'stop_production_identity', stop)
     monkeypatch.setattr(runner, 'production_start', start)
     runner.trace_series_prepare()
-    assert seen == [('current_ema_0p999.pt', .999), ('best_ema_0p999.pt', .999), ('best_ema_0p99.pt', .99)]
-    assert [e['status'] for e in json.loads((tmp_path / 'series/series.json').read_text())['entries']] == ['pending'] * 3
+    expected = ([('current_ema_0p999.pt', .999), ('best_ema_0p999.pt', .999), ('best_ema_0p99.pt', .99)]
+                if variants is None else [('best_ema_0p99.pt', .99), ('best_ema_0p999.pt', .999)])
+    assert seen == expected
+    assert [e['status'] for e in json.loads((tmp_path / 'series/series.json').read_text())['entries']] == ['pending'] * len(expected)
     stop.assert_not_called()
     start.assert_not_called()
+
+
+@pytest.mark.parametrize('variants', [[], ['best99', 'best99'], ['typo'], 'best99', [[]]])
+def test_series_invalid_variants_fail_before_freezing(runner, monkeypatch, tmp_path, variants):
+    control = tmp_path / 'control.json'
+    control.write_text(json.dumps({'trace_series':{'variants':variants}}))
+    monkeypatch.setattr(runner, 'CONTROL', control)
+    freeze = Mock(side_effect=AssertionError('must not freeze'))
+    monkeypatch.setattr(runner, 'freeze_ema_selection', freeze)
+    with pytest.raises(ValueError, match='variants'):
+        runner.trace_series_prepare()
+    freeze.assert_not_called()
 
 
 @pytest.mark.parametrize('fail', [False, True])
@@ -225,11 +243,36 @@ def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path
         with pytest.raises(RuntimeError, match='interrupted/failed'):
             runner.trace_series_next()
         assert [e['status'] for e in json.loads(path.read_text())['entries']] == ['failed', 'pending', 'pending']
+        fail = False
+        runner.trace_series_next(retry_failed=True)
+        recovered = json.loads(path.read_text())['entries'][0]
+        assert recovered['status'] == 'done'
+        assert recovered['selection'] == state['entries'][0]['selection']
+        assert recovered['failed_attempts'][0]['output'] == str(tmp_path / 'current999')
+        assert recovered['output'] == str(tmp_path / 'current999-retry1')
+        assert (tmp_path / 'current999').is_dir()
+        with pytest.raises(RuntimeError, match='requires a failed'):
+            runner.trace_series_next(retry_failed=True)
     else:
         runner.trace_series_next()
         runner.trace_series_next()
         assert called == ['current999', 'best999']
         assert [e['status'] for e in json.loads(path.read_text())['entries']] == ['done', 'done', 'pending']
+
+
+def test_evaluation_cache_names_include_series_directory(runner, monkeypatch, tmp_path):
+    template = tmp_path / 'template.json'
+    template.write_text(json.dumps({'evaluation': {}}))
+    monkeypatch.setattr(runner.subprocess, 'run', Mock())
+    selection = dict(frozen='snapshot.pt', sha256='digest', selected={})
+    namespaces = []
+    for series in ('first', 'second'):
+        output = tmp_path / series / 'best99'
+        output.mkdir(parents=True)
+        runner.evaluate_frozen(selection, str(template), output)
+        namespaces.append(json.loads((output / 'workload.json').read_text())['evaluation']['inference_cache_namespace'])
+    assert namespaces[0] != namespaces[1]
+    assert all(len(n) <= 64 for n in namespaces)
 
 
 def test_equal_scroll_report_and_bolding(runner, monkeypatch):

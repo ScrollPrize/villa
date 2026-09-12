@@ -45,7 +45,8 @@ def comparison_markdown(rows):
     lines = ['# Equal-scroll tracing comparison', '',
              'Overall score: arithmetic mean of the five per-scroll means, **20% each**.',
              'Lengths are mm. Best/tied values are bold; old pooled overall scores are omitted.',
-             'Classic is longer-trained; earlier modern rows use best checkpoints by600k.',
+             'Classic is longer-trained; NML/JSON/Combined raw/EMA rows use the600k cutoff.',
+             'Prior EMA series and new EMA rows use their separately recorded later-run checkpoints.',
              'New EMA rows are frozen from the later training run; checkpoint ages are listed below.', '',
              '## Overall', '', '| Model | Equal-scroll score ↑ |', '|---|---:|']
     for row, score in zip(rows, scores):
