@@ -11,13 +11,15 @@ namespace vc3d::surface_rotation
 constexpr float kMinimumAngleDegrees = 0.01f;
 
 struct TransformPersistenceCompatibility {
+    bool isImmutableCatalogSegment{false};
     bool hasMultipageMask{false};
     bool maskInspectionFailed{false};
     bool hasDisconnectedComponents{false};
 
     [[nodiscard]] bool allowed() const
     {
-        return !hasMultipageMask && !maskInspectionFailed && !hasDisconnectedComponents;
+        return !isImmutableCatalogSegment && !hasMultipageMask &&
+               !maskInspectionFailed && !hasDisconnectedComponents;
     }
 };
 
@@ -57,6 +59,8 @@ inline void inspectMaskForTransformPersistence(
     TransformPersistenceCompatibility compatibility;
     compatibility.hasDisconnectedComponents = hasDisconnectedComponents;
     if (!surfacePath.empty()) {
+        compatibility.isImmutableCatalogSegment =
+            std::filesystem::is_regular_file(surfacePath / "catalog-origin.json");
         inspectMaskForTransformPersistence(surfacePath / "mask.tif", compatibility);
         inspectMaskForTransformPersistence(surfacePath / "multilayer_mask.tif", compatibility);
     }

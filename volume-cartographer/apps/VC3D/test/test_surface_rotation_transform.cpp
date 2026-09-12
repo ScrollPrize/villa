@@ -151,16 +151,32 @@ private slots:
     void blocksTransformPersistenceForUnsupportedSurfaceFeatures()
     {
         const vc3d::surface_rotation::TransformPersistenceCompatibility supported;
-        const vc3d::surface_rotation::TransformPersistenceCompatibility mask{true, false, false};
-        const vc3d::surface_rotation::TransformPersistenceCompatibility inspectionFailure{false, true, false};
-        const vc3d::surface_rotation::TransformPersistenceCompatibility components{false, false, true};
-        const vc3d::surface_rotation::TransformPersistenceCompatibility all{true, true, true};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility immutable{true, false, false, false};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility mask{false, true, false, false};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility inspectionFailure{false, false, true, false};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility components{false, false, false, true};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility all{true, true, true, true};
 
         QVERIFY(supported.allowed());
+        QVERIFY(!immutable.allowed());
         QVERIFY(!mask.allowed());
         QVERIFY(!inspectionFailure.allowed());
         QVERIFY(!components.allowed());
         QVERIFY(!all.allowed());
+    }
+
+    void blocksPersistenceForImmutableCatalogSegment()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+        const std::filesystem::path root{temporaryDirectory.path().toStdString()};
+
+        std::ofstream(root / "catalog-origin.json") << "{}";
+        const auto compatibility =
+            vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+
+        QVERIFY(compatibility.isImmutableCatalogSegment);
+        QVERIFY(!compatibility.allowed());
     }
 
     void detectsActualMaskPageCount()

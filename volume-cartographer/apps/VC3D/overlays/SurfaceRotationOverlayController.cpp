@@ -63,6 +63,11 @@ vc3d::surface_rotation::TransformPersistenceCompatibility surfaceTransformPersis
 
 QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
 {
+    if (compatibility.isImmutableCatalogSegment) {
+        return QObject::tr(
+            "Apply is unavailable for immutable Open Data catalog segments. "
+            "Create an editable copy first.");
+    }
     if (compatibility.maskInspectionFailed) {
         return QObject::tr(
             "Apply is unavailable because a mask TIFF could not be inspected safely.");
@@ -649,6 +654,19 @@ void SurfaceRotationOverlayController::applyRotation()
 
     if (!hasFileMetadata(_sourceSurface)) {
         QMessageBox::warning(nullptr, tr("Surface Transform Failed"), tr("Failed to save the transformed surface: the selected surface is missing file metadata."));
+        return;
+    }
+
+    // The menu materializes catalog segments before preview. Keep this final
+    // check here as well so another caller or a stale source can never write
+    // into the immutable Open Data cache.
+    if (surfaceTransformPersistenceCompatibility(_sourceSurface)
+            .isImmutableCatalogSegment) {
+        QMessageBox::warning(
+            nullptr,
+            tr("Open Data Segment"),
+            tr("This catalog segment is immutable. Create an editable copy "
+               "before applying the transform."));
         return;
     }
 

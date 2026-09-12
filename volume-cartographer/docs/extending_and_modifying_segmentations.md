@@ -4,11 +4,11 @@ This is relatively untested, but (should) work. It's possible to easily create r
 
 **rotate and flip a surface**
 
-Select a segmentation, then open `Actions > Transforms > Rotate`. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation and flip preview remain available for surfaces with multipage `mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
+Select a segmentation, then open `Actions > Transforms > Rotate`. For an immutable Open Data catalog segment, VC3D first asks you to create or choose an editable copy and leaves the catalog cache unchanged. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation and flip preview remain available for surfaces with multipage `mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
 
-The captures below use sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog.
+The captures below were made with an earlier build using sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog. They demonstrate the transform output; current builds first create or select an editable copy for immutable catalog segments.
 
-| Original | Preview: 37° + horizontal flip | Persisted after Apply |
+| Original | Preview: 37° + horizontal flip | Transformed result after Apply (earlier build) |
 | --- | --- | --- |
 | ![Original real-scroll surface](imgs/surface-transform-real-scroll-before.png) | ![Real-scroll transform preview](imgs/surface-transform-real-scroll-preview.png) | ![Persisted real-scroll transform](imgs/surface-transform-real-scroll-after.png) |
 
