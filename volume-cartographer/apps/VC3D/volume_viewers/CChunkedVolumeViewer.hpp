@@ -111,6 +111,11 @@ public:
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
+    // Pins the camera's surface Y: pans move only along X, zooms are anchored
+    // on that row, and resets, centering and applied camera states land back
+    // on it. Enforced in syncCameraTransform(), i.e. before any render is
+    // submitted or repainted, so no frame is ever shown off the pinned row.
+    void setPinnedSurfaceY(std::optional<float> surfaceY);
     void applyCameraStateForReplayRepaint(const CameraState& state);
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
@@ -599,6 +604,7 @@ private:
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
+    std::optional<float> _pinnedSurfacePtrY;
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;

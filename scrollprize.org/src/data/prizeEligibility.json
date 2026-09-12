@@ -13,5 +13,30 @@
     { "scroll": "PHerc1218", "volume": "20250521120456" },
     { "scroll": "PHerc1447", "volume": "20250521151220" },
     { "scroll": "PHerc1545", "volume": "20250821151648" }
+  ],
+  "first-letters-2027": [
+    { "scroll": "PHerc0125", "volume": "20250821151825" },
+    { "scroll": "PHerc0175A", "volume": "20250521115057" },
+    { "scroll": "PHerc0175B", "volume": "20250521125822" },
+    { "scroll": "PHerc0191", "volume": "20250821151635" },
+    { "scroll": "PHerc0211", "volume": "20250821151803" },
+    { "scroll": "PHerc0257", "volume": "20250821151750" },
+    { "scroll": "PHerc0268", "volume": "20251110183117" },
+    { "scroll": "PHerc0306B", "volume": "20250521133212" },
+    { "scroll": "PHerc0343", "volume": "20250521140437" },
+    { "scroll": "PHerc0358", "volume": "20250821151737" },
+    { "scroll": "PHerc0483A", "volume": "20250521140913" },
+    { "scroll": "PHerc0483B", "volume": "20251124083638" },
+    { "scroll": "PHerc0490A", "volume": "20250521151210" },
+    { "scroll": "PHerc0490B", "volume": "20250521151215" },
+    { "scroll": "PHerc0800", "volume": "20250521135224" },
+    { "scroll": "PHerc0813", "volume": "20250821151723" },
+    { "scroll": "PHerc0826", "volume": "20250821151701" },
+    { "scroll": "PHerc0846A", "volume": "20250728152254" },
+    { "scroll": "PHerc0846B", "volume": "20250804142305" },
+    { "scroll": "PHerc1203", "volume": "20250820131727" },
+    { "scroll": "PHerc1218", "volume": "20250521120456" },
+    { "scroll": "PHerc1447", "volume": "20250521151220" },
+    { "scroll": "PHerc1545", "volume": "20250821151648" }
   ]
 }

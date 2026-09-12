@@ -91,11 +91,10 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
         settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                        viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
     {
-        const QString stored =
-            settings.value(viewer::REMOTE_CACHE_DIR).toString();
-        const QString active = vc3d::remoteCachePath(stored);
-        edtRemoteCachePath->setText(active);
-        _activeRemoteCacheRoot = active.toStdString();
+        const QString configured =
+            settings.value(viewer::REMOTE_CACHE_DIR).toString().trimmed();
+        edtRemoteCachePath->setText(
+            configured.isEmpty() ? vc3d::remoteCachePath() : configured);
     }
     spinRemoteCacheMaximumGiB->setValue(static_cast<int>(settings.value(
         perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong()));
@@ -267,7 +266,7 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
-    settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+    settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text().trimmed());
     settings.setValue(
         perf::REMOTE_CACHE_DELTA3D,
         _remoteCacheDelta3dCheckBox->isChecked());
@@ -284,13 +283,13 @@ void SettingsDialog::accept()
         automaticDownloads);
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
+    settings.sync();
     constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
     vc::render::PersistentZarrCacheBudget::Limits limits;
     if (spinRemoteCacheMaximumGiB->value() > 0)
         limits.maximumBytes = static_cast<std::uint64_t>(spinRemoteCacheMaximumGiB->value()) * gib;
     limits.minimumFreeBytes =
         static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
-    vc::render::PersistentZarrCacheBudget::configure(_activeRemoteCacheRoot, limits);
     vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
 
     // Per-segment backup count: persist and apply live (no restart needed).

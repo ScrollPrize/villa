@@ -121,6 +121,7 @@ private:
     bool _scrollPanDisabled = false;
     bool _sceneWidgetMouseCapture = false;
     int _wheelAccum = 0;  // fractional wheel delta accumulator
+    Qt::KeyboardModifiers _wheelAccumModifiers = Qt::NoModifier;  // modifiers _wheelAccum was gathered under
     mutable QFont _cachedFont;
     mutable bool _scalebarCacheDirty = true;
     mutable double _cachedBarPx = 0;

@@ -4,7 +4,8 @@ import math
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import numpy as np
 from dtypes import numpy_float_hi
@@ -12,11 +13,122 @@ import torch
 import torch.nn.functional as F
 import zarr
 
-from lasagna_volume import LasagnaVolume
+from lasagna_volume import ChannelGroup, LasagnaVolume
 
 # --- Chunk sampling statistics ---
 CHUNK_STATS_ENABLED = False
 _CHUNK_SIZE = 32
+
+
+@dataclass(frozen=True)
+class StreamingZarrSource:
+	"""A complete local Zarr array or the authoritative remote catalog array."""
+
+	zarr_path: str
+	remote: bool = False
+
+
+def _safe_relative_zarr_key(raw_path: str) -> tuple[str, ...]:
+	"""Return a catalog-safe relative Zarr key without normalizing traversal."""
+
+	value = str(raw_path).strip()
+	posix = PurePosixPath(value.replace("\\", "/"))
+	windows = PureWindowsPath(value)
+	parts = posix.parts
+	if (not value or posix.is_absolute() or windows.is_absolute() or windows.drive
+			or not parts or any(part in ("", ".", "..") for part in parts)):
+		raise ValueError(f"catalog remote Zarr path must be a safe relative path: {raw_path!r}")
+	return tuple(parts)
+
+
+def _read_validated_lasagna_remote_marker(vol: LasagnaVolume) -> str:
+	"""Return the authoritative artifact URL from VC3D's adjacent marker."""
+
+	marker_path = vol.path.parent / "lasagna-remote.json"
+	try:
+		marker = json.loads(marker_path.read_text(encoding="utf-8"))
+	except FileNotFoundError as exc:
+		raise ValueError(
+			"VC3D split Lasagna cache has metadata outside the chunk tree but "
+			"no adjacent lasagna-remote.json marker; refusing to treat partial "
+			"local chunks as a complete Zarr store"
+		) from exc
+	except json.JSONDecodeError as exc:
+		raise ValueError(f"invalid VC3D lasagna-remote.json: {marker_path}") from exc
+	if not isinstance(marker, dict):
+		raise ValueError(f"VC3D lasagna-remote.json must be an object: {marker_path}")
+	manifest_file = marker.get("manifest_file")
+	if not isinstance(manifest_file, str) or not manifest_file.strip():
+		raise ValueError("VC3D lasagna-remote.json has no manifest_file")
+	if (vol.path.parent / manifest_file).resolve() != vol.path.resolve():
+		raise ValueError("VC3D lasagna-remote.json does not identify the opened manifest")
+	artifact_url = marker.get("artifact_url")
+	if not isinstance(artifact_url, str) or not artifact_url.strip():
+		raise ValueError("VC3D lasagna-remote.json has no artifact_url")
+	url = artifact_url.strip().rstrip("/")
+	parsed_url = urlsplit(url)
+	if parsed_url.scheme not in {"http", "https", "s3"} or not parsed_url.netloc:
+		raise ValueError("VC3D lasagna-remote.json artifact_url must use http, https, or s3")
+	return url
+
+
+def _join_remote_artifact_url(artifact_url: str, key_parts: tuple[str, ...]) -> str:
+	"""Append a relative Zarr key before any query or fragment component."""
+
+	parsed = urlsplit(artifact_url)
+	encoded_key = "/".join(quote(part, safe="-._~") for part in key_parts)
+	path = parsed.path.rstrip("/") + "/" + encoded_key
+	return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def resolve_streaming_zarr_source(
+	vol: LasagnaVolume, group: ChannelGroup
+) -> StreamingZarrSource:
+	"""Resolve a group without ever accepting VC3D's incomplete sparse cache.
+
+	VC3D deliberately keeps Zarr metadata under ``.lasagna-zarr-metadata`` while
+	chunk objects live in the visible sibling tree.  Opening that visible tree
+	locally would turn every not-yet-cached chunk into Zarr's fill value.  For a
+	split cache, use the marker's authoritative remote artifact instead.
+	"""
+
+	group_path = str(group.zarr_path)
+	marker_path = vol.path.parent / "lasagna-remote.json"
+	if marker_path.is_file():
+		# A VC3D marker means the artifact is authoritative.  A copied .zarray
+		# beside incomplete cached chunks would otherwise make Zarr return fills.
+		key_parts = _safe_relative_zarr_key(group_path)
+		artifact_url = _read_validated_lasagna_remote_marker(vol)
+		return StreamingZarrSource(
+			_join_remote_artifact_url(artifact_url, key_parts),
+			remote=True,
+		)
+
+	local_path = vol.path.parent / group_path
+	if any((local_path / name).is_file() for name in (".zarray", "zarr.json")):
+		return StreamingZarrSource(str(local_path), remote=False)
+
+	key_parts = _safe_relative_zarr_key(group_path)
+	metadata_root = vol.path.parent / ".lasagna-zarr-metadata" / Path(*key_parts)
+	has_split_metadata = any(
+		(metadata_root / name).is_file() for name in (".zarray", "zarr.json")
+	)
+	if not has_split_metadata:
+		# Preserve the normal local-Zarr failure when this is not a VC3D catalog cache.
+		return StreamingZarrSource(str(local_path), remote=False)
+
+	artifact_url = _read_validated_lasagna_remote_marker(vol)
+	return StreamingZarrSource(
+		_join_remote_artifact_url(artifact_url, key_parts),
+		remote=True,
+	)
+
+
+def _probe_tensorstore_zarr_shape(zarr_path: str, *, remote: bool) -> tuple[int, ...]:
+	"""Open only remote metadata so load_3d_streaming can validate its shape."""
+
+	from sparse_tensorstore_cache import probe_zarr_shape
+	return probe_zarr_shape(zarr_path, remote=remote)
 
 
 def _dilate26(t: torch.Tensor) -> torch.Tensor:
@@ -1285,11 +1397,20 @@ def load_3d_streaming(
 		if not channels:
 			continue
 
-		zarr_path = str(vol.path.parent / group.zarr_path)
-		zsrc = zarr.open(zarr_path, mode="r")
-		if not isinstance(zsrc, zarr.Array):
-			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
-		shape = tuple(int(v) for v in zsrc.shape)
+		source = resolve_streaming_zarr_source(vol, group)
+		zarr_path = source.zarr_path
+		if source.remote:
+			if _backend != "tensorstore":
+				raise ValueError(
+					"VC3D catalog split-cache fallback requires "
+					"sparse_prefetch_backend='tensorstore'"
+				)
+			shape = _probe_tensorstore_zarr_shape(zarr_path, remote=True)
+		else:
+			zsrc = zarr.open(zarr_path, mode="r")
+			if not isinstance(zsrc, zarr.Array):
+				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+			shape = tuple(int(v) for v in zsrc.shape)
 		Z, Y, X, is_3d = _validate_group_zarr_shape(
 			vol=vol,
 			group_name=group_name,
@@ -1309,6 +1430,7 @@ def load_3d_streaming(
 			cache = TensorStoreSparseChunkGroupCache(
 				channels=channels,
 				zarr_path=zarr_path,
+				remote=source.remote,
 				vol_shape_zyx=(Z, Y, X),
 				channel_indices=channel_indices,
 				is_3d_zarr=is_3d,

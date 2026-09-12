@@ -135,6 +135,7 @@ private:
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
     QJsonObject handleSegmentsFetch(const QJsonValue& params);
+    QJsonObject handleSegmentsCreateEditableCopy(const QJsonValue& params);
     // Destructive on-disk operations use the same dialog-free cores as the UI.
     QJsonObject handleSegmentsDelete(const QJsonValue& params);
     QJsonObject handleSegmentsRename(const QJsonValue& params);
