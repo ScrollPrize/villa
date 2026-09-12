@@ -1,3 +1,11 @@
+## 2026-09-12 — Live-training EMA tracing comparisons
+
+- Evaluated frozen current0.999, best0.999 and best0.99 in order on50fibers;
+  manager paused/resumed the same training root, never stopped/relaunched it.
+- Equal-scroll scores6.240/6.180/6.389mm; best0.99 narrowly leads the compared
+  models. Cumulative per-scroll reports preserve classic/600k references,
+  exact checkpoint hashes and best/tie highlights; no pooled overall score.
+
 ## 2026-09-12 — EMA and historical training observations
 
 - Optional EMA0.99/.999 with separately tested/current/best/kept exports, raw

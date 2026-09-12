@@ -65,14 +65,20 @@ def trace_evaluate(settings=None):
     output = Path(settings['output'])
     output.mkdir(parents=True, exist_ok=False)
     frozen, digest = freeze_checkpoint(Path(selected['path']), output / 'frozen')
-    workload = json.loads((ROOT / settings['template']).read_text())
-    workload.update(checkpoint=str(frozen), checkpoint_sha256=digest, output_root=str(output))
+    selection = dict(run=str(run), candidates=candidates, selected=selected,
+                     frozen=str(frozen), sha256=digest)
+    return evaluate_frozen(selection, settings['template'], output)
+
+
+def evaluate_frozen(selection, template, output):
+    """Single shared invocation path, retaining managed evaluator admission."""
+    workload = json.loads((ROOT / template).read_text())
+    workload.update(checkpoint=selection['frozen'], checkpoint_sha256=selection['sha256'], output_root=str(output))
     workload['evaluation']['inference_cache_namespace'] = output.name
     config = output / 'workload.json'
     config.write_text(json.dumps(workload, indent=2))
-    (output / 'selection.json').write_text(json.dumps(dict(run=str(run), candidates=candidates,
-        selected=selected, frozen=str(frozen), sha256=digest), indent=2))
-    print(f'trace selection {selected} sha256={digest} output={output}', flush=True)
+    (output / 'selection.json').write_text(json.dumps(selection, indent=2))
+    print(f"trace selection {selection['selected']} sha256={selection['sha256']} output={output}", flush=True)
     script = ROOT / 'vesuvius/scripts/run_classic_fiber_evaluation.py'
     for mode in ('prepare', 'validate-full', 'full'):
         print(f'trace {mode}: log={output / (mode + ".log")}', flush=True)
@@ -80,6 +86,88 @@ def trace_evaluate(settings=None):
             subprocess.run([sys.executable, str(script), mode, '--config', str(config)],
                            cwd=ROOT, check=True, stdout=log, stderr=subprocess.STDOUT)
     return output
+
+
+EMA_SERIES = [('current999', 'current_ema_0p999.pt', 0.999),
+              ('best999', 'best_ema_0p999.pt', 0.999),
+              ('best99', 'best_ema_0p99.pt', 0.99)]
+
+
+def freeze_ema_selection(run, filename, decay, cache):
+    import math
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
+    path = run / 'snapshots' / filename
+    frozen, digest = freeze_checkpoint(path, cache)
+    payload = torch.load(frozen, map_location='cpu', weights_only=True, mmap=True)
+    expected_metric = 'test_' + filename.split('_', 1)[1][:-3] + '/loss_total'
+    if (payload.get('snapshot_kind') != 'ema' or
+            payload.get('ema_metadata', {}).get('decay') != decay or
+            payload.get('metric_name') != expected_metric or
+            not math.isfinite(float(payload['metric']))):
+        raise ValueError(f'EMA snapshot metadata mismatch: {path}')
+    selected = dict(path=str(path), metric=float(payload['metric']), metric_name=payload['metric_name'],
+                    step=int(payload['step']), samples=int(payload['samples_seen']), decay=decay)
+    return dict(run=str(run), selected=selected, candidates=[selected],
+                frozen=str(frozen), sha256=digest)
+
+
+def trace_series_prepare():
+    from villa_gpu_manager.processes import process_state
+    settings = json.loads(CONTROL.read_text())['trace_series']
+    identity = json.loads((Path(settings['launch']) / 'controller.json').read_text())
+    if process_state(identity, os.getuid()) != 'alive':
+        raise RuntimeError('expected live training root; no automatic restart')
+    root = Path(settings['output'])
+    root.mkdir(parents=True, exist_ok=False)
+    entries = []
+    for name, filename, decay in EMA_SERIES:
+        selection = freeze_ema_selection(Path(settings['run']), filename, decay, root / 'frozen')
+        entries.append(dict(name=name, status='pending', selection=selection))
+        print(f'frozen {name}: {selection}', flush=True)
+    state = dict(settings=settings, training_identity=identity, entries=entries,
+                 captured_at=datetime.now(timezone.utc).isoformat())
+    (root / 'series.json').write_text(json.dumps(state, indent=2))
+
+
+def trace_series_next():
+    from villa_gpu_manager.processes import process_state
+    from fiber3d_comparison_report import series_report
+    root = Path(json.loads(CONTROL.read_text())['trace_series']['output'])
+    path = root / 'series.json'
+    state = json.loads(path.read_text())
+    entry = next((e for e in state['entries'] if e['status'] != 'done'), None)
+    if entry is None:
+        print('all three evaluations complete', flush=True)
+        return
+    if entry['status'] != 'pending':
+        raise RuntimeError('previous evaluation interrupted/failed; inspect before retrying')
+    if process_state(state['training_identity'], os.getuid()) != 'alive':
+        raise RuntimeError('training root is no longer alive; no automatic restart')
+    output = root / entry['name']
+    output.mkdir(exist_ok=False)
+    entry['status'] = 'running'
+    path.write_text(json.dumps(state, indent=2))
+    try:
+        evaluate_frozen(entry['selection'], state['settings']['template'], output)
+        script = ROOT / 'vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/trace_restart_analysis_20260911.py'
+        audit = subprocess.check_output([sys.executable, str(script), str(output / 'full')], cwd=ROOT, text=True)
+        (output / 'trace_audit.json').write_text(audit)
+        entry.update(status='done', metrics=json.loads(audit), output=str(output))
+        report = series_report(state)
+        report_path = root / f"comparison_after_{entry['name']}.md"
+        report_path.write_text(report)
+        entry['report'] = str(report_path)
+        entry['training_root_state'] = process_state(state['training_identity'], os.getuid())
+        if entry['training_root_state'] != 'alive':
+            raise RuntimeError('evaluation completed but original training root is not alive')
+        path.write_text(json.dumps(state, indent=2))
+        print(report, flush=True)
+        print(f"REPORT={report_path}; original training root remains alive", flush=True)
+    except BaseException as exc:
+        entry.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+        path.write_text(json.dumps(state, indent=2))
+        raise
 
 
 def comparison_followup():
@@ -563,7 +651,7 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
@@ -575,6 +663,10 @@ def main():
         comparison()
     elif args.command == 'comparison-followup':
         comparison_followup()
+    elif args.command == 'trace-series-prepare':
+        trace_series_prepare()
+    elif args.command == 'trace-series-next':
+        trace_series_next()
     elif args.command == 'production-start':
         production_start()
     elif args.command == 'production-status':

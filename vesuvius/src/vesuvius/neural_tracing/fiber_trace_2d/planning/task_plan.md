@@ -1,48 +1,22 @@
-# Short training comparison plan
+# Three EMA evaluation plan
 
-1. Add identity-bound sample-limit monitor to approved experiment controller. Bind saved launch, never mutable latest. Stop after complete evaluation AND snapshots at4700updates=601600samples. Use existing bounded TERM cleanup; test on CPU.
-2. Prepare fresh five-scroll JSON601600 and combined JSON+NML499200 with same modern model, LR.01, global128, EMA.99/.999, regular run root, held-out five-scroll tests. Add optional per-dataset sampling_group and sampling_group_weight: choose scroll uniformly, then group by its explicit mass, then distance uniformly within group. Paris4 JSON/NML each half its20%; default ungrouped sampling must retain identical RNG and outputs. Reject missing/inconsistent group weights. Tests verify20% scrolls,10% subgroups and length-proportional fibers, including both Paris4 JSON directories grouped together.
-3. Run sequential managed trainings; record configs/data identities and realized counts. The original step2 combined499200 budget was corrected by the user to601600 after completion; use its continuation for the additional matched-budget comparison below.
-4. Freeze best raw and lowest-test-loss best EMA across decays for each run using existing live-evaluation helper. Reuse locked50fiber/100direction evaluator, fresh namespaces, exclusive manager ownership. Six evaluations.
-5. Compare complete-reference mean segment length and per-scroll failures; resume winning run from resumable raw state, retaining EMA history. EMA inference exports cannot restore optimizer.
+1. Bind active combined run directory and training launch identity. Through approved experiment controller freeze current_ema_0p999.pt, best_ema_0p999.pt, best_ema_0p99.pt before any evaluation. Reuse freeze_checkpoint; read metadata from frozen files, validate EMA kind/decay/test metric, record step/samples/hash. Concurrent serialization or corrupt copies fail clearly, never silently substitute.
+2. Extract existing frozen-evaluation invocation into one shared helper for trace_evaluate and the series. Preserve prepare/validate-full/full and exclusive manager admission. Add trace-series-prepare and trace-series-next to approved launcher; next executes only next entry in declared order and audits all100directions. No training stop/start/watch calls or signals.
+3. Generate cumulative Markdown after each result using previous audit reports and classic complete_report. Validate identical scroll IDs/counts/reference lengths; average five means at20% each. Show per-scroll distributions with best/ties bold, no pooled overall score.
+4. Execute three serial evaluations, report each immediately, verify training root alive and manager pause/resume.
 
 ## Spec update
 
-### Corrected 600k follow-up
-
-The combined 500k limit was a user typo. Stop its already-running continuation
-after the complete 601600-sample test/snapshot boundary using the existing watcher.
-Evaluate best raw and best EMA across parent and continuation snapshots, rejecting
-any candidate beyond the cutoff. Reuse the managed tracing evaluator and audit;
-resume raw current (with optimizer/EMA state) afterward. Extend only the approved
-experiment controller to orchestrate this follow-up, with CPU tests for selection
-and resume sequencing. Report all five scrolls and pooled statistics for the three
-600k conditions, raw/EMA separately: checkpoint provenance, directions, reference
-length, restarts, segment count, mean/median/P05/P95 and zero-length segments.
-Keep the earlier combined500k results explicitly separate.
-
-No model/loss numerics or manager protocol changes. Optional explicit sampling groups affect only requested grouped datasets; ungrouped sampling stays identical. Stop controls bind immutable launch identity and wait for completed snapshot publication, never kill a replacement. Record approximate sample boundaries. Best-test-loss selection remains unchanged.
+No training, inference, tracing geometry, manager protocol or numerical changes. Snapshot variants use exact filenames, not cross-decay selection. Classic is longer-trained; new snapshots are later than600k.
 
 ## Docs updates
 
-### Equal-scroll report refinement
-
-Re-audit classic's saved100-direction artifacts with the existing helper. Verify
-identical scroll identities, direction counts and reference lengths across all
-seven evaluations. Compute score=sum(per-scroll mean segment mm)/5; do not average
-percentiles or include the old pooled score in the new report. Write a separate
-classic+raw/EMA comparison document including per-scroll distributions, sample
-counts, checkpoint provenance and unequal classic training-budget caveat. Validate
-every per-scroll mean against length/(restarts+directions), then independently
-review calculations/interpretation. No training or production evaluator changes,
-GPU use or inference reruns; retain original audit artifacts as source evidence.
-
-Document stop control and comparison commands/checkpoint provenance/results.
+Save cumulative reports and frozen provenance under output root; summarize usage/results in docs and task log.
 
 ## Validation
 
-CPU monitor tests for boundaries and identity; existing evaluation preflight; inspect checkpoint counts/EMA and complete100directions for every evaluation. Confirm manager resources released after stop.
+CPU tests for freeze metadata/decay checks, exact variant order, failures not marked complete, no training stop/restart, equal-scroll means and highlighted extrema. Existing managed preflight/full100direction artifact audits for all three GPU evaluations. Independent plan/report review.
 
 ## Changelog
 
-Record comparison outcome and selected continuation; previous EMA task remains in committed history.
+Record evaluation results/report paths and unchanged active training.

@@ -63,5 +63,20 @@
   },
   "production": {
     "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_ema_16x8.json"
+  },
+  "trace_series": {
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_164113",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/compare_5scroll_s1a_128_sd1_16x8_ema_500k_20260912_164117",
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912",
+    "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "baselines": [
+      {"name":"Classic", "output":"/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap"},
+      {"name":"NML raw", "output":"/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912"},
+      {"name":"NML EMA", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/s1a_600k_ema"},
+      {"name":"JSON raw", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_raw"},
+      {"name":"JSON EMA", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_ema"},
+      {"name":"Combined raw", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/raw"},
+      {"name":"Combined EMA", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/ema"}
+    ]
   }
 }

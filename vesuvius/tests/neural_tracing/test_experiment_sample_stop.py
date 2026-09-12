@@ -154,3 +154,97 @@ def test_followup_resumes_raw_current_only_after_both_audits(runner, monkeypatch
         return tmp_path / 'next', Mock(pid=456)
     monkeypatch.setattr(runner, 'production_start', start)
     runner.comparison_followup()
+
+
+def test_exact_ema_freeze_reads_metadata_from_frozen_copy(runner, monkeypatch, tmp_path):
+    import torch
+    from vesuvius.neural_tracing.fiber_trace_3d import live_evaluate
+    frozen = tmp_path / 'frozen.pt'
+    monkeypatch.setattr(live_evaluate, 'freeze_checkpoint', lambda *a: (frozen, 'digest'))
+    def load(path, **kwargs):
+        assert path == frozen and kwargs['map_location'] == 'cpu'
+        return dict(snapshot_kind='ema', ema_metadata={'decay':.999},
+                    metric_name='test_ema_0p999/loss_total', metric=.3, step=100, samples_seen=12800)
+    monkeypatch.setattr(torch, 'load', load)
+    result = runner.freeze_ema_selection(tmp_path, 'current_ema_0p999.pt', .999, tmp_path)
+    assert result['selected']['step'] == 100 and result['sha256'] == 'digest'
+    with pytest.raises(ValueError, match='metadata'):
+        runner.freeze_ema_selection(tmp_path, 'best_ema_0p99.pt', .99, tmp_path)
+
+
+def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path):
+    import villa_gpu_manager.processes as processes
+    launch = tmp_path / 'launch'
+    launch.mkdir()
+    (launch / 'controller.json').write_text('{"pid":123}')
+    control = tmp_path / 'control.json'
+    control.write_text(json.dumps({'trace_series':dict(launch=str(launch), run='run', output=str(tmp_path / 'series'))}))
+    monkeypatch.setattr(runner, 'CONTROL', control)
+    monkeypatch.setattr(processes, 'process_state', lambda *a: 'alive')
+    seen = []
+    def freeze(run, filename, decay, cache):
+        seen.append((filename, decay))
+        return {'frozen':filename}
+    monkeypatch.setattr(runner, 'freeze_ema_selection', freeze)
+    stop, start = Mock(side_effect=AssertionError('must not stop')), Mock(side_effect=AssertionError('must not restart'))
+    monkeypatch.setattr(runner, 'stop_production_identity', stop)
+    monkeypatch.setattr(runner, 'production_start', start)
+    runner.trace_series_prepare()
+    assert seen == [('current_ema_0p999.pt', .999), ('best_ema_0p999.pt', .999), ('best_ema_0p99.pt', .99)]
+    assert [e['status'] for e in json.loads((tmp_path / 'series/series.json').read_text())['entries']] == ['pending'] * 3
+    stop.assert_not_called()
+    start.assert_not_called()
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path, fail):
+    import villa_gpu_manager.processes as processes
+    monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
+    import fiber3d_comparison_report as reporting
+    control = tmp_path / 'control.json'
+    control.write_text(json.dumps({'trace_series':{'output':str(tmp_path)}}))
+    monkeypatch.setattr(runner, 'CONTROL', control)
+    monkeypatch.setattr(processes, 'process_state', lambda *a: 'alive')
+    state = dict(training_identity={'pid':123}, settings={'template':'template'},
+                 entries=[dict(name=n, status='pending', selection={}) for n, _, _ in runner.EMA_SERIES])
+    path = tmp_path / 'series.json'
+    path.write_text(json.dumps(state))
+    called = []
+    def evaluate(selection, template, output):
+        called.append(output.name)
+        if fail:
+            raise RuntimeError('injected')
+    monkeypatch.setattr(runner, 'evaluate_frozen', evaluate)
+    monkeypatch.setattr(runner.subprocess, 'check_output', lambda *a, **k: '{}')
+    monkeypatch.setattr(reporting, 'series_report', lambda s: 'report')
+    monkeypatch.setattr(runner, 'stop_production_identity', Mock(side_effect=AssertionError('stop')))
+    monkeypatch.setattr(runner, 'production_start', Mock(side_effect=AssertionError('start')))
+    if fail:
+        with pytest.raises(RuntimeError, match='injected'):
+            runner.trace_series_next()
+        with pytest.raises(RuntimeError, match='interrupted/failed'):
+            runner.trace_series_next()
+        assert [e['status'] for e in json.loads(path.read_text())['entries']] == ['failed', 'pending', 'pending']
+    else:
+        runner.trace_series_next()
+        runner.trace_series_next()
+        assert called == ['current999', 'best999']
+        assert [e['status'] for e in json.loads(path.read_text())['entries']] == ['done', 'done', 'pending']
+
+
+def test_equal_scroll_report_and_bolding(runner, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
+    from fiber3d_comparison_report import SCROLLS, comparison_markdown, equal_scroll_score
+    rows = []
+    for name, failures in [('A', 99), ('B', 49)]:
+        scrolls = {s:dict(directions=1, failures=failures, directed_reference_mm=2000,
+                         mean_segment_length_mm=2000/(failures+1), median_segment_length_mm=1,
+                         p05_segment_length_mm=.1, p95_segment_length_mm=10, zero_length_segments=0) for s in SCROLLS}
+        rows.append(dict(name=name, output=name, metrics={'scrolls':scrolls}))
+    assert equal_scroll_score(rows[0]['metrics']) == 20
+    doc = comparison_markdown(rows)
+    assert '| B | **40.000** |' in doc
+    assert '| B | **49** | **40.000** | **1.000** | **0.1000** | **10.000** | **0** |' in doc
+    rows[1]['metrics']['scrolls'][SCROLLS[0]]['directions'] = 2
+    with pytest.raises(ValueError, match='coverage'):
+        comparison_markdown(rows)
