@@ -1,10 +1,9 @@
-# Three EMA tracing evaluations during live training
+# Current snapshot test-loss versus tracing comparison
 
-Follow-up: run another pair from the current state, best99 then best999. Keep
-training alive with manager pauses only, and compare against all previous rows.
-Explain best selection: separately per raw/EMA track, minimum aggregate dense
-test loss_total, not per metric or equal-scroll tracing score.
-
-Evaluate current combined training's current EMA0.999, best EMA0.999, then best EMA0.99, in that order. Freeze all three before evaluations and record exact checkpoint steps/samples/hashes. Keep training alive; only manager-exclusive evaluation grants may pause it. No stop/relaunch or manual pause commands.
-
-After each evaluation report comparison against Classic and six earlier NML/JSON/combined600k raw/EMA evaluations plus completed new entries. Every scroll has20% weight in the overall arithmetic mean score. Omit pooled overall scores. Show full per-scroll distributions, highlighting best/tied values per metric.
+Freeze current EMA0.999, current EMA0.99, current raw from active combined training,
+then evaluate in that order on existing50fiber/100direction workload. Record exact
+samples/step/testloss/hash. Training staysalive with manager pauses only.
+After EACH evaluation print full per-scroll tables against Classic and latest
+best99/best999 pair plus completed current entries. Highlight best/ties; each
+scroll20% overallweight. Omit pooledscore. Compare testloss to tracing performance
+without claiming a reliable correlation from this small set. Preserve artifacts.
