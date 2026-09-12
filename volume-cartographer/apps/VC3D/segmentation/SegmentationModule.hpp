@@ -75,6 +75,7 @@ public:
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
     [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
     [[nodiscard]] bool annotateMode() const { return _annotateMode; }
+    bool ensureActiveSurfaceEditableForModification();
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);

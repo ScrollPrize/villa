@@ -1,5 +1,23 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
 
+add_executable(test_surface_rotation_transform
+    test_surface_rotation_transform.cpp)
+
+target_include_directories(test_surface_rotation_transform PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_surface_rotation_transform PRIVATE
+    Qt6::Core
+    Qt6::Test
+    TIFF::TIFF)
+
+set_target_properties(test_surface_rotation_transform PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+add_test(NAME surface_rotation_transform COMMAND test_surface_rotation_transform)
+vc_register_test_target(test_surface_rotation_transform)
+vc_register_ctest(surface_rotation_transform test_surface_rotation_transform)
+
 add_executable(test_vc_settings
     test_vc_settings.cpp)
 
