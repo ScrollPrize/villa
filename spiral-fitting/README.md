@@ -532,13 +532,23 @@ ledger or automatic commit on editor save. Checkpoint uploads remain service-sco
 
 Interactive influence settings are captured when each **Run** request starts.
 Applying input revisions uses those captured settings and extends the
-influence region's union and the DT-disabled deadline within the remaining
-Run window. The region is cleared only when the Run pauses, before autosaving.
+influence region's union.
+The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
-without reloading the resident session. The **Disable DT** percentage controls
-how much of the remaining run suppresses directional DT losses after applying
-input revisions.
+without reloading the resident session.
+
+Directional DT timing is an independent control on every interactive Run.
+When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
+When checked, the adjacent percentage is the eligible suffix of the originally
+requested Run: the first eligible iteration is
+`run_start + floor(iterations * (1 - percentage / 100))`. Thus 25% of a
+10,000-iteration Run suppresses DT for 7,500 iterations and permits it for the
+final 2,500; for small Runs the eligible step count is rounded up. Zero percent
+suppresses DT for the whole Run and 100% adds no suppression. Stopping early
+does not recalculate the original window. The schedule is transient Run state,
+not advanced configuration or checkpoint state, and is cleared before the
+Run's autosave.
 
 Input-local validation failures reject the entire selected candidate without
 changing active supervision. Distributed ranks prepare the same candidate and

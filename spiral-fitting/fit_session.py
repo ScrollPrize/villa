@@ -109,7 +109,11 @@ from config import Config
 # preview provenance, and active/pending publication state. Preview capture is
 # an all-rank fit boundary, while flattening and artifact publication continue
 # independently of the client connection and the next Run.
-API_VERSION = 34
+# Version 35 gives every Run an independent DT-loss schedule. The required
+# dt_loss_schedule object controls how much of the final Run window is DT
+# eligible and is transient rather than part of advanced configuration or a
+# checkpoint.
+API_VERSION = 35
 
 
 class SessionState(str, Enum):

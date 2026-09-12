@@ -506,6 +506,17 @@ class InputBatchCommand(SessionCommand):
 
 
 @dataclasses.dataclass
+class DtLossScheduleCommand(SessionCommand):
+    """Install one Run's transient DT-loss window on the fitter thread."""
+
+    kind: ClassVar[str] = "dt_loss_schedule"
+
+    run_start: int = 0
+    requested_iterations: int = 0
+    schedule: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class SaveCheckpointCommand(SessionCommand):
     """Write a checkpoint from the fitter thread."""
 
@@ -1185,6 +1196,9 @@ class InteractiveFitSession:
             if isinstance(command, InputBatchCommand):
                 self._run_input_batch(command)
                 continue
+            if isinstance(command, DtLossScheduleCommand):
+                self._run_dt_loss_schedule(command)
+                continue
             if isinstance(command, ConfigureCommand):
                 self._run_configuration(command)
                 continue
@@ -1612,6 +1626,10 @@ class InteractiveFitSession:
             with self._condition:
                 self._pending = 0
                 self._target = self._completed
+                abandoned = [queued for queued in self._commands
+                             if isinstance(queued, DtLossScheduleCommand)]
+                self._commands = [queued for queued in self._commands
+                                  if queued not in abandoned]
                 # No step follows a failed configure; a live boundary held
                 # for this Run has nothing left to wait for.
                 self._live_reservation_iteration = None
@@ -1621,6 +1639,11 @@ class InteractiveFitSession:
                 self._transition_locked(
                     SessionState.Idle, IDLE_PHASE,
                     reason="run configuration failed")
+            self._clear_context_run_state()
+            for queued in abandoned:
+                queued.cancel(
+                    f"cancelled by failed configure command "
+                    f"{command.command_id}")
             command.fail(error)
             self._publish_status()
         else:
@@ -1649,6 +1672,50 @@ class InteractiveFitSession:
                 self._begin_optimization_progress()
             else:
                 self._progress_reporter().clear()
+
+    def _clear_context_run_state(self):
+        """Clear all transient fitter state installed for the current Run."""
+        if self._context is None:
+            return
+        clear = getattr(self._context, "clear_interactive_run_state", None)
+        if clear is not None:
+            clear()
+            return
+        # Source compatibility for small in-process test/embedder contexts.
+        clear = getattr(self._context, "clear_interactive_influence", None)
+        if clear is not None:
+            clear()
+        clear = getattr(self._context, "clear_dt_loss_schedule", None)
+        if clear is not None:
+            clear()
+
+    def _run_dt_loss_schedule(self, command):
+        """Apply the Run DT schedule after all other Run setup commands."""
+        try:
+            if self._context is None:
+                raise RuntimeError(
+                    "The resident fitter does not support DT-loss schedules")
+            self._context.configure_dt_loss_schedule(
+                command.run_start, command.requested_iterations,
+                dict(command.schedule))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self._condition:
+                self._pending = 0
+                self._target = self._completed
+                self._warnings.append(f"Run DT-loss scheduling failed: {error}")
+                if self._state is SessionState.Running:
+                    self._transition_locked(
+                        SessionState.Idle, IDLE_PHASE,
+                        reason="DT-loss scheduling failed")
+            self._clear_context_run_state()
+            command.fail(error)
+            self._progress_reporter().clear()
+            self._publish_status()
+        else:
+            command.complete(
+                resume_iteration=getattr(
+                    self._context, "run_dt_resume_iteration", None))
 
     def _run_model_rebuild(self, command):
         """Rebuild the model stage in place, on the fitter thread.
@@ -1804,8 +1871,7 @@ class InteractiveFitSession:
         autosave_wanted = (getattr(self, "publishes_outputs", True)
                            and getattr(self, "_autosave_on_pause", True))
         if pause:
-            if self._context is not None:
-                self._context.clear_interactive_influence()
+            self._clear_context_run_state()
             # Pausing writes the durable autosave when the run asked for it,
             # and does nothing else. Exporting a preview is a request of its
             # own: it costs minutes, and a client that wants one after a
@@ -1887,7 +1953,8 @@ class InteractiveFitSession:
 
     # Coordinator-thread commands.
     def run(self, count, influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True, preview_schedule=None, barrier=None):
+            autosave_on_pause=True, preview_schedule=None,
+            dt_loss_schedule=None, barrier=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
@@ -1908,6 +1975,8 @@ class InteractiveFitSession:
                 self._completed + int(preview_schedule["cadence_iterations"])
                 if preview_schedule else None)
             self._automatic_previews_disabled = False
+            dt_loss_schedule = dict(dt_loss_schedule or {
+                "enabled": False, "last_fraction": 0.25})
             run_config = dict(run_config or {})
             path_changes = dict(path_changes or {})
             target = self._completed + count
@@ -1925,6 +1994,7 @@ class InteractiveFitSession:
                     and target > configured_horizon):
                 run_config["optimizer_num_training_steps"] = (
                     max(configured_horizon, self._completed) + count)
+            setup_config_revision = self._config_revision
             if run_config or path_changes:
                 if self._context is None:
                     raise RuntimeError(
@@ -1948,6 +2018,18 @@ class InteractiveFitSession:
                     config=run_config, path_changes=path_changes,
                     previous_run_config=previous_run_config))
                 self._run_config.update(run_config)
+                setup_config_revision += 1
+            # Every Run installs its schedule on the fitter thread, including
+            # runs with no configuration changes. It is
+            # deliberately last so the first step sees all setup atomically.
+            self._commands.append(DtLossScheduleCommand(
+                session_generation=self.session_generation,
+                epoch=epoch,
+                expected_iteration=self._completed,
+                expected_config_revision=setup_config_revision,
+                run_start=self._completed,
+                requested_iterations=count,
+                schedule=dt_loss_schedule))
             self._pending = count
             self._run_start_completed = self._completed
             self._target = target
@@ -2228,6 +2310,7 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         autosave_on_pause=arguments.get(
                             "autosave_on_pause", True),
                         preview_schedule=arguments.get("preview_schedule"),
+                        dt_loss_schedule=arguments.get("dt_loss_schedule"),
                         barrier=barrier,
                     )
                 elif name == "stop":
@@ -2677,7 +2760,8 @@ class DistributedInteractiveFitSession:
             f"{silent} to {name}"))
 
     def run(self, count, influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True, preview_schedule=None):
+            autosave_on_pause=True, preview_schedule=None,
+            dt_loss_schedule=None):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
@@ -2688,6 +2772,8 @@ class DistributedInteractiveFitSession:
             "path_changes": dict(path_changes or {}),
             "autosave_on_pause": bool(autosave_on_pause),
             "preview_schedule": copy.deepcopy(preview_schedule),
+            "dt_loss_schedule": copy.deepcopy(dt_loss_schedule or {
+                "enabled": False, "last_fraction": 0.25}),
         }
         return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S)
 

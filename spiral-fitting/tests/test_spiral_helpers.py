@@ -19,9 +19,59 @@ from spiral_helpers import (
 from fit_spiral import (
     FitContext,
     _UnattachedPclStripList,
+    get_dt_loss_eligibility,
+    get_progressive_dt_max_winding,
+    get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
 from tifxyz import load_tifxyz
+
+
+class RunDtLossScheduleTests(unittest.TestCase):
+    def test_ten_thousand_iterations_at_25_percent(self):
+        resume = get_run_dt_resume_iteration(400, 10_000, 0.25)
+        self.assertEqual(resume, 7_900)
+        self.assertEqual(resume - 400, 7_500)
+        self.assertEqual(10_400 - resume, 2_500)
+
+    def test_small_runs_use_a_ceiling_sized_eligible_suffix(self):
+        for iterations, fraction, eligible in (
+                (1, 0.25, 1), (2, 0.25, 1), (3, 0.25, 1),
+                (5, 0.25, 2), (5, 0.0, 0), (5, 1.0, 5)):
+            resume = get_run_dt_resume_iteration(10, iterations, fraction)
+            self.assertEqual(10 + iterations - resume, eligible)
+
+    def test_schedule_composes_with_strict_family_start_thresholds(self):
+        cfg = Config({
+            'loss_start_patch_dt': 10,
+            'loss_start_track_dt': 20,
+            'loss_start_unverified_patch_dt': 30,
+        }).as_dict()
+        resume = 15
+        self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
+            'verified_patch': False,
+            'unverified_patch': False,
+            'track': False,
+            'unattached_pcl': False,
+        })
+        # Existing loss starts remain strict `iteration > start` checks.
+        at_starts = get_dt_loss_eligibility(cfg, 20, resume)
+        self.assertTrue(at_starts['verified_patch'])
+        self.assertTrue(at_starts['unattached_pcl'])
+        self.assertFalse(at_starts['track'])
+        self.assertFalse(at_starts['unverified_patch'])
+        after_all = get_dt_loss_eligibility(cfg, 31, resume)
+        self.assertTrue(all(after_all.values()))
+
+    def test_progressive_winding_cutoff_is_unchanged(self):
+        cfg = Config({
+            'dt_progressive_windings': True,
+            'dt_progressive_inner_winding': 20,
+            'dt_progressive_steps': 100,
+            'dt_progressive_exponent': 1.0,
+        }).as_dict()
+        self.assertEqual(
+            get_progressive_dt_max_winding(cfg, 60, 10, 120), 70.0)
 
 
 class FiberPointCollectionTests(unittest.TestCase):

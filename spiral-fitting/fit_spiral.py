@@ -15,6 +15,7 @@ import hashlib
 import multiprocessing
 import json
 import glob
+import math
 import re
 try:
     import resource
@@ -1052,18 +1053,36 @@ def get_progressive_dt_max_winding(cfg, iteration, dt_start_step, shell_outer_wi
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
-                                        disabled_fraction=0.75):
-    """Return the first iteration that may use DT losses after new inputs.
+def get_run_dt_resume_iteration(run_start, requested_iterations,
+                                last_fraction):
+    """Return the first Run iteration eligible for directional DT losses.
 
-    Inputs apply at an optimizer boundary. Keep DT losses disabled for the
-    requested fraction of the remaining run so the radius-based
-    losses can settle the newly added geometry before directional constraints
-    resume.
+    The final ``last_fraction`` of a Run is eligible. Flooring the suppressed
+    prefix makes the eligible suffix ``ceil(iterations * last_fraction)``.
     """
-    run_iterations = max(0, int(target_iteration) - int(start_iteration))
-    fraction = min(1.0, max(0.0, float(disabled_fraction)))
-    return int(start_iteration) + int(run_iterations * fraction)
+    iterations = max(0, int(requested_iterations))
+    fraction = min(1.0, max(0.0, float(last_fraction)))
+    suppressed = math.floor(iterations * (1.0 - fraction))
+    return int(run_start) + suppressed
+
+
+def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
+    """Return DT eligibility for every directional DT loss family."""
+    run_eligible = (run_dt_resume_iteration is None
+                    or iteration >= run_dt_resume_iteration)
+    patch_start = cfg['loss_start_patch_dt']
+    track_start = (patch_start if cfg['loss_start_track_dt'] is None
+                   else cfg['loss_start_track_dt'])
+    unverified_start = (
+        patch_start if cfg['loss_start_unverified_patch_dt'] is None
+        else cfg['loss_start_unverified_patch_dt'])
+    return {
+        'verified_patch': run_eligible and iteration > patch_start,
+        'unverified_patch': run_eligible and iteration > unverified_start,
+        'track': run_eligible and iteration > track_start,
+        # Unattached PCL DT intentionally keeps the verified-patch start.
+        'unattached_pcl': run_eligible and iteration > patch_start,
+    }
 
 
 def unresolved_fiber_link_warning(fiber_catalog, *, use_links, use_pending_links,
@@ -3258,7 +3277,7 @@ class FitContext:
         )
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
-        self.interactive_dt_resume_iteration = None
+        self.run_dt_resume_iteration = None
 
     # What _build_model_state() constructs, and therefore what
     # rebuild_model_state() releases before running it again. Written out
@@ -3280,7 +3299,7 @@ class FitContext:
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
-        'interactive_dt_resume_iteration',
+        'run_dt_resume_iteration',
     )
 
     def rebuild_model_state(self):
@@ -3783,12 +3802,11 @@ class FitContext:
         return zs, yx, scroll_slices, prediction_slices, quad_labels
 
     def clear_interactive_influence(self):
-        """End the current Run request's influence window.
+        """End the current Run request's localization window.
 
         Called by the runtime when an interactive Run reaches its target, and
         defensively before a new incorporation begins.
         """
-        self.interactive_dt_resume_iteration = None
         if self.influence_state is None:
             self.interactive_influence_loss_weight = 0.0
             self.interactive_influence_anchor_samples = 0
@@ -3828,6 +3846,30 @@ class FitContext:
         print(f'preview: evaluated {len(self.verified_patches_list):,} '
               f'patches for splice in {time.perf_counter() - started:.2f}s')
         return evaluation
+
+    def configure_dt_loss_schedule(self, run_start, requested_iterations,
+                                   schedule):
+        """Install one Run's independent directional-DT eligibility window."""
+        if not schedule['enabled']:
+            self.run_dt_resume_iteration = None
+            return
+        self.run_dt_resume_iteration = get_run_dt_resume_iteration(
+            run_start, requested_iterations, schedule['last_fraction'])
+        if self.dist.is_main_process:
+            print(
+                'Run DT losses resume at iteration '
+                f'{self.run_dt_resume_iteration} '
+                f'(Run starts at {int(run_start)}, '
+                f'{int(requested_iterations)} requested iterations)')
+
+    def clear_dt_loss_schedule(self):
+        """Remove the transient DT window without touching localization."""
+        self.run_dt_resume_iteration = None
+
+    def clear_interactive_run_state(self):
+        """Clear every transient state installed for one interactive Run."""
+        self.clear_interactive_influence()
+        self.clear_dt_loss_schedule()
 
     def export_preview(self, generation_path, surface_id, *, diagnostics=False):
         """Write one preview generation; optionally with its loss overlays.
@@ -4339,10 +4381,6 @@ class FitContext:
                         cfg['sample_count_influence_anchor_samples_per_step'])
             else:
                 candidate.optimiser.state = self.optimiser.state
-            candidate.interactive_dt_resume_iteration = max(
-                self.interactive_dt_resume_iteration or 0,
-                get_interactive_dt_resume_iteration(current_iteration, target_iteration,
-                                                    cfg['influence_disable_dt_frac']))
             return candidate
         except MissingPclSamplingWeightError as exc:
             # Reject configuration errors without stopping the resident worker.
@@ -4815,17 +4853,20 @@ class FitContext:
             for name, value in weighted_losses.items():
                 losses[name] = value.detach()
 
-        interactive_dt_suppressed = (
-            self.interactive_dt_resume_iteration is not None
-            and iteration < self.interactive_dt_resume_iteration
+        run_dt_suppressed = (
+            self.run_dt_resume_iteration is not None
+            and iteration < self.run_dt_resume_iteration
         )
-        log_metrics['interactive_dt_suppressed'] = float(interactive_dt_suppressed)
+        log_metrics['run_dt_suppressed'] = float(run_dt_suppressed)
 
-        compute_patch_dt = not interactive_dt_suppressed and iteration > self.config['loss_start_patch_dt']
+        dt_eligibility = get_dt_loss_eligibility(
+            self.config, iteration, self.run_dt_resume_iteration)
+        compute_patch_dt = dt_eligibility['verified_patch']
         track_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_track_dt'] is None else self.config['loss_start_track_dt']
-        compute_track_dt = not interactive_dt_suppressed and iteration > track_dt_start
+        compute_track_dt = dt_eligibility['track']
         unverified_patch_dt_start = self.config['loss_start_patch_dt'] if self.config['loss_start_unverified_patch_dt'] is None else self.config['loss_start_unverified_patch_dt']
-        compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
+        compute_unverified_patch_dt = dt_eligibility['unverified_patch']
+        compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
 
         # Progressive-outward DT gating: winding cutoff that grows from the
         # respective DT start step. None means no gating.
@@ -4857,7 +4898,7 @@ class FitContext:
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
                 ))
-            if compute_patch_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
+            if compute_unattached_pcl_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                 pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
                 if pcl_flat is not None:
                     unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
@@ -5127,7 +5168,7 @@ class FitContext:
                 get_or_build_unattached_pcl_flat,
                 self.config['sample_count_unattached_pcls_per_step'],
                 self.config['sample_count_unattached_pcl_points_per_step'],
-                compute_dt=compute_patch_dt,
+                compute_dt=compute_unattached_pcl_dt,
                 dt_max_winding=patch_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
                 crossing_map=self.theta_crossing_map,
