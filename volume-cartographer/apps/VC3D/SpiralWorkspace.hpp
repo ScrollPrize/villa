@@ -192,6 +192,8 @@ private:
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updatePendingPatchIds(const QJsonObject& status);
+    void pruneBrushPreviewSurfaces();
+    QSet<QString> _retainedBrushPreviewIds;
     void inputDraftPrepared(const QString& alias, const QString& error = {});
     void updateSurfaceIntersections();
     void ensureInitialFocus();
@@ -287,6 +289,7 @@ private:
         QString path;
         QColor color;
         std::shared_ptr<QuadSurface> surface;
+        QString operation;
     };
     QHash<QString, PendingBrushPatch> _pendingBrushPatches;
     QHash<QString, QString> _brushProvisionalPaths;

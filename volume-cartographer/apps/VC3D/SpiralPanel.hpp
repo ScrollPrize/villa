@@ -44,6 +44,7 @@ public:
     }
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
+    void setLocalPatchDrafts(const QJsonArray& drafts);
     void setLocalDraftsReady(bool ready);
     // Enables the Display toggle of one editable PCL role's overlay; an
     // unavailable overlay is unchecked and explains itself in the tooltip.
@@ -67,6 +68,7 @@ signals:
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
+    void removeLocalPatchRequested(const QString& id);
     void addDraftsRequested(bool commitAfterAdd);
 
 private:
@@ -205,6 +207,7 @@ private:
     QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
+    QJsonArray _localPatchDrafts;
     QJsonArray _lastInputDrafts;
     QHash<QString, QListWidgetItem*> _inputItems;
     QLineEdit* _inputFilter = nullptr;

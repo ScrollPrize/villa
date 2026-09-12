@@ -2,6 +2,8 @@
 
 #include "SpiralPclRole.hpp"
 #include "SpiralPointPlacementMode.hpp"
+#include "SpiralPatchMode.hpp"
+#include "SpiralBrushPatch.hpp"
 #include "SpiralPointCollectionEdit.hpp"
 #include "SpiralPointChain.hpp"
 #include "overlays/ScreenSpacePointIndex.hpp"
@@ -9,6 +11,7 @@
 
 #include <QColor>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QPainterPath>
 #include <QPointF>
 #include <QPointer>
@@ -21,6 +24,7 @@
 
 #include <array>
 #include <memory>
+#include <functional>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
@@ -28,6 +32,7 @@
 #include <vector>
 
 class QuadSurface;
+class SurfacePatchIndex;
 class VolumeViewerBase;
 class SpiralBrushCursorWidget;
 class PointsOverlayController;
@@ -50,6 +55,7 @@ public:
         QString id;
         QColor color;
         std::shared_ptr<QuadSurface> surface;
+        QString operation;
     };
     struct PreparedPointCollections {
         QString id;
@@ -89,7 +95,14 @@ public:
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
     std::vector<PreparedPointCollections> preparePointCollections(QStringList& warnings);
     void finalizationSucceeded(const QString& id);
-    void finalizationFailed(const QString& id);
+    void finalizationFailed(const QString& id, const QString& error = {});
+    QJsonArray patchDrafts() const;
+    bool removePatchDraft(const QString& id);
+    std::shared_ptr<QuadSurface> setPatchRemoved(const QString& id, bool removed);
+    void setPatchIndexProvider(std::function<SurfacePatchIndex*()> provider) { _patchIndexProvider = std::move(provider); }
+    bool usesPaintSurface(const std::shared_ptr<QuadSurface>& surface) const;
+    bool dragging() const { return _dragMode != DragMode::None; }
+
     // The dataset now holds these finalized inputs. Their local drafts are
     // superseded by the refreshed source snapshot, so they are dropped; in
     // particular a replaced or deleted collection stops being suppressed in
@@ -113,17 +126,8 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    enum class GestureState { Painted, Ready, Finalizing, Finalized };
-    struct Gesture {
-        QString id;
-        QColor color;
-        std::shared_ptr<QuadSurface> source;
-        QPainterPath shape;
-        QPointF gridOrigin;
-        QPointF columnStep;
-        QPointF rowStep;
-        GestureState state = GestureState::Painted;
-    };
+    using GestureState = SpiralGestureState;
+    using Gesture = SpiralBrushPatch;
     struct PolylineGesture {
         enum class Kind { Freehand, Anchored, PointCollection };
         QString id;
@@ -183,6 +187,11 @@ private:
     };
     enum class DragMode { None, Paint, Polyline, Erase };
 
+    std::optional<QPointF> mapPatchPoint(const QPointF& point,
+        const std::shared_ptr<QuadSurface>& from, const std::shared_ptr<QuadSurface>& to) const;
+    std::optional<QPainterPath> mapPatchShape(const QPainterPath& path,
+        const std::shared_ptr<QuadSurface>& from, const std::shared_ptr<QuadSurface>& to) const;
+    std::function<SurfacePatchIndex*()> _patchIndexProvider;
     QColor nextColor();
     QPainterPath deviceDisk(const QPointF& center) const;
     QPainterPath deviceSweep(const QPointF& from, const QPointF& to) const;
@@ -282,6 +291,7 @@ private:
     bool _vHeld = false;
     bool _vClickConsumed = false;
     SpiralPointPlacementMode _pointPlacement;
+    SpiralPatchMode _patchMode;
     std::optional<EditablePclHit> _hoveredEditablePcl;
     bool _pclLeftClickConsumed = false;
     float _pointViewToleranceVoxels = 100.0f;

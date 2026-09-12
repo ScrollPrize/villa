@@ -68,6 +68,31 @@ private slots:
         QVERIFY(client._inputDrafts["a"]->deleted());
     }
 
+    void drawnPatchRevisionsUseOneDraft() {
+        const auto source = qEnvironmentVariable("SPIRAL_PATCH_REAL_INPUT");
+        if (source.isEmpty()) QSKIP("Set SPIRAL_PATCH_REAL_INPUT to a real tifxyz patch");
+        SpiralServiceManager client;
+        client.stagePatch(source, "brush-test");
+        QCOMPARE(client._inputDrafts.size(), 1);
+        const auto id = client._inputOrder.front();
+        const auto draft = client._inputDrafts.value(id);
+        const auto first = draft->snapshot();
+        QVERIFY(first.content.manifest.value("path").toString() != source);
+        QVERIFY(QFileInfo::exists(first.content.manifest.value("path").toString() + "/x.tif"));
+        QVERIFY(client.inputDraftStatus().first().toObject().value("error").toString().isEmpty());
+        client.stagePatch(source, "brush-test");
+        QCOMPARE(client._inputDrafts.size(), 1);
+        QVERIFY(draft->snapshot().localRevision > first.localRevision);
+        QVERIFY(draft->snapshot().content.manifest.value("path") != first.content.manifest.value("path"));
+        client.stagePatch({}, "brush-test", true);
+        QCOMPARE(client._inputDrafts.size(), 1);
+        QVERIFY(draft->deleted());
+        QVERIFY(draft->canRestore());
+        client.restoreInputDraft(id);
+        QVERIFY(!draft->deleted());
+        QVERIFY(QFileInfo::exists(first.content.manifest.value("path").toString() + "/x.tif"));
+    }
+
     void revisionOnlyRetry_data() {
         QTest::addColumn<int>("persisted");
         QTest::addColumn<bool>("commit");

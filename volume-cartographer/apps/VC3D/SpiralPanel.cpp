@@ -1,4 +1,5 @@
 #include "SpiralPanel.hpp"
+#include "SpiralInputRows.hpp"
 #include "SpiralActivityWidget.hpp"
 #include "SpiralInputFilter.hpp"
 
@@ -1395,6 +1396,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         const auto* item = _inputList->currentItem();
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
+        const auto row = item->data(Qt::UserRole + 4).toJsonObject();
+        if (row.value("local").toBool()) {
+            emit removeLocalPatchRequested(row.value("alias").toString(id));
+            return;
+        }
         if (item->data(Qt::UserRole + 3).toBool()) _service->restoreInputDraft(id);
         else _service->removeInputDraft(id);
     });
@@ -1409,11 +1415,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         auto* discard = menu.addAction(tr("Discard Local Changes"));
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
         const bool owner = _service->ownsInputWorkspace();
-        edit->setEnabled(owner && !row.value(QStringLiteral("deleted")).toBool());
-        retry->setEnabled(owner && (!row.value(QStringLiteral("committed")).toBool()
+        edit->setEnabled(owner && !row.value("local").toBool() && !row.value(QStringLiteral("deleted")).toBool());
+        retry->setEnabled(owner && !row.value("local").toBool() && (!row.value(QStringLiteral("committed")).toBool()
             || !row.value(QStringLiteral("error")).toString().isEmpty()));
-        discard->setEnabled(owner && row.value(QStringLiteral("dirty")).toBool());
+        discard->setEnabled(owner && (row.value("local").toBool() || row.value(QStringLiteral("dirty")).toBool()));
         const auto* choice = menu.exec(_inputList->viewport()->mapToGlobal(position));
+        if (row.value("local").toBool()) {
+            if (choice == discard) emit removeLocalPatchRequested(row.value("alias").toString(id));
+            return;
+        }
         if (choice == edit) _service->editInputDraft(id);
         else if (choice == retry) _service->applyInputDrafts(false, {id});
         else if (choice == discard) _service->discardInputDraft(id);
@@ -2150,6 +2160,13 @@ void SpiralPanel::updateWarnings(const QJsonObject& status)
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
 }
 
+void SpiralPanel::setLocalPatchDrafts(const QJsonArray& drafts)
+{
+    if (_localPatchDrafts == drafts) return;
+    _localPatchDrafts = drafts;
+    if (!_lastInputStatus.isEmpty()) updateStatus(_lastInputStatus);
+}
+
 void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     _lastInputStatus = status;
@@ -2351,7 +2368,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             !_checkpointChoice->currentData().toString().isEmpty()));
 
     // Baseline catalog entries and local revisioned drafts.
-    const QJsonArray ephemeral = _service->inputDraftStatus();
+    const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows(
+        _service->inputDraftStatus(), _localPatchDrafts);
     // Rebuild only on change: the 1 Hz status poll must not wipe the row the
     // user selected while aiming for Remove.
     if (ephemeral != _lastInputDrafts) {
@@ -2403,6 +2421,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 _inputItems[id] = item;
             }
             item->setText(label);
+            if (input.contains("color")) item->setForeground(QColor(input.value("color").toString()));
             item->setToolTip({});
             item->setData(Qt::UserRole + 4, input);
             item->setData(Qt::UserRole, kind);
