@@ -14,3 +14,13 @@
 - CPU run20260912_101634_356799:27passed20.89s (historical-grid/loader override,
   existing exclusive ownership and stopguard faults). Jul30 test config matches
   Jul29; only later-leg LR differs,not used for fresh initialization.
+- Stage00 commit171d94085,branch fiber-repro/stage00-modern-oldtest; run
+  reproduction/repro00_modern_oldtest-20260912_101715,8H100,B16/GPU,global128,
+  freshseed0,LR.01/100updatewarmup. Manager-exclusive full inventory. Initial
+  historical test7.33s,subsequent~.63s. Running to300800samples.
+- Old source99eb13150 confirms identical sample_order seeded permutation and
+  batch-row angle mean. Historical test count128,batch8. No old initialization
+  seed recorded; new trials fixseed0 and need repeats for ambiguous conclusions.
+- Old blur: isotropic sigma.5 always with aug; directional Bernoulli.5, fixed
+  sigma_along1.5/across.25. Old validity mask is source coverage/bounds, used for
+  image stats and final zeroing/negative-presence eligibility,not GTbackground.

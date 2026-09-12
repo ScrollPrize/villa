@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 import threading
+import re
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,6 +115,25 @@ def status(stop=False):
             print(stream.read().decode(errors='replace'))
 
 
+def summarize():
+    for folder in sorted(OUTPUT.glob('repro*')):
+        log = folder / 'train.log'
+        if not log.exists():
+            continue
+        rows = []
+        for match in re.finditer(r'^test samples=(\d+) update=(\d+).*?angle_mean_deg=([\d.]+)',
+                                 log.read_text(), re.MULTILINE):
+            rows.append({'samples':int(match[1]), 'update':int(match[2]), 'angle':float(match[3])})
+        window = [r for r in rows if 200000 <= r['samples'] <= 300800]
+        report = {'experiment':folder.name, 'latest':rows[-1:] or None, 'window':window,
+                  'window_mean':statistics.mean(r['angle'] for r in window) if window else None,
+                  'window_median':statistics.median(r['angle'] for r in window) if window else None,
+                  'first_under20':next((r for r in rows if r['angle'] < 20), None),
+                  'result':json.loads((folder/'result.json').read_text()) if (folder/'result.json').exists() else None}
+        (folder / 'summary.json').write_text(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2), flush=True)
+
+
 def inspect():
     import torch
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -138,12 +159,14 @@ def inspect():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop'])
+    parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize'])
     args = parser.parse_args()
     if args.command == 'inspect':
         inspect()
     elif args.command == 'start':
         start()
+    elif args.command == 'summarize':
+        summarize()
     else:
         status(stop=args.command == 'stop')
 
