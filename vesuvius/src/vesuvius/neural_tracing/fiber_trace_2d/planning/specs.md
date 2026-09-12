@@ -1,5 +1,18 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Optional within-scroll sampling groups
+
+- Scroll-balanced arclength sampling may assign every dataset within a scroll
+  a nonempty sampling_group and explicit positive finite sampling_group_weight.
+  Datasets with the same group must agree on weight. Group weight is assigned
+  once to the whole group, not once per file or dataset entry.
+- Scrolls remain uniform; conditional group probabilities are proportional to
+  group weight, and fibers/locations within groups remain arclength-proportional.
+  Ungrouped scrolls retain the previous arithmetic and RNG draws exactly.
+- The combined five-scroll+S1a experiment assigns Paris4 JSON and NML equal group
+  weights, so both JSON directories together10%, NML10%, other scrolls20%each.
+  Held-out test datasets remain ungrouped and otherwise unchanged.
+
 ## EMA and historical observation
 
 - Optional training.ema_decays are unique finite values in(0,1). FP32 shadows

@@ -60,6 +60,69 @@ def test_duplicate_vertices_have_no_sampling_mass():
         assert location.xyz[0] == pytest.approx(10 * location.fraction)
 
 
+def test_group_weights_balance_paris_json_nml_without_length_bias():
+    records = [record(scroll, [[0, 0, 0], [10, 0, 0]]) for scroll in ('A','B','C','D')]
+    # Two JSON directories belong to ONE group; radically different NML length.
+    for group, length in [('json', 10), ('json', 30), ('nml', 1000)]:
+        row = record('Paris4', [[0, 0, 0], [length, 0, 0]])
+        row.dataset_config.update(sampling_group=group, sampling_group_weight=1)
+        records.append(row)
+    sampler = ScrollArcSampler(records)
+    rng = np.random.default_rng(42)
+    counts, fractions = Counter(), []
+    for _ in range(50000):
+        _, i, location = sampler.sample(rng)
+        counts[i] += 1
+        fractions.append(location.fraction)
+    for i in range(4):
+        assert counts[i] / 50000 == pytest.approx(.2, abs=.01)
+    assert (counts[4] + counts[5]) / 50000 == pytest.approx(.1, abs=.01)
+    assert counts[6] / 50000 == pytest.approx(.1, abs=.01)
+    assert counts[5] / (counts[4] + counts[5]) == pytest.approx(.75, abs=.025)
+    assert np.mean(fractions) == pytest.approx(.5, abs=.01)
+
+
+@pytest.mark.parametrize('bad', [None, '', 0])
+def test_grouped_scroll_rejects_missing_group(bad):
+    rows = [record('A', [[0,0,0], [10,0,0]]) for _ in range(2)]
+    rows[0].dataset_config.update(sampling_group='json', sampling_group_weight=1)
+    rows[1].dataset_config.update(sampling_group=bad, sampling_group_weight=1)
+    with pytest.raises(ValueError, match='sampling_group'):
+        ScrollArcSampler(rows)
+
+
+@pytest.mark.parametrize('weight', [None, 0, -1, float('nan'), float('inf'), True, '1'])
+def test_group_weight_validation(weight):
+    row = record('A', [[0,0,0], [10,0,0]])
+    row.dataset_config.update(sampling_group='json', sampling_group_weight=weight)
+    with pytest.raises(ValueError, match='positive and finite'):
+        ScrollArcSampler([row])
+
+
+def test_default_sampling_keeps_original_random_draws_and_distances():
+    rows = [record('A', [[0,0,0], [10,0,0]]), record('A', [[0,1,0], [30,1,0]]),
+            record('B', [[0,2,0], [5,2,0]])]
+    sampler = ScrollArcSampler(rows)
+    old_rng, new_rng = np.random.default_rng(72), np.random.default_rng(72)
+    for _ in range(1000):
+        scroll = int(old_rng.integers(2))
+        distance = old_rng.random() * (40 if scroll == 0 else 5)
+        index = (0 if distance < 10 else 1) if scroll == 0 else 2
+        distance -= 10 if index == 1 else 0
+        _, actual, location = sampler.sample(new_rng)
+        assert actual == index
+        assert location.fraction == distance / (10,30,5)[index]
+    assert old_rng.random() == new_rng.random()
+
+
+def test_same_group_disagrees_on_weight():
+    rows = [record('A', [[0,0,0], [10,0,0]]) for _ in range(2)]
+    for row, weight in zip(rows, [1,2]):
+        row.dataset_config.update(sampling_group='json', sampling_group_weight=weight)
+    with pytest.raises(ValueError, match='agree'):
+        ScrollArcSampler(rows)
+
+
 @pytest.mark.parametrize("points", [[[0, 0, 0], [0, 0, 0]], [[0, 0, 0], [float('nan'), 0, 0]]])
 def test_invalid_lengths_fail(points):
     with pytest.raises(ValueError, match="positive finite"):

@@ -34,6 +34,34 @@ class ScrollArcSampler:
         self.record_indices = [np.asarray(grouped[s], dtype=np.int64) for s in self.scrolls]
         self.fiber_cdfs = [np.cumsum([self.segment_cdfs[i][-1] for i in ids])
                            for ids in self.record_indices]
+        self.distance_scales = [None] * len(self.scrolls)
+        for scroll_index, ids in enumerate(self.record_indices):
+            configs = [records[i].dataset_config for i in ids]
+            if not any('sampling_group' in c or 'sampling_group_weight' in c for c in configs):
+                continue
+            weights, totals, groups = {}, {}, []
+            for index, config in zip(ids, configs):
+                group = config.get('sampling_group')
+                weight = config.get('sampling_group_weight')
+                if not isinstance(group, str) or not group.strip():
+                    raise ValueError('every dataset in a grouped scroll needs a sampling_group')
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not np.isfinite(weight) or weight <= 0:
+                    raise ValueError('sampling_group_weight must be positive and finite')
+                if group in weights and weights[group] != weight:
+                    raise ValueError('datasets sharing a sampling_group must agree on its weight')
+                weights[group] = weight
+                totals[group] = totals.get(group, 0.0) + self.segment_cdfs[index][-1]
+                groups.append(group)
+            # Reweight fibers by group mass / group length. One uniform distance
+            # draw still selects both fiber and position; no extra RNG calls.
+            lengths = np.asarray([self.segment_cdfs[i][-1] for i in ids])
+            masses = np.asarray([length * weights[group] / totals[group]
+                                 for length, group in zip(lengths, groups)])
+            cdf = np.cumsum(masses)
+            if not np.isfinite(cdf).all() or np.any(np.diff(np.r_[0.0, cdf]) <= 0):
+                raise ValueError('sampling group masses are not numerically representable')
+            self.fiber_cdfs[scroll_index] = cdf
+            self.distance_scales[scroll_index] = lengths / masses
 
     def sample(self, rng):
         scroll_index = int(rng.integers(len(self.scrolls)))
@@ -42,6 +70,9 @@ class ScrollArcSampler:
         local_index = int(np.searchsorted(fibers, distance, side="right"))
         record_index = int(self.record_indices[scroll_index][local_index])
         distance -= float(fibers[local_index - 1]) if local_index else 0.0
+        scales = self.distance_scales[scroll_index]
+        if scales is not None:
+            distance *= float(scales[local_index])
         segments = self.segment_cdfs[record_index]
         distance = min(distance, np.nextafter(segments[-1], 0.0))
         segment = int(np.searchsorted(segments, distance, side="right"))
