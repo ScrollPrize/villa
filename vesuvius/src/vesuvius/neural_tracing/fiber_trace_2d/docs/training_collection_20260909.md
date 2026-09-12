@@ -1,5 +1,31 @@
 # Five-scroll JSON fiber training
 
+## S1a-only comparison using current training
+
+`fiber_trace_3d/configs/train_s1a_nml_16x8.json` changes data, run name and
+test/checkpoint intervals from the current collection setup. Training uses the eight original
+`fibers_s1a_*.nml` files and the established inverse affine into the Paris4 SD1
+scan. Testing uses the original held-out `/ephemeral/hendrik/fiber3d_train/data/test/*.json`
+without that affine, not the five-scroll test collection.
+
+Retains GroupNorm/BF16, stride-4 output, current augmentations, LR0.01, local
+batch16/global128, 2M updates and test/checkpoint interval100. No embeddings.
+Both splits use dense supervision and continuous arc-length sampling within
+PHercParis4 (the only scroll). This reproduces the old data selection, **not**
+the old control-point sampling, normalization, or CP-only JSON test metric.
+Manager startup/calibration/adaptation is unchanged; no manual resource setup.
+
+```bash
+source /home/hendrik/.venv_las/bin/activate
+CONFIG=/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_16x8.json
+python -m vesuvius.neural_tracing.fiber_trace_3d.train "$CONFIG"
+```
+
+Creates a fresh `s1a_nml_128_sd1_16x8_<timestamp>` run under
+`/ephemeral/hendrik/fiber3d_train2/runs`. No resume weights by default.
+
+## Five-scroll collection
+
 Config: `fiber_trace_3d/configs/train_collection_20260909_5scroll_16x8.json`.
 Based on `train_s1a_nml_8gpu_fast.json`; sampling strategy, dataset lists, run name, explicit
 `embedding.enabled=false` and test/checkpoint intervals (1000 instead of 100)

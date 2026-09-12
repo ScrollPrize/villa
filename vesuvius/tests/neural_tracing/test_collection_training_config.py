@@ -69,3 +69,43 @@ def test_local_collection_membership_and_parser():
                 assert len(fibers) == 1
                 assert len(fibers[0].line_points_xyz) >= 2
     assert selected["datasets"].isdisjoint(selected["test_datasets"])
+
+
+def test_modern_s1a_config_uses_current_training_and_original_sources():
+    path = CONFIGS / "train_s1a_nml_16x8.json"
+    raw = json.loads(path.read_text())
+    current = json.loads(CONFIG.read_text())
+    previous = json.loads((CONFIGS / "train_s1a_nml_8gpu_fast.json").read_text())
+    assert load_config(path).sampling_strategy == "scroll_balanced_arclength"
+    assert raw["training"]["run_name"] == "s1a_nml_128_sd1_16x8"
+    for key in ("test_interval", "checkpoint_interval"):
+        assert raw["training"][key] == 100
+        current["training"][key] = 100
+    for split in ("datasets", "test_datasets"):
+        entries = raw.pop(split)
+        assert len(entries) == 1
+        assert entries[0].pop("scroll_id") == "PHercParis4"
+        assert entries[0].pop("dense_supervision") is True
+        assert entries == previous[split]
+        current.pop(split)
+    raw["training"].pop("run_name")
+    current["training"].pop("run_name")
+    assert raw == current
+
+
+def test_local_modern_s1a_inputs_exist_and_have_positive_length():
+    import numpy as np
+    raw = json.loads((CONFIGS / "train_s1a_nml_16x8.json").read_text())
+    if not Path(raw["datasets"][0]["fiber_glob"]).parent.exists():
+        pytest.skip("local S1a dataset not installed")
+    for split, suffix in (("datasets", ".nml"), ("test_datasets", ".json")):
+        paths = sorted(glob.glob(raw[split][0]["fiber_glob"]))
+        assert paths, split
+        for path in paths:
+            assert Path(path).suffix == suffix
+            fibers = load_fiber_file(path)
+            assert fibers
+            for fiber in fibers:
+                points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+                assert np.isfinite(points).all()
+                assert np.linalg.norm(np.diff(points, axis=0), axis=1).sum() > 0

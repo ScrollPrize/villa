@@ -1,5 +1,5 @@
 {
-  "suites": ["retrain-merge"],
+  "suites": ["arc-sampling"],
   "native_build": false,
   "gpu_devices": ["0"],
   "timeout_seconds": 300,
