@@ -1,3 +1,7 @@
+## 2026-09-12 — Latest28k then best11k full evaluations
+
+- Frozen latestcurrent28k/3584000samples(loss0.387998919) andbest11k/1408000samples(loss0.360366457) before sequential fresh-inference50fiber/100direction runs under exclusive8GPU manager. Latest399.916s/2516restarts/mean3.089281mm;best398.684s/2214restarts/mean3.492462mm. Best improves overlastbest5k3.218462mm but remains belowclassic3.857546mm. Full highlighted per-scroll mean/median/P05/P95/counts and runtime comparison in docs/benchmarks/collection_182306_latest_best_full_20260912.md/.json;individual raw reports retained.200artifacts audited,bothcommands exit0,managergrants released,training restored. Config/docs only;codeb32f31a55 unchanged.
+
 ## 2026-09-11 — Current best5k full five-scroll evaluation
 
 - Evaluated new frozen step5000/640000samples best.pt (2823f517…,dense test loss0.408346925) from runcollection_20260909_5scroll_128_sd1_16x8_20260911_182306. Same50fibers100directions,fresh inference,exclusive8GPUs. Completed402.933s,2411restarts,mean3.218462mm vs same-run3k3.601407mm (10.63%shorter); Paris4 drives regression. Corrected terminal-inclusive mean/median/P05/P95 with all4baselines/per-scroll in docs/benchmarks/collection_182306_best5k_full_20260911.md/.json.100artifacts audited; manager released,training resumed. Config/docs only,previous metric patch preserved.

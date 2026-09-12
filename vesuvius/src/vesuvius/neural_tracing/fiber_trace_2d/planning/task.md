@@ -1,3 +1,3 @@
-# Evaluate current best snapshot
+# Latest and best checkpoint full evaluation —2026-09-12
 
-Run all50locked test fibers across five actual scrolls in both directions against new best.pt from collection_20260909_5scroll_128_sd1_16x8_20260911_182306. Freeze selection; fresh inference with source caches reused and exclusive8GPU manager. Compare complete-segment mean/median/P05/P95 and restart counts against saved baselines. Continue to completion and persist results.
+Evaluate the latest current.pt first, then best.pt from collection_20260909_5scroll_128_sd1_16x8_20260911_182306. Each evaluates all50locked fibers/100directions across5actualscrolls, fresh inference and exclusive8GPU manager. Compare quality and runtime against classic and the last best5k run, with full per-scroll metrics and best highlighting. Freeze both before either run; finish and persist both results.
