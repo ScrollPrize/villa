@@ -36,6 +36,7 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "reproduction": ["tests/neural_tracing/test_reproduction.py", "../gpu_manager/tests/test_stop_guard.py", "../gpu_manager/tests/test_exclusive.py"],
     "loss-regression": ["tests/neural_tracing/test_fiber_trace_3d.py", "tests/neural_tracing/test_fiber_embeddings.py", "-k", "loss or bounded_gradients or two_branch_positive_supervision"],
     "stop-guard": ["../gpu_manager/tests/test_stop_guard.py"],
     "shutdown": ["../gpu_manager/tests/test_stop_guard.py", "../gpu_manager/tests/test_supervisor.py", "tests/neural_tracing/test_ordered_sample_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],

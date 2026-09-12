@@ -834,6 +834,13 @@ def _make_test_loader_raw_config(raw_config: dict[str, Any], training: dict[str,
     test_raw = dict(raw_config)
     test_raw["datasets"] = raw_config["test_datasets"]
     test_raw.pop("test_datasets", None)
+    if "test_batch_size" in training:
+        size = training["test_batch_size"]
+        if type(size) is not int or size < 1:
+            raise ValueError("training.test_batch_size must be a positive integer")
+        test_raw["batch_size"] = size
+    if "test_sampling_strategy" in training:
+        test_raw["sampling_strategy"] = training["test_sampling_strategy"]
     if not bool(training.get("test_augment_enabled", False)):
         test_raw["augment_enabled"] = False
     return test_raw
@@ -2217,6 +2224,26 @@ def _distributed_gather_dense_test_rows(
     return [item for rank_rows in gathered for item in rank_rows]
 
 
+class _FullResolutionEvaluation(torch.nn.Module):
+    """Evaluate low-resolution predictions against the historical full-grid targets."""
+    output_stride = 1
+
+    def __init__(self, model, mode):
+        super().__init__()
+        if mode not in {"trilinear", "nearest"}:
+            raise ValueError("test_output_upsample must be trilinear or nearest")
+        if _model_uses_conditioned_decoder(model):
+            raise ValueError("historical full-grid evaluation only supports ordinary models")
+        self.model, self.mode = model, mode
+
+    def forward(self, volume):
+        output = self.model(volume)
+        if output.shape[2:] == volume.shape[2:]:
+            return output
+        kwargs = {"align_corners": False} if self.mode == "trilinear" else {}
+        return F.interpolate(output, size=volume.shape[2:], mode=self.mode, **kwargs)
+
+
 @torch.no_grad()
 def _evaluate_dense_loss_rows(
     model: torch.nn.Module,
@@ -2238,8 +2265,11 @@ def _evaluate_dense_loss_rows(
     prediction_observer: Any | None = None,
     microbatch_size: int | None = None,
     profile_times: dict[str, list[float]] | None = None,
+    output_upsample: str | None = None,
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
+    if output_upsample is not None:
+        model = _FullResolutionEvaluation(model, output_upsample)
     batch_size = int(loader.config.batch_size)
     if microbatch_size is not None and (type(microbatch_size) is not int or microbatch_size < 1):
         raise ValueError("test microbatch_size must be positive")
@@ -3331,6 +3361,7 @@ def training_units(
                     direction_weight=direction_weight, presence_weight=presence_weight,
                     conditioned_loss_options=conditioned_loss_options, mixed_precision=mixed_precision,
                     diagnostics=diagnostics, diagnostic_step=step,
+                    output_upsample=training.get("test_output_upsample"),
                     prediction_observer=test_visualization if distributed.is_main and writer is not None and test_vis_due else None,
                 )
                 if physical_microbatch_sizes is not None:

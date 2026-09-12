@@ -1,0 +1,1 @@
+{"stage":"repro00_modern_oldtest","config":"vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro00_modern_oldtest.json","devices":[0,1,2,3,4,5,6,7],"timeout_seconds":14400}

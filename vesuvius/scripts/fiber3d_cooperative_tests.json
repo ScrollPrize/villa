@@ -1,5 +1,5 @@
 {
-  "suites": ["loss-regression", "single-backward", "cuda-arc", "cuda-cohort"],
+  "suites": ["reproduction"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,
