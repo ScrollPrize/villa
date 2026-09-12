@@ -1,5 +1,8 @@
 # Native 3D Trace2CP Benchmarks
 
+> Current five-scroll results use **complete reference segments including terminals**, not the older failure-only or whole-corpus F+1 metrics below. See the [corrected comparison](benchmarks/complete_segments_20260911.md) and [latest best5k full comparison](benchmarks/collection_182306_best5k_full_20260911.md). Historical tables below are retained as legacy records, not current headline metrics.
+
+
 ## Current full five-scroll native/live benchmark
 
 - 2026-09-11: [run20260911_182306 best3k, full50fiber/100direction comparison, all paired metrics](benchmarks/collection_182306_best3k_full_20260911.md).

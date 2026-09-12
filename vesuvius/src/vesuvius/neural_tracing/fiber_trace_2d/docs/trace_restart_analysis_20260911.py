@@ -1,11 +1,13 @@
 import argparse, json, math, statistics, hashlib
 from pathlib import Path
 from collections import defaultdict
+from vesuvius.neural_tracing.fiber_trace_3d.replay_metrics import complete_report
 parser = argparse.ArgumentParser(description='Audit saved full100-direction replay artifacts; no inference or writes.')
 parser.add_argument('root', nargs='?', type=Path, default=Path('/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full'))
 root = parser.parse_args().root
 raw = (root/'summary.json').read_bytes()
 summary = json.loads(raw)
+complete = complete_report(summary)
 assert summary['completed'] and summary['cases'] == 100
 groups = defaultdict(list)
 collections = {}
@@ -28,7 +30,8 @@ for source in summary['sources']:
     collections[source['source_id']] = rows
     groups[scroll].extend(rows)
     expected = source['summary']['mean_failed_span_length_mm']
-    assert math.isclose(sum(sum(r['failed_mm']) for r in rows)/sum(len(r['failed_mm']) for r in rows), expected)
+    failures = sum(len(r['failed_mm']) for r in rows)
+    assert math.isclose(sum(sum(r['failed_mm']) for r in rows)/failures if failures else 0, expected)
 seen = set()
 for path in sorted((root/'cases').glob('*/trace.json')):
     artifact = json.loads(path.read_text())
@@ -62,7 +65,7 @@ for path in sorted((root/'cases').glob('*/trace.json')):
 assert seen == set(case_lookup) and len(seen)==100
 def aggregate(rows):
     failed=[x for r in rows for x in r['failed_mm']]
-    percentiles=statistics.quantiles(failed, n=100, method='inclusive')
+    percentiles=statistics.quantiles(failed, n=100, method='inclusive') if len(failed)>1 else [failed[0] if failed else 0]*99
     physical=[x for r in rows for x in r['physical_failed_mm']]
     all_physical=[x for r in rows for x in r['physical_all_mm']]
     n=len(failed); length=sum(r['reference_mm'] for r in rows)
@@ -72,15 +75,15 @@ def aggregate(rows):
         zero_length_failures=sum(x==0 for x in failed),
         failure_free_directions=sum(r['failure_free'] for r in rows),
         directed_reference_mm=length, credited_mm=credit,
-        failed_span_sum_mm=sum(failed), mean_before_restart_mm=statistics.mean(failed),
-        median_before_restart_mm=statistics.median(failed),
+        failed_span_sum_mm=sum(failed), mean_before_restart_mm=statistics.mean(failed) if failed else 0,
+        median_before_restart_mm=statistics.median(failed) if failed else 0,
         p05_before_restart_mm=percentiles[4],
         p95_before_restart_mm=percentiles[94],
-        mean_all_attempts_including_terminal_and_zero_mm=credit/len(all_physical),
-        mean_positive_seeded_span_mm=credit/sum(r['seeded'] for r in rows),
+        mean_all_attempts_including_terminal_and_zero_mm=credit/len(all_physical) if all_physical else 0,
+        mean_positive_seeded_span_mm=credit/sum(r['seeded'] for r in rows) if sum(r['seeded'] for r in rows) else 0,
         corpus_reliability_mm=length/(n+1),
-        mean_failed_polyline_mm=statistics.mean(physical),
-        mean_all_polyline_mm=statistics.mean(all_physical))
+        mean_failed_polyline_mm=statistics.mean(physical) if physical else 0,
+        mean_all_polyline_mm=statistics.mean(all_physical) if all_physical else 0)
 global_rows=[r for rows in groups.values() for r in rows]
 report=dict(input=str(root), summary_sha256=hashlib.sha256(raw).hexdigest(),
     artifact_cases_validated=len(seen), global_result=aggregate(global_rows),
@@ -88,5 +91,11 @@ report=dict(input=str(root), summary_sha256=hashlib.sha256(raw).hexdigest(),
     collections={k:aggregate(v) for k,v in collections.items()})
 assert report['global_result']['failures']==summary['failures']
 assert math.isclose(report['global_result']['directed_reference_mm'], summary['directed_reference_length_mm'])
-assert math.isclose(report['global_result']['corpus_reliability_mm'],summary['mean_segment_length_mm'])
+if summary.get('metric_definition'):
+    assert math.isclose(complete['global_result']['mean_segment_length_mm'],summary['mean_segment_length_mm'])
+else:
+    assert math.isclose(report['global_result']['corpus_reliability_mm'],summary['mean_segment_length_mm'])
+# Old quantities remain explicitly diagnostic, never headline segment metrics.
+report['legacy_diagnostics'] = {k: report.pop(k) for k in ('global_result', 'scrolls', 'collections')}
+report.update(complete)
 print(json.dumps(report,indent=2))

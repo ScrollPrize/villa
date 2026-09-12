@@ -1,15 +1,15 @@
-# Plan: next collection snapshot evaluation
+# Plan: current best5k full evaluation
 
-1. Read existing full-test workflow/specs, inspect current best.pt metadata and hash, confirm model native stride4. Freeze selected step3000 snapshot (384000samples, test/loss_total0.43289151958754807, SHA256ee4595cd702029ad1f2edbbd56ebaf8006991b57601f3bbc7499b0e1a4970b18) with existing freeze_checkpoint helper in /tmp staging so ongoing training cannot change preparation/audit. Live runner subsequently freezes it into global inference model cache as usual. Keep original training path/provenance in docs; no new snapshot-copy implementation.
-2. Archive previous active log and independently review plan. Clone prior full cap8 config changing only checkpoint path/hash and fresh output/cache namespace. Exact6collections/5scrolls,50fibers100directions, inputL1,total factor4,native4,256tile96overlap32border32outputchunk,bf16,cap8,existing trace/ellipse/reset settings. No production-code changes planned, no installs, no retraining or GT-heading fix.
-3. Prepare and validate-full with approved run_classic_fiber_evaluation.py entrypoint, then full with exclusive8GPU manager priority100/224logicalCPUs. Manager handles pausable training; never bypass exclusivity or mutate training manually. Fresh inference; existing source fetches reusable. Monitor to100/100 and successful cleanup; no stop at launch. Keep stable hash throughout.
-4. Use existing saved-artifact analysis script (optional root, actual terminal-segment counts) and existing failure/percentile definitions. Validate all100artifacts, units/source identities/counts, zero warm inference, drained queues and released manager grant. Compare mean/median/P05/P95/failures/zero spans globally/per-scroll with classic and previous collection; retain all channels/provenance. One full trial, report timing limitations and no significance claim.
-5. Record exact commands/build/config/data/snapshot hashes and results under docs/benchmarks, link existing native_trace2cp_benchmarks.md, update task_log/status/changelog. Native-stride batching already validated in previous task; configuration-only preparation validation and actual full run are primary tests; rerun relevant lightweight checks if code changes become necessary.
+1. Read workflow/specs/plan and independently review. Archive preceding correction log; preserve its uncommitted code/docs/tests. Corrected native binary already rebuilt/tested (11native+16CLI); no implementation changes expected.
+2. Freeze current best using existing live_evaluate.freeze_checkpoint into /tmp staging, then canonical model cache in runner. Captured best5k,640000samples,test/loss_total0.4083469252361626,SHA2823f5175be6d9ecc072bffd9079b6a2d984aa7bd014ab8c72d6b195992d101e. Keep original path. best means minimum dense test/loss_total, not latest current.pt or tracing-selected.
+3. Clone best3k workload changing only frozen snapshot/hash and distinct output/inference namespace. Same50fibers100directions6collections5scrolls,source mappings,native stride handling,256tile96overlap32border32outputchunk,bf16,cap8,128readers256inputslots128resultslots,canonical tracer parameters. No GT-heading/reset changes. Use approved run_classic_fiber_evaluation.py prepare,validate-full,full; manager exclusive8GPUs priority100/224logicalCPUs; no unmanaged bypass.
+4. Monitor to100/100 and successful cleanup. Reuse source fetches, never inference. Existing completed pilot satisfies prerequisite; no new subset trial. Audit snapshot hash,warmchunks0,membership,F+C mean. Run existing saved-artifact audit on100cases; compare global/per-scroll full metrics with classic,previous17k,earlier3k. Record wall/tiles/batches and timing caveats.
+5. Persist config and benchmark JSON/MD with command/data/checkpoint/build/revision provenance; link index, update log/status/changelog. No training changes/installs. Record uncommitted corrected-metric patch provenance; do not claim clean historical code revision.
 
 ## Spec update
 
-None: existing authoritative-checkpoint/native-stride/exclusive full-test specs apply unchanged. Keep GT-heading investigation deferred.
+None. Apply complete-reference-partition-v1 (L/(F+C), terminals included in quantiles), authoritative checkpoint/native stride and exclusive fresh-inference specs.
 
 ## Docs updates
 
-New benchmark record for run20260911_182306, full paired metrics vs prior baselines, artifact audit and timing provenance. Archive previous log; update current workflow/history. Preserve measured old records unchanged.
+New best5k comparison and metadata; archive prior task log, update progress/log/changelog. Preserve historical benchmarks.

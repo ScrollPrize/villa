@@ -1,5 +1,18 @@
 # Collection best17k — full five-scroll evaluation, 2026-09-11
 
+## Current corrected metrics
+
+The complete-segment comparison below supersedes all failure-only/corpus-F+1 quality numbers in the historical record that follows. Traces, checkpoints and timings are unchanged. See [full corrected per-scroll comparison](complete_segments_20260911.md).
+
+| Model | Restarts | Segments | Mean mm | Median mm | P05 mm | P95 mm | Zero segments |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Classic best91.5k | 1995 | 2095 | 3.857546 | 0.210496 | 0.011224 | 19.465051 | 22 |
+| Collection 09-10 best17k | 2885 | 2985 | 2.707390 | 0.067985 | 0.009190 | 11.575651 | 26 |
+| Collection 09-11 best3k | 2144 | 2244 | 3.601407 | 0.148167 | 0.009164 | 18.480183 | 25 |
+
+## Historical record (superseded quality metrics; preserved run provenance)
+
+
 ## Outcome
 
 Completed all50locked test fibers/100directions across5scrolls (6collections).

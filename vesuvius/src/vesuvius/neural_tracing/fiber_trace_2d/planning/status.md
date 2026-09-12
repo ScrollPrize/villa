@@ -1,9 +1,9 @@
-# New collection full-test status
+# Status
 
-- [x] Read workflow/specs and inspect best checkpoint metadata.
-- [x] Plan full50fiber/100direction evaluation.
-- [x] Freeze selected best checkpoint; independent review confirms only four intended config fields differ.
-- [x] Prepare full50fiber/100direction config and validate checkpoint/data bindings.
-- [x] Complete exclusive8GPU run100/100, exit0, grant released; training unpaused and regranted all8GPUs.
-- [x] Audit all100artifacts/2144failure spans,96terminal suffixes and drained required queues.
-- [x] Save full classic/previous/new paired metrics and provenance under docs/benchmarks; report.
+- [x] Read workflow/specs and freeze current best5k.
+- [x] Write plan and archive previous log.
+- [x] Independent review approved; only snapshot/hash/output/namespace differ.
+- [x] Prepare/validate full workload:50fibers100directions and all manifests verified.
+- [x] Exclusive fresh-inference100-direction run:completed402.933s,exit0.
+- [x] Audit all100artifacts,compare full metrics; manager released,training resumed128CPU/8GPU.
+- [x] Persisted best5k config,benchmark JSON/MD,provenance,index,changelog and log.

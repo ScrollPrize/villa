@@ -6903,18 +6903,27 @@
   mean seeded-span length but not mean failed-span length; an unseeded failure
   contributes a zero failed span. Millimeter conversion requires an explicit
   positive base voxel size.
-- The primary whole-run reliability value is mean segment length. Treat the
-  complete tested directed reference corpus as one interval split into
-  `total_failures + 1` segments, so the value is
-  `sum(full directed reference length) / (total_failures + 1)`. Its percentage
-  is equivalently `100 / (total_failures + 1)`. Only a zero-failure run reports
-  the complete tested length and 100 percent; one failure reports 50 percent.
-  Every failure reason contributes to the count, and the benchmark rejects
-  incomplete directional evaluation before calculating the metric.
-- Version 4 replaces the deprecated `mean_distance_per_failure_*` and
-  `zero_failure_convention_applied` summary fields with
-  `reliability_segments=total_failures+1` and `mean_segment_length_*`.
-- Results use JSON schema version 4 and include tracer identity, common and
+- The primary mean segment length is `sum(full directed reference length) /
+  (total_failures + directed_cases)`. Each independent directed reference is
+  partitioned at its directional failure arcs, from 0 through its full length.
+  Successful terminal spans count, including a zero terminal at an endpoint
+  failure. Repeated failure positions give zero segments. Forced reset advance
+  is included in reference-distance accounting, not claimed as successfully
+  traced length. The partition sum must equal full directed reference length.
+  A 10mm direction with one restart has two segments and mean5mm. Pool segments
+  across cases; never average case means. All failure reasons count; reject
+  incomplete evaluation. Empty summaries use zero count and numeric zero means.
+- Median/P05/P95 use the same complete partition with linear interpolation at
+  `(n-1)*q`. Failure-only, credited seeded-span and physical-path statistics
+  remain explicitly separate diagnostics, never headline quality metrics.
+- Version5 supersedes version4's incorrect whole-corpus `F+1` accounting with
+  `reliability_segments=total_failures+directed_cases` and metric definition
+  `complete-reference-partition-v1`. Replay-set summaries use version2.
+  `mean_segment_length_percent` remains mean divided by total directed length,
+  equivalently `100/(F+C)`: this is not per-fiber success percentage.
+  Saved summaries may be migrated without rerunning traces, retaining original
+  summary bytes/hash and raw failure/geometry data unchanged.
+- Results use JSON schema version5 and include tracer identity, common and
   backend configuration, and every failure's reason, stable
   indices, directional and source-oriented reference arc/fraction, reference
   and optional evaluator position, and optional anisotropic threshold
@@ -6928,8 +6937,10 @@
   `algorithm_revision` separately from `measurement_date`,
   `measurement_revision`, and the reproducible run record. Plot dates are
   algorithm milestones; benchmark table dates remain execution dates.
-- Reference replay plots derive `mean_segment_length_percent` as
-  `100/(failures+1)` after complete evaluation. Crop plots preserve the
+- Historical reference replay plots using `100/(failures+1)` retain their
+  explicitly legacy metric; they are not comparable to current complete-segment
+  reports, which use `100/(failures+directed_cases)`. New replay plots must use
+  the current definition and retain directed-case counts. Crop plots preserve the
   existing problematic-to-retained error ratio but negate it as
   `-100*problematic/retained_fulfilled`; zero is ideal and higher is better.
   Pre-pruning reference-accuracy plots derive

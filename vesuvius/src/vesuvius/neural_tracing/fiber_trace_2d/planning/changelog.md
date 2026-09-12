@@ -1,3 +1,11 @@
+## 2026-09-11 — Current best5k full five-scroll evaluation
+
+- Evaluated new frozen step5000/640000samples best.pt (2823f517…,dense test loss0.408346925) from runcollection_20260909_5scroll_128_sd1_16x8_20260911_182306. Same50fibers100directions,fresh inference,exclusive8GPUs. Completed402.933s,2411restarts,mean3.218462mm vs same-run3k3.601407mm (10.63%shorter); Paris4 drives regression. Corrected terminal-inclusive mean/median/P05/P95 with all4baselines/per-scroll in docs/benchmarks/collection_182306_best5k_full_20260911.md/.json.100artifacts audited; manager released,training resumed. Config/docs only,previous metric patch preserved.
+
+## 2026-09-11 — Complete reference-segment metric correction
+
+- Supersedes prior failure-only headline statistics and whole-corpus F+1 convention: mean full reference length/(restarts+directed cases); successful terminal segments included in mean and all quantiles. Native source schema5/replay-set2; preserved tracing/diagnostics. Corrected25saved summaries with original backups, audited300main-case artifacts without inference rerun. Corrected global classic/collection17k/collection3k means3.857546/2.707390/3.601407mm; full per-scroll comparison in docs/benchmarks/complete_segments_20260911.md.11native+16CLI+9Python tests passed. Older records below retain their historical explicitly superseded metric definitions.
+
 ## 2026-09-11 — Collection run182306 best3k full test
 
 - Captured active training run's best3k/384000samples snapshot (ee4595cd…),

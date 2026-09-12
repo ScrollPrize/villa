@@ -1,5 +1,8 @@
 # Classic full-test trace-length analysis — 2026-09-11
 
+> Current five-scroll results use **complete reference segments including terminals**, not the older failure-only or whole-corpus F+1 metrics below. See the [corrected comparison](benchmarks/complete_segments_20260911.md). Historical tables below are retained as legacy records, not current headline metrics.
+
+
 Saved full cap8/heap run; no inference, tracing or benchmark rerun. Input:
 `/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap/full`.
 Summary SHA256: `7ded270d794461c558ee6ca2f4a7ea8091db7a382dec231c130dedc7285c9d3c`.
