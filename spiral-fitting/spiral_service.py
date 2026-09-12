@@ -2948,6 +2948,7 @@ class ServiceState:
                     "This input is queued for the next optimizer step and "
                     "can no longer be removed")
             if (record.incorporated
+                    or record.incorporated_revision is not None
                     or record.operation == PCL_ASSIGN_COLLECTION_IDS):
                 raise ApiError(HTTPStatus.CONFLICT,
                                "This input already joined the resident fit; removing it "

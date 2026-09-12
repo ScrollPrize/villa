@@ -3962,6 +3962,36 @@ class CommitTests(unittest.TestCase):
             self.state.remove_input("patch", "patch-9")
         self.assertEqual(caught.exception.status, 409)
 
+    def test_remove_pending_fiber_revision_preserves_resident_revision(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        mark(pending)
+        self.session.state = SessionState.Idle
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        record.auto_commit = True
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-9",
+            {"fiber.json": json.dumps(document).encode()},
+            base_revision=first["revision"]))["input"]
+        self.assertEqual(second["state"], "pending")
+        self.assertEqual(second["incorporated_revision"], first["revision"])
+        before = self.state.status()["ephemeral_inputs"]
+
+        with self.assertRaisesRegex(ApiError, "requires reloading") as caught:
+            self.state.remove_input("fiber", "fiber-9")
+
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIs(self.state.ephemeral_records.find("fiber", "fiber-9"),
+                      record)
+        self.assertEqual(self.state.status()["ephemeral_inputs"], before)
+        self.assertTrue(record.auto_commit)
+        self.assertTrue(Path(first["path"]).is_file())
+        self.assertTrue(Path(second["path"]).is_file())
+
     def test_remove_committed_pending_input_keeps_the_dataset_copy(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self.state.commit_inputs()
