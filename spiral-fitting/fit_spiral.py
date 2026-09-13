@@ -4194,7 +4194,8 @@ class FitContext:
         self._commit_rederived_pcl_views(
             list(self.cross_patch_pcls), strips, strip_groups)
 
-    def _reingest_fiber_documents(self, current_iteration):
+    def _prepare_fiber_reingest(self):
+        """Check reload sources before Run settings mutate resident state."""
         records = []
         missing = []
         for logical_id, pcl in self.fiber_catalog.items():
@@ -4212,6 +4213,9 @@ class FitContext:
                 'pcl_fiber_min_point_spacing cannot change at a Run boundary: '
                 f'{len(missing)} resident fiber document(s) are no longer on '
                 f'disk (e.g. {missing[:3]}); rebuild the fit instead')
+        return records
+
+    def _reingest_fiber_documents(self, records):
         if records:
             warnings = self._incorporate_prevalidated_interactive_inputs(
                 records, influence_config={'influence_enabled': False})
@@ -4993,6 +4997,11 @@ class FitContext:
                 if pcl_role_toggle_key(role) in changed
                 and self.config[pcl_role_toggle_key(role)]
             }
+            fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
+            fiber_records = (
+                self._prepare_fiber_reingest()
+                if 'pcl_fiber_min_point_spacing' in changed and fiber_catalog
+                else None)
             if cadence_changed:
                 if cadence_keys <= changed and (
                         int(config['theta_crossing_map_update_interval'])
@@ -5157,10 +5166,9 @@ class FitContext:
                 'pcl_use_pending_fiber_links',
                 'pcl_unattached_pcl_min_point_spacing',
             }
-            fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
             rederived_views = False
-            if 'pcl_fiber_min_point_spacing' in changed and fiber_catalog:
-                self._reingest_fiber_documents(current_iteration)
+            if fiber_records is not None:
+                self._reingest_fiber_documents(fiber_records)
                 rederived_views = True
             elif changed & fiber_view_keys and fiber_catalog:
                 self._rematerialize_fiber_views()

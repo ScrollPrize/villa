@@ -3,6 +3,7 @@
 Each test builds a FitContext piecemeal (the pattern test_vertical_fiber_theta
 uses) and drives FitContext.apply_config the way the interactive runtime does.
 """
+import copy
 import json
 from types import SimpleNamespace
 from unittest import mock
@@ -189,6 +190,42 @@ def test_fiber_spacing_reloads_the_documents_and_refuses_missing_ones(tmp_path):
         [{'kind': 'fiber', 'path': str(present), 'id': 'present',
           'revision': 'abc'}],
         influence_config={'influence_enabled': False})
+
+
+@pytest.mark.parametrize('exponential', [False, True])
+def test_missing_fiber_rejects_lr_changes_without_mutating_optimizer(
+        tmp_path, exponential):
+    context = _context(optimizer_exp_lr_schedule=exponential)
+    context.fiber_catalog = {'gone': {'source_file': str(tmp_path / 'gone.json')}}
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    context.optimiser = torch.optim.SGD(
+        [parameter], lr=context.config['optimizer_learning_rate'])
+    context.lr_scheduler = None
+    context._realign_lr_schedule(10)
+    config_before = dict(context.config)
+    optimizer_before = copy.deepcopy(context.optimiser.state_dict())
+    scheduler = context.lr_scheduler
+    scheduler_before = copy.deepcopy(scheduler.state_dict()) if scheduler else None
+    horizon_before = context.num_training_steps
+
+    with pytest.raises(ValueError, match='no longer on disk'):
+        context.apply_config({
+            'pcl_fiber_min_point_spacing': 5.0,
+            'optimizer_learning_rate': 0.5,
+            'optimizer_lr_final_factor': 0.2,
+            'optimizer_num_training_steps': horizon_before + 100,
+            'optimizer_exp_lr_schedule': not exponential,
+        }, current_iteration=10)
+
+    assert context.config == config_before
+    assert context.optimiser.state_dict() == optimizer_before
+    assert context.lr_scheduler is scheduler
+    if scheduler is not None:
+        assert scheduler.state_dict() == scheduler_before
+    assert context.num_training_steps == horizon_before
+    context.apply_config({}, current_iteration=10)
+    assert context.optimiser.state_dict() == optimizer_before
+    assert context.num_training_steps == horizon_before
 
 
 # --- regular strips --------------------------------------------------------------

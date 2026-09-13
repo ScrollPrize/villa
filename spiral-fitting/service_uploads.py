@@ -221,6 +221,10 @@ def _validate_deletion_document(document, target_collection_id):
         raise ApiError(
             HTTPStatus.BAD_REQUEST,
             "A deletion upload must contain exactly its target collection")
+    # Both runtime paths load the collection before processing its deletion.
+    if not isinstance(collections[target_collection_id].get("name"), str):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "A deletion collection needs a name")
 
 
 def _validate_upload_content(kind, role, directory, *, operation=None,

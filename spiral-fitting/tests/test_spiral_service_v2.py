@@ -2650,6 +2650,29 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(caught.exception.payload["current_revision"],
                          self.state._file_sha256(target))
 
+    def test_deletion_without_name_is_rejected_before_publication(self):
+        self._session()
+        for role, filename in (("same_winding", "same_windings.json"),
+                               ("relative", "relative_windings.json")):
+            with self.subTest(role=role):
+                target = self.dataset / filename
+                source = {"vc_pointcollections_json_version": "1",
+                          "collections": {"0": {"name": "target", "points": {}}}}
+                target.write_text(json.dumps(source))
+                base = self.state._file_sha256(target)
+                upload_id = _upload_input(
+                    self.state, "pcl", f"delete-nameless-{role}",
+                    {"delete.json": json.dumps({
+                        "vc_pointcollections_json_version": "1",
+                        "collections": {"0": {}},
+                    }).encode()},
+                    role=role, operation="delete_collection",
+                    target_collection_id="0", base_source_revision=base)
+                with self.assertRaisesRegex(ApiError, "needs a name") as caught:
+                    self.state.finalize_upload(upload_id)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(self.state._file_sha256(target), base)
+
     def test_same_winding_deletion_uses_the_mutation_protocol(self):
         self._session()
         target = self.dataset / "same_windings.json"
