@@ -675,6 +675,12 @@ def inspect():
 
 
 def main():
+    if sys.argv[1:] == ['embedding-consistency-report']:
+        return subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL), '--report'])
+    if sys.argv[1:] == ['embedding-consistency']:
+        return subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL)])
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['inspect', 'start', 'status', 'stop', 'summarize', 'inputs', 'evaluate', 'audit-latest', 'production-start', 'production-status', 'production-stop', 'production-watch', 'trace-evaluate', 'comparison', 'comparison-followup', 'trace-series-prepare', 'trace-series-next', 'trace-series-retry'])
     args = parser.parse_args()

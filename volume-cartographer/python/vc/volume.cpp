@@ -33,6 +33,8 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
+void bindNormalSampler(nb::module_& m);
+
 namespace {
 
 std::string dtypeName(vc::render::ChunkDtype dtype)
@@ -1408,6 +1410,7 @@ nb::list collectBBoxDependencies(
 
 NB_MODULE(volume, m)
 {
+    bindNormalSampler(m);
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
     m.def("global_cache_root", [] { return vc::core::util::globalCacheRoot().string(); },
           "Resolve the shared VC3D cache root without creating it.");

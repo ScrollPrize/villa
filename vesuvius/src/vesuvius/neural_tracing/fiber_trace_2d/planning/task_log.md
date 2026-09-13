@@ -1,42 +1,11 @@
-# Stopped finetuning evaluation log
+# Embedding consistency analysis
 
-- Current999 completed100directions/audit/exit0;6.371mm vsprior6.444.
-  Full16model/5scrolltables printed beforecurrent99 launched. Root remainsdead.
-- Watcherexit0,trainingdead. Addedexplicitdeadstate checks withdefaultalive,
-  rawbest catalog. CPU29passed1.71s. Allprevious15rows included asbaselines.
-- Frozen current3all49500/6336000samples:999loss.454955825/hash141c57af,
- 99loss.455648193/hash31eae592,rawloss.468490525/hash65a2db4f.
- Best raw21600/2764800samples/loss.378411270/hash7f400b4e.
- Fullhashes in comparisons/finetune_four_20260913/series.json. Firsteval launched.
-- Requested stop LR.001finetuning andevaluatecurrentEMAs/currentraw/bestraw.
-- Latestcompletedtest49500updates/6336000samples. Watcherboundtofinetune223739.
-# Classic-normalized reporting refinement
-
-- Independent finalreview verified21scores,630per-scroll cells/highlights,
-  labels/provenance, allsix100direction audits anddeadtrainingstate. Noblockers.
-
-- BestfinetuneEMA999(23400) completed/audited100directions, score5.486.
-  Allsix evals nowdone, original training rootverifieddead aftereveryeval.
-- Final21snapshot report includes allper-scroll metrics/highlights, selection
-  reason/testloss/exactmetricname, ages andhashes. CPU suite31passed1.69s.
-- Full results/workflow: docs/training_finetune_evaluations.md.
-
-- BestfinetuneEMA99(21900) completed/audited100directions, score5.324 vs
-  currentEMA99(49500)5.665 despitebetter dense testloss .383839 vs .455648.
-- User requested selectionreason+testloss aswell: allsavedreports regenerated
-  with latest/current versus besttestloss, exactsample/update andmetricname.
-
-- Allfour original stopped-run evals complete/audited100directions each.
-  Currentraw49500 scores5.360; bestraw21600 scores5.589. Training staysdead.
-- User added bestEMA99(step21900/2803200samples,testloss.383839) and
-  bestEMA999(step23400/2995200samples,testloss.388823), frozen beforeeval.
-  Newseries finetune_best_emas_20260913 includes all19completed priorrows.
-- Labels now use exactsample/update/weightkind and explicitfinetune;31tests pass.
-
-- EMA99 completed all100 directions and artifact audit; training remains dead.
-- User-approved aggregate now exactClassic arithmeticmean (5.722681385mm)
-  times geometricmean of five model/Classic ratios. Per-scroll values unchanged.
-- Finetuned current999=5.724mm-equivalent, current99=5.665; prior best999=5.790.
-- Independent plan review approved. CPU regression suite:30passed1.66s.
-- Full17model report: docs/benchmarks/finetune_current_emas_20260913.md.
-- Currentraw and bestraw evaluations remain pending; no training restart.
+- 2026-09-13: Analysis-only task started. Preserve prior uncommitted embedding/native-loader work. Full tracer proposal recorded as next task. Include negative distributions, not just means. GPU work only through approved manager-exclusive launcher.
+- Independent review by review_consistency_plan: all eight corners/all contributors, arclength-matched comparisons, cancellation versus amplitude and unlabeled controls clarified.
+- Added analysis-only embedding_consistency.py and approved experiment subcommands embedding-consistency / embedding-consistency-report. Reuses NativeTileReader, Vc3dCoordinateSampler, checkpoint freeze/load, preprocessing, precision and canonical geometry/Gaussian blend ramp. No production embedding publication or tracer changes.
+- Validation: run_fiber3d_cooperative_tests, CPU suite embedding-consistency, 3 passed in2.06s; log /ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260913_113539_405538/embedding-consistency.log.
+- Measurement: run_fiber3d_experiment embedding-consistency, exclusive task ced39ec8-da6a-4781-9aad-8be056ce3e87; training released all GPUs, probe used GPU0. Frozen raw step5300/samples678400, SHA256 f4e261f81de165a76bde523b7d864b6001ddefa543037ce958590cbf6e8ee258.
+- Ten held-out fibers, two per scroll;256 input tiles/64 overlap/16 border, stride4, input level1,chunk32.48 forwards,48.3s analysis including CT/source/metrics (not admission/model startup). Outputs /ephemeral/hendrik/fiber3d_train2/evaluations/embedding_consistency_20260913_v1.
+- Equal-scroll mean same-point cross-tile cosine0.999994;4-base-voxel along-GT cosine interior0.999986, handoff0.999996.15 observed dominant-tile handoffs. No zero GT vectors.23.4–31.8% of high-presence off-GT controls have cosine>0.9. GT window means across10 fibers pairwise cosine min0.999982: consistency alone does not establish fiber discrimination.
+- Explicit limitations: pilot10 fiber windows, not full50 suite; signed embeddings blendedFP32 (no production embedding storage exists, no f16/Zarr roundtrip). Storage boundaries classified in continuous blended field only. Off-GT controls use conservative Euclidean>80-base exclusion rather than exact normal ellipse; they are unlabeled, not guaranteed other fibers. Cancellation summaries include all support corners including zero-alpha corners. No tracing accuracy or throughput claim.
+- Report generated with approved embedding-consistency-report and saved to docs/embedding_consistency_20260913.md. Training verified resumed same run generation3 and progressed to update5400. Stop for requested joint review; do not implement next tracer task yet.

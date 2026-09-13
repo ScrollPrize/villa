@@ -37,9 +37,12 @@ mismatched prepass from silently changing the loss. CPU queue slots are copied
 into bounded owned host staging and promptly released; GPU inputs/graphs remain
 microbatch-bounded. Geometry CUDA work honors the preparer's pause/stream barrier.
 
-Embedding and ordinary multi-branch losses are temporarily rejected at training
-startup and evaluation loss entrypoints. TODO: make their global denominators
-target-only before re-enabling them. Their inference models remain usable.
+Single-branch embeddings add two fixed configured pair budgets to the prepass.
+Each receives weight1/2; no eligible negative presence contributes zero numerator
+without removing its budget. They share the same single backward; no component
+gradient banks are needed. Nested eligibility tensors are owned before queue
+slots are released. Ordinary multi-branch losses remain rejected until their
+denominators are target-only. Their inference models remain usable.
 Conditioned counts are 12 per GT voxel, two positive groups per GT-positive sample,
 and two negative groups per sample, including empty-GT samples. No production
 component-backward fallback remains. The old accumulator remains a numerical/

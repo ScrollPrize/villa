@@ -1350,8 +1350,8 @@ def compute_losses(
     presence_loss_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
     # TODO: replace prediction-dependent global counts before re-enabling these modes.
-    if embeddings is not None or output.shape[1] != 7:
-        raise ValueError("Embedding and ordinary multi-branch losses are temporarily unsupported: "
+    if output.shape[1] != 7:
+        raise ValueError("Ordinary multi-branch losses are temporarily unsupported: "
                          "fix target-only normalization so other samples' predictions cannot change loss weights.")
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
@@ -2891,11 +2891,11 @@ def training_units(
     if "initialization_seed" in training:
         torch.manual_seed(int(training["initialization_seed"]))
     raw_model = build_fiber_trace_3d_model(raw_config)
-    if getattr(raw_model, "embedding_channels", 0) or (
+    if (
         not _model_uses_conditioned_decoder(raw_model)
         and int(getattr(raw_model, "direction_branch_count", 1)) != 1
     ):
-        raise ValueError("Embedding and ordinary multi-branch training are temporarily unsupported; "
+        raise ValueError("Ordinary multi-branch training is temporarily unsupported; "
                          "TODO: implement target-only loss normalization before re-enabling them.")
     sync_batchnorm = _distributed_should_use_sync_batchnorm(
         distributed,
@@ -3815,7 +3815,8 @@ def training_units(
                 return accumulator
 
             if target_only_accumulation and optimizer_microbatch_count == 0:
-                component_accumulator = normalized_accumulator(torch.zeros(3, device=device))
+                component_accumulator = normalized_accumulator(torch.zeros(
+                    5 if getattr(raw_model, "embedding_channels", 0) else 3, device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
                     (step - 1) * optimizer_microbatch_count + microbatch_index + 1

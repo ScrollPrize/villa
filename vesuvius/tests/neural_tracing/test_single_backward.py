@@ -16,14 +16,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from test_arc_sampling import make_loader
 
 
-@pytest.mark.parametrize("raw", [{"embedding": {"enabled": True}},
-    {"model_3d": {"direction_branch_count": 2}}, {"model": {"output_channels": 21}}])
+@pytest.mark.parametrize("raw", [{"model_3d": {"direction_branch_count": 2}}, {"model": {"output_channels": 21}}])
 def test_unsupported_losses_fail_early(raw):
     with pytest.raises(ValueError, match="TODO.*prediction-dependent"):
         validate_target_only_loss_config(raw)
 
 
-@pytest.mark.parametrize("embedding,channels", [(True, 7), (False, 14)])
+@pytest.mark.parametrize("embedding,channels", [(False, 14)])
 def test_unsupported_losses_fail_in_evaluation(embedding, channels):
     with pytest.raises(ValueError, match="temporarily unsupported"):
         compute_losses(torch.zeros(1, channels, 1, 1, 1), None,

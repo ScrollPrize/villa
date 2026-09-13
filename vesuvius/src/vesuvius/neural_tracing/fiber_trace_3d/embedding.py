@@ -48,6 +48,10 @@ class EmbeddingGeometry:
     weight: float
 
 
+class InvalidNormalSampleError(ValueError):
+    """Native sampler reports no valid normal; replace the whole sample."""
+
+
 def _nearest_by_scan(points, line):
     """Exact Euclidean segment projection, O(points) temporary space.
 
@@ -206,13 +210,21 @@ def sample_embeddings(embedding, points):
     return F.normalize(sampled.reshape(embedding.shape[0], -1).T, dim=1, eps=1e-8)
 
 
+def embedding_pair_counts(batch):
+    """Configured budgets, independent of presence and negative eligibility."""
+    if batch.embedding_geometry is None or any(g is None for g in batch.embedding_geometry):
+        raise ValueError("embedding pair budgets require geometry for every sample")
+    half = sum(g.pairs // 2 for g in batch.embedding_geometry)
+    return half, half
+
+
 def embedding_statistics(embeddings, presence, batch):
     """Separate component sums/counts; sampling never backpropagates to presence."""
     zero = embeddings.reshape(-1)[0].float() * 0
     pos_sum, neg_sum = zero, zero
-    pos_count, neg_count = zero.detach(), zero.detach()
     if batch.embedding_geometry is None or len(batch.embedding_geometry) != len(embeddings):
         raise ValueError("embedding-enabled model requires loader embedding geometry/normals")
+    pos_count, neg_count = zero.detach().new_tensor(embedding_pair_counts(batch)).unbind()
     for i, geometry in enumerate(batch.embedding_geometry):
         if geometry is None or tuple(geometry.eligible.shape) != tuple(embeddings.shape[-3:]):
             raise ValueError("missing or mismatched embedding output-grid geometry")
@@ -227,7 +239,6 @@ def embedding_statistics(embeddings, presence, batch):
         on_trace = sample_embeddings(embeddings[i], points)
         positive = 1 - (on_trace[:half] * on_trace[half:2 * half]).sum(dim=1).clamp(-1, 1)
         pos_sum = pos_sum + positive.sum() * geometry.weight
-        pos_count = pos_count + half
         weights = presence[i].detach().float().reshape(-1)
         if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
             raise ValueError("embedding sampling requires finite presence probabilities in [0,1]")
@@ -239,5 +250,4 @@ def embedding_statistics(embeddings, presence, batch):
         negatives = F.normalize(embeddings[i].reshape(embeddings.shape[1], -1)[:, chosen].T.float(), dim=1, eps=1e-8)
         negative = (on_trace[2 * half:] * negatives).sum(dim=1).clamp_min(0)
         neg_sum = neg_sum + negative.sum() * geometry.weight
-        neg_count = neg_count + half
     return pos_sum, pos_count, neg_sum, neg_count

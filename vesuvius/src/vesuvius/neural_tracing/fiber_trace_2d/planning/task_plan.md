@@ -1,45 +1,40 @@
-# Stopped-run evaluation plan
+# Embedding consistency analysis
+1. Inspect shared live inference model, native input, tile geometry and blending.
+   Freeze a completed raw snapshot; record step, SHA256, config and precision.
+2. Deterministically select held-out fiber segments across five scrolls; dense
+   physical GT sampling through tile overlap. Distinguish inference tile edges,
+   dominant-contributor switches and arbitrary stored Zarr chunk boundaries.
+3. Measure within-tile cosine versus distance, same-location cross-tile cosine,
+   blended vector norm/cancellation and along-GT cosine across boundaries versus
+   distance-matched interiors. Include negative/off-fiber similarity distributions
+   and presence so collapse or background cannot masquerade as consistency.
+4. Reuse native reads, model construction/preprocessing and blend weights.
+   Analysis-only bounded embedding tiles need not change production publication.
+   Include all contributing tiles for blended points; disclose storage precision
+   differences and sampling limitations explicitly.
+5. CPU synthetic regression tests, then managed real measurement through approved
+   experiment caller. Preserve running training and verify ownership release.
+6. Save reproducible JSON and Markdown results per scroll plus equal-scroll
+   aggregate. Stop for user review before implementing tracer changes.
 
-1. Existing approved watcher targets activefinetuning launch andlastcomplete test;
-verify current raw/EMA writes beforeboundedstop. Leave stopped.
-2. Extend shared series catalogue with bestraw; explicit expected_training_state
-alive(default) or dead for thisseries. Check it beforefreeze, before/aftereval;
-unknown iserror. Preserve oldlivebehavior, no skipchecks or trainingrestarts.
-3. Freeze4exact snapshots beforefirstGPUevaluation; freshoutputroot. Add previous
-currentraw/currentEMA99/currentEMA999 to Classic andprevious bestpair comparisons.
-Include ALL earlier evaluatedrows (NML/JSON/combined600k,early3EMA,bestpair,
-previouscurrent3) directly asbaselines; no optional archival-only scope.
-4. Run4serial managedexclusive evaluations andaudits, fulltables aftereach.
-Record best rawselection testmetric/step and compare finetuning vsprior results.
-5. User extension: freeze bestEMA99/bestEMA999 from stoppedfinetuning, then
-evaluate both afterbestraw. New series uses all19 completedrows asbaselines.
-No training restart; reuse existing runner and artifact audits unchanged.
+## Independent review refinements
+Blend every contributing tile at all eight query corners before interpolation.
+Measure cancellation as norm(sum(w*e))/sum(w*norm(e)), separately from amplitude.
+Match boundary/interior pairs by arclength lag. Random off-GT controls are not
+guaranteed distinct fibers; report presence strata and cosine quantiles. Initial
+controls use conservative distance >80 base voxels from the full GT polyline,
+which guarantees exclusion from its radius20/80 normal ellipse without adding
+normal loading. This is not exactly the training candidate distribution.
 
 ## Spec update
-
-Reporting refinement: replace the arithmetic aggregate with Classic's exact
-arithmetic mean times the geometric mean of five model/Classic scroll ratios.
-Require exactly one Classic row, positive baseline means, finite nonnegative
-model means; zero model mean gives zero score. Keep all per-scroll metrics.
-Test baseline identity, proportional gains, scroll-scale invariance of ranking,
-and invalid baselines. Regenerate the completed EMA99 comparison without GPUs.
-Use actual snapshot sample/update counts and weight kind in labels, not
-early/previous/current ages. Mark finetuning explicitly; preserve provenance.
-Also show selection reason (latest/current or best test loss), exact test metric
-and its value; best selection is per raw/EMA track, not trace-score selection.
-
-No training or inference math changes. Stopped-run mode explicit; previous alive
-invariant retained bydefault. AllGPUwork usesexistingmanagerexclusiveadmission.
+Analysis-only diagnostic, no training/loss, cache-format or manager-protocol change.
 
 ## Docs updates
-
-Preserve reports/provenance/tasklog; explain stopped-run option and conclusions.
+Report commands, data, checkpoint, metrics, caveats and timing; replace active log/status.
 
 ## Validation
-
-CPU exactbestraw order/rawvalidation/stoppedstate/defaultalive regressions;
-4full100direction GPUartifactaudits. Independent plan/finalreport review.
+Independent plan review against task/spec/plan. Synthetic identities, boundaries
+and inconsistent embeddings; real manager-exclusive measurement.
 
 ## Changelog
-
-Record stoppedfinetuning evaluationresults.
+Record diagnostic and findings when complete.

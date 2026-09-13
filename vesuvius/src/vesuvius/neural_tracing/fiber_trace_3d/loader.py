@@ -10,8 +10,8 @@ import os
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace, field
-from types import SimpleNamespace
-from .embedding import EmbeddingConfig, EmbeddingGeometry, build_eligibility
+from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
+                        InvalidNormalSampleError)
 from .arc_sampling import FiberLocation, ScrollArcSampler
 from pathlib import Path
 from typing import Any
@@ -34,8 +34,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
     load_fiber_file,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
-    FiberStrip2DLoader,
-    _open_manifest_channels,
     _download_prefetch_request,
     _empty_marker_path,
     _existing_data_path,
@@ -2032,6 +2030,8 @@ class FiberTrace3DLoader:
         if config.embedding.enabled and any(not d.get("lasagna_manifest_path") for d in config.datasets):
             raise ValueError("embedding training requires lasagna_manifest_path for every dataset")
         self._embedding_normal_records = {}
+        self._missing_normal_samples = 0
+        self._replacement_pools = {}
         self.records = self._load_records()
         if config.sampling_strategy not in {"control_points", "scroll_balanced_arclength"}:
             raise ValueError("sampling_strategy must be control_points or scroll_balanced_arclength")
@@ -3015,25 +3015,32 @@ class FiberTrace3DLoader:
             self._target_tangent_output_zyx(record, cp_index, params),
         )
 
-    def _build_embedding_geometry(self, record, record_index, params):
+    def _build_embedding_geometry(self, record, record_index, params, timings=None):
         cfg = self.config.embedding
         if not cfg.enabled:
             return None
-        if record_index not in self._embedding_normal_records:
-            channels = _open_manifest_channels(record.dataset_config, self.config,
-                                               volume=record.volume, volume_path=record.volume_path)
-            _, grad, grad_spacing, nx, ny, nx_spacing, ny_spacing = channels
-            self._embedding_normal_records[record_index] = SimpleNamespace(
-                **vars(record), grad_mag=grad, grad_mag_spacing_base=grad_spacing,
-                nx=nx, ny=ny, nx_spacing_base=nx_spacing, ny_spacing_base=ny_spacing)
-        normal_record = self._embedding_normal_records[record_index]
+        from vc.volume import NormalSampler
+        manifest = _resolve_path(record.dataset_config["lasagna_manifest_path"], self.config.config_dir)
+        if manifest not in self._embedding_normal_records:
+            opened = time.perf_counter()
+            self._embedding_normal_records[manifest] = NormalSampler(
+                manifest, self.config.volume_cache_dir or "")
+            if timings is not None:
+                timings["embedding_normal_open_ms"] = (time.perf_counter()-opened)*1000
+        sampler = self._embedding_normal_records[manifest]
 
         def sample_normals(points):
-            normals, valid, errors = FiberStrip2DLoader.sample_lasagna_normals_at_zyx_batch(
-                normal_record, points, line_indices=np.arange(len(points)))
+            # Native interface is base XYZ; loader geometry is base ZYX.
+            xyz = np.ascontiguousarray(points[:, ::-1], dtype=np.float32)
+            started = time.perf_counter()
+            normals, valid = sampler.sample(xyz, threads=1)
+            if timings is not None:
+                timings["embedding_normals_ms"] = timings.get("embedding_normals_ms", 0.) + (time.perf_counter()-started)*1000
             if not valid.all():
-                raise ValueError("embedding exclusion: " + next(iter(errors.values())))
-            return normals[:, ::-1]  # shared sampler returns XYZ; geometry is ZYX
+                raise InvalidNormalSampleError(
+                    f"embedding exclusion: invalid normal (including zero grad_mag) "
+                    f"manifest={manifest} invalid={np.count_nonzero(~valid)}/{len(valid)}")
+            return normals[:, ::-1]
 
         eligible = build_eligibility(
             self.config.patch_shape_zyx, cfg.output_stride,
@@ -3043,6 +3050,55 @@ class FiberTrace3DLoader:
                                  cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight)
 
     def load_raw_sample(
+        self, sample_index: int, *, sample_index_limit: int | None = None,
+        sample_mode: str = "random", device: torch.device | str = "cpu",
+        profile: bool = False,
+    ) -> FiberTrace3DRawSample:
+        """Replace invalid-normal samples within their original scroll/group.
+
+        Queue identity remains canonical. Replacement draws and augmentations
+        are keyed only by that identity and attempt, not worker/rank state.
+        """
+        data_index = _bounded_data_sample_index(int(sample_index), sample_index_limit)
+        original = self.descriptor_for_sample_index(data_index, sample_mode=sample_mode)
+        descriptor = original
+        for attempt in range(129):
+            augmentation_index = int(sample_index) if attempt == 0 else (
+                _stable_seed(self.config.seed, "missing_normal_augmentation", sample_index, attempt) % (2**63-1))
+            try:
+                return self._load_raw_sample_once(sample_index, sample_index_limit=sample_index_limit,
+                    sample_mode=sample_mode, device=device, profile=profile,
+                    descriptor=descriptor, augmentation_index=augmentation_index)
+            except InvalidNormalSampleError as exc:
+                self._missing_normal_samples += 1
+                if self._missing_normal_samples == 1 or self._missing_normal_samples % 100 == 0:
+                    print(f"fiber loader: skip invalid-normal sample={sample_index} attempt={attempt} "
+                          f"worker_skipped={self._missing_normal_samples} fiber={descriptor[0].fiber.path} {exc}", flush=True)
+                if attempt == 128:
+                    raise RuntimeError(f"no normal-supported sample after 128 replacements: "
+                        f"sample={sample_index} original_fiber={original[0].fiber.path}: {exc}") from exc
+                descriptor = self._replacement_descriptor(original, sample_index, attempt+1, sample_mode)
+        raise AssertionError("unreachable")
+
+    def _replacement_descriptor(self, original, sample_index, attempt, sample_mode):
+        record = original[0]
+        def group(r):
+            return (r.dataset_config.get("scroll_id", r.volume_path),
+                    r.dataset_config.get("sampling_group"))
+        key = group(record)
+        if key not in self._replacement_pools:
+            self._replacement_pools[key] = tuple(i for i,r in enumerate(self.records) if group(r) == key)
+        ids = self._replacement_pools[key]
+        rng = np.random.default_rng(_stable_seed(self.config.seed, "missing_normal_replacement", sample_index, attempt))
+        if sample_mode == "random" and self._arc_sampler is not None:
+            return self._arc_sampler.sample_within(rng, ids)
+        counts = np.cumsum([len(self.records[i].fiber.control_points_xyz) for i in ids])
+        flat = int(rng.integers(int(counts[-1])))
+        local = int(np.searchsorted(counts, flat, side="right"))
+        cp = flat - (int(counts[local-1]) if local else 0)
+        return self.records[ids[local]], ids[local], cp
+
+    def _load_raw_sample_once(
         self,
         sample_index: int,
         *,
@@ -3050,6 +3106,8 @@ class FiberTrace3DLoader:
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
         profile: bool = False,
+        descriptor=None,
+        augmentation_index: int | None = None,
     ) -> FiberTrace3DRawSample:
         stream_index = int(sample_index)
         total_start = time.perf_counter()
@@ -3058,16 +3116,17 @@ class FiberTrace3DLoader:
         resolved_device = torch.device(device)
         start = time.perf_counter()
         data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
-        record, record_index, cp_index = self.descriptor_for_sample_index(
-            data_index,
-            sample_mode=sample_mode,
-        )
+        record, record_index, cp_index = descriptor
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        params = self._sample_augment_params(record, cp_index, stream_index)
+        params = self._sample_augment_params(record, cp_index, augmentation_index)
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
+        embedding_start = time.perf_counter()
+        embedding_geometry = self._build_embedding_geometry(record, record_index, params, timings)
+        if timings is not None:
+            timings["embedding_geometry_ms"] = (time.perf_counter() - embedding_start) * 1000.0
         start = time.perf_counter()
         geometry = self._build_geometry_maps(
             params,
@@ -3103,10 +3162,6 @@ class FiberTrace3DLoader:
         )
         if timings is not None:
             timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
-        embedding_start = time.perf_counter()
-        embedding_geometry = self._build_embedding_geometry(record, record_index, params)
-        if timings is not None:
-            timings["embedding_geometry_ms"] = (time.perf_counter() - embedding_start) * 1000.0
         load_wall_ms = (time.perf_counter() - total_start) * 1000.0
         load_cpu_ms = (time.process_time() - cpu_total_start) * 1000.0
         if timings is not None:

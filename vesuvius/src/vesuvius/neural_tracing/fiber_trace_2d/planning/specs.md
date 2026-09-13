@@ -666,6 +666,13 @@
 
 ## 3D CP-Centered Fiber Model Variant
 
+- The analysis-only embedding_consistency diagnostic uses frozen checkpoints,
+  native live-inference CT reads/preprocessing and shared canonical tile geometry
+  and Gaussian blend ramps. It combines all contributors on the output lattice
+  before interpolation and cosine normalization. GPU admission uses the existing
+  exclusive manager launcher. It does not enable embedding publication or tracer
+  scoring; continuity and off-GT discrimination are reported separately.
+
 - Local metric embeddings are opt-in through top-level `embedding.enabled`.
   Existing models and forward callers retain the `7*K` direction/presence tensor.
   Enabled unconditioned U-Nets add a signed embedding head in the same final
@@ -681,7 +688,9 @@
 - Negative output-grid points are sampled proportional to detached predicted
   presence (maximum branch presence for multiple direction branches), after
   exclusion. Zero weights are never sampled. No eligible positive weight means
-  zero negative count/loss, without uniform fallback or doubling positive weight.
+  zero negative loss while retaining the configured negative count, without
+  uniform fallback or doubling positive weight. Both budgets are known before
+  forward; other patches' predictions never change normalization weights.
   Empty nonzero GT support is an error. Sampling uses per-stream seeded RNG,
   independent of rank and microbatch placement, without cross-patch pairs.
 - Embedding training requires each dataset's `lasagna_manifest_path` with valid
@@ -691,16 +700,22 @@
   the Euclidean-nearest continuous annotated segment point, sample the shared
   principal-axis normal there, and exclude when `dn^2 + dt^2/16 <= 20^2`.
   The tangent is the full surface tangent plane, not learned fiber direction.
-  Unlike replay's invalid-normal spherical fallback, training errors on invalid
-  required normals. The NumPy threshold backend implements the native replay
+  Training replaces the whole sample on invalid required normals, including
+  missing or zero grad_mag, with bounded deterministic draws within the same
+  scroll/sampling group. Configuration and I/O failures remain errors. Normals
+  use vc.volume.NormalSampler, the existing C++ LasagnaNormalSampler with native
+  chunk caching and decoded-corner tensor interpolation; no Python Zarr reads.
+  The NumPy threshold backend implements the native replay
   formula; it is not a call to the C++ evaluator.
 - Eligibility is prepared in bounded blocks by loader workers and transported
   in the existing fixed shared-slot bank; IPC carries only its descriptor.
   Pinned transfer and CUDA stream ownership cover eligibility as well as input.
   Normals and exclusion do not run in the model forward. Pair loss uses FP32
   arithmetic on the model's device while model autocast policy remains unchanged.
-- Embedding losses are temporarily disabled with an explicit TODO error until
-  their global normalization is target-only. Checkpoint configs retain embedding settings.
+- Single-branch embedding losses use fixed configured pair budgets in the
+  target-only prepass and the same combined backward as direction/presence.
+  embedding_negative_pairs reports the normalization budget, not actual draws.
+  Checkpoint configs retain embedding settings.
   Enabling embeddings invalidates an old cooperative memory calibration.
   Conditioned-decoder embeddings and embedding Zarr publication are not provided
   by this training feature; default inference products remain unchanged.
@@ -716,7 +731,7 @@
   observed-count validation occur at the update boundary; no full-batch graph
   is retained. FP32 master parameters/gradient reduction and configured autocast
   remain unchanged. Zero-work ranks join both count and gradient reductions.
-  Embedding and ordinary multi-branch losses temporarily raise explicit errors:
+  Ordinary multi-branch losses temporarily raise explicit errors:
   TODO target-only normalization before re-enabling them. Inference remains
   supported. Conditioned counts retain two positive queries and two dense
   negative groups per sample. No component-backward production fallback exists.

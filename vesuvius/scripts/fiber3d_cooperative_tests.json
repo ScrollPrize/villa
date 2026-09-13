@@ -1,5 +1,5 @@
 {
-  "suites": ["ema"],
+  "suites": ["embedding-consistency"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

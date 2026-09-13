@@ -21,6 +21,9 @@ def historical_test_config(raw):
     result["sampling_strategy"] = "control_points"
     result["batch_size"] = 8
     result["augment_enabled"] = False
+    # Historical observation uses direction/presence only. Do not let unused
+    # embedding eligibility change its reference sample population.
+    result["embedding"] = {"enabled": False}
     result.pop("test_datasets", None)
     result.pop("historical_test_datasets", None)
     return result

@@ -1,3 +1,16 @@
+## 2026-09-13 — Fixed-budget single-backward embeddings
+
+- Re-enabled single-branch embeddings with fixed positive/negative budgets,
+  including zero-presence patches; one combined backward and no extra gradient
+  banks. Fixed shared eligibility ownership in macro-batch staging.
+- Combined five-scroll/Paris4 NML+JSON config at LR0.01 prepared with existing
+  normal sources. CPU/two-GPU gradient tests pass.
+- Embedding geometry uses the existing native LasagnaNormalSampler via a thin
+  vc.volume binding, reusing native chunk caching and decoded-corner tensor
+  interpolation. Invalid normals (including zero grad_mag) replace whole samples
+  deterministically within the original scroll/group; shared queue IDs are stable.
+  No Python normal-data reads, extra validity masks, or spherical fallback.
+
 ## 2026-09-12 — Live-training EMA tracing comparisons
 
 - Evaluated frozen current0.999, best0.999 and best0.99 in order on50fibers;
@@ -2503,3 +2516,9 @@
 # Saved-test analysis — 2026-09-11
 
 - Committed measured native/inference/integration state (75013f6cc, a238c4598, 175e3645b), then audited all100 saved full-cap8 traces without rerunning. Mean failure-ended reference span3.427927mm; per-scroll/collection counts, terminal handling, historical4.048877mm corpus reliability and reproducible calculation in docs/trace_restart_analysis_20260911.md/.json/.py.
+# 2026-09-13 — Embedding consistency diagnostic
+
+- Added manager-exclusive GT embedding overlap/blend diagnostic and reproducible
+  report (docs/embedding_consistency_20260913.md). Ten-fiber pilot found excellent
+  tile consistency but substantial high-similarity off-GT controls. Tracer
+  integration remains the next task pending review; training resumed unchanged.

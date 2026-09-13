@@ -666,14 +666,17 @@ class MacroBatchTargetSource:
     def __next__(self):
         if not self.pending:
             prepared = []
-            counts = torch.zeros(3)
+            counts = torch.zeros(5 if self.config.embedding.enabled else 3)
             for size in self.batch_sizes:
                 raw = next(self.source)
                 try:
                     # Queue views release/reuse their slots on next(); take
                     # ownership before returning credits, including geometry.
                     batch = replace(raw, **{name: value.clone() for name, value in vars(raw).items()
-                                           if isinstance(value, torch.Tensor)})
+                                           if isinstance(value, torch.Tensor)},
+                                    embedding_geometry=None if raw.embedding_geometry is None else tuple(
+                                        None if item is None else replace(item, eligible=item.eligible.clone())
+                                        for item in raw.embedding_geometry))
                 finally:
                     self.source.release_current()
                 if batch.volume.shape[0] != size:
@@ -698,6 +701,9 @@ class MacroBatchTargetSource:
                 targets.presence_target.new_tensor(indices.shape[0] * 6),
                 targets.presence_target.new_tensor(torch.unique(indices[:, 0]).numel()),
                 (targets.presence_target <= 0.5).flatten(1).any(dim=1).sum().float()))
+            if self.config.embedding.enabled:
+                from .embedding import embedding_pair_counts
+                counts = torch.cat((counts, counts.new_tensor(embedding_pair_counts(batch))))
             return counts.cpu()
 
     def release_current(self):

@@ -1,4 +1,12 @@
 {
+  "embedding_consistency": {
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_embedding_128_sd1_16x8_ema_20260913_094346/snapshots/current.pt",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_consistency_20260913_v1",
+    "template": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
+    "cache_root": "/ephemeral/hendrik/fiber3d_train/chunk_cache",
+    "tile": 256, "overlap": 64, "border": 16, "chunk": 32,
+    "fibers_per_scroll": 2, "spacing_input": 2, "length_input": 256
+  },
   "stage": "repro00_modern_oldtest",
   "config": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/repro00_modern_oldtest.json",
   "devices": [
@@ -62,7 +70,7 @@
     "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
-    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_finetune_5scroll_s1a_ema_lr0001.json"
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_combined_5scroll_s1a_embedding_ema_16x8.json"
   },
   "trace_series": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",

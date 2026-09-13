@@ -1,15 +1,8 @@
-# Finetuning evaluation status
+# Embedding consistency analysis
 
-- [x] Inspect andplan.
-- [x] Stop aftercompletecheckpoints (49500/6336000samples).
-- [x] Review plan andtest explicitstoppedmode/bestraw (29passed).
-- [x] Freeze4snapshots.
-- [x] Current999 eval/audit/report.
-- [x] Current99 eval/audit/report.
-- [x] Classic-normalized geometric score and exact snapshot-age labels (31 tests).
-- [x] Currentraw eval/audit/report.
-- [x] Bestraw eval/audit/report.
-- [x] Freeze additionally requested finetuning bestEMA99/bestEMA999.
-- [x] BestEMA99 eval/audit/report.
-- [x] BestEMA999 eval/audit/report.
-- [x] Review fullcomparison, verify remainsstopped, docs/commit.
+- [x] Instructions and current/next task recorded.
+- [x] Independent plan review; corner-complete blending, distance matching and control caveats incorporated.
+- [x] Diagnostic and synthetic validation: 3 CPU tests passed.
+- [x] Managed measurement: raw update5300 /678400 samples,10 held-out fibers,48 forwards,48.3s on one GPU.
+- [x] Report and training continuation checked: generation3, update5400.
+- [ ] User review before implementing the separately recorded tracer plan.

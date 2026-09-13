@@ -36,6 +36,10 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "embedding-consistency": ["tests/neural_tracing/test_embedding_consistency.py"],
+    "embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_single_backward.py"],
+    "embedding-data": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "real_data_preflight", "-s"],
+    "cuda-embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "cuda_embedding", "-s"],
     "cuda-ema": ["tests/neural_tracing/test_ema.py", "-k", "cuda", "-s"],
     "ema": ["tests/neural_tracing/test_ema.py", "tests/neural_tracing/test_reproduction.py", "tests/neural_tracing/test_training_state.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],
     "reproduction": ["tests/neural_tracing/test_reproduction.py", "../gpu_manager/tests/test_stop_guard.py", "../gpu_manager/tests/test_exclusive.py"],
@@ -101,6 +105,9 @@ def main():
                    PYTHONPATH=f"{ROOT / 'vesuvius/src'}:{ROOT / 'gpu_manager/src'}:{ROOT}")
         env.pop("FIBER_COOPERATIVE_CUDA_TEST", None)
         env.pop("FIBER_COOPERATIVE_TEST_GPUS", None)
+        env.pop("FIBER_EMBEDDING_DATA_TEST", None)
+        if suite == "embedding-data":
+            env["FIBER_EMBEDDING_DATA_TEST"] = "1"
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')
             env["PYTHONPATH"] = f"{ROOT / 'vesuvius/scripts/cooperative_test_support'}:" + env["PYTHONPATH"]
@@ -108,6 +115,10 @@ def main():
             env.update(CUDA_VISIBLE_DEVICES=devices[0], FIBER_COOPERATIVE_CUDA_TEST="1")
         elif suite in ("cuda-cohort", "cuda-reference"):
             env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(devices)
+        elif suite == "cuda-embedding":
+            if len(devices) != 2:
+                raise ValueError("cuda-embedding requires two GPUs")
+            env["FIBER_COOPERATIVE_CUDA_TEST"] = "1"
         command = [sys.executable, "-m", "pytest", "-q", "-o", "faulthandler_timeout=60", *SUITES[suite]]
         if suite == "cuda-reference":
             env.update(FIBER_COOPERATIVE_TEST_CONTROL=str(output / "control.json"),
@@ -161,6 +172,8 @@ def main():
                 env["FIBER_COOPERATIVE_TEST_GPUS"] = ",".join(peaks)
                 if suite in ("cuda-amp", "cuda-arc", "cuda-ema"):
                     env["CUDA_VISIBLE_DEVICES"] = next(iter(peaks))
+                elif suite == "cuda-embedding":
+                    env["CUDA_VISIBLE_DEVICES"] = ",".join(peaks)
                 managed_command = ExclusiveCommand(command, cwd=ROOT / "vesuvius", env=env,
                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
                 lease.cohort = managed_command

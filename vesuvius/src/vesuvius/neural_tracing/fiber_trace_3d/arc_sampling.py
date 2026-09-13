@@ -73,6 +73,18 @@ class ScrollArcSampler:
         scales = self.distance_scales[scroll_index]
         if scales is not None:
             distance *= float(scales[local_index])
+        return self._location(record_index, distance)
+
+    def sample_within(self, rng, record_indices):
+        """Conditional arclength draw for replacement in a fixed scroll/group."""
+        lengths = np.asarray([self.segment_cdfs[i][-1] for i in record_indices])
+        cdf = np.cumsum(lengths)
+        distance = min(float(rng.random()*cdf[-1]), np.nextafter(cdf[-1], 0.0))
+        local = int(np.searchsorted(cdf, distance, side="right"))
+        distance -= float(cdf[local-1]) if local else 0.0
+        return self._location(int(record_indices[local]), distance)
+
+    def _location(self, record_index, distance):
         segments = self.segment_cdfs[record_index]
         distance = min(distance, np.nextafter(segments[-1], 0.0))
         segment = int(np.searchsorted(segments, distance, side="right"))

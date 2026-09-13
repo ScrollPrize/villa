@@ -10,8 +10,10 @@ import torch
 from vesuvius.neural_tracing.fiber_trace_3d.embedding import (
     EmbeddingConfig, EmbeddingGeometry, build_eligibility, embedding_statistics,
     nearest_polyline_points, outside_normal_ellipse, sample_trace_points,
+    InvalidNormalSampleError,
 )
-from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import ComponentGradientAccumulator
+from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import NormalizedGradientAccumulator, validate_target_only_loss_config
+from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import MacroBatchTargetSource
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DSharedTensorSlots, collate_fiber_trace_3d_samples,
 )
@@ -154,8 +156,190 @@ def test_zero_negative_support_retains_positive_term():
     batch = pair_batch(pairs=128)
     a = embedding_statistics(embedding, torch.zeros(1, 1, 2, 2, 3), batch)
     b = embedding_statistics(embedding, torch.ones(1, 1, 2, 2, 3), batch)
-    assert a[3] == 0 and a[2] == 0 and a[1] == 64
+    assert a[3] == 64 and a[2] == 0 and a[1] == 64
     torch.testing.assert_close(a[0], b[0])
+
+
+def test_native_normal_interpolation_and_validity(tmp_path, capsys):
+    import json
+    from vc.volume import NormalSampler
+    from tests.zarr_utils import create_v2_group_array
+    groups = {}
+    arrays = {}
+    for name, value in (("grad_mag", 1), ("nx", 255), ("ny", 128)):
+        array = create_v2_group_array(tmp_path / (name+".zarr"), "0", shape=(8,8,8),
+                                     chunks=(4,4,4), dtype="uint8")
+        array[:4,:4,:4] = value
+        if name == "nx":
+            array[:4,:4,2:4] = 1  # +X to -X encoding jump, SAME unoriented axis
+        if name == "grad_mag":
+            array[1,1,1] = 0  # stored zero is as invalid as absent far chunk
+        groups[name] = {"zarr": name+".zarr/0", "scaledown":0, "channels":[name]}
+        arrays[name] = array
+    manifest = tmp_path / "normals.lasagna.json"
+    manifest.write_text(json.dumps({"version":2, "source_to_base":1,
+        "base_shape_zyx":[8,8,8], "grad_mag_encode_scale":1000,
+        "grad_mag_factor":.25, "groups":groups}))
+    sampler = NormalSampler(str(manifest), str(tmp_path / "cache"))
+    points = np.array([[1.5,2,2], [1,1,1], [6,6,6], [2,2,2]], dtype=np.float32)
+    normals, valid = sampler.sample(points)
+    assert valid.tolist() == [True, False, False, True]
+    np.testing.assert_allclose(np.abs(normals[valid]), [[1,0,0], [1,0,0]], atol=1e-5)
+    for point, expected, ok in zip(points, normals, valid):
+        one, one_valid = sampler.sample(point[None])
+        assert one_valid[0] == ok
+        np.testing.assert_allclose(one[0], expected)
+    empty, empty_valid = sampler.sample(np.empty((0,3), np.float32))
+    assert empty.shape == (0,3) and empty_valid.shape == (0,)
+    with pytest.raises(ValueError):
+        sampler.sample(np.zeros((2,2), np.float32))
+    with pytest.raises(Exception):
+        NormalSampler(str(tmp_path / "nonexistent.json"))
+    # Same warm-cache workload against the former Python/Zarr normal path.
+    import time
+    from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DLoader
+    record = SimpleNamespace(**arrays, grad_mag_spacing_base=1., nx_spacing_base=1., ny_spacing_base=1.)
+    queries = np.random.default_rng(11).uniform(.1, 2.9, (32768,3)).astype(np.float32)
+    rows = {}
+    for backend in ("native", "python_zarr"):
+        durations = []
+        for iteration in range(4):
+            start = time.perf_counter()
+            if backend == "native":
+                axis, ok = sampler.sample(queries, threads=1)
+            else:
+                axis, ok, _ = FiberStrip2DLoader.sample_lasagna_normals_at_zyx_batch(
+                    record, queries[:, ::-1], line_indices=np.arange(len(queries)))
+            durations.append(time.perf_counter()-start)
+            assert ok.all()
+            np.testing.assert_allclose(np.abs(axis[:,0]), 1, atol=1e-5)
+        measured = durations[1:]
+        rows[backend] = {"seconds_min_median_max": [min(measured), float(np.median(measured)), max(measured)]}
+    with capsys.disabled():
+        print("NORMAL_SAMPLING_BENCH " + json.dumps({"points":32768, "cpu_sampling_threads":1,
+            "dataset":"synthetic 8-cube; warm cache; sign-jump normals", "results":rows}), flush=True)
+
+
+@pytest.mark.parametrize("mode", ["flat", "random"])
+def test_whole_sample_replacement_deterministic_and_bounded(monkeypatch, mode):
+    loader = _loader_with_mapping({"augment_enabled": False})
+    calls = []
+    def load(index, **kwargs):
+        calls.append(kwargs["augmentation_index"])
+        if len(calls) == 1:
+            raise InvalidNormalSampleError("missing")
+        return SimpleNamespace(sample=SimpleNamespace(stream_index=index),
+                               descriptor=kwargs["descriptor"], seed=kwargs["augmentation_index"])
+    monkeypatch.setattr(loader, "_load_raw_sample_once", load)
+    first = loader.load_raw_sample(7, sample_mode=mode)
+    calls.clear()
+    second = loader.load_raw_sample(7, sample_mode=mode)
+    assert first.sample.stream_index == second.sample.stream_index == 7
+    assert first.descriptor == second.descriptor and first.seed == second.seed
+    def invalid(*a, **kw): raise ValueError("present but invalid")
+    monkeypatch.setattr(loader, "_load_raw_sample_once", invalid)
+    with pytest.raises(ValueError, match="present but invalid"):
+        loader.load_raw_sample(7)
+    def io_error(*a, **kw): raise TimeoutError("network timeout")
+    monkeypatch.setattr(loader, "_load_raw_sample_once", io_error)
+    with pytest.raises(TimeoutError): loader.load_raw_sample(7)
+    def missing(*a, **kw): raise InvalidNormalSampleError("missing")
+    monkeypatch.setattr(loader, "_load_raw_sample_once", missing)
+    with pytest.raises(RuntimeError, match="128 replacements"):
+        loader.load_raw_sample(7)
+
+
+def test_replacement_stays_in_scroll_and_group():
+    from vesuvius.neural_tracing.fiber_trace_3d.arc_sampling import ScrollArcSampler
+    loader = _loader_with_mapping({"augment_enabled": False})
+    base = loader.records[0]
+    loader.records = [replace(base, dataset_config={**base.dataset_config, "scroll_id":s,
+        "sampling_group":g, "sampling_group_weight":1})
+        for s,g in [("Paris4","json"),("Paris4","json"),("Paris4","nml"),("Other","json")]]
+    loader._arc_sampler = ScrollArcSampler(loader.records)
+    for mode in ("flat","random"):
+        chosen = [loader._replacement_descriptor((loader.records[0],0,0), 0, i, mode)[1] for i in range(100)]
+        assert set(chosen) == {0,1}
+
+
+def test_embedding_prepass_owns_eligibility_after_shared_slot_release():
+    batch = training_batch()
+    parts = [_slice_batch(batch, i, i + 1) for i in range(2)]
+    class Source:
+        def __next__(self):
+            self.current = parts.pop(0)
+            return self.current
+        def release_current(self):
+            self.current.embedding_geometry[0].eligible.logical_not_()
+        def close(self): pass
+    config = replace(_loader_with_mapping({"augment_enabled": False}).config,
+                     embedding=EmbeddingConfig(enabled=True))
+    source = MacroBatchTargetSource(Source(), config=config, device=torch.device("cpu"),
+                                   output_stride=2, batch_sizes=[1, 1])
+    first, second = next(source), next(source)
+    assert first.embedding_geometry[0].eligible.all()
+    assert not second.embedding_geometry[0].eligible.any()
+    torch.testing.assert_close(first.normalization_counts[-2:], torch.tensor([64.,64.]))
+
+
+def test_combined_embedding_real_data_preflight():
+    """Explicit host-only integration check; never fetch training data in CI."""
+    import os
+    import glob
+    import json
+    from pathlib import Path
+    if os.environ.get("FIBER_EMBEDDING_DATA_TEST") != "1":
+        pytest.skip("requires approved host-data test runner")
+    from vesuvius.neural_tracing.fiber_trace_3d.loader import FiberTrace3DLoader, config_from_mapping
+    path = Path(__file__).parents[2] / "src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_combined_5scroll_s1a_embedding_ema_16x8.json"
+    raw = json.loads(path.read_text())
+    assert raw["training"]["learning_rate"] == .01 and "resume" not in raw["training"]
+    assert raw["training"]["max_steps"] == 2000000
+    assert raw["sampling_strategy"] == "scroll_balanced_arclength"
+    assert len({d["scroll_id"] for d in raw["datasets"]}) == 5
+    paris = [d for d in raw["datasets"] if d["scroll_id"] == "PHercParis4"]
+    assert {(d["sampling_group"], d["sampling_group_weight"]) for d in paris} == {("json",1),("nml",1)}
+    torch.set_num_threads(1)
+    for kind in ("datasets", "test_datasets", "historical_test_datasets"):
+        for dataset in raw[kind]:
+            files = sorted(glob.glob(dataset["fiber_glob"]))
+            assert files, dataset
+            entry = {k:v for k,v in dataset.items() if k != "fiber_glob"}
+            entry["fiber_paths"] = files
+            probe = {**raw, "datasets": [entry], "batch_size": 1,
+                     "volume_io_threads": 1, "volume_decode_threads": 1, "volume_sample_threads": 1}
+            if kind == "historical_test_datasets":
+                probe["sampling_strategy"] = "control_points"
+                probe["embedding"] = {"enabled": False}
+            loader = FiberTrace3DLoader(config_from_mapping(probe, config_dir=path.parent))
+            sample = loader.load_raw_sample(0, profile=True).sample
+            if kind == "historical_test_datasets":
+                assert sample.embedding_geometry is None
+            else:
+                assert sample.embedding_geometry.eligible.shape == (32,32,32)
+            print(f"EMBEDDING_DATA_OK {kind} {dataset['scroll_id']} "
+                  f"embedding_ms={sample.profile_timings_ms.get('embedding_geometry_ms')} "
+                  f"replacements={loader._missing_normal_samples}", flush=True)
+            if kind == "datasets" and dataset is raw[kind][0]:
+                from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
+                    FiberTrace3DSampleQueue, SampleQueueSource)
+                import time
+                queue = FiberTrace3DSampleQueue(sources={"train": SampleQueueSource(loader.config)},
+                    workers=2, slot_count=2, initial_in_flight=2)
+                try:
+                    ticket = queue.submit("train", (0,1))
+                    deadline = time.monotonic()+90
+                    batch = None
+                    while batch is None and time.monotonic() < deadline:
+                        batch = queue.batch(ticket)
+                        if batch is None: time.sleep(.02)
+                    assert batch is not None, "queued embedding load timed out"
+                    assert len(batch.embedding_geometry) == 2
+                    assert all(g.eligible.shape == (32,32,32) for g in batch.embedding_geometry)
+                    queue.release(ticket)
+                    print("EMBEDDING_NATIVE_QUEUE_OK workers=2 samples=2", flush=True)
+                finally:
+                    queue.close()
 
 
 def tiny_config():
@@ -193,38 +377,59 @@ def training_batch():
     return materialize_targets(batch, loader.config, output_stride=2)
 
 
-def test_regular_and_bounded_embedding_gradients_match():
+def pair_prepass_counts(batch):
+    loader = _loader_with_mapping({"augment_enabled": False, "batch_size": 2})
+    config = replace(loader.config, embedding=EmbeddingConfig(enabled=True))
+    source = MacroBatchTargetSource(None, config=config, device=batch.volume.device,
+                                   output_stride=2, batch_sizes=[len(batch.volume)])
+    return source._counts(batch)
+
+
+def test_regular_and_bounded_embedding_gradients_match(monkeypatch):
     torch.manual_seed(5)
     batch = training_batch()
     expected = build_fiber_trace_3d_model(tiny_config())
     actual = copy.deepcopy(expected)
     losses = _forward_loss_tensors(expected, batch, direction_weight=1.2, presence_weight=0.7, training_loss=True)
     losses["total"].backward()
-    accumulator = ComponentGradientAccumulator(actual)
-    assert len(accumulator.banks) == 5
+    validate_target_only_loss_config(tiny_config())
+    accumulator = NormalizedGradientAccumulator(actual, pair_prepass_counts(batch),
+                                               direction_weight=1.2, presence_weight=0.7)
+    calls = []
+    original = torch.Tensor.backward
+    def backward(tensor, *args, **kwargs):
+        calls.append(1)
+        return original(tensor, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "backward", backward)
     for i in range(2):
         statistics = _forward_loss_statistics(actual, _slice_batch(batch, i, i + 1))
         accumulator.add(statistics)
-    total = accumulator.reduce_and_assign(direction_weight=1.2, presence_weight=0.7)
+    total = accumulator.reduce_and_assign()
+    assert len(calls) == 2
     reduced = _finalize_loss_statistics(total, direction_weight=1.2, presence_weight=0.7)
     for key in losses:
         torch.testing.assert_close(reduced[key], losses[key], atol=2e-5, rtol=2e-5)
     for a, b in zip(actual.parameters(), expected.parameters()):
         torch.testing.assert_close(a.grad, b.grad, atol=3e-5, rtol=3e-4)
-    assert reduced["embedding_negative_pairs"] == 32
+    assert reduced["embedding_negative_pairs"] == 64  # budget, including excluded patch
     legacy = build_fiber_trace_3d_model({**tiny_config(), "embedding": {"enabled": False}})
-    assert len(ComponentGradientAccumulator(legacy).banks) == 3
+    assert len(NormalizedGradientAccumulator(legacy, torch.zeros(3),
+               direction_weight=1, presence_weight=1).components) == 3
 
 
 def test_normals_loader_and_shared_transport(monkeypatch):
-    from vesuvius.neural_tracing.fiber_trace_3d import loader as module
-    def channels(*args, **kwargs):
-        shape = (64, 64, 64)
-        return shape, np.ones(shape), 1., np.full(shape, 128), np.full(shape, 128), 1., 1.
-    monkeypatch.setattr(module, "_open_manifest_channels", channels)
+    import vc.volume
+    opened = []
+    class Sampler:
+        def __init__(self, *args): opened.append(args)
+        def sample(self, xyz, threads):
+            assert threads == 1
+            return np.tile([0.,0.,1.], (len(xyz),1)), np.ones(len(xyz), bool)
+    monkeypatch.setattr(vc.volume, "NormalSampler", Sampler)
     loader = _loader_with_mapping({"augment_enabled": False, "embedding": {"enabled": True},
                                    "model_3d": {"output_stride": 4},
                                    "datasets": [{"lasagna_manifest_path": "synthetic.json"}]})
+    loader.records[0].dataset_config["lasagna_manifest_path"] = "synthetic.json"
     raw = loader.load_raw_sample(2)
     assert raw.sample.embedding_geometry.eligible.shape == (4, 4, 4)
     slots = FiberTrace3DSharedTensorSlots(start_index=2, slot_count=1, patch_shape_zyx=(16, 16, 16), embedding_stride=4)
@@ -233,6 +438,8 @@ def test_normals_loader_and_shared_transport(monkeypatch):
     restored = slots.decode(2, payload, final=False)
     assert torch.equal(restored.sample.embedding_geometry.eligible, raw.sample.embedding_geometry.eligible)
     assert restored.sample.embedding_geometry.seed == raw.sample.embedding_geometry.seed
+    loader.load_raw_sample(3)
+    assert len(opened) == 1  # manifest handle reused across samples
 
 
 def test_enabled_loader_requires_normals():
@@ -241,13 +448,16 @@ def test_enabled_loader_requires_normals():
 
 
 def test_invalid_normals_fail_instead_of_spherical_fallback(monkeypatch):
-    from vesuvius.neural_tracing.fiber_trace_3d import loader as module
-    monkeypatch.setattr(module, "_open_manifest_channels", lambda *a, **kw: (
-        (64, 64, 64), np.zeros((64, 64, 64)), 1.,
-        np.full((64, 64, 64), 128), np.full((64, 64, 64), 128), 1., 1.))
+    import vc.volume
+    class Sampler:
+        def __init__(self, *args): pass
+        def sample(self, xyz, threads):
+            return np.zeros_like(xyz), np.zeros(len(xyz), bool)
+    monkeypatch.setattr(vc.volume, "NormalSampler", Sampler)
     loader = _loader_with_mapping({"embedding": {"enabled": True}, "model_3d": {"output_stride": 4},
                                    "datasets": [{"lasagna_manifest_path": "synthetic.json"}]})
-    with pytest.raises(ValueError, match="embedding exclusion.*grad_mag"):
+    loader.records[0].dataset_config["lasagna_manifest_path"] = "synthetic.json"
+    with pytest.raises(RuntimeError, match="128 replacements"):
         loader.load_raw_sample(0)
 
 
@@ -261,15 +471,14 @@ def test_real_manifest_scales_and_actual_augmentation(tmp_path, monkeypatch):
     volume = tmp_path / "volume.zarr"
     create_v2_group_array(volume, "0", shape=(64, 64, 64), chunks=(16, 16, 16), dtype="uint8")[:] = 80
     create_v2_array(volume / "1", shape=(32, 32, 32), chunks=(16, 16, 16), dtype="uint8")[:] = 80
-    normals = create_v2_group_array(tmp_path / "normals.zarr", "2", shape=(3, 16, 16, 16),
-                                    chunks=(1, 8, 8, 8), dtype="uint8")
-    normals[0] = 1
-    normals[1] = 128
-    normals[2] = 128  # surface normal +Z in base coordinates
+    groups = {}
+    for channel, value in (("grad_mag", 1), ("nx", 128), ("ny", 128)):
+        create_v2_group_array(tmp_path / (channel+".zarr"), "2", shape=(16,16,16),
+                              chunks=(8,8,8), dtype="uint8")[:] = value
+        groups[channel] = {"zarr": channel+".zarr/2", "scaledown":2, "channels":[channel]}
     manifest = tmp_path / "normal.lasagna.json"
     manifest.write_text(json.dumps({"version": 2, "source_to_base": 1., "base_shape_zyx": [64, 64, 64],
-        "grad_mag_encode_scale": 1000., "grad_mag_factor": 1., "groups": {"normals": {
-            "zarr": "normals.zarr", "scaledown": 2, "channels": ["grad_mag", "nx", "ny"]}}}))
+        "grad_mag_encode_scale": 1000., "grad_mag_factor": 1., "groups": groups}))
     # Input annotations use a translation transform, distinct from augmentation.
     fiber = _write_fiber(tmp_path / "fiber.json", points=[[x, 27, 29] for x in range(10, 51, 2)])
     transform = np.eye(4)
@@ -289,7 +498,7 @@ def test_real_manifest_scales_and_actual_augmentation(tmp_path, monkeypatch):
     loaded = loader.load_raw_sample(0)
     record, record_index, cp = loader.descriptor_for_sample_index(0)
     assert record.volume_spacing_base == 2
-    assert loader._embedding_normal_records[record_index].nx_spacing_base == 4
+    assert str(manifest) in loader._embedding_normal_records
     np.testing.assert_allclose(record.fiber.line_points_zyx[:, :2], 32)
     params = loader._sample_augment_params(record, cp, 0)
     indices = np.indices((12, 12, 12)).reshape(3, -1).T
@@ -315,32 +524,65 @@ def test_state_only_checkpoint_does_not_infer_embedding_as_branches(tmp_path):
     restored.load_state_dict(model.state_dict())
 
 
-def _distributed_embedding_worker(rank, directory):
+def _distributed_embedding_worker(rank, directory, backend="gloo", world_size=3, amp=False):
     import torch.distributed as dist
-    dist.init_process_group("gloo", init_method=f"file://{directory}/init", rank=rank, world_size=3)
+    from contextlib import nullcontext
+    from datetime import timedelta
+    device = torch.device(f"cuda:{rank}" if backend == "nccl" else "cpu")
+    if backend == "nccl":
+        torch.cuda.set_device(device)
+        # Compare actual FP32 math, not shape-dependent TF32 convolution choices.
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.cuda.set_per_process_memory_fraction(8 * 1024**3 / torch.cuda.get_device_properties(device).total_memory, device)
+    dist.init_process_group(backend, init_method=f"file://{directory}/init", rank=rank,
+                            world_size=world_size, timeout=timedelta(seconds=60))
     try:
         torch.set_num_threads(1)
         torch.manual_seed(8)
-        model = build_fiber_trace_3d_model(tiny_config())
+        model = build_fiber_trace_3d_model(tiny_config()).to(device)
         oracle = copy.deepcopy(model)
-        batch = training_batch()
-        expected = _forward_loss_tensors(oracle, batch, direction_weight=1., presence_weight=1., training_loss=True)
+        batch = training_batch().to(device)
+        context = lambda: torch.autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext()
+        with context():
+            expected = _forward_loss_tensors(oracle, batch, direction_weight=1., presence_weight=1., training_loss=True)
         expected["total"].backward()
-        accumulator = ComponentGradientAccumulator(model)
-        # Rank 2 deliberately has no samples; rank 1 has no negative pairs.
+        counts = pair_prepass_counts(_slice_batch(batch, rank, rank + 1)) if rank < 2 else torch.zeros(5)
+        accumulator = NormalizedGradientAccumulator(model, counts, direction_weight=1.,
+                                                    presence_weight=1., distributed=True)
+        # Rank 2 has no samples; rank 1 has no eligible negatives but retains its budget.
         if rank < 2:
-            accumulator.add(_forward_loss_statistics(model, _slice_batch(batch, rank, rank + 1)))
-        statistics = accumulator.reduce_and_assign(direction_weight=1., presence_weight=1., distributed=True)
+            with context():
+                stats = _forward_loss_statistics(model, _slice_batch(batch, rank, rank + 1))
+            accumulator.add(stats)
+        statistics = accumulator.reduce_and_assign()
         for a, b in zip(model.parameters(), oracle.parameters()):
-            torch.testing.assert_close(a.grad, b.grad, atol=3e-5, rtol=3e-4)
+            if not amp:
+                torch.testing.assert_close(a.grad, b.grad, atol=3e-5, rtol=3e-4)
+        if amp:
+            actual = torch.cat([p.grad.flatten() for p in model.parameters()])
+            reference = torch.cat([p.grad.flatten() for p in oracle.parameters()])
+            relative = (actual-reference).norm()/reference.norm()
+            assert relative < .02, relative.item()
+            if rank == 0:
+                print(f"EMBEDDING_BF16_GRADIENT_RELATIVE_L2={relative.item():.6g}", flush=True)
         assert statistics.positive_embedding_count == 64
-        assert statistics.negative_embedding_count == 32
+        assert statistics.negative_embedding_count == 64
     finally:
         dist.destroy_process_group()
 
 
 def test_gloo_embedding_unequal_and_zero_work_ranks(tmp_path):
     torch.multiprocessing.spawn(_distributed_embedding_worker, args=(str(tmp_path),), nprocs=3)
+
+
+@pytest.mark.parametrize("amp", [False, True])
+def test_cuda_embedding_distributed_single_backward(tmp_path, amp):
+    import os
+    if os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1":
+        pytest.skip("requires manager-authorized CUDA test launcher")
+    torch.multiprocessing.spawn(_distributed_embedding_worker,
+        args=(str(tmp_path), "nccl", 2, amp), nprocs=2)
 
 
 def test_embedding_cpu_cost(capsys):

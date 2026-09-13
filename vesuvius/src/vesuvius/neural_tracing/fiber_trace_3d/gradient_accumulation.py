@@ -14,16 +14,15 @@ from .loss_statistics import LossStatistics
 
 
 COMPONENTS = ("direction", "positive_presence", "negative_presence")
+EMBEDDING_COMPONENTS = ("positive_embedding", "negative_embedding")
 
 
 def validate_target_only_loss_config(raw):
     """Reject unsupported loss modes, without restricting inference models."""
     model = raw.get("model_3d", raw.get("model", {}))
     branches = int(model.get("direction_branch_count", int(model.get("output_channels", 7)) // 7))
-    if raw.get("embedding", {}).get("enabled", False) or (
-        not model.get("conditioned_decoder_enabled", False) and branches != 1
-    ):
-        raise ValueError("Embedding and ordinary multi-branch losses are temporarily unsupported. "
+    if not model.get("conditioned_decoder_enabled", False) and branches != 1:
+        raise ValueError("Ordinary multi-branch losses are temporarily unsupported. "
                          "TODO: fix prediction-dependent global normalization before re-enabling these modes.")
 
 
@@ -43,13 +42,15 @@ class NormalizedGradientAccumulator:
         if not self.parameters or any(p.dtype != torch.float32 for p in self.parameters):
             raise ValueError("requires FP32 master parameters; use autocast for mixed precision")
         self.distributed, self.process_group = distributed, process_group
+        self.components = COMPONENTS + (EMBEDDING_COMPONENTS if getattr(model, "embedding_channels", 0) else ())
         self.counts = counts.detach().to(device=self.parameters[0].device, dtype=torch.float32).clone()
-        if self.counts.shape != (3,):
-            raise ValueError("expected three target-derived normalization counts")
+        if self.counts.shape != (len(self.components),):
+            raise ValueError(f"expected {len(self.components)} target-derived normalization counts")
         if distributed:
             dist.all_reduce(self.counts, group=process_group)
         self.weights = self.counts.new_tensor((direction_weight,
-            presence_weight * positive_query_weight, presence_weight * negative_query_weight))
+            presence_weight * positive_query_weight, presence_weight * negative_query_weight)
+            + ((0.5, 0.5) if len(self.components) == 5 else ()))
         self.loss_scale = float(loss_scale)
         if not math.isfinite(self.loss_scale) or self.loss_scale <= 0:
             raise ValueError("invalid loss scale")
@@ -59,10 +60,10 @@ class NormalizedGradientAccumulator:
     def add(self, statistics):
         if self.finished:
             raise RuntimeError("accumulator already finalized")
-        if statistics.positive_embedding_sum.requires_grad or statistics.negative_embedding_sum.requires_grad:
-            raise ValueError("target-only accumulator does not support prediction-dependent embedding counts")
+        if len(self.components) == 3 and (statistics.positive_embedding_sum.requires_grad or statistics.negative_embedding_sum.requires_grad):
+            raise ValueError("embedding statistics require an embedding-enabled accumulator model")
         self.statistics.add_(statistics.packed())
-        numerators = torch.stack([getattr(statistics, f"{name}_sum").float() for name in COMPONENTS])
+        numerators = torch.stack([getattr(statistics, f"{name}_sum").float() for name in self.components])
         loss = (numerators * (self.weights / self.counts.clamp_min(1))).sum()
         (loss * self.loss_scale).backward()
 
@@ -73,7 +74,7 @@ class NormalizedGradientAccumulator:
         if self.distributed:
             dist.all_reduce(self.statistics, group=self.process_group)
         statistics = LossStatistics.unpack(self.statistics)
-        actual = torch.stack([getattr(statistics, f"{name}_count") for name in COMPONENTS])
+        actual = torch.stack([getattr(statistics, f"{name}_count") for name in self.components])
         # Refuse an update if prepared geometry and actual forward targets differ.
         if not torch.equal(actual, self.counts):
             raise RuntimeError(f"target normalization counts changed: prepared={self.counts.tolist()} actual={actual.tolist()}")
