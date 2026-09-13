@@ -36,11 +36,16 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "paired": ["tests/neural_tracing/test_paired_embeddings.py", "tests/neural_tracing/test_local_competition.py", "tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_cooperative_resources.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py"],
+    "paired-data": ["tests/neural_tracing/test_paired_embeddings.py", "-k", "real_data_preflight", "-s"],
+    "embedding-tracer": ["tests/neural_tracing/test_embedding_tracer.py", "tests/neural_tracing/test_cached_trace_profile.py", "tests/neural_tracing/test_managed_evaluation.py", "tests/neural_tracing/test_cooperative_resources.py", "../gpu_manager/tests/test_exclusive.py", "../lasagna/tests/test_demand_predict3d.py", "../lasagna/tests/test_omezarr_compression.py"],
+    "embedding-native-build": [],
+    "embedding-native-tests": [],
     "local-competition": ["tests/neural_tracing/test_local_competition.py", "tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_single_backward.py"],
     "embedding-consistency": ["tests/neural_tracing/test_embedding_consistency.py", "tests/neural_tracing/test_embedding_histograms.py"],
     "embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_single_backward.py"],
     "embedding-data": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "real_data_preflight", "-s"],
-    "cuda-embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "cuda_embedding", "-s"],
+    "cuda-embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_paired_embeddings.py", "-k", "cuda_embedding", "-s"],
     "cuda-ema": ["tests/neural_tracing/test_ema.py", "-k", "cuda", "-s"],
     "ema": ["tests/neural_tracing/test_ema.py", "tests/neural_tracing/test_reproduction.py", "tests/neural_tracing/test_training_state.py", "tests/neural_tracing/test_evaluation_pipeline.py", "tests/neural_tracing/test_sample_broker.py", "tests/neural_tracing/test_cooperative_integration.py"],
     "reproduction": ["tests/neural_tracing/test_reproduction.py", "../gpu_manager/tests/test_stop_guard.py", "../gpu_manager/tests/test_exclusive.py"],
@@ -107,7 +112,7 @@ def main():
         env.pop("FIBER_COOPERATIVE_CUDA_TEST", None)
         env.pop("FIBER_COOPERATIVE_TEST_GPUS", None)
         env.pop("FIBER_EMBEDDING_DATA_TEST", None)
-        if suite == "embedding-data":
+        if suite in ("embedding-data", "paired-data"):
             env["FIBER_EMBEDDING_DATA_TEST"] = "1"
         if control.get("native_build", False):
             env["FIBER_COOPERATIVE_NATIVE_BUILD"] = str(ROOT / 'volume-cartographer/build/dev-quickbuild-gcc/python')
@@ -125,6 +130,15 @@ def main():
             env.update(FIBER_COOPERATIVE_TEST_CONTROL=str(output / "control.json"),
                        FIBER_COOPERATIVE_TEST_OUTPUT=str(output))
             command = [sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.cooperative_reference_validation"]
+        elif suite == "embedding-native-build":
+            env.update(CCACHE_DIR="/tmp/ccache", CCACHE_TEMPDIR="/tmp/ccache-tmp")
+            command = ["cmake", "--build", str(ROOT / "volume-cartographer/build/dev-quickbuild-gcc"),
+                       "--target", "vc_fiber_trace_metric", "vc_cache_root", "test_fiber_trace3d", "test_chunk_cache", "-j", "4"]
+            if hasattr(os, "sched_getaffinity"):
+                command = ["taskset", "--cpu-list", ",".join(map(str, sorted(os.sched_getaffinity(0))[:4])), *command]
+        elif suite == "embedding-native-tests":
+            command = ["ctest", "--test-dir", str(ROOT / "volume-cartographer/build/dev-quickbuild-gcc"),
+                       "--output-on-failure", "--timeout", "120", "-R", "^(test_chunk_cache|test_fiber_trace3d)$"]
         elif suite == "native-configure":
             command = ["cmake", "-S", str(ROOT / "volume-cartographer"),
                        "-B", str(ROOT / "volume-cartographer/build/dev-quickbuild-gcc"),

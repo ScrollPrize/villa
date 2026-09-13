@@ -2,6 +2,7 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
+#include "vc/fiber_tracer/FiberEmbedding.hpp"
 
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -473,6 +474,15 @@ void requireNormalSamplerForNormalAwareSmoothness(const FiberTraceConfig& config
 
 void validateTraceConfig(const FiberTraceConfig& config)
 {
+    if (config.embeddingHistoryFalloff != "uniform" && config.embeddingHistoryFalloff != "linear" &&
+        config.embeddingHistoryFalloff != "gaussian")
+        throw std::invalid_argument("unknown embedding history falloff");
+    if (!std::isfinite(config.embeddingWeight) || config.embeddingWeight < 0 ||
+        !std::isfinite(config.embeddingHistorySpacingBaseVoxels) || config.embeddingHistorySpacingBaseVoxels <= 0 ||
+        !std::isfinite(config.embeddingHistoryWindowBaseVoxels) ||
+        config.embeddingHistoryWindowBaseVoxels < config.embeddingHistorySpacingBaseVoxels ||
+        config.embeddingHistoryCount < 1 || config.embeddingHistoryCount > 64)
+        throw std::invalid_argument("invalid embedding weight/history configuration");
     auto requireFinite = [](double value, const char* name) {
         if (!std::isfinite(value))
             throw std::invalid_argument(std::string(name) + " must be finite");
@@ -583,6 +593,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
 }
 
 struct BeamState {
+    FiberEmbeddingHistory embeddingHistory;
     struct PathNode {
         TraceVec point{0.0f, 0.0f, 0.0f};
         std::shared_ptr<const PathNode> previous;
@@ -639,7 +650,21 @@ struct CandidateScore {
     TraceVec selectedCurrentDirection{0.0f, 0.0f, 0.0f};
     float selectedPresence = 0.0f;
     bool valid = false;
+    std::vector<float> embedding;
 };
+
+void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
+    const BeamState& parent, const TraceVec& point, const FiberTraceConfig& config)
+{
+    if (config.embeddingWeight == 0) return;
+    if (vector.empty()) { score.valid = false; score.loss = std::numeric_limits<float>::infinity(); return; }
+    const double arc = (parent.tracedLength + traceLength(point - beamEndpoint(parent))) * config.traceToBaseScale;
+    // Same per-step units as the existing local alignment/smoothness costs.
+    score.loss += static_cast<float>(config.embeddingWeight * fiberEmbeddingCost(
+        vector, parent.embeddingHistory, arc, config.embeddingHistoryWindowBaseVoxels,
+        config.embeddingHistoryFalloff));
+    score.embedding = vector;
+}
 
 struct CandidateTask {
     uint32_t beamIndex = 0;
@@ -997,6 +1022,11 @@ void sampleCandidateNormals(
     referenceDirections.clear();
     auto& predictionSamples = scratch.predictionSamples;
     const auto predictionStart = TraceClock::now();
+    std::vector<std::vector<float>> embeddingSamples;
+    if (config.embeddingWeight > 0) {
+        predictions.sampleEmbeddings(candidatePoints, embeddingSamples);
+        if (embeddingSamples.size() != tasks.size()) throw std::runtime_error("invalid embedding batch size");
+    }
     const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions);
     const auto* lasagnaSampler = dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normalSampler);
     struct CornerScoreContext {
@@ -1007,7 +1037,8 @@ void sampleCandidateNormals(
         std::vector<CandidateScore>* scores;
         const FrontierScoreOutput* frontierOutput;
         size_t optionCount;
-    } cornerContext{&beams, &tasks, &candidatePoints, &config, &scores, frontierOutput, field ? field->optionCount() : 0};
+        const std::vector<std::vector<float>>* embeddings;
+    } cornerContext{&beams, &tasks, &candidatePoints, &config, &scores, frontierOutput, field ? field->optionCount() : 0, &embeddingSamples};
     const auto scoreCornerPoint =
         +[](void* rawContext, size_t pointIndex, const cv::Vec3f& fractionXYZ, bool valid, std::span<const std::array<uint8_t, 8>> volumeCorners) {
             const auto& context = *static_cast<CornerScoreContext*>(rawContext);
@@ -1018,6 +1049,8 @@ void sampleCandidateNormals(
             CandidateScore& score = (*context.scores)[pointIndex];
             score = candidateLossFromCornerValues(
                 volumeCorners, fractionXYZ, valid, context.optionCount, (*context.beams)[task.beamIndex], task.direction, *context.config);
+            if (context.config->embeddingWeight > 0)
+                addEmbeddingScore(score, (*context.embeddings)[pointIndex], (*context.beams)[task.beamIndex], (*context.candidatePoints)[pointIndex], *context.config);
             storeScoredFrontierCandidate(context.frontierOutput, *context.beams, task, (*context.candidatePoints)[pointIndex], score, pointIndex);
         };
     const bool fusedCornerScoring =
@@ -1064,6 +1097,8 @@ void sampleCandidateNormals(
         const auto& task = tasks[index];
         const vc::lasagna::LasagnaNormalSampler::FloatNormalSample* normal = index < normalsForScoring.size() ? &normalsForScoring[index] : nullptr;
         scores[index] = candidateLossFromSample(predictionSamples[index], beams[task.beamIndex], task.direction, config, normal);
+        if (config.embeddingWeight > 0)
+            addEmbeddingScore(scores[index], embeddingSamples[index], beams[task.beamIndex], candidatePoints[index], config);
         storeScoredFrontierCandidate(frontierOutput, beams, task, candidatePoints[index], scores[index], index);
     };
 
@@ -1368,6 +1403,10 @@ void updateTargetPlaneCrossings(
     out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.depth, config.cumulativeSmoothnessSteps);
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength + traceLength(candidate.point - beamEndpoint(parent));
+    if (config.embeddingWeight > 0)
+        advanceFiberEmbeddingHistory(out.embeddingHistory, score.embedding,
+            out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
+            config.embeddingHistoryWindowBaseVoxels, static_cast<size_t>(config.embeddingHistoryCount));
     out.depth = candidate.depth;
     out.reached = candidate.reached;
     out.crossedTargetPlaneMask = candidate.crossedTargetPlaneMask;
@@ -1711,6 +1750,12 @@ template <typename LossAt>
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;
+    if (request.config.embeddingWeight > 0) {
+        std::vector<std::vector<float>> seed;
+        predictions.sampleEmbeddings({start}, seed);
+        if (seed.size() != 1 || seed.front().empty()) throw std::runtime_error("trace seed has no valid embedding");
+        initial.embeddingHistory.push_back({0, seed.front()});
+    }
     updateTargetPlaneCrossings(start, start, targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings);
     initial.reached = targetPlanesReached(targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings, acceptThresholdVoxels);
     std::vector<BeamState> beams{initial};
@@ -2643,7 +2688,7 @@ public:
         bool sharedPresenceNxNy = false;
     };
 
-    Impl(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode)
+    Impl(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode, bool enableEmbeddings)
     {
         const auto& manifest = dataset.manifest();
         sourceScaleExplicit_ = manifest.raw.empty() || (manifest.raw.contains("source_to_base") && manifest.raw.at("source_to_base").is_number());
@@ -2680,6 +2725,9 @@ public:
             options_.push_back(std::move(option));
             if (prefix.empty())
                 canonicalOptionIndex_ = options_.size() - 1;
+        }
+        if (enableEmbeddings) {
+            embeddings_ = vc::lasagna::bindLasagnaEmbeddingChannels(manifest, options_.front().presence);
         }
         if (canonicalOptionIndex_.has_value()) {
             const auto& canonical = options_[*canonicalOptionIndex_];
@@ -2751,6 +2799,15 @@ public:
             }
         }
         readinessGate_ = std::move(gate);
+    }
+
+    void sampleEmbeddings(const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& values) const
+    {
+        if (embeddings_.empty()) throw std::runtime_error("embedding sampling was not enabled for prediction field");
+        // All siblings are published together by the existing demand store.
+        // Await the identical prediction lattice before reading any signed data.
+        awaitPoints(points);
+        vc::lasagna::sampleLasagnaVectorBatch(embeddings_, points, values);
     }
 
     void awaitPoint(const cv::Vec3d& point) const
@@ -3692,6 +3749,7 @@ private:
     };
     std::vector<ReadinessGroup> readinessGroups_;
     std::vector<Option> options_;
+    std::vector<vc::lasagna::LasagnaChannelBinding> embeddings_;
     FiberPredictionReadinessGate readinessGate_;
     std::vector<OptionSamplingGrid> optionGrids_;
     bool cornerSamplingAvailable_ = true;
@@ -3700,12 +3758,17 @@ private:
     FiberPredictionGridInfo canonicalGridInfo_;
 };
 
-FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode)
-    : impl_(std::make_unique<Impl>(dataset, bindingMode))
+FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset, FiberPredictionFieldBindingMode bindingMode, bool enableEmbeddings)
+    : impl_(std::make_unique<Impl>(dataset, bindingMode, enableEmbeddings))
 {
 }
 
 FiberPredictionField::~FiberPredictionField() = default;
+
+void FiberPredictionField::sampleEmbeddings(const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& values) const
+{
+    impl_->sampleEmbeddings(points, values);
+}
 
 void FiberPredictionField::setReadinessGate(FiberPredictionReadinessGate gate)
 {

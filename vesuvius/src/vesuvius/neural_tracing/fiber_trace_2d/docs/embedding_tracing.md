@@ -1,0 +1,159 @@
+# Embedding-guided live tracing
+
+Follow-up: [cached GT/error-route and short/long-range analysis](embedding_route_analysis_20260913.md).
+
+Opt-in native beam cost; ordinary presence, direction and normal scoring stays
+unchanged. The live evaluator reads `--embedding-weight` in `trace_args` and
+requests embeddings from the same model forward when positive. Weight zero
+retains the existing prediction products and makes no embedding reads.
+
+## Scoring and storage
+
+- Extra cost per candidate: `weight * mean(1 - cosine(candidate, reference))`.
+  This uses the same per-step cost units as existing alignment/smoothness, not
+  another step-length multiplier. Cosine is clamped to [-1,1]. The cost is
+  nonnegative, preserving the beam search's lower-bound pruning.
+- References belong to each beam hypothesis, begin with its inferred seed
+  embedding, and are sampled along traced arclength. Defaults: spacing32,
+  window256 base voxels, maximum8 references. Restarts begin a new history.
+  GT is not consulted for scoring or history updates.
+- Flags: `--embedding-weight`, `--embedding-history-spacing-base-voxels`,
+  `--embedding-history-window-base-voxels`, `--embedding-history-count`.
+- `FiberTrace3DPredictAdapter(emit_embeddings=True)` exposes signed float32
+  `embedding_NNN` scalar channels, alongside unchanged uint8 predictions.
+  Raw vectors use the existing overlap accumulator and coherent demand-cache
+  publication. The cache identity includes embedding output format.
+- Native `ChannelSampler` uses the existing decoded chunk cache and trilinear
+  component interpolation, then unit-normalizes the interpolated vector.
+  Direction/normal interpolation retains its existing encoding-aware fast path.
+  Embeddings must share the exact prediction lattice and chunk layout, so the
+  same demand-readiness gate covers their sibling chunks. Missing configuration
+  or incompatible channels errors; zero/nonfinite vectors reject candidates
+  (and error at the seed).
+
+Float32 is intentional for this first validation. Compact float16 or normalized
+int8 storage is a follow-up, requiring measured cosine/trace comparisons before
+changing precision. This adds no new public Atlas artifact type.
+
+## Manager and pilot
+
+The existing command lease now optionally accepts a non-exclusive fixed CPU/VRAM
+grant. Evaluator `gpu_manager` settings require explicit `cpu_cores` and
+`vram_bytes_per_gpu` when `exclusive:false`. The command is nonpausable and
+nonadaptive; it waits for its full grant, caps the Torch allocator with a 2GiB
+context reserve, and releases ownership only after child cleanup. Protocol and
+default exclusive behavior are unchanged. Adaptive training may briefly unload
+and restart to resize; non-exclusive does not mean zero transition overhead.
+
+Edit `embedding_trace_pilot` in `vesuvius/scripts/fiber3d_experiment.json`, then:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_experiment embedding-trace-pilot
+```
+
+The pilot freezes current raw after admission, selects the shortest whole held-out
+fiber of the configured source, and compares weight0 and0.25 bidirectionally.
+An optional `fiber` path selects exactly one fiber already listed in that source's
+prepared config, allowing difficult-case checks without changing the evaluator.
+Both variants share the frozen checkpoint and settings but have fresh prediction
+caches. Source caches are not purged. `resume:true` verifies the frozen hash,
+keeps completed variants, and uses fresh paths for failed attempts. Set a new
+output and `resume:false` for a new current snapshot. `report.json` records full
+metrics and provenance; each variant also has `inference_summary.json`.
+
+The pilot uses one GPU with a 20GiB grant, 16 logical CPUs, tile256, border32,
+overlap96, batch1, bf16 forward and float32 accumulation. It is a functionality
+and initial quality check, not a corpus-wide result or isolated speed benchmark.
+
+## Validation
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_cooperative_tests
+```
+
+Control suites: `embedding-native-build`, `embedding-native-tests`,
+`embedding-tracer`. The native build is this checkout's
+`volume-cartographer/build/dev-quickbuild-gcc`, not the villa2 build in `/tmp`.
+Tests cover signed disk roundtrip, unchanged ordinary forward output, invalid
+embeddings, interpolation-before-normalization, history isolation and cost,
+weight-zero compatibility, shared demand-cache contracts and manager grants.
+
+## Current-snapshot pilot, 2026-09-13
+
+Snapshot: `combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_121417`,
+**current raw update5400 /691200 samples**, frozen after manager admission.
+SHA256: `7ea0f9c89e4bd4ce8c48dbae920b7ed24c810c178ab34576767e30b930057b35`.
+Fiber: PHerc0139 `lt_20260909T071741261_000094.json` from the held-out collection;
+7.329 mm, run in both directions. This is not the older consistency snapshot.
+
+| Measure | Embeddings off | Weight0.25 |
+|---|---:|---:|
+| Failures (two directions) | 1 | 1 |
+| Mean segment length (mm) | 4.88577 | 4.88577 |
+| Failures/directed mm | 0.06823 | 0.06823 |
+| End-to-end variant wall time (s) | 32.01 | 37.91 |
+| Inferred tiles / published chunks | 78 /20 | 82 /22 |
+| GPU worker time per tile, mean (ms) | 208.59 | 212.28 |
+| GPU worker time per tile, min/median/max (ms) | 205.64 /206.04 /376.43 | 208.60 /209.01 /396.89 |
+| Peak Torch allocated /reserved (GiB, one GPU) | 4.74 /7.10 | 4.74 /7.10 |
+
+The output trajectories differ; the failure-count-derived metric is unchanged.
+No quality improvement is established by this one-fiber pilot. Timings are one
+run each, include startup and unpurged source caches, and use a shared manager
+grant rather than isolated GPUs. More tiles were requested by the changed path;
+the 18% wall-time difference is not purely embedding compute overhead.
+
+Full evidence:
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_20260913_v2/report.json`.
+Baseline: `weight-0`; enabled: `weight-0p25-retry-1789309548141295533`.
+Each directory contains per-direction trace JSON/OBJ, native logs, summary and
+inference timing/memory data. Failed attempts remain for inspection.
+
+Final validation: 97 Python tests passed (31.80s), both native suites passed
+(1.60s); logs in
+`/ephemeral/hendrik/fiber3d_train2/cooperative-tests/20260913_142632_123641`.
+No training/model/loss modifications and no full50-fiber sweep in this task.
+
+## Hard-fiber follow-up, 2026-09-13
+
+Selected `lt_20260825T075316065_000069.json`, canonical **PHerc1299** (the
+prepared source/dataset label is `PHerc1229`). Historical best11k evaluation
+had107 bidirectional failures. The prepared held-out geometry matches that
+historical fiber exactly. The shorter35.725mm fiber was chosen over much longer
+high-failure cases before seeing embedding results. No fallback case was needed.
+
+Same frozen raw5400/691200 checkpoint and SHA as above, unchanged settings,
+one non-exclusive20GiB GPU/16CPU grant for both runs, fresh prediction namespaces.
+Historical107 only motivated selection; the newly measured off result is the
+controlled baseline.
+
+| Measure | Off | Weight0.25 |
+|---|---:|---:|
+| Forward failures | 40 | 56 |
+| Reverse failures | 56 | 53 |
+| Total failures | 96 | 109 |
+| Mean segment length (mm) | 0.72909 | 0.64370 |
+| Failures/directed mm | 1.34359 | 1.52553 |
+| Variant wall time (s) | 93.21 | 143.30 |
+| Inferred tiles | 335 | 349 |
+| Worker time/tile, mean (ms, one GPU) | 223.09 | 299.19 |
+| Worker time/tile, min/median/max (ms) | 205.57 /206.94 /432.81 | 209.66 /295.46 /667.32 |
+| Peak Torch allocated/reserved (GiB, one GPU) | 4.74 /7.10 | 4.74 /7.10 |
+
+**This setting worsened the selected hard case:**13.5% more failures and11.7%
+shorter mean segment length. Reverse improved slightly, forward worsened.
+This does not establish that embeddings cannot help: weight/history were not
+tuned, and this is one deliberately selected hard fiber, not a corpus sweep.
+No settings were adjusted after seeing the result. Source/OS caches were not
+purged and training shared the node; timings are observed, not isolated overhead.
+
+Evidence: `/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_hard_20260913_v1/report.json`;
+per-direction artifacts under `weight-0/cases` and `weight-0p25/cases`.
+Command: the same approved `run_fiber3d_experiment embedding-trace-pilot` above.
+Native QuickBuild unchanged. Explicit selection regression plus existing suites:
+98 Python passed39.35s, two native suites passed1.88s, logs under
+`cooperative-tests/20260913_143916_847400`. No install or training changes.
+# History parameter sweep
+
+See [the full history-spacing/falloff sweep](embedding_history_sweep_20260913.md)
+for all36 combinations, controls and exact-repeat checks. Defaults remain unchanged.

@@ -1204,6 +1204,8 @@ std::unique_ptr<ChunkCache> createChunkCache(
     ChunkDtype dtype = ChunkDtype::UInt8;
     if (meta.dtype == utils::ZarrDtype::uint16) {
         dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype == utils::ZarrDtype::float32) {
+        dtype = ChunkDtype::Float32;
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error(
             "streaming zarr cache currently supports uint8 and uint16 only");
@@ -1240,6 +1242,8 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     ChunkDtype dtype = ChunkDtype::UInt8;
     if (meta.dtype == utils::ZarrDtype::uint16) {
         dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype == utils::ZarrDtype::float32) {
+        dtype = ChunkDtype::Float32;
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error(
             "streaming zarr cache currently supports uint8 and uint16 only");

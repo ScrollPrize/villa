@@ -57,6 +57,8 @@ class CanonicalSampleBroker:
             loader = FiberTrace3DLoader(config)
             count, offset, mode = _resolve_dense_test_selection(training,
                 loader_sample_count=loader.sample_count, default_count=0)
+            if config.embedding.paired_patches and (count % 2 or offset % 2 or config.batch_size % 2):
+                raise ValueError("paired test count, offset and batch size must be even")
             batch = config.batch_size
             sources["test"] = SampleQueueSource(config, mode)
         from .historical_evaluation import historical_test_config

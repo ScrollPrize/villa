@@ -6,6 +6,7 @@ ownership stays with the broker until a complete optimizer update is reported.
 """
 
 import multiprocessing as mp
+import json
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -47,6 +48,8 @@ class FiberCohort:
         self._temp = tempfile.TemporaryDirectory(prefix="fiber-cohort-")
         context = mp.get_context("spawn")
         devices = sorted(grant["gpus"])
+        raw_config = json.loads(Path(config_path).read_text())
+        group_size = 2 if raw_config.get("embedding", {}).get("paired_patches", False) else 1
         if startup_microbatch_size is not None:
             if type(startup_microbatch_size) is not int or startup_microbatch_size < 1 or calibration is not None:
                 raise ValueError("startup requires a positive physical batch and no invented calibration")
@@ -55,6 +58,7 @@ class FiberCohort:
         else:
             sizes = tuple(calibration.microbatch_for(grant["gpus"][gpu]) for gpu in devices)
             reserve = calibration.reserve_bytes
+        sizes = tuple(s // group_size * group_size for s in sizes)
         if not sizes or min(sizes) < 1:
             self._temp.cleanup()
             raise ValueError("grant cannot fit a calibrated microbatch")
@@ -77,7 +81,7 @@ class FiberCohort:
                 self._received.append(context.Value("q", 0))
                 self._sent.append(0)
                 self._drained.append(0)
-                self._maps.append(EffectiveBatchSampleIndex(broker.effective_batch_size, sizes, rank, start_step))
+                self._maps.append(EffectiveBatchSampleIndex(broker.effective_batch_size, sizes, rank, start_step, group_size))
             factory = FiberWorkerFactory(
                 str(config_path), sizes, tuple(self._queues), tuple(self._received), os.getpid(),
                 (Path(self._temp.name) / "rendezvous").as_uri(), start_step, broker.effective_batch_size,

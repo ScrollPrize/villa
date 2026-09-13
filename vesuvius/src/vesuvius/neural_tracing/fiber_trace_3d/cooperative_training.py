@@ -134,11 +134,15 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         from .startup_calibration import StartupMemoryCalibration
         target = min(int(raw.get("batch_size", training.get("batch_size", 16))),
                      max(1, settings.batch_size // settings.request["max_gpus"]))
-        startup = StartupMemoryCalibration(fingerprint, target_microbatch=target)
-        overrides["evaluation_microbatch_size"] = 1
+        group_size = 2 if raw.get("embedding", {}).get("paired_patches", False) else 1
+        target = max(group_size, target // group_size * group_size)
+        startup = StartupMemoryCalibration(fingerprint, target_microbatch=target, sample_group_size=group_size)
+        overrides["evaluation_microbatch_size"] = group_size
     elif any(row.get("evaluation_microbatch_size") == 1
              for row in training["cooperative"]["memory_calibration"]["observations"]):
         overrides["evaluation_microbatch_size"] = 1
+    elif raw.get("embedding", {}).get("paired_patches", False):
+        overrides["evaluation_microbatch_size"] = 2
     hub = WriterHub(_make_summary_writer)
 
     def observe_startup(rows, progress):

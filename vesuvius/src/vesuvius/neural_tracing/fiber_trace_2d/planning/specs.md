@@ -692,7 +692,8 @@
   uniform fallback or doubling positive weight. Both budgets are known before
   forward; other patches' predictions never change normalization weights.
   Empty nonzero GT support is an error. Sampling uses per-stream seeded RNG,
-  independent of rank and microbatch placement, without cross-patch pairs.
+  independent of rank and microbatch placement. Default mode has no cross-patch pairs;
+  opt-in paired mode below couples exactly two patches, never separate microbatches.
 - Embedding training requires each dataset's `lasagna_manifest_path` with valid
   grad_mag/nx/ny data. Input/output scale, annotation transforms, rotation, scale,
   and nonlinear augmentation use the existing coordinate maps. Output lattice
@@ -702,7 +703,8 @@
   The tangent is the full surface tangent plane, not learned fiber direction.
   Training replaces the whole sample on invalid required normals, including
   missing or zero grad_mag, with bounded deterministic draws within the same
-  scroll/sampling group. Configuration and I/O failures remain errors. Normals
+  scroll/sampling group (paired mode retries positions on the same fiber).
+  Configuration and I/O failures remain errors. Normals
   use vc.volume.NormalSampler, the existing C++ LasagnaNormalSampler with native
   chunk caching and decoded-corner tensor interpolation; no Python Zarr reads.
   The NumPy threshold backend implements the native replay
@@ -729,8 +731,27 @@
   temperature0.1 and margin0.2. Multiply by embedding.weight and divide summed
   loss by fixed configured anchor count, including patches without eligible
   negatives (zero numerator there). No separate pairwise cosine loss is added.
-  Competition is within a patch/anchor only; no prediction-dependent cross-patch
-  normalization. Single backward and macro-batch partition invariance remain.
+  Default competition is within a patch/anchor only. Paired mode below samples
+  across its two patches, with fixed target-only normalization counts.
+  Single backward and pair-preserving macro-batch partition invariance remain.
+- Optional embedding.paired_patches requires enabled local_contrastive and
+  scroll_balanced_arclength. Consecutive canonical indices2k/2k+1 select the same
+  fiber; second location is independently uniform along its full arclength.
+  Both have independent geometry/smooth transforms but shared value RNG, blur
+  strengths/activation and noise seed. Fiber-oriented blur axes follow each
+  patch's transformed tangent. Normal-invalid retries retain fiber/value seed;
+  exhausting128 retries fails explicitly. No fallback to a different fiber.
+- Each patch supplies its existing anchor/negative budget; positives select
+  own/partner patch with equal probability, then arclength sampling within it.
+  Negatives use combined detached presence mass, with destination-local ellipse
+  eligibility. Both graphs remain attached; one backward per paired microbatch.
+  Thus128 total patches are64 pairs, with unchanged total embedding budgets.
+- Pair ID/member/fiber identity travel in existing shared-slot metadata; invalid
+  or split pairs fail. Cooperative partitions and tests preserve two-patch units;
+  memory calibration starts at2 and grants must fit a pair. Historical metrics
+  have embedding disabled and retain the original unpaired sample population.
+  Full-population paired testing has one pair per original sample slot; explicit
+  test patch counts/offsets must be even. No GPU-manager protocol changes.
 - Regular raw/EMA evaluation reuses sampled pairs to log embedding_similarity/*:
   positive_mean, positive_patch_p05, negative_mean, negative_patch_p95/p99,
   negative_above_0p9, hardest_negative_mean and positive_hardest_gap. These are

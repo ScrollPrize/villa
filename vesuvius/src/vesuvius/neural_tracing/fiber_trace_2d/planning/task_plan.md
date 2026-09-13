@@ -1,25 +1,12 @@
-# Plan
+# Embedding tuning plan
 
-## Follow-up: cosine histograms
-Use saved results only (CPU, no GPU interruption). Plot equal-scroll aggregate
-and per-scroll positive/negative cosine histograms. Positives are all distinct
-GT point pairs in each saved blended window; negatives are the saved unblended
-same-tile GT/off-GT pairs. Label this distinction and do not manufacture
-matched-anchor gap distributions. Show all negatives and presence>=0.5 subset,
-normalize each distribution separately, report counts and quantiles. Add small
-CPU tests for pair construction and histogram normalization. Save PNG, SVG,
-numeric summary and a short reproducible documentation note. No loss changes.
-
-1. Use existing approved embedding-consistency runner, current raw snapshot of the contrastive run, new output directory; retain other settings.
-2. Independently review this plan. Freeze snapshot via existing evaluator and record exact step, samples and SHA. Exclusive manager allocation pauses training.
-3. Compare same-point overlap, along-GT within/blended/boundary cosines, high-presence off-GT similarity and cancellation against previous report.
-4. Record results in a new report and brief task log; verify manager release and training continuation. No training or tracer changes.
+1. Freeze raw4300/550400, same hard held-out fiber and bidirectional metric. Run off/.25 controls and signed embedding cache under manager nonexclusive oneGPU20GiB/16CPU. Training stays active. Restarts ranked by existing total_failures, complete traces only.
+2. Generalize existing sweep configuration, not tracer implementation: explicit candidate histories accepted; weight search accepts selected history and starting weight instead of hardcoded old optimum. Keep old defaults/tests. Validate values and preserve all non-embedding trace args.
+3. First grid weight.25: spacing8/32/128 and window64/256/1024/4096 with count64 and uniform/linear/Gaussian (skip spacing>window); include old controls. This covers short and newly relevant long ranges. Select minimum failures, then .05 weight neighbor descent from.25 with that history (ties retain center). Compare count8/16/32/64 at winning weight/history, and a local history refinement at the new weight if weight changed. Retain zero-weight control as candidate. Report local, not global optimum. Stop refining when no strict improvement among tested neighbors.
+4. Reuse cached inference; manager fills only additional missing coverage. Require exact old-control replay and exact repeat of final winner. CPU regression tests via existing approved test runner, then complete actual tuning. Report settings/counts/restarts relative to fresh off/default and log full result directories. No global default changes unless separately requested.
 
 ## Spec update
-None. Preserve ten-window pilot, conservative >80-base-voxel off-GT controls (not exact training ellipse distribution), FP32 vector blending and hypothetical storage boundaries (no serialization test).
+No numerical, training or protocol change. Configurable experiment search only; settings restricted to embedding parameters, unchanged deterministic selection and fail-closed coverage.
 
 ## Docs updates
-New comparison report with provenance and limitations; retain previous report.
-
-## Validation and changelog
-Existing runner unchanged; verify all ten cases finish and frozen snapshot identity. Document results, not a claimed full 50-fiber trace benchmark or matched-age training ablation.
+New tuning report with snapshot/data, search grid and local refinement, complete controls/repeat, timings and single-fiber overfit limitation. Task log/status/changelog brief.

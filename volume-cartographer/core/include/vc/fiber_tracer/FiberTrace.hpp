@@ -87,6 +87,11 @@ struct FiberTraceProfile {
 };
 
 struct FiberTraceConfig {
+    double embeddingWeight = 0.0;
+    double embeddingHistorySpacingBaseVoxels = 32.0;
+    double embeddingHistoryWindowBaseVoxels = 256.0;
+    int embeddingHistoryCount = 8;
+    std::string embeddingHistoryFalloff = "uniform";
     double stepVoxels = 4.0;
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;
@@ -274,6 +279,11 @@ struct FiberInput {
 class FiberPredictionSource
 {
 public:
+    virtual void sampleEmbeddings(const std::vector<cv::Vec3f>&,
+                                 std::vector<std::vector<float>>&) const
+    {
+        throw std::runtime_error("embedding tracing requested but source has no embedding channels");
+    }
     virtual ~FiberPredictionSource() = default;
     [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept { return false; }
     [[nodiscard]] virtual vc::lasagna::NormalPrefetchReport prefetchSamples(const std::vector<cv::Vec3d>& /*volumePoints*/) const
@@ -314,9 +324,12 @@ using FiberPredictionReadinessGate = std::function<void(const std::vector<FiberP
 class FiberPredictionField final : public FiberPredictionSource
 {
 public:
+    void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+                          std::vector<std::vector<float>>& embeddings) const override;
     explicit FiberPredictionField(
         const vc::lasagna::LasagnaDataset& dataset,
-        FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions);
+        FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions,
+        bool enableEmbeddings = false);
     ~FiberPredictionField() override;
 
     // Configure once, before concurrent sampling. Empty retains offline behavior.

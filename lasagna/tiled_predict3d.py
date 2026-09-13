@@ -1410,6 +1410,7 @@ def _create_omezarr(
 	chunk: int,
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
+	dtype: Any = np.uint8,
 ) -> zarr.Group:
 	"""Create an OME-Zarr group with pyramid level arrays."""
 	codec = _omezarr_compressor(compressor)
@@ -1425,7 +1426,7 @@ def _create_omezarr(
 			g.create_array(
 				str(lv), shape=sh,
 				chunks=chunks,
-				dtype=np.uint8, fill_value=0, overwrite=True,
+				dtype=dtype, fill_value=0, overwrite=True,
 				compressor=codec,
 				chunk_key_encoding={"name": "v2", "separator": "/"},
 			)
@@ -1434,7 +1435,7 @@ def _create_omezarr(
 				g.create_dataset(
 					str(lv), shape=sh,
 					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
+					dtype=dtype, fill_value=0, overwrite=True,
 					compressor=codec,
 					dimension_separator="/",
 				)
@@ -1442,7 +1443,7 @@ def _create_omezarr(
 				g.create_dataset(
 					str(lv), shape=sh,
 					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
+					dtype=dtype, fill_value=0, overwrite=True,
 					compressor=codec,
 				)
 		datasets.append({
@@ -1471,6 +1472,7 @@ def _open_or_create_omezarr(
 	chunk: int,
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
+	dtype: Any = np.uint8,
 ) -> zarr.Group:
 	"""Open existing OME-Zarr group or create a new one."""
 	if os.path.exists(path):
@@ -1478,6 +1480,8 @@ def _open_or_create_omezarr(
 			g = zarr.open_group(str(path), mode="r+")
 			expected = _omezarr_level_shape(base_shape_zyx, first_level)
 			arr = g[str(first_level)]
+			if np.dtype(arr.dtype) != np.dtype(dtype):
+				raise ValueError(f"{path} dtype {arr.dtype} does not match requested {np.dtype(dtype)}")
 			if tuple(int(v) for v in arr.shape) == expected:
 				import json as _json
 				zarray_path = os.path.join(path, str(first_level), ".zarray")
@@ -1518,7 +1522,7 @@ def _open_or_create_omezarr(
 	print(f"[predict3d] creating new {os.path.basename(path)} "
 		  f"(levels {first_level}-{n_levels-1})", flush=True)
 	return _create_omezarr(
-		path, base_shape_zyx, first_level, n_levels, chunk, channel_name, compressor,
+		path, base_shape_zyx, first_level, n_levels, chunk, channel_name, compressor, dtype,
 	)
 
 
@@ -1543,6 +1547,7 @@ def create_product_omezarr_groups(
 				int(ome_chunk),
 				channel.name,
 				ome_compressor,
+				product.dtype,
 			)
 	return groups
 

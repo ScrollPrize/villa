@@ -3,6 +3,7 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
 #include "FiberTraceEvaluationCli.hpp"
+#include "FiberEmbeddingQuery.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -55,6 +56,11 @@ void printUsage(const char* argv0)
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
         << "  --cone-grid-size N              legacy square-to-disk grid size when cone step <= 0 [25]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
+        << "  --embedding-weight N            local cosine history penalty [0=disabled]\n"
+        << "  --embedding-history-spacing-base-voxels N  reference spacing [32]\n"
+        << "  --embedding-history-window-base-voxels N   reference window [256]\n"
+        << "  --embedding-history-count N     maximum references per hypothesis [8]\n"
+        << "  --embedding-history-falloff NAME uniform, linear, gaussian [uniform]\n"
         << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
         << "  --lookahead-parent-cap N        final-lookahead parent cap, 0 is exact [32]\n"
@@ -239,6 +245,8 @@ void clearProgressLine()
 int main(int argc, char** argv)
 {
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "sample-embeddings")
+            return queryCachedFiberEmbeddings(argc, argv);
         if (argc > 1 && (std::string_view(argv[1]) == "replay-set" || std::string_view(argv[1]) == "render-replay"))
             return runFiberTraceEvaluationCli(argc, argv);
         const CliOptions options = parseArgs(argc, argv);
@@ -259,7 +267,7 @@ int main(int argc, char** argv)
         predictionManifest.workingToBaseScale = workingToBaseScale;
         const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
         const vc::fiber_tracer::FiberPredictionField predictions(
-            dataset);
+            dataset, vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions, options.trace.embeddingWeight > 0);
 
         std::optional<vc::lasagna::LasagnaDataset> normalDataset;
         std::optional<vc::lasagna::LasagnaNormalSampler> normalSampler;

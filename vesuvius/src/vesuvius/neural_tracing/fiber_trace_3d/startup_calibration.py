@@ -11,16 +11,19 @@ from .memory_calibration import calibration_from_observations
 
 class StartupMemoryCalibration:
     def __init__(self, fingerprint, *, target_microbatch, reserve_bytes=4 * 1024**3,
-                 updates_per_size=3):
+                 updates_per_size=3, sample_group_size=1):
         if type(target_microbatch) is not int or target_microbatch < 1:
             raise ValueError("startup target microbatch must be positive")
         if type(updates_per_size) is not int or updates_per_size < 2:
             raise ValueError("startup measurement needs at least two real optimizer updates")
         self.fingerprint = fingerprint
+        if sample_group_size not in (1, 2) or target_microbatch % sample_group_size:
+            raise ValueError("startup target must contain whole sample groups")
+        self.sample_group_size = sample_group_size
         self.target = target_microbatch
         self.reserve_bytes = reserve_bytes
         self.updates_per_size = updates_per_size
-        self.microbatch_size = 1
+        self.microbatch_size = sample_group_size
         self.observations = []
         self.latest = None
         self.test_peaks = {}
@@ -67,7 +70,7 @@ class StartupMemoryCalibration:
             # initial test peak to the observed training footprint rather than
             # assuming evaluation before optimizer initialization is sufficient.
             row["evaluation_overhead_bytes"] = self.test_peaks[gpu]
-            row["evaluation_microbatch_size"] = 1
+            row["evaluation_microbatch_size"] = self.sample_group_size
             row["initial_test_completed"] = True
         report = calibration_from_observations(self.fingerprint, rows, reserve_bytes=self.reserve_bytes)
         if any(max(row["driver_peak_bytes"], row["peak_reserved_bytes"]) + row["evaluation_overhead_bytes"] + self.reserve_bytes

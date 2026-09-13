@@ -848,6 +848,9 @@ def _make_test_loader_raw_config(raw_config: dict[str, Any], training: dict[str,
         test_raw["sampling_strategy"] = training["test_sampling_strategy"]
     if not bool(training.get("test_augment_enabled", False)):
         test_raw["augment_enabled"] = False
+    if test_raw.get("embedding", {}).get("paired_patches", False):
+        if int(test_raw.get("batch_size", 1)) % 2 or int(training.get("test_start_sample_index", 0)) % 2:
+            raise ValueError("paired evaluation requires even batch size and start index")
     return test_raw
 
 
@@ -2287,6 +2290,10 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
     """Shared per-logical-batch evaluation, including bounded physical splits."""
     take = int(batch.volume.shape[0])
     size = take if microbatch_size is None else microbatch_size
+    if config.embedding.paired_patches:
+        if take % 2 or size < 2:
+            raise ValueError("paired evaluation requires complete pairs and microbatch >=2")
+        size = size // 2 * 2
     statistics = None
     embedding_diagnostics = []
     for offset in range(0, take, size):
@@ -2846,6 +2853,8 @@ def training_units(
     bounded_accumulation = training.get("bounded_gradient_accumulation", False)
     if type(bounded_accumulation) is not bool:
         raise ValueError("training.bounded_gradient_accumulation must be a boolean")
+    if raw_config.get("embedding", {}).get("paired_patches", False) and not bounded_accumulation:
+        raise ValueError("paired embedding training requires bounded_gradient_accumulation to keep pairs together")
     profile_loader = loader_profile_enabled(training)
     profile_replay_batch = replay_batch_enabled(training)
     profile_replay_cpu_batch = replay_cpu_batch_enabled(training)
@@ -3158,6 +3167,7 @@ def training_units(
         sizes = physical_microbatch_sizes or (loader.config.batch_size,) * distributed.world_size
         bounded_index = EffectiveBatchSampleIndex(
             optimizer_global_batch_size, tuple(sizes), distributed.rank, int(start_step),
+            2 if loader.config.embedding.paired_patches else 1,
         )
         optimizer_virtual_world_size = distributed.world_size
         optimizer_microbatch_takes = bounded_index.batch_sizes
@@ -3185,6 +3195,9 @@ def training_units(
         writer = _SampleAxisWriter(writer, sample_progress)
         writer.add_text("config/progress_axis", "Cumulative global training samples; schedules use optimizer updates.", 0)
     optimizer_microbatch_count = len(optimizer_microbatch_takes)
+    if loader.config.embedding.paired_patches and (optimizer_global_batch_size % 2 or
+            any(t % 2 for t in optimizer_microbatch_takes)):
+        raise ValueError("paired training requires pair-aligned microbatches")
     manual_gradient_sync = bounded_accumulation or optimizer_virtual_world_size != distributed.world_size
     if manual_gradient_sync and ddp_broadcast_buffers:
         raise ValueError(

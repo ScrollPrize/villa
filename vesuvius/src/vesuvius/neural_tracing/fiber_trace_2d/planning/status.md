@@ -1,7 +1,7 @@
-# Contrastive embedding analysis
+# Embedding tuning
 
-- [x] Inspect existing protocol and select new run.
+- [x] Freeze snapshot and start controls.
 - [x] Independent plan review.
-- [x] Run manager-mediated analysis and record snapshot (update 2100 / 268800 samples).
-- [x] Compare results and verify training continuation (update 2200 observed).
-- [x] CPU-only cosine histograms, tests and visual inspection; training untouched.
+- [x] Configurable search and CPU tests.
+- [x] History grid, weight search, count/local refinement.
+- [x] Exact-repeat winner, final report.

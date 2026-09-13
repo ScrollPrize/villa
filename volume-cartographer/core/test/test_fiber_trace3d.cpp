@@ -3,6 +3,7 @@
 #include "../../apps/src/FiberLiveBridge.hpp"
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberEmbedding.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -16,6 +17,74 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+TEST_CASE("embedding falloff is normalized and preserves uniform default")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingHistory history{{0, {-1, 0}}, {24, {1, 0}}};
+    CHECK(fiberEmbeddingCost({1, 0}, history, 32, 32) == 1);
+    CHECK(fiberEmbeddingCost({1, 0}, history, 32, 32, "uniform") == 1);
+    CHECK(fiberEmbeddingCost({1, 0}, history, 32, 32, "linear") == 0);
+    CHECK(fiberEmbeddingCost({1, 0}, history, 32, 32, "gaussian") ==
+          doctest::Approx(2*std::exp(-2.)/(std::exp(-2.)+std::exp(-.125))));
+    CHECK(fiberEmbeddingCost({1, 0}, {{0, {-1, 0}}}, 32, 32, "linear") == 0);
+    CHECK_THROWS(fiberEmbeddingCost({1, 0}, history, 32, 32, "unknown"));
+}
+
+TEST_CASE("embedding history is arclength bounded and branch local")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingHistory history;
+    advanceFiberEmbeddingHistory(history, {1, 0}, 0, 32, 256, 8);
+    advanceFiberEmbeddingHistory(history, {0, 1}, 16, 32, 256, 8);
+    CHECK(history.size() == 1);
+    CHECK(fiberEmbeddingCost({1, 0}, history, 16, 256) == doctest::Approx(0));
+    CHECK(fiberEmbeddingCost({-1, 0}, history, 16, 256) == doctest::Approx(2));
+    auto other = history;
+    advanceFiberEmbeddingHistory(other, {0, 1}, 32, 32, 256, 8);
+    CHECK(history.size() == 1);
+    CHECK(other.size() == 2);
+    CHECK(fiberEmbeddingCost({1, 0}, other, 32, 256) == doctest::Approx(.5));
+    CHECK(fiberEmbeddingCost({1, 0}, other, 300, 256) == 0);
+    for (int i = 1; i <= 20; ++i) advanceFiberEmbeddingHistory(history, {1, 0}, i * 32, 32, 256, 8);
+    CHECK(history.size() == 8);
+    CHECK(history.back().arcBase == 640);
+    CHECK_THROWS(fiberEmbeddingCost({1}, history, 640, 256));
+}
+
+TEST_CASE("signed float32 channels interpolate before normalization through shared cache")
+{
+    namespace fs = std::filesystem;
+    struct Temp { fs::path path; ~Temp() { std::error_code e; fs::remove_all(path, e); } }
+        temp{fs::temp_directory_path() / ("vc_embedding_" + std::to_string(std::mt19937_64(std::random_device{}())()))};
+    fs::create_directories(temp.path);
+    nlohmann::json groups;
+    for (int c = 0; c < 2; ++c) {
+        const auto name = "embedding_00" + std::to_string(c);
+        utils::ZarrMetadata metadata;
+        metadata.version = utils::ZarrVersion::v2;
+        metadata.shape = {2, 2, 2}; metadata.chunks = {2, 2, 2};
+        metadata.dtype = utils::ZarrDtype::float32; metadata.compressor_id.clear(); metadata.fill_value = 0;
+        auto array = utils::ZarrArray::create(temp.path / name, metadata);
+        std::vector<float> values(8, c == 0 ? -2.0f : 1.0f);
+        if (c == 0) for (size_t i = 1; i < 8; i += 2) values[i] = 4;
+        const std::array<size_t, 3> index{0, 0, 0};
+        array.write_chunk(index, std::as_bytes(std::span(values)));
+        groups[name] = {{"zarr", (temp.path / name).string()}, {"scaledown", 0}, {"channels", {name}}};
+    }
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(
+        nlohmann::json{{"version", 2}, {"groups", groups}}.dump(), temp.path / "manifest.json");
+    CHECK_THROWS(vc::lasagna::bindLasagnaChannel(manifest, "embedding_000"));
+    std::vector<vc::lasagna::LasagnaChannelBinding> channels;
+    for (auto name : {"embedding_000", "embedding_001"}) channels.push_back(vc::lasagna::bindLasagnaChannel(manifest, name, true));
+    std::vector<std::vector<float>> values;
+    vc::lasagna::sampleLasagnaVectorBatch(channels, {{.5f, .5f, .5f}, {0, 0, 0}, {-1, 0, 0}}, values);
+    REQUIRE(values[0].size() == 2);
+    CHECK(values[0][0] == doctest::Approx(std::sqrt(.5)));
+    CHECK(values[0][1] == doctest::Approx(std::sqrt(.5)));
+    CHECK(values[1][0] == doctest::Approx(-2 / std::sqrt(5.0)));
+    CHECK(values[2].empty());
+}
 
 TEST_CASE("live field gates float visitor boundary chunks before any cache read")
 {
@@ -345,6 +414,44 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.endpointAcceptThresholdBaseVoxels == doctest::Approx(20.0));
     CHECK(config.traceToBaseScale == doctest::Approx(1.0));
     CHECK_FALSE(config.baseVoxelSizeUm.has_value());
+}
+
+TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embeddings")
+{
+    class Embedded final : public vc::fiber_tracer::FiberPredictionSource {
+    public:
+        mutable int reads = 0;
+        bool invalid = false;
+        bool orthogonal = false;
+        vc::fiber_tracer::FiberPredictionSample sample(const cv::Vec3d&, const cv::Vec3d&) const override {
+            vc::fiber_tracer::FiberPredictionSample sample;
+            sample.options.push_back({{1, 0, 0}, 1, true});
+            return sample;
+        }
+        void sampleEmbeddings(const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& out) const override {
+            ++reads;
+            out.clear();
+            for (const auto& p : points)
+                out.push_back(invalid ? std::vector<float>{} :
+                    orthogonal && p[0] > 0 ? std::vector<float>{0, 1} : std::vector<float>{1, 0});
+        }
+    } predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0, 0, 0}; request.targetPoint = {12, 0, 0}; request.initialDirection = {1, 0, 0};
+    request.budgetSpanVoxels = 12;
+    setExplicitTargetPlane(request, {1, 0, 0});
+    request.config.smoothnessNormalWeight = request.config.smoothnessTangentWeight = request.config.cumulativeSmoothnessTangentWeight = 0;
+    request.config.parallelThreads = 1;
+    auto old = vc::fiber_tracer::traceFiberOneWay(predictions, request);
+    CHECK(predictions.reads == 0);
+    request.config.embeddingWeight = 1;
+    auto same = vc::fiber_tracer::traceFiberOneWay(predictions, request);
+    CHECK(predictions.reads > 0);
+    CHECK(old.points == same.points);
+    predictions.invalid = true;
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), doctest::Contains("trace seed has no valid embedding"), std::runtime_error);
+    StraightPrediction missing;
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::traceFiberOneWay(missing, request), doctest::Contains("embedding tracing requested but source has no embedding channels"), std::runtime_error);
 }
 
 TEST_CASE("native fiber tracer bounds endpoint acceptance by a quarter of the span")

@@ -232,7 +232,8 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
     power = int(math.log2(geometry.scale))
     adapter = inference_adapter.FiberTrace3DPredictAdapter(effective, checkpoint=snapshot,
         level=level + power, scaledown=(1 << level) * geometry.scale, inference_scaledown=geometry.scale,
-        chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber")
+        chunk_size=geometry.chunk, product_prefix="fiber", zarr_path_prefix=cache / "fiber",
+        emit_embeddings=bool(settings.get("emit_embeddings", False)))
     # Construction restores checkpoint config; reapply the resolved precision.
     adapter.config["training"] = {**adapter.config.get("training", {}),
         "mixed_precision": effective["training"]["mixed_precision"]}
@@ -280,6 +281,13 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     snapshot, checkpoint_digest = freeze_checkpoint(Path(checkpoint), cache_root)
     effective, _ = _checkpoint_config_for_inference(snapshot, model_config)
     settings = dict(config.get("inference", {}))
+    trace_args = config.get("trace_args", [])
+    if "--embedding-weight" in trace_args:
+        weight = float(trace_args[trace_args.index("--embedding-weight") + 1])
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("embedding weight must be finite and nonnegative")
+        if weight > 0:
+            settings["emit_embeddings"] = True
     device_list = tuple(torch.device(f"cuda:{int(v)}") for v in devices.split(","))
     if not device_list or len(set(device_list)) != len(device_list):
         raise ValueError("select a nonempty distinct comma-separated CUDA device list")
@@ -301,7 +309,8 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                       "precision": precision, "tile": tile, "overlap": overlap, "border": border,
                       "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
                       "compressor": settings.get("compressor", "blosc-zstd"), "implementation": implementation,
-                      "max_batch_size": max_batch_size}
+                      "max_batch_size": max_batch_size,
+                      "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
     model_key = json_digest(model_identity)
     evaluation = dict(config)
     if not isinstance(config.get("render", False), bool):

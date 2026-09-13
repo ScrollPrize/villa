@@ -25,7 +25,8 @@ enum class ChunkDtype {
     UInt8,
     UInt16,
     // Variable-length application records, never dense tensor samples.
-    Opaque
+    Opaque,
+    Float32 // Signed scalar channels; sampled through typed channel readers.
 };
 
 struct ChunkResult {

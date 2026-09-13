@@ -57,9 +57,17 @@ def launch_managed(command, *, devices, settings, socket=None, priority=None):
     from villa_gpu_manager.exclusive import run_exclusive
     from villa_gpu_manager.bootstrap import ensure_manager
     selected = resolve_gpu_uuids(devices)
+    exclusive = settings.get("exclusive", True)
+    if type(exclusive) is not bool:
+        raise ValueError("gpu_manager.exclusive must be boolean")
     socket, _ = ensure_manager(socket or settings.get("socket"))
     command = [*command, "--unmanaged", "--devices", ",".join(str(i) for i in range(len(selected)))]
     environment = dict(os.environ)
+    if not exclusive:
+        budget = settings.get("vram_bytes_per_gpu")
+        if type(budget) is not int or budget <= 2 * 1024**3:
+            raise ValueError("shared evaluation needs a VRAM budget larger than the 2GiB context reserve")
+        environment["FIBER_INFERENCE_VRAM_BUDGET_BYTES"] = str(budget)
     # Preserve explicit local import roots in the exec child, including when
     # invoked from a different working directory or an older editable install.
     repo = Path(__file__).resolve().parents[5]
@@ -69,4 +77,6 @@ def launch_managed(command, *, devices, settings, socket=None, priority=None):
     return run_exclusive(command, socket=socket,
                          gpu_uuids=selected, priority=settings.get("priority", 100) if priority is None else priority,
                          label=settings.get("label", "fiber-evaluation"), environment=environment,
-                         before_authorize=lambda: assert_gpus_idle(selected))
+                         before_authorize=(lambda: assert_gpus_idle(selected)) if exclusive else None,
+                         exclusive=exclusive, cpu_cores=settings.get("cpu_cores"),
+                         vram_bytes_per_gpu=settings.get("vram_bytes_per_gpu"))

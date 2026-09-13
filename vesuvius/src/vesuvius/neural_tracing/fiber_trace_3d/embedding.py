@@ -18,11 +18,12 @@ class EmbeddingConfig:
     negatives_per_anchor: int = 32
     temperature: float = 0.1
     margin: float = 0.2
+    paired_patches: bool = False
 
     @classmethod
     def from_mapping(cls, raw):
         values = dict(raw.get("embedding", {}))
-        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight", "objective", "negatives_per_anchor", "temperature", "margin"}
+        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight", "objective", "negatives_per_anchor", "temperature", "margin", "paired_patches"}
         if unknown:
             raise ValueError(f"unknown embedding settings: {sorted(unknown)}")
         model = raw.get("model_3d", raw.get("model", {}))
@@ -39,6 +40,9 @@ class EmbeddingConfig:
             raise ValueError("embeddings currently require the unconditioned U-Net")
         if result.objective not in ("pairwise", "local_contrastive"):
             raise ValueError("unknown embedding objective")
+        if type(result.paired_patches) is not bool or (result.paired_patches and
+                (not result.enabled or result.objective != "local_contrastive")):
+            raise ValueError("paired_patches requires enabled local_contrastive embeddings")
         if type(result.negatives_per_anchor) is not int or result.negatives_per_anchor < 1:
             raise ValueError("negatives_per_anchor must be positive integer")
         if not math.isfinite(result.temperature) or result.temperature <= 0 or not math.isfinite(result.margin):
@@ -63,6 +67,9 @@ class EmbeddingGeometry:
     negatives_per_anchor: int = 32
     temperature: float = 0.1
     margin: float = 0.2
+    pair_id: int | None = None
+    pair_member: int = 0
+    fiber_id: str = ""
 
 
 class InvalidNormalSampleError(ValueError):
@@ -231,6 +238,7 @@ def embedding_pair_counts(batch):
     """Configured budgets, independent of presence and negative eligibility."""
     if batch.embedding_geometry is None or any(g is None for g in batch.embedding_geometry):
         raise ValueError("embedding pair budgets require geometry for every sample")
+    validate_patch_pairs(batch.embedding_geometry)
     modes = {g.objective for g in batch.embedding_geometry}
     if len(modes) != 1:
         raise ValueError("mixed embedding objectives in batch")
@@ -238,6 +246,22 @@ def embedding_pair_counts(batch):
         return (0, 0, sum(g.pairs // g.negatives_per_anchor for g in batch.embedding_geometry))
     half = sum(g.pairs // 2 for g in batch.embedding_geometry)
     return half, half
+
+
+def validate_patch_pairs(geometries):
+    if not any(g.pair_id is not None for g in geometries):
+        return
+    if len(geometries) % 2:
+        raise ValueError("embedding pairs must remain together in each microbatch")
+    for a, b in zip(geometries[::2], geometries[1::2]):
+        if (a.pair_id is None or a.pair_id != b.pair_id or
+                (a.pair_member, b.pair_member) != (0, 1) or
+                not a.fiber_id or a.fiber_id != b.fiber_id):
+            raise ValueError("embedding pair identity/fiber mismatch")
+        if (a.pairs, a.stride, a.weight, a.objective, a.negatives_per_anchor,
+                a.temperature, a.margin) != (b.pairs, b.stride, b.weight, b.objective,
+                b.negatives_per_anchor, b.temperature, b.margin):
+            raise ValueError("embedding pair settings mismatch")
 
 
 def embedding_statistics(embeddings, presence, batch, diagnostics=None):
@@ -264,15 +288,30 @@ def embedding_statistics(embeddings, presence, batch, diagnostics=None):
             points = sample_trace_points(starts, ends, anchors*2, rng, embeddings.shape[-3:])
             positive_vectors = sample_embeddings(embeddings[i], points)
             a, p = positive_vectors[:anchors], positive_vectors[anchors:]
+            banks = [i]
+            if geometry.pair_id is not None:
+                partner = i ^ 1
+                banks.append(partner)
+                other = batch.embedding_geometry[partner]
+                off, nseg = int(batch.target_segment_offsets[partner]), int(batch.target_segment_counts[partner])
+                other_points = sample_trace_points(
+                    batch.target_segment_starts_zyx[off:off+nseg].float()/other.stride,
+                    batch.target_segment_ends_zyx[off:off+nseg].float()/other.stride,
+                    anchors, rng, embeddings.shape[-3:])
+                cross = sample_embeddings(embeddings[partner], other_points)
+                # Symmetric per-patch anchors; equal within/cross positive probability.
+                use_cross = torch.rand(anchors, device=embeddings.device, generator=rng) < .5
+                p = torch.where(use_cross[:, None], cross, p)
             positive = (a*p).sum(1).clamp(-1, 1)
-            weights = presence[i].detach().float().reshape(-1)
+            weights = torch.cat([presence[j].detach().float().reshape(-1) for j in banks])
             if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
                 raise ValueError("embedding presence must be finite probabilities")
-            weights = weights * geometry.eligible.to(weights.device).reshape(-1)
+            weights = weights * torch.cat([batch.embedding_geometry[j].eligible.to(weights.device).reshape(-1) for j in banks])
             negative = positive.new_empty((anchors, 0))
             if bool(weights.sum() > 0):
                 chosen = torch.multinomial(weights, geometry.pairs, replacement=True, generator=rng)
-                n = F.normalize(embeddings[i].reshape(embeddings.shape[1], -1)[:, chosen].T.float(), dim=1, eps=1e-8)
+                vectors = torch.cat([embeddings[j].reshape(embeddings.shape[1], -1) for j in banks], dim=1)
+                n = F.normalize(vectors[:, chosen].T.float(), dim=1, eps=1e-8)
                 negative = (a[:, None, :] * n.reshape(anchors, geometry.negatives_per_anchor, -1)).sum(-1).clamp(-1, 1)
                 competition = competition + local_competition(positive, negative, geometry.temperature, geometry.margin).sum()*geometry.weight
             if diagnostics is not None:

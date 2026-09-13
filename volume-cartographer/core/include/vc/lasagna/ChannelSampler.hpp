@@ -54,6 +54,9 @@ struct LasagnaChannelBinding {
     double spacing = 1.0;
 };
 
+[[nodiscard]] std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
+    const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice);
+
 struct LasagnaCubeValues {
     double c000 = 0.0;
     double c001 = 0.0;
@@ -217,7 +220,13 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
 
 [[nodiscard]] LasagnaChannelBinding bindLasagnaChannel(
     const LasagnaDatasetManifest& manifest,
-    std::string_view channel);
+    std::string_view channel,
+    bool allowFloat32 = false);
+
+// Typed scalar reads through the same process cache. Interpolate each component
+// before L2 normalization; an empty row denotes an invalid/zero vector.
+void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
+    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors);
 
 [[nodiscard]] LasagnaCubeRequest prepareLasagnaCubeRequest(
     const LasagnaChannelBinding& binding,

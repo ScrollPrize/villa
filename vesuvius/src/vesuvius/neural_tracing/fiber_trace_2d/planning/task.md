@@ -1,6 +1,3 @@
-# Contrastive embedding consistency
+# Embedding-only tracer tuning
 
-Follow-up: show positive/negative cosine histograms from the saved results so
-their distributional overlap is visible without rerunning inference.
-
-Rerun the existing chunk-boundary/blending and GT/off-GT similarity analysis on the new contrastive training's current raw snapshot. Keep the previous protocol and compare results. Let training pause/resume through the manager; do not stop it.
+Freeze a new current raw snapshot and tune embedding tracer settings to minimize restarts. Only embedding weight/history spacing/window/count/falloff; leave all geometric and other cost settings unchanged. Preserve training and manager resource handling.

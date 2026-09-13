@@ -89,6 +89,16 @@ inline bool parseTraceOption(
         config.lazyLookahead = false;
     else if (argument == "--threads")
         config.parallelThreads = parseInt(value("threads"), "threads");
+    else if (argument == "--embedding-weight")
+        config.embeddingWeight = parseDouble(value("embedding-weight"), "embedding-weight");
+    else if (argument == "--embedding-history-spacing-base-voxels")
+        config.embeddingHistorySpacingBaseVoxels = parseDouble(value("embedding-history-spacing-base-voxels"), "embedding-history-spacing-base-voxels");
+    else if (argument == "--embedding-history-window-base-voxels")
+        config.embeddingHistoryWindowBaseVoxels = parseDouble(value("embedding-history-window-base-voxels"), "embedding-history-window-base-voxels");
+    else if (argument == "--embedding-history-falloff")
+        config.embeddingHistoryFalloff = value("embedding-history-falloff");
+    else if (argument == "--embedding-history-count")
+        config.embeddingHistoryCount = parseInt(value("embedding-history-count"), "embedding-history-count");
     else if (argument == "--smoothness-weight")
         config.smoothnessWeight = parseDouble(value("smoothness-weight"), "smoothness-weight");
     else if (argument == "--smoothness-normal-weight")
@@ -138,6 +148,11 @@ inline void validateTraceOptions(const FiberTraceConfig& config)
 inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
 {
     return {
+        {"embedding_weight", config.embeddingWeight},
+        {"embedding_history_spacing_base_voxels", config.embeddingHistorySpacingBaseVoxels},
+        {"embedding_history_window_base_voxels", config.embeddingHistoryWindowBaseVoxels},
+        {"embedding_history_count", config.embeddingHistoryCount},
+        {"embedding_history_falloff", config.embeddingHistoryFalloff},
         {"step_voxels", config.stepVoxels},
         {"cone_angle_degrees", config.coneAngleDegrees},
         {"cone_angle_step_degrees", config.coneAngleStepDegrees},

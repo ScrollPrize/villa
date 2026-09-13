@@ -13,6 +13,51 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
 from .live_evaluate import coordinate_native
 
 
+def extend_cached_replay(evaluation, binary, checkpoint):
+    """Continue an existing inference cache through shared demand publication.
+
+    Unlike a fresh experiment namespace, this explicitly validates and locks
+    the existing cache. The numerical adapter/store/control loop are unchanged.
+    Caller must own its GPU grant before entering.
+    """
+    from contextlib import ExitStack
+    import subprocess
+    import torch
+    from lasagna.demand_predict3d import DemandGeometry
+    from .live_evaluate import (Vc3dCoordinateSampler, NativeTileReader,
+        create_demand_store, native_reader_options, implementation_identity,
+        input_root_attributes, validate_input_lattice)
+    binary = Path(binary)
+    cache_root = subprocess.check_output([str(binary.with_name("vc_cache_root"))], text=True).strip()
+    settings = evaluation["inference"]
+    stores, readers, mapping, channels = {}, {}, {}, {}
+    with ExitStack() as cleanup:
+        for source in evaluation["sources"]:
+            cache = Path(source["fiber_manifest"]).parent
+            persisted = json.loads((cache / "cache_identity.json").read_text())
+            identity = persisted["identity"]
+            model, original = identity["model"], identity["source"]
+            if model["implementation"] != implementation_identity() or model["checkpoint_sha256"] != sha256_file(checkpoint):
+                raise ValueError("cannot extend cache with different checkpoint/implementation")
+            geometry = DemandGeometry(**persisted["geometry"])
+            sampler = Vc3dCoordinateSampler(original["locator"], level=original["level"],
+                cache_root=cache_root, **native_reader_options(settings))
+            attrs = input_root_attributes(sampler.volume)
+            validate_input_lattice(attrs, original["level"])
+            if (list(sampler.volume.shape_at(original["level"])) != original["shape"] or
+                list(sampler.volume.shape_at(0)) != original["base_shape"] or attrs != original["metadata"]):
+                raise ValueError("source metadata changed since cached inference")
+            key = str(cache)
+            stores[key] = cleanup.enter_context(create_demand_store(cache, original, model, geometry,
+                model["config"], checkpoint, original["level"], settings))
+            readers[key] = NativeTileReader(sampler, geometry, sampler.volume.dtype)
+            mapping[source["id"]] = key
+            channels[key] = {str((Path(c.relative_path)/str(p.level)).resolve()): geometry
+                            for p in stores[key].products for c in p.channels}
+        return coordinate_native(evaluation, binary, stores, mapping, channels,
+            {k:set() for k in stores}, readers, (torch.device("cuda:0"),), settings)
+
+
 def prefix_points(points, length):
     points = np.asarray(points, dtype=np.float64)
     if length <= 0:
@@ -50,8 +95,8 @@ class PublishedStore:
                 raise ValueError("published channel escapes cache")
             meta = json.loads((level_path / ".zarray").read_text())
             level, chunk, shape = int(level_path.name), tuple(meta["chunks"]), tuple(meta["shape"])
-            if len(shape) != 3 or len(set(chunk)) != 1 or np.dtype(meta["dtype"]) != np.dtype("u1"):
-                raise ValueError("cached profile requires ordinary 3D cubic uint8 chunks")
+            if len(shape) != 3 or len(set(chunk)) != 1 or np.dtype(meta["dtype"]) not in (np.dtype("u1"), np.dtype("float32")):
+                raise ValueError("cached profile requires 3D cubic uint8 or float32 chunks")
             if self.level is not None and (level, chunk[0], shape) != (self.level, self.chunk, self.shape):
                 raise ValueError("published channels disagree on their lattice")
             self.level, self.chunk, self.shape = level, chunk[0], shape

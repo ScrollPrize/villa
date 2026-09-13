@@ -1,3 +1,35 @@
+## 2026-09-13 — Paired embedding tracer tuning
+
+- Generalized existing embedding-only sweep for configured histories and selected-history weight search.
+  Frozen4300 pilot tuned86 off/90 original to82 restarts, exact repeat; local one-fiber result,
+  no default changes. Full results: docs/embedding_paired_tracer_tuning_20260913.md.
+
+## 2026-09-13 — Paired long-range embedding training
+
+- Added same-fiber patch pairs with shared value augmentation, independent geometry,
+  joint contrastive sampling and pair-preserving cooperative microbatch allocation.
+- Validated CPU, native real-data loading and manager-exclusive two-GPU gradients;
+  replacement training starts from scratch at LR 0.01 with 64 pairs/update.
+
+## 2026-09-13 — Embedding-guided live tracing
+
+- Full36 history sweep at0.30:best93 at8/64/Gaussian vs88 at0.25, exact repeat;
+  side-by-side report retained, production defaults unchanged.
+- Fixed-history weight neighbor search:0.25 remains local best88 failures,
+  versus98/103 at0.20/0.30; exact cached repeat, no defaults changed.
+- Added uniform/linear/Gaussian history sweep:36 variants, best88 vs96 off
+  failures on one difficult fiber; exact cached repeat. Defaults unchanged.
+  See docs/embedding_history_sweep_20260913.md for the full matrix and caveats.
+- Added CPU-only cached embedding query/route analysis using shared native
+  sampling; measured GT continuity and baseline failure discrimination across
+  short/long distances. See docs/embedding_route_analysis_20260913.md.
+
+- Opt-in native cosine history cost, signed float32 inference channels using
+  shared demand publication and native interpolation/cache. Weight zero retains
+  ordinary behavior. Shared fixed-budget evaluator grants preserve manager protocol.
+- Current-raw5400 one-fiber bidirectional pilot validated; score unchanged.
+  See docs/embedding_tracing.md for settings, timings, tests and limitations.
+
 ## 2026-09-13 — Fixed-budget single-backward embeddings
 
 - Added opt-in local contrastive competition with2048 GT anchors/65536 negatives

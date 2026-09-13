@@ -8,7 +8,7 @@ peaks, not just activations. No estimate is supplied implicitly.
 from dataclasses import dataclass
 
 
-def configure_cuda_memory_budget(allowance, reserve):
+def configure_cuda_memory_budget(allowance, reserve, device=0):
     """Worker-only allocator limit, shared by production and calibration.
 
     Leave reserve outside PyTorch for the context/NCCL. Driver-visible usage is
@@ -17,8 +17,8 @@ def configure_cuda_memory_budget(allowance, reserve):
     if type(allowance) is not int or type(reserve) is not int or not 0 <= reserve < allowance:
         raise ValueError("VRAM grant must exceed its nonnegative driver reserve")
     import torch
-    properties = torch.cuda.get_device_properties(0)
-    torch.cuda.set_per_process_memory_fraction(min(1.0, (allowance - reserve) / properties.total_memory), 0)
+    properties = torch.cuda.get_device_properties(device)
+    torch.cuda.set_per_process_memory_fraction(min(1.0, (allowance - reserve) / properties.total_memory), device)
     return properties
 
 
@@ -57,9 +57,14 @@ class EffectiveBatchSampleIndex:
     microbatch_sizes: tuple[int, ...]
     rank: int
     start_step: int = 0
+    group_size: int = 1
 
     def __post_init__(self):
         partition_offsets(self.effective_batch_size, self.microbatch_sizes)
+        if (type(self.group_size) is not int or self.group_size < 1 or
+                self.effective_batch_size % self.group_size or
+                any(s % self.group_size for s in self.microbatch_sizes)):
+            raise ValueError("effective batch and microbatches must contain whole sample groups")
         if type(self.rank) is not int or not 0 <= self.rank < len(self.microbatch_sizes):
             raise ValueError("invalid partition rank")
         if type(self.start_step) is not int or self.start_step < 0:
@@ -67,7 +72,8 @@ class EffectiveBatchSampleIndex:
 
     @property
     def bounds(self):
-        offsets = partition_offsets(self.effective_batch_size, self.microbatch_sizes)
+        offsets = tuple(v * self.group_size for v in
+                        partition_offsets(self.effective_batch_size // self.group_size, self.microbatch_sizes))
         return offsets[self.rank:self.rank + 2]
 
     @property

@@ -5720,6 +5720,15 @@ bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)
 
 bool ChunkCache::isAllFill(const State& state, const std::vector<std::byte>& bytes)
 {
+    if (state.dtype_ == ChunkDtype::Float32) {
+        if (bytes.size() % sizeof(float)) return false;
+        for (size_t offset = 0; offset < bytes.size(); offset += sizeof(float)) {
+            float value;
+            std::memcpy(&value, bytes.data() + offset, sizeof(value));
+            if (value != static_cast<float>(state.fillValue_)) return false;
+        }
+        return true;
+    }
     if (state.dtype_ == ChunkDtype::UInt8) {
         const auto fill = static_cast<unsigned char>(std::clamp(
             state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<unsigned char>::max())));
@@ -5751,6 +5760,8 @@ std::size_t ChunkCache::dtypeSize(ChunkDtype dtype)
         return 1;
     case ChunkDtype::UInt16:
         return 2;
+    case ChunkDtype::Float32:
+        return 4;
     case ChunkDtype::Opaque:
         return 0;
     }

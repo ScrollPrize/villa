@@ -151,6 +151,7 @@ class _Augment3DParams:
     anisotropic_blur_sigma_along: float
     anisotropic_blur_sigma_across: float
     anisotropic_blur_axis_zyx: np.ndarray | None
+    value_seed_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1729,7 +1730,7 @@ def _apply_value_augmentation_prefix_3d(
     started = time.perf_counter()
     if params.noise_std > 0.0:
         gen = torch.Generator(device=out.device)
-        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
+        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index if params.value_seed_index is None else params.value_seed_index) % (2**63 - 1))
         out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
     record("value_noise_ms", started)
     return out
@@ -1881,7 +1882,7 @@ def apply_value_augmentation_batch_3d(
                     continue
                 generator = torch.Generator(device=out.device)
                 generator.manual_seed(
-                    _stable_seed(config.seed, "value_noise", item.stream_index) % (2**63 - 1)
+                    _stable_seed(config.seed, "value_noise", item.stream_index if item.value_seed_index is None else item.value_seed_index) % (2**63 - 1)
                 )
                 noise_parts.append(
                     torch.randn(
@@ -2043,6 +2044,8 @@ class FiberTrace3DLoader:
             if any(not _uses_dense_fiber_supervision(r) for r in self.records):
                 raise ValueError("scroll_balanced_arclength requires dense supervision for every dataset")
             self._arc_sampler = ScrollArcSampler(self.records)
+        if config.embedding.paired_patches and self._arc_sampler is None:
+            raise ValueError("paired patches require scroll_balanced_arclength sampling")
         self._flat_offsets: list[int] = []
         flat_total = 0
         for record in self.records:
@@ -2055,7 +2058,7 @@ class FiberTrace3DLoader:
 
     @property
     def sample_count(self) -> int:
-        return int(self._flat_sample_count)
+        return int(self._flat_sample_count) * (2 if self.config.embedding.paired_patches else 1)
 
     def _load_records(self) -> list[_Record]:
         array_records = getattr(self.config, "_array_records", None)
@@ -2191,6 +2194,14 @@ class FiberTrace3DLoader:
         *,
         sample_mode: str = "random",
     ) -> tuple[_Record, int, int | FiberLocation]:
+        if self.config.embedding.paired_patches:
+            original = self._descriptor_for_unpaired_index(sample_index // 2, sample_mode=sample_mode)
+            if sample_index % 2:
+                return self._arc_sampler.sample_within(self._rng(sample_index // 2, "pair_partner"), [original[1]])
+            return original
+        return self._descriptor_for_unpaired_index(sample_index, sample_mode=sample_mode)
+
+    def _descriptor_for_unpaired_index(self, sample_index, *, sample_mode):
         if sample_mode == "random":
             if self._arc_sampler is not None:
                 return self._arc_sampler.sample(self._rng(sample_index, "scroll_arclength"))
@@ -2353,6 +2364,7 @@ class FiberTrace3DLoader:
         record: _Record,
         cp_index: int | FiberLocation,
         sample_index: int,
+        value_index: int | None = None,
     ) -> _Augment3DParams:
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.int64)
         margin = int(self.config.cp_margin_voxels)
@@ -2385,6 +2397,9 @@ class FiberTrace3DLoader:
             else:
                 rotation = np.eye(3, dtype=np.float64)
             source_to_output = rotation @ np.diag(flip * scale)
+            geometry_rng = rng
+            if value_index is not None:
+                rng = self._rng(value_index, "paired_value")
             brightness = (
                 float(rng.uniform(-self.config.augment_brightness, self.config.augment_brightness))
                 if self.config.augment_brightness > 0.0
@@ -2400,6 +2415,8 @@ class FiberTrace3DLoader:
             directional_sigma_across = float(
                 rng.uniform(0.0, self.config.augment_anisotropic_blur_sigma_across)
             )
+            if value_index is not None:
+                rng = geometry_rng
         else:
             cp_local = center
             source_to_output = np.eye(3, dtype=np.float64)
@@ -2415,7 +2432,7 @@ class FiberTrace3DLoader:
             record,
             cp_index,
             source_to_output,
-            rng,
+            rng if value_index is None else self._rng(value_index, "paired_blur_axis"),
         )
 
         return _Augment3DParams(
@@ -2437,6 +2454,7 @@ class FiberTrace3DLoader:
             if anisotropic_axis is not None
             else 0.0,
             anisotropic_blur_axis_zyx=anisotropic_axis,
+            value_seed_index=value_index,
         )
 
     def _output_points_to_source_volume_np(
@@ -3061,6 +3079,8 @@ class FiberTrace3DLoader:
         are keyed only by that identity and attempt, not worker/rank state.
         """
         data_index = _bounded_data_sample_index(int(sample_index), sample_index_limit)
+        if self.config.embedding.paired_patches and sample_index_limit and sample_index_limit % 2:
+            raise ValueError("paired sample index limit must be even")
         original = self.descriptor_for_sample_index(data_index, sample_mode=sample_mode)
         descriptor = original
         for attempt in range(129):
@@ -3083,6 +3103,10 @@ class FiberTrace3DLoader:
 
     def _replacement_descriptor(self, original, sample_index, attempt, sample_mode):
         record = original[0]
+        if self.config.embedding.paired_patches:
+            # Never replace one partner with a different fiber.
+            return self._arc_sampler.sample_within(
+                self._rng(sample_index, f"pair_normal_retry_{attempt}"), [original[1]])
         def group(r):
             return (r.dataset_config.get("scroll_id", r.volume_path),
                     r.dataset_config.get("sampling_group"))
@@ -3121,11 +3145,15 @@ class FiberTrace3DLoader:
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        params = self._sample_augment_params(record, cp_index, augmentation_index)
+        params = self._sample_augment_params(record, cp_index, augmentation_index,
+            value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
         embedding_start = time.perf_counter()
         embedding_geometry = self._build_embedding_geometry(record, record_index, params, timings)
+        if self.config.embedding.paired_patches:
+            embedding_geometry = replace(embedding_geometry, pair_id=stream_index // 2,
+                pair_member=stream_index % 2, fiber_id=f"{record_index}:{record.fiber.path}")
         if timings is not None:
             timings["embedding_geometry_ms"] = (time.perf_counter() - embedding_start) * 1000.0
         start = time.perf_counter()

@@ -675,6 +675,56 @@ def inspect():
 
 
 def main():
+    if sys.argv[1:] == ['embedding-watch-start']:
+        from villa_gpu_manager.processes import process_identity
+        control = json.loads(CONTROL.read_text())
+        root = Path(control['embedding_milestone']['output'])
+        root.mkdir(parents=True, exist_ok=False)
+        frozen_control = root / 'control.json'
+        frozen_control.write_text(json.dumps(control, indent=2))
+        with (root / 'watch.log').open('w') as log:
+            process = subprocess.Popen([sys.executable, '-u', '-m',
+                'vesuvius.neural_tracing.fiber_trace_3d.embedding_milestone', str(frozen_control)],
+                cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        (root / 'watcher.json').write_text(json.dumps(process_identity(process.pid)))
+        print(f'watcher pid={process.pid} log={root / "watch.log"}', flush=True)
+        return
+    if sys.argv[1:] == ['embedding-stop-pilot']:
+        from villa_gpu_manager.processes import process_identity
+        matches = []
+        for proc in Path('/proc').glob('[0-9]*'):
+            try:
+                args = (proc / 'cmdline').read_bytes().split(b'\0')
+                if (proc.stat().st_uid == os.getuid() and b'-m' in args and
+                    b'vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_pilot' in args and
+                    str(CONTROL).encode() in args and b'--unmanaged' not in args):
+                    matches.append(int(proc.name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        for pid in matches:
+            stop_production_identity(process_identity(pid))
+        print(f'stopped managed pilot roots: {matches}', flush=True)
+        return
+    if sys.argv[1:] == ['embedding-freeze-current']:
+        from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
+        import torch
+        control = json.loads(CONTROL.read_text())
+        settings = control['embedding_trace_pilot']
+        frozen, digest = freeze_checkpoint(Path(settings['checkpoint']), Path(settings['output'] + '-frozen'))
+        payload = torch.load(frozen, map_location='cpu', weights_only=True, mmap=True)
+        settings['checkpoint'] = str(frozen)
+        CONTROL.write_text(json.dumps(control, indent=2) + '\n')
+        print(json.dumps(dict(checkpoint=str(frozen), sha256=digest, step=payload['step'], samples_seen=payload.get('samples_seen'))), flush=True)
+        return
+    if sys.argv[1:] == ['embedding-trace-sweep']:
+        raise SystemExit(subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep', str(CONTROL)]))
+    if sys.argv[1:] == ['embedding-route-analysis']:
+        raise SystemExit(subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_route_analysis', str(CONTROL)]))
+    if sys.argv[1:] == ['embedding-trace-pilot']:
+        raise SystemExit(subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_pilot', str(CONTROL)]))
     if sys.argv[1:] == ['embedding-histograms']:
         return subprocess.call([sys.executable, '-m',
             'vesuvius.neural_tracing.fiber_trace_3d.embedding_histograms', str(CONTROL)])

@@ -183,7 +183,8 @@ class FiberTrainingWorker:
         from .train import training_units
         from .cooperative_resources import EffectiveBatchSampleIndex
         index_map = EffectiveBatchSampleIndex(factory.effective_batch_size, factory.microbatch_sizes,
-                                              rank, factory.start_step)
+                                              rank, factory.start_step,
+                                              2 if raw.get("embedding", {}).get("paired_patches", False) else 1)
         self.source = QueueBatchSource(factory.queues[rank], factory.received[rank], factory.owner_pid, index_map,
                                        factory.test_connections[rank] if factory.test_connections else None)
         self.units = training_units(
