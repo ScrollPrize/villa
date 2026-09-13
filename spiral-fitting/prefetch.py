@@ -61,7 +61,7 @@ class LegacyNumpyRandom:
     # identical to the historical behaviour).
 
     random = staticmethod(np.random.random)
-    randint = staticmethod(np.random.randint)
+    randint = staticmethod(lambda *a, **k: np.random.randint(*a, dtype=np.int64, **k))
     uniform = staticmethod(np.random.uniform)
     choice = staticmethod(np.random.choice)
 
@@ -101,7 +101,7 @@ class StepPrefetcher:
         if rng is None:
             # Seeded once from the global stream: deterministic given the
             # deterministic first-use order, then independent of it.
-            seed = int(np.random.randint(0, 2 ** 63 - 1))
+            seed = int(np.random.randint(0, 2 ** 63 - 1, dtype=np.int64))
             rng = _GeneratorShim(np.random.Generator(np.random.PCG64(seed)))
             self._np_rngs[key] = rng
         return rng

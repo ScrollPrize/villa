@@ -70,6 +70,13 @@ struct ChunkCacheOptions {
     bool compressPersistentCache = false;
     // Near-lossless persistent-cache quantization width; one is lossless.
     int cacheQuantBinWidth = 1;
+    // When the shared decoded-byte budget must evict, sources flagged here
+    // are preferred victims: they may not displace other participants'
+    // decoded data unless no flagged participant has anything left to give.
+    // Set by bulk background consumers (lasagna channel sampling for line
+    // solves) so their chunk streams cannot evict the viewer tiles the user
+    // is panning over.
+    bool decodedEvictionPreferSelf = false;
 };
 
 // Application-owned decoded chunk-cache service. Source identity strings are
@@ -195,7 +202,9 @@ public:
         // level. Persistent-cache probes count while the requested chunk is
         // still unavailable to rendering.
         std::vector<std::size_t> unresolvedFetchesByLevel;
-
+        // Readers currently parked inside getChunkBlocking (summed over
+        // keys). Chunks with parked readers are protected from eviction.
+        std::size_t blockingReaders = 0;
     };
 
     struct PersistentChunkDependency {
@@ -492,6 +501,17 @@ private:
                            StorageObjectTransfer,
                            StorageObjectKeyHash> storageObjectTransfers_;
         std::list<ChunkKey> lru_;
+        // Readers currently parked inside getChunkBlocking, counted per key
+        // and owned by the readers themselves (registered on entry, released
+        // exactly once on every exit). The count - not the entry - carries
+        // the eviction protection: both evictors and the budget's victim
+        // probe skip keys with parked readers, so a successor entry created
+        // after an invalidation is protected from the moment it exists, and
+        // no entry lifecycle event can duplicate, destroy, or transfer a
+        // reader's registration. Slots are erased at zero; the map is empty
+        // whenever no blocking read is in progress.
+        std::unordered_map<ChunkKey, std::size_t, ChunkKeyHash>
+            blockingReadersByKey_;
         std::vector<std::size_t> unresolvedFetchesByLevel_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t decodedBudgetRegistration_ = 0;
@@ -552,6 +572,8 @@ private:
                                        Entry& entry,
                                        const ChunkRequestContext& request);
     static bool hasDemandLocked(const Entry& entry);
+    static bool hasParkedBlockingReaderLocked(const State& state,
+                                              const ChunkKey& key);
     static bool cancelUndemandedEntryLocked(State& state,
                                             const ChunkKey& key,
                                             Entry& entry);
@@ -748,8 +770,8 @@ private:
     static void notifyListeners(const std::shared_ptr<State>& state);
     static void notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                            const ChunkKey& key,
-                                           bool active);
-    static void waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key);
+                                           bool active,
+                                           bool isolateCallbackExceptions = false);
     static std::uint64_t nextSchedulerGroup();
     static void invalidateState(const std::shared_ptr<State>& state);
     static void registerStateBudget(const std::shared_ptr<State>& state);

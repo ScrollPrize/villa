@@ -1,0 +1,145 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+  MAINTAINER Seth Parker <c.seth.parker@uky.edu>
+  OS Ubuntu 22.04
+
+%files
+  /tmp/pgs-recon /usr/local/educelab/pgs-recon
+
+%post
+  # Restore container PATH
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  # apt dependencies
+  apt update
+  DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+    build-essential \
+    bzip2 \
+    cmake \
+    curl \
+    doxygen \
+    git \
+    graphviz \
+    imagemagick \
+    libboost-iostreams-dev \
+    libboost-program-options-dev \
+    libboost-serialization-dev \
+    libboost-system-dev \
+    libboost-thread-dev \
+    libbz2-dev \
+    libgmp3-dev \
+    libjpeg-turbo8-dev \
+    libqt5opengl5-dev \
+    libmpfr-dev \
+    libqt5svg5-dev \
+    libqt5x11extras5-dev \
+    locales \
+    nano \
+    ninja-build \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    qtbase5-dev \
+    qt5-qmake \
+    software-properties-common \
+    tzdata \
+    wget \
+    xz-utils \
+    zlib1g-dev
+
+  # Build photogrammetry dependencies
+  mkdir -p /usr/local/educelab/build/ && cd /usr/local/educelab/build/
+  cmake \
+    -DCMAKE_INSTALL_PREFIX=/usr/local/ \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_JPEG=OFF \
+    -GNinja \
+    /usr/local/educelab/pgs-recon/dependencies/
+  ninja
+
+  # Fix locales
+  locale-gen en_US en_US.UTF-8
+  dpkg-reconfigure --frontend=noninteractive locales
+
+  # Install exiftool
+  echo "Installing ExifTool"
+  mkdir -p /usr/local/educelab/exiftool/ && cd /usr/local/educelab/exiftool/
+  EXIFTOOL_VER=$(curl --no-progress-meter https://exiftool.org/ver.txt)
+  curl -O -L https://exiftool.org/Image-ExifTool-${EXIFTOOL_VER}.tar.gz
+  tar -xzf Image-ExifTool-${EXIFTOOL_VER}.tar.gz
+  cd Image-ExifTool-${EXIFTOOL_VER}/
+  perl Makefile.PL
+  make test
+  make install
+  echo "Exiftool ${EXIFTOOL_VER} installed"
+
+  # Create a virtual environment for this project
+  python3 -m venv /usr/local/educelab/pgs-recon/.venv
+
+  # Activate virtualenv
+  . /usr/local/educelab/pgs-recon/.venv/bin/activate
+  # Update pip
+  python3 -m pip install --upgrade pip wheel
+
+  # Install PGSRecon
+  python3 -m pip install --editable /usr/local/educelab/pgs-recon
+
+  # Setup code and git for overlays
+  chmod --recursive a+rw /usr/local/educelab/pgs-recon/
+  chmod a+rw /usr/local/lib/openMVG/sensor_width_camera_database.txt
+  git config --global credential.helper cache
+  git config --global credential.helper 'cache --timeout=3600'
+  git config --global --add safe.directory /usr/local/educelab/pgs-recon/
+
+%runscript 
+#!/bin/bash
+  if [ $# -lt 1 ]; then
+      echo "Usage: ./container <command>"
+      exit 1
+  fi
+
+  source /usr/local/educelab/pgs-recon/.venv/bin/activate
+  exec "$@"
+
+%help
+  This container provides an environment for running pgs-recon.
+
+  Building the container:
+    - The photogrammetry git repository must exist at /tmp/pgs-recon on the
+      host machine before building the container. Cloning using https is
+      recommended so that the repository can be manipulated after container
+      creation using your username and password instead of needing ssh keys
+      on the container. After this clone, you can check out a different branch
+      or make changes if desired, but this can also be done after the container
+      is built.
+    - Example command sequence to build fresh container:
+      `cd <path_to_project>/singularity`
+      `rm -rf /tmp/pgs-recon`
+      `git clone --branch main https://gitlab.com/educelab/pgs-recon.git /tmp/pgs-recon`
+      `sudo singularity build pgs-recon.sif pgs-recon.def`
+
+  Preparing for use:
+    - Then get the container ready for use, for example:
+      `scp pgs-recon.sif lcc:~`
+      `ssh lcc`
+      `module load ccs/singularity`
+      `rm -f pgs-recon.overlay && dd if=/dev/zero of=pgs-recon.overlay bs=1M count=500 && mkfs.ext3 -F pgs-recon.overlay  # Create a new overlay for the new container`
+      `singularity shell --overlay pgs-recon.overlay pgs-recon.sif  # If you want to get into the container and make any changes to the code, or checkout another branch`
+      `rclone copy -uv pgs-recon.sif dri-experiments-drive:singularity-containers`  # If you want to update the shared .sif file
+      `cp pgs-recon.sif $PROJECT/seales_uksr/containers`
+      `chmod g+w $PROJECT/seales_uksr/containers/pgs-recon.sif`
+      `chgrp seales_uksr $PROJECT/seales_uksr/containers/pgs-recon.sif`
+
+  Usage:
+    - It is possible to use an overlay to allow one to check out another branch, pull recent changes, or make local edits to project code. To create and use an overlay: `dd if=/dev/zero of=pgs-recon.overlay bs=1M count=500 && mkfs.ext3 pgs-recon.overlay; singularity shell --overlay pgs-recon.overlay pgs-recon.sif` (see Singularity documentation on persistent overlays). If the overlay directory is deleted or not specified when using the container, the changes will be gone and the checkout built into the container will be present.
+    - You can use `git config` to set your name and email after creating an overlay so you get accurate commit authorship.
+    - It is recommended to use the included `singularity/submit.sh` to run a job.
+    - Example reconstruction pipeline usage with sbatch:
+      `sbatch -p <partition> --time=<timelimit> submit.sh pgs-recon input_images/ output_dir/ # Submit jobs using the container`
+    - Example running single executable with sbatch:
+      `sbatch -p <partition> --time=<timelimit> submit.sh openMVG_main_GlobalSfM -i sfm_data.json -o recon/ -m matches/'
+
+
+  This container is intended to be built once and used with multiple checkouts of project code, using an overlay to store the changes or checkouts. Only when the dependencies change does the container need rebuilding.

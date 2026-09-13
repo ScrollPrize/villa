@@ -1,0 +1,11 @@
+dependencies/build/*
+dependencies/installed/*
+out/*
+venv/*
+.venv/*
+**/__pycache__/*
+.idea/*
+**/*.egg-info
+**/*.sif
+build*/
+*out.txt

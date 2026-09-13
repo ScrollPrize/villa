@@ -66,6 +66,10 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_surface_area_units)
+
+vc_add_test(NAME test_voxel_size_metadata)
+
 vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
@@ -79,6 +83,11 @@ vc_add_test(NAME test_segmentation_autosave_state
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_surface_display_name
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_volumetric_compositor
+    SOURCES test_volumetric_compositor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/VolumetricCompositor.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_segmentation_intersection_invalidation
@@ -867,6 +876,17 @@ if(TARGET vc_seg_add_overlap)
         LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
         DEFS VC_SEG_ADD_OVERLAP_BIN="$<TARGET_FILE:vc_seg_add_overlap>")
     add_dependencies(test_seg_add_overlap_cli vc_seg_add_overlap)
+endif()
+
+if(TARGET vc_render_tifxyz)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    vc_register_test_target(vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_logging
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_logging.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
+    vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)

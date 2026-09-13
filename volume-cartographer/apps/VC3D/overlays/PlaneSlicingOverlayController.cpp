@@ -5,6 +5,7 @@
 #include "../volume_viewers/CChunkedVolumeViewer.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../CState.hpp"
+#include "../ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <QCursor>
@@ -80,7 +81,11 @@ bool PlaneSlicingOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer
     if (!_axisAlignedEnabled || !viewer) {
         return false;
     }
-    return viewer->surfName() == "xy plane";
+    // The guides render in the xy view only, but the xz/yz viewers must reach
+    // collectPrimitives too: their rebuilds (scroll, composite changes) are
+    // what propagates a refresh onto the xy viewers' guide lines.
+    const std::string& name = viewer->surfName();
+    return name == "xy plane" || name == "seg xz" || name == "seg yz";
 }
 
 PlaneSlicingOverlayController::ViewerState& PlaneSlicingOverlayController::ensureViewerState(VolumeViewerBase* viewer)
@@ -179,6 +184,18 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     if (!_axisAlignedEnabled || viewer->surfName() != "xy plane") {
         removeInteractions(viewer);
         clearOverlay(viewer);
+        // The guide lines drawn in the xy view track the xz/yz viewers'
+        // scroll offset and composite slab, which don't touch shared state
+        // the xy viewer observes; propagate those viewers' refreshes.
+        if (_axisAlignedEnabled &&
+            (viewer->surfName() == "seg xz" || viewer->surfName() == "seg yz") &&
+            manager()) {
+            for (auto* other : manager()->baseViewers()) {
+                if (other && other != viewer && other->surfName() == "xy plane") {
+                    refreshViewer(other);
+                }
+            }
+        }
         return;
     }
 
@@ -192,6 +209,22 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     }
 
     const cv::Vec3f focus = focusPoi->p;
+
+    // The xy viewer's displayed plane: guide lines mark where the xz/yz view
+    // planes cross this plane, not where they cross the focus point.
+    cv::Vec3f viewNormal(0.0f, 0.0f, 1.0f);
+    cv::Vec3f viewOrigin = focus;
+    {
+        auto xyHolder = _state->surface("xy plane");
+        if (auto* xyPlane = dynamic_cast<PlaneSurface*>(xyHolder.get())) {
+            viewNormal = xyPlane->normal({}, {});
+            if (cv::norm(viewNormal) < 1e-5f) {
+                viewNormal = cv::Vec3f(0.0f, 0.0f, 1.0f);
+            }
+            cv::normalize(viewNormal, viewNormal);
+            viewOrigin = xyPlane->origin() + viewNormal * viewer->normalOffset();
+        }
+    }
 
     const struct {
         const char* name;
@@ -209,19 +242,42 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             continue;
         }
 
+        // The viewer displaying this plane contributes a scroll offset along
+        // the normal and, when plane compositing is on, a slab around it.
+        VolumeViewerBase* srcViewer = nullptr;
+        if (manager()) {
+            for (auto* candidate : manager()->baseViewers()) {
+                if (candidate && candidate->surfName() == def.name) {
+                    srcViewer = candidate;
+                    break;
+                }
+            }
+        }
+
         cv::Vec3f normal = plane->normal({}, {});
-        cv::Vec3f dir3D = normal.cross(cv::Vec3f(0.0f, 0.0f, 1.0f));
+        if (cv::norm(normal) < 1e-5f) {
+            continue;
+        }
+        cv::normalize(normal, normal);
+        const cv::Vec3f planeOrigin =
+            plane->origin() + normal * (srcViewer ? srcViewer->normalOffset() : 0.0f);
+
+        cv::Vec3f dir3D = normal.cross(viewNormal);
         if (cv::norm(dir3D) < 1e-5f) {
             continue;
         }
         cv::normalize(dir3D, dir3D);
 
-        cv::Vec3f origin = focus;
-        cv::Vec3f dirXY(dir3D[0], dir3D[1], 0.0f);
-        if (cv::norm(dirXY) < 1e-5f) {
-            continue;
+        // Line center: the point on both displayed planes nearest the focus.
+        // Start from the focus dropped onto the view plane, then slide within
+        // the view plane (perpendicular to the line) onto the sliced plane.
+        cv::Vec3f origin = focus + viewNormal * (viewOrigin - focus).dot(viewNormal);
+        const cv::Vec3f inViewPerp = viewNormal.cross(dir3D);
+        const float perpDotNormal = inViewPerp.dot(normal);
+        if (std::abs(perpDotNormal) > 1e-6f) {
+            origin += inViewPerp * ((planeOrigin - origin).dot(normal) / perpDotNormal);
         }
-        cv::normalize(dirXY, dirXY);
+        const cv::Vec3f dirXY = dir3D;
 
         cv::Vec3f baseDir = def.baseNormal.cross(cv::Vec3f(0.0f, 0.0f, 1.0f));
         if (cv::norm(baseDir) < 1e-5f) {
@@ -248,6 +304,93 @@ void PlaneSlicingOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         lineStyle.z = kLineZ;
 
         builder.addLineStrip({negativeScene, positiveScene}, false, lineStyle);
+
+        // When the plane's viewer composites a slab, mark its front/behind
+        // extents with thinner dashed lines; volumetric compositing views the
+        // slab from the front bound, so mark that side with triangles
+        // pointing into the slab (mirrors the flattened-view slab bounds).
+        if (srcViewer && srcViewer->isPlaneCompositeEnabled()) {
+            const auto& cs = srcViewer->compositeRenderSettings();
+            const float step = cs.planeReverseDirection ? -1.0f : 1.0f;
+            const float slabFront = float(std::max(0, cs.planeLayersFront)) * step;
+            const float slabBehind = -float(std::max(0, cs.planeLayersBehind)) * step;
+            const bool volumetric = cs.params.method == "volumetric";
+
+            OverlayStyle slabStyle = lineStyle;
+            slabStyle.penWidth = 1.0;
+
+            for (float slabOffset : {slabFront, slabBehind}) {
+                if (std::abs(slabOffset) < 1e-3f) {
+                    continue;
+                }
+                const cv::Vec3f slabOrigin = origin + normal * slabOffset;
+                const QPointF a = builder.viewer()->volumeToScene(slabOrigin - dirXY * span);
+                const QPointF b = builder.viewer()->volumeToScene(slabOrigin + dirXY * span);
+                builder.addLineStrip({a, b}, false, slabStyle);
+            }
+
+            if (volumetric && std::abs(slabFront - slabBehind) > 1e-3f) {
+                // Match the flattened-view slab markers: triangles at a fixed
+                // scene-pixel spacing across the whole visible extent of the
+                // line, not just around the handles.
+                constexpr qreal kMarkerSpacingScenePx = 48.0;
+                constexpr qreal kMarkerSizeScenePx = 8.0;
+                OverlayStyle markerStyle;
+                markerStyle.penColor = Qt::transparent;
+                markerStyle.brushColor = lineColor;
+                markerStyle.z = kLineZ;
+
+                // The line is affine in the parameter s (voxels along dirXY):
+                // clip it against the viewport in scene space, then convert
+                // the pixel spacing back into a step in s.
+                const QPointF sceneAt0 = builder.viewer()->volumeToScene(origin);
+                const QPointF sceneAt1 = builder.viewer()->volumeToScene(origin + dirXY);
+                const QPointF scenePerS = sceneAt1 - sceneAt0;
+                const qreal pxPerS = std::hypot(scenePerS.x(), scenePerS.y());
+                auto* gv = viewer->graphicsView();
+                qreal sMin = -span;
+                qreal sMax = span;
+                bool visible = pxPerS > 1e-6 && gv;
+                if (visible) {
+                    // Liang-Barsky clip of sceneAt0 + s*scenePerS against the
+                    // viewport rect.
+                    const QRectF viewRect =
+                        gv->mapToScene(gv->viewport()->rect()).boundingRect();
+                    const qreal p[4] = {-scenePerS.x(), scenePerS.x(), -scenePerS.y(), scenePerS.y()};
+                    const qreal q[4] = {sceneAt0.x() - viewRect.left(), viewRect.right() - sceneAt0.x(),
+                                        sceneAt0.y() - viewRect.top(), viewRect.bottom() - sceneAt0.y()};
+                    for (int e = 0; e < 4 && visible; ++e) {
+                        if (std::abs(p[e]) < 1e-9) {
+                            visible = q[e] >= 0;
+                            continue;
+                        }
+                        const qreal t = q[e] / p[e];
+                        if (p[e] < 0) sMin = std::max(sMin, t);
+                        else sMax = std::min(sMax, t);
+                    }
+                    visible = visible && sMin <= sMax;
+                }
+                const qreal sStep = visible ? kMarkerSpacingScenePx / pxPerS : 1.0;
+                // Anchor the grid at s=0 so markers don't crawl while panning.
+                const qreal sStart = std::ceil(sMin / sStep) * sStep;
+                for (qreal s = sStart; visible && s <= sMax; s += sStep) {
+                    const cv::Vec3f base = origin + dirXY * float(s);
+                    const QPointF from = builder.viewer()->volumeToScene(base + normal * slabFront);
+                    const QPointF toward = builder.viewer()->volumeToScene(base + normal * slabBehind);
+                    QPointF dir = toward - from;
+                    const qreal dirLen = std::hypot(dir.x(), dir.y());
+                    if (dirLen < 1e-6) {
+                        continue;
+                    }
+                    dir /= dirLen;
+                    const QPointF perp(-dir.y(), dir.x());
+                    builder.addLineStrip({from + perp * (kMarkerSizeScenePx * 0.5),
+                                          from - perp * (kMarkerSizeScenePx * 0.5),
+                                          from + dir * kMarkerSizeScenePx},
+                                         true, markerStyle);
+                }
+            }
+        }
 
         cv::Vec3f handleOffset3D = dirXY * kHandleVolumeOffset;
         cv::Vec3f handlePositive = origin + handleOffset3D;
@@ -354,14 +497,15 @@ void PlaneSlicingOverlayController::handleMouseMove(VolumeViewerBase* viewer,
             return;
         }
 
-        auto* focusPoi = _state ? _state->poi("focus") : nullptr;
-        if (!focusPoi || !_rotationSetter) {
+        if (!_state || !_rotationSetter) {
             return;
         }
 
         const PlaneVisual& visual = planeIt->second;
 
-        cv::Vec3f delta = volumePoint - focusPoi->p;
+        // Rotate about the drawn line center (the plane's current position in
+        // this view), which may sit away from the focus point.
+        cv::Vec3f delta = volumePoint - visual.origin;
         if (!_activeDrag.positiveHandle) {
             delta *= -1.0f;
         }

@@ -24,7 +24,8 @@ void populate_normal_grid(const SkeletonGraph& g, vc::core::util::GridStore& nor
 
         for (size_t i = 1; i < path.size(); ++i) {
             cv::Point current_point = path[i];
-            double dist_sq = cv::norm(current_point - last_point) * cv::norm(current_point - last_point);
+            auto v = current_point - last_point;
+            double dist_sq = v.ddot(v);
             if (dist_sq >= target_dist_sq) {
                 resampled_path.push_back(current_point);
                 last_point = current_point;
@@ -50,7 +51,8 @@ void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, vc:
 
         for (size_t i = 1; i < trace.size(); ++i) {
             cv::Point current_point = trace[i];
-            double dist_sq = cv::norm(current_point - last_point) * cv::norm(current_point - last_point);
+            auto v = current_point - last_point;
+            double dist_sq = v.ddot(v);
             if (dist_sq >= target_dist_sq) {
                 resampled_path.push_back(current_point);
                 last_point = current_point;

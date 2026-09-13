@@ -52,6 +52,10 @@ constexpr int kFiberIdRole = Qt::UserRole + 1;
 constexpr int kIsSpanRole = Qt::UserRole + 2;
 constexpr int kSpanFirstControlIndexRole = Qt::UserRole + 3;
 constexpr int kSpanSecondControlIndexRole = Qt::UserRole + 4;
+// Marks the single dummy child that keeps a collapsed fiber's expand arrow
+// visible; the real span rows are built on first expansion (they are ~90% of
+// the model's items, and most fibers stay collapsed).
+constexpr int kSpanPlaceholderRole = Qt::UserRole + 5;
 constexpr double kHighlightThresholdDegrees = 45.0;
 
 void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
@@ -346,6 +350,8 @@ void CFiberWidget::setupUi()
 
     connect(_treeView->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &CFiberWidget::onSelectionChanged);
+    connect(_treeView, &QTreeView::expanded,
+            this, &CFiberWidget::ensureSpanChildrenBuilt);
     connect(_treeView, &QTreeView::doubleClicked,
             this, &CFiberWidget::onDoubleClicked);
     connect(_treeView, &QWidget::customContextMenuRequested,
@@ -641,6 +647,9 @@ void CFiberWidget::updateAlignmentMetrics(
         return;
     }
     updateMetricDisplayForRow(root, alignment);
+    if (spanChildrenArePlaceholder(root)) {
+        return;
+    }
     for (int row = 0; row < root->rowCount() && row < static_cast<int>(spanAlignments.size()); ++row) {
         updateMetricDisplayForRow(root->child(row, kNameColumn), spanAlignments[static_cast<size_t>(row)]);
     }
@@ -708,36 +717,81 @@ void CFiberWidget::rebuildModel()
         }
 
         QStandardItem* root = row[kNameColumn];
-        for (const auto& span : fiber.spans) {
-            const QString spanName = tr("span %1  cp %2-%3")
-                .arg(span.spanIndex + 1)
-                .arg(span.firstControlIndex + 1)
-                .arg(span.secondControlIndex + 1);
-            QList<QStandardItem*> childRow{
-                readOnlyItem(spanName),
-                readOnlyItem(directionForFiber(fiber)),
-                readOnlyItem(QString()),
-                readOnlyItem(QString()),
-                readOnlyItem(formatDouble(span.lengthVx, 1)),
-                readOnlyItem(QString::number(span.controlPointCount)),
-                readOnlyItem(QString::number(span.linePointCount)),
-                readOnlyItem(QString()),
-                readOnlyItem(QString(QChar::fromLatin1(span.interpMarker))),
-            };
-            applyRowMetadata(childRow, fiber.id, true, span.alignment, showMetrics);
-            applySpanMetadata(childRow, span.firstControlIndex, span.secondControlIndex);
-            if (!span.fiberManifest.empty()) {
-                childRow[kInterpStatusColumn]->setToolTip(
-                    tr("Traced with: %1")
-                        .arg(QString::fromStdString(span.fiberManifest)));
-            }
-            root->appendRow(childRow);
+        const bool wasExpanded =
+            _treeView && expandedFibers.find(fiber.id) != expandedFibers.end();
+        if (wasExpanded) {
+            buildSpanChildRows(root, fiber);
+        } else if (!fiber.spans.empty()) {
+            // Placeholder keeps the expand arrow; the real span rows (the
+            // bulk of the model) are built on first expansion.
+            QStandardItem* placeholder = readOnlyItem(QString());
+            placeholder->setData(QVariant::fromValue(fiber.id), kFiberIdRole);
+            placeholder->setData(true, kSpanPlaceholderRole);
+            root->appendRow(placeholder);
         }
 
         _model->appendRow(row);
-        if (_treeView && expandedFibers.find(fiber.id) != expandedFibers.end()) {
+        if (wasExpanded) {
             _treeView->setExpanded(root->index(), true);
         }
+    }
+}
+
+void CFiberWidget::buildSpanChildRows(QStandardItem* root, const FiberEntry& fiber)
+{
+    const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
+    for (const auto& span : fiber.spans) {
+        const QString spanName = tr("span %1  cp %2-%3")
+            .arg(span.spanIndex + 1)
+            .arg(span.firstControlIndex + 1)
+            .arg(span.secondControlIndex + 1);
+        QList<QStandardItem*> childRow{
+            readOnlyItem(spanName),
+            readOnlyItem(directionForFiber(fiber)),
+            readOnlyItem(QString()),
+            readOnlyItem(QString()),
+            readOnlyItem(formatDouble(span.lengthVx, 1)),
+            readOnlyItem(QString::number(span.controlPointCount)),
+            readOnlyItem(QString::number(span.linePointCount)),
+            readOnlyItem(QString()),
+            readOnlyItem(QString(QChar::fromLatin1(span.interpMarker))),
+        };
+        applyRowMetadata(childRow, fiber.id, true, span.alignment, showMetrics);
+        applySpanMetadata(childRow, span.firstControlIndex, span.secondControlIndex);
+        if (!span.fiberManifest.empty()) {
+            childRow[kInterpStatusColumn]->setToolTip(
+                tr("Traced with: %1")
+                    .arg(QString::fromStdString(span.fiberManifest)));
+        }
+        root->appendRow(childRow);
+    }
+}
+
+bool CFiberWidget::spanChildrenArePlaceholder(QStandardItem* root) const
+{
+    if (!root || root->rowCount() != 1) {
+        return false;
+    }
+    QStandardItem* child = root->child(0, kNameColumn);
+    return child && child->data(kSpanPlaceholderRole).toBool();
+}
+
+void CFiberWidget::ensureSpanChildrenBuilt(const QModelIndex& index)
+{
+    if (!_model || !index.isValid()) {
+        return;
+    }
+    QStandardItem* root = _model->itemFromIndex(index.siblingAtColumn(kNameColumn));
+    if (!root || root->parent() || !spanChildrenArePlaceholder(root)) {
+        return;
+    }
+    const uint64_t fiberId = root->data(kFiberIdRole).toULongLong();
+    const auto fiberIt = std::find_if(
+        _fibers.begin(), _fibers.end(),
+        [fiberId](const FiberEntry& fiber) { return fiber.id == fiberId; });
+    root->removeRows(0, 1);
+    if (fiberIt != _fibers.end()) {
+        buildSpanChildRows(root, *fiberIt);
     }
 }
 
@@ -780,6 +834,9 @@ void CFiberWidget::refreshMetricDisplays()
             continue;
         }
         updateMetricDisplayForRow(root, fiber.alignment);
+        if (spanChildrenArePlaceholder(root)) {
+            continue;
+        }
         for (int row = 0; row < root->rowCount() && row < static_cast<int>(fiber.spans.size()); ++row) {
             updateMetricDisplayForRow(root->child(row, kNameColumn),
                                       fiber.spans[static_cast<size_t>(row)].alignment);

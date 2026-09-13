@@ -1,0 +1,16 @@
+diff --git a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
+index 9756b174..48aba63c 100644
+--- a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
++++ b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
+@@ -6882,3 +6882,11 @@ Zuk Z1;4.69
+ Zuk Z2 Pro;4.61
+ Zuk Z2 Rio Edition;4.54
+ Zuk Z2;4.61
++iPhone X;4.8
++Nexus 5X;4.7
++Pixel 3a;5.6448
++Pixel 4a;5.6448
++Pixel 6a;5.6448
++ILCE-6300;23.5
++Chameleon3 CM3-U3-31S4C;7.0656
++Chameleon3 CM3-U3-50S5M;8.4456

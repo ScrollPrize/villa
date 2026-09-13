@@ -40,10 +40,27 @@ constexpr double kEpsilon = 1.0e-12;
     if (itemCount < 2) {
         return 1;
     }
-    const unsigned hardwareThreads = std::thread::hardware_concurrency();
-    const size_t requested = parallelThreads > 0
-        ? static_cast<size_t>(parallelThreads)
-        : (hardwareThreads == 0 ? fallbackWorkers : static_cast<size_t>(hardwareThreads));
+    // Default (parallelThreads <= 0) honors the OpenMP ICV the way
+    // FiberTrace::traceWorkerCount does, instead of hardware_concurrency().
+    // The num_threads clause overrides omp_set_num_threads(1) per region, so
+    // the old default spawned a full-width team PER CALLING THREAD - during a
+    // line solve (up to four calling threads) that oversubscribed every core
+    // and starved the GUI and render pools. The materialize loops are
+    // schedule(static) with per-slot writes, so results are identical at any
+    // width. Callers that measured a benefit can still request more threads
+    // explicitly.
+    size_t requested;
+    if (parallelThreads > 0) {
+        requested = static_cast<size_t>(parallelThreads);
+    } else {
+#ifdef _OPENMP
+        (void)fallbackWorkers;
+        const int ompThreads = omp_get_max_threads();
+        requested = ompThreads > 0 ? static_cast<size_t>(ompThreads) : size_t{1};
+#else
+        requested = std::max<size_t>(1, fallbackWorkers);
+#endif
+    }
     return std::clamp<size_t>(requested, 1, itemCount);
 }
 

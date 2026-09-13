@@ -23,12 +23,12 @@ prizes:
         amount: 50000
       - name: "4th"
         amount: 50000
-  - id: first-letters
+  - id: first-letters-2027
     title: "First Letters"
     amount: 500000
     cadence: "Max 10 scrolls · Deadline June 25th, 2027"
     href: "/prizes#first-letters-prizes"
-    hook: "$50,000 per scroll across the 2027 Grand Prize volumes: uncover 10 letters within a single 4 cm² area."
+    hook: "$50,000 per scroll across the eligible unread scroll volumes: uncover 10 letters within a single 4 cm² area."
   - id: first-title
     title: "PHerc. Paris 4's Title"
     amount: 50000
@@ -89,6 +89,7 @@ prizes:
 </head>
 
 import PrizePoolBanner from '@site/src/components/PrizePoolBanner';
+import EligibleVolumes from '@site/src/components/atlas/EligibleVolumes';
 
 Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us make history!
 
@@ -102,23 +103,7 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 Prizes will be awarded to any team or individual that fully digitally unrolls and makes readable (according to the conditions and requirements specified below) one of the eligible CT scans of carbonized scrolls from Herculaneum:
 
-<details>
-<summary>Eligible scroll volumes (13)</summary>
-
-1. [PHerc. 125](/data_browser/PHerc0125) — [20250720091415-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22125_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-2. [PHerc. 191](/data_browser/PHerc0191) — [20250720024445-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22191_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-3. [PHerc. 211](/data_browser/PHerc0211) — [20250720140115-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22211_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-4. [PHerc. 257](/data_browser/PHerc0257) — [20250720113058-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22257_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-5. [PHerc. 268](/data_browser/PHerc0268) — [20250511054932-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22268_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-6. [PHerc. 358](/data_browser/PHerc0358) — [20250719150703-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22358_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-7. [PHerc. 800](/data_browser/PHerc0800) — [20250510225703-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22800_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-8. [PHerc. 813](/data_browser/PHerc0813) — [20250720160015-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22813_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-9. [PHerc. 826](/data_browser/PHerc0826) — [20250720174915-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22826_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-10. [PHerc. 1203](/data_browser/PHerc1203) — [20250720004030-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221203_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-11. [PHerc. 1218](/data_browser/PHerc1218) — [20250510170249-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221218_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-12. [PHerc. 1447](/data_browser/PHerc1447) — [20250509011039-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221447_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-13. [PHerc. 1545](/data_browser/PHerc1545) — [20250720045926-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221545_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-</details>
+<EligibleVolumes prize="grand-prize-2027" />
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -159,7 +144,7 @@ If you have a qualifying result, submit it for consideration by sending an email
   * Please create a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * Attach your code/video directly to the email, or include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate that the text is not hallucinated — for example by finding plausible text on held-out regions.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
@@ -212,7 +197,11 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 These prizes bridge ink detection on fragments to the much harder problem of reading intact scrolls: we want to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the eligible scroll volumes listed below.** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
+
+Note the eligible set here is larger than the [2027 Grand Prize](#2027-grand-prize) set: it includes every Grand Prize volume plus several additional scrolls where no text has been read yet.
+
+<EligibleVolumes prize="first-letters-2027" />
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -231,7 +220,7 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate that the text is not hallucinated — for example by finding different, plausible letters on a held-out region.
   * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
@@ -243,9 +232,11 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 <details>
 <summary>How to get started</summary>
 
-Here's one way in. This is a suggested path, not a requirement — anything that produces a qualifying image counts.
+**Start here: [From CT Scan to Ancient Text: A First Letters Prize Workflow](https://scrollprize.substack.com/p/from-ct-scan-to-ancient-text-a-first)** — our step-by-step guide to going from a scroll's CT scan to an ink prediction.
 
-1. **Pick a scroll** from the [eligible list](#2027-grand-prize).
+The short version is below. This is a suggested path, not a requirement — anything that produces a qualifying image counts.
+
+1. **Pick a scroll** from the eligible volume list above.
 2. **Open it in VC3D** from the built-in open data catalog, and **grow a segment** on the scroll's recto surface prediction with `Create Segment (GrowPatch)`, refining it by hand where the automatic growth goes wrong. See the [VC3D unwrapping tutorial](/tutorial_VC3D) for opening the catalog and growing patches, and the [segmentation tutorial](/segmentation) for more on growing and manually refining meshes.
 3. **Render** the flattened segment and **run ink detection** on it, following the [ink detection tutorial](/tutorial5).
 4. **Repeat** on other regions (and other scrolls) until you find 10 legible letters within a single 4 cm² area.
@@ -290,7 +281,7 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
 * **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * The larger your model's window size, the easier it is for it to invent plausible letterforms instead of recovering real ink. Large windows are fine, but you must demonstrate the letters and words are not hallucinated — for example by validating on a held-out region with known ground-truth.
   * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
@@ -316,7 +307,7 @@ If you are new to the project, this is a great place to start.
 
 **Best Submission of the Month: <span className="vc-money">\$20,000</span>, guaranteed every month, to the single best submission — selected by the Vesuvius Challenge team.**
 
-Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span> or <span className="vc-money">\$500</span>.
+Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span>, <span className="vc-money">\$500</span> or <span className="vc-money">\$250</span>.
 
 We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
@@ -332,7 +323,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, August 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, September 30th, 2026!
 {/* progress-prizes:deadline:end */}
 
 <details>
@@ -353,7 +344,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
 </details>
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSev2vJobu521iB6OuyehDktzYTEo131F4iUGwt3Qxa9a1fk6A/viewform)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLScNBMj25FMnphngRG1Ciryv_2_Mkdq2YPJOD9WqPfZExII2iQ/viewform)
 {/* progress-prizes:form:end */}
 
 ***

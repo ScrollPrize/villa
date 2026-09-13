@@ -41,6 +41,16 @@ TEST_CASE("Rect3D default-construction is zero box")
     CHECK(r.high == cv::Vec3f(0, 0, 0));
 }
 
+TEST_CASE("Rect3D containment is inclusive in base XYZ")
+{
+    const Rect3D bounds{{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}};
+    CHECK(contains_point(bounds, cv::Vec3f(1.0f, 2.0f, 3.0f)));
+    CHECK(contains_point(bounds, cv::Vec3d(4.0, 5.0, 6.0)));
+    CHECK(contains_point(bounds, cv::Vec3d(2.5, 3.5, 4.5)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3f(0.99f, 3.0f, 4.0f)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3d(2.0, 5.01, 4.0)));
+}
+
 TEST_CASE("expand_rect grows box to include a new point")
 {
     Rect3D a;
@@ -178,6 +188,51 @@ TEST_CASE("surface/grid conversion and sampling use one exact affine convention"
     CHECK(surface.sampleAtSurface(nearEdge));
     const cv::Vec2d outside = surface.gridToSurface({3.0 + 2e-6, 2.0});
     CHECK_FALSE(surface.sampleAtSurface(outside));
+}
+
+TEST_CASE("shiftSurfaceOrigin moves content by -delta in every surface mapping")
+{
+    cv::Mat_<cv::Vec3f> points(3, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(
+                100.0f + 2.0f * col + 3.0f * row,
+                200.0f - 4.0f * col + 5.0f * row,
+                300.0f + 7.0f * col - 2.0f * row);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(2.0f, 4.0f));
+    const cv::Vec2d grid(1.25, 0.5);
+    const cv::Vec2d before = surface.gridToSurface(grid);
+    const cv::Vec3f volumeBefore = surface.sampleAtSurface(before).volume;
+
+    const cv::Vec2d delta(0.75, -0.25);
+    surface.shiftSurfaceOrigin(delta);
+
+    // The same grid sample is now addressed by (before - delta)...
+    const cv::Vec2d after = surface.gridToSurface(grid);
+    CHECK(after[0] == doctest::Approx(before[0] - delta[0]).epsilon(1e-6));
+    CHECK(after[1] == doctest::Approx(before[1] - delta[1]).epsilon(1e-6));
+    // ...and the shifted address samples the identical content, through the
+    // surface path and the ptr path (coord), which must stay in agreement.
+    const auto sample = surface.sampleAtSurface(after);
+    REQUIRE(sample);
+    CHECK(sample.volume[0] == doctest::Approx(volumeBefore[0]));
+    CHECK(sample.volume[1] == doctest::Approx(volumeBefore[1]));
+    CHECK(sample.volume[2] == doctest::Approx(volumeBefore[2]));
+    const cv::Vec3f ptr(static_cast<float>(after[0] * 2.0f),
+                        static_cast<float>(after[1] * 4.0f),
+                        0.0f);
+    const cv::Vec3f viaPtr = surface.coord(ptr);
+    CHECK(viaPtr[0] == doctest::Approx(volumeBefore[0]).epsilon(1e-4));
+    CHECK(viaPtr[1] == doctest::Approx(volumeBefore[1]).epsilon(1e-4));
+    CHECK(viaPtr[2] == doctest::Approx(volumeBefore[2]).epsilon(1e-4));
+
+    // Non-finite deltas are ignored.
+    surface.shiftSurfaceOrigin({std::numeric_limits<double>::quiet_NaN(), 0.0});
+    const cv::Vec2d unchanged = surface.gridToSurface(grid);
+    CHECK(unchanged[0] == doctest::Approx(after[0]));
+    CHECK(unchanged[1] == doctest::Approx(after[1]));
 }
 
 TEST_CASE("surface sampling rejects any location owned by an invalid quad")

@@ -1,5 +1,6 @@
 {
 "input_use_pcl_drawn_control_points": false,
+"input_use_tracks": false,
 "z_begin": 8500,
 "z_end": 17000,
 "dense_spacing_mode": "winding_model",

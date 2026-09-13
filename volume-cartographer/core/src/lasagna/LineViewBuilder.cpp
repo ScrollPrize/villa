@@ -82,7 +82,7 @@ std::vector<double> crossOffsets()
     const int center = kLineViewCrossSampleCount / 2;
     for (int i = 0; i < kLineViewCrossSampleCount; ++i) {
         offsets.push_back(
-            static_cast<double>(i - center) * kLineViewSamplingDistanceBaseVoxels);
+            static_cast<double>(i - center) * kLineViewCrossRowSpacingBaseVoxels);
     }
     return offsets;
 }
@@ -915,25 +915,29 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
                                        fixedCrossOffsets,
                                        ribbonFrames,
                                        positionMap.stripGridSpacingBaseVoxels,
-                                       kLineViewSamplingDistanceBaseVoxels,
+                                       kLineViewCrossRowSpacingBaseVoxels,
                                        true);
     surfaces.lineSideSlice = buildRibbon(ribbonSamples,
                                          fixedCrossOffsets,
                                          ribbonFrames,
                                          positionMap.stripGridSpacingBaseVoxels,
-                                         kLineViewSamplingDistanceBaseVoxels,
+                                         kLineViewCrossRowSpacingBaseVoxels,
                                          false);
     surfaces.stripPositionMap = positionMap;
 
-    surfaces.lineZSlices.reserve(line.points.size());
+    if (config.buildLineZSlices) {
+        surfaces.lineZSlices.reserve(line.points.size());
+    }
     surfaces.lineUpVectors.reserve(line.points.size());
     for (size_t i = 0; i < line.points.size(); ++i) {
-        const cv::Vec3f origin = toVec3f(line.points[i].position);
-        const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
         const cv::Vec3f up = toVec3f(frameData.transportedUpVectors[i]);
-        auto plane = std::make_shared<PlaneSurface>();
-        plane->setFromNormalAndUp(origin, tangent, up);
-        surfaces.lineZSlices.push_back(std::move(plane));
+        if (config.buildLineZSlices) {
+            const cv::Vec3f origin = toVec3f(line.points[i].position);
+            const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
+            auto plane = std::make_shared<PlaneSurface>();
+            plane->setFromNormalAndUp(origin, tangent, up);
+            surfaces.lineZSlices.push_back(std::move(plane));
+        }
         surfaces.lineUpVectors.push_back(up);
     }
     return surfaces;

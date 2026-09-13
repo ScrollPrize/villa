@@ -56,9 +56,11 @@ static std::shared_ptr<Volume> New(std::filesystem::path path,
 // Open a remote HTTP or s3:// zarr volume. s3:// URLs are resolved to HTTPS.
 static std::shared_ptr<Volume> NewFromUrl(
     const std::string& url,
-    const std::filesystem::path& cacheRoot = {},
     const vc::HttpAuth& auth = {});
 ```
+
+Remote volumes always use the process-wide remote cache root configured by
+VC3D.
 
 `New(path, options)` creates a local zarr pyramid when `path` has no existing
 zarr array, or when `options.overwriteExisting` is true. Existing volumes are
@@ -407,9 +409,8 @@ volume->updateMetadata(patch);
   using power-of-two level indices, with limited per-level padding tolerance.
 - Local zarr arrays may be stored as scale directories (`0`, `1`, `2`, ...)
   or as a root array for level 0.
-- Remote `s3://` URLs are resolved to HTTPS. AWS SigV4 credentials are used
-  when available, with anonymous fallback for public buckets if stale
-  credentials are rejected.
+- Remote `s3://` URLs are resolved to HTTPS and opened anonymously first. AWS
+  SigV4 credentials are used when anonymous access is denied.
 - `processChunkCacheService()` retains regular source state for the process.
   Capacity and concurrency changes preserve source identity and all
   queued/running work. A capacity reduction evicts globally oldest decoded

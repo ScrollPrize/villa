@@ -1,35 +1,30 @@
-# VC3D render attribution and lookup performance repair
+# Public S3 Lasagna authentication fallback
 
-Repair the synthetic rendering performance gate before re-enabling it, then
-recover the lookup performance lost around the render-order changes.
+Fix manual remote Lasagna attachment when ambient AWS credentials are stale or
+malformed but the requested S3 manifest and Zarr objects are publicly readable.
 
-Priorities:
+The observed real-data failure uses the public PHerc0139 fiber-inference
+manifest at:
 
-1. Correct and stabilize the passive Valgrind attribution. Collect periodic
-   Callgrind cost slices and a DRD dependency graph from separate executions
-   with identical Valgrind scheduling parameters. Reconstruct logical worker
-   traces canonically instead of equating raw worker IDs, trim DRD to the same
-   existing timed render boundary, and reject any pair whose logical pattern is
-   ambiguous or not reproducible. The measured binary must remain unchanged:
-   no markers, affinity mode, deterministic executor, or added instructions.
-2. Measure and repair renderer lookup speed using the commit immediately before
-   `Vc3d renderorder` and the current implementation as an A/B case. Preserve
-   rendered bytes, fallback behavior, request priority, and scheduling
-   semantics.
+```text
+s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/fibers/20260102150214-fibers-20260801084232-L1/PHerc0139-20260102150214-las-sd1-92481a4c.lasagna.json
+```
 
-Speed investigation requirements:
+Both that locator and its virtual-hosted HTTPS equivalent are recognized as S3.
+The previous implementation signed them whenever ambient credentials existed,
+causing public access to fail with `InvalidToken` before anonymous access was
+attempted.
 
-- Treat `ChunkRequestContext` as render-job-constant; verify and exploit that
-  without changing request publication semantics.
-- Investigate a prepared/source-bound key lookup path so level, source, and
-  request information are not repeatedly assembled in the hot lookup.
-- Avoid rebuilding and probing a full key when a correlated sample remains in
-  the same successfully resolved chunk.
-- Account for the existing `LocalChunkCache`: it already retains the last key
-  and result and up to eight pinned chunks. Do not duplicate that cache under a
-  different name; improve the work that happens before it can identify a hit.
-- Establish repeatable before/after Release measurements and verify exact output
-  checksums before accepting any optimization.
+Required behavior:
 
-The Valgrind attribution repair is first. Lookup optimization remains planned
-until the gate can produce stable, semantically valid scores.
+- Keep authenticated access for private S3 data.
+- Attempt S3 data anonymously first and use credentials only when anonymous
+  access is denied.
+- Once Lasagna's remote Zarr store proves anonymous access works, keep using
+  anonymous requests for that store.
+- Apply the same behavior to `s3://`, region-qualified S3, and recognized S3
+  HTTPS endpoints.
+- Do not select or change a sticky mode after unrelated HTTP, transport,
+  server, or not-found failures.
+- Preserve remote source identity, cache paths, exact bytes, and project
+  serialization.

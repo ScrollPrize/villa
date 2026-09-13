@@ -134,10 +134,11 @@ def run_worker(argv):
     # nnU-Net was written assuming the fork start method; Python 3.14 defaults to
     # forkserver, which re-imports the main module in every pool worker (slow, and it
     # trips over non-file mains). Force fork to restore the behaviour nnU-Net expects.
-    try:
+    # Ask only where fork exists. set_start_method(force=True) cannot raise
+    # RuntimeError -- force=True guards that arm out -- and on a fork-less
+    # platform get_context raises ValueError, which the old guard let through.
+    if 'fork' in multiprocessing.get_all_start_methods():
         multiprocessing.set_start_method('fork', force=True)
-    except RuntimeError:
-        pass
 
     set_nnunet_env()
     import torch

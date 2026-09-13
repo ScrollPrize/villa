@@ -1,4 +1,5 @@
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 
 #include <utils/http_fetch.hpp>
 
@@ -25,16 +26,19 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     return utils::HttpClient(std::move(cfg));
 }
 
-bool isAuthError(long status, const std::string& body)
+// Binary payloads (100+ MB mesh bands) can legitimately take minutes or hours
+// while still making progress. Use a connection timeout plus curl's low-speed
+// policy instead of imposing a hard wall-clock deadline on the transfer.
+utils::HttpClient makeBinaryClient(const HttpAuth& auth)
 {
-    if (status == 401 || status == 403)
-        return true;
-    return body.find("ExpiredToken") != std::string::npos ||
-           body.find("AccessDenied") != std::string::npos ||
-           body.find("InvalidAccessKeyId") != std::string::npos ||
-           body.find("SignatureDoesNotMatch") != std::string::npos ||
-           body.find("TokenRefreshRequired") != std::string::npos ||
-           body.find("InvalidToken") != std::string::npos;
+    utils::HttpClient::Config cfg;
+    cfg.aws_auth = auth;
+    cfg.transfer_timeout = std::chrono::seconds{0};
+    cfg.connect_timeout = std::chrono::seconds{5};
+    cfg.low_speed_limit_bytes_per_second = 1;
+    cfg.low_speed_time = std::chrono::seconds{10};
+    cfg.max_retries = 2;
+    return utils::HttpClient(std::move(cfg));
 }
 
 std::string authErrorMessage(long status, const std::string& body)
@@ -104,7 +108,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());
-        if (isAuthError(resp.status_code, body))
+        if (isAwsAuthenticationFailure(resp.status_code, body))
             throw std::runtime_error(authErrorMessage(resp.status_code, body));
         if (resp.status_code >= 500) {
             throw std::runtime_error(
@@ -116,7 +120,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 
 std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth)
 {
-    auto client = makeTextClient(auth);
+    auto client = makeBinaryClient(auth);
     auto resp = client.get(url);
     if (resp.ok()) {
         return std::move(resp.body);
@@ -124,12 +128,16 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
 
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());
-        if (isAuthError(resp.status_code, body))
+        if (isAwsAuthenticationFailure(resp.status_code, body))
             throw std::runtime_error(authErrorMessage(resp.status_code, body));
         if (resp.status_code >= 500) {
             throw std::runtime_error(
                 "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
         }
+    }
+    if (resp.status_code == 0 && !resp.error_message.empty()) {
+        throw std::runtime_error(
+            "HTTP transport error fetching " + url + ": " + resp.error_message);
     }
     return {};
 }

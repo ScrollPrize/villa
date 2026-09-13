@@ -862,6 +862,20 @@ def save_overlay_and_print_satisfaction(
     total_area = float(total_areas.sum().item())
     satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
     print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+    satisfaction_summary = {
+        'satisfied_patches': int(satisfied_count),
+        'total_patches': int(total_count),
+        'satisfied_patches_fraction': satisfied_ratio,
+        'satisfied_patches_area': satisfied_patches_area,
+        'all_patches_area': all_patches_area,
+        'satisfied_patches_area_weighted_fraction': area_weighted_satisfied_ratio,
+        'boundary_satisfied_patches': int(boundary_satisfied_count),
+        'boundary_total_patches': int(total_count),
+        'boundary_satisfied_patches_fraction': boundary_satisfied_ratio,
+        'satisfied_area': satisfied_area,
+        'total_area': total_area,
+        'satisfied_area_fraction': satisfied_area_ratio,
+    }
     unattached_pcl_per_point_satisfied = []
     unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
     if unattached_pcl_strips:
@@ -881,6 +895,14 @@ def save_overlay_and_print_satisfaction(
         total_points = int(unattached_pcl_total_counts.sum().item())
         satisfied_point_ratio = satisfied_points / max(total_points, 1)
         print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
+        satisfaction_summary.update({
+            'satisfied_unattached_pcls': fully_satisfied_pcls,
+            'total_unattached_pcls': num_pcls,
+            'satisfied_unattached_pcls_fraction': fully_satisfied_ratio,
+            'satisfied_unattached_pcl_points': satisfied_points,
+            'total_unattached_pcl_points': total_points,
+            'satisfied_unattached_pcl_points_fraction': satisfied_point_ratio,
+        })
     if tracks:
         # Free the patch/pcl eval tensors before the (much larger) track eval,
         # and chunk the track eval so the full track set does not have to be
@@ -906,6 +928,14 @@ def save_overlay_and_print_satisfaction(
             track_total_points = int(track_total_counts.sum().item())
             track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
             print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+            satisfaction_summary.update({
+                'satisfied_tracks': fully_satisfied_tracks,
+                'total_tracks': num_valid_tracks,
+                'satisfied_tracks_fraction': fully_satisfied_track_ratio,
+                'satisfied_track_points': track_satisfied_points,
+                'total_track_points': track_total_points,
+                'satisfied_track_points_fraction': track_satisfied_point_ratio,
+            })
         except torch.OutOfMemoryError:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -930,6 +960,14 @@ def save_overlay_and_print_satisfaction(
         u_tot_area = float(u_tot_areas.sum().item())
         u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
         print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
+        satisfaction_summary.update({
+            'unverified_satisfied_patches': u_count,
+            'unverified_total_patches': u_total,
+            'unverified_satisfied_patches_fraction': u_ratio,
+            'unverified_satisfied_area': u_sat_area,
+            'unverified_total_area': u_tot_area,
+            'unverified_satisfied_area_fraction': u_area_ratio,
+        })
         for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
             fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
             unverified_patch_satisfaction_entries.append({
@@ -972,6 +1010,8 @@ def save_overlay_and_print_satisfaction(
             'pcls': pcl_satisfaction_entries,
             'unverified_patches': unverified_patch_satisfaction_entries,
         }, f, indent=2)
+    with open(f'{out_path}/satisfaction_metrics_{suffix}.json', 'w') as f:
+        json.dump({'summary': satisfaction_summary}, f, indent=2)
     need_overlay = (save_png_visualizations
                     and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1')
     need_mesh = os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1'

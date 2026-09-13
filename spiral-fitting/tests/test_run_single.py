@@ -446,6 +446,13 @@ def _fake_pipeline_subprocess(calls, *, fail_seed=None):
                 raise subprocess.CalledProcessError(1, command)
             fitted = output / "generated" / "meshes" / "fitted-result"
             fitted.mkdir(parents=True)
+            _write_json(
+                output / "generated" / run_single.SATISFACTION_METRICS_FILENAME,
+                {"summary": {
+                    "satisfied_area_fraction": seed / 10,
+                    "non_numeric_note": "ignored",
+                }},
+            )
             Path(env["FIT_SPIRAL_METRICS_HISTORY"]).write_text(
                 json.dumps({"iteration": 0, "metrics": {"loss": seed + 1}}) + "\n")
         elif script == "get_ink_metrics.py":
@@ -562,6 +569,11 @@ def test_seeded_run_is_sequential_and_overrides_config_seed(tmp_path, monkeypatc
         "mean": 3.0, "stddev": 1.0, "count": 2}
     assert aggregate["final"]["score"] == {
         "mean": 4.0, "stddev": 2.0, "count": 2}
+    satisfaction = aggregate["final"][
+        "satisfaction/satisfied_area_fraction"]
+    assert satisfaction["mean"] == pytest.approx(0.2)
+    assert satisfaction["stddev"] == pytest.approx(0.1)
+    assert satisfaction["count"] == 2
 
 
 def test_seeded_run_fails_fast_without_aggregate(tmp_path, monkeypatch):
@@ -593,6 +605,7 @@ def test_one_seed_has_no_aggregate_and_logs_final(tmp_path, monkeypatch):
     run_single.run(args)
 
     assert logged[0][0]["score"] == 14
+    assert logged[0][0]["satisfaction/satisfied_area_fraction"] == 0.7
     assert logged[0][1]["seed_run_id"] == "batch_seed_7"
     assert not (tmp_path / "output" / "aggregate_metrics.json").exists()
 
@@ -667,7 +680,11 @@ def test_aggregate_wandb_logs_only_complete_means(monkeypatch):
             "loss": {"mean": 2.0, "stddev": 1.0, "count": 2},
             "partial": {"mean": 4.0, "stddev": 0.0, "count": 1},
         }}],
-        {"score": {"mean": 6.0, "stddev": 2.0, "count": 2}},
+        {
+            "score": {"mean": 6.0, "stddev": 2.0, "count": 2},
+            "satisfaction/satisfied_area_fraction": {
+                "mean": 0.75, "stddev": 0.05, "count": 2},
+        },
         seed_count=2, project="project", entity="entity",
         aggregate_run_id="batch_aggregate", group="batch")
 
@@ -676,7 +693,10 @@ def test_aggregate_wandb_logs_only_complete_means(monkeypatch):
     assert init_calls[0]["group"] == "batch"
     assert fake_run.log_calls == [
         ({"loss": 2.0}, {"step": 200}),
-        ({"final/score": 6.0}, {}),
+        ({
+            "final/score": 6.0,
+            "final/satisfaction/satisfied_area_fraction": 0.75,
+        }, {}),
     ]
 
 
@@ -701,14 +721,65 @@ def test_seed_final_wandb_retries_until_training_run_is_released(monkeypatch):
     monkeypatch.setattr(run_single.time, "sleep", sleeps.append)
 
     uploaded = run_single.log_seed_final_metrics(
-        {"score": 4, "path": "/not/numeric"}, project="project",
+        {"score": 4, "satisfaction/satisfied_area_fraction": 0.75,
+         "path": "/not/numeric"}, project="project",
         entity="entity", seed_run_id="batch_seed_1")
 
     assert uploaded is True
     assert len(attempts) == 3
     assert sleeps == list(run_single._WANDB_IN_USE_RETRY_DELAYS[:2])
-    assert fake_run.log_calls == [{"final/score": 4}]
+    assert fake_run.log_calls == [{
+        "final/score": 4,
+        "final/satisfaction/satisfied_area_fraction": 0.75,
+    }]
     assert fake_run.finish_calls == 1
+
+
+def test_rendered_ink_preview_uses_one_scale_and_joins_full_lasagna(
+    tmp_path, monkeypatch
+):
+    from PIL import Image
+
+    ink = tmp_path / "ink"
+    ink.mkdir()
+    Image.new("L", (8, 4), color=64).save(ink / "render.000.jpg")
+    Image.new("L", (4, 4), color=192).save(ink / "render.001.jpg")
+    monkeypatch.setattr(run_single, "_FULL_LASAGNA_PREVIEW_MAX_WIDTH", 6)
+
+    preview = run_single._build_rendered_ink_preview(ink)
+    try:
+        assert preview.mode == "L"
+        assert preview.size == (6, 2)
+    finally:
+        preview.close()
+
+
+def test_seed_final_wandb_logs_and_closes_rendered_ink(monkeypatch, tmp_path):
+    fake_run = SimpleNamespace(log_calls=[])
+    fake_run.log = fake_run.log_calls.append
+    fake_run.finish = lambda: None
+    monkeypatch.setattr(run_single, "_wandb_init", lambda **_kwargs: fake_run)
+    preview = SimpleNamespace(closed=False)
+    preview.close = lambda: setattr(preview, "closed", True)
+    ink_dir = tmp_path / "ink"
+    monkeypatch.setattr(
+        run_single, "_build_rendered_ink_preview",
+        lambda path: preview if path == ink_dir else pytest.fail("wrong ink dir"))
+    monkeypatch.setattr(
+        run_single, "_wandb_image",
+        lambda image, **kwargs: (image, kwargs["caption"]))
+
+    uploaded = run_single.log_seed_final_metrics(
+        {"score": 4}, project="project", entity="entity",
+        seed_run_id="batch_seed_1", ink_dir=ink_dir)
+
+    assert uploaded is True
+    assert fake_run.log_calls == [{
+        "final/score": 4,
+        "final/rendered_ink_full_lasagna": (
+            preview, "Full Lasagna-flattened rendered ink panorama"),
+    }]
+    assert preview.closed is True
 
 
 def test_seed_final_wandb_failure_does_not_fail_pipeline(monkeypatch, capsys):

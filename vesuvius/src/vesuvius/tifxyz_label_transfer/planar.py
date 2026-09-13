@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from .core import (
     Surface,
     SurfaceMapper,
-    estimate_surface_spacing,
+    automatic_max_distance,
     infer_output_shape,
 )
 
@@ -47,9 +47,7 @@ def fit_planar_label_transform(
         np.eye(4, dtype=np.float64) if affine is None else affine
     )
     if max_distance is None:
-        source_spacing = estimate_surface_spacing(source, effective_affine)
-        target_spacing = estimate_surface_spacing(target)
-        max_distance = max(1e-3, 0.75 * min(source_spacing, target_spacing))
+        max_distance = automatic_max_distance(target)
     if not math.isfinite(max_distance) or max_distance <= 0:
         raise ValueError(f"max_distance must be positive; got {max_distance}")
     if sample_vertices < 3:
@@ -213,10 +211,8 @@ def transfer_array_planar(
         vertex_index=vertex_index,
         sample_vertices=sample_vertices,
     )
-    # Block-wise floor warp, matching transfer_array's floor-of-continuous
-    # label sampling. Flooring the corner-frame coordinate keeps boundary
-    # pixels stable where a rounded centre-frame coordinate would sit on a
-    # knife edge at exactly 0 or size-1.
+    # Match transfer_array's floor sampling in corner coordinates to avoid
+    # rounding instability at image boundaries.
     label_height, label_width = label.shape
     column_indices = np.arange(resolved_shape[1], dtype=np.float64)[None, :]
     block_rows = max(1, min(resolved_shape[0], 1024))

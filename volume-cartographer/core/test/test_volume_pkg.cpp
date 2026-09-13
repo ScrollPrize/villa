@@ -794,7 +794,7 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:old"}, true, oldAttachments) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(
-        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments, {}, true, true, {"model:"}) ==
+        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments, true, true, {"model:"}) ==
         VolumePkg::AttachLasagnaResult::Attached);
 
     REQUIRE(pkg->lasagnaDatasetEntries().size() == 1);

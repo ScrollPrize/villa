@@ -1,196 +1,73 @@
-# VC3D render attribution and lookup repair task log
+# Public S3 Lasagna authentication fallback task log
 
-## 2026-08-18 findings
+## 2026-08-27 findings
 
-- The frozen reference predates `81f6a8ffb` (`Vc3d renderorder`). Its parent
-  passed the gate and the squash commit failed it. The later
-  `QuadSurface::gen()` optimization cannot be the original trigger because the
-  synthetic fixture calls `ChunkedPlaneSampler` directly.
-- Callgrind and DRD are necessarily collected in separate Valgrind processes.
-  Current evaluation passes per-thread Callgrind costs directly to a DRD graph
-  under the same raw Valgrind IDs. Worker participation and executed work are
-  not stable identities across those executions.
-- `Graph::assignCosts()` iterates DRD threads. It fails when a DRD thread lacks
-  a same-numbered Callgrind profile, but does not reject extra Callgrind thread
-  costs. A Callgrind-only worker cost can therefore be silently omitted from the
-  replay.
-- Every CI case currently uses one Callgrind execution and one first-complete
-  DRD execution. No median or repeated-trace aggregation protects the parallel
-  score from attribution/scheduling variation.
-- The event-cost model contains nonlinear interaction features. Each Callgrind
-  thread must continue to be modeled independently before worker costs are
-  summed; summing raw counters first changes the modeled total.
-- Periodic Callgrind dumps at 10,000 basic blocks produce chronological,
-  separate-thread delta profiles without changing the benchmark binary.
-- Three repeated `parallel/full_res` DRD runs had the same measured render
-  structure: seven main quanta and sixteen quanta on each of four workers. One
-  whole-process trace differed by one unrelated main-thread quantum, confirming
-  that the graph must be trimmed to the measured render.
-- The existing benchmark timing calls appear passively in the DRD syscall log.
-  The measured render is the unique pair of main-thread `clock_gettime` calls
-  sharing a stack address. This provides boundaries without markers.
-- Fair-scheduled `mixed_correlated` Callgrind runs execute one logical range per
-  worker, but physical IDs vary. Their canonical worker instruction totals are
-  stable at approximately 13.38M, 13.38M, 14.53M, and 16.17M. Independent DRD
-  runs produce corresponding measured worker lengths of 36/37, 36, 40, and 44
-  quanta. Rank matching is therefore viable; the two shortest ranges are an
-  equivalent tie.
-- `--fair-sched=no` is unsuitable: one physical worker may execute multiple
-  logical ranges while another remains effectively idle.
-- Reducing the fair-scheduled quantum from 10,000 to 1,000 basic blocks does
-  not stabilize raw worker IDs. Physical IDs are therefore never a valid
-  cross-run identity, regardless of quantum.
-- A three-run, four-scenario passive matrix with the unmodified release binary
-  validated canonical reconstruction:
+- The public PHerc0139 manifest returns HTTP 200 to an unsigned request.
+- `resolveRemoteUrl()` intentionally classifies both `s3://` locators and
+  virtual-hosted `*.s3.amazonaws.com` HTTPS URLs as S3. Changing between those
+  forms therefore does not bypass signing.
+- Manual remote Lasagna attachment loads ambient AWS credentials before opening
+  the manifest. The observed credentials contain a rejected session token.
+- `RemoteFileCache` performs one credentialed request and reports
+  `InvalidToken`; it has no anonymous retry.
+- The ordinary remote Zarr opener already retries anonymously after a rejected
+  credentialed open.
+- Lasagna uses a separate exact-byte remote Zarr store. It also builds one
+  credentialed client and currently has no anonymous fallback for descriptor or
+  chunk reads.
+- Open-data catalogue Lasagna preparation avoids this failure by explicitly
+  disabling credential discovery, but manually attached manifests do not carry
+  that public-data knowledge.
+- A path-style `https://s3.amazonaws.com/<bucket>/<key>` locator works as an
+  immediate workaround because the current resolver does not classify that
+  hostname as S3, but it is not an acceptable permanent requirement.
 
-  | Scenario | Canonical worker `Ir` stability | DRD measured quanta | Worst 32-bin cost-shape delta |
-  | --- | ---: | --- | ---: |
-  | `full_res` | 0.29% | `16,16,16,16` | 0.23% |
-  | `fallback_3` | 0.74% | `56,57,62,71` | 0.36% |
-  | `mixed_correlated` | 0.48% | `36,36,40,44` | 0.37% |
-  | `mixed_shuffled` | 0.08% | `77,77,78,78` | 0.03% |
+## 2026-08-28 review follow-up
 
-- Replaying every admissible mapping inside equal-quantum groups bounded the
-  remaining identity ambiguity at 0.90% makespan for `full_res`, 0.11% for
-  `mixed_shuffled`, and 0% for `fallback_3` and `mixed_correlated`. The gate can
-  conservatively report the maximum mapping when a tie is equivalent instead
-  of selecting an arbitrary worker.
-- The passive task-start order is not sufficient to identify FIFO task order:
-  multiple workers can dequeue inside one periodic Callgrind interval. Matching
-  must use complete canonical workload signatures and enumerate equivalent
-  ties, not first-observed worker order.
+- Signed-first fallback scanned successful response bodies for AWS error words,
+  so private content containing a marker could be discarded.
+- S3 HEAD responses carry no error body. A stale session token therefore
+  produced an unclassified empty HTTP 400 before a fresh remote Zarr could open.
+- Anonymous-first access avoids both ambiguities: public data never uses ambient
+  credentials, while anonymous 401/403 responses still fall back to private
+  authenticated access.
+- A not-found or unrelated failure does not select a sticky mode. Concurrent
+  initial requests share one probe, and a later anonymous denial can upgrade a
+  mixed-access store.
 
-## Attribution options
+## Implementation result
 
-### A. Main/worker role pooling (recommended first)
+- `S3AuthFallback` now performs one synchronized anonymous-first probe while
+  retaining stable anonymous and authenticated HTTP clients.
+- Anonymous 2xx responses make anonymous mode sticky. Anonymous 401/403
+  responses retry with credentials, and authenticated 2xx/404 responses retain
+  authenticated mode. Other failures leave the mode undecided.
+- `RemoteFileCache` applies the policy to remote manifest GETs and preserves
+  both anonymous and authenticated status in diagnostics when both fail.
+- Lasagna's exact-byte remote Zarr store applies the policy to HEAD and GET
+  requests, so descriptor validation and later chunk reads share the selected
+  mode without changing cached bytes or source identity.
+- Ordinary remote Zarr opening now attempts the complete anonymous open before
+  retrying with credentials. Optional metadata 403s remain ignorable for
+  least-privilege stores; if discovery then finds no required array metadata,
+  the remembered denial triggers authenticated retry.
+- Successful responses are never classified from their content.
 
-Keep thread 1 as the stable process-main role. Sum independently modeled
-non-main Callgrind costs, then distribute that complete worker-pool cost over
-all eligible non-main DRD work windows using the existing quantum/residual
-weights. This removes invented worker identity, accepts different worker sets,
-preserves total modeled work, and remains completely passive. DRD event thread
-IDs are retained, so worker program order, blocking, wakeups, and cross-thread
-dependencies continue to determine replay makespan; only cross-process cost
-identity is pooled.
+## Validation
 
-Tradeoff: per-worker Callgrind imbalance is deliberately discarded. DRD still
-supplies worker participation, dependencies, blocking, and available work
-windows. This is appropriate unless repeated tests show that worker-cost
-imbalance itself carries necessary predictive information.
-
-### B. Worker-cost permutation ensemble
-
-Treat Callgrind worker costs and DRD worker schedules as unlabeled multisets.
-Evaluate all worker assignments (small for the configured four workers) and use
-the median while reporting min/max bounds. This preserves measured imbalance
-without claiming IDs correspond.
-
-Tradeoff: differing worker participation requires zero-padding or pooling, and
-the selected statistic is less directly interpretable. The worst-case bound is
-likely too pessimistic for a regression gate. Keep this as a diagnostic or a
-fallback if role pooling loses important behavior.
-
-### C. Repeated independent trace ensemble
-
-Collect several complete Callgrind/DRD samples and gate a median role-pooled
-score. This addresses residual variation in synchronization outcomes and cache
-simulation.
-
-Tradeoff: it multiplies the expensive Valgrind portion of CI and does not by
-itself repair invalid raw-ID attribution. Consider it only after option A and
-prefer repeating DRD alone if Callgrind total work proves stable.
-
-### D. Deterministic benchmark scheduling or explicit task markers
-
-Force task-to-worker assignment or add logical phase/task events so profiles
-can be paired exactly.
-
-Rejected as the primary solution: it changes or instruments the renderer being
-measured, stops being passive, and can hide the scheduling regressions the gate
-is meant to detect.
-
-### E. Aggregate work divided by configured worker count
-
-Discard DRD and derive runtime from total modeled work plus a fixed parallelism
-factor.
-
-Rejected: it cannot see startup, blocking, synchronization, or lost
-parallelism, which are central requirements of this benchmark.
-
-## Speed notes for phase 2
-
-- `PendingRenderJob.chunkRequest` is created once from view ID plus render
-  request ID. `renderFrame()` copies it into base/overlay sampling options, and
-  all sampling calls in that job reuse it. The request is therefore constant
-  per render job, but not across jobs or request-ID changes.
-- `LevelAccess` already hoists shape, chunk shape, transform, dtype/fill, and
-  level validity once per sampled level.
-- `LocalChunkCache` already has a same-key `lastResult` fast path and pins up to
-  eight chunk results. A repeated successful chunk does not invoke
-  `IChunkedArray::tryGetChunk()` again within that local sampler cache. Separate
-  tile/level sampling contexts do not share this local hit state.
-- The caller still computes voxel-to-chunk integer divisions and assembles a
-  `ChunkKey` before `LocalChunkCache` can detect that hit. A successful-chunk
-  cursor with cached voxel bounds can bypass both for correlated samples.
-- Production `ChunkCache` directly overrides contextual `tryGetChunk()`. The
-  synthetic fixture overrides only the compatibility overload, so its measured
-  path currently includes an extra virtual forwarding call that production
-  rendering does not.
-- `ChunkCache::tryGetChunk()` reloads shared state, appends source ID to a new
-  full key, and acquires the cache mutex for each local-cache miss. A prepared
-  source/request/level lookup handle may remove repeated setup, but should be
-  attempted only if profiles still identify this path after the cursor/local
-  cache improvements.
-
-## Current decision
-
-Prototype deterministic paired reconstruction instead of role pooling. Keep the
-measured program unchanged and reject ambiguous pairings. Use role pooling only
-as a diagnostic baseline. Do not update the reference or tolerance yet. Defer
-speed implementation until attribution is correct enough to evaluate it, while
-retaining the pre/post render-order commits as the A/B workload.
-
-The no-code-change feasibility prototype passed. Production wiring may change
-collector/parser/replay tooling, but must not modify or instrument the measured
-renderer, benchmark, thread pool, or workload. Equivalent tie groups should be
-enumerated and scored conservatively; non-equivalent ambiguous groups fail.
-
-## Native implementation result
-
-- The regular Ninja estimate now invokes Valgrind directly and runs raw
-  Callgrind parsing, measured-window DRD parsing, canonical matching,
-  chronological attribution, conservative replay, reference comparison, and
-  JSON output in C++. Python is not in the evaluation path.
-- The measured renderer, benchmark, thread pool, and workload were not changed.
-- A fresh current-build parallel matrix produced these conservative scores:
-
-  | Scenario | Score (ns/call) | Mappings | Best-to-worst mapping span |
-  | --- | ---: | ---: | ---: |
-  | `full_res` | 917,189 | 24 | 0.87% |
-  | `fallback_3` | 2,515,155 | 2 | 0.12% |
-  | `mixed_correlated` | 1,700,855 | 2 | 0.00% |
-  | `mixed_shuffled` | 3,155,879 | 2 | 0.02% |
-
-- Three additional sequential fresh `parallel/full_res` pairs scored 917,333,
-  917,297, and 917,304 ns/call. The full range is 0.004%, confirming that the
-  paired estimate is stable on the current binary.
-- A fresh tied `full_res` group had 2.38% total modeled-cost spread but only
-  0.22% normalized chronological-shape spread. The predeclared native gates are
-  therefore separate: 5% total cost and 2% 32-bin shape. Every passing tie is
-  still fully enumerated and scored by its maximum makespan.
-
-## Scheduler-evidence repair
-
-- Rank matching still failed when DRD workers tied even though their Callgrind
-  costs differed. Callgrind now records the passive scheduler stream from its
-  own run, with no benchmark or renderer changes.
-- The native matcher enumerates all 24 four-worker assignments and compares
-  normalized worker activity share plus cumulative activity in 16 bins. It
-  replays every assignment within one scheduler quantum of the best match and
-  reports the maximum makespan.
-- The repaired eight-case matrix passed the existing references. The four
-  parallel cases retained 20, 2, 2, and 2 mappings respectively; their
-  conservative makespan spreads were 1.295%, 0.249%, 0.005%, and 0.011%.
-- Attribution fails when compatible mappings span more than 2% in makespan.
-  A future retry must recollect only that failed case. It must not retry a valid
-  score regression.
+- Built `test_http_fetch_errors`, `test_remote_file_cache`,
+  `test_lasagna_manifest`, `test_lasagna_project_volumes`, `test_remote_url`,
+  `test_zarr_chunk_fetcher`, `test_volume_live_s3`, and `VC3D` with 32-way
+  build parallelism.
+- The six focused deterministic tests passed together. The policy test passed
+  20 consecutive executions, including its coordinated eight-thread initial
+  transition case.
+- With `VC_TEST_REQUIRE_NETWORK=1`, `test_lasagna_manifest` passed all 17 cases
+  with a malformed session token configured. The real-data case downloaded the
+  reported PHerc0139 manifest anonymously and opened public `presence` metadata
+  with shape `[9620, 3314, 3314]`.
+- With required network access, `test_volume_live_s3` passed all 10 cases,
+  including its invalid-session-credential anonymous-open case.
+- The initial sandboxed live attempt could not resolve the public hostname;
+  rerunning with network access succeeded. This was an execution-environment
+  restriction, not a code failure.

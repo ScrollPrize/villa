@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
-"""Inspect TIFXYZ label transfer and volume registration in one Napari viewer.
+"""Inspect CT, labels, validity, and TIFXYZ geometry in Napari.
 
-Blue always means the earlier/source representation and red means the
-updated/target representation. With additive blending, matching content is
-purple. The layer list contains togglable groups for:
-
-- HF-source versus updated-2.399um labels and supervision;
-- updated-2.399um versus projected-to-9.362um labels and supervision;
-- middle-three-layer max composites from the actual surface-volume Zarrs;
-- raw stage-one and affine-registered 3D TIFXYZ point overlays.
-
-The 9.362um label layers are projections of the original 2.399um annotations,
-not independent native annotations.
+Source is blue, target red, and overlap purple. Final-stage labels are
+transferred annotations, not independent native annotations.
 """
 
 from __future__ import annotations
@@ -499,10 +490,8 @@ def discover_case(
             f"{selection_path} predates surface-volume support; rerun "
             "download_ink_app_inputs.py to refresh it"
         )
-    # The transferred target can exist without a matching native CT surface
-    # volume (currently PHerc1667 and PHercParis4 at 7.91 um).  Keep the target
-    # TIFXYZ/report available for geometric inspection, but require CT only for
-    # the updated stage so validation can still measure old -> updated.
+    # Target CT is optional for geometry inspection; updated CT is required
+    # to validate the old-to-updated mapping.
     requested = {updated_resolution} | (
         {target_resolution} if target_resolution is not None else set()
     )
@@ -2226,10 +2215,8 @@ def release_case_layers(
 
     case_groups.clear()
     viewer.layers.clear()
-    # Removing a Napari layer releases Python references immediately, while
-    # Qt/Vispy may defer deletion of the corresponding image and GPU texture
-    # until the event queue runs.  Cross that release barrier before allocating
-    # the next case so only one complete segment is resident at a time.
+    # Qt/Vispy defers texture deletion until the event queue runs. Process it
+    # before loading another case to avoid holding two cases in GPU memory.
     try:
         from qtpy.QtWidgets import QApplication
     except ImportError:

@@ -23,6 +23,9 @@ TINY_CONFIG = {
     'model_linear_z_resolution': 48,
     'model_gap_expander_logit_resolution': 24,
     'model_gap_expander_num_windings': 6,
+    'model_gap_expander_capacity_windings': 6,
+    'model_gap_expander_min_gap': 1.0,
+    'model_gap_expander_softplus_bias': 4.0,
     'model_gap_expander_lr_scale': 0.3,
     'output_first_winding': 1,
 }

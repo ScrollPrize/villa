@@ -2,6 +2,7 @@ import React from "react";
 import Link from "@docusaurus/Link";
 import PipelineStepper from "./PipelineStepper";
 import useAtlasCard from "./useAtlasCard";
+import { isPrizeEligible } from "./prizeEligibility";
 
 // A single scroll/fragment card. Ported from the reference renderer card markup
 // (index.html ~233-247). The whole card is a Docusaurus <Link> to the sample's
@@ -117,6 +118,14 @@ export default function ScrollCard({ scroll }) {
       <div className="chead">
         <span className="name">
           {label}
+          {isPrizeEligible(scroll.id) ? (
+            <span
+              className="pb prize"
+              title="An open Vesuvius Challenge prize can be won on this scroll"
+            >
+              🏆 prize
+            </span>
+          ) : null}
           {hasInk3d ? (
             <span
               className="pb ink3d"

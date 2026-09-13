@@ -496,6 +496,35 @@ TEST_CASE("LineOptimizer resamples fractional control insertion spans evenly")
     }
 }
 
+TEST_CASE("LineOptimizer cancellation throws at solve entry points")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    std::atomic<bool> cancel{true};
+    vc::lasagna::LineOptimizationConfig config;
+    config.cancelFlag = &cancel;
+    config.printSolverProgress = false;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 10; ++i) {
+        linePoints.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+    CHECK_THROWS_AS(optimizer.optimizeExistingLine(linePoints, {0, 10}, 5, config),
+                    vc::lasagna::LineOptimizationCancelled);
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {10.0, linePoints[10], false, 10},
+    };
+    CHECK_THROWS_AS(optimizer.reinitializeAndOptimizeExistingLine(
+                        linePoints, controls, {0, 10}, 5, config),
+                    vc::lasagna::LineOptimizationCancelled);
+
+    // Unset flag: entry points proceed (no throw).
+    cancel.store(false);
+    CHECK_NOTHROW(optimizer.optimizeExistingLine(linePoints, {0, 10}, 5, config));
+}
+
 TEST_CASE("LineOptimizer local update range covers three neighboring control spans")
 {
     std::vector<cv::Vec3d> linePoints;

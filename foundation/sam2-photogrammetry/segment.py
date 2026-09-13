@@ -230,7 +230,7 @@ def main():
     # Convert input paths to Path objects and then resolve them
     root_dir = Path(args.root_dir).resolve()
     sam2_checkpoint = Path(args.sam2_checkpoint).resolve()
-    model_cfg = Path(args.model_cfg).resolve()
+    model_cfg = args.model_cfg
     photo_t_checkpoint = Path(args.photo_t_checkpoint).resolve()
 
     # Select the device for computation

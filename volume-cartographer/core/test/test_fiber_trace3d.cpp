@@ -288,6 +288,24 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK_FALSE(config.baseVoxelSizeUm.has_value());
 }
 
+TEST_CASE("native fiber tracer bounds endpoint acceptance by a quarter of the span")
+{
+    using vc::fiber_tracer::effectiveEndpointAcceptThresholdBaseVoxels;
+    using vc::fiber_tracer::kEndpointAcceptSpanFraction;
+    const vc::fiber_tracer::FiberTraceConfig config;  // 20 vx threshold
+    CHECK(kEndpointAcceptSpanFraction == doctest::Approx(0.25));
+    // Long span: the configured threshold stands.
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(config, 200.0) == doctest::Approx(20.0));
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(config, 80.0) == doctest::Approx(20.0));
+    // Short span: a 40 vx span accepts at most a 10 vx endpoint miss.
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(config, 40.0) == doctest::Approx(10.0));
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(config, 0.0) == doctest::Approx(0.0));
+    // Unknown span: unchanged.
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(
+              config, std::numeric_limits<double>::quiet_NaN()) == doctest::Approx(20.0));
+    CHECK(effectiveEndpointAcceptThresholdBaseVoxels(config, -5.0) == doctest::Approx(20.0));
+}
+
 TEST_CASE("fiber prediction trace scales derive from existing manifest fields")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;

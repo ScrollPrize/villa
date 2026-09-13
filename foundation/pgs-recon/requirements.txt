@@ -1,0 +1,12 @@
+configargparse
+educelab-imgproc>=0.4
+imageio
+matplotlib
+numpy
+opencv-python>=4.7
+PyExifTool
+PySfMUtils
+scikit-image
+scipy
+tqdm
+vtk
