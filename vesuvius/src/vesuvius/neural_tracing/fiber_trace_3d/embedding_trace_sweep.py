@@ -64,6 +64,10 @@ def refine_families(execute, families):
         if not axes or any(not isinstance(v,list) or not v for v in axes.values()):
             raise ValueError('refinement requires nonempty finite axes')
         configured_variants({'candidates':[family['seed']]})
+        if family.get('neighbor_weight',False):
+            weights=[family['seed']['weight']]+axes.get('weight',[])
+            if any(not isinstance(w,(int,float)) or not math.isfinite(w) or abs(w*20-round(w*20))>1e-8 for w in weights):
+                raise ValueError('neighbor refinement requires .05 weight ticks')
         for axis, values in axes.items():
             for value in values:
                 configured_variants({'candidates':[dict(family['seed'],**{axis:value})]})
@@ -88,9 +92,14 @@ def refine_families(execute, families):
                 parameters,best = min(candidates,key=lambda pair:pair[1]['failures'])
                 if best['failures'] < center['failures']:
                     current = dict(parameters)
+            if family.get('neighbor_weight',False):
+                history = {k:v for k,v in current.items() if k != 'weight'}
+                refined = search_weight(lambda row:evaluate({k:v for k,v in row.items() if k != 'name'}),
+                                        history=history,start_weight=current['weight'])
+                current['weight'] = refined['weight']
             if evaluate(current)['failures'] >= previous['failures']:
                 break
-        winners.append(dict(label=family['label'],axes=axes,parameters=current,result=evaluate(current)))
+        winners.append(dict(label=family['label'],axes=axes,neighbor_weight=family.get('neighbor_weight',False),parameters=current,result=evaluate(current)))
     return winners
 
 

@@ -8,6 +8,8 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Mechanism implementation committed1425f53c5 after native2/Python116 tests; mechanism sweep running. Fine .05 weight neighbors now integrated into independent family coordinate cycles (opt-in), with up-front tick validation; Python116 passed31.81s (`20260913_221326_604149`). This checks neighboring weights even if a coarse axis winner lies between tested endpoints.
+
 - Whole-path initial grid complete: K2spacing12881/78,51272/81; K4spacing12878/83,51275/84; K8spacing12884/84,51276/84 (nearest/halfEMA). EMA69 repeat exact. Committed initial implementations/harness844856518.
 - Novelty LRU and support-softmin implemented and independently reviewed; native tests pass1.59s, Python suite running. Support-softmin uses stable expm1/log1p for large temperatures after review; normalization/split/limits tests included. Mechanism grid prepared; then all-family refinement remains required.
 

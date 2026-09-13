@@ -186,6 +186,10 @@ def test_family_refinement_cycles_and_retains_each_family():
     assert results[0]['parameters']['ema_mix']==.5
     assert results[1]['parameters']['mode']=='anchors-lru'
     assert len({r['name'] for r in calls})==len(calls)
+    def weight_only(v):
+        return dict(v,completed=True,failures=round(abs(v['weight']-.35)*100))
+    fine=refine_families(weight_only,[dict(label='fine',seed=seed,axes={'weight':[.25,.5]},neighbor_weight=True)])
+    assert fine[0]['parameters']['weight']==.35
 
 
 def test_product_storage_preserves_signed_float32(tmp_path):
