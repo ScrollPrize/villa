@@ -141,3 +141,46 @@ Binding rebuild/install used in this workspace:
 ```bash
 CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13 AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 uv pip install --python /home/hendrik/.venv_las/bin/python --no-deps --reinstall -e ./volume-cartographer
 ```
+# Local contrastive competition (2026-09-13)
+
+New fresh config: `configs/train_combined_5scroll_s1a_contrastive_ema_16x8.json`.
+Same combined five-scroll data, Paris4 JSON/NML10% each, LR0.01,128 effective
+batch, EMA99/999 and existing tests. Legacy configs retain pairwise loss.
+
+At128³,2048 GT anchors each have one GT positive and32 presence-sampled
+off-GT negatives:65536 negatives plus2048 positives. The normal ellipse and
+native loading stay unchanged. Local competition is
+`logsumexp([0, (negative_cosine-positive_cosine+0.2)/0.1])`, averaged by the
+fixed number of anchors. Temperature/margin/negatives_per_anchor are explicit
+embedding config settings. There is no additional positive margin loss.
+
+Counts are known from geometry before forward; a patch with no eligible positive
+presence contributes zero loss with its budget intact. One backward/microbatch,
+no inter-sample softmax or other prediction-dependent normalization.
+
+Test and test_ema_* TensorBoard groups include `embedding_similarity/` means,
+positive_patch_p05, negative_patch_p95/p99, negative_above_0p9,
+hardest_negative_mean and positive_hardest_gap. Quantiles are averaged per patch;
+they are not pooled percentiles. `embedding_similarity_count/` gives the patch
+coverage per metric; undefined negative metrics are excluded, not treated as0.
+No extra forward is needed. Training does not calculate these test diagnostics.
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_experiment production-start
+```
+
+The approved runner's production config now selects the contrastive config;
+it starts through the manager and does not resume old weights. GPU validation
+uses `run_fiber3d_cooperative_tests` with the cuda-embedding suite.
+
+For a read-only audit of the latest production run's raw/EMA similarity tags:
+
+```bash
+/home/hendrik/villa/vesuvius/scripts/run_fiber3d_experiment production-embedding-metrics
+```
+
+Validation: 55 CPU tests passed (7 gated skips); five manager-exclusive CUDA
+tests passed, including FP32/BF16 accumulation equivalence. Isolated one-GPU,
+one-patch FP32 embedding forward/backward (65536 negatives, 16 channels,
+32³ output; five warm measurements) took 2.363ms median versus 2.486ms for
+the old pairwise loss. This is not a full training-throughput measurement.

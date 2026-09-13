@@ -1,40 +1,24 @@
-# Embedding consistency analysis
-1. Inspect shared live inference model, native input, tile geometry and blending.
-   Freeze a completed raw snapshot; record step, SHA256, config and precision.
-2. Deterministically select held-out fiber segments across five scrolls; dense
-   physical GT sampling through tile overlap. Distinguish inference tile edges,
-   dominant-contributor switches and arbitrary stored Zarr chunk boundaries.
-3. Measure within-tile cosine versus distance, same-location cross-tile cosine,
-   blended vector norm/cancellation and along-GT cosine across boundaries versus
-   distance-matched interiors. Include negative/off-fiber similarity distributions
-   and presence so collapse or background cannot masquerade as consistency.
-4. Reuse native reads, model construction/preprocessing and blend weights.
-   Analysis-only bounded embedding tiles need not change production publication.
-   Include all contributing tiles for blended points; disclose storage precision
-   differences and sampling limitations explicitly.
-5. CPU synthetic regression tests, then managed real measurement through approved
-   experiment caller. Preserve running training and verify ownership release.
-6. Save reproducible JSON and Markdown results per scroll plus equal-scroll
-   aggregate. Stop for user review before implementing tracer changes.
+# Implementation plan
 
-## Independent review refinements
-Blend every contributing tile at all eight query corners before interpolation.
-Measure cancellation as norm(sum(w*e))/sum(w*norm(e)), separately from amplitude.
-Match boundary/interior pairs by arclength lag. Random off-GT controls are not
-guaranteed distinct fibers; report presence strata and cosine quantiles. Initial
-controls use conservative distance >80 base voxels from the full GT polyline,
-which guarantees exclusion from its radius20/80 normal ellipse without adding
-normal loading. This is not exactly the training candidate distribution.
+1. Preserve legacy pairwise objective for old configs; new explicit local_contrastive mode uses32 negatives per anchor, negative budget65536 at128patch, positive budget1/32. Temperature0.1 and margin0.2 are initial configurable choices. Stable logsumexp([0,(negative-positive+margin)/temperature]); fixed anchor-count denominator, no cross-patch competition. Empty eligible presence gives zero numerator with fixed budget.
+2. Add dedicated contrastive sufficient-statistic component; share target counts with prepass and one-backward accumulation. Preserve legacy numerics. Sampling deterministic per patch, no gradients through presence. Native normal/ellipse/queue unchanged.
+3. Collect detached per-patch positive/negative cosine means/percentiles, negative>0.9 fraction, mean hardest-negative and gap during testing only, reusing pair computations. Log clearly labeled patch-averaged diagnostics, weighted by patch count across microbatches/test rows; no averaging quantiles under a claim of global quantiles. Raw+EMA. No extra model forward/backward.
+4. Regression tests: budget, logsumexp math/hard-negative weighting, detached presence, zero candidates, partition invariance, one backward and metric aggregation. Managed GPU tests via approved caller.
+5. New explicit combined contrastive config; stop current run using approved tree-aware command; launch fresh atLR0.01 with manager and verify test metrics/finite updates. Log outcomes and limitations.
 
 ## Spec update
-Analysis-only diagnostic, no training/loss, cache-format or manager-protocol change.
+Opt-in local competition alongside legacy objective; fixed target-only denominator and test-only diagnostics. No manager protocol or native reader changes.
 
 ## Docs updates
-Report commands, data, checkpoint, metrics, caveats and timing; replace active log/status.
+Embedding objective/options, metric definitions, fresh config and task status/log.
 
 ## Validation
-Independent plan review against task/spec/plan. Synthetic identities, boundaries
-and inconsistent embeddings; real manager-exclusive measurement.
+Independent agent plan review; CPU+manager GPU oracle; real managed startup.
+
+Review refinements: scale the negative budget linearly and round to a multiple
+of K. Undefined negative diagnostics contribute no values/counts, not cosine0;
+report per-metric patch coverage. Verify old root dead and new command has no
+resume. Measure isolated GPU loss time/memory, not an inferred full-pipeline speed.
 
 ## Changelog
-Record diagnostic and findings when complete.
+Record local competition and fresh production launch.

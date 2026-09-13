@@ -14,11 +14,15 @@ class EmbeddingConfig:
     pairs_at_128: int = 65536
     weight: float = 1.0
     output_stride: int = 1
+    objective: str = "pairwise"
+    negatives_per_anchor: int = 32
+    temperature: float = 0.1
+    margin: float = 0.2
 
     @classmethod
     def from_mapping(cls, raw):
         values = dict(raw.get("embedding", {}))
-        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight"}
+        unknown = set(values) - {"enabled", "channels", "pairs_at_128", "weight", "objective", "negatives_per_anchor", "temperature", "margin"}
         if unknown:
             raise ValueError(f"unknown embedding settings: {sorted(unknown)}")
         model = raw.get("model_3d", raw.get("model", {}))
@@ -33,9 +37,18 @@ class EmbeddingConfig:
             raise ValueError("invalid embedding weight/output stride")
         if result.enabled and model.get("conditioned_decoder_enabled", False):
             raise ValueError("embeddings currently require the unconditioned U-Net")
+        if result.objective not in ("pairwise", "local_contrastive"):
+            raise ValueError("unknown embedding objective")
+        if type(result.negatives_per_anchor) is not int or result.negatives_per_anchor < 1:
+            raise ValueError("negatives_per_anchor must be positive integer")
+        if not math.isfinite(result.temperature) or result.temperature <= 0 or not math.isfinite(result.margin):
+            raise ValueError("invalid contrastive temperature/margin")
         return result
 
     def pairs(self, shape):
+        if self.objective == "local_contrastive":
+            k = self.negatives_per_anchor
+            return k * max(1, round(self.pairs_at_128 * max(shape) / 128 / k))
         return 2 * max(1, round(self.pairs_at_128 * max(shape) / 128 / 2))
 
 
@@ -46,6 +59,10 @@ class EmbeddingGeometry:
     pairs: int
     stride: int
     weight: float
+    objective: str = "pairwise"
+    negatives_per_anchor: int = 32
+    temperature: float = 0.1
+    margin: float = 0.2
 
 
 class InvalidNormalSampleError(ValueError):
@@ -214,23 +231,53 @@ def embedding_pair_counts(batch):
     """Configured budgets, independent of presence and negative eligibility."""
     if batch.embedding_geometry is None or any(g is None for g in batch.embedding_geometry):
         raise ValueError("embedding pair budgets require geometry for every sample")
+    modes = {g.objective for g in batch.embedding_geometry}
+    if len(modes) != 1:
+        raise ValueError("mixed embedding objectives in batch")
+    if modes == {"local_contrastive"}:
+        return (0, 0, sum(g.pairs // g.negatives_per_anchor for g in batch.embedding_geometry))
     half = sum(g.pairs // 2 for g in batch.embedding_geometry)
     return half, half
 
 
-def embedding_statistics(embeddings, presence, batch):
+def embedding_statistics(embeddings, presence, batch, diagnostics=None):
     """Separate component sums/counts; sampling never backpropagates to presence."""
     zero = embeddings.reshape(-1)[0].float() * 0
     pos_sum, neg_sum = zero, zero
     if batch.embedding_geometry is None or len(batch.embedding_geometry) != len(embeddings):
         raise ValueError("embedding-enabled model requires loader embedding geometry/normals")
-    pos_count, neg_count = zero.detach().new_tensor(embedding_pair_counts(batch)).unbind()
+    counts = zero.detach().new_tensor(embedding_pair_counts(batch)).unbind()
+    contrastive = len(counts) == 3
+    pos_count, neg_count = counts[:2]
+    competition = zero
     for i, geometry in enumerate(batch.embedding_geometry):
         if geometry is None or tuple(geometry.eligible.shape) != tuple(embeddings.shape[-3:]):
             raise ValueError("missing or mismatched embedding output-grid geometry")
         # Loader stream seeds are 128-bit hashes; PyTorch accepts 64-bit seeds.
         # Match the existing value-augmentation seed conversion.
         rng = torch.Generator(device=embeddings.device).manual_seed(geometry.seed % (2**63 - 1))
+        if contrastive:
+            anchors = geometry.pairs // geometry.negatives_per_anchor
+            offset, count = int(batch.target_segment_offsets[i]), int(batch.target_segment_counts[i])
+            starts = batch.target_segment_starts_zyx[offset:offset + count].float() / geometry.stride
+            ends = batch.target_segment_ends_zyx[offset:offset + count].float() / geometry.stride
+            points = sample_trace_points(starts, ends, anchors*2, rng, embeddings.shape[-3:])
+            positive_vectors = sample_embeddings(embeddings[i], points)
+            a, p = positive_vectors[:anchors], positive_vectors[anchors:]
+            positive = (a*p).sum(1).clamp(-1, 1)
+            weights = presence[i].detach().float().reshape(-1)
+            if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
+                raise ValueError("embedding presence must be finite probabilities")
+            weights = weights * geometry.eligible.to(weights.device).reshape(-1)
+            negative = positive.new_empty((anchors, 0))
+            if bool(weights.sum() > 0):
+                chosen = torch.multinomial(weights, geometry.pairs, replacement=True, generator=rng)
+                n = F.normalize(embeddings[i].reshape(embeddings.shape[1], -1)[:, chosen].T.float(), dim=1, eps=1e-8)
+                negative = (a[:, None, :] * n.reshape(anchors, geometry.negatives_per_anchor, -1)).sum(-1).clamp(-1, 1)
+                competition = competition + local_competition(positive, negative, geometry.temperature, geometry.margin).sum()*geometry.weight
+            if diagnostics is not None:
+                diagnostics.append(similarity_diagnostics(positive.detach(), negative.detach()))
+            continue
         half = geometry.pairs // 2
         offset, count = int(batch.target_segment_offsets[i]), int(batch.target_segment_counts[i])
         starts = batch.target_segment_starts_zyx[offset:offset + count].float() / geometry.stride
@@ -250,4 +297,23 @@ def embedding_statistics(embeddings, presence, batch):
         negatives = F.normalize(embeddings[i].reshape(embeddings.shape[1], -1)[:, chosen].T.float(), dim=1, eps=1e-8)
         negative = (on_trace[2 * half:] * negatives).sum(dim=1).clamp_min(0)
         neg_sum = neg_sum + negative.sum() * geometry.weight
+    if contrastive:
+        return pos_sum, pos_count, neg_sum, neg_count, competition, counts[2]
     return pos_sum, pos_count, neg_sum, neg_count
+
+
+def local_competition(positive, negative, temperature, margin):
+    logits = (negative-positive[:, None]+margin)/temperature
+    return torch.logsumexp(torch.cat((torch.zeros_like(positive[:, None]), logits), dim=1), dim=1)
+
+
+def similarity_diagnostics(positive, negative):
+    """Per-patch diagnostics; detached, no training-state or normalization effect."""
+    result = dict(positive_mean=positive.mean(), positive_patch_p05=torch.quantile(positive, .05))
+    if negative.numel():
+        hardest = negative.max(dim=1).values
+        quantiles = torch.quantile(negative.reshape(-1), negative.new_tensor([.95,.99]))
+        result.update(negative_mean=negative.mean(), negative_patch_p95=quantiles[0],
+            negative_patch_p99=quantiles[1], negative_above_0p9=(negative>.9).float().mean(),
+            hardest_negative_mean=hardest.mean(), positive_hardest_gap=(positive-hardest).mean())
+    return result

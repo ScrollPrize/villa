@@ -1,8 +1,13 @@
-# Embedding consistency analysis
+# Local contrastive competition
 
-- [x] Instructions and current/next task recorded.
-- [x] Independent plan review; corner-complete blending, distance matching and control caveats incorporated.
-- [x] Diagnostic and synthetic validation: 3 CPU tests passed.
-- [x] Managed measurement: raw update5300 /678400 samples,10 held-out fibers,48 forwards,48.3s on one GPU.
-- [x] Report and training continuation checked: generation3, update5400.
-- [ ] User review before implementing the separately recorded tracer plan.
+- [x] Commit prior state and write plan.
+- [x] Review plan.
+- [x] Objective and test diagnostics.
+- [x] CPU/managed GPU validation:54 CPU passes,5 CUDA passes (FP32/BF16 and cost).
+- [x] Stop old run; verify dead and manager release.
+- [x] Launch fresh managed run (root3343490; no resume; first failed launch retained for diagnosis).
+- [x] Verify all 24 real raw/EMA similarity tags and three finite optimizer updates.
+
+Active run: `combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_121417`.
+Automatic real-update startup calibration continues; adaptive handoff has not
+yet been observed. The requested fresh training is running, not an evaluation-only probe.

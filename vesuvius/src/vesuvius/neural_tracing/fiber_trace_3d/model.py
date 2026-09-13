@@ -34,6 +34,7 @@ class FiberTrace3DModelConfig:
     normalization: str = "batch"
     output_stride: int = 1
     embedding_channels: int = 0
+    embedding_objective: str = "pairwise"
 
 
 class FiberTrace3DNet(nn.Module):
@@ -48,6 +49,7 @@ class FiberTrace3DNet(nn.Module):
             raise ValueError("features_per_stage must not be empty")
         self.conditioned_decoder_enabled = bool(cfg.conditioned_decoder_enabled)
         self.embedding_channels = int(cfg.embedding_channels)
+        self.embedding_objective = cfg.embedding_objective
         if self.embedding_channels < 0 or (self.embedding_channels and self.conditioned_decoder_enabled):
             raise ValueError("embedding channels require an unconditioned U-Net")
         if self.conditioned_decoder_enabled:
@@ -404,5 +406,6 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
             normalization=str(model_cfg.get("normalization", "batch")),
             output_stride=int(model_cfg.get("output_stride", 1)),
             embedding_channels=embedding.channels if embedding.enabled else 0,
+            embedding_objective=embedding.objective,
         )
     )

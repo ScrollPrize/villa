@@ -666,7 +666,7 @@ class MacroBatchTargetSource:
     def __next__(self):
         if not self.pending:
             prepared = []
-            counts = torch.zeros(5 if self.config.embedding.enabled else 3)
+            counts = None
             for size in self.batch_sizes:
                 raw = next(self.source)
                 try:
@@ -681,7 +681,8 @@ class MacroBatchTargetSource:
                     self.source.release_current()
                 if batch.volume.shape[0] != size:
                     raise RuntimeError("target prepass microbatch differs from canonical partition")
-                counts += self.prepare_geometry(lambda: self._counts(batch))
+                batch_counts = self.prepare_geometry(lambda: self._counts(batch))
+                counts = batch_counts.clone() if counts is None else counts + batch_counts
                 prepared.append(batch)
             local_counts = counts.cpu()
             self.pending = [replace(batch, normalization_counts=local_counts) for batch in reversed(prepared)]

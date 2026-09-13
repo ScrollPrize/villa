@@ -679,7 +679,7 @@
   projection and expose it separately with `return_embeddings=True`. Defaults:
   16 channels, 65,536 pairs at input patch width 128, overall weight 1. Pair count
   is `2*max(1,round(pairs_at_128*max(patch_shape_zyx)/128/2))`.
-- Each patch supplies half GT/GT and half GT/off-fiber pairs with replacement.
+- In legacy embedding.objective=pairwise mode each patch supplies half GT/GT and half GT/off-fiber pairs with replacement.
   GT endpoints are independently uniform in arc length over nonzero trace
   segments clipped to the supported output lattice, independent of presence.
   Embeddings are interpolated at GT coordinates and L2-normalized for cosine.
@@ -719,6 +719,25 @@
   Enabling embeddings invalidates an old cooperative memory calibration.
   Conditioned-decoder embeddings and embedding Zarr publication are not provided
   by this training feature; default inference products remain unchanged.
+
+- embedding.objective=local_contrastive instead assigns pairs_at_128 to the
+  negative budget: K=negatives_per_anchor (default32), A=max(1,round(
+  pairs_at_128*max(patch_shape)/128/K)); A positive pairs and A*K negative pairs.
+  For each uniformly arclength-sampled GT anchor, draw one same-fiber positive
+  and K presence-proportional negatives outside the same native-normal ellipse.
+  Loss per anchor is logsumexp([0,(cos_neg-cos_pos+margin)/temperature]); defaults
+  temperature0.1 and margin0.2. Multiply by embedding.weight and divide summed
+  loss by fixed configured anchor count, including patches without eligible
+  negatives (zero numerator there). No separate pairwise cosine loss is added.
+  Competition is within a patch/anchor only; no prediction-dependent cross-patch
+  normalization. Single backward and macro-batch partition invariance remain.
+- Regular raw/EMA evaluation reuses sampled pairs to log embedding_similarity/*:
+  positive_mean, positive_patch_p05, negative_mean, negative_patch_p95/p99,
+  negative_above_0p9, hardest_negative_mean and positive_hardest_gap. These are
+  patch-averaged observation metrics, not optimizer losses. Percentiles are
+  means of per-patch quantiles, not pooled quantiles. Undefined negative metrics
+  are omitted for empty-eligible patches; embedding_similarity_count/* records
+  contributing patches and aggregate means are count-weighted across batches.
 
 - `training.bounded_gradient_accumulation` is opt-in and defaults false. The
   fixed-cohort path rejects batch-dependent normalization. Ordinary single-branch

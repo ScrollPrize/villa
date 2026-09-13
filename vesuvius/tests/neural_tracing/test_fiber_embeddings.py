@@ -385,10 +385,15 @@ def pair_prepass_counts(batch):
     return source._counts(batch)
 
 
-def test_regular_and_bounded_embedding_gradients_match(monkeypatch):
+@pytest.mark.parametrize('competition', [False, True])
+def test_regular_and_bounded_embedding_gradients_match(monkeypatch, competition):
     torch.manual_seed(5)
     batch = training_batch()
-    expected = build_fiber_trace_3d_model(tiny_config())
+    config = tiny_config()
+    if competition:
+        config['embedding']['objective'] = 'local_contrastive'
+        batch = replace(batch, embedding_geometry=tuple(replace(g, objective='local_contrastive') for g in batch.embedding_geometry))
+    expected = build_fiber_trace_3d_model(config)
     actual = copy.deepcopy(expected)
     losses = _forward_loss_tensors(expected, batch, direction_weight=1.2, presence_weight=0.7, training_loss=True)
     losses["total"].backward()
@@ -411,7 +416,9 @@ def test_regular_and_bounded_embedding_gradients_match(monkeypatch):
         torch.testing.assert_close(reduced[key], losses[key], atol=2e-5, rtol=2e-5)
     for a, b in zip(actual.parameters(), expected.parameters()):
         torch.testing.assert_close(a.grad, b.grad, atol=3e-5, rtol=3e-4)
-    assert reduced["embedding_negative_pairs"] == 64  # budget, including excluded patch
+    assert reduced["embedding_negative_pairs"] == (0 if competition else 64)
+    if competition:
+        assert reduced['embedding_anchors'] == 4  # includes excluded patch
     legacy = build_fiber_trace_3d_model({**tiny_config(), "embedding": {"enabled": False}})
     assert len(NormalizedGradientAccumulator(legacy, torch.zeros(3),
                direction_weight=1, presence_weight=1).components) == 3
@@ -524,7 +531,7 @@ def test_state_only_checkpoint_does_not_infer_embedding_as_branches(tmp_path):
     restored.load_state_dict(model.state_dict())
 
 
-def _distributed_embedding_worker(rank, directory, backend="gloo", world_size=3, amp=False):
+def _distributed_embedding_worker(rank, directory, backend="gloo", world_size=3, amp=False, competition=False):
     import torch.distributed as dist
     from contextlib import nullcontext
     from datetime import timedelta
@@ -540,14 +547,19 @@ def _distributed_embedding_worker(rank, directory, backend="gloo", world_size=3,
     try:
         torch.set_num_threads(1)
         torch.manual_seed(8)
-        model = build_fiber_trace_3d_model(tiny_config()).to(device)
+        config = tiny_config()
+        if competition:
+            config['embedding']['objective'] = 'local_contrastive'
+        model = build_fiber_trace_3d_model(config).to(device)
         oracle = copy.deepcopy(model)
         batch = training_batch().to(device)
+        if competition:
+            batch = replace(batch, embedding_geometry=tuple(replace(g, objective='local_contrastive') for g in batch.embedding_geometry))
         context = lambda: torch.autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext()
         with context():
             expected = _forward_loss_tensors(oracle, batch, direction_weight=1., presence_weight=1., training_loss=True)
         expected["total"].backward()
-        counts = pair_prepass_counts(_slice_batch(batch, rank, rank + 1)) if rank < 2 else torch.zeros(5)
+        counts = pair_prepass_counts(_slice_batch(batch, rank, rank + 1)) if rank < 2 else torch.zeros(6 if competition else 5)
         accumulator = NormalizedGradientAccumulator(model, counts, direction_weight=1.,
                                                     presence_weight=1., distributed=True)
         # Rank 2 has no samples; rank 1 has no eligible negatives but retains its budget.
@@ -566,23 +578,71 @@ def _distributed_embedding_worker(rank, directory, backend="gloo", world_size=3,
             assert relative < .02, relative.item()
             if rank == 0:
                 print(f"EMBEDDING_BF16_GRADIENT_RELATIVE_L2={relative.item():.6g}", flush=True)
-        assert statistics.positive_embedding_count == 64
-        assert statistics.negative_embedding_count == 64
+        assert statistics.positive_embedding_count == (0 if competition else 64)
+        assert statistics.negative_embedding_count == (0 if competition else 64)
+        if competition:
+            assert statistics.contrastive_embedding_count == 4
     finally:
         dist.destroy_process_group()
 
 
-def test_gloo_embedding_unequal_and_zero_work_ranks(tmp_path):
-    torch.multiprocessing.spawn(_distributed_embedding_worker, args=(str(tmp_path),), nprocs=3)
+@pytest.mark.parametrize('competition', [False, True])
+def test_gloo_embedding_unequal_and_zero_work_ranks(tmp_path, competition):
+    torch.multiprocessing.spawn(_distributed_embedding_worker, args=(str(tmp_path),'gloo',3,False,competition), nprocs=3)
 
 
 @pytest.mark.parametrize("amp", [False, True])
-def test_cuda_embedding_distributed_single_backward(tmp_path, amp):
+@pytest.mark.parametrize('competition', [False, True])
+def test_cuda_embedding_distributed_single_backward(tmp_path, amp, competition):
     import os
     if os.environ.get("FIBER_COOPERATIVE_CUDA_TEST") != "1":
         pytest.skip("requires manager-authorized CUDA test launcher")
     torch.multiprocessing.spawn(_distributed_embedding_worker,
-        args=(str(tmp_path), "nccl", 2, amp), nprocs=2)
+        args=(str(tmp_path), "nccl", 2, amp, competition), nprocs=2)
+
+
+def test_cuda_embedding_objective_cost():
+    import os, json, time
+    if os.environ.get('FIBER_COOPERATIVE_CUDA_TEST') != '1':
+        pytest.skip('manager-authorized CUDA test required')
+    torch.cuda.set_device(0)
+    torch.set_num_threads(1)
+    torch.manual_seed(19)
+    batch = pair_batch((32,32,32))
+    batch.target_segment_ends_zyx[0,2] = 31
+    batch.target_segment_offsets = batch.target_segment_offsets.cuda()
+    batch.target_segment_counts = batch.target_segment_counts.cuda()
+    batch.target_segment_starts_zyx = batch.target_segment_starts_zyx.cuda()
+    batch.target_segment_ends_zyx = batch.target_segment_ends_zyx.cuda()
+    batch.embedding_geometry = tuple(replace(g,eligible=g.eligible.cuda()) for g in batch.embedding_geometry)
+    embedding = torch.randn(1,16,32,32,32,device='cuda',requires_grad=True)
+    presence = torch.rand(1,1,32,32,32,device='cuda')
+    report = {}
+    for mode in ('pairwise','local_contrastive'):
+        batch.embedding_geometry = tuple(replace(g,objective=mode) for g in batch.embedding_geometry)
+        times=[]
+        torch.cuda.reset_peak_memory_stats()
+        for i in range(6):
+            embedding.grad = None
+            torch.cuda.synchronize()
+            start=time.perf_counter()
+            r = embedding_statistics(embedding,presence,batch)
+            loss = (r[0]/r[1]+r[2]/r[3])*.5 if len(r)==4 else r[4]/r[5]
+            loss.backward()
+            torch.cuda.synchronize()
+            if i: times.append(time.perf_counter()-start)
+        diagnostic_times=[]
+        for i in range(6):
+            diag=[]
+            torch.cuda.synchronize()
+            start=time.perf_counter()
+            with torch.no_grad(): embedding_statistics(embedding,presence,batch,diag)
+            torch.cuda.synchronize()
+            if i: diagnostic_times.append(time.perf_counter()-start)
+        report[mode]=dict(forward_backward_seconds_min_median_max=[min(times),float(np.median(times)),max(times)],
+            test_forward_with_diagnostics_seconds_min_median_max=[min(diagnostic_times),float(np.median(diagnostic_times)),max(diagnostic_times)],
+            peak_allocated_bytes=torch.cuda.max_memory_allocated())
+    print('EMBEDDING_GPU_COST '+json.dumps(dict(processing_units='one GPU, one patch;16 channels,32-cube output,65536 budget;FP32 loss',results=report)),flush=True)
 
 
 def test_embedding_cpu_cost(capsys):

@@ -1,5 +1,11 @@
 ## 2026-09-13 — Fixed-budget single-backward embeddings
 
+- Added opt-in local contrastive competition with2048 GT anchors/65536 negatives
+  per128patch, fixed target-only anchor normalization and one backward. Raw/EMA
+  tests log cosine means, patch quantiles, high-similarity fraction and hardest
+  negative gap. New combined-data LR0.01 contrastive config starts from scratch;
+  previous pairwise training and its checkpoints are preserved.
+
 - Re-enabled single-branch embeddings with fixed positive/negative budgets,
   including zero-presence patches; one combined backward and no extra gradient
   banks. Fixed shared eligibility ownership in macro-batch staging.

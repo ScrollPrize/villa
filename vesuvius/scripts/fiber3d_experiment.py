@@ -675,6 +675,22 @@ def inspect():
 
 
 def main():
+    if sys.argv[1:] == ['production-embedding-metrics']:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        config = json.loads((ROOT / json.loads(CONTROL.read_text())['production']['config']).read_text())
+        launch = Path((Path(config['training']['run_path']) / '.launches/latest').read_text())
+        run = Path(re.findall(r'run_dir=(\S+)', (launch/'train.log').read_text())[-1])
+        events = EventAccumulator(str(run), size_guidance={'scalars':0})
+        events.Reload()
+        values = {}
+        for prefix in ('test', 'test_ema_0p99', 'test_ema_0p999'):
+            for metric in ('positive_mean', 'positive_patch_p05', 'negative_mean', 'negative_patch_p95',
+                           'negative_patch_p99', 'negative_above_0p9', 'hardest_negative_mean', 'positive_hardest_gap'):
+                key = f'{prefix}/embedding_similarity/{metric}'
+                row = events.Scalars(key)[-1]
+                values[key] = dict(step=row.step, value=row.value)
+        print(json.dumps(dict(run=str(run), metrics=values), indent=2))
+        return
     if sys.argv[1:] == ['embedding-consistency-report']:
         return subprocess.call([sys.executable, '-m',
             'vesuvius.neural_tracing.fiber_trace_3d.embedding_consistency', str(CONTROL), '--report'])

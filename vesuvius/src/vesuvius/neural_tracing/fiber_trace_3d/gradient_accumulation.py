@@ -17,6 +17,13 @@ COMPONENTS = ("direction", "positive_presence", "negative_presence")
 EMBEDDING_COMPONENTS = ("positive_embedding", "negative_embedding")
 
 
+def loss_components(model):
+    if not getattr(model, "embedding_channels", 0):
+        return COMPONENTS
+    return COMPONENTS + EMBEDDING_COMPONENTS + (("contrastive_embedding",)
+        if getattr(model, "embedding_objective", "pairwise") == "local_contrastive" else ())
+
+
 def validate_target_only_loss_config(raw):
     """Reject unsupported loss modes, without restricting inference models."""
     model = raw.get("model_3d", raw.get("model", {}))
@@ -42,7 +49,7 @@ class NormalizedGradientAccumulator:
         if not self.parameters or any(p.dtype != torch.float32 for p in self.parameters):
             raise ValueError("requires FP32 master parameters; use autocast for mixed precision")
         self.distributed, self.process_group = distributed, process_group
-        self.components = COMPONENTS + (EMBEDDING_COMPONENTS if getattr(model, "embedding_channels", 0) else ())
+        self.components = loss_components(model)
         self.counts = counts.detach().to(device=self.parameters[0].device, dtype=torch.float32).clone()
         if self.counts.shape != (len(self.components),):
             raise ValueError(f"expected {len(self.components)} target-derived normalization counts")
@@ -50,7 +57,7 @@ class NormalizedGradientAccumulator:
             dist.all_reduce(self.counts, group=process_group)
         self.weights = self.counts.new_tensor((direction_weight,
             presence_weight * positive_query_weight, presence_weight * negative_query_weight)
-            + ((0.5, 0.5) if len(self.components) == 5 else ()))
+            + ((0.5, 0.5) if len(self.components) >= 5 else ()) + ((1.0,) if len(self.components) == 6 else ()))
         self.loss_scale = float(loss_scale)
         if not math.isfinite(self.loss_scale) or self.loss_scale <= 0:
             raise ValueError("invalid loss scale")
@@ -120,8 +127,7 @@ class ComponentGradientAccumulator:
             base_model = base_model._orig_mod
         while hasattr(base_model, "module"):
             base_model = base_model.module
-        self.components = COMPONENTS + (("positive_embedding", "negative_embedding")
-                                       if getattr(base_model, "embedding_channels", 0) else ())
+        self.components = loss_components(base_model)
         self.parameters = tuple(p for p in model.parameters() if p.requires_grad)
         if not self.parameters:
             raise ValueError("no trainable parameters")
@@ -193,7 +199,7 @@ class ComponentGradientAccumulator:
                 dist.all_reduce(bank, group=process_group)
         statistics = LossStatistics.unpack(self.statistics)
         weights = (direction_weight, presence_weight * positive_query_weight,
-                   presence_weight * negative_query_weight, 0.5, 0.5)
+                   presence_weight * negative_query_weight, 0.5, 0.5, 1.0)
         with torch.no_grad():
             # Keep GradScaler's scale applied. The existing optimizer boundary
             # unscales/checks/clips exactly once, after globally combining banks.

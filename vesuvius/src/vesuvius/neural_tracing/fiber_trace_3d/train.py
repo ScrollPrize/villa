@@ -29,6 +29,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.historical_evaluation import (
     historical_test_config, historical_presence_mask,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
+    loss_components,
     NormalizedGradientAccumulator,
     validate_target_only_loss_config, validate_sample_independent_model,
 )
@@ -972,8 +973,10 @@ def _finalize_loss_statistics(
         "selected_score",
         "positive_embedding",
         "negative_embedding",
+        "contrastive_embedding",
     )
     local_pairs = {
+        "contrastive_embedding": (statistics.contrastive_embedding_sum, statistics.contrastive_embedding_count),
         "positive_embedding": (statistics.positive_embedding_sum, statistics.positive_embedding_count),
         "negative_embedding": (statistics.negative_embedding_sum, statistics.negative_embedding_count),
         "direction": (statistics.direction_sum, statistics.direction_count),
@@ -1043,13 +1046,15 @@ def _finalize_loss_statistics(
         * negative_presence_loss
         * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
     )
-    embedding_loss = 0.5 * (ratio("positive_embedding") + ratio("negative_embedding"))
+    embedding_loss = 0.5 * (ratio("positive_embedding") + ratio("negative_embedding")) + ratio("contrastive_embedding")
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss + embedding_loss
     return {
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
         "embedding": embedding_loss,
+        "embedding_contrastive": ratio("contrastive_embedding"),
+        "embedding_anchors": global_values["contrastive_embedding"][1] if global_values else statistics.contrastive_embedding_count,
         "embedding_positive": ratio("positive_embedding"),
         "embedding_negative": ratio("negative_embedding"),
         "embedding_negative_pairs": global_values["negative_embedding"][1] if global_values else statistics.negative_embedding_count,
@@ -1346,6 +1351,7 @@ def compute_losses(
     presence_weight: float,
     branch_selection_mode: str = "eval_voxel",
     embeddings: torch.Tensor | None = None,
+    embedding_diagnostics: list | None = None,
     _return_statistics: bool = False,
     presence_loss_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor] | _LossStatistics:
@@ -1512,9 +1518,13 @@ def compute_losses(
         selected_score_count=selected_score_count,
     )
     if embeddings is not None:
-        pos, pc, neg, nc = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch)
+        embedding_values = embedding_statistics(embeddings, pred_presences.amax(dim=1), batch, embedding_diagnostics)
+        pos, pc, neg, nc = embedding_values[:4]
         statistics = replace(statistics, positive_embedding_sum=pos, positive_embedding_count=pc,
                              negative_embedding_sum=neg, negative_embedding_count=nc)
+        if len(embedding_values) == 6:
+            statistics = replace(statistics, contrastive_embedding_sum=embedding_values[4],
+                                 contrastive_embedding_count=embedding_values[5])
     if _return_statistics:
         return statistics
     return _finalize_loss_statistics(
@@ -2222,10 +2232,17 @@ def _mean_dense_test_rows(
             "selected_score_mean": math.inf,
         }
     rows = [row for _batch_index, row in ordered]
-    return {
+    result = {
         key: float(sum(row[key] for row in rows) / len(rows))
-        for key in rows[0]
+        for key in rows[0] if 'embedding_similarity/' not in key and 'embedding_similarity_count/' not in key
     }
+    for key in {k for row in rows for k in row if 'embedding_similarity/' in k}:
+        count_key = key.replace('embedding_similarity/', 'embedding_similarity_count/')
+        count = sum(row.get(count_key, 0) for row in rows)
+        if count:
+            result[key] = sum(row.get(key, 0)*row.get(count_key, 0) for row in rows)/count
+            result[count_key] = count
+    return result
 
 
 def _distributed_gather_dense_test_rows(
@@ -2271,6 +2288,7 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
     take = int(batch.volume.shape[0])
     size = take if microbatch_size is None else microbatch_size
     statistics = None
+    embedding_diagnostics = []
     for offset in range(0, take, size):
         physical = _slice_batch(batch, offset, min(take, offset + size)).to(device)
         physical = materialize_targets(physical, config, output_stride=_model_output_stride(model))
@@ -2279,13 +2297,20 @@ def _evaluate_loaded_batch(model, batch, config, *, device, microbatch_size,
         with _autocast_context(mixed_precision):
             part = _forward_loss_statistics(model, physical,
                 conditioned_loss_options=conditioned_loss_options, training_loss=False,
-                prediction_observer=prediction_observer, historical_presence_mask=historical)
+                prediction_observer=prediction_observer, historical_presence_mask=historical,
+                embedding_diagnostics=embedding_diagnostics)
+            # Diagnostics reuse the forward pair samples; no extra inference.
         statistics = part if statistics is None else statistics + part
     options = conditioned_loss_options or {}
-    return _finalize_loss_statistics(statistics,
+    result = _finalize_loss_statistics(statistics,
         direction_weight=direction_weight, presence_weight=presence_weight,
         positive_query_weight=options.get("positive_query_weight", 1.0),
         negative_query_weight=options.get("negative_query_weight", 1.0))
+    for key in {k for row in embedding_diagnostics for k in row}:
+        values = [row[key] for row in embedding_diagnostics if key in row]
+        result['embedding_similarity/'+key] = torch.stack(values).mean()
+        result['embedding_similarity_count/'+key] = torch.tensor(len(values), device=device)
+    return result
 
 
 @torch.no_grad()
@@ -2628,6 +2653,7 @@ def _forward_loss_statistics(
     training_loss: bool = True,
     prediction_observer: Any | None = None,
     historical_presence_mask: bool = False,
+    embedding_diagnostics: list | None = None,
 ) -> _LossStatistics:
     if _model_uses_conditioned_decoder(model):
         result = compute_conditioned_losses(
@@ -2649,6 +2675,7 @@ def _forward_loss_statistics(
             output,
             batch,
             embeddings=prediction["embeddings"] if use_embeddings else None,
+            embedding_diagnostics=embedding_diagnostics,
             presence_loss_mask=batch.presence_mask if historical_presence_mask else None,
             direction_weight=1.0,
             presence_weight=1.0,
@@ -2663,14 +2690,25 @@ def _forward_loss_statistics(
 def _embedding_log(losses, model):
     if not getattr(_unwrap_model(model), "embedding_channels", 0):
         return ""
-    return (f"loss_embedding={losses['embedding']:.6f} "
-            f"embedding_negative_pairs={losses['embedding_negative_pairs']:.0f} ")
+    extra = ''
+    for key in ('positive_mean', 'negative_mean', 'negative_above_0p9', 'hardest_negative_mean', 'positive_hardest_gap'):
+        if 'embedding_similarity/'+key in losses:
+            extra += f"emb_{key}={losses['embedding_similarity/'+key]:.4f} "
+    budget = (f"embedding_anchors={losses.get('embedding_anchors', 0):.0f} "
+              if getattr(_unwrap_model(model), 'embedding_objective', 'pairwise') == 'local_contrastive'
+              else f"embedding_negative_pairs={losses['embedding_negative_pairs']:.0f} ")
+    return f"loss_embedding={losses['embedding']:.6f} " + budget + extra
 
 
 def _log_embedding_scalars(writer, prefix, losses, model, step):
     if getattr(_unwrap_model(model), "embedding_channels", 0):
-        for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs"):
+        for key in ("embedding", "embedding_positive", "embedding_negative", "embedding_negative_pairs", "embedding_contrastive", "embedding_anchors"):
+            if key not in losses:
+                continue
             writer.add_scalar(f"{prefix}/{key}", losses[key], step)
+        for key, value in losses.items():
+            if key.startswith(('embedding_similarity/', 'embedding_similarity_count/')):
+                writer.add_scalar(f"{prefix}/{key}", value, step)
 
 
 def _losses_to_float_dict(losses: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -3414,10 +3452,12 @@ def training_units(
 
     def log_observation(prefix, values, step):
         print(f"{prefix} samples={sample_progress.at(step)} update={step} "
-              f"loss_total={values['total']:.6f} angle_mean_deg={values['angle_mean_deg']:.2f}", flush=True)
+              f"loss_total={values['total']:.6f} angle_mean_deg={values['angle_mean_deg']:.2f} "
+              f"{_embedding_log(values, raw_model) if 'embedding' in values else ''}", flush=True)
         if writer is not None:
             writer.add_scalar(f"{prefix}/loss_total", values["total"], step)
             writer.add_scalar(f"{prefix}/angle_mean_deg", values["angle_mean_deg"], step)
+            _log_embedding_scalars(writer, prefix, values, raw_model, step)
 
     def run_configured_tests(step: int, *, initial=False):
         nonlocal pending_test, ema_test_metrics
@@ -3816,7 +3856,7 @@ def training_units(
 
             if target_only_accumulation and optimizer_microbatch_count == 0:
                 component_accumulator = normalized_accumulator(torch.zeros(
-                    5 if getattr(raw_model, "embedding_channels", 0) else 3, device=device))
+                    len(loss_components(raw_model)), device=device))
             for microbatch_index, take in enumerate(optimizer_microbatch_takes):
                 local_batch_ordinal = (
                     (step - 1) * optimizer_microbatch_count + microbatch_index + 1

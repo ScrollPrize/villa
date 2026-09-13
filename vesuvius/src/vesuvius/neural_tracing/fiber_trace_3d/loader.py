@@ -3047,7 +3047,8 @@ class FiberTrace3DLoader:
             lambda points: self._output_points_to_source_volume_np(points, params) * record.volume_spacing_base,
             record.fiber.line_points_zyx, sample_normals, record.base_shape_zyx)
         return EmbeddingGeometry(eligible, _stable_seed(self.config.seed, params.stream_index, "embedding"),
-                                 cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight)
+                                 cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight,
+                                 cfg.objective, cfg.negatives_per_anchor, cfg.temperature, cfg.margin)
 
     def load_raw_sample(
         self, sample_index: int, *, sample_index_limit: int | None = None,
