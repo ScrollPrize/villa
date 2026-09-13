@@ -150,9 +150,15 @@ def test_delete_restore_and_monotonic_ids(workspace):
     entry = ws.catalog.entries()[0]
     change(ws, entry.identity.id, 1, deleted=True)
     assert Path(entry.identity.source).exists()
-    change(ws, entry.identity.id, 2, restore_revision=1)
+    status = ws.catalog.entry(entry.identity.id).status()
+    assert status["can_restore"]
+    assert status["restore_revision"] == 1
+    change(ws, entry.identity.id, 2, restore_revision=status["restore_revision"])
     change(ws, entry.identity.id, 3, deleted=True)
+    assert ws.catalog.entry(entry.identity.id).status()["restore_revision"] == 3
     commit(ws, entry.identity.id, 4)
+    assert ws.catalog.entry(entry.identity.id).status()["restore_revision"] is None
+    assert not ws.catalog.entry(entry.identity.id).status()["can_restore"]
     with pytest.raises(ApiError, match='new input'):
         change(ws, entry.identity.id, 4, restore_revision=1)
     new_id = str(uuid4())

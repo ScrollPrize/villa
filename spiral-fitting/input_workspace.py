@@ -98,6 +98,10 @@ class Entry:
         return self.current.content is None
 
     def status(self):
+        restore_revision = None
+        if self.deleted and self.accepted != self.persisted:
+            restore_revision = next((revision.number for revision in reversed(self.revisions)
+                                     if revision.content is not None), None)
         return {
             "id": self.identity.id, "kind": self.identity.kind,
             "source": self.identity.source, "role": self.identity.role,
@@ -107,8 +111,8 @@ class Entry:
             "content": self.current.content.json() if self.current.content else None,
             "errors": [{"revision": number, "stage": stage, "message": message}
                        for number, stage, message in self.errors],
-            "can_restore": (self.deleted and self.accepted != self.persisted
-                            and any(revision.content for revision in self.revisions)),
+            "can_restore": restore_revision is not None,
+            "restore_revision": restore_revision,
         }
 
 

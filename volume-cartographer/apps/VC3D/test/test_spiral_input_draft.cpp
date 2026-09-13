@@ -58,6 +58,24 @@ private slots:
         QCOMPARE(draft.snapshot().content.manifest.value("points").toInt(), 3);
     }
 
+    void importedDeletionRestoresServiceRevision()
+    {
+        InputDraft draft("fiber", {{{"restore_revision", 4}}, true}, 4,
+                         InputDraftContent{{{"restore_revision", 3}}, false});
+        draft.reconcileServiceCursors(4, 1);
+        QVERIFY(!draft.dirty());
+        QVERIFY(draft.canRestore());
+        draft.restore();
+        QVERIFY(draft.dirty());
+        QVERIFY(!draft.deleted());
+        QCOMPARE(draft.snapshot().content.manifest.value("restore_revision").toInt(), 3);
+        QCOMPARE(draft.snapshot().expectedAccepted, quint64(4));
+        draft.discardLocalChanges();
+        QVERIFY(draft.canRestore());
+        draft.acknowledgePersisted(4);
+        QVERIFY(!draft.canRestore());
+    }
+
     void restoreRetainsInvalidity()
     {
         InputDraft draft("fiber", {}, 1);

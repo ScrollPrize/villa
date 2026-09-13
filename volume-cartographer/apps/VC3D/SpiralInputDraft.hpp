@@ -31,9 +31,10 @@ struct InputDraftSnapshot {
 
 class InputDraft {
 public:
-    InputDraft(QString id, InputDraftContent content, quint64 accepted = 0)
+    InputDraft(QString id, InputDraftContent content, quint64 accepted = 0,
+               std::optional<InputDraftContent> beforeDelete = std::nullopt)
         : _id(std::move(id)), _content(std::move(content)),
-          _acceptedContent(_content), _accepted(accepted),
+          _acceptedContent(_content), _beforeDelete(std::move(beforeDelete)), _accepted(accepted),
           _applied(accepted), _persisted(accepted),
           _acceptedLocal(accepted ? 1 : 0)
     {
