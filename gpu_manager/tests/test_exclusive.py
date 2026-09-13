@@ -33,6 +33,29 @@ def marker_command(path):
     return [sys.executable, "-c", "import pathlib,sys,os; pathlib.Path(sys.argv[1]).write_text(os.environ['CUDA_VISIBLE_DEVICES'])", str(path)]
 
 
+def test_fixed_nonexclusive_command_shares_inventory(tmp_path):
+    e = engine()
+    donor = register(e, max_cpu_cores=8, max_gpus=1,
+        min_vram_bytes_per_gpu=40, max_vram_bytes_per_gpu=40,
+        allowed_gpu_uuids=["GPU-b"], priority=0, exclusive=False)
+    report(e, donor, "applied")
+    marker = tmp_path / "shared"
+    assert run_exclusive(marker_command(marker), socket="unused", gpu_uuids=["GPU-a"],
+        client_factory=memory_client(e), poll_interval=.01, priority=0,
+        exclusive=False, cpu_cores=4, vram_bytes_per_gpu=30) == 0
+    assert marker.read_text() == "GPU-a"
+    task = max(e.tasks.values(), key=lambda t: t["order"])
+    assert not task["request"]["exclusive"] and not task["pausable"] and not task["adaptable"]
+    assert task["request"]["max_vram_bytes_per_gpu"] == 30
+    assert e.tasks[donor["task"]["task_id"]]["phase"] == "applied"
+
+
+def test_nonexclusive_requires_explicit_budgets(tmp_path):
+    with pytest.raises(ValueError, match="explicit CPU"):
+        run_exclusive(marker_command(tmp_path / "no"), socket="unused", gpu_uuids=["GPU-a"],
+            client_factory=memory_client(engine()), exclusive=False)
+
+
 def test_exclusive_waits_for_donor_and_gates_before_applied(tmp_path):
     e = engine()
     donor = register(e)

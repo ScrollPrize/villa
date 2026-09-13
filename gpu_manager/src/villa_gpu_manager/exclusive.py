@@ -198,7 +198,9 @@ class ExclusiveTask:
     Cleanup must verifiably join workers before the lease releases ownership.
     """
     def __init__(self, path, grant, *, label, priority=0, poll_seconds=.1,
-                 client_factory=Client, stop_event=None, cleanup_timeout=30.0):
+                 client_factory=Client, stop_event=None, cleanup_timeout=30.0, exclusive=True):
+        if type(exclusive) is not bool:
+            raise ValueError("exclusive must be boolean")
         if type(priority) is not int or poll_seconds <= 0 or cleanup_timeout <= 0:
             raise ValueError("integer priority and positive intervals required")
         if (type(grant["cpu_cores"]) is not int or grant["cpu_cores"] < 1 or
@@ -212,7 +214,7 @@ class ExclusiveTask:
         max_cpu = grant["cpu_cores"] * len(sizes) * max(sizes) // sum(sizes)
         self.request = dict(max_cpu_cores=max_cpu, max_gpus=len(sizes),
             min_vram_bytes_per_gpu=min(sizes), max_vram_bytes_per_gpu=max(sizes),
-            allowed_gpu_uuids=sorted(grant["gpus"]), priority=priority, exclusive=True)
+            allowed_gpu_uuids=sorted(grant["gpus"]), priority=priority, exclusive=exclusive)
         self.client = client_factory(path)
         self.label, self.poll_seconds = label, poll_seconds
         self.stop_event, self.cleanup_timeout = stop_event, cleanup_timeout
@@ -248,7 +250,7 @@ class ExclusiveTask:
             if task["granted"] != self.grant:
                 raise RuntimeError("manager granted only part of the requested CPU/devices/VRAM; not launching")
             self.epoch, self.generation = self.client.epoch, task["generation"]
-            print(f"gpu-manager task={self.client.task_id} exclusive grant={self.grant}", flush=True)
+            print(f"gpu-manager task={self.client.task_id} exclusive={self.request['exclusive']} grant={self.grant}", flush=True)
             return self
         except BaseException:
             self.close("failed before worker startup")
@@ -323,7 +325,8 @@ class ExclusiveTask:
 @_termination_signals
 def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-evaluation",
                   environment=None, poll_interval=1.0, stop_event=None,
-                  client_factory=Client, cleanup_timeout=30.0, before_authorize=None):
+                  client_factory=Client, cleanup_timeout=30.0, before_authorize=None,
+                  exclusive=True, cpu_cores=None, vram_bytes_per_gpu=None):
     """Gated command adapter around ExclusiveTask; no unmanaged fallback.
 
     The caller may bootstrap the shared manager before calling. An independent
@@ -338,11 +341,13 @@ def run_exclusive(command, *, socket, gpu_uuids, priority=100, label="fiber-eval
         client.close()
     if not set(gpu_uuids) <= inventory["gpus"].keys():
         raise ValueError("requested GPUs are not in the manager inventory")
-    grant = dict(cpu_cores=inventory["cpu_cores"],
-                 gpus={gpu: inventory["gpus"][gpu] for gpu in gpu_uuids})
+    if not exclusive and (cpu_cores is None or vram_bytes_per_gpu is None):
+        raise ValueError("non-exclusive command requires explicit CPU and VRAM budgets")
+    grant = dict(cpu_cores=inventory["cpu_cores"] if cpu_cores is None else cpu_cores,
+                 gpus={gpu: inventory["gpus"][gpu] if vram_bytes_per_gpu is None else vram_bytes_per_gpu for gpu in gpu_uuids})
     lease = ExclusiveTask(socket, grant, label=label, priority=priority,
         poll_seconds=poll_interval, stop_event=stop_event, client_factory=client_factory,
-        cleanup_timeout=cleanup_timeout)
+        cleanup_timeout=cleanup_timeout, exclusive=exclusive)
     outcome = "failed"
     try:
         lease.__enter__()
