@@ -1,5 +1,18 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Trace comparison reporting
+
+- The five-scroll aggregate is Classic's exact arithmetic mean multiplied by
+  the geometric mean of five model/Classic per-scroll mean-distance ratios.
+  Each scroll has equal proportional influence. Label as Classic-normalized
+  score (mm-equivalent), not an observed mean tracing distance.
+- Require one Classic baseline with positive finite means and identical
+  evaluation coverage across models. Retain all per-scroll trace metrics.
+- Snapshot labels identify sample/update count, raw/EMA kind and finetuning;
+  include selection reason and test loss; checkpoint provenance records its
+  exact metric name. This changes reporting only, not
+  training losses or best-checkpoint selection.
+
 ## Optional within-scroll sampling groups
 
 - Scroll-balanced arclength sampling may assign every dataset within a scroll

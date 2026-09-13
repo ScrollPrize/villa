@@ -50,8 +50,8 @@
     "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json"
   },
   "production_stop": {
-    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_164113",
-    "samples": 2700800
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",
+    "samples": 6336000
   },
   "comparison_followup": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_155840",
@@ -65,15 +65,32 @@
     "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_finetune_5scroll_s1a_ema_lr0001.json"
   },
   "trace_series": {
-    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/compare_5scroll_s1a_128_sd1_16x8_ema_500k-20260912_164113",
-    "run": "/ephemeral/hendrik/fiber3d_train2/runs/compare_5scroll_s1a_128_sd1_16x8_ema_500k_20260912_164117",
-    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m",
-    "variants": ["current999", "current99", "current"],
+    "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001_20260912_223743",
+    "output": "/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_best_emas_20260913",
+    "variants": ["best99", "best999"],
+    "expected_training_state": "dead",
     "template": "vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
     "baselines": [
       {"name":"Classic", "output":"/ephemeral/hendrik/fiber3d_train2/evaluations/classic_full_dynamic256_b8_20260911_v3_heap"},
+      {"name":"NML raw 600k", "output":"/ephemeral/hendrik/fiber3d_train2/evaluations/compare_s1a_600k_best_raw_20260912"},
+      {"name":"NML EMA 600k", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/s1a_600k_ema"},
+      {"name":"JSON raw 600k", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_raw"},
+      {"name":"JSON EMA 600k", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/json_600k_ema"},
+      {"name":"Combined raw 600k", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/raw"},
+      {"name":"Combined EMA 600k", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_600k_20260912/ema"},
+      {"name":"Early current999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/current999"},
+      {"name":"Early best999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/best999"},
+      {"name":"Early best99", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_three_ema_20260912/best99"},
       {"name":"Best EMA99", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_best_pair_20260912_19m/best99-retry1"},
-      {"name":"Best EMA999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_best_pair_20260912_19m/best999"}
+      {"name":"Best EMA999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_best_pair_20260912_19m/best999"},
+      {"name":"Previous current999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current999"},
+      {"name":"Previous current99", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current99"},
+      {"name":"Previous raw", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/combined_current_three_20260912_26m/current"},
+      {"name":"Finetune current999", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current999"},
+      {"name":"Finetune current99", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current99"},
+      {"name":"Finetune current", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/current"},
+      {"name":"Finetune best", "output":"/ephemeral/hendrik/fiber3d_train2/comparisons/finetune_four_20260913/best"}
     ]
   }
 }
