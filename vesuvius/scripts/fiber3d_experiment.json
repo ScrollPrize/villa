@@ -1,7 +1,7 @@
 {
   "embedding_consistency": {
-    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_embedding_128_sd1_16x8_ema_20260913_094346/snapshots/current.pt",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_consistency_20260913_v1",
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_121417/snapshots/current.pt",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_consistency_20260913_contrastive_v1",
     "template": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/eval_collection_182306_best11k_full.json",
     "cache_root": "/ephemeral/hendrik/fiber3d_train/chunk_cache",
     "tile": 256, "overlap": 64, "border": 16, "chunk": 32,

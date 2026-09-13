@@ -37,7 +37,7 @@ CPU_TESTS = [
 ]
 SUITES = {
     "local-competition": ["tests/neural_tracing/test_local_competition.py", "tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_single_backward.py"],
-    "embedding-consistency": ["tests/neural_tracing/test_embedding_consistency.py"],
+    "embedding-consistency": ["tests/neural_tracing/test_embedding_consistency.py", "tests/neural_tracing/test_embedding_histograms.py"],
     "embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_single_backward.py"],
     "embedding-data": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "real_data_preflight", "-s"],
     "cuda-embedding": ["tests/neural_tracing/test_fiber_embeddings.py", "-k", "cuda_embedding", "-s"],

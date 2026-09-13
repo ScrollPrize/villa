@@ -1,24 +1,25 @@
-# Implementation plan
+# Plan
 
-1. Preserve legacy pairwise objective for old configs; new explicit local_contrastive mode uses32 negatives per anchor, negative budget65536 at128patch, positive budget1/32. Temperature0.1 and margin0.2 are initial configurable choices. Stable logsumexp([0,(negative-positive+margin)/temperature]); fixed anchor-count denominator, no cross-patch competition. Empty eligible presence gives zero numerator with fixed budget.
-2. Add dedicated contrastive sufficient-statistic component; share target counts with prepass and one-backward accumulation. Preserve legacy numerics. Sampling deterministic per patch, no gradients through presence. Native normal/ellipse/queue unchanged.
-3. Collect detached per-patch positive/negative cosine means/percentiles, negative>0.9 fraction, mean hardest-negative and gap during testing only, reusing pair computations. Log clearly labeled patch-averaged diagnostics, weighted by patch count across microbatches/test rows; no averaging quantiles under a claim of global quantiles. Raw+EMA. No extra model forward/backward.
-4. Regression tests: budget, logsumexp math/hard-negative weighting, detached presence, zero candidates, partition invariance, one backward and metric aggregation. Managed GPU tests via approved caller.
-5. New explicit combined contrastive config; stop current run using approved tree-aware command; launch fresh atLR0.01 with manager and verify test metrics/finite updates. Log outcomes and limitations.
+## Follow-up: cosine histograms
+Use saved results only (CPU, no GPU interruption). Plot equal-scroll aggregate
+and per-scroll positive/negative cosine histograms. Positives are all distinct
+GT point pairs in each saved blended window; negatives are the saved unblended
+same-tile GT/off-GT pairs. Label this distinction and do not manufacture
+matched-anchor gap distributions. Show all negatives and presence>=0.5 subset,
+normalize each distribution separately, report counts and quantiles. Add small
+CPU tests for pair construction and histogram normalization. Save PNG, SVG,
+numeric summary and a short reproducible documentation note. No loss changes.
+
+1. Use existing approved embedding-consistency runner, current raw snapshot of the contrastive run, new output directory; retain other settings.
+2. Independently review this plan. Freeze snapshot via existing evaluator and record exact step, samples and SHA. Exclusive manager allocation pauses training.
+3. Compare same-point overlap, along-GT within/blended/boundary cosines, high-presence off-GT similarity and cancellation against previous report.
+4. Record results in a new report and brief task log; verify manager release and training continuation. No training or tracer changes.
 
 ## Spec update
-Opt-in local competition alongside legacy objective; fixed target-only denominator and test-only diagnostics. No manager protocol or native reader changes.
+None. Preserve ten-window pilot, conservative >80-base-voxel off-GT controls (not exact training ellipse distribution), FP32 vector blending and hypothetical storage boundaries (no serialization test).
 
 ## Docs updates
-Embedding objective/options, metric definitions, fresh config and task status/log.
+New comparison report with provenance and limitations; retain previous report.
 
-## Validation
-Independent agent plan review; CPU+manager GPU oracle; real managed startup.
-
-Review refinements: scale the negative budget linearly and round to a multiple
-of K. Undefined negative diagnostics contribute no values/counts, not cosine0;
-report per-metric patch coverage. Verify old root dead and new command has no
-resume. Measure isolated GPU loss time/memory, not an inferred full-pipeline speed.
-
-## Changelog
-Record local competition and fresh production launch.
+## Validation and changelog
+Existing runner unchanged; verify all ten cases finish and frozen snapshot identity. Document results, not a claimed full 50-fiber trace benchmark or matched-age training ablation.

@@ -1,16 +1,27 @@
-# Local contrastive competition
+# Contrastive embedding analysis
 
-- Replacement run `combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_121417`: initial tests40.649s; approved production-embedding-metrics verified all24 raw/EMA scalar tags. Real optimizer updates1–3 completed (128–384samples), finite total7.2175→6.5520 and embedding4.7032→4.3170, fixed262144anchor denominator. Startup microbatch1 measurement completed and microbatch2 initialization began. Adaptive handoff/steady-state throughput not yet claimed. No tracer changes or changes to the existing data balance/native normal eligibility.
+- Follow-up histograms: independent review approved. Added CPU-only saved-result
+  plotting via approved embedding-histograms command. All unordered within-window
+  blended GT pairs versus original unblended negative controls; distinction labeled.
+  PNG/SVG/JSON saved beside results; equal-scroll binned overlap2.73% (not error rate).
+  Five CPU tests passed in1.90s; visually inspected PNG. No GPU use/training pause.
 
-- First fresh launch passed initial evaluation but failed entering training: MacroBatchTargetSource.__next__ still allocated five counters. Removed that duplicated layout assumption; initialize from the real target-count tensor. Added full two-microbatch prepass regression (not merely _counts). CPU rerun:55 passed,7 gated skips in15.66s. Failed root verified dead; restarted fresh root3343490 at12:14:14, no checkpoint resume.
+- Completed unchanged analysis: 10 matching fiber windows/coordinates/handoffs,
+  48 tile forwards, one managed GPU, 34.5s excluding grant/model startup.
+  Frozen raw update2100,268800samples,SHA46ff8c8320a7787d1d4209fe0dbf8b9e3aea8f1e40a2314b9be708ded7489eb6.
+- New high-presence controls: 0/1024 cosine>0.9; all controls 0/7899.
+  Equal-scroll overlap cosine0.898922, blended interior0.957121/switch0.952987.
+  Separation improved markedly, cross-tile consistency decreased. Different
+  training ages and model-dependent presence subsets limit causal comparison.
+- Saved docs/embedding_consistency_contrastive_20260913.md with full per-scroll
+  tables. Did not run old report generator because it hardcodes prior conclusions.
+  No code changes/tests needed for unchanged analyzer; real ten-case run succeeded.
+- Manager released exclusive analysis; training resumed on eight GPUs, generation3,
+  and completed update2200 (281600samples). No training stop or restart command used.
 
-- Previous state committed as242c9f50f before edits. New task: per-anchor competition/test diagnostics/fresh replacement training.
-- Independent plan reviewed by review_competition; incorporated budget rounding, undefined-negative coverage and fresh-start/measurement requirements.
-- Implemented explicit local_contrastive objective (T0.1,margin0.2,K32), dedicated contrastive sufficient statistic and6-component target prepass/one-backward accumulator. Legacy pairwise mode remains unchanged. No change to native normals/ellipse or presence sampling.
-- Raw/EMA tests reuse detached pair samples; per-patch quantiles/means aggregated with per-metric contributing-patch counts. Undefined negative metrics omitted. No extra model forward or training diagnostic computation.
-- CPU validation via approved run_fiber3d_cooperative_tests:54 passed,6 gated skips in21.48s. Includes exact scalar oracle, hard-negative gradient emphasis, empty budget, detached presence, uneven microbatch/zero-work ranks and one backward.
-- First manager-exclusive CUDA suite:5 passed in35.42s; new BF16 gradient relativeL2=.0023967 versus full physical-batch oracle. FP32 all gradients pass tolerance. Isolated loss one GPU/one128input patch/16channels/32output:median old2.659ms,new2.553ms (5 measured after warmup), peaks44.7MB vs29.2MB. Diagnostic first-call overhead prompted warmed repeated measurement and shared percentile sort.
-- Old production run stopped with approved production-stop; root verified dead and manager reports finished/released. Last logged update6700 (857600samples); snapshots retained. It is not paused awaiting replacement.
-- Warm GPU rerun:5 passed in35.96s. Old pairwise fwd+bwd min/median/max2.461/2.486/3.160ms; local competition2.339/2.363/2.521ms. New test forward including diagnostics1.749/1.781/1.952ms after warmup (oneGPU/onepatch,5 measured,FP32 loss tensors; excludes model/loader). No full training throughput claim.
-- Fresh production-start launched root3075960; log /ephemeral/hendrik/fiber3d_train2/runs/.launches/combined_5scroll_s1a_contrastive_128_sd1_16x8_ema-20260913_120619/train.log. New config no resume; LR0.01 peak with retained warmup.
-- Initial real raw+EMA tests completed step0 in41.36s total:contrastive loss4.677036; positive mean.8963,negative mean.7825,negative>0.9 fraction.0832,hardest negative.9238,gap-.0276. Same values for both EMA tracks at initialization, as expected. Run dir combined_5scroll_s1a_contrastive_128_sd1_16x8_ema_20260913_120621; standard /ephemeral/hendrik/fiber3d_train2/runs root. Automatic calibration is real training, not a separate discarded run.
+- Independent review approved unchanged protocol; verify identical case windows,
+  report model-dependent high-presence counts and avoid stale autogenerated conclusions.
+- Approved embedding-consistency runner obtained exclusive manager grant on one GPU;
+  training released its allocation. Analysis running, no training changes.
+
+- Selected current raw from contrastive run 20260913_121417; existing ten-window protocol unchanged. New output preserves the previous pairwise analysis.

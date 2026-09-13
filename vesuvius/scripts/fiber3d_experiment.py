@@ -675,6 +675,9 @@ def inspect():
 
 
 def main():
+    if sys.argv[1:] == ['embedding-histograms']:
+        return subprocess.call([sys.executable, '-m',
+            'vesuvius.neural_tracing.fiber_trace_3d.embedding_histograms', str(CONTROL)])
     if sys.argv[1:] == ['production-embedding-metrics']:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
         config = json.loads((ROOT / json.loads(CONTROL.read_text())['production']['config']).read_text())

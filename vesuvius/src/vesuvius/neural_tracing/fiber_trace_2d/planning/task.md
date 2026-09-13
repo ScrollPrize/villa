@@ -1,3 +1,6 @@
-# Local contrastive competition and fresh training
+# Contrastive embedding consistency
 
-Commit previous state first. Replace the production embedding objective with within-patch per-anchor positive/negative competition:65536 negative pairs and2048 positives at128patch,32 negatives per anchor. Preserve presence sampling/native normal ellipse. Add positive/negative cosine distributions, >0.9 fraction, hardest-negative and positive-hardest gap as observation-only regular test metrics (raw and EMA). Preserve one backward and exact macro-batch normalization. Validate, stop old run reliably, start fresh LR0.01 combined five-scroll JSON+Paris4 NML/JSON training; retain EMA and balanced data. No tracer changes.
+Follow-up: show positive/negative cosine histograms from the saved results so
+their distributional overlap is visible without rerunning inference.
+
+Rerun the existing chunk-boundary/blending and GT/off-GT similarity analysis on the new contrastive training's current raw snapshot. Keep the previous protocol and compare results. Let training pause/resume through the manager; do not stop it.
