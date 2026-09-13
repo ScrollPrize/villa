@@ -483,10 +483,16 @@ void validateTraceConfig(const FiberTraceConfig& config)
     if (config.embeddingAnchorCount < 1 || config.embeddingAnchorCount > 8 ||
         !std::isfinite(config.embeddingAnchorEmaMix) || config.embeddingAnchorEmaMix < 0 || config.embeddingAnchorEmaMix > 1)
         throw std::invalid_argument("invalid embedding anchor count/EMA mix");
-    if (config.embeddingAnchorAggregation != "best" && config.embeddingAnchorAggregation != "mean")
+    if (config.embeddingAnchorAggregation != "best" && config.embeddingAnchorAggregation != "mean" && config.embeddingAnchorAggregation != "support-softmin")
         throw std::invalid_argument("invalid embedding anchor aggregation");
-    if ((mode == "anchors" || mode == "appearance") && config.embeddingAnchorAggregation != "best")
+    if (mode == "anchors" && config.embeddingAnchorAggregation != "best")
         throw std::invalid_argument("representative anchors use best aggregation");
+    if ((mode == "appearance" && config.embeddingAnchorAggregation == "mean") ||
+        (mode != "appearance" && config.embeddingAnchorAggregation == "support-softmin"))
+        throw std::invalid_argument("support-softmin requires appearance mode; appearance supports best or support-softmin");
+    if (!std::isfinite(config.embeddingAnchorNovelty) || config.embeddingAnchorNovelty < 0 || config.embeddingAnchorNovelty > 2 ||
+        !std::isfinite(config.embeddingAnchorTemperature) || config.embeddingAnchorTemperature <= 0)
+        throw std::invalid_argument("invalid anchor novelty/temperature");
     if (!std::isfinite(config.embeddingEmaHalfLifeBaseVoxels) || config.embeddingEmaHalfLifeBaseVoxels <= 0)
         throw std::invalid_argument("embedding EMA half life must be positive");
     if (config.embeddingHistoryFalloff != "uniform" && config.embeddingHistoryFalloff != "linear" &&
@@ -683,7 +689,8 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     const bool lru = config.embeddingReferenceMode == "anchors-lru";
     const bool appearance = config.embeddingReferenceMode == "appearance";
     const double cost = (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
-        (1-config.embeddingAnchorEmaMix) * (appearance ? fiberEmbeddingAppearanceCost(vector,parent.embeddingAppearance) : lru ? fiberEmbeddingLruCost(vector,parent.embeddingLru,
+        (1-config.embeddingAnchorEmaMix) * (appearance ? fiberEmbeddingAppearanceCost(vector,parent.embeddingAppearance,
+            config.embeddingAnchorAggregation == "support-softmin" ? config.embeddingAnchorTemperature : 0) : lru ? fiberEmbeddingLruCost(vector,parent.embeddingLru,
             config.embeddingAnchorAggregation == "mean") : fiberEmbeddingAnchorCost(vector, parent.embeddingHistory, parent.embeddingAnchors)) +
         config.embeddingAnchorEmaMix * fiberEmbeddingMemoryCost(vector, parent.embeddingMemory, false) :
         ema ? fiberEmbeddingMemoryCost(vector, parent.embeddingMemory,
@@ -1440,7 +1447,7 @@ void updateTargetPlaneCrossings(
                 config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount);
         else if (config.embeddingReferenceMode == "anchors-lru")
             advanceFiberEmbeddingLru(out.embeddingLru,score.embedding,out.tracedLength * config.traceToBaseScale,
-                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount);
+                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount,config.embeddingAnchorNovelty);
         else advanceFiberEmbeddingAnchors(out.embeddingHistory, out.embeddingAnchors, score.embedding,
             out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
             config.embeddingHistoryWindowBaseVoxels, config.embeddingHistoryCount, config.embeddingAnchorCount);

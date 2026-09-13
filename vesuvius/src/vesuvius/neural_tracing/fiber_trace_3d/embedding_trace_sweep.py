@@ -59,6 +59,14 @@ def search_weight(execute, *, history=None, start_weight=.25):
 def refine_families(execute, families):
     """Finite coordinate descent; each family starts from its own seed, not global best."""
     cache, winners = {}, []
+    for family in families:
+        axes = family['axes']
+        if not axes or any(not isinstance(v,list) or not v for v in axes.values()):
+            raise ValueError('refinement requires nonempty finite axes')
+        configured_variants({'candidates':[family['seed']]})
+        for axis, values in axes.items():
+            for value in values:
+                configured_variants({'candidates':[dict(family['seed'],**{axis:value})]})
     def evaluate(parameters):
         validated = configured_variants({'candidates':[parameters]})[-1]
         validated.pop('name')
@@ -72,8 +80,6 @@ def refine_families(execute, families):
     for family in families:
         current = dict(family['seed'])
         axes = family['axes']
-        if not axes or any(not isinstance(v,list) or not v for v in axes.values()):
-            raise ValueError('refinement requires nonempty finite axes')
         while True:
             previous = evaluate(current)
             for axis, values in axes.items():
@@ -98,7 +104,7 @@ def configured_variants(settings):
     rows = list(variants(True))
     for i, candidate in enumerate(custom):
         required = {"weight", "spacing", "window", "count", "falloff"}
-        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life", "anchors", "ema_mix", "aggregation"}:
+        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life", "anchors", "ema_mix", "aggregation", "novelty", "temperature"}:
             raise ValueError("candidate must contain only embedding weight/spacing/window/count/falloff")
         if any(not isinstance(candidate[k], (int, float)) or not math.isfinite(candidate[k]) or candidate[k] <= 0
                for k in ("spacing", "window")):
@@ -122,10 +128,16 @@ def configured_variants(settings):
         mix = candidate.get('ema_mix', .5)
         if not isinstance(mix, (int, float)) or not math.isfinite(mix) or not 0 <= mix <= 1:
             raise ValueError('invalid anchor EMA mix')
-        if candidate.get('aggregation','best') not in ('best','mean'):
+        if candidate.get('aggregation','best') not in ('best','mean','support-softmin'):
             raise ValueError('invalid anchor aggregation')
-        if mode in ('anchors','appearance') and candidate.get('aggregation','best') != 'best':
+        if mode == 'anchors' and candidate.get('aggregation','best') != 'best':
             raise ValueError('representative anchors require best aggregation')
+        if (mode == 'appearance' and candidate.get('aggregation') == 'mean') or (mode != 'appearance' and candidate.get('aggregation') == 'support-softmin'):
+            raise ValueError('support-softmin requires appearance; appearance does not use mean')
+        for key, default, lower, upper in [('novelty',0,0,2),('temperature',.1,0,float('inf'))]:
+            value=candidate.get(key,default)
+            if not isinstance(value,(int,float)) or not math.isfinite(value) or value < lower or value > upper or (key=='temperature' and value==0):
+                raise ValueError('invalid anchor '+key)
         rows.append(dict(candidate, name=f"candidate-{i:03d}"))
     return rows
 
@@ -176,7 +188,7 @@ def run(settings):
             evaluation['trace_args'] += ['--embedding-reference-mode', variant['mode']]
         if 'half_life' in variant:
             evaluation['trace_args'] += ['--embedding-ema-half-life-base-voxels', str(variant['half_life'])]
-        for key, flag in [('anchors', 'anchor-count'), ('ema_mix', 'anchor-ema-mix'), ('aggregation','anchor-aggregation')]:
+        for key, flag in [('anchors', 'anchor-count'), ('ema_mix', 'anchor-ema-mix'), ('aggregation','anchor-aggregation'), ('novelty','anchor-novelty'), ('temperature','anchor-temperature')]:
             if key in variant:
                 evaluation['trace_args'] += ['--embedding-'+flag, str(variant[key])]
         atomic_write(output / (variant["name"] + ".json"), evaluation)
@@ -243,7 +255,7 @@ def run(settings):
         if len(completed) != len(scheduled):
             raise RuntimeError("full history grid incomplete; cannot select winner")
         best = min(completed, key=lambda v: v["failures"])
-    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life", "anchors", "ema_mix", "aggregation") if k in best}, "name":"repeat-best"})
+    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life", "anchors", "ema_mix", "aggregation", "novelty", "temperature") if k in best}, "name":"repeat-best"})
     report["best"] = best["name"]
     report["repeat_identical"] = repeated.get("replay_hash") == best["replay_hash"]
     atomic_write(output / "report.json", report)

@@ -146,6 +146,45 @@ TEST_CASE("whole path appearance preserves support and old modes without expiry"
     CHECK(diverse.clusters[0].centroid[1]==doctest::Approx(.6/std::sqrt(3.6)));
 }
 
+TEST_CASE("novelty admission touches existing LRU without replacing familiar anchors")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingLru state;
+    advanceFiberEmbeddingLru(state,{1,0},0,10,2,.5);
+    advanceFiberEmbeddingLru(state,{0,1},10,10,2,.5);
+    advanceFiberEmbeddingLru(state,{.8f,.6f},20,10,2,.5);
+    CHECK(state.entries.size()==2);
+    CHECK(state.entries[0].vector==std::vector<float>{1,0});
+    CHECK(state.lastUsed[0]==20);
+    CHECK(state.lastAdmission==20);
+    advanceFiberEmbeddingLru(state,{-1,0},29,10,2,.5);
+    CHECK(state.entries[0].vector==std::vector<float>{1,0});
+    advanceFiberEmbeddingLru(state,{-1,0},30,10,2,.5);
+    CHECK(state.entries[0].vector==std::vector<float>{0,1});
+    CHECK(state.entries[1].vector==std::vector<float>{-1,0});
+    CHECK_THROWS(advanceFiberEmbeddingLru(state,{1,0},40,10,2,-1));
+}
+
+TEST_CASE("supported appearance softmin is normalized and split invariant")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingAppearance state;
+    state.clusters={{{18,0,0},{1,0,0},18},{{0,2,0},{0,1,0},2}};
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state)==0);
+    const double soft=fiberEmbeddingAppearanceCost({0,1,0},state,.1);
+    CHECK(soft==doctest::Approx(-.1*std::log(.1+.9*std::exp(-10))));
+    CHECK(fiberEmbeddingAppearanceCost({0,0,1},state,.1)==doctest::Approx(1));
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state,.00001)<.00003);
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state,10000)==doctest::Approx(.9).epsilon(.0001));
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state,1e100)==doctest::Approx(.9));
+    state.clusters[1].support=1;
+    state.clusters.push_back(state.clusters[1]);
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state,.1)==doctest::Approx(soft));
+    state.clusters.resize(1);
+    CHECK(fiberEmbeddingAppearanceCost({0,1,0},state,.1)==doctest::Approx(1));
+    CHECK_THROWS(fiberEmbeddingAppearanceCost({1,0,0},state,-1));
+}
+
 TEST_CASE("representative anchors cover frequent and distinct appearances deterministically")
 {
     using namespace vc::fiber_tracer;

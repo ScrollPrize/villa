@@ -63,6 +63,8 @@ void printUsage(const char* argv0)
         << "  --embedding-anchor-ema-mix N    EMA cost fraction [0.5], anchor fraction=1-N\n"
         << "  --embedding-anchor-aggregation MODE best|mean for anchors-lru; spacing limits admission\n"
         << "  appearance reference mode uses whole-path spherical centroids (no age expiry)\n"
+        << "  --embedding-anchor-novelty D minimum insertion distance for LRU (default 0)\n"
+        << "  --embedding-anchor-temperature T positive temperature for appearance support-softmin\n"
         << "  --embedding-history-spacing-base-voxels N  reference spacing [32]\n"
         << "  --embedding-history-window-base-voxels N   reference window [256]\n"
         << "  --embedding-history-count N     maximum references per hypothesis [8]\n"

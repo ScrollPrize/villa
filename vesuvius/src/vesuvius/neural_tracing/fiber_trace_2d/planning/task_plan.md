@@ -7,6 +7,15 @@
 5. Sweep K2/4/8, short bank32 samples spacing128/window4096 and long bank64 spacing256/window16384; anchor-only and half EMA mixture. Same .25 weight, manager nonexclusive20GiB/16CPU and cached inference extension. Repeat best exactly. Compare against69, full tables/timings. Refine useful anchor mixture/weight if promising; otherwise inspect promising EMA half-life neighbors256/384/640/768/1024 as an additional approach. Continue sensible measured refinements until improvement stabilized or no supported next acceleration/quality idea remains.
 
 ## Spec update
+Algorithmic refinements after initial grids (independently reviewed):
+- LRU novelty gate: touch closest at observation cadence, but insert only if its
+  cosine distance is at least novelty threshold. Threshold0 preserves prior LRU.
+- Whole-path support-softmin: normalized cluster support weights and temperature
+  combine costs as `min(c)-T*log(sum p*exp(-(c-min(c))/T))`. This requires stronger
+  support than hard nearest matching. Stable expm1/log1p at large temperatures.
+  Retain hard-min default; test normalization, one-cluster and split invariance.
+Sweep these mechanisms separately, then refine each family's own best settings.
+
 After LRU: replace the restricted rolling-bank appearance model with whole-path
 bounded representative/diverse anchors. No distance expiry. Retain accumulated
 support when compressing observations; explicitly test that old supported

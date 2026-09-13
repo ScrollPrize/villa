@@ -71,6 +71,27 @@ improvement. Keep both nearest and mean seeds for refinement. Report:
 
 ## Reproduction commands
 
+## Initial whole-path grid
+
+Spherical summaries preserve whole-path mass, no expiry. Weight.25; nearest
+centroid alone or half EMA512. All12 variants complete, controls/repeat exact.
+
+| Capacity | Admission spacing | Nearest | Half EMA |
+|---|---:|---:|---:|
+|2|128|81|78|
+|2|512|72|81|
+|4|128|78|83|
+|4|512|75|84|
+|8|128|84|84|
+|8|512|76|84|
+
+Best72 vs EMA69. Report `embedding_ema99_appearance_20260913_v1/report.json`.
+Next: novelty-gated LRU and support-softmin appearance, then refine each family.
+The initial whole-path implementation passed2native tests1.95s and115Python
+tests45.24s, log `cooperative-tests/20260913_215750_020249`.
+
+## Commands and environment
+
 Approved commands (settings in `vesuvius/scripts/fiber3d_experiment.json`):
 
 ```bash

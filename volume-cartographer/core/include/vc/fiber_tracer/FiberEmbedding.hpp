@@ -144,10 +144,11 @@ struct FiberEmbeddingLru {
 };
 
 inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector<float>& vector,
-    double arc, double spacing, size_t capacity)
+    double arc, double spacing, size_t capacity, double novelty = 0)
 {
     if (capacity < 1 || capacity > 8 || vector.empty() || !std::isfinite(arc) ||
-        !std::isfinite(spacing) || spacing <= 0) throw std::invalid_argument("invalid embedding LRU admission");
+        !std::isfinite(spacing) || spacing <= 0 || !std::isfinite(novelty) || novelty < 0 || novelty > 2)
+        throw std::invalid_argument("invalid embedding LRU admission");
     if (!state.entries.empty() && arc-state.lastAdmission < spacing) return;
     state.lastAdmission = arc;
     if (!state.entries.empty()) {
@@ -158,7 +159,7 @@ inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector
             if (cosine > closest) { closest = cosine; nearest = i; }
         }
         state.lastUsed[nearest] = arc;
-        if (state.entries[nearest].vector == vector) return;
+        if (state.entries[nearest].vector == vector || 1-closest < novelty) return;
         if (state.entries.size() >= capacity) {
             const size_t oldest = std::min_element(state.lastUsed.begin(),state.lastUsed.end())-state.lastUsed.begin();
             state.entries.erase(state.entries.begin()+oldest);
@@ -229,12 +230,25 @@ inline void advanceFiberEmbeddingAppearance(FiberEmbeddingAppearance& state,
 }
 
 inline double fiberEmbeddingAppearanceCost(const std::vector<float>& vector,
-    const FiberEmbeddingAppearance& state)
+    const FiberEmbeddingAppearance& state, double temperature = 0)
 {
     if (state.clusters.empty()) throw std::invalid_argument("empty embedding appearance");
+    if (!std::isfinite(temperature) || temperature < 0)
+        throw std::invalid_argument("invalid embedding appearance temperature");
     double cost = 2;
     for (const auto& cluster : state.clusters)
         cost = std::min(cost,1-fiberEmbeddingCosine(vector,cluster.centroid));
+    if (temperature > 0) {
+        double mass = 0, likelihood = 0;
+        for (const auto& cluster : state.clusters) {
+            if (!cluster.support) throw std::invalid_argument("zero embedding cluster support");
+            mass += cluster.support;
+            const double exponent = -(1-fiberEmbeddingCosine(vector,cluster.centroid)-cost)/temperature;
+            likelihood += cluster.support * (temperature >= 1 ? std::expm1(exponent) : std::exp(exponent));
+        }
+        const double logMean = temperature >= 1 ? std::log1p(likelihood/mass) : std::log(likelihood/mass);
+        return std::clamp(cost-temperature*logMean,0.0,2.0);
+    }
     return cost;
 }
 } // namespace vc::fiber_tracer

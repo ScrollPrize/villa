@@ -97,6 +97,8 @@ struct FiberTraceConfig {
     int embeddingAnchorCount = 4;
     double embeddingAnchorEmaMix = 0.5;
     std::string embeddingAnchorAggregation = "best";
+    double embeddingAnchorNovelty = 0;
+    double embeddingAnchorTemperature = 0.1;
     double stepVoxels = 4.0;
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;

@@ -7174,7 +7174,9 @@
 Whole-path `appearance` mode uses bounded spherical summaries (FP64 sums and
 support) rather than window expiry. Merge minimum incremental spherical error
 when over capacity; deterministic ties and cancellation fallback. Nearest
-normalized centroid cost, optional EMA mix; no support-weighted score. This
+normalized centroid cost by default, optional EMA mix. An explicit support-softmin
+aggregation uses normalized cluster support and positive temperature; minimum-
+shift exp/log (expm1/log1p for large temperature) preserves numerical stability. This
 retains all admitted mass approximately, not every distinct mode independently.
 
 
@@ -7184,3 +7186,5 @@ closest existing anchor, evicts least-recently-used (stable insertion ties), and
 inserts the new observation. Exact duplicates only touch/advance cadence.
 Nearest/mean cosine distance and optional convex EMA mixture score parent state;
 per-beam copies and seed resets prevent sibling/future leakage. Defaults unchanged.
+Optional LRU novelty distance in[0,2] suppresses insertion of familiar observations
+after touching nearest/advancing admission cadence. Zero retains original LRU.

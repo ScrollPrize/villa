@@ -193,6 +193,14 @@ Nearest-centroid cosine cost optionally mixes with EMA. Cluster support affects
 compression, not score weighting. This is approximate streaming clustering;
 bounded capacity can merge rare modes. State remains private per beam/restart.
 
+Optional `--embedding-anchor-aggregation support-softmin` uses cluster support
+fractions p and temperature T (`--embedding-anchor-temperature`, positive):
+`min(c)-T*log(sum p*exp(-(c-min(c))/T))`. Unlike nearest matching, a rare matching
+cluster carries less influence. Small T approaches nearest; large T approaches
+support-weighted mean cost. Stable min-shift and expm1/log1p handle the limits.
+This is an alternative hypothesis, not an assumption that rare appearances are
+incorrect. EMA mixing still applies after this aggregation.
+
 
 Experimental `--embedding-reference-mode anchors-lru` keeps up to
 `--embedding-anchor-count` (1–8) observed vectors with no distance expiry.
@@ -206,6 +214,12 @@ distance, optionally mixed with EMA using `--embedding-anchor-ema-mix`.
 The parent state scores candidates before admission. LRU ignores history window
 and history count; its capacity is anchor count. Closest does not imply a
 confident match. This mode is distinct from windowed medoid selection.
+
+For LRU, `--embedding-anchor-novelty` (default0, cosine distance[0,2]) optionally
+rejects insertion if the observation is already close to an anchor. It still
+touches that closest anchor and advances the observation cadence. Existing
+anchor vectors do not move. This reduces replacement churn; zero preserves
+the ungated LRU policy.
 
 
 See [the full history-spacing/falloff sweep](embedding_history_sweep_20260913.md)
