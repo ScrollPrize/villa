@@ -79,6 +79,97 @@ TEST_CASE("embedding best history and normalized EMA references")
     CHECK_THROWS(fiberEmbeddingMemoryCost({1}, m, false));
 }
 
+TEST_CASE("LRU anchors admit at bounded cadence and touch nearest before eviction")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingLru state;
+    advanceFiberEmbeddingLru(state,{1,0,0},0,10,2);
+    advanceFiberEmbeddingLru(state,{0,1,0},9,10,2);
+    CHECK(state.entries.size()==1);
+    advanceFiberEmbeddingLru(state,{0,1,0},10,10,2);
+    CHECK(state.entries.size()==2);
+    advanceFiberEmbeddingLru(state,{1,0,0},20,10,2);
+    CHECK(state.lastAdmission==20);
+    CHECK(state.lastUsed[0]==20);
+    auto branch=state;
+    advanceFiberEmbeddingLru(branch,{0,0,1},29,10,2);
+    CHECK(branch.entries[1].vector==std::vector<float>{0,1,0});
+    advanceFiberEmbeddingLru(branch,{0,0,1},30,10,2);
+    CHECK(branch.entries[0].vector==std::vector<float>{1,0,0});
+    CHECK(branch.entries[1].vector==std::vector<float>{0,0,1});
+    CHECK(state.entries[1].vector==std::vector<float>{0,1,0});
+    CHECK(fiberEmbeddingLruCost({1,0,0},branch,false)==0);
+    CHECK(fiberEmbeddingLruCost({1,0,0},branch,true)==.5);
+    CHECK_THROWS(advanceFiberEmbeddingLru(branch,{},40,10,2));
+    CHECK_THROWS(advanceFiberEmbeddingLru(branch,{1,0,0},40,10,0));
+}
+
+TEST_CASE("whole path appearance preserves support and old modes without expiry")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingAppearance state;
+    advanceFiberEmbeddingAppearance(state,{1,0},0,10,2);
+    advanceFiberEmbeddingAppearance(state,{0,1},10,10,2);
+    for (int i=2;i<=100;++i) advanceFiberEmbeddingAppearance(state,{0,1},i*1000,10,2);
+    REQUIRE(state.clusters.size()==2);
+    CHECK(state.clusters[0].support==1);
+    CHECK(state.clusters[1].support==100);
+    CHECK(state.clusters[1].sum==std::vector<double>{0,100});
+    CHECK(fiberEmbeddingAppearanceCost({1,0},state)==0);
+    auto branch=state;
+    advanceFiberEmbeddingAppearance(branch,{-1,0},100010,10,2);
+    CHECK(state.clusters[1].support==100);
+    size_t support=0;
+    for (const auto& c:branch.clusters) support+=c.support;
+    CHECK(support==102);
+    FiberEmbeddingAppearance one;
+    advanceFiberEmbeddingAppearance(one,{1,0},0,10,1);
+    advanceFiberEmbeddingAppearance(one,{-1,0},10,10,1);
+    CHECK(one.clusters[0].support==2);
+    CHECK(one.clusters[0].sum==std::vector<double>{0,0});
+    CHECK(fiberEmbeddingAppearanceCost({1,0},one)==0);
+    advanceFiberEmbeddingAppearance(one,{0,1},20,10,1);
+    CHECK(one.clusters[0].sum==std::vector<double>{0,1});
+    CHECK(fiberEmbeddingAppearanceCost({0,1},one)==0);
+    advanceFiberEmbeddingAppearance(one,{1,0},29,10,1);
+    CHECK(one.clusters[0].support==3);
+    CHECK_THROWS(advanceFiberEmbeddingAppearance(one,{},30,10,1));
+    CHECK_THROWS(advanceFiberEmbeddingAppearance(one,{1},30,10,1));
+    CHECK_THROWS(advanceFiberEmbeddingAppearance(one,{1,0},30,10,9));
+    FiberEmbeddingAppearance diverse;
+    advanceFiberEmbeddingAppearance(diverse,{1,0},0,1,2);
+    advanceFiberEmbeddingAppearance(diverse,{0,1},1,1,2);
+    advanceFiberEmbeddingAppearance(diverse,{.8f,.6f},2,1,2);
+    CHECK(diverse.clusters[0].support==2); // closest spherical pair merges
+    CHECK(diverse.clusters[1].centroid==std::vector<float>{0,1});
+    CHECK(diverse.clusters[0].centroid[0]==doctest::Approx(1.8/std::sqrt(3.6)));
+    CHECK(diverse.clusters[0].centroid[1]==doctest::Approx(.6/std::sqrt(3.6)));
+}
+
+TEST_CASE("representative anchors cover frequent and distinct appearances deterministically")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingHistory bank{{0,{1,0}}, {1,{1,0}}, {2,{1,0}}, {3,{0,1}}, {4,{0,1}}, {5,{-1,0}}};
+    CHECK(selectFiberEmbeddingAnchors(bank, 1) == std::vector<size_t>{0});
+    const auto two = selectFiberEmbeddingAnchors(bank, 2);
+    CHECK(two == std::vector<size_t>{0,3});
+    CHECK(selectFiberEmbeddingAnchors(bank, 3) == std::vector<size_t>{0,3,5});
+    CHECK(fiberEmbeddingAnchorCost({0,1},bank,two) == 0);
+    CHECK(fiberEmbeddingAnchorCost({-1,0},bank,two) == 1);
+    auto copy = bank;
+    auto selected = two;
+    advanceFiberEmbeddingAnchors(copy, selected, {-1,0}, 100, 10, 20, 4, 2);
+    CHECK(copy.size() == 1);
+    CHECK(selected == std::vector<size_t>{0});
+    CHECK(bank.size() == 6);
+    CHECK(two == std::vector<size_t>{0,3});
+    for (int i=1;i<100;++i) advanceFiberEmbeddingAnchors(copy, selected, {1,0}, 100+i*10, 10, 1000, 4, 2);
+    CHECK(copy.size() == 4);
+    CHECK(selected.size() <= 2);
+    CHECK_THROWS(selectFiberEmbeddingAnchors(bank,0));
+    CHECK_THROWS(selectFiberEmbeddingAnchors({},2));
+}
+
 TEST_CASE("signed float32 channels interpolate before normalization through shared cache")
 {
     namespace fs = std::filesystem;
@@ -475,7 +566,7 @@ TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embe
     auto same = vc::fiber_tracer::traceFiberOneWay(predictions, request);
     CHECK(predictions.reads > 0);
     CHECK(old.points == same.points);
-    for (const auto* mode : {"best", "ema", "ema-seed", "ema-gated", "ema-seed-gated"}) {
+    for (const auto* mode : {"best", "ema", "ema-seed", "ema-gated", "ema-seed-gated", "anchors", "anchors-lru", "appearance"}) {
         request.config.embeddingReferenceMode = mode;
         CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
     }

@@ -56,17 +56,49 @@ def search_weight(execute, *, history=None, start_weight=.25):
         current = best
 
 
+def refine_families(execute, families):
+    """Finite coordinate descent; each family starts from its own seed, not global best."""
+    cache, winners = {}, []
+    def evaluate(parameters):
+        validated = configured_variants({'candidates':[parameters]})[-1]
+        validated.pop('name')
+        key = json.dumps(validated, sort_keys=True)
+        if key not in cache:
+            row = execute(dict(validated,name=f'refine-{len(cache):04d}'))
+            if not row['completed']:
+                raise RuntimeError('incomplete refinement cannot establish a local optimum')
+            cache[key] = row
+        return cache[key]
+    for family in families:
+        current = dict(family['seed'])
+        axes = family['axes']
+        if not axes or any(not isinstance(v,list) or not v for v in axes.values()):
+            raise ValueError('refinement requires nonempty finite axes')
+        while True:
+            previous = evaluate(current)
+            for axis, values in axes.items():
+                center = evaluate(current)
+                candidates = [(current,center)] + [(dict(current,**{axis:v}),evaluate(dict(current,**{axis:v}))) for v in values]
+                parameters,best = min(candidates,key=lambda pair:pair[1]['failures'])
+                if best['failures'] < center['failures']:
+                    current = dict(parameters)
+            if evaluate(current)['failures'] >= previous['failures']:
+                break
+        winners.append(dict(label=family['label'],axes=axes,parameters=current,result=evaluate(current)))
+    return winners
+
+
 def configured_variants(settings):
     custom = settings.get("candidates")
     if custom is None:
-        return list(variants(settings.get("controls_only", False) or settings.get("weight_search", False),
+        return list(variants(settings.get("controls_only", False) or settings.get("weight_search", False) or bool(settings.get('refine')),
                              settings.get("grid_weight", .25)))
     if settings.get("weight_search", False) or not isinstance(custom, list) or not custom:
         raise ValueError("candidates must be nonempty and cannot accompany weight_search")
     rows = list(variants(True))
     for i, candidate in enumerate(custom):
         required = {"weight", "spacing", "window", "count", "falloff"}
-        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life"}:
+        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life", "anchors", "ema_mix", "aggregation"}:
             raise ValueError("candidate must contain only embedding weight/spacing/window/count/falloff")
         if any(not isinstance(candidate[k], (int, float)) or not math.isfinite(candidate[k]) or candidate[k] <= 0
                for k in ("spacing", "window")):
@@ -78,13 +110,22 @@ def configured_variants(settings):
         if candidate['falloff'] not in ('uniform', 'linear', 'gaussian'):
             raise ValueError("unsupported falloff")
         mode = candidate.get('mode', 'mean')
-        if mode not in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated'):
+        if mode not in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated', 'anchors', 'anchors-lru', 'appearance'):
             raise ValueError('unsupported reference mode')
         if mode == 'best' and candidate['falloff'] != 'uniform':
             raise ValueError('best history requires uniform falloff')
         half = candidate.get('half_life', 512)
         if not isinstance(half, (int, float)) or not math.isfinite(half) or half <= 0:
             raise ValueError('invalid EMA half life')
+        if type(candidate.get('anchors', 4)) is not int or not 1 <= candidate.get('anchors', 4) <= 8:
+            raise ValueError('invalid anchor count')
+        mix = candidate.get('ema_mix', .5)
+        if not isinstance(mix, (int, float)) or not math.isfinite(mix) or not 0 <= mix <= 1:
+            raise ValueError('invalid anchor EMA mix')
+        if candidate.get('aggregation','best') not in ('best','mean'):
+            raise ValueError('invalid anchor aggregation')
+        if mode in ('anchors','appearance') and candidate.get('aggregation','best') != 'best':
+            raise ValueError('representative anchors require best aggregation')
         rows.append(dict(candidate, name=f"candidate-{i:03d}"))
     return rows
 
@@ -135,6 +176,9 @@ def run(settings):
             evaluation['trace_args'] += ['--embedding-reference-mode', variant['mode']]
         if 'half_life' in variant:
             evaluation['trace_args'] += ['--embedding-ema-half-life-base-voxels', str(variant['half_life'])]
+        for key, flag in [('anchors', 'anchor-count'), ('ema_mix', 'anchor-ema-mix'), ('aggregation','anchor-aggregation')]:
+            if key in variant:
+                evaluation['trace_args'] += ['--embedding-'+flag, str(variant[key])]
         atomic_write(output / (variant["name"] + ".json"), evaluation)
         stores, mapping, channels = {}, {}, {}
         for source in evaluation["sources"]:
@@ -177,7 +221,20 @@ def run(settings):
         row = execute(variant)
         if variant["name"] in previous and (not row["completed"] or not row["original_replay_match"]):
             raise RuntimeError("control did not reproduce original replay; inspect before interpreting sweep")
-    if settings.get("weight_search", False):
+    if settings.get('refine'):
+        if settings.get('weight_search'):
+            raise ValueError('refine and weight_search are mutually exclusive')
+        if any(not row['completed'] for row in report['variants']):
+            raise RuntimeError('incomplete scheduled replay before refinement')
+        report['refinements'] = refine_families(execute,settings['refine'])
+        for i, family in enumerate(report['refinements']):
+            repeated = execute(dict(family['parameters'],name=f'repeat-family-{i:02d}'))
+            family['repeat_identical'] = repeated.get('replay_hash') == family['result']['replay_hash']
+            if not family['repeat_identical']:
+                raise RuntimeError('family winner repeat differs')
+        best = min(report['variants'],key=lambda v:v['failures'])
+        report['ranking'] = 'per-family coordinate minima over explicitly recorded finite axes'
+    elif settings.get("weight_search", False):
         best = search_weight(execute, history=settings.get('search_history'), start_weight=settings.get('start_weight', .25))
         best = min([best] + [v for v in report['variants'] if v['name'] in previous], key=lambda v: v['failures'])
         report["ranking"] = "local minimum of bidirectional failures on 0.05 weight grid; ties retain center"
@@ -186,7 +243,7 @@ def run(settings):
         if len(completed) != len(scheduled):
             raise RuntimeError("full history grid incomplete; cannot select winner")
         best = min(completed, key=lambda v: v["failures"])
-    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life") if k in best}, "name":"repeat-best"})
+    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life", "anchors", "ema_mix", "aggregation") if k in best}, "name":"repeat-best"})
     report["best"] = best["name"]
     report["repeat_identical"] = repeated.get("replay_hash") == best["replay_hash"]
     atomic_write(output / "report.json", report)

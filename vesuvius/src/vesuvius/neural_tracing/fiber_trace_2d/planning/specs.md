@@ -2,6 +2,17 @@
 
 ## Opt-in embedding reference modes
 
+- `anchors` uses <=64 arclength-sampled observed embeddings, <=8 representative
+  medoids selected by deterministic greedy reduction of summed nearest cosine
+  distance across the bank. Stable earliest ties, stop on no positive gain.
+  This is approximate coverage-weighted diversity, not global optimality or
+  outlier immunity. Resample/reselect after bank insertions/expiry only.
+  Candidate cost `(1-mix)*nearest_anchor_cost + mix*EMA_cost`, mix in[0,1],
+  before embedding weight. Same per-beam copy/reset and parent-before-update
+  rules. Bank count/spacing/window control memory; no GT/future data access.
+  Anchors score against the parent's bank; expiry is applied after selecting
+  the child. A reference crossing the window boundary can affect one step.
+
 - Default mean preserves history-weighted cosine costs. Best mode uses maximum
   cosine over bounded references, requiring uniform falloff. EMA modes maintain
   per-beam normalized references, decay exp2(-step_distance/half_life), score
@@ -7158,3 +7169,18 @@
   no new cohort/size is initialized or authorized without manager confirmation.
 - Explicit stop, known release and observed epoch change override grace.
 - No wire fields change; EOF/timeout never frees server-side reservations.
+# Experimental LRU embedding anchors
+
+Whole-path `appearance` mode uses bounded spherical summaries (FP64 sums and
+support) rather than window expiry. Merge minimum incremental spherical error
+when over capacity; deterministic ties and cancellation fallback. Nearest
+normalized centroid cost, optional EMA mix; no support-weighted score. This
+retains all admitted mass approximately, not every distinct mode independently.
+
+
+Opt-in anchors-lru has fixed capacity1–8 and no age expiry. Admission spacing
+applies to selected path observations, not all candidates. Admission touches the
+closest existing anchor, evicts least-recently-used (stable insertion ties), and
+inserts the new observation. Exact duplicates only touch/advance cadence.
+Nearest/mean cosine distance and optional convex EMA mixture score parent state;
+per-beam copies and seed resets prevent sibling/future leakage. Defaults unchanged.

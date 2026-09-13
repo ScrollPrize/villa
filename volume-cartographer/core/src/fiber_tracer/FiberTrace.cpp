@@ -476,10 +476,17 @@ void validateTraceConfig(const FiberTraceConfig& config)
 {
     const auto& mode = config.embeddingReferenceMode;
     if (mode != "mean" && mode != "best" && mode != "ema" && mode != "ema-seed" &&
-        mode != "ema-gated" && mode != "ema-seed-gated")
+        mode != "ema-gated" && mode != "ema-seed-gated" && mode != "anchors" && mode != "anchors-lru" && mode != "appearance")
         throw std::invalid_argument("unknown embedding reference mode");
     if (mode == "best" && config.embeddingHistoryFalloff != "uniform")
         throw std::invalid_argument("best embedding history requires uniform falloff");
+    if (config.embeddingAnchorCount < 1 || config.embeddingAnchorCount > 8 ||
+        !std::isfinite(config.embeddingAnchorEmaMix) || config.embeddingAnchorEmaMix < 0 || config.embeddingAnchorEmaMix > 1)
+        throw std::invalid_argument("invalid embedding anchor count/EMA mix");
+    if (config.embeddingAnchorAggregation != "best" && config.embeddingAnchorAggregation != "mean")
+        throw std::invalid_argument("invalid embedding anchor aggregation");
+    if ((mode == "anchors" || mode == "appearance") && config.embeddingAnchorAggregation != "best")
+        throw std::invalid_argument("representative anchors use best aggregation");
     if (!std::isfinite(config.embeddingEmaHalfLifeBaseVoxels) || config.embeddingEmaHalfLifeBaseVoxels <= 0)
         throw std::invalid_argument("embedding EMA half life must be positive");
     if (config.embeddingHistoryFalloff != "uniform" && config.embeddingHistoryFalloff != "linear" &&
@@ -603,6 +610,9 @@ void validateTraceConfig(const FiberTraceConfig& config)
 struct BeamState {
     FiberEmbeddingHistory embeddingHistory;
     FiberEmbeddingMemory embeddingMemory;
+    std::vector<size_t> embeddingAnchors;
+    FiberEmbeddingLru embeddingLru;
+    FiberEmbeddingAppearance embeddingAppearance;
     struct PathNode {
         TraceVec point{0.0f, 0.0f, 0.0f};
         std::shared_ptr<const PathNode> previous;
@@ -670,7 +680,13 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     const double arc = (parent.tracedLength + traceLength(point - beamEndpoint(parent))) * config.traceToBaseScale;
     // Same per-step units as the existing local alignment/smoothness costs.
     const bool ema = config.embeddingReferenceMode.starts_with("ema");
-    const double cost = ema ? fiberEmbeddingMemoryCost(vector, parent.embeddingMemory,
+    const bool lru = config.embeddingReferenceMode == "anchors-lru";
+    const bool appearance = config.embeddingReferenceMode == "appearance";
+    const double cost = (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
+        (1-config.embeddingAnchorEmaMix) * (appearance ? fiberEmbeddingAppearanceCost(vector,parent.embeddingAppearance) : lru ? fiberEmbeddingLruCost(vector,parent.embeddingLru,
+            config.embeddingAnchorAggregation == "mean") : fiberEmbeddingAnchorCost(vector, parent.embeddingHistory, parent.embeddingAnchors)) +
+        config.embeddingAnchorEmaMix * fiberEmbeddingMemoryCost(vector, parent.embeddingMemory, false) :
+        ema ? fiberEmbeddingMemoryCost(vector, parent.embeddingMemory,
         config.embeddingReferenceMode.starts_with("ema-seed")) : fiberEmbeddingCost(
         vector, parent.embeddingHistory, arc, config.embeddingHistoryWindowBaseVoxels,
         config.embeddingHistoryFalloff, config.embeddingReferenceMode == "best");
@@ -1415,7 +1431,21 @@ void updateTargetPlaneCrossings(
     out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.depth, config.cumulativeSmoothnessSteps);
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength + traceLength(candidate.point - beamEndpoint(parent));
-    if (config.embeddingWeight > 0 && config.embeddingReferenceMode.starts_with("ema"))
+    if (config.embeddingWeight > 0 && (config.embeddingReferenceMode == "anchors" || config.embeddingReferenceMode == "anchors-lru" || config.embeddingReferenceMode == "appearance")) {
+        advanceFiberEmbeddingMemory(out.embeddingMemory, score.embedding,
+            traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
+            config.embeddingEmaHalfLifeBaseVoxels, score.selectedPresence, false);
+        if (config.embeddingReferenceMode == "appearance")
+            advanceFiberEmbeddingAppearance(out.embeddingAppearance,score.embedding,out.tracedLength * config.traceToBaseScale,
+                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount);
+        else if (config.embeddingReferenceMode == "anchors-lru")
+            advanceFiberEmbeddingLru(out.embeddingLru,score.embedding,out.tracedLength * config.traceToBaseScale,
+                config.embeddingHistorySpacingBaseVoxels,config.embeddingAnchorCount);
+        else advanceFiberEmbeddingAnchors(out.embeddingHistory, out.embeddingAnchors, score.embedding,
+            out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
+            config.embeddingHistoryWindowBaseVoxels, config.embeddingHistoryCount, config.embeddingAnchorCount);
+    }
+    else if (config.embeddingWeight > 0 && config.embeddingReferenceMode.starts_with("ema"))
         advanceFiberEmbeddingMemory(out.embeddingMemory, score.embedding,
             traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
             config.embeddingEmaHalfLifeBaseVoxels, score.selectedPresence,
@@ -1773,6 +1803,12 @@ template <typename LossAt>
         if (seed.size() != 1 || seed.front().empty()) throw std::runtime_error("trace seed has no valid embedding");
         initial.embeddingHistory.push_back({0, seed.front()});
         initial.embeddingMemory.ema = initial.embeddingMemory.seed = seed.front();
+        initial.embeddingAnchors = {0};
+        initial.embeddingLru.entries = {{0,seed.front()}};
+        initial.embeddingLru.lastUsed = {0};
+        if (request.config.embeddingReferenceMode == "appearance")
+            advanceFiberEmbeddingAppearance(initial.embeddingAppearance,seed.front(),0,
+                request.config.embeddingHistorySpacingBaseVoxels,request.config.embeddingAnchorCount);
     }
     updateTargetPlaneCrossings(start, start, targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings);
     initial.reached = targetPlanesReached(targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings, acceptThresholdVoxels);

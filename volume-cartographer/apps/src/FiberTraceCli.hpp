@@ -101,6 +101,12 @@ inline bool parseTraceOption(
         config.embeddingHistoryCount = parseInt(value("embedding-history-count"), "embedding-history-count");
     else if (argument == "--embedding-reference-mode")
         config.embeddingReferenceMode = value("embedding-reference-mode");
+    else if (argument == "--embedding-anchor-count")
+        config.embeddingAnchorCount = parseInt(value("embedding-anchor-count"), "embedding-anchor-count");
+    else if (argument == "--embedding-anchor-ema-mix")
+        config.embeddingAnchorEmaMix = parseDouble(value("embedding-anchor-ema-mix"), "embedding-anchor-ema-mix");
+    else if (argument == "--embedding-anchor-aggregation")
+        config.embeddingAnchorAggregation = value("embedding-anchor-aggregation");
     else if (argument == "--embedding-ema-half-life-base-voxels")
         config.embeddingEmaHalfLifeBaseVoxels = parseDouble(value("embedding-ema-half-life-base-voxels"), "embedding-ema-half-life-base-voxels");
     else if (argument == "--smoothness-weight")
@@ -158,6 +164,9 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
         {"embedding_history_count", config.embeddingHistoryCount},
         {"embedding_history_falloff", config.embeddingHistoryFalloff},
         {"embedding_reference_mode", config.embeddingReferenceMode},
+        {"embedding_anchor_count", config.embeddingAnchorCount},
+        {"embedding_anchor_ema_mix", config.embeddingAnchorEmaMix},
+        {"embedding_anchor_aggregation", config.embeddingAnchorAggregation},
         {"embedding_ema_half_life_base_voxels", config.embeddingEmaHalfLifeBaseVoxels},
         {"step_voxels", config.stepVoxels},
         {"cone_angle_degrees", config.coneAngleDegrees},

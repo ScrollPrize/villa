@@ -9,6 +9,19 @@ retains the existing prediction products and makes no embedding reads.
 
 ## Scoring and storage
 
+`--embedding-reference-mode anchors` builds a compact observed appearance model.
+The regular bounded history is its observation bank (<=64); greedy medoid
+selection minimizes summed nearest cosine distance, taking up to
+`--embedding-anchor-count` (1–8, default4). It favors frequently represented
+appearances and different modes with coverage gains, not merely distant points.
+This is greedy approximation, not an exact global optimum. Selection reruns only
+when bank membership changes. Nearest-anchor cosine cost is mixed with EMA cost
+using `--embedding-anchor-ema-mix` (0=anchors only,1=EMA only,default.5).
+Bank, chosen indices and EMA are private to each beam and reset on restart.
+Arclength sample count/spacing/window bound CPU work and memory; no GT is used.
+Scoring uses the parent's bank, with expiry on child update (at most one-step
+window grace), unlike candidate-time filtering of mean/best history modes.
+
 Opt-in `--embedding-reference-mode` selects `mean` (unchanged default), `best`,
 `ema`, `ema-seed`, `ema-gated`, or `ema-seed-gated`. `best` takes minimum
 `1-cosine` over the bounded history and requires uniform falloff. EMA modes use
@@ -167,6 +180,33 @@ Native QuickBuild unchanged. Explicit selection regression plus existing suites:
 98 Python passed39.35s, two native suites passed1.88s, logs under
 `cooperative-tests/20260913_143916_847400`. No install or training changes.
 # History parameter sweep
+
+Experimental `--embedding-reference-mode appearance` corrects the windowed
+medoid restriction: it maintains up to `--embedding-anchor-count` whole-path
+spherical clusters, with FP64 vector sums and integer support. Every spaced
+admission is included; at K+1 clusters, merge the pair with smallest increase
+in spherical reconstruction error, `||a||+||b||-||a+b||`. Ties use stable order.
+Normalized centroids (not observed medoids) are the anchors. True sums retain
+all admitted contributions; no distance expiry or rolling bank. Exact cancellation
+keeps the prior valid representative for scoring without changing the true sum.
+Nearest-centroid cosine cost optionally mixes with EMA. Cluster support affects
+compression, not score weighting. This is approximate streaming clustering;
+bounded capacity can merge rare modes. State remains private per beam/restart.
+
+
+Experimental `--embedding-reference-mode anchors-lru` keeps up to
+`--embedding-anchor-count` (1–8) observed vectors with no distance expiry.
+`--embedding-history-spacing-base-voxels` limits admission frequency. At an
+admitted selected point, touch its closest existing anchor, evict the least
+recently used if full, then insert the point. Exact duplicates only touch and
+advance the admission clock. Ties use insertion order. Rejected candidates do
+not touch state; each beam owns a copy, reset at a new seed.
+`--embedding-anchor-aggregation best|mean` chooses nearest or average cosine
+distance, optionally mixed with EMA using `--embedding-anchor-ema-mix`.
+The parent state scores candidates before admission. LRU ignores history window
+and history count; its capacity is anchor count. Closest does not imply a
+confident match. This mode is distinct from windowed medoid selection.
+
 
 See [the full history-spacing/falloff sweep](embedding_history_sweep_20260913.md)
 for all36 combinations, controls and exact-repeat checks. Defaults remain unchanged.

@@ -149,9 +149,10 @@ def test_sweep_fill_requires_managed_launch(tmp_path, monkeypatch):
     assert calls[0][1]["settings"] == manager
 
 
-def test_configurable_embedding_search():
+@pytest.mark.parametrize('mode,aggregation',[('anchors-lru','mean'),('appearance','best')])
+def test_configurable_embedding_search(mode,aggregation):
     from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants, search_weight
-    history = dict(spacing=128, window=4096, count=64, falloff='linear', mode='ema-seed', half_life=512)
+    history = dict(spacing=128, window=4096, count=64, falloff='linear', mode=mode, half_life=512, anchors=4, ema_mix=.5, aggregation=aggregation)
     rows = configured_variants({'candidates': [dict(history, weight=.4)]})
     assert [r['name'] for r in rows] == ['off', 'original', 'candidate-000']
     assert rows[-1]['window'] == 4096
@@ -167,6 +168,24 @@ def test_configurable_embedding_search():
             configured_variants({'candidates': [bad]})
     with pytest.raises(ValueError):
         search_weight(execute, start_weight=.123)
+
+
+def test_family_refinement_cycles_and_retains_each_family():
+    from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import refine_families
+    calls=[]
+    def execute(v):
+        calls.append(v)
+        # EMA mix changes the preferred weight, requiring a second cycle.
+        target=.5 if v['ema_mix']==.5 else .25
+        return dict(v,completed=True,failures=round(100*abs(v['weight']-target))+int(v['ema_mix']==0)*30)
+    seed=dict(weight=.25,spacing=128,window=1024,count=8,falloff='uniform',mode='appearance',ema_mix=0)
+    families=[dict(label='a',seed=seed,axes={'weight':[.25,.5],'ema_mix':[0,.5]}),
+              dict(label='b',seed=dict(seed,mode='anchors-lru'),axes={'weight':[.25]})]
+    results=refine_families(execute,families)
+    assert results[0]['parameters']['weight']==.5
+    assert results[0]['parameters']['ema_mix']==.5
+    assert results[1]['parameters']['mode']=='anchors-lru'
+    assert len({r['name'] for r in calls})==len(calls)
 
 
 def test_product_storage_preserves_signed_float32(tmp_path):

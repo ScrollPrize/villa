@@ -2567,3 +2567,10 @@
   report (docs/embedding_consistency_20260913.md). Ten-fiber pilot found excellent
   tile consistency but substantial high-similarity off-GT controls. Tracer
   integration remains the next task pending review; training resumed unchanged.
+## 2026-09-13 — Experimental embedding appearance memories
+
+- Added opt-in windowed medoids, no-expiry LRU anchors and whole-path spherical
+  appearance summaries, sharing native cosine/EMA infrastructure. Added bounded
+  admission, aggregation controls, tests and per-family refinement harness.
+  Initial windowed/LRU sweeps do not beat EMA69; further evaluation ongoing.
+  See docs/embedding_multi_anchor_20260913.md; defaults unchanged.
