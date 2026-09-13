@@ -26,7 +26,7 @@ def context(monkeypatch):
     ctx.non_liftable_patch_paths = set()
     ctx._source_verified_patches = {'baseline': relink._flat_patch(50, 10, 10)}
     ctx._source_unverified_patches = {}
-    pcl = relink.LivePatchRelinkTests._regular_pcl(5, [[50, 20, 20], [50, 30, 30]])
+    pcl = relink._regular_pcl(5, [[50, 20, 20], [50, 30, 30]])
     ctx._source_point_collections = {5: pcl}
     ctx.next_id = 6
     ctx.verified_patches = {key: copy.copy(patch)
@@ -47,6 +47,10 @@ def context(monkeypatch):
     ctx.verified_patches_path = ''
     ctx.unverified_patches_path = ''
     ctx._derive_point_inputs(ctx.verified_patches, copy.deepcopy(ctx._source_point_collections), {})
+    from test_run_boundary_settings import _context
+    for name, value in vars(_context()).items():
+        if not name.startswith('_') and not hasattr(ctx, name):
+            setattr(ctx, name, value)
     return ctx
 
 
@@ -105,13 +109,10 @@ def test_mixed_revisions_keep_fiber_filename_and_restore_role_content(context, t
     assert 'fiber-uuid' not in ctx.fiber_catalog
     ctx.install_input_changes(candidate)
     resident_id = ctx._workspace_membership['pcl-uuid']['resident_id']
-    ctx.config.update({'input_use_pcl_same_winding': False})
-    candidate = ctx.prepare_input_changes([])
-    assert resident_id not in candidate.regular_pcl_catalog
-    assert resident_id in candidate._source_point_collections
-    ctx.install_input_changes(candidate)
-    ctx.config.update({'input_use_pcl_same_winding': True})
-    ctx.install_input_changes(ctx.prepare_input_changes([]))
+    ctx.apply_config({'input_use_pcl_same_winding': False}, current_iteration=0)
+    assert resident_id not in ctx.regular_pcl_catalog
+    assert resident_id in ctx._source_point_collections
+    ctx.apply_config({'input_use_pcl_same_winding': True}, current_iteration=0)
     assert resident_id in ctx.regular_pcl_catalog
     ctx.install_input_changes(ctx.prepare_input_changes([
         {**record, 'deleted': True, 'revision': 2} for record in records]))
@@ -161,3 +162,34 @@ def test_rebuild_adopts_baseline_geometry_without_reading_it_again(context):
     assert candidate._source_verified_patches['baseline'] is original
     ctx.install_input_changes(candidate)
     assert 'baseline' in ctx.verified_patches
+
+
+@pytest.mark.parametrize('role', ['same_winding', 'relative', 'absolute', 'drawn_control_points'])
+def test_patch_additions_rederive_one_view_per_collection(context, monkeypatch, role):
+    import fit_spiral
+    pcl = relink._regular_pcl(5, [[50, 20, 20], [50, 30, 30], [50, 520, 520], [50, 530, 530]])
+    fit_spiral.stamp_loaded_pcl_metadata(pcl, '/inputs/pcl.json', role, 5)
+    if role == 'absolute':
+        for point in pcl['points'].values():
+            point['winding_annotation'] = 1.0
+    context._source_point_collections = {5: pcl}
+    monkeypatch.setattr(fit_spiral, 'load_tifxyz', lambda path: relink._flat_patch(50, 510, 510))
+    context.install_input_changes(context.prepare_input_changes([
+        {'id': 'new', 'kind': 'patch', 'path': '/immutable/patch'}]))
+    assert len(context.cross_patch_pcls) == 1
+    assert {key: len(points) for key, points in context.cross_patch_pcls[0]['points_by_patch'].items()} == {
+        'baseline': 2, 'new': 2}
+    assert all('on_patch' not in point for point in context._source_point_collections[5]['points'].values())
+
+
+def test_fiber_spacing_reuses_revision_identity(context, tmp_path):
+    import json
+    path = tmp_path / 'fiber.json'
+    path.write_text(json.dumps({'type': 'vc3d_fiber', 'line_points': [], 'control_points': [[0, 0, 200], [400, 0, 200]]}))
+    context.install_input_changes(context.prepare_input_changes([
+        {'id': 'fiber-id', 'kind': 'fiber', 'path': str(path), 'revision': 2}]))
+    before = context._workspace_membership['fiber-id']['resident_id']
+    context.apply_config({'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
+    assert context._workspace_membership['fiber-id']['resident_id'] == before
+    assert context._workspace_membership['fiber-id']['revision'] == 2
+    assert list(context.fiber_catalog) == ['fiber-id']

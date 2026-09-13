@@ -2,6 +2,7 @@
 import hashlib
 import json
 import urllib.request
+import urllib.error
 from uuid import uuid4
 
 from test_spiral_service_v2 import HttpServiceFixture, _attach_fake_session
@@ -27,6 +28,16 @@ class EditingHttpTests(HttpServiceFixture):
         self.state.close()
         super().tearDown()
 
+    def put(self, upload_id, data, offset):
+        request = urllib.request.Request(
+            self.base + f'/session/inputs/{upload_id}/files/fiber.json?offset={offset}',
+            data=data, method='PUT', headers={**self.owner, 'Authorization': 'Bearer secret-key'})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, json.load(error)
+
     def test_lost_responses_reconcile_one_logical_input_and_exact_commit(self):
         data = b'{"type":"vc3d_fiber","version":1,"points":[]}'
         input_id, upload_id = str(uuid4()), uuid4().hex
@@ -36,10 +47,12 @@ class EditingHttpTests(HttpServiceFixture):
         for _ in range(2):
             self.assertEqual(self.request('POST', '/session/inputs', headers=self.owner,
                                           body=manifest)[0], 200)
-        req = urllib.request.Request(self.base + f'/session/inputs/{upload_id}/files/fiber.json?offset=0',
-            data=data, method='PUT', headers={**self.owner, 'Authorization': 'Bearer secret-key'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            self.assertEqual(response.status, 200)
+        self.assertEqual(self.put(upload_id, data[:8], 0)[0], 200)
+        code, result = self.put(upload_id, data[:8], 0)
+        self.assertEqual((code, result['offset']), (409, 8))
+        _, payload, _ = self.request('GET', f'/session/inputs/{upload_id}')
+        self.assertEqual(json.loads(payload)['files'][0]['offset'], 8)
+        self.assertEqual(self.put(upload_id, data[8:], 8)[0], 200)
         for _ in range(2):
             self.assertEqual(self.request('POST', f'/session/inputs/{upload_id}/finalize',
                                           headers=self.owner, body={})[0], 200)
@@ -70,7 +83,7 @@ class EditingHttpTests(HttpServiceFixture):
         self.assertEqual(self.request('POST', '/session/input-changes', headers=self.owner,
                                      body=command)[0], 409)
 
-    def test_observers_cannot_bypass_ownership_using_legacy_routes(self):
+    def test_ownership_and_removed_routes(self):
         for path, body in [('/session/run', {'command_id': 'run'}),
                            ('/session/commit-inputs', {'command_id': 'commit'}),
                            ('/session/inputs', {}),
@@ -78,7 +91,7 @@ class EditingHttpTests(HttpServiceFixture):
             self.assertEqual(self.request('POST', path, body=body)[0], 403)
         self.assertEqual(self.request('GET', '/session/status')[0], 200)
         self.assertEqual(self.request('DELETE', '/session/ephemeral-inputs/fiber/test',
-                                      headers=self.owner)[0], 410)
+                                      headers=self.owner)[0], 404)
 
     def test_release_retries_are_idempotent_over_http(self):
         for _ in range(2):

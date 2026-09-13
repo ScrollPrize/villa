@@ -2130,7 +2130,6 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         result.role = vc3d::spiral::pclRoleName(role);
         result.operation = operation;
         result.targetCollectionId = line.pclEdit->collectionId;
-        result.baseSourceRevision = line.pclEdit->sourceRevision;
         result.document = line.pclEdit->replacementDocument();
         line.id = result.id;
         line.state = GestureState::Finalizing;

@@ -796,10 +796,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             refreshCheckpointDownload);
 
     auto* ephemeralLabel = new QLabel(tr("Dataset inputs and local drafts:"), runContents);
-    _ephemeralList = new QListWidget(runContents);
-    _ephemeralList->setObjectName(QStringLiteral("spiralEphemeralList"));
-    _ephemeralList->setMaximumHeight(80);
-    _ephemeralList->setSelectionMode(QAbstractItemView::SingleSelection);
+    _inputList = new QListWidget(runContents);
+    _inputList->setObjectName(QStringLiteral("spiralInputList"));
+    _inputList->setMaximumHeight(80);
+    _inputList->setSelectionMode(QAbstractItemView::SingleSelection);
     _commitInputs = new QPushButton(tr("Commit"), runContents);
     _commitInputs->setEnabled(false);
     _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
@@ -822,7 +822,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         for (auto* item : _inputItems) item->setHidden(!item->text().contains(text, Qt::CaseInsensitive));
     });
     runLayout->addWidget(_inputFilter);
-    runLayout->addWidget(_ephemeralList);
+    runLayout->addWidget(_inputList);
     runLayout->addLayout(commitRow);
     runLayout->addWidget(_commitHint);
 
@@ -1331,31 +1331,31 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::inputDraftsChanged, this, [this]() {
         if (!_lastInputStatus.isEmpty()) updateStatus(_lastInputStatus);
     });
-    connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
-        const auto* item = _ephemeralList->currentItem();
+    connect(_inputList, &QListWidget::itemSelectionChanged, this, [this]() {
+        const auto* item = _inputList->currentItem();
         const auto row = item ? item->data(Qt::UserRole + 4).toJsonObject() : QJsonObject();
         _removeInput->setEnabled(_connected && _service->ownsInputWorkspace() && item
             && (!row.value(QStringLiteral("deleted")).toBool() || row.value(QStringLiteral("can_restore")).toBool()));
         _removeInput->setText(item && item->data(Qt::UserRole + 3).toBool() ? tr("Restore") : tr("Remove"));
     });
-    connect(_ephemeralList, &QListWidget::itemChanged, this, [this]() {
+    connect(_inputList, &QListWidget::itemChanged, this, [this]() {
         QStringList selected;
-        for (int index = 0; index < _ephemeralList->count(); ++index) {
-            const auto* item = _ephemeralList->item(index);
+        for (int index = 0; index < _inputList->count(); ++index) {
+            const auto* item = _inputList->item(index);
             if (item->checkState() == Qt::Checked) selected.push_back(item->data(Qt::UserRole + 1).toString());
         }
         _service->setInputSelection(selected);
     });
     connect(_removeInput, &QPushButton::clicked, this, [this]() {
-        const auto* item = _ephemeralList->currentItem();
+        const auto* item = _inputList->currentItem();
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
         if (item->data(Qt::UserRole + 3).toBool()) _service->restoreInputDraft(id);
-        else _service->removeEphemeralInput(item->data(Qt::UserRole).toString(), id);
+        else _service->removeInputDraft(id);
     });
-    _ephemeralList->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(_ephemeralList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& position) {
-        const auto* item = _ephemeralList->itemAt(position);
+    _inputList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(_inputList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& position) {
+        const auto* item = _inputList->itemAt(position);
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
         QMenu menu(this);
@@ -1368,7 +1368,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         retry->setEnabled(owner && (!row.value(QStringLiteral("committed")).toBool()
             || !row.value(QStringLiteral("error")).toString().isEmpty()));
         discard->setEnabled(owner && row.value(QStringLiteral("dirty")).toBool());
-        const auto* choice = menu.exec(_ephemeralList->viewport()->mapToGlobal(position));
+        const auto* choice = menu.exec(_inputList->viewport()->mapToGlobal(position));
         if (choice == edit) _service->editInputDraft(id);
         else if (choice == retry) _service->applyInputDrafts(false, {id});
         else if (choice == discard) _service->discardInputDraft(id);
@@ -2254,23 +2254,22 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
 
     // Baseline catalog entries and local revisioned drafts.
     const QJsonArray ephemeral = _service->inputDraftStatus();
-    _ephemeralCount = ephemeral.size();
     // Rebuild only on change: the 1 Hz status poll must not wipe the row the
     // user selected while aiming for Remove.
-    if (ephemeral != _lastEphemeral) {
-        _lastEphemeral = ephemeral;
+    if (ephemeral != _lastInputDrafts) {
+        _lastInputDrafts = ephemeral;
         _uncommittedCount = 0;
         QString selectedKind, selectedId;
-        if (const QListWidgetItem* current = _ephemeralList->currentItem()) {
+        if (const QListWidgetItem* current = _inputList->currentItem()) {
             selectedKind = current->data(Qt::UserRole).toString();
             selectedId = current->data(Qt::UserRole + 1).toString();
         }
         QSet<QString> excluded;
-        for (int index = 0; index < _ephemeralList->count(); ++index) {
-            const auto* item = _ephemeralList->item(index);
+        for (int index = 0; index < _inputList->count(); ++index) {
+            const auto* item = _inputList->item(index);
             if (item->checkState() != Qt::Checked) excluded.insert(item->data(Qt::UserRole + 1).toString());
         }
-        const QSignalBlocker blocker(_ephemeralList);
+        const QSignalBlocker blocker(_inputList);
         QSet<QString> present;
         QStringList selected;
         for (const QJsonValue& value : ephemeral) {
@@ -2302,7 +2301,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             const QString role = input.value(QStringLiteral("role")).toString();
             if (!role.isEmpty()) label += tr(" (%1)").arg(role);
             if (!item) {
-                item = new QListWidgetItem(_ephemeralList);
+                item = new QListWidgetItem(_inputList);
                 _inputItems[id] = item;
             }
             item->setText(label);
@@ -2324,7 +2323,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 label += tr(": %1").arg(incorporationError);
                 item->setText(label);
             }
-            if (kind == selectedKind && id == selectedId) _ephemeralList->setCurrentItem(item);
+            if (kind == selectedKind && id == selectedId) _inputList->setCurrentItem(item);
         }
         for (const auto& id : _inputItems.keys())
             if (!present.contains(id)) delete _inputItems.take(id);

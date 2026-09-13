@@ -57,7 +57,6 @@ public:
         QJsonDocument document;
         QString operation;
         QString targetCollectionId;
-        QString baseSourceRevision;
     };
 
     explicit SpiralBrushController(QObject* parent = nullptr);

@@ -107,9 +107,9 @@ def test_final_running_boundary_can_be_reserved(resident):
     with session._condition:
         session._state = SessionState.Running
         session._iteration_in_progress = 6
-    result = session.reserve_live_incorporation(7, 1, include_idle=True)
+    result = session.reserve_input_boundary(7, 1, include_idle=True)
     assert result["reserved"]
-    session.cancel_live_incorporation(1)
+    session.cancel_input_boundary(1)
 
 
 @pytest.mark.parametrize("failure", ["validation", "membership", None])
@@ -120,7 +120,7 @@ def test_distributed_decision_requires_all_ranks_prepared(failure):
 
     def call(name, arguments, **kwargs):
         assert not kwargs["collective"]
-        if name == "reserve_incorporation":
+        if name == "reserve_input_boundary":
             assert arguments["include_idle"]
             return {0: {"reserved": True}, 1: {"reserved": True}}
         if name == "prepare_input_batch":
@@ -147,3 +147,17 @@ def test_worker_failure_is_reported_instead_of_waiting_for_timeout(resident):
         session._error = 'device failure'
     with pytest.raises(RuntimeError, match='device failure'):
         session._wait_input_batch(InputBatchCommand(), 5)
+
+
+def test_failed_run_configuration_completes_its_command(resident):
+    from spiral_runtime import ConfigureCommand
+    from unittest.mock import Mock
+    resident, *_ = resident
+    resident._context.apply_config = Mock(side_effect=ValueError('invalid setting'))
+    resident._pending = 2
+    resident._warnings = []
+    command = ConfigureCommand(config={'optimizer_learning_rate': -1})
+    resident._run_configuration(command)
+    assert command.done.is_set() and 'invalid setting' in command.error
+    assert resident._pending == 0
+    assert resident.status()['state'] == 'Idle'

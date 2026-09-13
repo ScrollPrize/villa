@@ -209,25 +209,25 @@ void SpiralServiceManager::stageInput(const QString& kind, const QString& path, 
     emit inputDraftStaged(alias);
 }
 
-void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
+void SpiralServiceManager::stagePatch(const QString& directory, const QString& inputId)
 {
     stageInput(QStringLiteral("patch"), directory, inputId, QStringLiteral("verified"));
 }
 
-void SpiralServiceManager::uploadJsonInput(const QString& kind, const QString& path,
-                                          const QString& inputId, const QString& role, const QString&)
+void SpiralServiceManager::stageJsonInput(const QString& kind, const QString& path,
+                                          const QString& inputId, const QString& role)
 {
     stageInput(kind, path, inputId, role);
 }
 
-void SpiralServiceManager::uploadPclReplacement(vc3d::spiral::PclRole role, const QString& path,
-    const QString& inputId, const QString& operation, const QString& target, const QString&)
+void SpiralServiceManager::stagePclReplacement(vc3d::spiral::PclRole role, const QString& path,
+    const QString& inputId, const QString& operation, const QString& target)
 {
     stageInput(QStringLiteral("pcl"), path, inputId, vc3d::spiral::pclRoleName(role), target,
                operation == QStringLiteral("delete_collection"));
 }
 
-void SpiralServiceManager::removeEphemeralInput(const QString&, const QString& id)
+void SpiralServiceManager::removeInputDraft(const QString& id)
 {
     if (auto draft = _inputDrafts.value(id)) draft->remove();
     emit inputDraftsChanged();

@@ -15,7 +15,8 @@ import threading
 from uuid import UUID, uuid4, uuid5
 
 from input_publication import Output, PublicationTransaction, fingerprint
-from input_workspace import Catalog, Change, Content, InputIdentity, MutationCoordinator, WorkspaceLease
+from input_workspace import (Catalog, Change, Content, InputIdentity,
+                             MutationCoordinator, WorkspaceLease)
 from service_files import ExclusiveFileLock
 from service_http import ApiError
 from service_uploads import (PCL_ROLE_FILES, UploadEnvironment, UploadManager,
@@ -43,8 +44,7 @@ class EditingWorkspace:
         self.reviewed_bases = {}
         self.uploads = UploadManager(UploadEnvironment(
             lock=threading.RLock(), output_root=lambda: self.root,
-            session_id=lambda: self.id, ephemeral_dir=lambda: self.root / 'content',
-            require_session=lambda: None, immutable_content=True))
+            session_id=lambda: self.id, allowed_kinds=('patch', 'fiber', 'pcl')))
 
     def claim(self, token, command_id):
         def claim(_):

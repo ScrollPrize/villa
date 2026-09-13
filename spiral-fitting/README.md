@@ -351,27 +351,38 @@ Regression checks for this workflow (using existing environments/builds):
 
 ```bash
 # From the repository root:
-AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_input_workspace.py spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py
+AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
 AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_spiral_input_draft test_spiral_input_workflow -j 2
 AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
 ```
 
 The workflow tests start a loopback HTTP service and cover remote baseline
 restore, service restart, and edits made while a submission is running.
+The service suite includes transfer, revision, conflict, and publication recovery
+checks; runtime and geometry tests cover worker boundaries and supervision.
+For the retained CUDA check on temporary copies of a real dataset patch:
 
-See [REVISIONED_INPUTS.md](REVISIONED_INPUTS.md) for the protocol, recovery
-contract, tests and measured acceptance workload.
+```bash
+AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
+  SPIRAL_REVISION_PATCH=patch-directory-name \
+  spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_revisioned_live_fit.py
+```
+
+Input uploads only transfer immutable bytes. The editing workspace owns
+acceptance, application, and persistence; there is no separate ephemeral-input
+ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
 
 Interactive influence settings are captured when each **Run** request starts.
-The fitter builds an influence region from the inputs pending at Run start;
-inputs added live use the same captured settings and extend the region's union.
-They also extend (never shorten) the DT-disabled deadline within the remaining
+Applying input revisions uses those captured settings and extends the
+influence region's union and the DT-disabled deadline within the remaining
 Run window. The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
 without reloading the resident session. The **Disable DT** percentage controls
-how much of that run suppresses directional DT losses after incorporating its
-pending inputs.
+how much of the remaining run suppresses directional DT losses after applying
+input revisions.
 
 Input-local validation failures reject the entire selected candidate without
 changing active supervision. Distributed ranks prepare the same candidate and
@@ -401,8 +412,8 @@ With an existing fit, *Load* replaces the resident model's weights, optimiser
 and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and discards added inputs that
-were never committed. The panel reports the reasons and asks; a checkpoint no
+a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
+revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
 rebuild can accept — one written against another dataset, or against a
 configuration schema this service does not have — is reported and nothing is
 offered. A checkpoint-backed session takes its durable configuration from the

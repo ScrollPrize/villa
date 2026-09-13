@@ -66,7 +66,7 @@ private slots:
         const auto baseline = root.filePath(QStringLiteral("dataset/fibers/baseline.json"));
         const auto original = document(baseline);
         QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
-        client.removeEphemeralInput(QStringLiteral("fiber"), firstId);
+        client.removeInputDraft(firstId);
         client.applyInputDrafts();
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
         client.restoreInputDraft(firstId);
@@ -80,7 +80,7 @@ private slots:
         auto edited = original;
         edited[QStringLiteral("name")] = QStringLiteral("before restart");
         write(local, QJsonDocument(edited).toJson());
-        client.uploadJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
         client.setInputSelection({firstId});
         client.applyInputDrafts(true);
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
@@ -99,7 +99,7 @@ private slots:
         QVERIFY(secondId != firstId);
         edited[QStringLiteral("name")] = QStringLiteral("after restart");
         write(local, QJsonDocument(edited).toJson());
-        client.uploadJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
         QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
         QCOMPARE(fiberRow(client).value(QStringLiteral("id")).toString(), secondId);
         client.applyInputDrafts(true);
@@ -140,13 +140,13 @@ private slots:
             templateFiber[QStringLiteral("name")] = QStringLiteral("second");
             const auto second = QJsonDocument(templateFiber).toJson();
             write(source, first);
-            client.uploadJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
+            client.stageJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
             QVERIFY(client.hasInputDrafts());
             QVERIFY(!fiberRow(client).isEmpty());
-            client.uploadJsonInput(QStringLiteral("pcl"), root.filePath(QStringLiteral("pcl-template.json")),
+            client.stageJsonInput(QStringLiteral("pcl"), root.filePath(QStringLiteral("pcl-template.json")),
                 QStringLiteral("pcl"), QStringLiteral("same_winding"));
             if (QDir(root.filePath(QStringLiteral("replacement"))).exists())
-                client.uploadPatch(root.filePath(QStringLiteral("replacement")), QStringLiteral("baseline"));
+                client.stagePatch(root.filePath(QStringLiteral("replacement")), QStringLiteral("baseline"));
             const QString id = fiberRow(client).value(QStringLiteral("id")).toString();
             write(root.filePath(QStringLiteral("hold-apply")), "hold");
             QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
@@ -159,7 +159,7 @@ private slots:
             QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(root.filePath(QStringLiteral("applying"))), 10000);
             // A save during the worker boundary creates a newer local revision.
             write(source, second);
-            client.uploadJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
+            client.stageJsonInput(QStringLiteral("fiber"), source, QStringLiteral("fiber"));
             QFile::remove(root.filePath(QStringLiteral("hold-apply")));
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));
@@ -184,7 +184,7 @@ private slots:
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));
             QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))).value(QStringLiteral("name")).toString(), QStringLiteral("second"));
             QVERIFY(!client.hasInputDrafts());
-            client.removeEphemeralInput(QStringLiteral("fiber"), id);
+            client.removeInputDraft(id);
             client.applyInputDrafts();
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
             QVERIFY(QFile::exists(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))));
@@ -193,7 +193,7 @@ private slots:
             client.applyInputDrafts(true);
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 4, 10000);
             QVERIFY2(completed.last()[0].toString().isEmpty(), qPrintable(completed.last()[0].toString()));
-            client.removeEphemeralInput(QStringLiteral("fiber"), id);
+            client.removeInputDraft(id);
             client.applyInputDrafts(true);
             QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 5, 10000);
             QVERIFY(!QFile::exists(root.filePath(QStringLiteral("dataset/fibers/fiber.json"))));

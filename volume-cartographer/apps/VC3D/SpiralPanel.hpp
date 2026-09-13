@@ -195,13 +195,13 @@ private:
     QWidget* _apiKeyRow = nullptr;
     QWidget* _mappingRow = nullptr;
 
-    // Ephemeral inputs
-    QListWidget* _ephemeralList = nullptr;
+    // Input drafts
+    QListWidget* _inputList = nullptr;
     QPushButton* _commitInputs = nullptr;
     QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
-    QJsonArray _lastEphemeral;
+    QJsonArray _lastInputDrafts;
     QHash<QString, QListWidgetItem*> _inputItems;
     QLineEdit* _inputFilter = nullptr;
     QJsonObject _lastInputStatus;
@@ -230,7 +230,6 @@ private:
     QString _previewTransferText;
     // Last reported session lifecycle state; "Error" is the recovery case.
     QString _sessionState;
-    int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;
     bool _runningGuardedExit = false;

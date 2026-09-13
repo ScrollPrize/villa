@@ -1456,7 +1456,7 @@ void SpiralWorkspace::addPatchToCurrentFit(
     const QString inputId = QFileInfo(tifxyzDirectory).fileName();
     registerPendingPatchSurface(inputId, surface);
     statusBar()->showMessage(tr("Preparing patch %1 for the Spiral session…").arg(inputId));
-    _service->uploadPatch(tifxyzDirectory, inputId);
+    _service->stagePatch(tifxyzDirectory, inputId);
     _service->applyInputDrafts();
 }
 
@@ -1465,7 +1465,7 @@ void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
     if (!_service) return;
     const auto inputId = vc3d::spiralFiberInputId(fiberJsonPath);
     if (inputId.isEmpty()) return;
-    _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
+    _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
     _service->applyInputDrafts();
 }
 
@@ -1475,7 +1475,7 @@ void SpiralWorkspace::noteTrackedFiberSaved(uint64_t, const QString& fiberJsonPa
     if (!_managedFiberDirectories.contains(QFileInfo(fiberJsonPath).absolutePath())) return;
     const QString inputId = vc3d::spiralFiberInputId(fiberJsonPath);
     if (!inputId.isEmpty())
-        _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
+        _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
 }
 
 void SpiralWorkspace::noteFiberRemoved(const QString& path)
@@ -1487,7 +1487,7 @@ void SpiralWorkspace::noteFiberRemoved(const QString& path)
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")
             && (QFileInfo(input.value(QStringLiteral("source")).toString()).completeBaseName() == alias
                 || input.value(QStringLiteral("name")).toString() == alias))
-            _service->removeEphemeralInput(QStringLiteral("fiber"), input.value(QStringLiteral("id")).toString());
+            _service->removeInputDraft(input.value(QStringLiteral("id")).toString());
     }
 }
 
@@ -1508,7 +1508,7 @@ bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface
         }
     }
     if (id.isEmpty()) return false;
-    _service->removeEphemeralInput(QStringLiteral("patch"), id);
+    _service->removeInputDraft(id);
     statusBar()->showMessage(tr("Patch removal staged. Apply removes supervision; Commit deletes dataset files."), 15000);
     return true;
 }
@@ -1536,7 +1536,7 @@ bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& su
 void SpiralWorkspace::noteManagedPatchSaved(const QString& path)
 {
     if (!_managedPatchCopies.contains(path)) return;
-    _service->uploadPatch(path, _managedPatchCopies.value(path));
+    _service->stagePatch(path, _managedPatchCopies.value(path));
 }
 
 QString SpiralWorkspace::provisionalBrushRoot() const
@@ -1617,7 +1617,7 @@ void SpiralWorkspace::finalizeBrushPaint()
                         inputDraftPrepared(id, error);
                         return;
                     }
-                    _service->uploadPatch(path, id);
+                    _service->stagePatch(path, id);
                 });
         const auto surface = patch.surface;
         watcher->setFuture(QtConcurrent::run([surface, path]() -> QString {
@@ -1645,12 +1645,11 @@ void SpiralWorkspace::finalizeBrushPaint()
             _pendingPointCollectionPaths[document.id] = path;
             const auto role = vc3d::spiral::pclRoleFromName(document.role);
             if (!document.operation.isEmpty() && role) {
-                _service->uploadPclReplacement(
+                _service->stagePclReplacement(
                     *role, path, document.id, document.operation,
-                    document.targetCollectionId,
-                    document.baseSourceRevision);
+                    document.targetCollectionId);
             } else {
-                _service->uploadJsonInput(QStringLiteral("pcl"), path,
+                _service->stageJsonInput(QStringLiteral("pcl"), path,
                                           document.id, document.role);
             }
         }

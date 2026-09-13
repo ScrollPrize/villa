@@ -9,7 +9,6 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
-import dataclasses
 import concurrent.futures
 import gc
 import hashlib
@@ -52,7 +51,6 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
 from fit_session import (EDITABLE_PCL_ROLE_VALUES, RUN_MUTABLE_PCL_ROLES,
-                         PclInputSpec, conventional_pcl_document_path,
                          fit_input, input_source_enabled, pcl_input_enabled,
                          pcl_role_toggle_key, phase_bundle_enabled,
                          shell_losses_enabled, winding_inference_enabled)
@@ -79,12 +77,8 @@ from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
-from point_collection import (
-    link_points_to_patches,
-    link_unattached_points_to_patches,
-    load_point_collection,
-    normalise_pcl_winding_annotations,
-)
+from point_collection import (link_points_to_patches, load_point_collection,
+                              normalise_pcl_winding_annotations)
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -736,72 +730,6 @@ class PatchAtlas:
         return (np.asarray(node_ordinals, dtype=np.int64)
                 + self._theta_node_start)
 
-    def append_patches(self, patches_by_id):
-        """Append new patches without rebuilding the resident atlas.
-
-        Only the new grids are transferred to the atlas device, so a resident
-        interactive session can incorporate a handful of patches quickly.
-        """
-        if not patches_by_id:
-            return
-        offsets = [int(self.offsets[-1].item())]
-        widths = []
-        heights = []
-        for pid, p in patches_by_id.items():
-            if pid in self.id_to_idx:
-                raise ValueError(f'Patch {pid!r} is already in the atlas')
-            z = p.zyxs
-            H, W = z.shape[:2]
-            offsets.append(offsets[-1] + H * W)
-            widths.append(W)
-            heights.append(H)
-        if self.zyxs_flat is not None:
-            patch_start = len(self._patches)
-            patch_values = list(patches_by_id.values())
-            local_offsets = torch.tensor(
-                [value - offsets[0] for value in offsets],
-                dtype=torch.int64, device=self.zyxs_flat.device)
-            chunk = {
-                'zyxs_flat': self._materialize_geometry(
-                    patch_values, offsets[-1] - offsets[0],
-                    self.zyxs_flat.device),
-                'offsets': local_offsets,
-                'widths': torch.tensor(
-                    widths, dtype=torch.int64, device=self.zyxs_flat.device),
-                'heights': torch.tensor(
-                    heights, dtype=torch.int64, device=self.zyxs_flat.device),
-                'patch_start': patch_start,
-                'patch_end': patch_start + len(patch_values),
-            }
-            self._geometry_chunks.append(chunk)
-        self.offsets = torch.cat([
-            self.offsets,
-            torch.tensor(offsets[1:], dtype=torch.int64, device=self.offsets.device),
-        ])
-        self.widths = torch.cat([
-            self.widths, torch.tensor(widths, dtype=torch.int64, device=self.widths.device)])
-        self.heights = torch.cat([
-            self.heights, torch.tensor(heights, dtype=torch.int64, device=self.heights.device)])
-        self._patches.extend(patches_by_id.values())
-        self._num_vertices = offsets[-1]
-        self._theta_node_start = None
-        self._theta_node_ranges = []
-        self._satisfaction_atlases.clear()
-        next_idx = len(self.id_to_idx)
-        for pid in patches_by_id:
-            self.id_to_idx[pid] = next_idx
-            next_idx += 1
-        masks = [
-            np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
-            for p in patches_by_id.values()
-        ]
-        if self.sampling_atlas is not None:
-            self.sampling_atlas.append(masks)
-        else:
-            self.sampling_atlas = _make_patch_sampling_atlas(masks)
-        self._quad_counts = np.asarray(
-            self.sampling_atlas.valid_counts(), dtype=np.int64)
-
 
 class _UnattachedPclStripList(list):
     """List of unattached-pcl strip dicts, with a slot for an attached `.flat`
@@ -872,33 +800,6 @@ def _logical_identity(record):
     if kind is None:
         return None
     return (kind, str(record.get('logical_input_id')))
-
-
-def _without_regular_records(cross_patch, strips, strip_groups, dropped):
-    """The regular training views with every record ``dropped`` accepts
-    removed.
-
-    ``dropped(identity, resident_id)`` sees each record's logical identity
-    (see _logical_identity; None for a record without one) and its resident
-    collection id (None for fiber strips, whose ids are not regular catalog
-    keys). ``cross_patch`` holds pcl dicts, ``strips`` the unattached strips
-    with their parallel ``strip_groups``. Shared by live replace/delete of
-    editable collections and by turning a whole role off at a Run boundary.
-    """
-    kept_cross = []
-    for pcl in cross_patch:
-        metadata = pcl.get('metadata', {})
-        if not dropped(_logical_identity(metadata),
-                       metadata.get('resident_collection_id')):
-            kept_cross.append(pcl)
-    kept = []
-    for strip, group in zip(strips, strip_groups):
-        resident_id = (strip.get('id')
-                       if strip.get('logical_input_kind') != 'fiber' else None)
-        if not dropped(_logical_identity(strip), resident_id):
-            kept.append((strip, group))
-    return (kept_cross, [strip for strip, _ in kept],
-            [group for _, group in kept])
 
 
 def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
@@ -1151,8 +1052,8 @@ def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
                                         disabled_fraction=0.75):
     """Return the first iteration that may use DT losses after new inputs.
 
-    Input incorporation happens at the start of an interactive run. Keep DT
-    losses disabled for the requested fraction of that run so the radius-based
+    Inputs apply at an optimizer boundary. Keep DT losses disabled for the
+    requested fraction of the remaining run so the radius-based
     losses can settle the newly added geometry before directional constraints
     resume.
     """
@@ -2077,7 +1978,6 @@ class FitContext:
         # Drop the JSON-shaped source containers, especially the independent deep
         # copies made for PCLs that participate in both loss families.
         self.link_distance_tolerance = link_distance_tolerance
-
 
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
@@ -4052,60 +3952,6 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
-    def _assign_editable_collection_identities(self, record):
-        """Give a committed editable-role addition its role-scoped identity.
-
-        The addition joined the fit under resident ids only; the dataset
-        commit has since renumbered its collections into the role file.
-        Every resident view of them (catalog copy, cross-patch PCL, strip,
-        influence contribution) learns ``(role, committed id)`` so a later
-        replace/delete of that committed collection finds them.
-        """
-        role = record.get('role')
-        input_id = str(record.get('id'))
-        committed_ids = record.get('committed_collection_ids') or {}
-        if role not in EDITABLE_PCL_ROLE_VALUES or not committed_ids:
-            return
-        # Resident collection id -> committed id, from the catalog the
-        # additions were captured into.
-        by_resident_id = {}
-        for cid, pcl in getattr(self, 'regular_pcl_catalog', {}).items():
-            metadata = pcl.get('metadata', {})
-            if metadata.get('ephemeral_input_id') != input_id:
-                continue
-            committed_id = committed_ids.get(
-                str(metadata.get('ephemeral_collection_key')))
-            if committed_id is not None:
-                by_resident_id[cid] = str(committed_id)
-
-        def assign(metadata, committed_id):
-            metadata['logical_input_kind'] = role
-            metadata['logical_input_id'] = committed_id
-            metadata['logical_input_revision'] = None
-            metadata['committed_source_file'] = conventional_pcl_document_path(
-                getattr(getattr(self, 'paths', None), 'dataset_root', ''), role)
-
-        for cid, committed_id in by_resident_id.items():
-            assign(self.regular_pcl_catalog[cid].setdefault('metadata', {}),
-                   committed_id)
-        for pcl in self.cross_patch_pcls:
-            metadata = pcl.get('metadata', {})
-            committed_id = by_resident_id.get(
-                metadata.get('resident_collection_id'))
-            if committed_id is not None:
-                assign(metadata, committed_id)
-        for strip in self.unattached_pcl_strips:
-            if strip.get('logical_input_kind') == 'fiber':
-                continue
-            committed_id = by_resident_id.get(strip.get('id'))
-            if committed_id is not None:
-                assign(strip, committed_id)
-        influence_state = getattr(self, 'influence_state', None)
-        if influence_state is not None:
-            for cid, committed_id in by_resident_id.items():
-                influence_state.rename_logical_contribution_(
-                    ('pcl', cid), (role, committed_id))
-
     def prepare_input_changes(self, records, influence_config=None, *,
                               current_iteration=0, target_iteration=0):
         """Prepare a complete revision batch without changing active state.
@@ -4386,70 +4232,6 @@ class FitContext:
         self._write_non_liftable_patch_report()
         return list(candidate._input_warnings)
 
-    def _prevalidate_interactive_input(self, record):
-        """Load and validate one record without touching resident structures."""
-        kind = record.get('kind')
-        path = record.get('path')
-        input_id = record.get('id')
-        if kind == 'patch':
-            if not input_source_enabled(self.config, 'verified_patches'):
-                raise ValueError('verified-patch inputs are disabled for this session')
-            if input_id in self.verified_patches:
-                raise ValueError(f'Patch {input_id!r} is already part of this session')
-            patch = load_tifxyz(path)
-            cells = patch.erosion_cells(self.config['patch_erode_patches'])
-            if cells > 0 and not erode_patch_valid_region(patch, cells):
-                raise ValueError(f'Patch {input_id!r} has no valid quads after erosion')
-            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                raise ValueError(
-                    f'Patch {input_id!r} does not intersect the fitted z range '
-                    f'[{self.z_begin}, {self.z_end})')
-            return
-        if kind == 'fiber':
-            if not input_source_enabled(self.config, 'fibers'):
-                raise ValueError('fiber inputs are disabled for this session')
-            pcl = load_fiber_point_collection(
-                path, self.next_id,
-                min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
-                base_shape_zyx=getattr(self, 'base_shape_zyx', None))
-            if pcl is None:
-                raise ValueError(f'Fiber {input_id!r} has no usable control points')
-            groups = ['fibers']
-        elif kind == 'pcl':
-            role = record.get('role')
-            if not pcl_input_enabled(self.config, role, path):
-                raise ValueError(
-                    f'{role or "legacy"} PCL inputs are disabled for this session')
-            if (role in EDITABLE_PCL_ROLE_VALUES
-                    and record.get('operation') == 'assign_collection_ids'):
-                # Metadata only: the staged copy may already be gone, and
-                # the resident collections it names are found by upload id.
-                if not isinstance(record.get('committed_collection_ids'), dict):
-                    raise ValueError(
-                        f'PCL upload {input_id!r} names no committed '
-                        'collection ids')
-                return
-            loaded = load_point_collection(path) or {}
-            if not loaded:
-                raise ValueError(
-                    f'PCL document {input_id!r} contains no collections')
-            if (role in EDITABLE_PCL_ROLE_VALUES
-                    and record.get('operation') == 'delete_collection'):
-                return
-            if role == 'absolute':
-                for pcl in loaded.values():
-                    for point in pcl.get('points', {}).values():
-                        value = point.get('winding_annotation')
-                        if value is not None and (not np.isfinite(value) or value <= 0):
-                            raise ValueError(
-                                f'Absolute-winding pcl {pcl.get("name")!r} must '
-                                'use positive winding annotations')
-            groups = [path] * len(loaded)
-        else:
-            raise ValueError(f'Unknown ephemeral input kind {kind!r}')
-        if self.config['pcl_sampling_weights'] is not None:
-            build_pcl_sampling_strata(groups, self.config)
-
     def _fiber_views_from_catalog(self, fiber_catalog, cross_patch, strips,
                                   strip_groups):
         """Build all fiber-derived training views without mutating inputs."""
@@ -4569,6 +4351,7 @@ class FitContext:
                 continue
             records.append({
                 'kind': 'fiber', 'path': path, 'id': str(logical_id),
+                'source_id': os.path.splitext(pcl.get('file_basename', str(logical_id)))[0],
                 'revision': pcl.get('metadata', {}).get(
                     'logical_input_revision'),
             })
@@ -4581,772 +4364,11 @@ class FitContext:
 
     def _reingest_fiber_documents(self, records):
         if records:
-            warnings = self._incorporate_prevalidated_interactive_inputs(
+            candidate = self.prepare_input_changes(
                 records, influence_config={'influence_enabled': False})
+            warnings = self.install_input_changes(candidate)
             for warning in warnings or ():
                 print(f'WARNING: {warning}')
-
-    def _relink_resident_points_to_new_patches(
-            self, new_patches, regular_by_cid, fiber_by_cid):
-        """Attach still-unattached resident points to newly added patches."""
-        regular_gained = link_unattached_points_to_patches(
-            regular_by_cid,
-            self.verified_patches,
-            new_patches,
-            tolerance=self.link_distance_tolerance,
-            surface_index_tolerance=self.link_distance_tolerance,
-            distance_scale=1.0,
-            general_hit_policy='largest_area',
-        )
-        fiber_gained = link_unattached_points_to_patches(
-            fiber_by_cid,
-            self.verified_patches,
-            new_patches,
-            tolerance=self.link_distance_tolerance,
-            surface_index_tolerance=self.link_distance_tolerance,
-            distance_scale=1.0,
-            general_hit_policy='largest_area',
-        )
-        relinked_regular = {}
-        for cid in regular_gained:
-            working = catalog_copy_of_pcl(regular_by_cid[cid])
-            working['chain'] = SequenceChain(working)
-            relinked_regular[cid] = working
-        print(f'relinked {sum(regular_gained.values())} regular points in '
-              f'{len(regular_gained)} collections and '
-              f'{sum(fiber_gained.values())} fiber points in '
-              f'{len(fiber_gained)} fibers to {len(new_patches)} added patches')
-        return relinked_regular, bool(fiber_gained)
-
-    def incorporate_interactive_inputs(self, records, influence_config=None, *,
-                                       current_iteration, target_iteration):
-        """Prevalidate independently, then atomically apply all valid records."""
-        outcomes = self.prevalidate_interactive_inputs(records)
-        valid_identities = {
-            (outcome['kind'], outcome['id'], outcome.get('revision'))
-            for outcome in outcomes
-            if outcome['state'] == 'incorporated'
-        }
-        valid = [record for record in records
-                 if (record.get('kind'), record.get('id'),
-                     record.get('revision')) in valid_identities]
-        warnings = []
-        if valid:
-            warnings = self._incorporate_prevalidated_interactive_inputs(
-                valid, influence_config,
-                current_iteration=current_iteration,
-                target_iteration=target_iteration)
-        return {'outcomes': outcomes, 'warnings': list(warnings or ())}
-
-    def prevalidate_interactive_inputs(self, records):
-        """Return deterministic per-record verdicts without resident mutation."""
-        numpy_state = np.random.get_state()
-        torch_state = torch.random.get_rng_state()
-        cuda_states = torch.cuda.get_rng_state_all()
-        try:
-            outcomes = []
-            for record in records:
-                try:
-                    self._prevalidate_interactive_input(record)
-                except (OSError, ValueError, KeyError, TypeError,
-                        RuntimeError) as exc:
-                    outcomes.append({
-                        'id': record.get('id'), 'kind': record.get('kind'),
-                        'revision': record.get('revision'),
-                        'state': 'error',
-                        'error': f'{type(exc).__name__}: {exc}',
-                    })
-                else:
-                    outcomes.append({
-                        'id': record.get('id'), 'kind': record.get('kind'),
-                        'revision': record.get('revision'),
-                        'state': 'incorporated',
-                    })
-            return outcomes
-        finally:
-            np.random.set_state(numpy_state)
-            torch.random.set_rng_state(torch_state)
-            torch.cuda.set_rng_state_all(cuda_states)
-
-    def _editable_resident_ids(self, role, collection_id, source):
-        """Find one document's collection across the catalog and CPU views."""
-        result = set()
-        records = list(getattr(self, 'regular_pcl_catalog', {}).items())
-        records.extend((pcl.get('metadata', {}).get('resident_collection_id'), pcl)
-                       for pcl in self.cross_patch_pcls)
-        records.extend((strip.get('id'), strip)
-                       for strip in self.unattached_pcl_strips)
-        for resident_id, pcl in records:
-            metadata = pcl.get('metadata', pcl)
-            document = metadata.get('committed_source_file') or pcl.get('source_file')
-            if (resident_id is not None and document
-                    and _logical_identity(metadata) == (role, str(collection_id))
-                    and os.path.realpath(document) == os.path.realpath(source)):
-                result.add(resident_id)
-        return result
-
-    def _incorporate_prevalidated_interactive_inputs(
-            self, records, influence_config=None, *, current_iteration=0,
-            target_iteration=0):
-        """Incorporate uploaded inputs without rebuilding device/model state.
-
-        current_iteration/target_iteration describe the Run request queued
-        alongside the new inputs (the runtime sets the target before this
-        method runs at the pause boundary); they size the DT-free window.
-
-        Runs on the fitter thread at a pause boundary. Patches and regular PCLs
-        retain their resident append-only behavior. Fiber documents replace or
-        append entries in a candidate logical-id catalog, then all fiber-derived
-        CPU views are materialized once and swapped together. Existing model,
-        optimizer, patch-atlas, and device tensors remain resident.
-
-        Returns the warnings this incorporation raised, for the runtime to
-        publish on the session status (nothing here is fatal enough to refuse
-        the inputs).
-        """
-        # Incorporation has its own saved RNG envelope so adding inputs does
-        # not alter the stochastic training sequence (same discipline as the
-        # interactive preview export).
-        numpy_state = np.random.get_state()
-        torch_state = torch.random.get_rng_state()
-        cuda_states = torch.cuda.get_rng_state_all()
-        try:
-            run_cfg = dict(self.config)
-            run_cfg.update(dict(influence_config or {}))
-            new_patches = {}
-            new_collections = {}
-            new_regular_collections = {}
-            theta_warnings = []
-            new_fibers = []
-            # Live replace/delete of editable-role collections. Identities
-            # are resolved to resident ids within their source document.
-            replacing_editable = False
-            deleting_editable_ids = set()
-            replacing_resident_ids = set()
-            candidate_fiber_catalog = dict(self.fiber_catalog)
-            candidate_next_id = self.next_id
-            # Identity assignments first: a mutation later in this batch may
-            # already target the committed id they hand out.
-            identity_assignments = [
-                record for record in records
-                if record.get('kind') == 'pcl'
-                and record.get('operation') == 'assign_collection_ids'
-            ]
-            for record in identity_assignments:
-                self._assign_editable_collection_identities(record)
-            for record in records:
-                if record in identity_assignments:
-                    continue
-                kind = record.get('kind')
-                path = record.get('path')
-                input_id = record.get('id')
-                if kind == 'patch':
-                    if not input_source_enabled(
-                            self.config, 'verified_patches'):
-                        raise RuntimeError(
-                            'verified-patch inputs are disabled for this session')
-                    if input_id in self.verified_patches or input_id in new_patches:
-                        raise RuntimeError(f'Patch {input_id!r} is already part of this session')
-                    patch = load_tifxyz(path)
-                    patch._source_path = os.path.abspath(path)
-                    cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
-                    if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
-                        raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
-                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                        raise RuntimeError(
-                            f'Patch {input_id!r} does not intersect the fitted z range '
-                            f'[{self.z_begin}, {self.z_end})')
-                    patch.release_derived_caches()
-                    new_patches[input_id] = patch
-                elif kind == 'fiber':
-                    if not input_source_enabled(self.config, 'fibers'):
-                        raise RuntimeError(
-                            'fiber inputs are disabled for this session')
-                    logical_id = str(input_id)
-                    resident = candidate_fiber_catalog.get(logical_id)
-                    collection_id = (
-                        resident['id'] if resident is not None
-                        else candidate_next_id)
-                    pcl = load_fiber_point_collection(
-                        path, collection_id,
-                        min_point_spacing=self.config[
-                            'pcl_fiber_min_point_spacing'],
-                        base_shape_zyx=getattr(self, 'base_shape_zyx', None))
-                    if pcl is None:
-                        raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
-                    pcl['source_file'] = path
-                    pcl.setdefault('metadata', {})['winding_is_absolute'] = False
-                    pcl['metadata']['input_role'] = 'fiber'
-                    pcl['metadata']['logical_input_kind'] = 'fiber'
-                    pcl['metadata']['logical_input_id'] = logical_id
-                    pcl['metadata']['logical_input_revision'] = record.get(
-                        'revision')
-                    pcl['sampling_group'] = 'fibers'
-                    pcl['file_basename'] = f'{logical_id}.json'
-                    new_fibers.append((logical_id, pcl))
-                    new_collections[collection_id] = pcl
-                    candidate_fiber_catalog[logical_id] = pcl
-                    if resident is None:
-                        candidate_next_id += 1
-                elif kind == 'pcl':
-                    role = record.get('role')
-                    if not pcl_input_enabled(self.config, role, path):
-                        raise RuntimeError(
-                            f'{role or "legacy"} PCL inputs are disabled for '
-                            'this session')
-                    loaded = record.get('_loaded_collections')
-                    if loaded is None:
-                        loaded = load_point_collection(path) or {}
-                    if not loaded:
-                        raise RuntimeError(f'PCL document {input_id!r} contains no collections')
-                    editable_role = role in EDITABLE_PCL_ROLE_VALUES
-                    committed_ids = record.get('committed_collection_ids')
-                    committed_source = record.get('committed_source_file')
-                    if editable_role and committed_source is None:
-                        committed_source = conventional_pcl_document_path(
-                            getattr(getattr(self, 'paths', None), 'dataset_root', ''),
-                            role) or path
-                    if editable_role and record.get('operation') in (
-                            'replace_collection', 'delete_collection'):
-                        resident_ids = sorted(self._editable_resident_ids(
-                            role, record.get('target_collection_id'), committed_source))
-                        replacing_resident_ids.update(resident_ids)
-                        replacing_editable = True
-                        if record.get('operation') == 'delete_collection':
-                            deleting_editable_ids.add(
-                                (role, str(record.get('target_collection_id'))))
-                            continue
-                    for source_key, pcl in loaded.items():
-                        committed_id = (committed_ids or {}).get(str(source_key))
-                        if (editable_role and committed_id is not None
-                                and record.get('operation') not in (
-                                    'replace_collection', 'delete_collection')
-                                and any(_logical_identity(item.get('metadata', {}))
-                                        == (role, str(committed_id))
-                                        and os.path.realpath(
-                                            item.get('metadata', {}).get(
-                                                'committed_source_file')
-                                            or item.get('source_file', ''))
-                                        == os.path.realpath(committed_source)
-                                        for item in (
-                                            list(getattr(self, 'regular_pcl_catalog', {}).values())
-                                            + list(new_regular_collections.values())))):
-                            # Enabling the role may already have loaded this
-                            # committed addition from its dataset document.
-                            continue
-                        replacement = (
-                            editable_role
-                            and record.get('operation') == 'replace_collection')
-                        if replacement:
-                            logical_id = str(record.get('target_collection_id'))
-                            collection_id = (resident_ids[0]
-                                             if resident_ids
-                                             else candidate_next_id)
-                            if not resident_ids:
-                                candidate_next_id += 1
-                            replacing_editable = True
-                        else:
-                            collection_id = candidate_next_id
-                            candidate_next_id += 1
-                        pcl['source_file'] = path
-                        pcl['sampling_group'] = path
-                        pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
-                        pcl['metadata']['input_role'] = role
-                        pcl['metadata']['resident_collection_id'] = collection_id
-                        if replacement:
-                            pcl['metadata'].update({
-                                'committed_source_file': committed_source,
-                                'logical_input_kind': role,
-                                'logical_input_id': logical_id,
-                                'logical_input_revision': record.get(
-                                    'base_source_revision'),
-                                'resident_collection_id': collection_id,
-                            })
-                        elif editable_role:
-                            # A plain addition. Remember where it came from
-                            # so its committed collection id can be applied
-                            # later; apply it now when commit already
-                            # happened.
-                            pcl['metadata'].update({
-                                'ephemeral_input_id': str(input_id),
-                                'ephemeral_collection_key': str(source_key),
-                            })
-                            committed_id = (committed_ids or {}).get(
-                                str(source_key))
-                            if committed_id is not None:
-                                pcl['metadata'].update({
-                                    'logical_input_kind': role,
-                                    'logical_input_id': str(committed_id),
-                                    'logical_input_revision': None,
-                                    'committed_source_file': committed_source,
-                                })
-                        new_collections[collection_id] = pcl
-                        new_regular_collections[collection_id] = pcl
-                else:
-                    raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
-
-            # Weighted sampling intentionally requires every group to be named.
-            # Validate uploaded groups before mutating any resident patch/PCL pools,
-            # so a missing weight cannot leave a half-incorporated session behind.
-            if new_collections and self.config['pcl_sampling_weights'] is not None:
-                build_pcl_sampling_strata(
-                    (pcl['sampling_group'] for pcl in new_collections.values()),
-                    self.config)
-
-            source_additions = {
-                cid: catalog_copy_of_pcl(pcl) for cid, pcl in new_collections.items()
-            }
-
-            # ---- Patches: sampling caches, probabilities, atlas append ----
-            if new_patches:
-                for patch in new_patches.values():
-                    self._prepare_patch_sampling_cache([patch])
-                self.verified_patches.update(new_patches)
-                self.verified_patches_list.extend(new_patches.values())
-                self.patch_sampling_probabilities = self._patch_sampling_probabilities(
-                    self.verified_patches_list)
-                self.patch_atlas.append_patches(new_patches)
-                if self.config['dt_target_mode'] == 'whole_object_quantile':
-                    prepare_patch_dt_target_samples(
-                        list(new_patches.values()),
-                        self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-                    )
-
-            # ---- Point collections: link, classify, strip-materialise ----
-            for pcl in new_collections.values():
-                for point in pcl['points'].values():
-                    point['zyx'] = np.array(
-                        [point['p'][2], point['p'][1], point['p'][0]],
-                        dtype=np.float32)
-                pcl['chain'] = SequenceChain(pcl)
-            if new_collections:
-                link_points_to_patches(
-                    self.verified_patches,
-                    new_collections,
-                    tolerance=self.link_distance_tolerance,
-                    surface_index_tolerance=self.link_distance_tolerance,
-                    distance_scale=1.0,
-                    general_hit_policy='largest_area',
-                )
-
-            # Capture uploads before classification trims or normalizes them.
-            catalog_additions = {
-                cid: catalog_copy_of_pcl(pcl)
-                for cid, pcl in new_regular_collections.items()
-            }
-
-            relinked_regular = {}
-            fiber_relinked = False
-            if new_patches:
-                new_fiber_ids = {logical_id for logical_id, _ in new_fibers}
-                regular_by_cid = {
-                    cid: pcl for cid, pcl in
-                    getattr(self, 'regular_pcl_catalog', {}).items()
-                    if cid not in new_regular_collections
-                    and cid not in replacing_resident_ids
-                }
-                fiber_by_cid = {
-                    pcl['id']: pcl
-                    for logical_id, pcl in candidate_fiber_catalog.items()
-                    if logical_id not in new_fiber_ids
-                }
-                relinked_regular, fiber_relinked = (
-                    self._relink_resident_points_to_new_patches(
-                        new_patches, regular_by_cid, fiber_by_cid))
-
-            if (new_collections or deleting_editable_ids
-                    or relinked_regular or fiber_relinked):
-                new_cross_patch = {}
-                new_unattached = {}
-                classify = (list(relinked_regular.items()) +
-                            list(new_regular_collections.items()))
-                for pid, pcl in classify:
-                    num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
-                    num_unattached = len(pcl['points']) - num_attached
-                    if pcl.get('metadata', {}).get('winding_is_absolute', False):
-                        attached_points = [point for point in pcl['points'].values()
-                                           if 'on_patch' in point]
-                        if any(not np.isfinite(point['winding_annotation'])
-                               or point['winding_annotation'] <= 0
-                               for point in attached_points):
-                            raise RuntimeError(
-                                f'Absolute-winding pcl {pcl.get("name")!r} must annotate every '
-                                f'attached point with a positive winding number')
-                        new_cross_patch[pid] = pcl
-                        continue
-                    if num_attached >= 2:
-                        new_cross_patch[pid] = pcl
-                    if num_unattached >= 1:
-                        new_unattached[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
-
-                z_margin = self.config['patch_loss_z_margin']
-                for pid in list(new_unattached.keys()):
-                    pcl = new_unattached[pid]
-                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-                    best_start, best_end = 0, 0
-                    run_start = 0
-                    for i, (_, point) in enumerate(sorted_items):
-                        z = point['zyx'][0]
-                        if self.z_begin - z_margin <= z < self.z_end + z_margin:
-                            if i + 1 - run_start > best_end - best_start:
-                                best_start, best_end = run_start, i + 1
-                        else:
-                            run_start = i + 1
-                    kept_items = sorted_items[best_start:best_end]
-                    if len(kept_items) < 2:
-                        del new_unattached[pid]
-                    else:
-                        pcl['points'] = dict(kept_items)
-
-                normalise_pcl_winding_annotations(new_cross_patch)
-                normalise_pcl_winding_annotations(new_unattached)
-
-                retained_cross_patch = list(self.cross_patch_pcls)
-                retained_strips = list(self.unattached_pcl_strips)
-                retained_strip_groups = list(
-                    self.unattached_strip_sampling_groups)
-                if relinked_regular:
-                    retained_cross_patch = [
-                        pcl for pcl in retained_cross_patch
-                        if pcl.get('metadata', {}).get('resident_collection_id')
-                        not in relinked_regular
-                    ]
-                    retained = [
-                        (strip, group) for strip, group in zip(
-                            retained_strips, retained_strip_groups)
-                        if not (strip.get('logical_input_kind') != 'fiber'
-                                and strip.get('id') in relinked_regular)
-                    ]
-                    retained_strips = [strip for strip, _ in retained]
-                    retained_strip_groups = [group for _, group in retained]
-                if replacing_editable:
-                    (retained_cross_patch, retained_strips,
-                     retained_strip_groups) = _without_regular_records(
-                        retained_cross_patch, retained_strips,
-                        retained_strip_groups,
-                        lambda _, resident_id: resident_id in replacing_resident_ids)
-                if new_fibers or fiber_relinked:
-                    retained_cross_patch = [
-                        pcl for pcl in retained_cross_patch
-                        if pcl.get('metadata', {}).get('input_role')
-                        not in {'fiber', 'fiber_link_component'}
-                        and pcl.get('metadata', {}).get(
-                            'logical_input_kind') != 'fiber'
-                    ]
-                    retained = [
-                        (strip, group) for strip, group in zip(
-                            retained_strips, retained_strip_groups)
-                        if strip.get('logical_input_kind') != 'fiber'
-                    ]
-                    retained_strips = [strip for strip, _ in retained]
-                    retained_strip_groups = [group for _, group in retained]
-
-                    (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
-                     candidate_resolved_links,
-                     candidate_link_components) = materialize_fiber_fit_inputs(
-                        candidate_fiber_catalog,
-                        self.verified_patches,
-                        z_begin=self.z_begin,
-                        z_end=self.z_end,
-                        z_margin=self.config['patch_loss_z_margin'],
-                        min_point_spacing=self.config[
-                            'pcl_unattached_pcl_min_point_spacing'],
-                        use_links=self.config['pcl_use_fiber_links'],
-                        use_pending_links=self.config[
-                            'pcl_use_pending_fiber_links'],
-                    )
-                    retained_cross_patch.extend(fiber_cross_patch)
-                    retained_strips.extend(fiber_strips)
-                    retained_strip_groups.extend(fiber_sampling_groups)
-
-                for pcl in new_cross_patch.values():
-                    points_by_patch = {}
-                    for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
-                        if 'on_patch' not in point:
-                            continue
-                        pid = point['on_patch']['id']
-                        if pid not in self.verified_patches:
-                            continue
-                        points_by_patch.setdefault(pid, []).append(point)
-                    pcl['points_by_patch'] = points_by_patch
-                    retained_cross_patch.append(pcl)
-
-                min_point_spacing = self.config['pcl_unattached_pcl_min_point_spacing']
-                for pcl_id, pcl in new_unattached.items():
-                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-                    if len(sorted_items) < 2:
-                        continue
-                    zyxs = np.stack([point['zyx'] for _, point in sorted_items],
-                                    axis=0).astype(np.float32)
-                    windings = np.array(
-                        [point['winding_annotation'] for _, point in sorted_items],
-                        dtype=np.float32)
-                    zyxs, keep = _decimate_ordered_points_min_spacing(
-                        zyxs, min_point_spacing, return_indices=True,
-                        force_keep={len(zyxs) - 1})
-                    windings = windings[keep]
-                    retained_strips.append({
-                        'id': pcl_id,
-                        'name': pcl.get('name'),
-                        'source_file': pcl.get('source_file'),
-                        'zyxs': zyxs,
-                        'windings': windings,
-                        'logical_input_kind': pcl.get('metadata', {}).get(
-                            'logical_input_kind'),
-                        'logical_input_id': pcl.get('metadata', {}).get(
-                            'logical_input_id'),
-                        'logical_input_revision': pcl.get('metadata', {}).get(
-                            'logical_input_revision'),
-                        'link_points': {},
-                    })
-                    retained_strip_groups.append(pcl.get('sampling_group'))
-
-                # Commit the catalog and all derived fiber views together only
-                # after the catalog-wide materialization has succeeded.
-                self.cross_patch_pcls[:] = retained_cross_patch
-                self.unattached_pcl_strips[:] = retained_strips
-                self.unattached_strip_sampling_groups[:] = retained_strip_groups
-                self.unattached_pcl_strips.flat = None
-                if new_fibers or fiber_relinked:
-                    self.fiber_catalog = candidate_fiber_catalog
-                    self.resolved_links[:] = candidate_resolved_links
-                    self.link_components[:] = candidate_link_components
-                if replacing_editable:
-                    for cid in [
-                            cid for cid, pcl in
-                            getattr(self, 'regular_pcl_catalog', {}).items()
-                            if cid in replacing_resident_ids]:
-                        del self.regular_pcl_catalog[cid]
-                if not hasattr(self, 'regular_pcl_catalog'):
-                    self.regular_pcl_catalog = {}
-                self.regular_pcl_catalog.update(catalog_additions)
-                self.next_id = candidate_next_id
-                self._rebuild_pcl_sampling_strata()
-
-            if new_patches or new_collections or deleting_editable_ids:
-                # Whole-object DT target caches index the changed object
-                # pools; force recomputation on next use.
-                self.dt_target_cache_manager.reset()
-                if new_fibers or replacing_editable:
-                    self._refresh_trusted_geometry()
-                theta_warnings = self._build_theta_crossing_map()
-                # The gate may have rejected one of this incorporation's
-                # patches; downstream influence setup must see only survivors.
-                new_patches = {
-                    patch_id: patch for patch_id, patch in new_patches.items()
-                    if patch_id in self.verified_patches
-                }
-
-            if deleting_editable_ids and self.influence_state is not None:
-                self.influence_state.remove_logical_contributions_(
-                    sorted(deleting_editable_ids),
-                    spiral_and_transform=self.spiral_and_transform,
-                    optimiser=self.optimiser)
-
-            if run_cfg['influence_enabled'] and (new_patches or new_collections):
-                if self.influence_state is None:
-                    self.influence_state = make_influence_state(
-                        run_cfg, torch.device('cuda'))
-                self.influence_state.activate_or_extend_(
-                    new_patches=new_patches,
-                    new_collections=new_collections,
-                    spiral_and_transform=self.spiral_and_transform,
-                    optimiser=self.optimiser,
-                    cfg=run_cfg,
-                    z_begin=self.z_begin,
-                    z_end=self.z_end,
-                    anchor_geometry_zyx=self.influence_anchor_geometry,
-                )
-                self.interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
-                self.interactive_influence_anchor_samples = int(
-                    run_cfg['sample_count_influence_anchor_samples_per_step'])
-
-            # The runtime sets the target before this method is drained at the
-            # pause boundary, so this is exactly the iteration window requested
-            # alongside the new inputs. Do not let a later incorporation
-            # shorten an already-active DT-free window.
-            dt_resume_iteration = get_interactive_dt_resume_iteration(
-                current_iteration,
-                target_iteration,
-                run_cfg['influence_disable_dt_frac'],
-            )
-            if getattr(self, 'interactive_dt_resume_iteration', None) is None:
-                self.interactive_dt_resume_iteration = dt_resume_iteration
-            else:
-                self.interactive_dt_resume_iteration = max(
-                    self.interactive_dt_resume_iteration,
-                    dt_resume_iteration)
-
-            print(f'incorporated {len(new_patches)} patches and '
-                  f'{len(new_collections)} point collections into the resident session; '
-                  f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
-
-            # Keep immutable pre-link geometry available when a legacy upload
-            # is followed by a revision batch during the paired migration.
-            if hasattr(self, '_source_point_collections'):
-                for cid in replacing_resident_ids:
-                    self._source_point_collections.pop(cid, None)
-                self._source_point_collections.update(source_additions)
-                self._source_verified_patches.update(new_patches)
-
-            warnings = list(theta_warnings)
-            link_warning = unresolved_fiber_link_warning(
-                candidate_fiber_catalog,
-                use_links=self.config['pcl_use_fiber_links'],
-                use_pending_links=self.config['pcl_use_pending_fiber_links'])
-            if link_warning is not None:
-                print(f'WARNING: {link_warning}')
-                warnings.append(link_warning)
-            return warnings
-        finally:
-            np.random.set_state(numpy_state)
-            torch.random.set_rng_state(torch_state)
-            torch.cuda.set_rng_state_all(cuda_states)
-
-    def _pcl_role_document_paths(self, role):
-        """The point-collection documents one role would load: every spec the
-        session request named for the role plus the dataset's conventional
-        document, existing files only, in that order without duplicates."""
-        paths = getattr(self, 'paths', None)
-        candidates = [
-            spec.path for spec in (
-                getattr(self, '_configured_pcl_sources', ())
-                + tuple(getattr(paths, 'pcls', None) or ()))
-            if spec.role is role
-        ]
-        conventional = conventional_pcl_document_path(
-            getattr(paths, 'dataset_root', ''), role)
-        if conventional:
-            candidates.append(conventional)
-        found = []
-        for pattern in candidates:
-            expanded = (sorted(glob.glob(pattern))
-                        if glob.has_magic(pattern) else [pattern])
-            for path in expanded:
-                if path not in found and os.path.isfile(path):
-                    found.append(path)
-        return found
-
-    def _prepare_pcl_role_inputs(self, role):
-        """Read and validate a role before any Run participation changes."""
-        documents = self._pcl_role_document_paths(role)
-        if not documents:
-            print(f'{pcl_role_toggle_key(role)} enabled, but no '
-                  f'{role.value} document exists for this dataset; nothing '
-                  'to load until one is uploaded or committed')
-            return []
-        records = []
-        for path in documents:
-            loaded = load_point_collection(path) or {}
-            if not loaded:
-                print(f'WARNING: {role.value} document {path} contains no '
-                      'collections; skipped')
-                continue
-            records.append({
-                'kind': 'pcl',
-                'role': role.value,
-                'path': path,
-                'id': f'{role.value}-document:{path}',
-                'committed_source_file': path,
-                '_loaded_collections': loaded,
-                'committed_collection_ids': {
-                    str(source_id): source_id for source_id in loaded},
-            })
-        if records and self.config['pcl_sampling_weights'] is not None:
-            build_pcl_sampling_strata(
-                (record['path'] for record in records), self.config)
-        return records
-
-    def _enable_pcl_role_inputs(self, role, records=None):
-        """Load validated role documents without an influence window."""
-        if records is None:
-            records = self._prepare_pcl_role_inputs(role)
-        if not records:
-            return
-        self._incorporate_prevalidated_interactive_inputs(
-            records, {'influence_enabled': False})
-        paths = getattr(self, 'paths', None)
-        if paths is not None:
-            named = {spec.path for spec in paths.pcls}
-            added = tuple(
-                PclInputSpec(path=record['path'], role=role)
-                for record in records if record['path'] not in named)
-            self.paths = dataclasses.replace(
-                paths, pcls=tuple(paths.pcls) + added)
-
-    def _disable_pcl_role_inputs(self, role):
-        """Drop every resident collection of one role (Run boundary).
-
-        Collections are found by role: committed ones through their logical
-        identity, uncommitted uploads through the regular catalog's
-        resident ids (their strips carry the catalog id). The training
-        views, the catalog (so a later patch relink cannot resurrect the
-        role), the sampling strata, the trusted geometry, the theta map and
-        any influence contributions forget the role together. Uncommitted
-        uploads of the role go with it: a later enable reloads only the
-        dataset documents.
-        """
-        catalog = getattr(self, 'regular_pcl_catalog', None) or {}
-        resident_ids = set()
-        identities = set()
-        influence_keys = set()
-
-        def note(metadata, resident_id):
-            if metadata.get('input_role') != role.value:
-                return
-            identity = _logical_identity(metadata)
-            if identity is not None:
-                identities.add(identity)
-                influence_keys.add(identity)
-            elif resident_id is not None:
-                influence_keys.add(('pcl', str(resident_id)))
-            if resident_id is not None:
-                resident_ids.add(resident_id)
-
-        for cid, pcl in catalog.items():
-            note(pcl.get('metadata', {}), cid)
-        for pcl in self.cross_patch_pcls:
-            metadata = pcl.get('metadata', {})
-            note(metadata, metadata.get('resident_collection_id'))
-        for strip in self.unattached_pcl_strips:
-            identity = _logical_identity(strip)
-            if identity is not None and identity[0] == role.value:
-                identities.add(identity)
-                influence_keys.add(identity)
-
-        paths = getattr(self, 'paths', None)
-        if paths is not None:
-            self.paths = dataclasses.replace(
-                paths, pcls=tuple(spec for spec in paths.pcls
-                                  if spec.role is not role))
-        if not identities and not resident_ids:
-            return
-
-        def dropped(identity, resident_id):
-            return identity in identities or resident_id in resident_ids
-
-        cross_patch, strips, groups = _without_regular_records(
-            self.cross_patch_pcls, self.unattached_pcl_strips,
-            self.unattached_strip_sampling_groups, dropped)
-        self.cross_patch_pcls[:] = cross_patch
-        self.unattached_pcl_strips[:] = strips
-        self.unattached_strip_sampling_groups[:] = groups
-        self.unattached_pcl_strips.flat = None
-        for cid in [cid for cid in catalog if cid in resident_ids]:
-            del catalog[cid]
-        self._rebuild_pcl_sampling_strata()
-        self.dt_target_cache_manager.reset()
-        self._refresh_trusted_geometry()
-        self._build_theta_crossing_map()
-        influence_state = getattr(self, 'influence_state', None)
-        if influence_state is not None:
-            influence_state.remove_logical_contributions_(
-                sorted(influence_keys),
-                spiral_and_transform=self.spiral_and_transform,
-                optimiser=self.optimiser)
-        print(f'{pcl_role_toggle_key(role)} disabled: dropped '
-              f'{len(resident_ids)} {role.value} collections from the '
-              'resident session')
 
     def apply_config(self, config, path_changes=None, *, current_iteration):
         """Apply Run-scoped settings without replacing the resident fit.
@@ -5356,7 +4378,6 @@ class FitContext:
         """
         path_changes = dict(path_changes or {})
         changed = set(config)
-        revisioned_inputs = bool(getattr(self, "_workspace_membership", None))
         cadence_keys = {
             'theta_crossing_map_update_interval',
             'dt_target_update_interval',
@@ -5366,14 +4387,6 @@ class FitContext:
         old_values = {key: self.config[key] for key in tracked}
         self.config.update(config)
         try:
-            # Validate every enabling role before disabling any resident
-            # supervision. Reuse the parsed documents during incorporation.
-            prepared_roles = {
-                role: self._prepare_pcl_role_inputs(role)
-                for role in RUN_MUTABLE_PCL_ROLES
-                if not revisioned_inputs and pcl_role_toggle_key(role) in changed
-                and self.config[pcl_role_toggle_key(role)]
-            }
             fiber_catalog = getattr(self, 'fiber_catalog', None) or {}
             fiber_records = (
                 self._prepare_fiber_reingest()
@@ -5546,6 +4559,10 @@ class FitContext:
             rederived_views = False
             if fiber_records is not None:
                 self._reingest_fiber_documents(fiber_records)
+                rebuilt_unverified = self.unverified_patches
+                rebuilt_unverified_list = self.unverified_patches_list
+                rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
+                rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
             elif changed & fiber_view_keys and fiber_catalog:
                 self._rematerialize_fiber_views()
@@ -5554,11 +4571,10 @@ class FitContext:
                     and getattr(self, 'regular_pcl_catalog', None)):
                 self._rederive_regular_unattached_strips()
                 rederived_views = True
-            # Role participation toggles of the editable roles. Each one
-            # goes through the incorporation machinery (which rebuilds the
-            # strata itself), so they run after every other view change.
+            # Rebuild participation from retained source revisions after all
+            # other view changes. Disabled roles keep their editable content.
             role_changes = changed & {pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
-            if revisioned_inputs and role_changes:
+            if role_changes:
                 candidate = self.prepare_input_changes(
                     [], {'influence_enabled': False}, current_iteration=current_iteration,
                     target_iteration=current_iteration)
@@ -5568,15 +4584,6 @@ class FitContext:
                 rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
                 rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
-            else:
-                for role in RUN_MUTABLE_PCL_ROLES:
-                    if pcl_role_toggle_key(role) not in changed:
-                        continue
-                    if self.config[pcl_role_toggle_key(role)]:
-                        self._enable_pcl_role_inputs(role, prepared_roles[role])
-                    else:
-                        self._disable_pcl_role_inputs(role)
-                    rederived_views = True
             if rebuild_strata and not rederived_views:
                 self._rebuild_pcl_sampling_strata()
         except Exception:

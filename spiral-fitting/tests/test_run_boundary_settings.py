@@ -4,9 +4,7 @@ Each test builds a FitContext piecemeal (the pattern test_vertical_fiber_theta
 uses) and drives FitContext.apply_config the way the interactive runtime does.
 """
 import copy
-import json
 from types import SimpleNamespace
-from unittest import mock
 from unittest.mock import Mock
 
 import numpy as np
@@ -14,8 +12,6 @@ import pytest
 import torch
 
 from config import Config
-from fit_session import (PclInputSpec, PclRole, SpiralInputPaths,
-                         pcl_role_toggle_key)
 from fit_spiral import FitContext, _UnattachedPclStripList
 
 
@@ -170,12 +166,13 @@ def test_fiber_spacing_reloads_the_documents_and_refuses_missing_ones(tmp_path):
     context.fiber_catalog = {
         'gone': _fiber(1, 'gone', [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])}
     context.fiber_catalog['gone']['source_file'] = str(tmp_path / 'gone.json')
-    context._incorporate_prevalidated_interactive_inputs = Mock(return_value=[])
+    context.prepare_input_changes = Mock()
+    context.install_input_changes = Mock(return_value=[])
     with pytest.raises(ValueError, match='no longer on disk'):
         context.apply_config(
             {'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
     assert context.config['pcl_fiber_min_point_spacing'] == 40.0
-    context._incorporate_prevalidated_interactive_inputs.assert_not_called()
+    context.prepare_input_changes.assert_not_called()
 
     present = tmp_path / 'present.json'
     present.write_text('{}')
@@ -186,8 +183,8 @@ def test_fiber_spacing_reloads_the_documents_and_refuses_missing_ones(tmp_path):
         'logical_input_revision'] = 'abc'
     context.apply_config(
         {'pcl_fiber_min_point_spacing': 5.0}, current_iteration=0)
-    context._incorporate_prevalidated_interactive_inputs.assert_called_once_with(
-        [{'kind': 'fiber', 'path': str(present), 'id': 'present',
+    context.prepare_input_changes.assert_called_once_with(
+        [{'kind': 'fiber', 'path': str(present), 'id': 'present', 'source_id': 'present',
           'revision': 'abc'}],
         influence_config={'influence_enabled': False})
 
@@ -269,172 +266,6 @@ def test_unattached_spacing_rederives_regular_strips_from_the_catalog():
 
 # --- point-collection role toggles ---------------------------------------------
 
-def _pcl_document(path, collection_id, points):
-    path.write_text(json.dumps({
-        "vc_pointcollections_json_version": "1",
-        "collections": {
-            str(collection_id): {
-                "id": collection_id, "name": f"c{collection_id}",
-                "points": {
-                    str(i): {"id": i, "collectionId": collection_id,
-                             "p": p, "creation_time": i}
-                    for i, p in enumerate(points)
-                },
-            },
-        },
-    }))
-    return str(path)
-
-
-def _role_context(tmp_path, **overrides):
-    context = _context(**overrides)
-    context.paths = SpiralInputPaths(dataset_root=str(tmp_path))
-    context.next_id = 40
-    context.link_distance_tolerance = 2.5
-    context._trusted_geometry_from_active_inputs = Mock(
-        return_value=torch.empty((0, 3)))
-    context.run_dt_resume_iteration = None
-    context.influence_state = None
-    return context
-
-
-def test_enabling_a_role_loads_the_conventional_dataset_document(tmp_path):
-    # The session was built with same-winding off, so its manifest names no
-    # same-winding document; enabling finds the dataset's conventional one.
-    context = _role_context(tmp_path, input_use_pcl_same_winding=False)
-    document = _pcl_document(
-        tmp_path / "same_windings.json", 5,
-        [[0, 0, 10], [4, 0, 12], [8, 0, 14]])
-
-    with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
-            mock.patch.object(torch.cuda, "set_rng_state_all"):
-        context.apply_config(
-            {"input_use_pcl_same_winding": True}, current_iteration=0)
-
-    assert context.config["input_use_pcl_same_winding"] is True
-    # No patches, so the collection is one unattached strip that keeps its
-    # source id as logical id exactly as a build-time load would.
-    assert context.cross_patch_pcls == []
-    [strip] = context.unattached_pcl_strips
-    assert strip["logical_input_kind"] == "same_winding"
-    assert strip["logical_input_id"] == "5"
-    assert strip["id"] == 40
-    assert context.unattached_strip_sampling_groups == [document]
-    [catalog_entry] = context.regular_pcl_catalog.values()
-    assert catalog_entry["metadata"]["input_role"] == "same_winding"
-    assert catalog_entry["source_file"] == document
-    assert context.paths.pcls == (
-        PclInputSpec(document, PclRole.SAME_WINDING),)
-    context._rebuild_pcl_sampling_strata.assert_called_once_with()
-    context._build_theta_crossing_map.assert_called_once_with()
-
-
-def test_enabling_a_role_without_a_document_changes_nothing(tmp_path):
-    context = _role_context(tmp_path, input_use_pcl_relative=False)
-
-    context.apply_config({"input_use_pcl_relative": True}, current_iteration=0)
-
-    assert context.config["input_use_pcl_relative"] is True
-    assert list(context.unattached_pcl_strips) == []
-    assert context.regular_pcl_catalog == {}
-    assert context.paths.pcls == ()
-    context._rebuild_pcl_sampling_strata.assert_not_called()
-
-
-@pytest.mark.parametrize('role', [PclRole.SAME_WINDING, PclRole.RELATIVE])
-@pytest.mark.parametrize('collection_ids', [(5, 6), (0, 0)])
-def test_role_toggle_restores_all_explicit_documents(tmp_path, role, collection_ids):
-    key = pcl_role_toggle_key(role)
-    context = _role_context(tmp_path, **{key: False})
-    documents = [
-        _pcl_document(tmp_path / f'custom-{index}.json', cid,
-                      [[0, 0, 10], [4, 0, 12], [8, 0, 14]])
-        for index, cid in enumerate(collection_ids)]
-    context._configured_pcl_sources = tuple(
-        PclInputSpec(document, role) for document in documents)
-
-    for _ in range(2):
-        context.apply_config({key: True}, current_iteration=0)
-        assert context.paths.pcls == context._configured_pcl_sources
-        assert {pcl['source_file'] for pcl in
-                context.regular_pcl_catalog.values()} == set(documents)
-        assert len(context.unattached_pcl_strips) == 2
-
-        context.apply_config({key: False}, current_iteration=0)
-        assert context.paths.pcls == ()
-        assert context.regular_pcl_catalog == {}
-        assert list(context.unattached_pcl_strips) == []
-
-
-def test_disabling_a_role_drops_its_committed_and_uploaded_collections(tmp_path):
-    context = _role_context(tmp_path)
-    context.paths = SpiralInputPaths(
-        dataset_root=str(tmp_path),
-        pcls=(PclInputSpec("/ds/same_windings.json", PclRole.SAME_WINDING),
-              PclInputSpec("/ds/relative_windings.json", PclRole.RELATIVE)))
-    committed_cross = {
-        "id": 5, "sampling_group": "/ds/same_windings.json", "points": {},
-        "metadata": {"input_role": "same_winding",
-                     "logical_input_kind": "same_winding",
-                     "logical_input_id": "5", "resident_collection_id": 17},
-    }
-    committed_strip = {
-        "id": 17, "logical_input_kind": "same_winding",
-        "logical_input_id": "5", "zyxs": np.zeros((2, 3), np.float32),
-        "windings": np.zeros(2, np.float32)}
-    # An uncommitted upload of the role: no logical identity yet, found
-    # through the catalog's resident id.
-    uploaded_strip = {
-        "id": 30, "logical_input_kind": None, "logical_input_id": None,
-        "zyxs": np.ones((2, 3), np.float32),
-        "windings": np.zeros(2, np.float32)}
-    relative_strip = {
-        "id": 22, "logical_input_kind": "relative", "logical_input_id": "2",
-        "zyxs": np.ones((2, 3), np.float32),
-        "windings": np.zeros(2, np.float32)}
-    fiber_strip = {
-        "id": 9, "logical_input_kind": "fiber", "logical_input_id": "f",
-        "zyxs": np.ones((2, 3), np.float32),
-        "windings": np.zeros(2, np.float32)}
-    context.cross_patch_pcls = [committed_cross]
-    context.unattached_pcl_strips = _UnattachedPclStripList(
-        [committed_strip, uploaded_strip, relative_strip, fiber_strip])
-    context.unattached_strip_sampling_groups = [
-        "/ds/same_windings.json", "/uploads/x.json",
-        "/ds/relative_windings.json", "fibers"]
-    context.regular_pcl_catalog = {
-        17: {"metadata": dict(committed_cross["metadata"]), "points": {}},
-        30: {"metadata": {"input_role": "same_winding",
-                          "resident_collection_id": 30,
-                          "ephemeral_input_id": "upload-1"}, "points": {}},
-        22: {"metadata": {"input_role": "relative",
-                          "logical_input_kind": "relative",
-                          "logical_input_id": "2",
-                          "resident_collection_id": 22}, "points": {}},
-    }
-    context.influence_state = Mock()
-    context.spiral_and_transform = object()
-    context.optimiser = object()
-
-    context.apply_config(
-        {"input_use_pcl_same_winding": False}, current_iteration=0)
-
-    assert context.cross_patch_pcls == []
-    assert list(context.unattached_pcl_strips) == [relative_strip, fiber_strip]
-    assert context.unattached_strip_sampling_groups == [
-        "/ds/relative_windings.json", "fibers"]
-    assert set(context.regular_pcl_catalog) == {22}
-    assert context.paths.pcls == (
-        PclInputSpec("/ds/relative_windings.json", PclRole.RELATIVE),)
-    context._rebuild_pcl_sampling_strata.assert_called_once_with()
-    context._refresh_trusted_geometry.assert_called_once_with()
-    context._build_theta_crossing_map.assert_called_once_with()
-    context.dt_target_cache_manager.reset.assert_called_once_with()
-    context.influence_state.remove_logical_contributions_.assert_called_once_with(
-        [("pcl", "30"), ("same_winding", "5")],
-        spiral_and_transform=context.spiral_and_transform,
-        optimiser=context.optimiser)
-
 
 # --- tracks ---------------------------------------------------------------------
 
@@ -487,55 +318,3 @@ def test_visualisation_slice_count_is_read_live():
         fit_spiral.FitContext._MODEL_STAGE_ATTRIBUTES)
     assert 'output_num_slices_for_visualization' in inspect.getsource(
         fit_spiral.FitContext._prepare_png_visualization_inputs)
-
-
-def test_pending_committed_addition_is_not_duplicated_after_role_enable(tmp_path):
-    context = _role_context(tmp_path, input_use_pcl_same_winding=False)
-    points = [[0, 0, 10], [4, 0, 12], [8, 0, 14]]
-    _pcl_document(tmp_path / "same_windings.json", 5, points)
-    upload = _pcl_document(tmp_path / "upload.json", 9, points)
-    with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
-            mock.patch.object(torch.cuda, "set_rng_state_all"):
-        context.apply_config({"input_use_pcl_same_winding": True}, current_iteration=0)
-        next_id = context.next_id
-        context._incorporate_prevalidated_interactive_inputs(
-            [{"kind": "pcl", "id": "pending-upload", "path": upload,
-              "role": "same_winding", "committed_collection_ids": {"9": 5}}],
-            {"influence_enabled": False})
-    assert len(context.regular_pcl_catalog) == 1
-    assert len(context.unattached_pcl_strips) == 1
-    assert context.next_id == next_id
-    assert context.unattached_pcl_strips[0]["logical_input_id"] == "5"
-
-
-def test_failed_role_switch_preserves_resident_supervision(tmp_path):
-    context = _role_context(
-        tmp_path, input_use_pcl_same_winding=False,
-        input_use_pcl_relative=False)
-    points = [[0, 0, 10], [4, 0, 12], [8, 0, 14]]
-    _pcl_document(tmp_path / "same_windings.json", 0, points)
-    relative = tmp_path / "relative_windings.json"
-    _pcl_document(relative, 0, points)
-    context.apply_config({"input_use_pcl_same_winding": True}, current_iteration=0)
-    catalog = dict(context.regular_pcl_catalog)
-    strips = list(context.unattached_pcl_strips)
-    groups = list(context.unattached_strip_sampling_groups)
-    paths = context.paths
-    next_id = context.next_id
-    context.config["pcl_sampling_weights"] = {"same_windings": 1.0}
-    context._build_theta_crossing_map.reset_mock()
-    context._rebuild_pcl_sampling_strata.reset_mock()
-
-    with pytest.raises(KeyError, match="relative_windings"):
-        context.apply_config({"input_use_pcl_same_winding": False,
-                              "input_use_pcl_relative": True}, current_iteration=0)
-
-    assert context.config["input_use_pcl_same_winding"] is True
-    assert context.config["input_use_pcl_relative"] is False
-    assert context.paths == paths
-    assert context.next_id == next_id
-    assert context.regular_pcl_catalog == catalog
-    assert list(context.unattached_pcl_strips) == strips
-    assert context.unattached_strip_sampling_groups == groups
-    context._build_theta_crossing_map.assert_not_called()
-    context._rebuild_pcl_sampling_strata.assert_not_called()

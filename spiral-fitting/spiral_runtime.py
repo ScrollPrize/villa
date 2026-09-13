@@ -106,10 +106,10 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
-# Live incorporation rebuilds resident catalogs, indices, fiber views, and GPU
+# Input application rebuilds resident catalogs, indices, fiber views, and GPU
 # influence masks.  Its acknowledgement is the result of that whole operation,
 # not the quick queue-admission acknowledgement covered above.
-LIVE_INCORPORATION_TIMEOUT_S = 1200.0
+INPUT_BATCH_TIMEOUT_S = 1200.0
 
 # How long one requested preview export may take. The window covers the whole
 # operation, not just the render: the host service Lasagna-flattens and hashes
@@ -327,8 +327,8 @@ def _apply_input_changes_at_boundary(session, batch_id, records, influence_confi
         if distributed:
             return session._call(name, arguments, collective=False, return_all=True,
                                  timeout=timeout + COMMAND_ACK_GRACE_S)
-        methods = {"reserve_incorporation": session.reserve_live_incorporation,
-                   "cancel_incorporation": session.cancel_live_incorporation,
+        methods = {"reserve_input_boundary": session.reserve_input_boundary,
+                   "cancel_input_boundary": session.cancel_input_boundary,
                    "prepare_input_batch": session.prepare_input_batch,
                    "finish_input_batch": session.finish_input_batch}
         return {0: methods[name](**arguments)}
@@ -347,12 +347,12 @@ def _apply_input_changes_at_boundary(session, batch_id, records, influence_confi
                 status = session.status()
                 target = int(status.get("current_iteration", 0))
             for _ in range(32):
-                reservations = call("reserve_incorporation", {
+                reservations = call("reserve_input_boundary", {
                     "target_iteration": target, "reservation_epoch": epoch,
                     "include_idle": True})
                 if all(result.get("reserved") for result in reservations.values()):
                     break
-                call("cancel_incorporation", {"reservation_epoch": epoch})
+                call("cancel_input_boundary", {"reservation_epoch": epoch})
                 suggestions = [int(result["next_iteration"])
                                for result in reservations.values()]
                 next_target = max(suggestions)
@@ -491,18 +491,6 @@ class RebuildModelCommand(SessionCommand):
 
 
 @dataclasses.dataclass
-class IncorporateCommand(SessionCommand):
-    """Append newly uploaded ephemeral inputs to the resident fit."""
-
-    kind: ClassVar[str] = "incorporate"
-
-    records: list = dataclasses.field(default_factory=list)
-    mark_incorporated: Any = None
-    influence_config: dict[str, Any] = dataclasses.field(default_factory=dict)
-    reservation_epoch: int | None = None
-
-
-@dataclasses.dataclass
 class InputBatchCommand(SessionCommand):
     """Prepare or install an immutable batch while holding a worker boundary."""
 
@@ -513,15 +501,6 @@ class InputBatchCommand(SessionCommand):
     influence_config: dict = dataclasses.field(default_factory=dict)
     reservation_epoch: int | None = None
     candidate: Any = dataclasses.field(default=None, repr=False)
-
-
-@dataclasses.dataclass
-class PrevalidateIncorporationCommand(SessionCommand):
-    """Validate a reserved live batch without mutating resident state."""
-
-    kind: ClassVar[str] = "prevalidate_incorporation"
-    records: list = dataclasses.field(default_factory=list)
-    reservation_epoch: int | None = None
 
 
 @dataclasses.dataclass
@@ -641,7 +620,7 @@ class InteractiveFitSession:
         self._autosave_on_pause = True
         # The FitContext this session owns, set on the fitter thread once the
         # device state is built. It doubles as the capability flag for the
-        # fitter operations (save/preview/incorporate/configure).
+        # fitter operations (save/preview/apply/configure).
         self._context = None
         # Commands queued for the fitter thread's pause boundary, oldest
         # first. Both the generation and the configuration revision fence
@@ -662,7 +641,7 @@ class InteractiveFitSession:
         # under. Re-checked at every pause boundary before another step.
         self._step_epoch = 0
         self._step_config_revision = 0
-        # A live-incorporation reservation prevents this rank from crossing
+        # A input-batch reservation prevents this rank from crossing
         # the agreed DDP boundary while the coordinator completes the second
         # phase.  The iteration in progress is tracked separately so a claim
         # never targets a step that has already begun.
@@ -1158,12 +1137,6 @@ class InteractiveFitSession:
             if isinstance(command, InputBatchCommand):
                 self._run_input_batch(command)
                 continue
-            if isinstance(command, IncorporateCommand):
-                self._run_incorporation(command)
-                continue
-            if isinstance(command, PrevalidateIncorporationCommand):
-                self._run_incorporation_prevalidation(command)
-                continue
             if isinstance(command, ConfigureCommand):
                 self._run_configuration(command)
                 continue
@@ -1413,7 +1386,7 @@ class InteractiveFitSession:
 
     def prepare_input_batch(self, batch_id, records, influence_config=None, *,
                             target_iteration, reservation_epoch,
-                            timeout=LIVE_INCORPORATION_TIMEOUT_S):
+                            timeout=INPUT_BATCH_TIMEOUT_S):
         payload = json.dumps([records, influence_config or {}], sort_keys=True,
                              allow_nan=False, separators=(",", ":"))
         with self._condition:
@@ -1455,7 +1428,7 @@ class InteractiveFitSession:
             raise RuntimeError(command.error)
         return dict(command.result)
 
-    def finish_input_batch(self, batch_id, *, install, timeout=LIVE_INCORPORATION_TIMEOUT_S):
+    def finish_input_batch(self, batch_id, *, install, timeout=INPUT_BATCH_TIMEOUT_S):
         with self._condition:
             batch = self._input_batches[batch_id]
             prepared = batch["prepare"]
@@ -1478,109 +1451,6 @@ class InteractiveFitSession:
                 self._commands.append(command)
                 self._condition.notify_all()
         return self._wait_input_batch(command, timeout)
-
-    def _run_incorporation(self, command):
-        """Append newly uploaded ephemeral inputs to the resident fit.
-
-        Runs on the fitter thread at the pause boundary. A failure cancels the
-        queued run and surfaces a warning instead of tearing down the session.
-        """
-        records = command.records
-        mark_incorporated = command.mark_incorporated
-        influence_config = command.influence_config
-        with self._condition:
-            no_future = (command.reservation_epoch is not None
-                         and (self._state is not SessionState.Running
-                              or command.expected_iteration is None
-                              or command.expected_iteration >= self._target))
-        if no_future:
-            result = {"no_future_step": True, "outcomes": []}
-            if mark_incorporated is not None:
-                mark_incorporated(records, no_future_step=True)
-            with self._condition:
-                self._live_reservation_iteration = None
-                self._condition.notify_all()
-            command.complete(**result)
-            return
-        try:
-            if self._context is None:
-                raise RuntimeError(
-                    "The resident fitter does not support adding inputs to a running session")
-            with self._condition:
-                self._phase = "Incorporating new session inputs"
-                # run() set the pause-boundary target alongside the queued
-                # inputs; the context sizes its DT-free window from it.
-                current_iteration = self._completed
-                target_iteration = self._target
-            self._progress_reporter().begin(
-                "incorporating_inputs", "Incorporating new session inputs",
-                step=0, total_steps=len(records), unit="inputs")
-            self._publish_status()
-
-            incorporation_result = self._context.incorporate_interactive_inputs(
-                records, influence_config,
-                current_iteration=current_iteration,
-                target_iteration=target_iteration)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            self._progress_reporter().clear()
-            if mark_incorporated is not None:
-                mark_incorporated(records, error=error)
-            command.fail(error)
-            # Prevalidation failures are returned as per-record outcomes by
-            # FitContext. Reaching this branch means application may already
-            # have mutated resident tensors; continuing would risk resident
-            # or rank divergence, so fail the fitter thread.
-            raise RuntimeError(
-                f"Input incorporation failed after application began: {error}") from exc
-        else:
-            if isinstance(incorporation_result, dict):
-                incorporation_warnings = incorporation_result.get("warnings", [])
-                outcomes = list(incorporation_result.get("outcomes", []))
-            else:
-                incorporation_warnings = incorporation_result
-                outcomes = [
-                    {"id": record.get("id"), "kind": record.get("kind"),
-                     "revision": record.get("revision"),
-                     "state": "incorporated"}
-                    for record in records
-                ]
-            if mark_incorporated is not None:
-                try:
-                    mark_incorporated(records, outcomes=outcomes)
-                except TypeError:
-                    # API-30 in-process callers used the older all-success
-                    # callback shape. Keep those embedders source-compatible.
-                    mark_incorporated(records)
-            with self._condition:
-                # Incorporation warnings are advisory (the inputs were taken):
-                # they ride the status warnings the panel already displays.
-                self._warnings.extend(incorporation_warnings or ())
-                if self._state is SessionState.Running:
-                    self._phase = "Optimizing"
-                self._live_reservation_iteration = None
-                self._condition.notify_all()
-            command.complete(
-                incorporated=sum(outcome.get("state") == "incorporated"
-                                 for outcome in outcomes),
-                outcomes=outcomes, no_future_step=False)
-            if getattr(self, "_state", None) is SessionState.Running:
-                self._begin_optimization_progress()
-            else:
-                self._progress_reporter().clear()
-            self._publish_status()
-
-    def _run_incorporation_prevalidation(self, command):
-        """Run DDP phase-one validation while holding the reserved boundary."""
-        with self._condition:
-            no_future = (self._state is not SessionState.Running
-                         or command.expected_iteration is None
-                         or command.expected_iteration >= self._target)
-        if no_future:
-            command.complete(no_future_step=True, outcomes=[])
-            return
-        outcomes = self._context.prevalidate_interactive_inputs(command.records)
-        command.complete(no_future_step=False, outcomes=list(outcomes))
 
     @staticmethod
     def _run_config_limits_for(config):
@@ -1616,13 +1486,6 @@ class InteractiveFitSession:
             with self._condition:
                 self._pending = 0
                 self._target = self._completed
-                # Leave newly uploaded inputs pending for a later valid Run.
-                abandoned = [queued for queued in self._commands
-                             if isinstance(queued, (
-                                 IncorporateCommand,
-                                 PrevalidateIncorporationCommand))]
-                self._commands = [queued for queued in self._commands
-                                  if queued not in abandoned]
                 # No step follows a failed configure; a live boundary held
                 # for this Run has nothing left to wait for.
                 self._live_reservation_iteration = None
@@ -1632,12 +1495,6 @@ class InteractiveFitSession:
                 self._transition_locked(
                     SessionState.Idle, IDLE_PHASE,
                     reason="run configuration failed")
-            for queued in abandoned:
-                if isinstance(queued, IncorporateCommand):
-                    if queued.mark_incorporated is not None:
-                        queued.mark_incorporated(
-                            queued.records, no_future_step=True)
-                queued.complete(no_future_step=True, outcomes=[])
             command.fail(error)
             self._publish_status()
         else:
@@ -1839,8 +1696,7 @@ class InteractiveFitSession:
         self._publish_status()
 
     # Coordinator-thread commands.
-    def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, influence_config=None, run_config=None, path_changes=None,
             autosave_on_pause=True, barrier=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
@@ -1857,9 +1713,6 @@ class InteractiveFitSession:
             # property of the run that is pausing, decided at admission
             # rather than read from configuration at the boundary.
             self._autosave_on_pause = bool(autosave_on_pause)
-            # Frozen for the lifetime of this Run. Live additions must not
-            # observe panel edits made after admission.
-            self._active_influence_config = dict(influence_config or {})
             run_config = dict(run_config or {})
             path_changes = dict(path_changes or {})
             target = self._completed + count
@@ -1891,8 +1744,7 @@ class InteractiveFitSession:
                     key: self._run_config.get(key)
                     for key in run_config
                 }
-                # Configuration is queued ahead of incorporation: new inputs
-                # must be incorporated under the settings this run asked for.
+                # Apply the requested configuration before taking any steps.
                 self._commands.append(ConfigureCommand(
                     session_generation=self.session_generation,
                     epoch=epoch,
@@ -1901,17 +1753,6 @@ class InteractiveFitSession:
                     config=run_config, path_changes=path_changes,
                     previous_run_config=previous_run_config))
                 self._run_config.update(run_config)
-            if pending_inputs:
-                if self._context is None:
-                    raise RuntimeError(
-                        "The resident fitter does not support adding inputs to a running session")
-                self._commands.append(IncorporateCommand(
-                    session_generation=self.session_generation,
-                    epoch=epoch,
-                    expected_iteration=self._completed,
-                    records=list(pending_inputs),
-                    mark_incorporated=mark_incorporated,
-                    influence_config=dict(influence_config or {})))
             self._pending = count
             self._run_start_completed = self._completed
             self._target = target
@@ -1925,7 +1766,7 @@ class InteractiveFitSession:
             self._condition.notify_all()
             return self._target
 
-    def reserve_live_incorporation(self, target_iteration, reservation_epoch, *,
+    def reserve_input_boundary(self, target_iteration, reservation_epoch, *,
                                    include_idle=False):
         """Phase one: hold one still-future optimizer boundary."""
         with self._condition:
@@ -1958,7 +1799,7 @@ class InteractiveFitSession:
             return {"reserved": True, "target_iteration": target_iteration,
                     "reservation_epoch": int(reservation_epoch)}
 
-    def cancel_live_incorporation(self, reservation_epoch):
+    def cancel_input_boundary(self, reservation_epoch):
         with self._condition:
             if self._live_reservation_epoch == int(reservation_epoch):
                 self._live_reservation_iteration = None
@@ -1966,90 +1807,22 @@ class InteractiveFitSession:
         return {"cancelled": True}
 
     def apply_input_changes(self, batch_id, records, influence_config=None, *,
-                            timeout=LIVE_INCORPORATION_TIMEOUT_S):
+                            timeout=INPUT_BATCH_TIMEOUT_S):
         return _apply_input_changes_at_boundary(
             self, batch_id, records, influence_config or {}, timeout=timeout,
             distributed=False)
 
-    def incorporate_live(self, records, influence_config=None, *,
-                         target_iteration=None, reservation_epoch=None,
-                         mark_incorporated=None,
-                         timeout=LIVE_INCORPORATION_TIMEOUT_S):
-        """Phase two: apply a reserved batch immediately before its step."""
-        if target_iteration is None:
-            with self._condition:
-                if self._state is not SessionState.Running:
-                    return {"no_future_step": True, "outcomes": []}
-                target_iteration = (self._completed
-                                    if self._iteration_in_progress is None
-                                    else self._iteration_in_progress + 1)
-                self._live_reservation_epoch += 1
-                reservation_epoch = self._live_reservation_epoch
-                if influence_config is None:
-                    influence_config = dict(getattr(
-                        self, "_active_influence_config", {}))
-                # Condition uses an RLock: selection and reservation must be
-                # atomic with respect to the fitter starting the next step.
-                reservation = self.reserve_live_incorporation(
-                    target_iteration, reservation_epoch)
-            if not reservation.get("reserved"):
-                return {"no_future_step": True, "outcomes": []}
-        with self._condition:
-            if (self._live_reservation_iteration != int(target_iteration)
-                    or self._live_reservation_epoch != int(reservation_epoch)):
-                return {"no_future_step": True, "outcomes": []}
-            command = IncorporateCommand(
-                session_generation=self.session_generation,
-                expected_iteration=int(target_iteration),
-                expected_config_revision=(
-                    self._live_expected_config_revision_locked()),
-                records=list(records), mark_incorporated=mark_incorporated,
-                influence_config=dict(influence_config or {}),
-                reservation_epoch=int(reservation_epoch))
-        return self._queue_command(command, timeout)
-
-    def prevalidate_live_incorporation(
-            self, records, *, target_iteration, reservation_epoch,
-            timeout=COMMAND_ACK_TIMEOUT_S):
-        with self._condition:
-            if (self._live_reservation_iteration != int(target_iteration)
-                    or self._live_reservation_epoch != int(reservation_epoch)):
-                return {"no_future_step": True, "outcomes": []}
-            command = PrevalidateIncorporationCommand(
-                session_generation=self.session_generation,
-                expected_iteration=int(target_iteration),
-                expected_config_revision=(
-                    self._live_expected_config_revision_locked()),
-                records=list(records), reservation_epoch=int(reservation_epoch))
-        return self._queue_command(command, timeout)
-
     def stop(self, barrier=None):
-        abandoned = []
         with self._condition:
             if self._state is not SessionState.Running:
                 raise RuntimeError("Session is not running")
             self._enter_epoch_locked("stop", barrier)
             self._stop_requested = True
-            # A stopped Run has no future optimizer boundary at which a live
-            # claim may apply. Release a held boundary and let the dispatcher
-            # return those records to pending.
-            abandoned = [command for command in self._commands
-                         if isinstance(command, (IncorporateCommand,
-                                                 PrevalidateIncorporationCommand))
-                         and command.reservation_epoch is not None]
-            self._commands = [command for command in self._commands
-                              if command not in abandoned]
             self._live_reservation_iteration = None
             # If stop landed exactly between steps, permit the one boundary
             # needed to observe _stop_requested under the stop epoch.
             self._step_epoch = self._command_epoch
             self._condition.notify_all()
-        for command in abandoned:
-            if isinstance(command, IncorporateCommand):
-                if command.mark_incorporated is not None:
-                    command.mark_incorporated(
-                        command.records, no_future_step=True)
-            command.complete(no_future_step=True, outcomes=[])
 
     def save_checkpoint(self, path, timeout=120.0):
         with self._condition:
@@ -2076,59 +1849,13 @@ class InteractiveFitSession:
             self._commands.append(command)
             self._condition.notify_all()
         if not command.wait(timeout):
-            reason = f"{command.kind} command timed out after {timeout:g}s"
-            publish_failure = False
-            abandoned = []
             with self._condition:
-                # Completion may race Event.wait()'s timeout. Once the
-                # condition is held, the command is either complete, still
-                # cancellable in the queue, or already owned by the fitter.
-                timed_out = not command.done.is_set()
-                if timed_out:
+                if not command.done.is_set():
                     if command in self._commands:
                         self._commands.remove(command)
-                        command.cancel(reason)
-                        if isinstance(
-                                command,
-                                (IncorporateCommand,
-                                 PrevalidateIncorporationCommand)) \
-                                and self._live_reservation_epoch \
-                                == command.reservation_epoch:
-                            self._live_reservation_iteration = None
+                        command.cancel(f"{command.kind} command timed out after {timeout:g}s")
                         self._condition.notify_all()
-                    elif isinstance(command,
-                                    PrevalidateIncorporationCommand):
-                        # Prevalidation is read-only. It may finish after its
-                        # caller gives up, but releasing the held optimizer
-                        # boundary cannot expose a partial model mutation.
-                        if self._live_reservation_epoch \
-                                == command.reservation_epoch:
-                            self._live_reservation_iteration = None
-                        command.cancel(reason)
-                        self._condition.notify_all()
-                    elif isinstance(command, IncorporateCommand):
-                        # The fitter has crossed the last cancellable point.
-                        # Incorporation may already be mutating resident
-                        # tensors, so this session must never take another
-                        # optimizer step even if the command later returns.
-                        self._error = reason
-                        self._warnings.append(reason)
-                        self._pending = 0
-                        self._target = self._completed
-                        self._live_reservation_iteration = None
-                        abandoned, self._commands = self._commands, []
-                        self._transition_locked(
-                            SessionState.Error, "Error",
-                            reason=f"timed-out {command.kind} command")
-                        publish_failure = True
-            for queued in abandoned:
-                queued.cancel(
-                    f"cancelled after {command.kind} command "
-                    f"{command.command_id} timed out")
-            if publish_failure:
-                self._publish_status()
-            if timed_out:
-                raise TimeoutError(reason)
+                    raise TimeoutError(f"{command.kind} command timed out after {timeout:g}s")
         if command.error is not None:
             raise RuntimeError(command.error)
         return dict(command.result)
@@ -2275,17 +2002,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
             barrier, command_id, name, arguments = commands.get()
             try:
                 if name == "run":
-                    mark_incorporated = None
-                    if rank == 0 and arguments.get("pending_inputs"):
-                        def mark_incorporated(
-                                records, error=None, outcomes=None,
-                                no_future_step=False, cid=command_id):
-                            events.put(("incorporated", cid, error, outcomes,
-                                        no_future_step))
                     result = session.run(
                         arguments["count"],
-                        pending_inputs=arguments.get("pending_inputs"),
-                        mark_incorporated=mark_incorporated,
                         influence_config=arguments.get("influence_config"),
                         run_config=arguments.get("run_config"),
                         path_changes=arguments.get("path_changes"),
@@ -2295,8 +2013,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     )
                 elif name == "stop":
                     result = session.stop(barrier=barrier)
-                elif name == "reserve_incorporation":
-                    result = session.reserve_live_incorporation(
+                elif name == "reserve_input_boundary":
+                    result = session.reserve_input_boundary(
                         arguments["target_iteration"],
                         arguments["reservation_epoch"],
                         include_idle=arguments.get("include_idle", False))
@@ -2304,23 +2022,9 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     result = session.prepare_input_batch(**arguments)
                 elif name == "finish_input_batch":
                     result = session.finish_input_batch(**arguments)
-                elif name == "cancel_incorporation":
-                    result = session.cancel_live_incorporation(
+                elif name == "cancel_input_boundary":
+                    result = session.cancel_input_boundary(
                         arguments["reservation_epoch"])
-                elif name == "incorporate":
-                    result = session.incorporate_live(
-                        arguments.get("records", []),
-                        arguments.get("influence_config", {}),
-                        target_iteration=arguments["target_iteration"],
-                        reservation_epoch=arguments["reservation_epoch"],
-                        timeout=arguments.get(
-                            "timeout", LIVE_INCORPORATION_TIMEOUT_S))
-                elif name == "prevalidate_incorporation":
-                    result = session.prevalidate_live_incorporation(
-                        arguments.get("records", []),
-                        target_iteration=arguments["target_iteration"],
-                        reservation_epoch=arguments["reservation_epoch"],
-                        timeout=arguments.get("timeout", COMMAND_ACK_TIMEOUT_S))
                 elif name == "export_preview":
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
@@ -2459,7 +2163,6 @@ class DistributedInteractiveFitSession:
             },
         }
         self._acks = {}
-        self._incorporation_callbacks = {}
         self._rank_statuses = {}
         self._failed_error = None
         self._closed = False
@@ -2691,21 +2394,6 @@ class DistributedInteractiveFitSession:
                 with self._condition:
                     self._acks.setdefault(command_id, {})[rank] = (ok, result)
                     self._condition.notify_all()
-            elif kind == "incorporated":
-                _, command_id, error, outcomes, no_future_step = event
-                with self._condition:
-                    pending_callback = self._incorporation_callbacks.pop(command_id, None)
-                if pending_callback is not None:
-                    callback, records = pending_callback
-                    if error:
-                        callback(records, error=error)
-                    elif outcomes is not None:
-                        callback(records, outcomes=outcomes)
-                    elif no_future_step:
-                        callback(records, no_future_step=True)
-                    else:
-                        callback(records)
-                continue
             elif kind == "worker_error":
                 _, rank, error, trace = event
                 self._publish_rank_event(rank, {
@@ -2719,7 +2407,7 @@ class DistributedInteractiveFitSession:
                 callback(snapshot)
 
     def _call(self, name, arguments=None, ranks=None,
-              timeout=COMMAND_ACK_TIMEOUT_S, incorporation_callback=None,
+              timeout=COMMAND_ACK_TIMEOUT_S,
               collective=True, return_all=False):
         """Send one command to the participating ranks and await every ack.
 
@@ -2736,10 +2424,6 @@ class DistributedInteractiveFitSession:
         ranks = tuple(range(len(self._processes))) if ranks is None else tuple(ranks)
         command_id = uuid.uuid4().hex
         with self._condition:
-            if incorporation_callback is not None:
-                records = list((arguments or {}).get("pending_inputs", []))
-                self._incorporation_callbacks[command_id] = (
-                    incorporation_callback, records)
             barrier = self._issue_barrier(name) if collective else None
         for rank in ranks:
             self._commands[rank].put(
@@ -2748,11 +2432,9 @@ class DistributedInteractiveFitSession:
         with self._condition:
             while len(self._acks.get(command_id, {})) < len(ranks):
                 if self._failed_error is not None:
-                    self._incorporation_callbacks.pop(command_id, None)
                     raise RuntimeError(self._failed_error)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._incorporation_callbacks.pop(command_id, None)
                     silent = [rank for rank in ranks
                               if rank not in self._acks.get(command_id, {})]
                     break
@@ -2762,7 +2444,6 @@ class DistributedInteractiveFitSession:
                 failures = [f"rank {rank}: {responses[rank][1]}" for rank in ranks
                             if not responses[rank][0]]
                 if failures:
-                    self._incorporation_callbacks.pop(command_id, None)
                     raise RuntimeError("; ".join(failures))
                 if return_all:
                     return {rank: responses[rank][1] for rank in ranks}
@@ -2774,165 +2455,25 @@ class DistributedInteractiveFitSession:
             f"Timed out after {timeout:.0f}s waiting for GPU worker ranks "
             f"{silent} to {name}"))
 
-    def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, influence_config=None, run_config=None, path_changes=None,
             autosave_on_pause=True):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
         arguments = {
             "count": count,
-            "pending_inputs": list(pending_inputs or []),
             "influence_config": dict(influence_config or {}),
             "run_config": dict(run_config or {}),
             "path_changes": dict(path_changes or {}),
             "autosave_on_pause": bool(autosave_on_pause),
         }
-        return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S,
-                          incorporation_callback=mark_incorporated)
+        return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S)
 
     def apply_input_changes(self, batch_id, records, influence_config=None, *,
-                            timeout=LIVE_INCORPORATION_TIMEOUT_S):
+                            timeout=INPUT_BATCH_TIMEOUT_S):
         return _apply_input_changes_at_boundary(
             self, batch_id, records, influence_config or {}, timeout=timeout,
             distributed=True)
-
-    def incorporate_live(self, records, influence_config=None,
-                         mark_incorporated=None):
-        """Reserve and apply one live batch at the same boundary on all ranks."""
-        with self._condition:
-            status = copy.deepcopy(self._status)
-            self._live_reservation_epoch += 1
-            reservation_epoch = self._live_reservation_epoch
-        if status.get("state") != SessionState.Running:
-            return {"no_future_step": True, "outcomes": []}
-        target_iteration = int(status.get("current_iteration", 0))
-        reservations = None
-        for _ in range(8):
-            reserve_args = {
-                "target_iteration": target_iteration,
-                "reservation_epoch": reservation_epoch,
-            }
-            reservations = self._call(
-                "reserve_incorporation", reserve_args, collective=False,
-                return_all=True)
-            if all(result.get("reserved") for result in reservations.values()):
-                break
-            self._call(
-                "cancel_incorporation",
-                {"reservation_epoch": reservation_epoch},
-                collective=False)
-            suggestions = [result.get("next_iteration")
-                           for result in reservations.values()
-                           if result.get("next_iteration") is not None]
-            if not suggestions:
-                return {"no_future_step": True, "outcomes": []}
-            target_iteration = max(int(value) for value in suggestions)
-        else:
-            return {"no_future_step": True, "outcomes": []}
-        preflight_arguments = {
-            "records": list(records),
-            "target_iteration": target_iteration,
-            "reservation_epoch": reservation_epoch,
-            "timeout": COMMAND_ACK_TIMEOUT_S,
-        }
-        try:
-            preflights = self._call(
-                "prevalidate_incorporation", preflight_arguments,
-                collective=False, return_all=True,
-                timeout=COMMAND_ACK_TIMEOUT_S + COMMAND_ACK_GRACE_S)
-        except BaseException:
-            # A rank whose read-only prevalidation timed out releases its own
-            # reservation. Release the siblings as well; successful ranks
-            # otherwise remain parked at a boundary the coordinator has
-            # abandoned.
-            try:
-                self._call(
-                    "cancel_incorporation",
-                    {"reservation_epoch": reservation_epoch},
-                    collective=False)
-            except BaseException:
-                pass
-            raise
-        canonical_preflight = preflights[min(preflights)]
-        preflight_outcomes = canonical_preflight.get("outcomes", [])
-        if (canonical_preflight.get("no_future_step")
-                or any(result.get("outcomes", []) != preflight_outcomes
-                       for result in preflights.values())):
-            self._call(
-                "cancel_incorporation",
-                {"reservation_epoch": reservation_epoch},
-                collective=False)
-            if any(result.get("outcomes", []) != preflight_outcomes
-                   for result in preflights.values()):
-                raise RuntimeError(
-                    "GPU ranks disagreed on live input validation outcomes")
-            return {"no_future_step": True, "outcomes": []}
-        valid_identities = {
-            (outcome.get("kind"), outcome.get("id"))
-            for outcome in preflight_outcomes
-            if outcome.get("state") == "incorporated"
-        }
-        valid_records = [
-            record for record in records
-            if (record.get("kind"), record.get("id")) in valid_identities
-        ]
-        if not valid_records:
-            self._call(
-                "cancel_incorporation",
-                {"reservation_epoch": reservation_epoch},
-                collective=False)
-            result = {"no_future_step": False,
-                      "outcomes": preflight_outcomes, "incorporated": 0}
-            if mark_incorporated is not None:
-                mark_incorporated(records, outcomes=preflight_outcomes)
-            return result
-        arguments = {
-            "records": valid_records,
-            "influence_config": dict(influence_config or {}),
-            "target_iteration": target_iteration,
-            "reservation_epoch": reservation_epoch,
-            "timeout": LIVE_INCORPORATION_TIMEOUT_S,
-        }
-        try:
-            results = self._call(
-                "incorporate", arguments, collective=False, return_all=True,
-                timeout=LIVE_INCORPORATION_TIMEOUT_S + COMMAND_ACK_GRACE_S)
-        except BaseException:
-            # A rank that cancelled its incorporate command released its own
-            # boundary. Release the siblings as well so no rank stays parked
-            # at a boundary the coordinator has given up on.
-            try:
-                self._call(
-                    "cancel_incorporation",
-                    {"reservation_epoch": reservation_epoch},
-                    collective=False)
-            except BaseException:
-                pass
-            raise
-        canonical = results[min(results)]
-        applied_outcomes = canonical.get("outcomes", [])
-        applied_by_identity = {
-            (outcome.get("kind"), outcome.get("id")): outcome
-            for outcome in applied_outcomes
-        }
-        canonical_outcomes = [
-            (applied_by_identity.get((outcome.get("kind"), outcome.get("id")),
-                                     outcome))
-            for outcome in preflight_outcomes
-        ]
-        if any(result.get("outcomes", []) != applied_outcomes
-               or result.get("no_future_step", False)
-               != canonical.get("no_future_step", False)
-               for result in results.values()):
-            raise RuntimeError(
-                "GPU ranks disagreed on live input validation outcomes")
-        if mark_incorporated is not None:
-            if canonical.get("no_future_step"):
-                mark_incorporated(records, no_future_step=True)
-            else:
-                mark_incorporated(records, outcomes=canonical_outcomes)
-        return {**canonical, "outcomes": canonical_outcomes}
 
     def stop(self):
         state = self.status()["state"]

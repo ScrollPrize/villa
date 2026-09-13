@@ -5,9 +5,6 @@ immutable uploaded bytes). The catalog never owns a mutable editor path.
 Revision numbers are per logical UUID; PCL collection numbers belong to the
 serialization source and are allocated separately. Mutating callers must use
 one MutationCoordinator for acceptance, application, publication and rebuild.
-
-This is the contract for the revisioned protocol. The legacy API's ephemeral
-ledger is not an adapter for this model: it cannot express these guarantees.
 """
 
 from __future__ import annotations

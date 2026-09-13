@@ -19,8 +19,8 @@ existing one.
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
-(patches, fibers, PCL documents) can be uploaded into a session-scoped
-ephemeral folder and later committed into the dataset.
+(patches, fibers, PCL documents) can be uploaded into a dataset-scoped
+editing workspace and explicitly applied or committed into the dataset.
 
 Host filesystem paths are the service's business. A client never invents
 one: a saved checkpoint is a name the service places under the session
@@ -39,10 +39,8 @@ from __future__ import annotations
 
 import argparse
 from service_editing import EditingWorkspace
-from service_uploads import collection_has_affected_links
 from collections import OrderedDict, deque
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import hashlib
@@ -63,15 +61,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, EDITABLE_PCL_ROLES,
-                         EDITABLE_PCL_ROLE_VALUES, FIT_INPUT_CATALOG,
-                         SESSION_BUSY_STATES,
-                         SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
-                         PclRole, ScrollSpecError, SessionState,
-                         SpiralInputPaths, default_user_cache_dir,
-                         input_source_enabled, pcl_input_enabled,
-                         phase_bundle_enabled, winding_inference_enabled,
-                         load_scroll_spec,
+from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
+                         SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
+                         SCROLL_SPEC_OWNED_RUN_KEYS, PclRole, ScrollSpecError,
+                         SessionState, SpiralInputPaths, default_user_cache_dir,
+                         input_source_enabled, pcl_input_enabled, phase_bundle_enabled,
+                         winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS,
@@ -81,13 +76,8 @@ from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
 from service_files import ExclusiveFileLock, FileLockUnavailable
-from service_uploads import (EphemeralLedger, PCL_ASSIGN_COLLECTION_IDS,
-                             PCL_ROLE_FILES,
-                             UPLOADED_CHECKPOINTS_DIRNAME,
-                             UPLOADED_CHECKPOINTS_KEPT,
-                             UPLOAD_GC_SECONDS, UploadEnvironment,
-                             UploadManager, _copy_publish,
-                             _merge_pcl_documents_assigning, _utc_stamp)
+from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_DIRNAME,
+                             UploadEnvironment, UploadManager)
 from lasagna_publish import (LasagnaPublisher, PreviewPublication,
                              stop_process_group)
 # Re-exported for the service's own test surface, which addresses the preview
@@ -126,8 +116,6 @@ CHECKPOINT_ARTIFACTS_KEPT = 2
 # Upper bound on the checkpoint listing /dataset advertises. A client offers
 # this as a choice, so it is a menu, not an inventory.
 SESSION_CHECKPOINTS_LISTED = 200
-EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
-                                           4 * 1024 * 1024 * 1024))
 MAX_LOG_ENTRY_CHARS = 8192
 # Structured event ring served through /events. This is the whole of what a
 # reconnecting client can recover, so it is sized to hold the loading bars
@@ -139,7 +127,6 @@ MAX_EVENT_READ_ENTRIES = 1000
 # the ProgressReporter publish interval, so the event stream carries the same
 # cadence a status poller already observes.
 EVENT_COALESCE_SECONDS = 1.0
-DATASET_COMMIT_LOCK_TIMEOUT_SECONDS = 20.0
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -199,33 +186,6 @@ def bind_service_paths(resolution, output_directory, cache_directory):
     resolution.resolved["output_directory"] = str(output_directory)
     resolution.resolved["cache_directory"] = str(cache_directory)
     return resolution
-
-
-@dataclasses.dataclass(frozen=True)
-class _CommitInputSnapshot:
-    """Immutable source facts for one explicit dataset commit."""
-
-    record: object = dataclasses.field(compare=False, repr=False)
-    id: str
-    kind: str
-    role: str | None
-    path: str
-    revision: str | None
-    incorporated: bool
-
-
-@dataclasses.dataclass(frozen=True)
-class _PreparedPclCommit:
-    """One editable PCL role's staged, not yet published, commit."""
-
-    role: str
-    label: str
-    target: Path
-    temp: Path
-    base_revision: str
-    snapshots: list
-    # (kind, id) of each plain addition -> {uploaded key: committed key}
-    collection_ids: dict
 
 
 def _validate_run_influence_config(value):
@@ -534,20 +494,8 @@ class ServiceState:
         self._event_errors = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
-        self.uploads_manager = UploadManager(self._upload_environment())
-        self.ephemeral_records = EphemeralLedger(self.lock)
-        # Finalization may happen on several HTTP threads. They feed one
-        # deterministic ledger-ordered dispatcher so the runtime sees at most
-        # one live-incorporation request at a time.
-        self._live_incorporation_queue = []
-        self._live_incorporation_active = False
+        self.checkpoint_uploads = UploadManager(self._upload_environment())
         self._active_run_influence = None
-        # Explicit commits copy without holding the service lock. These sets
-        # fence removal and obsolete-revision cleanup around their immutable
-        # source snapshots.
-        self._committing_inputs = set()
-        self._committing_fiber_revisions = set()
-        self._incorporating_fiber_revisions = {}
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
@@ -618,12 +566,10 @@ class ServiceState:
                 raise ApiError(409, "Wait for the resident fit to finish loading")
             return self.session
 
-    def input_upload_manager(self, upload_id=None):
-        workspace = self.editing_workspace
-        if workspace is not None and workspace.seeded:
-            if upload_id is None or upload_id in workspace.uploads.uploads:
-                return workspace.uploads
-        return self.uploads_manager
+    def input_upload_manager(self, upload_id):
+        if upload_id in self.checkpoint_uploads.uploads:
+            return self.checkpoint_uploads
+        return self.editing().uploads
 
     def editing_lifecycle(self, token, operation, request, callback):
         workspace = self.editing()
@@ -696,20 +642,6 @@ class ServiceState:
             "gpus": list(self.gpu_ids),
         }
 
-    def _commit_availability(self):
-        if self.session is None or self.session_paths is None:
-            return False, "No fit session is loaded"
-        if not self.ephemeral_records:
-            return False, "No ephemeral inputs have been added"
-        if not self.ephemeral_records.uncommitted():
-            return False, "Every added input is already committed"
-        dataset_root = self.session_paths.dataset_root
-        if not dataset_root or not Path(dataset_root).is_dir():
-            return False, "The session has no dataset root directory"
-        if not os.access(dataset_root, os.W_OK):
-            return False, "The dataset root is read-only"
-        return True, ""
-
     def status(self):
         with self.lock:
             response = self._base()
@@ -751,22 +683,11 @@ class ServiceState:
             if publishing is not None:
                 response["phase"] = publishing["stage_name"]
                 response["progress"] = publishing
-            response["ephemeral_inputs"] = self.ephemeral_records.status_entries()
-            # Persistence and incorporation are independent: an input can be
-            # in the user's dataset while the resident fit has not taken it
-            # yet. Name that set explicitly instead of leaving clients to
-            # rediscover it from the pair of fields above.
-            response["committed_not_incorporated"] = [
-                {"id": record.id, "kind": record.kind, "role": record.role}
-                for record in self.ephemeral_records.committed_not_incorporated()
-            ]
-            available, reason = self._commit_availability()
-            if self.editing_workspace is not None and self.editing_workspace.seeded:
-                available = any(entry.accepted > entry.persisted
-                                for entry in self.editing_workspace.catalog.entries())
-                reason = "" if available else "No uncommitted revisions"
+            available = (self.editing_workspace is not None
+                         and any(entry.accepted > entry.persisted
+                                 for entry in self.editing_workspace.catalog.entries()))
             response["commit_available"] = available
-            response["commit_unavailable_reason"] = reason
+            response["commit_unavailable_reason"] = "" if available else "No uncommitted revisions"
             response["preview_exporting"] = self._preview_export_active
             return response
 
@@ -1125,11 +1046,9 @@ class ServiceState:
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
 
-        The session object, its generation and its whole session scope
-        survive: the host inputs the ephemeral uploads were incorporated into
-        are retained, so neither the ephemeral ledger nor the uploaded files
-        behind it are reset here, and the session reports its own ``Loading``
-        while the fitter thread works.
+        The session object, its generation, and its resident inputs survive.
+        The editing workspace retains revisions across every rebuild; the
+        session reports ``Loading`` while the fitter thread works.
         """
         with self.lock:
             if self._building:
@@ -1169,7 +1088,6 @@ class ServiceState:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
             previous = self.session
-            previous_ephemeral = self._session_ephemeral_dir()
             self.session = None
             self._building = True
             self.session_generation += 1
@@ -1189,14 +1107,14 @@ class ServiceState:
             session_id = self.session_id
         threading.Thread(
             target=self._build,
-            args=(session_id, previous, previous_ephemeral, paths, run,
+            args=(session_id, previous, paths, run,
                   preview, scroll),
             name="spiral-session-build", daemon=True).start()
         threading.Thread(
             target=self._refresh_pcl_artifacts,
             name="spiral-pcl-artifact-publish", daemon=True).start()
 
-    def _build(self, session_id, previous, previous_ephemeral, paths, run,
+    def _build(self, session_id, previous, paths, run,
                preview, scroll):
         """Close the old resident session, then construct the new one.
 
@@ -1209,8 +1127,6 @@ class ServiceState:
         try:
             if previous is not None:
                 previous.close()
-            if previous_ephemeral:
-                shutil.rmtree(previous_ephemeral, ignore_errors=True)
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
@@ -1248,8 +1164,6 @@ class ServiceState:
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
-        self.ephemeral_records.clear()
-        self.uploads_manager.reset()
         previous_raw = self._preview.reset_session_scope()
         self.pcl_artifacts = {}
         if previous_raw:
@@ -1613,36 +1527,13 @@ class ServiceState:
             request.get("influence") or {})
         run_config = changes
         with self.lock:
-            # The fitter (and, under DDP, its child ranks) receives plain
-            # records; the ledger maps them back to its own entries when the
-            # incorporation outcome arrives.
-            claimed = self.ephemeral_records.claim_pending()
-            pending = self._snapshot_incorporation_locked(claimed)
-
-            def mark_incorporated(records, error=None, outcomes=None,
-                                  no_future_step=False):
-                self._finish_incorporation(
-                    records, error=error, outcomes=outcomes,
-                    no_future_step=no_future_step)
-
             self._active_run_influence = dict(influence_config)
-
-        run_arguments = {
-                "pending_inputs": pending,
-                "mark_incorporated": mark_incorporated,
-                "influence_config": influence_config,
-                "run_config": run_config,
-                # Whether this run's pause writes the durable autosave. It
-                # belongs to the run request, not to the plan: it changes
-                # nothing about the model, so it needs no planning round.
-                "autosave_on_pause": autosave_on_pause,
-        }
         try:
-            target = session.run(iterations, **run_arguments)
+            target = session.run(
+                iterations, influence_config=influence_config, run_config=run_config,
+                autosave_on_pause=autosave_on_pause)
         except BaseException:
             with self.lock:
-                self._release_incorporation_locked(pending)
-                self.ephemeral_records.return_pending(claimed)
                 self._active_run_influence = None
             raise
         with self.lock:
@@ -2145,7 +2036,7 @@ class ServiceState:
     @property
     def uploads(self):
         """Uploads in flight, keyed by upload ID (owned by the manager)."""
-        return self.uploads_manager.uploads
+        return self.checkpoint_uploads.uploads
 
     def _output_root(self):
         """Output directory known before any session in dataset mode."""
@@ -2155,16 +2046,11 @@ class ServiceState:
             return Path(self.dataset_resolution.resolved["output_directory"])
         return None
 
-    def _session_ephemeral_dir(self):
-        if self.session_paths is None or self.session_id is None:
-            return None
-        return Path(self.session_paths.output_directory) / ".spiral-ephemeral" / self.session_id
-
     def _staging_root(self):
-        return self.uploads_manager.staging_root()
+        return self.checkpoint_uploads.staging_root()
 
     def _checkpoint_upload_root(self):
-        return self.uploads_manager.checkpoint_root()
+        return self.checkpoint_uploads.checkpoint_root()
 
     def _upload_environment(self):
         """The whole of what the upload manager may ask this service."""
@@ -2172,11 +2058,8 @@ class ServiceState:
             lock=self.lock,
             output_root=self._output_root,
             session_id=lambda: self.session_id,
-            ephemeral_dir=self._session_ephemeral_dir,
-            require_session=self._require_session,
             active_checkpoint=self._active_checkpoint,
-            reserve_ephemeral=self._reserve_ephemeral,
-            validate_pcl_replacement=self._validate_pcl_replacement)
+            allowed_kinds=("checkpoint",))
 
     @staticmethod
     def _file_sha256(path):
@@ -2185,19 +2068,6 @@ class ServiceState:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
-
-    def _pcl_source_path(self, role):
-        role = PclRole(role)
-        with self.lock:
-            paths = self.session_paths
-        if paths is None:
-            return None
-        for pcl in paths.pcls:
-            if pcl.role == role and pcl.path:
-                return Path(pcl.path)
-        candidate = (Path(paths.dataset_root) /
-                     PCL_ROLE_FILES[role.value])
-        return candidate if candidate.is_file() else None
 
     def _pcl_source_editable(self, role, source):
         role = PclRole(role)
@@ -2215,98 +2085,14 @@ class ServiceState:
         except OSError:
             return False
 
-    _collection_has_affected_links = staticmethod(collection_has_affected_links)
-
-    def _validate_pcl_replacement(self, role, target_collection_id,
-                                  base_source_revision):
-        if role not in EDITABLE_PCL_ROLE_VALUES:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Collection mutations are only valid for same_winding or "
-                           "relative PCL uploads")
-        label = PCL_ROLE_LABELS[role]
-        source = self._pcl_source_path(role)
-        if source is None or not self._pcl_source_editable(role, source):
-            raise ApiError(HTTPStatus.CONFLICT,
-                           f"The {label} source is not editable")
-        current = self._file_sha256(source)
-        if current != base_source_revision:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"The {label} source changed since this draft was created",
-                payload={"code": "source_revision_conflict",
-                         "current_revision": current})
-        try:
-            with source.open("r", encoding="utf-8") as stream:
-                document = json.load(stream)
-        except (OSError, ValueError) as exc:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           f"The {label} source cannot be read: {exc}") from exc
-        collections = document.get("collections")
-        if not isinstance(collections, dict) \
-                or target_collection_id not in collections:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"The target {label} collection does not exist")
-        if self._collection_has_affected_links(collections,
-                                               target_collection_id):
-            raise ApiError(HTTPStatus.CONFLICT,
-                           f"Linked {label} collections cannot be changed safely")
-        with self.lock:
-            if any(record.operation in {
-                       "replace_collection", "delete_collection"}
-                   and record.role == role
-                   and record.target_collection_id == target_collection_id
-                   for record in self.ephemeral_records.records):
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "A replacement for this collection is already staged")
-
     def _active_checkpoint(self):
         with self.lock:
             return self.session_paths.checkpoint if self.session_paths else ""
 
-    def _reserve_ephemeral(self, kind, input_id, declared,
-                           base_revision=None, revision=None):
-        """Admit one new ephemeral input, or refuse it.
-
-        Duplicate identities and the ephemeral quota are ledger questions,
-        not transfer questions, so the upload manager delegates them here.
-        """
-        with self.lock:
-            existing = self.ephemeral_records.find(kind, input_id)
-            if kind == "fiber":
-                current = existing.revision if existing is not None else None
-                if base_revision != current:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"Fiber {input_id!r} changed since this client last saw it",
-                        payload={"current_revision": current})
-            elif existing is not None:
-                raise ApiError(HTTPStatus.CONFLICT,
-                               f"An ephemeral {kind} named {input_id!r} already exists")
-            if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
-                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                               "The ephemeral input quota is exhausted")
-
-    def _ephemeral_bytes_in_use(self):
-        return (self.ephemeral_records.bytes_in_use()
-                + self.uploads_manager.staged_ephemeral_bytes())
-
-    @contextmanager
-    def _refresh_conflicting_pcl_upload(self, role):
-        # Validation can run under the upload manager's shared service lock.
-        # Unwind all transfer/service locks before taking a publication lock.
-        try:
-            yield
-        except ApiError as exc:
-            if exc.payload.get("code") == "source_revision_conflict":
-                self._refresh_pcl_artifact(role)
-            raise
-
     def begin_upload(self, request):
-        if request.get("kind") != "checkpoint" and self.input_upload_manager() is not self.uploads_manager:
-            return {**self._base(), **self.input_upload_manager().begin(request)}
-        with self._refresh_conflicting_pcl_upload(request.get("role")):
-            return {**self._base(), **self.uploads_manager.begin(request)}
+        manager = (self.checkpoint_uploads if request.get("kind") == "checkpoint"
+                   else self.editing().uploads)
+        return {**self._base(), **manager.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):
         received = self.input_upload_manager(upload_id).receive(
@@ -2314,682 +2100,19 @@ class ServiceState:
         return {**self._base(), "received": received, "accepted": True}
 
     def finalize_upload(self, upload_id):
-        manager = self.input_upload_manager(upload_id)
-        if manager is not self.uploads_manager:
-            return {**self._base(), "accepted": True, "input": manager.finalize(upload_id).record}
-        # Fiber publication and logical revision installation are one service
-        # critical section. Cleanup uses the same lock, so it can never erase
-        # content that a concurrent finalizer has published but not installed.
-        upload = self.uploads_manager.get(upload_id)
-        scope = self.lock if upload.kind == "fiber" else nullcontext()
-        with self._refresh_conflicting_pcl_upload(upload.role):
-            with scope:
-                return self._finalize_upload(upload_id)
+        finalized = self.input_upload_manager(upload_id).finalize(upload_id)
+        return {**self._base(), "accepted": True, "input": finalized.record}
 
-    def _finalize_upload(self, upload_id):
-        finalized = self.uploads_manager.finalize(upload_id)
-        ledger_record = None
-        if finalized.kind == "fiber":
-            with self.lock:
-                existing = self.ephemeral_records.find(
-                    "fiber", finalized.record.get("id"))
-                current = existing.revision if existing is not None else None
-                revision = finalized.record.get("revision")
-                if current == revision:
-                    # Replay of a finalized upload ID, or a fresh upload of
-                    # identical bytes, converges on the existing logical row.
-                    record = existing
-                else:
-                    base = finalized.record.get("base_revision")
-                    if base != current:
-                        # Finalize may have reused an existing content-addressed
-                        # file. Clean through the ledger's protected-revision
-                        # policy instead of assuming this upload published it.
-                        if existing is not None:
-                            self._cleanup_fiber_revision_files(existing)
-                        else:
-                            Path(finalized.record["path"]).unlink(
-                                missing_ok=True)
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            f"Fiber {finalized.record.get('id')!r} changed "
-                            "while this revision was uploading",
-                            payload={"current_revision": current})
-                    record = self.ephemeral_records.revise_fiber(
-                        finalized.record)
-                ledger_record = record
-                if (record is not None and current != revision
-                        and self.session is not None
-                        and self.session.status().get("state")
-                        == SessionState.Running
-                        and self._active_run_influence is not None):
-                    record.incorporation = "queued"
-                    if record not in self._live_incorporation_queue:
-                        self._live_incorporation_queue.append(record)
-                    self._start_live_incorporation_dispatch_locked()
-                self.status_generation += 1
-                if current != revision and self.session is not None \
-                        and self.session.status().get("state") \
-                        == SessionState.Idle:
-                    self._cleanup_fiber_revision_files(record)
-        elif not finalized.replayed:
-            with self.lock:
-                if finalized.kind != "checkpoint":
-                    ledger_record = self.ephemeral_records.add(finalized.record)
-                    if (self.session is not None
-                            and self.session.status().get("state")
-                            == SessionState.Running
-                            and self._active_run_influence is not None):
-                        ledger_record.incorporation = "queued"
-                        self._live_incorporation_queue.append(ledger_record)
-                        self._start_live_incorporation_dispatch_locked()
-                self.status_generation += 1
-        input_record = dict(finalized.record)
-        if ledger_record is None and finalized.kind != "checkpoint":
-            ledger_record = self.ephemeral_records.find(
-                finalized.record.get("kind"), finalized.record.get("id"))
-        if ledger_record is not None:
-            input_record.update(ledger_record.status_entry())
-        return {**self.status(), "input": input_record,
-                "accepted": True}
-
-    def _enqueue_live_incorporation_locked(self, records):
-        """Queue pending records for the running fit; caller holds the lock.
-
-        Nothing happens unless a run with an influence configuration is in
-        progress: the records then wait for the next Run's claim.
-        """
-        if (not records or self.session is None
-                or self.session.status().get("state") != SessionState.Running
-                or self._active_run_influence is None):
-            return
-        for record in records:
-            if record.incorporation != "pending":
-                continue
-            record.incorporation = "queued"
-            if record not in self._live_incorporation_queue:
-                self._live_incorporation_queue.append(record)
-        self._start_live_incorporation_dispatch_locked()
-
-    def _start_live_incorporation_dispatch_locked(self):
-        """Start the one service dispatcher; caller holds ``self.lock``."""
-        if self._live_incorporation_active:
-            return
-        self._live_incorporation_active = True
-        generation = self.session_generation
-        threading.Thread(
-            target=self._dispatch_live_incorporation,
-            args=(generation,), name="spiral-live-inputs", daemon=True,
-        ).start()
-
-    def _snapshot_incorporation_locked(self, records):
-        """Pin immutable payload revisions while their runtime commands own them."""
-        payloads = [record.payload() for record in records]
-        for payload in payloads:
-            if payload.get("kind") == "fiber":
-                key = (payload["id"], payload.get("revision"))
-                self._incorporating_fiber_revisions[key] = (
-                    self._incorporating_fiber_revisions.get(key, 0) + 1)
-        return payloads
-
-    def _release_incorporation_locked(self, payloads):
-        for payload in payloads:
-            if payload.get("kind") == "fiber":
-                key = (payload["id"], payload.get("revision"))
-                count = self._incorporating_fiber_revisions.get(key, 0)
-                if count > 1:
-                    self._incorporating_fiber_revisions[key] = count - 1
-                else:
-                    self._incorporating_fiber_revisions.pop(key, None)
-
-    def _finish_incorporation(self, records, *, error=None, outcomes=None,
-                              no_future_step=False):
-        """Apply a runtime outcome; persistence remains non-fatal."""
-        # Payloads that carried their committed collection ids delivered
-        # the collections' identities with them; an addition committed while
-        # its payload was already in flight has to go back for them.
-        delivered = {
-            (record.get("kind"), record.get("id")) for record in records
-            if record.get("committed_collection_ids") is not None
-        }
-        with self.lock:
-            self._release_incorporation_locked(records)
-            resolved = self.ephemeral_records.resolve(records)
-            if no_future_step:
-                self.ephemeral_records.return_pending(resolved)
-            elif outcomes is not None:
-                self.ephemeral_records.mark_outcomes(
-                    outcomes, delivered_identities=delivered)
-            else:
-                self.ephemeral_records.mark_incorporated(
-                    resolved, error=error, delivered_identities=delivered)
-            self._enqueue_live_incorporation_locked(
-                self.ephemeral_records.collection_identity_assignments())
-            self.status_generation += 1
-
-        self._auto_commit_incorporated_fibers(resolved)
-        for record in resolved:
-            if record.kind == "fiber":
-                self._cleanup_fiber_revision_files(record)
-
-    def _auto_commit_incorporated_fibers(self, records):
-        """Catch up tracked fibers, reporting persistence failures non-fatally."""
-        with self.lock:
-            automatic = [
-                (record, record.revision) for record in records
-                if record.kind == "fiber" and record.auto_commit
-                and record.incorporated_revision == record.revision
-                and record.committed_revision != record.revision
-            ]
-
-        for record, revision in automatic:
-            try:
-                self._auto_commit_fiber(record)
-            except Exception as exc:
-                with self.lock:
-                    current = self.ephemeral_records.find(
-                        "fiber", record.id)
-                    if current is record and record.revision == revision:
-                        record.error = (
-                            "Automatic commit failed: "
-                            f"{type(exc).__name__}: {exc}")
-                        record.error_revision = revision
-                        self.status_generation += 1
-            else:
-                with self.lock:
-                    if (record.committed_revision == revision
-                            and record.error_revision == revision
-                            and str(record.error or "").startswith(
-                                "Automatic commit failed:")):
-                        record.error = None
-                        record.error_revision = None
-                        self.status_generation += 1
-
-    def _dispatch_live_incorporation(self, generation):
-        """Coalesce finalized records and hand each batch to the runtime."""
-        while True:
-            with self.lock:
-                if generation != self.session_generation:
-                    abandoned = list(self._live_incorporation_queue)
-                    self._live_incorporation_queue.clear()
-                    self.ephemeral_records.return_pending(abandoned)
-                    self._live_incorporation_active = False
-                    return
-                if not self._live_incorporation_queue:
-                    self._live_incorporation_active = False
-                    return
-                batch = list(self._live_incorporation_queue)
-                self._live_incorporation_queue.clear()
-                session = self.session
-                influence = dict(self._active_run_influence or {})
-                running = (session is not None
-                           and session.status().get("state")
-                           == SessionState.Running)
-                payloads = (self._snapshot_incorporation_locked(batch)
-                            if running and hasattr(session, "incorporate_live")
-                            else [])
-            if not running or not hasattr(session, "incorporate_live"):
-                with self.lock:
-                    self.ephemeral_records.return_pending(batch)
-                    self.status_generation += 1
-                continue
-            try:
-                result = session.incorporate_live(payloads, influence)
-            except Exception as exc:
-                # Runtime failures after mutation begins are fail-stop. Its
-                # state/error is authoritative; keep the records diagnosable.
-                error = f"{type(exc).__name__}: {exc}"
-                self._finish_incorporation(payloads, error=error)
-                continue
-            self._finish_incorporation(
-                payloads, outcomes=result.get("outcomes", []),
-                no_future_step=result.get("no_future_step", False))
-
-    def _cleanup_fiber_revision_files(self, record):
-        """Drop superseded staged content after runtime references are gone."""
-        failures = []
-        with self.lock:
-            if record.kind != "fiber":
-                return
-            current = self.ephemeral_records.find("fiber", record.id)
-            if current is not record:
-                return
-            protected = {
-                value for value in (
-                    record.revision, record.incorporated_revision,
-                    record.committed_revision)
-                if value
-            }
-            protected.update(
-                revision for input_id, revision
-                in self._committing_fiber_revisions
-                if input_id == record.id)
-            protected.update(
-                revision for input_id, revision
-                in self._incorporating_fiber_revisions
-                if input_id == record.id)
-            directory = Path(record.path).parent
-            if not directory.is_dir():
-                return
-            # Fiber publication is serialized by this same lock. Keep it
-            # held through deletion so a digest cannot be reused between the
-            # protected-set check and unlinking the path.
-            try:
-                candidates = list(directory.glob("*.json"))
-            except OSError as exc:
-                failures.append((directory, exc))
-                candidates = []
-            for path in candidates:
-                if path.stem in protected:
-                    continue
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as exc:
-                    failures.append((path, exc))
-        for path, exc in failures:
-            self.events.append(
-                "log", f"Could not remove obsolete fiber revision "
-                f"{path}: {type(exc).__name__}: {exc}",
-                severity="warning", source="service")
-
-    def _auto_commit_fiber(self, record):
-        """Persist one incorporated tracked revision without touching drafts."""
-        with self.lock:
-            if (self.session_paths is None or not record.auto_commit
-                    or record.incorporated_revision != record.revision
-                    or record.committed_revision == record.revision):
-                return
-            dataset_root = Path(self.session_paths.dataset_root)
-            fibers_dir = (Path(self.session_paths.fibers)
-                          if self.session_paths.fibers
-                          else dataset_root / "fibers")
-        commit_lock = ExclusiveFileLock(dataset_root / ".spiral-commit.lock")
-        commit_lock.acquire(DATASET_COMMIT_LOCK_TIMEOUT_SECONDS)
-        try:
-            with self.lock:
-                if (record not in self.ephemeral_records.records
-                        or record.incorporated_revision != record.revision
-                        or record.committed_revision == record.revision):
-                    return
-                _copy_publish(Path(record.path),
-                              fibers_dir / f"{record.id}.json",
-                              keep_source=True)
-                record.persistence = "committed"
-                record.committed_revision = record.revision
-                self.status_generation += 1
-        finally:
-            commit_lock.release()
+    def commit_input_revisions(self, token, request):
+        result = self.editing().commit(token, request)
+        self._refresh_pcl_artifacts()
+        return {**self.status(), **result}
 
     def gc_uploads(self):
-        self.uploads_manager.collect_garbage()
+        self.checkpoint_uploads.collect_garbage()
+        if self.editing_workspace is not None:
+            self.editing_workspace.uploads.collect_garbage()
 
-    def commit_inputs(self):
-        with self.lock:
-            self._require_session()
-            available, reason = self._commit_availability()
-            if not available:
-                raise ApiError(HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
-            expected_session_id = self.session_id
-            dataset_root = Path(self.session_paths.dataset_root)
-        commit_lock = ExclusiveFileLock(dataset_root / ".spiral-commit.lock")
-        try:
-            commit_lock.acquire(DATASET_COMMIT_LOCK_TIMEOUT_SECONDS)
-        except FileLockUnavailable as exc:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                "Dataset commit is busy in another Spiral session; try again") from exc
-        snapshots = []
-        pcl_commits = []
-        try:
-            # Re-check after acquiring the process-wide lock: another request
-            # may have completed while this one was waiting.
-            with self.lock:
-                self._require_session()
-                if self.session_id != expected_session_id:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        "The Spiral session changed while waiting to commit")
-                available, reason = self._commit_availability()
-                if not available:
-                    raise ApiError(
-                        HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
-                records = self.ephemeral_records.uncommitted()
-                paths = self.session_paths
-                patches_dir = (Path(paths.verified_patches)
-                               if paths.verified_patches
-                               else dataset_root / "verified_patches")
-                fibers_dir = (Path(paths.fibers) if paths.fibers
-                              else dataset_root / "fibers")
-                snapshots = [
-                    _CommitInputSnapshot(
-                        record=record, id=record.id, kind=record.kind,
-                        role=record.role, path=record.path,
-                        revision=record.revision,
-                        incorporated=record.incorporated)
-                    for record in records
-                ]
-                self._committing_inputs.update(
-                    (snapshot.kind, snapshot.id) for snapshot in snapshots)
-                self._committing_fiber_revisions.update(
-                    (snapshot.id, snapshot.revision)
-                    for snapshot in snapshots
-                    if snapshot.kind == "fiber" and snapshot.revision)
-
-            # Validation happens entirely under the dataset lock, before any
-            # record is published: collision checks cannot race a cooperating
-            # service process, and a record whose staged copy went missing
-            # fails the whole commit instead of leaving it half applied.
-            for snapshot in snapshots:
-                if not Path(snapshot.path).exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"The staged copy of {snapshot.kind} "
-                        f"{snapshot.id!r} is gone; "
-                        "it can no longer be committed")
-                if snapshot.kind == "patch" \
-                        and (patches_dir / snapshot.id).exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"A patch named {snapshot.id!r} already exists in the dataset")
-                # A tracked fiber commonly originates at this exact dataset
-                # path. Explicit commit adopts/updates it atomically and makes
-                # auto-commit sticky for later revisions.
-
-            committed = []
-            # Editable PCL roles: validate and stage every role's merged file
-            # before publishing any of them, so a revision conflict in one
-            # role cannot leave another role's file already rewritten (which
-            # would make the ledger's still-uncommitted mutations of that
-            # role conflict with their own commit on retry).
-            handled_editable = set()
-            pcl_commits = []
-            for role in EDITABLE_PCL_ROLES:
-                prepared = self._prepare_editable_pcl_commit(
-                    role, snapshots, handled_editable)
-                if prepared is not None:
-                    pcl_commits.append(prepared)
-            for prepared in pcl_commits:
-                self._recheck_editable_pcl_commit(prepared)
-            # Editable-role additions learn the collection ids the dataset
-            # file gave them; the resident fit needs them as the collections'
-            # logical identities before a later replace/delete can find them.
-            collection_ids = {}
-            for prepared in pcl_commits:
-                self._publish_editable_pcl_commit(
-                    prepared, committed, collection_ids)
-
-            for snapshot in snapshots:
-                if (snapshot.kind, snapshot.id) in handled_editable:
-                    continue
-                source = Path(snapshot.path)
-                # A still-pending record keeps its staged copy: it remains the
-                # incorporation source for the next run, so committing never
-                # removes an input from the live session's queue.
-                keep_source = not snapshot.incorporated
-                if snapshot.kind == "patch":
-                    _copy_publish(
-                        source, patches_dir / snapshot.id, keep_source)
-                elif snapshot.kind == "fiber":
-                    _copy_publish(source,
-                                  fibers_dir / f"{snapshot.id}.json",
-                                  keep_source=True)
-                else:
-                    target = dataset_root / PCL_ROLE_FILES[snapshot.role]
-                    with source.open("r", encoding="utf-8") as stream:
-                        incoming = json.load(stream)
-                    if target.exists():
-                        backup = target.with_name(f"{target.name}.{_utc_stamp()}.bak")
-                        shutil.copy2(target, backup)
-                        with target.open("r", encoding="utf-8") as stream:
-                            existing = json.load(stream)
-                        merged, assigned = _merge_pcl_documents_assigning(
-                            existing, incoming)
-                    else:
-                        merged = incoming
-                        assigned = {str(int(key)): key
-                                    for key in incoming.get("collections", {})}
-                    if snapshot.role in EDITABLE_PCL_ROLE_VALUES:
-                        collection_ids[(snapshot.kind, snapshot.id)] = assigned
-                    temp = target.with_name(
-                        f".{target.name}.incoming-{secrets.token_hex(4)}")
-                    with temp.open("w", encoding="utf-8") as stream:
-                        json.dump(merged, stream, indent=2)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temp, target)
-                    if not keep_source:
-                        source.unlink(missing_ok=True)
-                committed.append(snapshot.id)
-            with self.lock:
-                # Committed records that already joined the resident fit are
-                # done; the rest stay queued for the next run.
-                self.ephemeral_records.mark_committed(
-                    [snapshot.record for snapshot in snapshots],
-                    fiber_revisions={
-                        (snapshot.kind, snapshot.id): snapshot.revision
-                        for snapshot in snapshots
-                        if snapshot.kind == "fiber"
-                    },
-                    collection_ids=collection_ids)
-                # Additions the fit already holds under resident ids alone
-                # are re-queued as identity assignments; a running fit takes
-                # them live, an idle one at its next Run.
-                self._enqueue_live_incorporation_locked(
-                    self.ephemeral_records.collection_identity_assignments())
-                if self.dataset_resolution is not None:
-                    # Re-advertise the dataset with the committed inputs, but
-                    # keep the startup-bound output/cache roots: deployment
-                    # paths never change after launch.
-                    previous = self.dataset_resolution.resolved
-                    self.dataset_resolution = bind_service_paths(
-                        resolve_dataset_root(self.dataset_root),
-                        previous.get("output_directory", ""),
-                        previous.get("cache_directory", ""))
-                self.status_generation += 1
-            response = {
-                **self.status(), "committed": committed, "accepted": True}
-        finally:
-            for prepared in pcl_commits:
-                prepared.temp.unlink(missing_ok=True)
-            if snapshots:
-                with self.lock:
-                    self._committing_inputs.difference_update(
-                        (snapshot.kind, snapshot.id)
-                        for snapshot in snapshots)
-                    self._committing_fiber_revisions.difference_update(
-                        (snapshot.id, snapshot.revision)
-                        for snapshot in snapshots
-                        if snapshot.kind == "fiber" and snapshot.revision)
-                    fiber_records = {
-                        snapshot.id: snapshot.record
-                        for snapshot in snapshots
-                        if snapshot.kind == "fiber"
-                    }
-                    for record in fiber_records.values():
-                        self._cleanup_fiber_revision_files(record)
-            commit_lock.release()
-        # A newer revision may have finished incorporation before this first
-        # explicit commit enabled auto-commit. Recheck after releasing the
-        # dataset lock, which automatic persistence acquires independently.
-        self._auto_commit_incorporated_fibers(
-            snapshot.record for snapshot in snapshots
-            if snapshot.kind == "fiber")
-        response = {**response, **self.status()}
-        refreshed_roles = sorted({
-            snapshot.role for snapshot in snapshots
-            if snapshot.kind == "pcl"
-            and snapshot.role in EDITABLE_PCL_ROLE_VALUES})
-        for role_value in refreshed_roles:
-            self._refresh_pcl_artifact(
-                role_value,
-                str(Path(self.session_paths.dataset_root) /
-                    PCL_ROLE_FILES[role_value]))
-        if refreshed_roles:
-            response = {**response, **{
-                PCL_ARTIFACT_STATUS_KEYS[role_value]:
-                    self.pcl_artifacts.get(role_value)
-                for role_value in refreshed_roles}}
-        return response
-
-    def _prepare_editable_pcl_commit(self, role, snapshots, handled):
-        """Validate and stage one role's replace/delete mutations.
-
-        Ordinary additions of the same role are merged against the same
-        in-memory snapshot so a single atomic write covers everything that
-        commit touches in that file. The merged document is written to a
-        temporary sibling of the role file; nothing is published here.
-        Returns None when the role has no staged mutations. Runs under the
-        dataset commit lock. ``handled`` collects the ``(kind, id)`` of every
-        snapshot the returned plan covers.
-        """
-        role_value = PclRole(role).value
-        label = PCL_ROLE_LABELS[role_value]
-        mutation_snapshots = [
-            snapshot for snapshot in snapshots
-            if snapshot.kind == "pcl"
-            and snapshot.role == role_value
-            and snapshot.record.operation in {
-                "replace_collection", "delete_collection"}
-        ]
-        if not mutation_snapshots:
-            return None
-        target = self._pcl_source_path(role_value)
-        if target is None or not self._pcl_source_editable(role_value, target):
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"The configured {label} source is no longer editable")
-        bases = {snapshot.record.base_source_revision
-                 for snapshot in mutation_snapshots}
-        if len(bases) != 1:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"{label.capitalize()} changes in one commit must share a "
-                "source revision")
-        base_revision = next(iter(bases))
-        current_revision = self._file_sha256(target)
-        if current_revision != base_revision:
-            self._refresh_pcl_artifact(role_value, target)
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"The {label} source changed before commit",
-                payload={"code": "source_revision_conflict",
-                         "current_revision": current_revision})
-        with target.open("r", encoding="utf-8") as stream:
-            merged = json.load(stream)
-        target_collections = merged.get("collections")
-        # Pending additions must not take the identity of a resident collection
-        # deleted by this commit: the next Run still has that collection loaded.
-        min_next_id = max((int(key) for key in target_collections), default=-1) + 1
-        target_ids = [snapshot.record.target_collection_id
-                      for snapshot in mutation_snapshots]
-        if len(set(target_ids)) != len(target_ids):
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "A commit cannot change one collection twice")
-        for snapshot, target_id in zip(mutation_snapshots, target_ids):
-            if target_id not in target_collections:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    f"{label.capitalize()} collection {target_id} no longer exists")
-            if snapshot.record.operation == "delete_collection":
-                del target_collections[target_id]
-            else:
-                with Path(snapshot.path).open(
-                        "r", encoding="utf-8") as stream:
-                    incoming = json.load(stream)
-                target_collections[target_id] = \
-                    incoming["collections"][target_id]
-        # Ordinary additions of this role are applied after all
-        # replacements, against the same in-memory source snapshot.
-        additions = [
-            snapshot for snapshot in snapshots
-            if snapshot.kind == "pcl"
-            and snapshot.role == role_value
-            and snapshot.record.operation not in {
-                "replace_collection", "delete_collection"}
-        ]
-        collection_ids = {}
-        for snapshot in additions:
-            with Path(snapshot.path).open("r", encoding="utf-8") as stream:
-                incoming = json.load(stream)
-            merged, assigned = _merge_pcl_documents_assigning(
-                merged, incoming, min_next_id=min_next_id)
-            collection_ids[(snapshot.kind, snapshot.id)] = assigned
-        temp = target.with_name(
-            f".{target.name}.incoming-{secrets.token_hex(4)}")
-        try:
-            with temp.open("w", encoding="utf-8") as stream:
-                json.dump(merged, stream, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except BaseException:
-            temp.unlink(missing_ok=True)
-            raise
-        covered = mutation_snapshots + additions
-        handled.update((snapshot.kind, snapshot.id) for snapshot in covered)
-        return _PreparedPclCommit(
-            role=role_value, label=label, target=target, temp=temp,
-            base_revision=base_revision, snapshots=covered,
-            collection_ids=collection_ids)
-
-    def _recheck_editable_pcl_commit(self, prepared):
-        """Final CAS under the dataset lock, run for every role before any
-        role is published: closes non-cooperating source writers between
-        load and publication without leaving a sibling role half applied."""
-        late_revision = self._file_sha256(prepared.target)
-        if late_revision != prepared.base_revision:
-            self._refresh_pcl_artifact(prepared.role, prepared.target)
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"The {prepared.label} source changed during commit",
-                payload={"code": "source_revision_conflict",
-                         "current_revision": late_revision})
-
-    def _publish_editable_pcl_commit(self, prepared, committed,
-                                     collection_ids):
-        """Replace the role file with the staged merged document."""
-        backup = prepared.target.with_name(
-            f"{prepared.target.name}.{_utc_stamp()}.bak")
-        shutil.copy2(prepared.target, backup)
-        os.replace(prepared.temp, prepared.target)
-        collection_ids.update(prepared.collection_ids)
-        for snapshot in prepared.snapshots:
-            if snapshot.incorporated:
-                Path(snapshot.path).unlink(missing_ok=True)
-            committed.append(snapshot.id)
-
-    def remove_input(self, kind, input_id):
-        with self.lock:
-            self._require_session()
-            record = self.ephemeral_records.find(kind, input_id)
-            if record is None:
-                raise ApiError(HTTPStatus.NOT_FOUND,
-                               f"No ephemeral {kind or 'input'} named {input_id!r} exists")
-            if (record.kind, record.id) in self._committing_inputs:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "This input is being committed and cannot be removed")
-            if record.incorporation == "queued":
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "This input is queued for the next optimizer step and "
-                    "can no longer be removed")
-            if (record.incorporated
-                    or record.incorporated_revision is not None
-                    or record.operation == PCL_ASSIGN_COLLECTION_IDS):
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "This input already joined the resident fit; removing it "
-                               "requires reloading the session")
-            self.ephemeral_records.remove(record)
-            self.status_generation += 1
-        # The staged copy is only deleted when the dataset holds no committed
-        # copy; a committed record's file is the user's data now.
-        if not record.committed:
-            path = Path(record.path)
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
-        return {**self.status(), "removed": input_id, "accepted": True}
 
     # ------------------------------------------------------------------
     # Command-ID replay
@@ -3213,18 +2336,6 @@ ROUTES = (
           lambda ctx: ctx.state.input_upload_manager(ctx.args[0]).cancel(ctx.args[0]),
           Idempotency.NONE),
 
-    # There is deliberately no DELETE /session. The first session is created
-    # explicitly and replacing one is POST /session/rebuild.
-    #
-    # A removal names its target in the path, so it needs no body: the
-    # operation is already idempotent (a second DELETE finds nothing to
-    # remove), and clients do not retry it.
-    Route("DELETE",
-          re.compile(r"/session/ephemeral-inputs/([a-z]+)/([A-Za-z0-9._-]+)"),
-          "ephemeral_input_remove",
-          lambda ctx: ctx.state.remove_input(ctx.args[0], ctx.args[1]),
-          Idempotency.NONE),
-
     Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
           "upload_finalize",
           lambda ctx: ctx.state.finalize_upload(ctx.args[0]),
@@ -3257,7 +2368,8 @@ ROUTES = (
           lambda ctx: ctx.state.download_checkpoint(),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/commit-inputs", "commit_inputs",
-          lambda ctx: ctx.state.commit_inputs(), Idempotency.COMMAND_ID,
+          lambda ctx: ctx.state.commit_input_revisions(
+              ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body), Idempotency.NONE,
           reads_body=True),
 )
 
@@ -3420,12 +2532,6 @@ class SpiralHandler(BaseHTTPRequestHandler):
         if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
             token = self.headers.get("X-Spiral-Workspace-Token")
             workspace.require(token)
-            if route.operation == "commit_inputs":
-                result = workspace.commit(token, body or {})
-                state._refresh_pcl_artifacts()
-                return {**state.status(), **result}
-            if route.operation == "ephemeral_input_remove":
-                raise ApiError(410, "Stage a deletion with /session/input-changes")
             if route.idempotency == Idempotency.COMMAND_ID:
                 return state.editing_lifecycle(token, route.operation, body or {},
                                                 lambda captured: route.handler(RouteContext(
@@ -3536,7 +2642,7 @@ def main(argv=None):
                              "/dataset). Clients cannot repoint base inputs.")
     parser.add_argument("--output", required=True,
                         help="Root for all generated state (run directories, "
-                             "autosaves, previews, ephemeral inputs, upload "
+                             "autosaves, previews, input revisions, upload "
                              "staging, uploaded checkpoints). Must resolve "
                              "outside the dataset root.")
     parser.add_argument("--cache", default=None,

@@ -120,20 +120,17 @@ public:
     QString inputWorkspaceId() const { return _inputWorkspaceId; }
     void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
 
-    void uploadPatch(const QString& directory, const QString& inputId);
-    void uploadJsonInput(const QString& kind, const QString& filePath,
-                         const QString& inputId, const QString& role = {},
-                         const QString& baseRevision = {});
-    // CAS-guarded replacement or deletion of one collection of an editable
-    // PCL role (same-winding or relative-winding).
-    void uploadPclReplacement(vc3d::spiral::PclRole role,
+    void stagePatch(const QString& directory, const QString& inputId);
+    void stageJsonInput(const QString& kind, const QString& filePath,
+                         const QString& inputId, const QString& role = {});
+    // Stage a revision of an existing editable point collection.
+    void stagePclReplacement(vc3d::spiral::PclRole role,
                               const QString& filePath,
                               const QString& inputId,
                               const QString& operation,
-                              const QString& targetCollectionId,
-                              const QString& baseSourceRevision);
-    // Remove an added input that has not joined the resident fit yet.
-    void removeEphemeralInput(const QString& kind, const QString& inputId);
+                              const QString& targetCollectionId);
+    // Stage a deletion; Apply removes supervision and Commit persists it.
+    void removeInputDraft(const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
     // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.

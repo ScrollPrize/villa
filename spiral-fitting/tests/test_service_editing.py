@@ -1,5 +1,8 @@
 """Integrated immutable transport, catalog, resident and publication lifecycle."""
 import copy
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -8,7 +11,9 @@ from uuid import uuid4
 
 import pytest
 
-from input_publication import _Publication
+from input_publication import _Publication, Output, PublicationTransaction, fingerprint
+from input_workspace import Catalog, Change, Content, InputIdentity, MutationCoordinator
+from service_uploads import UploadEnvironment, UploadManager
 from service_editing import EditingWorkspace
 from service_http import ApiError
 
@@ -91,23 +96,6 @@ def test_transport_never_accepts_or_commits_and_revisions_are_exact(workspace):
     with pytest.raises(ApiError, match='older revision'):
         commit(ws, entry.identity.id, 2)
     assert json.loads(target.read_text())['collections']['7']['name'] == 'second'
-
-
-def test_conflict_is_scoped_and_does_not_gate_repairs(workspace):
-    ws, _ = workspace
-    entry = ws.catalog.entries()[0]
-    change(ws, entry.identity.id, 1, 'local')
-    target = Path(entry.identity.source)
-    external = json.loads(target.read_text())
-    external['collections']['7']['name'] = 'external'
-    target.write_text(json.dumps(external))
-    with pytest.raises(ApiError) as error:
-        commit(ws, entry.identity.id, 2, 'conflict')
-    assert error.value.payload['conflicts'][0]['id'] == entry.identity.id
-    assert not ws.transactions
-    assert ws.coordinator.outcome('conflict')['state'] == 'rejected'
-    change(ws, entry.identity.id, 2, 'repair')
-    assert json.loads(target.read_text()) == external
 
 
 def test_unrelated_pcl_changes_merge_and_command_path_is_not_interpreted(workspace, tmp_path):
@@ -292,40 +280,6 @@ def test_rebuild_preserves_desired_inputs_uploads_and_failed_preparation(workspa
         (e['id'], e['accepted_revision'], e['persisted_revision']) for e in desired]
 
 
-def test_use_current_timeout_does_not_accept_twice(workspace):
-    editing, resident = workspace
-    entry = editing.catalog.entries()[0]
-    target = Path(entry.identity.source)
-    document = json.loads(target.read_text())
-    document['collections']['7']['name'] = 'external'
-    target.write_text(json.dumps(document))
-    current, _ = editing._external(entry.identity)
-    request = {'command_id': 'review-timeout', 'id': entry.identity.id,
-        'expected_revision': 1, 'action': 'use_current', 'review_token': editing._review_token(current)}
-    original = resident.apply_input_changes
-    calls = 0
-    def interrupted(command, records, influence_config=None):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise TimeoutError('lost response')
-        return original(command, records, influence_config)
-    resident.apply_input_changes = interrupted
-    with pytest.raises(TimeoutError):
-        editing.resolve_conflict(TOKEN, request)
-    assert editing.resolve_conflict(TOKEN, request)['resolved']
-    assert editing.catalog.entry(entry.identity.id).accepted == 2
-    assert editing.catalog.entry(entry.identity.id).persisted == 2
-
-
-def test_release_reply_can_be_reconciled_after_lock_is_released(workspace):
-    editing, _ = workspace
-    assert editing.release(TOKEN, 'release')['released']
-    assert editing.release(TOKEN, 'release')['released']
-    with pytest.raises(ApiError):
-        editing.release('different-owner', 'release')
-
-
 def test_reconnect_refreshes_clean_targets_and_preserves_dirty_conflicts(workspace):
     editing, resident = workspace
     entry = editing.catalog.entries()[0]
@@ -410,3 +364,209 @@ def test_discovered_inputs_retry_failed_application(workspace):
     restored = editing.catalog.entry(entry.identity.id)
     assert (restored.accepted, restored.applied, restored.persisted) == (1, 1, 1)
     assert not restored.errors
+
+
+def identity(kind="pcl", *, source="same_windings.json", collection_id=None):
+    return InputIdentity(str(uuid4()), kind, source, "same_winding"
+                         if kind == "pcl" else None, collection_id)
+
+
+def content(value):
+    return Content.from_json({"value": value})
+
+
+def test_failed_batch_does_not_accept_any_changes_or_consume_ids():
+    catalog = Catalog()
+    first, second = identity(collection_id=7), identity(collection_id=9)
+    catalog.register_base(first, content("a"))
+    catalog.register_base(second, content("b"))
+    new = identity()
+    with pytest.raises(ApiError) as error:
+        catalog.accept([Change(new, 0, content("new")),
+                        Change(first, 1, content("changed")),
+                        Change(second, 0, None)])
+    assert error.value.payload["conflicts"][0]["id"] == second.id
+    assert catalog.entry(first.id).accepted == 1
+    assert len(catalog.entries()) == 2
+    catalog.accept([Change(new, 0, content("new"))])
+    assert catalog.entry(new.id).identity.collection_id == 10
+
+
+def test_commit_requires_each_exact_revision_to_have_applied():
+    catalog = Catalog()
+    item = identity("fiber")
+    first = catalog.accept([Change(item, 0, content("one"))])
+    second = catalog.accept([Change(item, 1, content("two"))])
+    catalog.mark_applied(second)
+    with pytest.raises(ApiError):
+        catalog.mark_persisted(first)
+    assert catalog.entry(item.id).persisted == 0
+    catalog.mark_persisted(second)
+
+
+def test_parallel_duplicate_commands_execute_once_and_reject_different_payload():
+    coordinator = MutationCoordinator()
+    started, finish = threading.Event(), threading.Event()
+    calls = []
+
+    def operation(payload):
+        calls.append(payload)
+        started.set()
+        assert finish.wait(5)
+        return {"revision": 1}
+
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(coordinator.execute, "one", "apply", {"v": 1}, operation)
+        assert started.wait(5)
+        assert coordinator.outcome("one")["state"] == "running"
+        second = pool.submit(coordinator.execute, "one", "apply", {"v": 1}, operation)
+        with pytest.raises(ApiError):
+            coordinator.execute("one", "apply", {"v": 2}, operation)
+        finish.set()
+        assert first.result(5) == second.result(5) == {"revision": 1}
+    assert calls == [{"v": 1}]
+    for n in range(300):
+        coordinator.execute(str(n), "apply", {}, lambda payload: {})
+    assert coordinator.execute("one", "apply", {"v": 1}, operation) == {"revision": 1}
+    assert len(calls) == 1  # No LRU expiration while the workspace lives.
+
+
+def prepare(tmp_path):
+    target = tmp_path / "dataset"
+    source = tmp_path / "drafts"
+    target.mkdir()
+    source.mkdir()
+    (target / "same.json").write_bytes(b"original collection")
+    (source / "same.json").write_bytes(b"selected revision")
+    (target / "fiber.json").write_bytes(b"old fiber")
+    (source / "fiber.json").write_bytes(b"new fiber")
+    (target / "patch").mkdir()
+    (target / "patch" / "x.tif").write_bytes(b"old geometry")
+    (source / "patch").mkdir()
+    (source / "patch" / "x.tif").write_bytes(b"selected geometry")
+    (target / "removed.json").write_bytes(b"delete me")
+    outputs = [Output(target / name, source / name, fingerprint(target / name))
+               for name in ("same.json", "patch", "fiber.json")]
+    outputs.append(Output(target / "removed.json", None, fingerprint(target / "removed.json")))
+    return PublicationTransaction.prepare(outputs), target, source
+
+
+@pytest.mark.parametrize("failure_phase", range(1, 6))
+@pytest.mark.parametrize("after_rename", [False, True])
+def test_every_rename_failure_resumes_exact_outputs(tmp_path, monkeypatch, failure_phase, after_rename):
+    transaction, target, source = prepare(tmp_path)
+    replace = os.replace
+    count = 0
+
+    def injected(src, dst):
+        nonlocal count
+        count += 1
+        if count == failure_phase and not after_rename:
+            raise OSError("injected before rename")
+        replace(src, dst)
+        if count == failure_phase and after_rename:
+            raise OSError("injected after rename")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "replace", injected)
+        with pytest.raises(OSError, match="injected"):
+            transaction.resume()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        transaction.release()
+    # New local edits cannot leak into a retained transaction.
+    (source / "same.json").write_bytes(b"newer unsubmitted draft")
+    transaction.resume()
+    transaction.resume()  # Lost success response.
+    assert (target / "same.json").read_bytes() == b"selected revision"
+    assert (target / "fiber.json").read_bytes() == b"new fiber"
+    assert (target / "patch" / "x.tif").read_bytes() == b"selected geometry"
+    assert not (target / "removed.json").exists()
+    assert all(entry["phase"] == "published" for entry in transaction.status())
+    transaction.release()
+    transaction.release()
+    assert not list(target.glob(".spiral-publication-*"))
+
+
+def test_published_target_is_verified_before_resuming_other_targets(tmp_path, monkeypatch):
+    transaction, target, _ = prepare(tmp_path)
+    original_replace = os.replace
+
+    def interrupted(src, dst):
+        original_replace(src, dst)
+        raise OSError("lost response")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "replace", interrupted)
+        with pytest.raises(OSError):
+            transaction.resume()
+    (target / "same.json").write_bytes(b"external post-publication edit")
+    with pytest.raises(ApiError, match="changed"):
+        transaction.resume()
+    assert (target / "patch" / "x.tif").read_bytes() == b"old geometry"
+
+
+def test_rejects_symlinks_and_overlapping_targets(tmp_path):
+    directory = tmp_path / "patch"
+    directory.mkdir()
+    (directory / "x.tif").write_bytes(b"data")
+    with pytest.raises(ApiError, match="overlap"):
+        PublicationTransaction.prepare([
+            Output(directory, None, fingerprint(directory)),
+            Output(directory / "x.tif", None, fingerprint(directory / "x.tif"))])
+    (tmp_path / "link").symlink_to(directory)
+    with pytest.raises(ApiError, match="symlink"):
+        fingerprint(tmp_path / "link")
+
+
+DATA = b'{"type":"vc3d_fiber","version":1,"points":[]}'
+
+@pytest.fixture
+def manager(tmp_path):
+    return UploadManager(UploadEnvironment(
+        lock=threading.RLock(), output_root=lambda: tmp_path,
+        session_id=lambda: "workspace"))
+
+
+def upload_manifest(data=DATA):
+    return {"upload_id": "a" * 32, "kind": "fiber", "id": "fiber-1",
+            "files": [{"name": "fiber.json", "size": len(data),
+                       "sha256": hashlib.sha256(data).hexdigest()}]}
+
+
+def test_cancellation_retains_receipt_and_never_recreates_transfer(manager):
+    upload_id = manager.begin(upload_manifest())["upload_id"]
+    manager.cancel(upload_id)
+    manager.cancel(upload_id)
+    assert manager.begin(upload_manifest())["upload_id"] == upload_id
+    assert manager.status(upload_id)["state"] == "cancelled"
+    assert not manager.uploads[upload_id].staging_dir.exists()
+    with pytest.raises(ApiError, match="cancelled"):
+        manager.receive(upload_id, "fiber.json", io.BytesIO(DATA), len(DATA))
+    with pytest.raises(ApiError, match="cancelled"):
+        manager.finalize(upload_id)
+
+
+def test_editable_upload_requires_stable_id_and_rejects_mutation_fields(manager):
+    manifest = upload_manifest()
+    del manifest['upload_id']
+    with pytest.raises(ApiError, match='stable upload_id'):
+        manager.begin(manifest)
+    for index, (key, value) in enumerate([('operation', 'delete_collection'), ('base_revision', 'old'),
+                       ('target_collection_id', '0'), ('base_source_revision', '0' * 64)]):
+        with pytest.raises(ApiError, match='bytes only'):
+            manager.begin(dict(upload_manifest(), upload_id=f"{index:032x}", **{key: value}))
+    assert manager.uploads == {}
+
+
+@pytest.mark.parametrize('partial', [False, True])
+def test_failed_transfer_cannot_finalize_and_retries_exact_bytes(manager, partial):
+    upload_id = manager.begin(upload_manifest())['upload_id']
+    with pytest.raises(ApiError):
+        manager.receive(upload_id, 'fiber.json', io.BytesIO(DATA[:8] if partial else b'x' * len(DATA)),
+                        len(DATA), offset=0)
+    with pytest.raises(ApiError, match='missing'):
+        manager.finalize(upload_id)
+    offset = manager.status(upload_id)['files'][0]['offset']
+    manager.receive(upload_id, 'fiber.json', io.BytesIO(DATA[offset:]), len(DATA) - offset, offset=offset)
+    result = manager.finalize(upload_id)
+    assert Path(result.record['path']).read_bytes() == DATA
