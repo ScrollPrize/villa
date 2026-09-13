@@ -227,3 +227,28 @@ def test_lease_excludes_other_clients_and_services_and_retains_reconnect(tmp_pat
     finally:
         first.close()
         second.close()
+
+
+def test_external_discovery_is_atomic_and_preserves_reserved_targets():
+    catalog = Catalog()
+    local = identity()
+    catalog.accept([Change(local, 0, content('local'))])
+    before = catalog.entries()
+    external = identity(collection_id=100)
+    collision = identity(collection_id=catalog.entry(local.id).identity.collection_id)
+    with pytest.raises(ValueError):
+        catalog.register_external_bases([(external, content('external')),
+                                         (collision, content('collision'))])
+    assert catalog.entries() == before
+    next_local = identity()
+    catalog.accept([Change(next_local, 0, content('next'))])
+    assert catalog.entry(next_local.id).identity.collection_id == 1
+    revisions = catalog.register_external_bases([(external, content('external'))])
+    imported = catalog.entry(external.id)
+    assert (imported.accepted, imported.applied, imported.persisted) == (1, 0, 1)
+    assert not imported.applied_history
+    catalog.mark_applied(revisions)
+    assert catalog.entry(external.id).applied == 1
+    following = identity()
+    catalog.accept([Change(following, 0, content('following'))])
+    assert catalog.entry(following.id).identity.collection_id == 101

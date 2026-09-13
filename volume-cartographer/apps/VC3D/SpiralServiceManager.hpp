@@ -278,6 +278,7 @@ private:
     void finishInputCommand();
     void installInputCatalog(const QJsonArray& inputs);
     void claimInputWorkspace();
+    void clearInputWorkspace();
     QString logicalInputId(const QString& kind, const QString& alias,
                            const QString& role, const QString& targetCollection);
     QMap<QString, std::shared_ptr<vc3d::spiral::InputDraft>> _inputDrafts;

@@ -317,7 +317,10 @@ The API 33 client and service use one revisioned input workspace per dataset.
 One service holds the dataset editing lease and one client owns that workspace;
 other connections can observe. Disconnecting retains ownership, drafts and
 command receipts. Reconnect with the same client resumes them. A fit rebuild
-replays desired inputs without replacing the editing workspace.
+replays desired inputs without replacing the editing workspace. Reconnect and
+rebuild also discover newly added dataset inputs, preserving their collection
+IDs and any existing workspace edits. A restarted service replaces a clean
+client catalog; pending edits or commands stay tied to their original workspace.
 
 **Add/Apply changes** captures the selected local revisions and applies the
 whole validated batch at a worker boundary, including while idle or after the
@@ -337,10 +340,24 @@ The input list includes baseline dataset entries and additions, with a filter
 and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
 operate on individual drafts. Applying Remove stops future supervision;
 Commit deletes the managed dataset entry. Restore remains available before
-committing a deletion. Removal cannot reverse completed optimizer steps.
+committing a deletion. Baseline restores reference the retained service revision
+and do not require access to the service filesystem. Removal cannot reverse
+completed optimizer steps.
 Invalid selected drafts keep the batch unapplied and remain editable. Scoped
 external-source conflicts offer Use Current, Apply Local After Review, or Save
 Local as New; unrelated PCL collection changes are merged during publication.
+
+Regression checks for this workflow (using existing environments/builds):
+
+```bash
+# From the repository root:
+AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_input_workspace.py spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_spiral_input_draft test_spiral_input_workflow -j 2
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
+```
+
+The workflow tests start a loopback HTTP service and cover remote baseline
+restore, service restart, and edits made while a submission is running.
 
 See [REVISIONED_INPUTS.md](REVISIONED_INPUTS.md) for the protocol, recovery
 contract, tests and measured acceptance workload.

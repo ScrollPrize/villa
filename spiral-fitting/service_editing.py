@@ -80,6 +80,7 @@ class EditingWorkspace:
             raise
         revisions = self.accepted_commands.get(command_id)
         if revisions is None:
+            self.catalog.register_external_bases(self._discover_inputs())
             documents, changes = {}, []
             for entry in self.catalog.entries():
                 if entry.accepted != entry.persisted:
@@ -104,7 +105,11 @@ class EditingWorkspace:
                                                  destination.with_suffix('.json')) if identity.kind == 'pcl'
                                else self._copy(identity.source, destination))
                 changes.append(Change(identity, entry.accepted, content))
-            revisions = self.catalog.accept(changes) if changes else ()
+            changed = self.catalog.accept(changes) if changes else ()
+            changed_ids = {r.id for r in changed}
+            revisions = (*changed, *(e.current for e in self.catalog.entries()
+                if e.applied < e.accepted and e.accepted == e.persisted
+                and e.identity.id not in changed_ids))
             self.accepted_commands[command_id] = revisions
         if revisions and self._apply(command_id, revisions).get('applied'):
             self.catalog.mark_persisted(revisions)
@@ -145,21 +150,36 @@ class EditingWorkspace:
         return Content.from_json({'path': str(destination), 'fingerprint': fingerprint(destination)})
 
     def _seed(self):
+        self.catalog.register_external_bases(self._discover_inputs(), applied=True)
+        self.seeded = True
+
+    def _discover_inputs(self):
+        """Snapshot unknown dataset targets for both startup and reconnect."""
+        known = {(e.identity.source, e.identity.collection_id) for e in self.catalog.entries()}
+        discovered = []
         namespace = UUID(self.id)
-        for spec in self.sources.get('pcl_inputs', []):
+        snapshot_root = self.root / 'base' / str(uuid4())
+        specs = list(self.sources.get('pcl_inputs', []))
+        paths = {str(Path(spec['path']).resolve()) for spec in specs}
+        specs.extend({'path': str(self.dataset / name), 'role': role}
+                     for role, name in PCL_ROLE_FILES.items()
+                     if str((self.dataset / name).resolve()) not in paths)
+        for spec in specs:
             path = Path(spec['path'])
             if not path.is_file():
                 continue
             before = fingerprint(path)
             document = json.loads(path.read_text())
             for key, collection in sorted(document.get('collections', {}).items(), key=lambda item: int(item[0])):
+                if (str(path.resolve()), int(key)) in known:
+                    continue
                 input_id = str(uuid5(namespace, f'{path.resolve()}:{key}'))
                 content = self._json_content({**document, 'collections': {key: collection}},
-                                             self.root / 'base' / f'{input_id}.json')
-                self.catalog.register_base(InputIdentity(input_id, 'pcl', str(path.resolve()),
-                                                        spec.get('role'), int(key)), content)
+                                             snapshot_root / f'{input_id}.json')
+                discovered.append((InputIdentity(input_id, 'pcl', str(path.resolve()),
+                                                        spec.get('role'), int(key)), content))
             if fingerprint(path) != before:
-                raise ApiError(409, 'PCL source changed while seeding the editing workspace')
+                raise ApiError(409, 'PCL source changed while snapshotting the editing workspace')
         resolved = self.sources.get('resolved', {})
         for key, kind, role in [('verified_patches', 'patch', 'verified'),
                                 ('unverified_patches', 'patch', 'unverified'),
@@ -172,11 +192,13 @@ class EditingWorkspace:
                     continue
                 if kind == 'fiber' and (not source.is_file() or source.suffix != '.json'):
                     continue
+                if (str(source.resolve()), None) in known:
+                    continue
                 input_id = str(uuid5(namespace, str(source.resolve())))
-                destination = self.root / 'base' / (input_id if kind == 'patch' else f'{input_id}.json')
-                self.catalog.register_base(InputIdentity(input_id, kind, str(source.resolve()), role),
-                                           self._copy(source, destination))
-        self.seeded = True
+                destination = snapshot_root / (input_id if kind == 'patch' else f'{input_id}.json')
+                discovered.append((InputIdentity(input_id, kind, str(source.resolve()), role),
+                                   self._copy(source, destination)))
+        return discovered
 
     def status(self):
         return {'workspace_id': self.id, 'ready': self.seeded,

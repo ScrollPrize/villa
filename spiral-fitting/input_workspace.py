@@ -127,21 +127,35 @@ class Catalog:
         with self._lock:
             if self._accepting:
                 raise ValueError("Baseline registration must precede edits")
-            if identity.id in self._entries or content is None:
-                raise ValueError("Duplicate or empty baseline input")
-            if identity.kind == "pcl":
-                if identity.collection_id is None:
-                    raise ValueError("Baseline PCLs must retain their numeric ids")
-                if any(entry.identity.source == identity.source
-                       and entry.identity.collection_id == identity.collection_id
-                       for entry in self._entries.values()):
-                    raise ValueError("Duplicate collection id in one source")
-                self._next_collection_ids[identity.source] = max(
-                    self._next_collection_ids.get(identity.source, 0),
-                    identity.collection_id + 1)
-            revision = Revision(identity.id, 1, content)
-            self._entries[identity.id] = Entry(
-                identity, revision, (revision,), 1, 1, frozenset({1}))
+            self.register_external_bases(((identity, content),), applied=True)
+
+    def register_external_bases(self, inputs, *, applied=False):
+        """Import newly discovered dataset targets without renumbering them.
+
+        Their bytes are already persisted, but a running resident still needs
+        to apply them. Validate the whole discovery before installing entries.
+        """
+        with self._lock:
+            entries = dict(self._entries)
+            counters = dict(self._next_collection_ids)
+            revisions = []
+            targets = {(e.identity.source, e.identity.collection_id) for e in entries.values()}
+            for identity, content in inputs:
+                target = (identity.source, identity.collection_id)
+                if identity.id in entries or content is None or target in targets:
+                    raise ValueError("Duplicate or empty baseline input")
+                if identity.kind == "pcl":
+                    if identity.collection_id is None:
+                        raise ValueError("Baseline PCLs must retain their numeric ids")
+                    counters[identity.source] = max(counters.get(identity.source, 0),
+                                                    identity.collection_id + 1)
+                revision = Revision(identity.id, 1, content)
+                entries[identity.id] = Entry(identity, revision, (revision,),
+                    1 if applied else 0, 1, frozenset({1}) if applied else frozenset())
+                targets.add(target)
+                revisions.append(revision)
+            self._entries, self._next_collection_ids = entries, counters
+            return tuple(revisions)
 
     def reserve_collection_ids(self, source, numbers):
         """External additions also advance the never-reused source counter."""

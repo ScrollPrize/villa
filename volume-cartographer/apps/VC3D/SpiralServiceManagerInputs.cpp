@@ -70,7 +70,7 @@ void SpiralServiceManager::claimInputWorkspace()
     get(QStringLiteral("/session/input-catalog"), Timeout::Load,
         [this](const QJsonObject& catalog) {
             const auto workspace = catalog.value(QStringLiteral("workspace_id")).toString();
-            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && hasInputDrafts()) {
+            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
                 _inputOwner = false;
                 emit errorOccurred(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
                 return;
@@ -79,10 +79,12 @@ void SpiralServiceManager::claimInputWorkspace()
         {{QStringLiteral("command_id"), commandId()}}, Timeout::Load, 2,
         [this](const QJsonObject& response) {
             const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
-            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && hasInputDrafts()) {
+            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
                 emit errorOccurred(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
                 return;
             }
+            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId)
+                clearInputWorkspace();
             _inputWorkspaceId = workspace;
             get(QStringLiteral("/session/input-catalog"), Timeout::Command,
                 [this](const QJsonObject& catalog) {
@@ -103,6 +105,12 @@ void SpiralServiceManager::refreshInputCatalog()
 {
     get(QStringLiteral("/session/input-catalog"), Timeout::Command,
         [this](const QJsonObject& response) {
+            const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
+            if (workspace != _inputWorkspaceId) {
+                if (hasInputDrafts() || _inputCommand) return;
+                clearInputWorkspace();
+                _inputWorkspaceId = workspace;
+            }
             // Reconcile a retained command before interpreting newer cursors.
             if (_inputCommand && _inputOwner) {
                 resumeInputCommand();
@@ -124,6 +132,8 @@ void SpiralServiceManager::installInputCatalog(const QJsonArray& inputs)
         if (!draft || (!draft->dirty() && draft->accepted() != quint64(accepted))) {
             QJsonObject manifest = input;
             manifest[QStringLiteral("path")] = input.value(QStringLiteral("content")).toObject().value(QStringLiteral("path"));
+            // This content belongs to the service; restores reference it without uploading a host path.
+            manifest[QStringLiteral("restore_revision")] = input.value(QStringLiteral("accepted_revision"));
             draft = std::make_shared<vc3d::spiral::InputDraft>(id,
                 vc3d::spiral::InputDraftContent{manifest, input.value(QStringLiteral("deleted")).toBool()}, accepted);
             _inputDrafts[id] = draft;
@@ -360,6 +370,8 @@ void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& sele
             {QStringLiteral("expected_revision"), qint64(snapshot.expectedAccepted)}};
         if (snapshot.content.deleted) {
             change[QStringLiteral("deleted")] = true;
+        } else if (manifest.contains(QStringLiteral("restore_revision"))) {
+            change[QStringLiteral("restore_revision")] = manifest.value(QStringLiteral("restore_revision"));
         } else {
             DraftTransfer transfer;
             transfer.id = snapshot.id;
@@ -606,6 +618,7 @@ void SpiralServiceManager::resolveInputConflict(const QJsonObject& conflict, con
                     if (input.value(QStringLiteral("id")).toString() != id) continue;
                     auto manifest = input;
                     manifest[QStringLiteral("path")] = input.value(QStringLiteral("content")).toObject().value(QStringLiteral("path"));
+                    manifest[QStringLiteral("restore_revision")] = input.value(QStringLiteral("accepted_revision"));
                     if (auto current = _inputDrafts.value(id))
                         current->reconcileReviewedContent({manifest, input.value(QStringLiteral("deleted")).toBool()},
                             input.value(QStringLiteral("accepted_revision")).toInteger(),
@@ -618,6 +631,7 @@ void SpiralServiceManager::resolveInputConflict(const QJsonObject& conflict, con
             if (action == QStringLiteral("save_as_new")) {
                 const auto newId = uuid();
                 auto content = captured.content;
+                content.manifest.remove(QStringLiteral("restore_revision"));
                 content.manifest[QStringLiteral("name")] = newId;
                 content.manifest[QStringLiteral("alias")] = newId;
                 _inputOrder.push_back(newId);
@@ -696,18 +710,23 @@ void SpiralServiceManager::releaseInputWorkspace(std::function<void()> done)
     postWithRetry(QStringLiteral("/session/editing/release"),
         {{QStringLiteral("command_id"), commandId()}}, Timeout::LongCommand, 2,
         [this, done](const QJsonObject&) {
-            _workingCopies.clear();
-            _inputOwner = false;
-            _inputWorkspaceId.clear();
-            _inputDrafts.clear();
-            _inputOrder.clear();
-            _inputCatalog.clear();
-            _inputAliases.clear();
-            _inputErrors.clear();
-            _inputSelection.clear();
-            _inputSelectionExplicit = false;
-            emit inputWorkspaceReleased();
-            emit inputDraftsChanged();
+            clearInputWorkspace();
             if (done) done();
         }, [this](const QString& error) { emit errorOccurred(error); });
+}
+
+void SpiralServiceManager::clearInputWorkspace()
+{
+    _workingCopies.clear();
+    _inputOwner = false;
+    _inputWorkspaceId.clear();
+    _inputDrafts.clear();
+    _inputOrder.clear();
+    _inputCatalog.clear();
+    _inputAliases.clear();
+    _inputErrors.clear();
+    _inputSelection.clear();
+    _inputSelectionExplicit = false;
+    emit inputWorkspaceReleased();
+    emit inputDraftsChanged();
 }

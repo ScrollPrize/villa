@@ -350,3 +350,63 @@ def test_reconnect_refreshes_clean_targets_and_preserves_dirty_conflicts(workspa
     change(editing, new_id, 0, 'new', kind='pcl', role='same_winding')
     assert editing.catalog.entry(new_id).identity.collection_id == 101
     assert json.loads(target.read_text()) == document
+
+
+def test_reconnect_discovers_external_inputs_without_replacing_local_changes(workspace):
+    editing, resident = workspace
+    baseline = editing.catalog.entries()[0]
+    change(editing, baseline.identity.id, 1, 'local')
+    target = Path(baseline.identity.source)
+    document = json.loads(target.read_text())
+    document['collections']['80'] = {'name': 'external', 'points': {}}
+    target.write_text(json.dumps(document))
+    # A conventional role file can appear after dataset resolution/startup.
+    from service_uploads import PCL_ROLE_FILES
+    relative = editing.dataset / PCL_ROLE_FILES['relative']
+    relative.write_text(json.dumps({'collections': {'12': {'name': 'relative', 'points': {}}}}))
+    fiber = editing.dataset / 'fibers' / 'external.json'
+    fiber.parent.mkdir()
+    fiber.write_text(json.dumps({'type': 'vc3d_fiber', 'version': 1, 'points': []}))
+    patch = editing.dataset / 'verified_patches' / 'external'
+    patch.mkdir(parents=True)
+    (patch / 'meta.json').write_text('{}')
+    (patch / 'x.tif').write_bytes(b'unchanged geometry bytes')
+    original = {p: p.read_bytes() for p in [target, relative, fiber, patch / 'meta.json', patch / 'x.tif']}
+
+    editing.claim(TOKEN, 'discover')
+    entries = editing.catalog.entries()
+    assert len(entries) == 5
+    imported = [e for e in entries if e.identity.id != baseline.identity.id]
+    assert {(e.identity.kind, e.identity.role) for e in imported} == {
+        ('pcl', 'same_winding'), ('pcl', 'relative'), ('fiber', None), ('patch', 'verified')}
+    assert all(e.accepted == e.applied == e.persisted == 1 for e in imported)
+    assert {r['id'] for r in resident.calls[-1][1]} == {e.identity.id for e in imported}
+    assert editing.catalog.entry(baseline.identity.id).accepted == 2
+    assert editing.catalog.entry(baseline.identity.id).persisted == 1
+    calls = len(resident.calls)
+    editing.claim(TOKEN, 'discover-again')
+    assert len(resident.calls) == calls
+    assert editing.catalog.entries() == entries
+    assert all(p.read_bytes() == data for p, data in original.items())
+    new_id = str(uuid4())
+    change(editing, new_id, 0, 'next', kind='pcl', role='same_winding')
+    assert editing.catalog.entry(new_id).identity.collection_id == 81
+    # Rebuild adopts the discovered identities rather than inventing duplicates.
+    assert editing.replay_resident('new-generation')['applied']
+    assert {r['id'] for r in resident.calls[-1][1]} == {e.identity.id for e in editing.catalog.entries()}
+
+
+def test_discovered_inputs_retry_failed_application(workspace):
+    editing, resident = workspace
+    target = editing.dataset / 'fibers' / 'external.json'
+    target.parent.mkdir()
+    target.write_text('{}')
+    resident.fail = True
+    editing.claim(TOKEN, 'failed-discovery')
+    entry = next(e for e in editing.catalog.entries() if e.identity.kind == 'fiber')
+    assert (entry.accepted, entry.applied, entry.persisted) == (1, 0, 1)
+    resident.fail = False
+    editing.claim(TOKEN, 'retry-discovery')
+    restored = editing.catalog.entry(entry.identity.id)
+    assert (restored.accepted, restored.applied, restored.persisted) == (1, 1, 1)
+    assert not restored.errors

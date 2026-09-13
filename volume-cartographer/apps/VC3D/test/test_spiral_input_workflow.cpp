@@ -30,6 +30,86 @@ class SpiralInputWorkflowTests : public QObject {
         return {};
     }
 private slots:
+    void remoteRestoreAndRestartReplaceCatalog() {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to the existing Spiral Python environment");
+        QTemporaryDir root;
+        QVERIFY(root.isValid());
+        QProcess service;
+        service.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.remove(QStringLiteral("SPIRAL_REVISION_CLIENT_LIVE"));
+        environment.remove(QStringLiteral("SPIRAL_REVISION_DROP_REPLIES"));
+        environment.remove(QStringLiteral("SPIRAL_REVISION_FAIL_PUBLICATION"));
+        environment.insert(QStringLiteral("SPIRAL_REVISION_REMOTE_CATALOG"), QStringLiteral("1"));
+        service.setProcessEnvironment(environment);
+        const auto start = [&]() {
+            service.start(python, {QStringLiteral(SPIRAL_CLIENT_SERVICE_FIXTURE), root.path()});
+            if (!service.waitForStarted() || !service.waitForReadyRead(30000)) return 0;
+            return service.readLine().trimmed().toInt();
+        };
+        int port = start();
+        QVERIFY(port > 0);
+        SpiralServiceProfile profile;
+        profile.id = QStringLiteral("remote-restart-test");
+        profile.baseUrl = QUrl(QStringLiteral("http://127.0.0.1:%1").arg(port));
+        profile.apiKey = QStringLiteral("test-key");
+        SpiralServiceManager client;
+        connect(&client, &SpiralServiceManager::errorOccurred, &client,
+                [](const QString& error) { qWarning().noquote() << error; });
+        client.connectToService(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(client.ownsInputWorkspace(), 10000);
+        QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
+        const auto firstWorkspace = client.inputWorkspaceId();
+        const auto firstId = fiberRow(client).value(QStringLiteral("id")).toString();
+        QVERIFY(!QFile::exists(fiberRow(client).value(QStringLiteral("path")).toString()));
+        const auto baseline = root.filePath(QStringLiteral("dataset/fibers/baseline.json"));
+        const auto original = document(baseline);
+        QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
+        client.removeEphemeralInput(QStringLiteral("fiber"), firstId);
+        client.applyInputDrafts();
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
+        client.restoreInputDraft(firstId);
+        client.applyInputDrafts(true);
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
+        QCOMPARE(document(baseline), original);
+        QVERIFY(!client.hasInputDrafts());
+
+        // Establish an alias and an explicit selection in the old workspace.
+        const auto local = root.filePath(QStringLiteral("local.json"));
+        auto edited = original;
+        edited[QStringLiteral("name")] = QStringLiteral("before restart");
+        write(local, QJsonDocument(edited).toJson());
+        client.uploadJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.setInputSelection({firstId});
+        client.applyInputDrafts(true);
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
+        QVERIFY(!client.hasInputDrafts());
+        client.disconnectFromService();
+        service.terminate();
+        QVERIFY(service.waitForFinished(5000));
+        port = start();
+        QVERIFY(port > 0);
+        profile.baseUrl = QUrl(QStringLiteral("http://127.0.0.1:%1").arg(port));
+        client.connectToService(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(client.ownsInputWorkspace(), 10000);
+        QVERIFY(client.inputWorkspaceId() != firstWorkspace);
+        QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
+        const auto secondId = fiberRow(client).value(QStringLiteral("id")).toString();
+        QVERIFY(secondId != firstId);
+        edited[QStringLiteral("name")] = QStringLiteral("after restart");
+        write(local, QJsonDocument(edited).toJson());
+        client.uploadJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
+        QCOMPARE(fiberRow(client).value(QStringLiteral("id")).toString(), secondId);
+        client.applyInputDrafts(true);
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 4, 10000);
+        QCOMPARE(document(baseline), edited);
+        QVERIFY(!client.hasInputDrafts());
+        client.disconnectFromService();
+        service.terminate();
+        QVERIFY(service.waitForFinished(5000));
+    }
     void editDuringApplyCommitAndReconnect() {
         const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
         if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to the existing Spiral Python environment");

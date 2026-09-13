@@ -30,7 +30,7 @@ if native:
     vertices = patch.zyxs[patch.valid_vertex_mask]
     endpoints = vertices[[0, -1]][:, [2, 1, 0]].tolist()
 else:
-    dataset.mkdir()
+    dataset.mkdir(exist_ok=True)
     endpoints = [[100, 200, 300], [110, 210, 310]]
 state = ServiceState(dataset_root=dataset, dataset_resolution=resolve_dataset_root(dataset))
 session = _attach_fake_session(state, root / 'output', dataset)
@@ -41,6 +41,11 @@ if native:
 (root / 'pcl-template.json').write_text(json.dumps({'vc_pointcollections_json_version': '1',
     'collections': {'0': {'name': 'client-pcl', 'points': {str(i): {'p': xyz, 'creation_time': i}
                                                         for i, xyz in enumerate(endpoints)}}}}))
+if os.environ.get('SPIRAL_REVISION_REMOTE_CATALOG'):
+    baseline_fiber = dataset / 'fibers' / 'baseline.json'
+    baseline_fiber.parent.mkdir(exist_ok=True)
+    if not baseline_fiber.exists():
+        baseline_fiber.write_bytes((root / 'fiber-template.json').read_bytes())
 original_apply = session.apply_input_changes if native else None
 boundaries = []
 state._refresh_pcl_artifacts = lambda: None
@@ -81,6 +86,14 @@ dropped = set()
 class FaultHandler(SpiralHandler):
     def _send(self, status, payload, **kwargs):
         path = urlparse(self.path).path
+        if os.environ.get('SPIRAL_REVISION_REMOTE_CATALOG') and path == '/session/input-catalog':
+            # Advertise paths that cannot be opened by this local test client,
+            # while retaining real immutable paths in the service catalog.
+            import copy
+            payload = copy.deepcopy(payload)
+            for entry in payload.get('inputs', []):
+                if entry.get('content'):
+                    entry['content']['path'] = str(root / 'remote-only' / entry['id'])
         family = None
         if self.command == 'PUT' and '/files/' in path: family = 'bytes'
         elif self.command == 'POST':
