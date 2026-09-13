@@ -56,7 +56,7 @@ def search_weight(execute, *, history=None, start_weight=.25):
         current = best
 
 
-def refine_families(execute, families):
+def refine_families(execute, families, on_result=None):
     """Finite coordinate descent; each family starts from its own seed, not global best."""
     cache, winners = {}, []
     for family in families:
@@ -83,6 +83,7 @@ def refine_families(execute, families):
         return cache[key]
     for family in families:
         current = dict(family['seed'])
+        print('refinement start '+family['label']+' '+json.dumps(current,sort_keys=True),flush=True)
         axes = family['axes']
         while True:
             previous = evaluate(current)
@@ -100,6 +101,9 @@ def refine_families(execute, families):
             if evaluate(current)['failures'] >= previous['failures']:
                 break
         winners.append(dict(label=family['label'],axes=axes,neighbor_weight=family.get('neighbor_weight',False),parameters=current,result=evaluate(current)))
+        if on_result is not None:
+            on_result(winners[-1])
+        print('refinement complete '+family['label']+' '+json.dumps(dict(parameters=current,failures=evaluate(current)['failures']),sort_keys=True),flush=True)
     return winners
 
 
@@ -247,7 +251,11 @@ def run(settings):
             raise ValueError('refine and weight_search are mutually exclusive')
         if any(not row['completed'] for row in report['variants']):
             raise RuntimeError('incomplete scheduled replay before refinement')
-        report['refinements'] = refine_families(execute,settings['refine'])
+        report['refinements'] = []
+        def family_finished(result):
+            report['refinements'].append(result)
+            atomic_write(output / 'report.json',report)
+        refine_families(execute,settings['refine'],on_result=family_finished)
         for i, family in enumerate(report['refinements']):
             repeated = execute(dict(family['parameters'],name=f'repeat-family-{i:02d}'))
             family['repeat_identical'] = repeated.get('replay_hash') == family['result']['replay_hash']

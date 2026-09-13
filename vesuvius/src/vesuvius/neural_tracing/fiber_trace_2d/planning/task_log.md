@@ -8,6 +8,10 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Mechanism24-replay grid complete, EMA69 repeats exactly. Best noveltyLRU71 and support-softmin71; no global win. Started `embedding_ema99_all_refine_20260913_v1`:13 independent families, dense admissions first and .05 neighbor weight descent. Per-family progress now persisted as each finishes; updated Python116 tests39.16s passed (`20260913_222829_257218`). Training remains manager-cooperative/nonexclusive; no model or geometry changes.
+
+- Important diagnostic: whole-path72-restart trace has74 segments, actual traced lengths mean432.11/median144.00/max6088.02base voxels. At spacing512,61/74 end before first admission after seed (mean1.55 observations); spacing12836/74 (mean3.84); spacing32only1/74 (mean14.07). Initial grids undersample anchor updates on this restart-heavy case. Prioritize spacing8/32/64 for all anchor-family refinement; do not infer poor appearance-memory potential from sparse initial trials. Calculated from actual trace_points_base_xyz, not GT lengths.
+
 - Mechanism implementation committed1425f53c5 after native2/Python116 tests; mechanism sweep running. Fine .05 weight neighbors now integrated into independent family coordinate cycles (opt-in), with up-front tick validation; Python116 passed31.81s (`20260913_221326_604149`). This checks neighboring weights even if a coarse axis winner lies between tested endpoints.
 
 - Whole-path initial grid complete: K2spacing12881/78,51272/81; K4spacing12878/83,51275/84; K8spacing12884/84,51276/84 (nearest/halfEMA). EMA69 repeat exact. Committed initial implementations/harness844856518.

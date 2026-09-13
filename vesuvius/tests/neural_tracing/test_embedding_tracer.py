@@ -181,7 +181,9 @@ def test_family_refinement_cycles_and_retains_each_family():
     seed=dict(weight=.25,spacing=128,window=1024,count=8,falloff='uniform',mode='appearance',ema_mix=0)
     families=[dict(label='a',seed=seed,axes={'weight':[.25,.5],'ema_mix':[0,.5]}),
               dict(label='b',seed=dict(seed,mode='anchors-lru'),axes={'weight':[.25]})]
-    results=refine_families(execute,families)
+    emitted=[]
+    results=refine_families(execute,families,on_result=emitted.append)
+    assert emitted==results
     assert results[0]['parameters']['weight']==.5
     assert results[0]['parameters']['ema_mix']==.5
     assert results[1]['parameters']['mode']=='anchors-lru'

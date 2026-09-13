@@ -48,7 +48,9 @@ New multi-anchor report, embedding_tracing options, task log/status/changelog in
 
 ## Validation
 Post-grid refinement requested: optimize each reference family's best seed,
-including nonwinning families. Use deterministic cached coordinate searches on
+including nonwinning families. Prioritize anchor admission8/32/64 after actual
+replay analysis found61/74 segments had no post-seed observation at512 spacing
+(median144). Use deterministic cached coordinate searches on
 weight and applicable capacity/admission/EMA/history axes, cycle until no strict
 improvement within tested axes, recheck neighboring weights and repeat winners.
 Record searched ranges and distinguish tested local optimum from global claims.

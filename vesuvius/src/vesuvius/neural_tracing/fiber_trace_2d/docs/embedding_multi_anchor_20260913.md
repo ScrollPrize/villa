@@ -51,8 +51,6 @@ LRU validation:2native suites passed1.92s,113Python tests44.66s;
 logs `cooperative-tests/20260913_214250_448282`. Fixed capacity and admission
 cadence, nearest touch, deterministic eviction and optional mean/EMA costs.
 
-## Reproduction / validation
-
 ## Initial LRU grid
 
 No age expiry. Weight.25; columns compare nearest anchor, equal-anchor mean,
@@ -68,8 +66,6 @@ and nearest mixed equally with EMA512. All12 combinations completed.
 Off87/original82/EMA69 exact; repeated EMA69 exact. Best LRU73, not an
 improvement. Keep both nearest and mean seeds for refinement. Report:
 `embedding_ema99_lru_20260913_v1/report.json` under evaluations root below.
-
-## Reproduction commands
 
 ## Initial whole-path grid
 
@@ -90,7 +86,54 @@ Next: novelty-gated LRU and support-softmin appearance, then refine each family.
 The initial whole-path implementation passed2native tests1.95s and115Python
 tests45.24s, log `cooperative-tests/20260913_215750_020249`.
 
-## Commands and environment
+## Admission diagnostic
+
+The best initial whole-path trace (72 failures,74 segments) has actual traced
+lengths mean432.11, median144.00, max6088.02base voxels. At spacing512,61/74
+segments end before the first post-seed observation; mean available observations
+including seed1.55. At spacing128:36/74,mean3.84; at spacing32:1/74,mean14.07.
+Computed by summing Euclidean edges in `trace_points_base_xyz`, not GT length.
+Thus sparse initial admission grids barely exercise multi-anchor behavior on
+most restarts. Dense8/32/64 admissions are prioritized for refinement.
+
+## Mechanism grid
+
+Same weight.25 and admission512. All24 replays completed, including controls
+and exact EMA69 repeat. These are algorithmic changes, not just weight sweeps.
+
+| Variant | K | Aggregation | Novelty | Temperature | Restarts | Wall s |
+|---|---:|---|---:|---:|---:|---:|
+|anchors-lru|4|best|0.02|—|74|40.38|
+|anchors-lru|4|best|0.1|—|71|45.53|
+|anchors-lru|4|best|0.3|—|75|42.63|
+|anchors-lru|4|mean|0.02|—|79|38.25|
+|anchors-lru|4|mean|0.1|—|75|44.64|
+|anchors-lru|4|mean|0.3|—|81|44.14|
+|anchors-lru|8|best|0.02|—|72|37.93|
+|anchors-lru|8|best|0.1|—|71|45.86|
+|anchors-lru|8|best|0.3|—|75|42.99|
+|anchors-lru|8|mean|0.02|—|75|38.82|
+|anchors-lru|8|mean|0.1|—|75|43.83|
+|anchors-lru|8|mean|0.3|—|81|44.87|
+|appearance|2|support-softmin|—|0.03|71|45.84|
+|appearance|2|support-softmin|—|0.1|75|52.01|
+|appearance|2|support-softmin|—|0.3|71|43.64|
+|appearance|4|support-softmin|—|0.03|74|41.29|
+|appearance|4|support-softmin|—|0.1|74|45.34|
+|appearance|4|support-softmin|—|0.3|72|43.83|
+
+24-replay wall mean40.57s,
+min/median/p95/max3.54/42.81/45.86/52.01s.
+Walls include variable path length and cache extension, not isolated method overhead.
+Best novelty71 vs plainLRU73; supported appearance71 vs nearest72.
+Report `embedding_ema99_mechanisms_20260913_v1/report.json`.
+
+Independent13-family refinement follows, with8/32/64 admissions and per-family
+weight/capacity/mix/history/temperature/novelty axes. Coarse coordinate cycles
+also check .05 weight neighbors, strict improvements only; this establishes a
+local tested result, not a global optimum. Each family is repeated separately.
+
+## Reproduction
 
 Approved commands (settings in `vesuvius/scripts/fiber3d_experiment.json`):
 
