@@ -16,6 +16,7 @@ hands the caller a record and the caller decides what to do with it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 import hashlib
 from http import HTTPStatus
 import json
@@ -69,7 +70,8 @@ class Upload:
     __slots__ = ("upload_id", "session_id", "kind", "role", "input_id",
                  "manifest", "staging_dir", "received", "record", "created",
                  "lock", "base_revision", "revision", "operation",
-                 "target_collection_id", "base_source_revision")
+                 "target_collection_id", "base_source_revision", "cancelled",
+                 "offsets")
 
     def __init__(self, upload_id, session_id, kind, role, input_id, manifest,
                  staging_dir, base_revision=None, revision=None,
@@ -91,6 +93,8 @@ class Upload:
         self.operation = operation
         self.target_collection_id = target_collection_id
         self.base_source_revision = base_source_revision
+        self.cancelled = False
+        self.offsets = {}
 
     def declared_bytes(self):
         return sum(entry["size"] for entry in self.manifest.values())
@@ -741,6 +745,7 @@ class UploadEnvironment:
     require_session: Callable[[], None]
     #: Checkpoint the loaded session resumed from; protected from retention.
     active_checkpoint: Callable[[], str] = lambda: ""
+    immutable_content: bool = False
     #: Raise ApiError when an input/revision may not be accepted. Called with
     #: (kind, id, declared bytes, base revision, content revision).
     reserve_ephemeral: Callable[[str, str, int, Optional[str], Optional[str]], None] = \
@@ -769,6 +774,11 @@ class UploadManager:
     def __init__(self, environment):
         self.environment = environment
         self.uploads = {}
+        # A caller-chosen id survives an ambiguous create response. Keep its
+        # manifest and receipt for the entire scope, including cancellation.
+        self._begin_requests = {}
+        self._begin_results = {}
+        self._begin_locks = {}
 
     @property
     def _lock(self):
@@ -840,13 +850,59 @@ class UploadManager:
     def staged_ephemeral_bytes(self):
         """Declared bytes of ephemeral uploads that are not finalized yet."""
         return sum(upload.declared_bytes() for upload in self.uploads.values()
-                   if upload.record is None and upload.kind != "checkpoint")
+                   if upload.record is None and not upload.cancelled
+                   and upload.kind != "checkpoint")
 
     # ------------------------------------------------------------------
     # Transfer
     # ------------------------------------------------------------------
 
     def begin(self, request):
+        request = copy.deepcopy(request)
+        upload_id = request.get("upload_id")
+        if upload_id is None:
+            return self._begin(request)
+        if not isinstance(upload_id, str) or not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "upload_id must be 32 lowercase hexadecimal characters")
+        try:
+            fingerprint = json.dumps(request, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid upload manifest") from exc
+        with self._lock:
+            previous = self._begin_requests.get(upload_id)
+            if previous is None and upload_id in self.uploads:
+                raise ApiError(HTTPStatus.CONFLICT, "Upload id already exists")
+            if previous is not None and previous != fingerprint:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "Upload id was reused with different content")
+            self._begin_requests[upload_id] = fingerprint
+            lock = self._begin_locks.setdefault(upload_id, threading.Lock())
+        # Different transfers remain concurrent; only duplicates wait here.
+        with lock:
+            with self._lock:
+                previous = self._begin_results.get(upload_id)
+                if previous is not None:
+                    return copy.deepcopy(previous)
+            result = self._begin(request)
+            with self._lock:
+                if result.get("deduplicated"):
+                    # Checkpoint reuse still has a reconcilable transfer id
+                    # when the caller supplied one. No staging bytes exist.
+                    record = dict(result["input"], upload_id=upload_id)
+                    upload = Upload(
+                        upload_id, self.environment.session_id(), "checkpoint", None,
+                        request["id"], _validate_upload_manifest(request),
+                        self.staging_root() / upload_id)
+                    upload.record = record
+                    upload.received = dict.fromkeys(upload.manifest, True)
+                    self.uploads[upload_id] = upload
+                    result = dict(result, upload_id=upload_id, input=record)
+                self._begin_results[upload_id] = copy.deepcopy(result)
+            return result
+
+    def _begin(self, request):
         """Start an upload.
 
         Returns ``{"upload_id": ...}`` for a transfer that must follow, or
@@ -865,6 +921,8 @@ class UploadManager:
         else:
             role = None
         operation = request.get("operation")
+        if self.environment.immutable_content and (operation is not None or not request.get("upload_id")):
+            raise ApiError(400, "Immutable uploads require upload_id and contain no mutation operation")
         target_collection_id = request.get("target_collection_id")
         base_source_revision = request.get("base_source_revision")
         if operation is not None:
@@ -959,6 +1017,7 @@ class UploadManager:
                         role, target_collection_id, base_source_revision)
                     if any(
                             pending.record is None
+                            and not pending.cancelled
                             and pending.operation in {
                                 "replace_collection", "delete_collection"}
                             and pending.role == role
@@ -967,9 +1026,10 @@ class UploadManager:
                         raise ApiError(
                             HTTPStatus.CONFLICT,
                             "A replacement for this collection is already uploading")
-                self.environment.reserve_ephemeral(
-                    kind, input_id, declared, base_revision, revision)
-            upload_id = secrets.token_hex(16)
+                if not self.environment.immutable_content:
+                    self.environment.reserve_ephemeral(
+                        kind, input_id, declared, base_revision, revision)
+            upload_id = request.get("upload_id") or secrets.token_hex(16)
             staging = self.staging_root() / upload_id
             upload = Upload(upload_id, self.environment.session_id(), kind,
                             role, input_id, manifest, staging,
@@ -977,11 +1037,11 @@ class UploadManager:
                             operation=operation,
                             target_collection_id=target_collection_id,
                             base_source_revision=base_source_revision)
+            staging.mkdir(parents=True, exist_ok=True)
             self.uploads[upload_id] = upload
-        staging.mkdir(parents=True, exist_ok=True)
         return {"upload_id": upload_id, "accepted": True}
 
-    def get(self, upload_id):
+    def get(self, upload_id, *, include_cancelled=False):
         with self._lock:
             upload = self.uploads.get(upload_id)
             # Checkpoint uploads are service-scoped; the ephemeral kinds are
@@ -989,9 +1049,47 @@ class UploadManager:
             if upload is None or (upload.kind != "checkpoint"
                                   and upload.session_id != self.environment.session_id()):
                 raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
+            if upload.cancelled and not include_cancelled:
+                raise ApiError(HTTPStatus.GONE, "Upload was cancelled")
             return upload
 
-    def receive(self, upload_id, relative_name, stream, length):
+    def status(self, upload_id):
+        upload = self.get(upload_id, include_cancelled=True)
+        with upload.lock:
+            return {
+                "upload_id": upload_id,
+                "state": ("cancelled" if upload.cancelled else
+                          "finalized" if upload.record is not None else "transferring"),
+                "files": [{"name": name, **entry,
+                           "offset": (entry["size"] if name in upload.received
+                                      else upload.offsets.get(name, 0)),
+                           "received": name in upload.received}
+                          for name, entry in upload.manifest.items()],
+                "input": copy.deepcopy(upload.record),
+            }
+
+    def cancel(self, upload_id):
+        upload = self.get(upload_id, include_cancelled=True)
+        with upload.lock:
+            if upload.record is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A finalized upload cannot be cancelled")
+            upload.cancelled = True
+            shutil.rmtree(upload.staging_dir, ignore_errors=True)
+        return {"upload_id": upload_id, "cancelled": True}
+
+    def receive(self, upload_id, relative_name, stream, length, *, offset=None):
+        upload = self.get(upload_id)
+        # Finalize/cancel cannot rename or remove the staging directory while
+        # a writer still has a file open. Different uploads use different locks.
+        with upload.lock:
+            if upload.cancelled:
+                raise ApiError(HTTPStatus.GONE, "Upload was cancelled")
+            if offset is not None:
+                return self._receive_chunk(upload, relative_name, stream, length, offset)
+            return self._receive(upload, relative_name, stream, length)
+
+    def _receive(self, upload, relative_name, stream, length):
         """Store one declared file.
 
         The transfer is content addressed, not command addressed: a client
@@ -1003,7 +1101,6 @@ class UploadManager:
         """
         if not is_safe_relative_name(relative_name):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Unsafe upload file name")
-        upload = self.get(upload_id)
         entry = upload.manifest.get(relative_name)
         if entry is None:
             raise ApiError(HTTPStatus.NOT_FOUND,
@@ -1035,7 +1132,56 @@ class UploadManager:
             os.replace(temp, destination)
         finally:
             temp.unlink(missing_ok=True)
-        with upload.lock:
+        (destination.parent / f".{destination.name}.partial").unlink(missing_ok=True)
+        upload.received[relative_name] = True
+        return relative_name
+
+    def _receive_chunk(self, upload, relative_name, stream, length, offset):
+        if not is_safe_relative_name(relative_name):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Unsafe upload file name")
+        entry = upload.manifest.get(relative_name)
+        if entry is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "The upload manifest does not declare this file")
+        if upload.record is not None:
+            raise ApiError(HTTPStatus.CONFLICT, "The upload is already finalized")
+        current = (entry["size"] if relative_name in upload.received
+                   else upload.offsets.get(relative_name, 0))
+        if (type(offset) is not int or type(length) is not int or offset < 0
+                or length < 0 or offset + length > entry["size"]):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid upload byte range")
+        # A lost response is reconciled through status. Refuse overlaps rather
+        # than appending the same chunk twice or trusting unverified bytes.
+        if offset != current:
+            raise ApiError(HTTPStatus.CONFLICT, "Upload offset changed",
+                           payload={"offset": current})
+        if relative_name in upload.received:
+            return relative_name
+        destination = upload.staging_dir / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.parent / f".{destination.name}.partial"
+        try:
+            with partial.open("r+b" if partial.exists() else "w+b") as sink:
+                sink.seek(current)
+                remaining = length
+                while remaining:
+                    block = stream.read(min(TRANSFER_CHUNK_BYTES, remaining))
+                    if not block:
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "The request body ended early")
+                    sink.write(block)
+                    current += len(block)
+                    remaining -= len(block)
+                sink.flush()
+        finally:
+            # Bytes written before a disconnect remain resumable. No content
+            # becomes final until the complete manifest digest is verified.
+            upload.offsets[relative_name] = partial.stat().st_size if partial.exists() else 0
+        if current == entry["size"]:
+            if self._file_sha256(partial) != entry["sha256"]:
+                partial.unlink()
+                upload.offsets[relative_name] = 0
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               "The uploaded bytes do not match the declared SHA-256")
+            os.replace(partial, destination)
             upload.received[relative_name] = True
         return relative_name
 
@@ -1047,6 +1193,8 @@ class UploadManager:
         """Validate and publish an upload; idempotent per upload ID."""
         upload = self.get(upload_id)
         with upload.lock:
+            if upload.cancelled:
+                raise ApiError(HTTPStatus.GONE, "Upload was cancelled")
             if upload.record is not None:
                 return FinalizedUpload(upload.kind, dict(upload.record),
                                        replayed=True)
@@ -1064,6 +1212,14 @@ class UploadManager:
                 upload.kind, upload.role, upload.staging_dir,
                 operation=upload.operation,
                 target_collection_id=upload.target_collection_id)
+            if self.environment.immutable_content and upload.kind != "checkpoint":
+                path = (upload.staging_dir if upload.kind == "patch" else
+                        next(p for p in upload.staging_dir.rglob("*") if p.is_file()))
+                upload.record = {
+                    "id": upload.input_id, "kind": upload.kind, "role": upload.role,
+                    "path": str(path), "upload_id": upload.upload_id,
+                    "bytes": upload.declared_bytes(), "state": "uploaded"}
+                return FinalizedUpload(upload.kind, dict(upload.record))
             if upload.kind == "checkpoint":
                 record = self._publish_checkpoint(upload)
                 upload.record = record
@@ -1171,7 +1327,8 @@ class UploadManager:
         now = time.time()
         with self._lock:
             for upload_id, upload in list(self.uploads.items()):
-                if upload.record is None and now - upload.created > UPLOAD_GC_SECONDS:
+                if (upload_id not in self._begin_requests and upload.record is None
+                        and now - upload.created > UPLOAD_GC_SECONDS):
                     expired.append(upload)
                     del self.uploads[upload_id]
         for upload in expired:
@@ -1180,3 +1337,32 @@ class UploadManager:
     def reset(self):
         """Forget every upload; called when the session scope is replaced."""
         self.uploads = {}
+        self._begin_requests = {}
+        self._begin_results = {}
+        self._begin_locks = {}
+
+def collection_has_affected_links(collections, target_id):
+    target = collections[target_id]
+    if target.get("windings_linked"):
+        return True
+    points = target.get("points") or {}
+    try:
+        target_point_ids = {int(key) for key in points}
+    except (TypeError, ValueError):
+        # A malformed source cannot be renumbered safely by a local
+        # replacement operation.
+        return True
+    if any(point.get("links") for point in points.values()
+           if isinstance(point, dict)):
+        return True
+    target_numeric = int(target_id)
+    for collection_id, collection in collections.items():
+        if collection_id == target_id or not isinstance(collection, dict):
+            continue
+        if target_numeric in (collection.get("windings_linked") or []):
+            return True
+        for point in (collection.get("points") or {}).values():
+            if isinstance(point, dict) and target_point_ids.intersection(
+                    point.get("links") or []):
+                return True
+    return False

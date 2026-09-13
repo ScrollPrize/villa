@@ -3153,6 +3153,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
                           .arg(QString::fromStdString(ec.message())));
             continue;
         }
+        emit fiberFileRemoved(QString::fromStdString(path.string()));
         deletedIds.push_back(fiberId);
         auto fiberIt = std::find_if(_fibers.begin(),
                                     _fibers.end(),
@@ -13293,7 +13294,9 @@ fs::path LineAnnotationController::fibersDir() const
         return {};
     }
     const auto vpkg = _state->vpkg();
-    return root / "fibers" / sanitizedProjectFiberDirName(vpkg->path(), root);
+    const auto source = fs::weakly_canonical(root / "fibers" / sanitizedProjectFiberDirName(vpkg->path(), root));
+    const auto redirected = _fiberSourceRedirects.find(source);
+    return redirected == _fiberSourceRedirects.end() ? source : redirected->second;
 }
 
 fs::path LineAnnotationController::relativeFiberPath(const StoredFiber& fiber) const
@@ -13361,6 +13364,41 @@ fs::path LineAnnotationController::fiberPath(const StoredFiber& fiber) const
             fiber.username, fiber.startedAt, fiber.sequence);
     }
     return fibersDir() / (std::to_string(fiber.id) + ".json");
+}
+
+bool LineAnnotationController::flushFiberSavesForDestinationChange(QString* errorMessage)
+{
+    const auto failures = _fiberSaveFailureCount;
+    waitForFiberSaves();
+    if (_fiberSaveFailureCount == failures) return true;
+    if (errorMessage) *errorMessage = tr("A queued fiber save failed; its editor destination was retained.");
+    return false;
+}
+
+bool LineAnnotationController::redirectFiberSource(const fs::path& source,
+                                                   const fs::path& workingCopy,
+                                                   QString* errorMessage)
+{
+    if (!flushFiberSavesForDestinationChange(errorMessage)) return false;
+    const auto original = fs::weakly_canonical(source);
+    const auto destination = fs::weakly_canonical(workingCopy);
+    if (!fs::is_directory(destination)) {
+        if (errorMessage) *errorMessage = tr("The fiber working directory does not exist");
+        return false;
+    }
+    _fiberSourceRedirects[original] = destination;
+    for (auto& fiber : _fibers) {
+        if (fiber.sourceRoot == original) {
+            fiber.sourceRoot = destination;
+            _fiberRuntimeIds.remember(destination, fiber.fileName, fiber.id);
+        }
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberSourceRoot == original)
+            pane.session->fiberSourceRoot = destination;
+    }
+    std::erase(_externalFiberSources, original);
+    return registerExternalFiberSource(destination, errorMessage);
 }
 
 bool LineAnnotationController::registerExternalFiberSource(

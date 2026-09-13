@@ -66,6 +66,10 @@ public:
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
     void noteTrackedFiberSaved(uint64_t generation, const QString& fiberJsonPath);
+    void noteFiberRemoved(const QString& path);
+    bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);
+    bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
+    void noteManagedPatchSaved(const QString& path);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
@@ -79,6 +83,7 @@ public:
 signals:
     void spiralSessionActiveChanged(bool active);
     void fiberBaseToPreviewFactorChanged(double factor, bool valid);
+    void patchEditorRequested(const QString& id, const QString& path);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -187,7 +192,7 @@ private:
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updatePendingPatchIds(const QJsonObject& status);
-    void uploadNewestFiberRevision(const QString& inputId);
+    void inputDraftPrepared(const QString& alias, const QString& error = {});
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -228,6 +233,7 @@ private:
     QJsonObject _sessionPaths;
     QJsonObject _sessionRunConfig;
     QString _externalFiberSource;
+    QSet<QString> _managedFiberDirectories;
     struct LineAnnotationDraft {
         std::shared_ptr<QuadSurface> surface;
         std::vector<QPointF> surfacePoints;
@@ -288,16 +294,13 @@ private:
     QHash<QString, QString> _pendingPointCollectionPaths;
     QHash<QString, QString> _pointCollectionProvisionalPaths;
     QSet<QString> _uncommittedPointCollectionIds;
-    QSet<QString> _replacementPointCollectionIds;
     // Role of each staged collection replacement, for user-facing messages.
-    QHash<QString, vc3d::spiral::PclRole> _replacementPointCollectionRoles;
-    QString _pclCommitConflictRevision;
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
+    QHash<QString, QString> _managedPatchCopies;
+    int _draftPreparationRemaining = 0;
+    bool _draftPreparationFailed = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime
     // fiber id: runtime ids are reassigned whenever the fiber list reloads.
     using TrackedFiber = vc3d::SpiralTrackedFiber;
-    bool _fiberUploadsSynchronized = false;
-    QHash<QString, TrackedFiber> _trackedFibers;
-    QHash<QString, QString> _residentFiberRevisions;
 };

@@ -307,43 +307,43 @@ inference, and the outer shell. For example:
 }
 ```
 
-Changing one requires a whole-fit rebuild, except the same-winding and
-relative PCL switches, which apply at the next Run: turning one on loads the
-dataset's conventional document for that role (`same_windings.json` or
-`relative_windings.json`, plus any document the session named) into the
-resident fit, and turning it off drops every resident collection of the role
-(uncommitted uploads of that role included). Disabling a prerequisite also
-disables its dependent supervision: phase spacing needs normals and surface
-SDT, while winding inference needs the outer shell.
+Most role switches require a whole-fit rebuild; same-winding and relative PCL
+switches apply at the next Run. Disabled roles retain their accepted workspace
+content, and enabling a role restores that desired content. Disabling a
+prerequisite also disables its dependent supervision: phase spacing needs
+normals and surface SDT, while winding inference needs the outer shell.
 
-While a session is active you can right-click a patch in the Surface panel or
-a fiber in the Fibers panel and pick *Add to current spiral fit*. In the Spiral
-workspace, `Q` toggles same-winding point placement and `E` toggles
-relative-winding point placement; left-click places points on the flattened
-preview or on any of the three plane views. A relative-winding collection
-counts `wind_a` 0, 1, 2, ... in placement order (only the differences matter to
-the fit, so there are no absolute values); `F` flips the active collection,
-reversing the chain and mirroring the annotations so the winding count runs the
-other way; `Delete` removes it after confirmation; `Escape` leaves placement.
-Existing collections from `same_windings.json` and `relative_windings.json` are
-shown through the Display dialog toggles (relative points carry their winding
-labels) and can be selected and edited the same way. Shift+E only marks drawn
-patches and point collections as local, editable drafts; **Add to current fit**
-snapshots and uploads every ready draft. **Commit current inputs** performs that Add first, waits for every
-upload, and only then moves the added inputs into the shared dataset. If an
-upload fails, commit stops and the failed draft remains editable. If a
-multi-step Run is active,
-successful finalization automatically queues the input for incorporation
-immediately before the next optimizer iteration; it does not add iterations or
-move the Run's requested target. An input finalized after the final iteration
-has begun remains pending for the next Run.
-Commits from multiple service processes are serialized. Drawn patches and
-point collections become immutable after Add. Explicitly added ordinary fibers
-stay tracked by stable fiber ID: later successful saves upload a content
-revision using the last known revision as a compare-and-swap base. Stale bases
-receive the current revision. Once explicitly committed, later incorporated
-revisions auto-commit; deleting the VC3D fiber does not remove its last resident
-revision.
+The API 33 client and service use one revisioned input workspace per dataset.
+One service holds the dataset editing lease and one client owns that workspace;
+other connections can observe. Disconnecting retains ownership, drafts and
+command receipts. Reconnect with the same client resumes them. A fit rebuild
+replays desired inputs without replacing the editing workspace.
+
+**Add/Apply changes** captures the selected local revisions and applies the
+whole validated batch at a worker boundary, including while idle or after the
+final step. **Commit current inputs** first applies the selected revisions,
+then persists those exact revisions. Editing can continue during either action;
+a response for an older revision leaves newer edits dirty. Failed transfers or
+publication can be retried with the retained command and bytes.
+
+In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
+points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
+the chain and mirrors annotations. Existing collections remain editable after
+Apply. Shift+E prepares local drafts. Managed patch and fiber editors save to
+session working copies; successful saves update drafts and do not apply or
+commit automatically. Linked-fiber saves use working copies for their peers.
+
+The input list includes baseline dataset entries and additions, with a filter
+and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
+operate on individual drafts. Applying Remove stops future supervision;
+Commit deletes the managed dataset entry. Restore remains available before
+committing a deletion. Removal cannot reverse completed optimizer steps.
+Invalid selected drafts keep the batch unapplied and remain editable. Scoped
+external-source conflicts offer Use Current, Apply Local After Review, or Save
+Local as New; unrelated PCL collection changes are merged during publication.
+
+See [REVISIONED_INPUTS.md](REVISIONED_INPUTS.md) for the protocol, recovery
+contract, tests and measured acceptance workload.
 
 Interactive influence settings are captured when each **Run** request starts.
 The fitter builds an influence region from the inputs pending at Run start;
@@ -356,13 +356,13 @@ without reloading the resident session. The **Disable DT** percentage controls
 how much of that run suppresses directional DT losses after incorporating its
 pending inputs.
 
-Input-local validation failures (for example, an empty fiber or a patch outside
-the fitted z range) are reported on that input and do not stop optimization;
-other valid records in the same batch still join. A failure after resident
-mutation begins is fatal because continuing could diverge GPU ranks or leave a
-partially updated resident fit. In multi-GPU sessions all ranks reserve one
-future iteration and agree on validation before application; a boundary any
-rank has already passed is cancelled and retried later.
+Input-local validation failures reject the entire selected candidate without
+changing active supervision. Distributed ranks prepare the same candidate and
+must all agree before installation. Unexpected worker/device failures retain
+fail-stop behavior. Publication prepares all outputs before changing targets;
+a failure after publication starts retains the transaction and queues later
+mutations behind recovery. Recovery covers the running service, not crashes,
+and does not promise atomic visibility across multiple dataset files.
 
 **Checkpoints** are one panel section, and loading one is one button. It lists
 what the service advertises (checkpoints at the dataset root, and those under

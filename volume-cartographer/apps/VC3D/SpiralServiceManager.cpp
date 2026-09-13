@@ -114,6 +114,7 @@ QString stateName(SpiralServiceManager::ConnectionState state)
 
 SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 {
+    connect(this, &SpiralServiceManager::inputDraftsChanged, this, [this]() { _inputRowsDirty = true; });
     _network = new QNetworkAccessManager(this);
     _artifactCache = new SpiralArtifactCache(this);
     _tunnel = new SpiralSshTunnel(this);
@@ -466,6 +467,7 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
             ? tr("session %1").arg(sessionName)
             : tr(" / session %1").arg(sessionName);
     setConnectionState(ConnectionState::Ready, identity);
+    claimInputWorkspace();
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
@@ -497,6 +499,9 @@ void SpiralServiceManager::fetchAdvertisedDataset()
 void SpiralServiceManager::disconnectFromService()
 {
     ++_connectionGeneration;
+    _inputOwner = false;
+    _inputCommandBusy = false;
+    if (_inputCommand) _inputSubmission.transportInterrupted();
     _poll->stop();
     _eventPoll->stop();
     _statusInFlight = false;
@@ -517,6 +522,16 @@ void SpiralServiceManager::disconnectFromService()
 void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
+    if (ownsProcess()) {
+        ++_connectionGeneration;
+        _inputOwner = false;
+        _inputCommandBusy = false;
+        _statusInFlight = false;
+        _eventsInFlight = false;
+        _synchronizedSessionId.clear();
+        beginHandshake();
+        return;
+    }
     connectToService(_profile);
 }
 
@@ -562,6 +577,7 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     if (!_credential.isEmpty())
         request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(_credential).toUtf8());
     request.setRawHeader("X-Spiral-Client", _clientId.toUtf8());
+    request.setRawHeader("X-Spiral-Workspace-Token", _clientId.toUtf8());
     request.setTransferTimeout(timeoutMs);
     return request;
 }
@@ -963,249 +979,6 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
         });
 }
 
-void SpiralServiceManager::commitInputs()
-{
-    postWithRetry(QStringLiteral("/session/commit-inputs"),
-                  {{QStringLiteral("command_id"), commandId()}},
-                  Timeout::LongCommand, kMutationRetries,
-                  [this](const QJsonObject& response) {
-                      fetchAdvertisedDataset();
-                      handleStatus(response);
-                      QStringList committed;
-                      for (const QJsonValue& value : response.value(QStringLiteral("committed")).toArray())
-                          committed.push_back(value.toString());
-                      emit commitInputsFinished(committed, {});
-                  },
-                  {},
-                  [this](const QString& error, const QJsonObject& body) {
-                      if (body.value(QStringLiteral("code")).toString()
-                              == QStringLiteral("source_revision_conflict")) {
-                          emit pclCommitConflict(
-                              body.value(QStringLiteral("current_revision")).toString(),
-                              error);
-                      }
-                      emit commitInputsFinished({}, error);
-                      if (body.value(QStringLiteral("code")).toString()
-                              != QStringLiteral("source_revision_conflict"))
-                          emit errorOccurred(error);
-                  });
-}
-
-void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QString& inputId)
-{
-    if (!isReady()) return;
-    // The target is named in the path, so this is a bodyless DELETE and goes
-    // through the same helpers as every other verb.
-    del(QStringLiteral("/session/ephemeral-inputs/%1/%2").arg(kind, inputId),
-        Timeout::Command);
-}
-
-void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
-{
-    if (!isReady()) {
-        const QString error = tr("Spiral service is not connected");
-        emit inputUploadFinished(inputId, error);
-        return;
-    }
-    const quint64 generation = _connectionGeneration;
-    auto* watcher = new QFutureWatcher<QJsonObject>(this);
-    connect(watcher, &QFutureWatcher<QJsonObject>::finished, this,
-            [this, watcher, directory, inputId, generation]() {
-                const QJsonObject begin = watcher->result();
-                watcher->deleteLater();
-                if (generation != _connectionGeneration) return;
-                if (begin.contains(QStringLiteral("error"))) {
-                    emit inputUploadFinished(inputId, begin.value(QStringLiteral("error")).toString());
-                    return;
-                }
-                QStringList names;
-                for (const QJsonValue& value : begin.value(QStringLiteral("files")).toArray())
-                    names.push_back(value.toObject().value(QStringLiteral("name")).toString());
-                post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
-                     [this, directory, inputId, names](const QJsonObject& response) {
-                         continueUpload(response.value(QStringLiteral("upload_id")).toString(),
-                                        inputId, QStringLiteral("patch"), directory, names);
-                     },
-                     [this, inputId](const QString& error) {
-                         emit inputUploadFinished(inputId, error);
-                     });
-            });
-    watcher->setFuture(QtConcurrent::run([directory, inputId]() -> QJsonObject {
-        QJsonArray files;
-        QDirIterator it(directory, QDir::Files, QDirIterator::Subdirectories);
-        const QDir base(directory);
-        while (it.hasNext()) {
-            const QString path = it.next();
-            QFile file(path);
-            if (!file.open(QIODevice::ReadOnly))
-                return {{QStringLiteral("error"), tr("Cannot read %1").arg(path)}};
-            QCryptographicHash hash(QCryptographicHash::Sha256);
-            hash.addData(&file);
-            files.append(QJsonObject{
-                {QStringLiteral("name"), base.relativeFilePath(path)},
-                {QStringLiteral("size"), file.size()},
-                {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())},
-            });
-        }
-        if (files.isEmpty())
-            return {{QStringLiteral("error"), tr("The patch directory %1 is empty").arg(directory)}};
-        return {{QStringLiteral("kind"), QStringLiteral("patch")},
-                {QStringLiteral("id"), inputId},
-                {QStringLiteral("files"), files}};
-    }));
-}
-
-void SpiralServiceManager::uploadJsonInput(const QString& kind, const QString& filePath,
-                                           const QString& inputId, const QString& role,
-                                           const QString& baseRevision)
-{
-    uploadJsonInputInternal(kind, filePath, inputId, role, baseRevision,
-                            {}, {}, {});
-}
-
-void SpiralServiceManager::uploadPclReplacement(
-    vc3d::spiral::PclRole role, const QString& filePath, const QString& inputId,
-    const QString& operation,
-    const QString& targetCollectionId, const QString& baseSourceRevision)
-{
-    uploadJsonInputInternal(
-        QStringLiteral("pcl_replacement"), filePath, inputId,
-        vc3d::spiral::pclRoleName(role), {},
-        operation, targetCollectionId,
-        baseSourceRevision);
-}
-
-void SpiralServiceManager::finishInputUpload(
-    const QString& kind, const QString& inputId, const QString& error,
-    const QJsonObject& body)
-{
-    if (kind == QStringLiteral("pcl_replacement")) {
-        emit pclReplacementUploadFinished(
-            inputId, body.value(QStringLiteral("current_revision")).toString(),
-            error);
-        return;
-    }
-    emit inputUploadFinished(inputId, error);
-    if (kind == QStringLiteral("fiber")) {
-        emit fiberRevisionUploadFinished(
-            inputId,
-            vc3d::spiralFiberConflictRevision(body), error);
-    }
-}
-
-void SpiralServiceManager::uploadJsonInputInternal(
-    const QString& kind, const QString& filePath, const QString& inputId,
-    const QString& role, const QString& baseRevision,
-    const QString& operation, const QString& targetCollectionId,
-    const QString& baseSourceRevision)
-{
-    if (!isReady()) {
-        const QString error = tr("Spiral service is not connected");
-        finishInputUpload(kind, inputId, error);
-        return;
-    }
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        const QString error = tr("Cannot read %1").arg(filePath);
-        finishInputUpload(kind, inputId, error);
-        return;
-    }
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    hash.addData(&file);
-    const QString name = QFileInfo(filePath).fileName();
-    QJsonObject begin{
-        {QStringLiteral("kind"), kind == QStringLiteral("pcl_replacement")
-             ? QStringLiteral("pcl") : kind},
-        {QStringLiteral("id"), inputId},
-        {QStringLiteral("files"), QJsonArray{QJsonObject{
-            {QStringLiteral("name"), name},
-            {QStringLiteral("size"), file.size()},
-            {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())},
-        }}},
-    };
-    if (!role.isEmpty()) begin[QStringLiteral("role")] = role;
-    if (kind == QStringLiteral("fiber")) {
-        begin[QStringLiteral("base_revision")] = baseRevision.isEmpty()
-            ? QJsonValue(QJsonValue::Null) : QJsonValue(baseRevision);
-    }
-    if (!operation.isEmpty()) {
-        begin[QStringLiteral("operation")] = operation;
-        begin[QStringLiteral("target_collection_id")] = targetCollectionId;
-        begin[QStringLiteral("base_source_revision")] = baseSourceRevision;
-    }
-    const QString baseDir = QFileInfo(filePath).absolutePath();
-    postWithRetry(
-        QStringLiteral("/session/inputs"), begin, Timeout::Command, 0,
-        [this, baseDir, inputId, name, kind](const QJsonObject& response) {
-            continueUpload(response.value(QStringLiteral("upload_id")).toString(),
-                           inputId, kind, baseDir, {name});
-        },
-        {},
-        [this, inputId, kind](const QString& error, const QJsonObject& body) {
-            finishInputUpload(kind, inputId, error, body);
-        });
-}
-
-void SpiralServiceManager::continueUpload(const QString& uploadId, const QString& inputId,
-                                          const QString& kind, const QString& baseDir,
-                                          QStringList pendingFiles)
-{
-    if (uploadId.isEmpty()) {
-        finishInputUpload(
-            kind, inputId, tr("The service did not return an upload id"));
-        return;
-    }
-    if (pendingFiles.isEmpty()) {
-        postWithRetry(
-             QStringLiteral("/session/inputs/%1/finalize").arg(uploadId), {},
-             Timeout::Command, 0,
-             [this, inputId, kind](const QJsonObject& response) {
-                 handleStatus(response);
-                 if (kind == QStringLiteral("fiber")) {
-                     const QString revision = response.value(QStringLiteral("input"))
-                                                  .toObject()
-                                                  .value(QStringLiteral("revision"))
-                                                  .toString();
-                     emit inputUploadFinished(inputId, {});
-                     emit fiberRevisionUploadFinished(inputId, revision, {});
-                 } else {
-                     finishInputUpload(kind, inputId, {});
-                 }
-             },
-             {},
-             [this, inputId, kind](const QString& error,
-                                   const QJsonObject& body) {
-                 finishInputUpload(kind, inputId, error, body);
-             });
-        return;
-    }
-    const QString name = pendingFiles.takeFirst();
-    auto file = std::make_unique<QFile>(QDir(baseDir).filePath(name));
-    if (!file->open(QIODevice::ReadOnly)) {
-        const QString error = tr("Cannot read %1").arg(file->fileName());
-        finishInputUpload(kind, inputId, error);
-        return;
-    }
-    QNetworkRequest request = makeRequest(
-        QStringLiteral("/session/inputs/%1/files/%2").arg(uploadId, name),
-        static_cast<int>(Timeout::LongCommand));
-    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/octet-stream"));
-    QFile* fileRaw = file.release();
-    auto* reply = _network->put(request, fileRaw);
-    fileRaw->setParent(reply);
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, generation, uploadId, inputId, kind, baseDir, pendingFiles]() {
-                handleReply(reply, generation,
-                            [this, uploadId, inputId, kind, baseDir, pendingFiles](const QJsonObject&) {
-                                continueUpload(uploadId, inputId, kind, baseDir, pendingFiles);
-                            },
-                            [this, inputId, kind](const QString& error) {
-                                finishInputUpload(kind, inputId, error);
-                            });
-            });
-}
-
 void SpiralServiceManager::post(const QString& path, QJsonObject body, Timeout timeout,
                                 std::function<void(const QJsonObject&)> success,
                                 std::function<void(const QString&)> failure)
@@ -1253,8 +1026,9 @@ void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, 
                     reply->deleteLater();
                     emit logMessage(tr("Retrying %1 with the same command id (%2 retries left)")
                                         .arg(path).arg(retriesLeft));
-                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft,
+                    QTimer::singleShot(1000, this, [this, generation, path, body, timeout, retriesLeft,
                                                     success, failure, detailedFailure]() {
+                        if (generation != _connectionGeneration) return;
                         postWithRetry(path, body, timeout, retriesLeft - 1, success,
                                       failure, detailedFailure);
                     });
@@ -1443,6 +1217,7 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         if (!request.isEmpty()) {
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
+            if (_inputOwner) refreshInputCatalog();
         }
     }
     // Pausing no longer exports a preview by itself. Ask for one exactly

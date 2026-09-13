@@ -1760,8 +1760,14 @@ class ExplicitInitializationTests(HttpServiceFixture):
                                        daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.state.editing().claim("test-owner", "claim")
+
+    def request(self, method, path, **kwargs):
+        kwargs['headers'] = {'X-Spiral-Workspace-Token': 'test-owner', **kwargs.get('headers', {})}
+        return super().request(method, path, **kwargs)
 
     def tearDown(self):
+        self.state.close()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(5)

@@ -225,6 +225,7 @@ set(srcs
     SpiralPointChain.cpp
     SpiralPointChain.hpp
     SpiralServiceManager.cpp
+    SpiralServiceManagerInputs.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
     SpiralSessionSync.hpp

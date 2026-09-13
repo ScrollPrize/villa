@@ -38,12 +38,13 @@ only verbs that hold a request open are the ones that are genuinely quick.
 from __future__ import annotations
 
 import argparse
+from service_editing import EditingWorkspace
+from service_uploads import collection_has_affected_links
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
-import errno
 import hashlib
 import json
 import math
@@ -79,6 +80,7 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS,
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
+from service_files import ExclusiveFileLock, FileLockUnavailable
 from service_uploads import (EphemeralLedger, PCL_ASSIGN_COLLECTION_IDS,
                              PCL_ROLE_FILES,
                              UPLOADED_CHECKPOINTS_DIRNAME,
@@ -199,10 +201,6 @@ def bind_service_paths(resolution, output_directory, cache_directory):
     return resolution
 
 
-class FileLockUnavailable(RuntimeError):
-    pass
-
-
 @dataclasses.dataclass(frozen=True)
 class _CommitInputSnapshot:
     """Immutable source facts for one explicit dataset commit."""
@@ -228,67 +226,6 @@ class _PreparedPclCommit:
     snapshots: list
     # (kind, id) of each plain addition -> {uploaded key: committed key}
     collection_ids: dict
-
-
-class ExclusiveFileLock:
-    """Small stdlib-only advisory lock shared by independent service processes."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-        self._stream = None
-
-    def acquire(self, timeout=0.0):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self.path.open("a+b")
-        if os.name == "nt":
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    stream.seek(0)
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._stream = stream
-                return self
-            except OSError as exc:
-                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                    stream.close()
-                    raise
-                if time.monotonic() >= deadline:
-                    stream.close()
-                    raise FileLockUnavailable(str(self.path)) from exc
-                time.sleep(0.05)
-
-    def release(self):
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-                stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            stream.close()
-
-    def __enter__(self):
-        if self._stream is None:
-            self.acquire()
-        return self
-
-    def __exit__(self, _exc_type, _exc, _traceback):
-        self.release()
 
 
 def _validate_run_influence_config(value):
@@ -561,6 +498,9 @@ class ServiceState:
             role: threading.Lock() for role in EDITABLE_PCL_ROLES
         }
         self.session = None
+        self.editing_workspace = None
+        self._input_content_artifacts = {}
+        self._input_content_artifact_lock = threading.Lock()
         self.session_id = None
         self.session_paths = None
         self.session_request = None
@@ -623,6 +563,103 @@ class ServiceState:
     # ------------------------------------------------------------------
     # Status and health
     # ------------------------------------------------------------------
+
+    def editing(self):
+        """The dataset workspace survives resident generations and disconnects."""
+        with self.lock:
+            if self.editing_workspace is None:
+                if self.dataset_root is None or self._output_root() is None:
+                    raise ApiError(409, "A managed dataset and output are required")
+                sources = (self.dataset_resolution.to_dict()
+                           if self.dataset_resolution is not None else {})
+                self.editing_workspace = EditingWorkspace(
+                    self.dataset_root, self._output_root(), sources,
+                    self._editing_resident, self._editing_influence)
+            return self.editing_workspace
+
+    def _editing_influence(self):
+        with self.lock:
+            return dict(self._active_run_influence or {})
+
+    def input_content_artifact(self, input_id, revision_number):
+        workspace = self.editing()
+        revision, = workspace._selection([{'id': input_id, 'revision': int(revision_number)}])
+        if revision.content is None:
+            raise ApiError(410, "This input revision is a deletion")
+        identity = workspace.catalog.entry(input_id).identity
+        siblings = tuple(r for r in workspace.catalog.desired()
+                         if r.content is not None and workspace.catalog.entry(r.id).identity.kind == 'fiber') if identity.kind == 'fiber' else ()
+        key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
+        with self._input_content_artifact_lock:
+            if key not in self._input_content_artifacts:
+                content = revision.content.json()
+                source = Path(content['path'])
+                if source.is_dir():
+                    root, entry = source, 'meta.json'
+                else:
+                    root = workspace.root / 'artifacts' / input_id / hashlib.sha256(repr(key).encode()).hexdigest()
+                    root.mkdir(parents=True, exist_ok=True)
+                    entry = Path(workspace.catalog.entry(input_id).identity.source).name
+                    workspace._copy(source, root / entry)
+                    # Linked editor saves must resolve peers against the same
+                    # immutable desired snapshot, never against dataset paths.
+                    for sibling in siblings:
+                        if sibling.id == input_id:
+                            continue
+                        name = Path(workspace.catalog.entry(sibling.id).identity.source).name
+                        workspace._copy(sibling.content.json()['path'], root / name)
+                self._input_content_artifacts[key] = self.artifacts.register_directory(
+                    'input-content', workspace.id, revision.number, root, entry)
+            return {'workspace_id': workspace.id, 'artifact': self._input_content_artifacts[key]}
+
+    def _editing_resident(self):
+        with self.lock:
+            if self.session is None or self._building:
+                raise ApiError(409, "Wait for the resident fit to finish loading")
+            return self.session
+
+    def input_upload_manager(self, upload_id=None):
+        workspace = self.editing_workspace
+        if workspace is not None and workspace.seeded:
+            if upload_id is None or upload_id in workspace.uploads.uploads:
+                return workspace.uploads
+        return self.uploads_manager
+
+    def editing_lifecycle(self, token, operation, request, callback):
+        workspace = self.editing()
+        workspace.require(token)
+        def perform(captured):
+            workspace.require(token)
+            rebuilding = operation in {"session_initialize", "session_rebuild"}
+            command_id = captured.get("command_id")
+            if rebuilding and command_id in workspace.lifecycle_started:
+                response = workspace.lifecycle_started[command_id]
+            else:
+                if operation == "session_rebuild":
+                    workspace.refresh_clean(f'{command_id}:refresh')
+                response = callback(captured)
+                if rebuilding:
+                    workspace.lifecycle_started[command_id] = response
+            # Keep the coordinator until background construction and desired
+            # input replay finish. Read-only status remains responsive.
+            if operation in {"session_initialize", "session_rebuild"}:
+                while True:
+                    with self.lock:
+                        building, session = self._building, self.session
+                        state = self._session_state if session is None else session.status()["state"]
+                    if not building and state != SessionState.Loading:
+                        break
+                    time.sleep(0.05)
+                if state == SessionState.Error:
+                    raise ApiError(409, "Resident construction failed", payload=self.status())
+                if session is not None:
+                    result = workspace.replay_resident(self.session_generation)
+                    if not result.get("applied"):
+                        raise ApiError(409, "Desired inputs could not be restored", payload=result)
+                response = {**self.status(), "accepted": True}
+            return response
+        return workspace.coordinator.execute(request.get("command_id"), operation,
+            request, perform, recoverable=lambda exc: isinstance(exc, TimeoutError))
 
     def _base(self):
         """The counters every response carries, and nothing else.
@@ -697,6 +734,7 @@ class ServiceState:
                     for key, value in response["progress"].items()
                     if key != "eta_seconds"
                 }
+            response["workspace_id"] = self.editing_workspace.id if self.editing_workspace else None
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview.artifact
             # Published separately from, and after, the surface: a client that
@@ -723,6 +761,10 @@ class ServiceState:
                 for record in self.ephemeral_records.committed_not_incorporated()
             ]
             available, reason = self._commit_availability()
+            if self.editing_workspace is not None and self.editing_workspace.seeded:
+                available = any(entry.accepted > entry.persisted
+                                for entry in self.editing_workspace.catalog.entries())
+                reason = "" if available else "No uncommitted revisions"
             response["commit_available"] = available
             response["commit_unavailable_reason"] = reason
             response["preview_exporting"] = self._preview_export_active
@@ -2173,32 +2215,7 @@ class ServiceState:
         except OSError:
             return False
 
-    @staticmethod
-    def _collection_has_affected_links(collections, target_id):
-        target = collections[target_id]
-        if target.get("windings_linked"):
-            return True
-        points = target.get("points") or {}
-        try:
-            target_point_ids = {int(key) for key in points}
-        except (TypeError, ValueError):
-            # A malformed source cannot be renumbered safely by a local
-            # replacement operation.
-            return True
-        if any(point.get("links") for point in points.values()
-               if isinstance(point, dict)):
-            return True
-        target_numeric = int(target_id)
-        for collection_id, collection in collections.items():
-            if collection_id == target_id or not isinstance(collection, dict):
-                continue
-            if target_numeric in (collection.get("windings_linked") or []):
-                return True
-            for point in (collection.get("points") or {}).values():
-                if isinstance(point, dict) and target_point_ids.intersection(
-                        point.get("links") or []):
-                    return True
-        return False
+    _collection_has_affected_links = staticmethod(collection_has_affected_links)
 
     def _validate_pcl_replacement(self, role, target_collection_id,
                                   base_source_revision):
@@ -2286,15 +2303,20 @@ class ServiceState:
             raise
 
     def begin_upload(self, request):
+        if request.get("kind") != "checkpoint" and self.input_upload_manager() is not self.uploads_manager:
+            return {**self._base(), **self.input_upload_manager().begin(request)}
         with self._refresh_conflicting_pcl_upload(request.get("role")):
             return {**self._base(), **self.uploads_manager.begin(request)}
 
-    def receive_upload_file(self, upload_id, relative_name, stream, length):
-        received = self.uploads_manager.receive(
-            upload_id, relative_name, stream, length)
+    def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):
+        received = self.input_upload_manager(upload_id).receive(
+            upload_id, relative_name, stream, length, offset=offset)
         return {**self._base(), "received": received, "accepted": True}
 
     def finalize_upload(self, upload_id):
+        manager = self.input_upload_manager(upload_id)
+        if manager is not self.uploads_manager:
+            return {**self._base(), "accepted": True, "input": manager.finalize(upload_id).record}
         # Fiber publication and logical revision installation are one service
         # critical section. Cleanup uses the same lock, so it can never erase
         # content that a concurrent finalizer has published but not installed.
@@ -3012,6 +3034,8 @@ class ServiceState:
         stop_process_group(process)
         if session:
             session.close()
+        if self.editing_workspace is not None:
+            self.editing_workspace.close()
 
 
 class SpiralServer(ThreadingHTTPServer):
@@ -3120,8 +3144,14 @@ def _route_upload_file(ctx):
         raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
     if length < 0:
         raise ApiError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+    offset = None
+    if "offset" in ctx.query:
+        try:
+            offset = int(ctx.query["offset"][-1])
+        except ValueError:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid upload offset")
     return ctx.state.receive_upload_file(
-        ctx.args[0], ctx.args[1], handler.rfile, length)
+        ctx.args[0], ctx.args[1], handler.rfile, length, offset=offset)
 
 
 _UPLOAD_ID = r"[0-9a-f]{32}"
@@ -3130,6 +3160,32 @@ _UPLOAD_ID = r"[0-9a-f]{32}"
 # no hand-written if-ladder, so a route's method, path, handler and retry
 # semantics are visible in one place.
 ROUTES = (
+    Route("POST", "/session/editing/claim", "editing_claim",
+          lambda ctx: ctx.state.editing().claim(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
+                                                ctx.body.get("command_id")),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/editing/release", "editing_release",
+          lambda ctx: ctx.state.editing().release(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
+                                                  ctx.body.get("command_id")),
+          Idempotency.NONE, reads_body=True),
+    Route("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content",
+          lambda ctx: ctx.state.input_content_artifact(ctx.args[0], ctx.args[1]), Idempotency.NONE),
+    Route("GET", "/session/input-catalog", "input_catalog",
+          lambda ctx: ctx.state.editing().status(), Idempotency.NONE),
+    Route("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command",
+          lambda ctx: ctx.state.editing().coordinator.outcome(ctx.args[0]), Idempotency.NONE),
+    Route("POST", "/session/input-changes", "input_changes",
+          lambda ctx: ctx.state.editing().change(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/discard-inputs", "discard_inputs",
+          lambda ctx: ctx.state.editing().discard(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/resolve-input", "resolve_input",
+          lambda ctx: ctx.state.editing().resolve_conflict(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
+    Route("POST", "/session/apply-inputs", "apply_inputs",
+          lambda ctx: ctx.state.editing().apply(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
+          Idempotency.NONE, reads_body=True),
     Route("GET", "/health", "health",
           lambda ctx: ctx.state.health(), Idempotency.NONE),
     Route("GET", "/configuration", "configuration",
@@ -3148,6 +3204,14 @@ ROUTES = (
 
     Route("PUT", re.compile(rf"/session/inputs/({_UPLOAD_ID})/files/(.+)"),
           "upload_file", _route_upload_file, Idempotency.CONTENT),
+    Route("GET", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
+          "upload_status",
+          lambda ctx: ctx.state.input_upload_manager(ctx.args[0]).status(ctx.args[0]),
+          Idempotency.NONE),
+    Route("DELETE", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
+          "upload_cancel",
+          lambda ctx: ctx.state.input_upload_manager(ctx.args[0]).cancel(ctx.args[0]),
+          Idempotency.NONE),
 
     # There is deliberately no DELETE /session. The first session is created
     # explicitly and replacing one is POST /session/rebuild.
@@ -3352,6 +3416,20 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
+        workspace = state.editing() if state.dataset_root is not None else state.editing_workspace
+        if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
+            token = self.headers.get("X-Spiral-Workspace-Token")
+            workspace.require(token)
+            if route.operation == "commit_inputs":
+                result = workspace.commit(token, body or {})
+                state._refresh_pcl_artifacts()
+                return {**state.status(), **result}
+            if route.operation == "ephemeral_input_remove":
+                raise ApiError(410, "Stage a deletion with /session/input-changes")
+            if route.idempotency == Idempotency.COMMAND_ID:
+                return state.editing_lifecycle(token, route.operation, body or {},
+                                                lambda captured: route.handler(RouteContext(
+                                                    self, state, args, context.query, captured)))
         if route.idempotency == Idempotency.COMMAND_ID:
             return state.replay_command(
                 route.operation, (body or {}).get("command_id"),
@@ -3367,14 +3445,14 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, response)
         except ApiError as exc:
             payload = self.server.state._base()
-            payload.update({"error": exc.message, "details": exc.details,
+            payload.update({"error": exc.message, "http_status": int(exc.status), "details": exc.details,
                             **exc.payload})
             # The request body may not have been fully consumed; do not reuse
             # the connection after an error.
             self._send(exc.status, payload, close=True)
         except Exception as exc:
             payload = self.server.state._base()
-            payload.update({"error": f"{type(exc).__name__}: {exc}"})
+            payload.update({"error": f"{type(exc).__name__}: {exc}", "http_status": 500})
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, payload, close=True)
 
     do_GET = _handle

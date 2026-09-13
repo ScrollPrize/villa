@@ -40,6 +40,8 @@ class SegmentationCommandHandler : public QObject
     Q_OBJECT
 
 public:
+    void setEditingDestinationResolver(std::function<bool(const std::shared_ptr<QuadSurface>&)> resolver)
+    { _editingDestinationResolver = std::move(resolver); }
     // --- Job structs (moved from CWindow.hpp) ---
 
     struct NeighborCopyJob {
@@ -196,6 +198,7 @@ public:
     const std::optional<ResumeLocalJob>& resumeLocalJob() const { return _resumeLocalJob; }
 
 signals:
+    void surfaceSavedTo(const QString& path);
     /** Replaces statusBar()->showMessage() */
     void statusMessage(QString text, int timeout);
 
@@ -363,6 +366,7 @@ private:
      * If \p checkRunner is true, also verifies _cmdRunner is set and idle.
      * Returns the QuadSurface* on success, or nullptr on failure.
      */
+    std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
     QuadSurface* requireSurfaceAndRunner(const std::string& segmentId,
                                           bool checkRunner = true);
 

@@ -429,6 +429,10 @@ public:
     bool registerExternalFiberSource(const std::filesystem::path& source,
                                      QString* errorMessage = nullptr);
     void unregisterExternalFiberSource(const std::filesystem::path& source);
+    bool flushFiberSavesForDestinationChange(QString* errorMessage = nullptr);
+    bool redirectFiberSource(const std::filesystem::path& source,
+                             const std::filesystem::path& workingCopy,
+                             QString* errorMessage = nullptr);
     [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
         resolveFiberOptimizationInputs(
             const std::string& fallbackNormalLocation,
@@ -461,6 +465,7 @@ signals:
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
         std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
     void fiberSaved(uint64_t fiberId, uint64_t generation);
+    void fiberFileRemoved(const QString& path);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
 
@@ -1126,6 +1131,7 @@ private:
     std::vector<StoredFiber> _fibers;
     mutable vc3d::FiberRuntimeIds _fiberRuntimeIds;
     std::vector<std::filesystem::path> _externalFiberSources;
+    std::map<std::filesystem::path, std::filesystem::path> _fiberSourceRedirects;
     // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
     std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
     std::vector<std::string> _knownFiberTags;

@@ -32,6 +32,7 @@
 #include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QMenu>
 #include <QSpinBox>
 #include <QSlider>
 #include <QStyle>
@@ -794,20 +795,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_checkpointDownloadTimer, &QTimer::timeout, this,
             refreshCheckpointDownload);
 
-    auto* ephemeralLabel = new QLabel(tr("Inputs added to the running fit:"), runContents);
+    auto* ephemeralLabel = new QLabel(tr("Dataset inputs and local drafts:"), runContents);
     _ephemeralList = new QListWidget(runContents);
     _ephemeralList->setObjectName(QStringLiteral("spiralEphemeralList"));
     _ephemeralList->setMaximumHeight(80);
     _ephemeralList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _commitInputs = new QPushButton(tr("Commit current inputs"), runContents);
+    _commitInputs = new QPushButton(tr("Commit"), runContents);
     _commitInputs->setEnabled(false);
     _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
-    _addInputs = new QPushButton(tr("Add to current fit"), runContents);
+    _addInputs = new QPushButton(tr("Add/Apply changes"), runContents);
     _addInputs->setToolTip(tr("Snapshot and upload all ready local drawing drafts"));
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
-    _removeInput->setToolTip(tr("Remove a pending input before it is queued; queued "
-                                "or incorporated inputs cannot be removed"));
+    _removeInput->setToolTip(tr("Stage removal from subsequent fit steps; Restore is available until Commit."));
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
@@ -816,6 +816,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     commitRow->addWidget(_removeInput);
     commitRow->addStretch(1);
     runLayout->addWidget(ephemeralLabel);
+    _inputFilter = new QLineEdit(runContents);
+    _inputFilter->setPlaceholderText(tr("Filter inputs by name or kind"));
+    connect(_inputFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
+        for (auto* item : _inputItems) item->setHidden(!item->text().contains(text, Qt::CaseInsensitive));
+    });
+    runLayout->addWidget(_inputFilter);
     runLayout->addWidget(_ephemeralList);
     runLayout->addLayout(commitRow);
     runLayout->addWidget(_commitHint);
@@ -1304,31 +1310,68 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                               .arg(iteration)
                         : tr("Rebuilding the fit from %1…").arg(hostPath));
             });
-    connect(_commitInputs, &QPushButton::clicked, this, [this]() {
-        if (QMessageBox::question(this, tr("Commit inputs"),
-                                  tr("Move the added inputs into the dataset? Patches go to "
-                                     "verified_patches/, fibers to fibers/, and PCL documents "
-                                     "merge into their conventional role file (control-point "
-                                     "lines go to drawn_control_points.json; same-winding "
-                                     "point collections go to same_windings.json; "
-                                     "relative-winding point collections go to "
-                                     "relative_windings.json)."))
-            != QMessageBox::Yes) return;
-        emit addDraftsRequested(true);
+    connect(_commitInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(true); });
+    connect(_addInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(false); });
+    connect(_service, &SpiralServiceManager::inputConflict, this, [this](const QJsonObject& conflict) {
+        QMessageBox dialog(QMessageBox::Warning, tr("Input changed in the dataset"),
+            tr("Review this input's base, current dataset content, and local draft. Other drafts are preserved."),
+            QMessageBox::NoButton, this);
+        dialog.setDetailedText(QString::fromUtf8(QJsonDocument(conflict).toJson(QJsonDocument::Indented)));
+        auto* current = dialog.addButton(conflict.value(QStringLiteral("current")).isNull()
+            ? tr("Discard Local") : tr("Use Current"), QMessageBox::AcceptRole);
+        auto* local = conflict.value(QStringLiteral("current")).isNull() ? nullptr
+            : dialog.addButton(tr("Apply Local After Review"), QMessageBox::ActionRole);
+        auto* copy = dialog.addButton(tr("Save Local as New"), QMessageBox::ActionRole);
+        dialog.addButton(QMessageBox::Cancel);
+        dialog.exec();
+        if (dialog.clickedButton() == current) _service->resolveInputConflict(conflict, QStringLiteral("use_current"));
+        else if (local && dialog.clickedButton() == local) _service->resolveInputConflict(conflict, QStringLiteral("apply_local_after_review"));
+        else if (dialog.clickedButton() == copy) _service->resolveInputConflict(conflict, QStringLiteral("save_as_new"));
     });
-    connect(_addInputs, &QPushButton::clicked, this, [this]() {
-        emit addDraftsRequested(false);
+    connect(_service, &SpiralServiceManager::inputDraftsChanged, this, [this]() {
+        if (!_lastInputStatus.isEmpty()) updateStatus(_lastInputStatus);
     });
     connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
-        const QListWidgetItem* item = _ephemeralList->currentItem();
-        _removeInput->setEnabled(_connected && item
-            && item->data(Qt::UserRole + 2).toString() == QStringLiteral("pending"));
+        const auto* item = _ephemeralList->currentItem();
+        const auto row = item ? item->data(Qt::UserRole + 4).toJsonObject() : QJsonObject();
+        _removeInput->setEnabled(_connected && _service->ownsInputWorkspace() && item
+            && (!row.value(QStringLiteral("deleted")).toBool() || row.value(QStringLiteral("can_restore")).toBool()));
+        _removeInput->setText(item && item->data(Qt::UserRole + 3).toBool() ? tr("Restore") : tr("Remove"));
+    });
+    connect(_ephemeralList, &QListWidget::itemChanged, this, [this]() {
+        QStringList selected;
+        for (int index = 0; index < _ephemeralList->count(); ++index) {
+            const auto* item = _ephemeralList->item(index);
+            if (item->checkState() == Qt::Checked) selected.push_back(item->data(Qt::UserRole + 1).toString());
+        }
+        _service->setInputSelection(selected);
     });
     connect(_removeInput, &QPushButton::clicked, this, [this]() {
-        const QListWidgetItem* item = _ephemeralList->currentItem();
+        const auto* item = _ephemeralList->currentItem();
         if (!item) return;
-        _service->removeEphemeralInput(item->data(Qt::UserRole).toString(),
-                                       item->data(Qt::UserRole + 1).toString());
+        const auto id = item->data(Qt::UserRole + 1).toString();
+        if (item->data(Qt::UserRole + 3).toBool()) _service->restoreInputDraft(id);
+        else _service->removeEphemeralInput(item->data(Qt::UserRole).toString(), id);
+    });
+    _ephemeralList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(_ephemeralList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& position) {
+        const auto* item = _ephemeralList->itemAt(position);
+        if (!item) return;
+        const auto id = item->data(Qt::UserRole + 1).toString();
+        QMenu menu(this);
+        auto* edit = menu.addAction(tr("Edit"));
+        auto* retry = menu.addAction(tr("Retry"));
+        auto* discard = menu.addAction(tr("Discard Local Changes"));
+        const auto row = item->data(Qt::UserRole + 4).toJsonObject();
+        const bool owner = _service->ownsInputWorkspace();
+        edit->setEnabled(owner && !row.value(QStringLiteral("deleted")).toBool());
+        retry->setEnabled(owner && (!row.value(QStringLiteral("committed")).toBool()
+            || !row.value(QStringLiteral("error")).toString().isEmpty()));
+        discard->setEnabled(owner && row.value(QStringLiteral("dirty")).toBool());
+        const auto* choice = menu.exec(_ephemeralList->viewport()->mapToGlobal(position));
+        if (choice == edit) _service->editInputDraft(id);
+        else if (choice == retry) _service->applyInputDrafts(false, {id});
+        else if (choice == discard) _service->discardInputDraft(id);
     });
     for (QSpinBox* spin : {_zBegin, _zEnd, _legacyCheckpointStep,
                            _renderVolumeScale})
@@ -2030,6 +2073,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
 void SpiralPanel::updateStatus(const QJsonObject& status)
 {
+    _lastInputStatus = status;
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
     _sessionState = status.value(QStringLiteral("state")).toString();
@@ -2191,12 +2235,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
-    _load->setEnabled(_connected
+    _load->setEnabled(_connected && _service->ownsInputWorkspace()
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
-    _run->setEnabled(_connected && runnable && !_reloadRequired);
-    _stop->setEnabled(state == "Running");
-    _save->setEnabled(_connected && runnable);
+    _run->setEnabled(_connected && _service->ownsInputWorkspace() && runnable && !_reloadRequired);
+    _stop->setEnabled(_service->ownsInputWorkspace() && state == "Running");
+    _save->setEnabled(_connected && _service->ownsInputWorkspace() && runnable);
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
     // An in-session load replaces resident model state, so it needs the same
@@ -2208,35 +2252,38 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             _connected, state,
             !_checkpointChoice->currentData().toString().isEmpty()));
 
-    // Ephemeral inputs added to the running fit.
-    const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
+    // Baseline catalog entries and local revisioned drafts.
+    const QJsonArray ephemeral = _service->inputDraftStatus();
     _ephemeralCount = ephemeral.size();
-    int pendingCount = 0;
-    int queuedCount = 0;
-    _uncommittedCount = 0;
-    for (const QJsonValue& value : ephemeral) {
-        const QJsonObject input = value.toObject();
-        if (input.value(QStringLiteral("state")).toString() == QStringLiteral("pending"))
-            ++pendingCount;
-        if (input.value(QStringLiteral("state")).toString() == QStringLiteral("queued"))
-            ++queuedCount;
-        if (!input.value(QStringLiteral("committed")).toBool())
-            ++_uncommittedCount;
-    }
     // Rebuild only on change: the 1 Hz status poll must not wipe the row the
     // user selected while aiming for Remove.
     if (ephemeral != _lastEphemeral) {
         _lastEphemeral = ephemeral;
+        _uncommittedCount = 0;
         QString selectedKind, selectedId;
         if (const QListWidgetItem* current = _ephemeralList->currentItem()) {
             selectedKind = current->data(Qt::UserRole).toString();
             selectedId = current->data(Qt::UserRole + 1).toString();
         }
-        _ephemeralList->clear();
+        QSet<QString> excluded;
+        for (int index = 0; index < _ephemeralList->count(); ++index) {
+            const auto* item = _ephemeralList->item(index);
+            if (item->checkState() != Qt::Checked) excluded.insert(item->data(Qt::UserRole + 1).toString());
+        }
+        const QSignalBlocker blocker(_ephemeralList);
+        QSet<QString> present;
+        QStringList selected;
         for (const QJsonValue& value : ephemeral) {
             const QJsonObject input = value.toObject();
             const QString kind = input.value(QStringLiteral("kind")).toString();
             const QString id = input.value(QStringLiteral("id")).toString();
+            present.insert(id);
+            if (!input.value(QStringLiteral("committed")).toBool()) ++_uncommittedCount;
+            auto* item = _inputItems.value(id);
+            if (item && item->data(Qt::UserRole + 4).toJsonObject() == input) {
+                if (item->checkState() == Qt::Checked) selected.push_back(id);
+                continue;
+            }
             const QString inputState =
                 input.value(QStringLiteral("state")).toString();
             QString stateLabel = inputState;
@@ -2244,42 +2291,49 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 stateLabel = tr("queued for next optimizer step");
             else if (inputState == QStringLiteral("pending"))
                 stateLabel = tr("pending for next Run");
-            QString label = tr("%1 %2 — %3").arg(kind, id, stateLabel);
+            QString name = input.value(QStringLiteral("name")).toString();
+            if (name.isEmpty()) name = QFileInfo(input.value(QStringLiteral("source")).toString()).fileName();
+            if (kind == QStringLiteral("pcl") && input.contains(QStringLiteral("collection_id")))
+                name += QStringLiteral(" #%1").arg(input.value(QStringLiteral("collection_id")).toInteger());
+            QString label = tr("%1 %2 — %3").arg(kind, name.isEmpty() ? id : name, stateLabel);
+            if (input.value(QStringLiteral("deleted")).toBool()) label += tr(" (removed)");
             if (input.value(QStringLiteral("committed")).toBool())
                 label += tr(", committed");
             const QString role = input.value(QStringLiteral("role")).toString();
             if (!role.isEmpty()) label += tr(" (%1)").arg(role);
-            auto* item = new QListWidgetItem(label, _ephemeralList);
+            if (!item) {
+                item = new QListWidgetItem(_ephemeralList);
+                _inputItems[id] = item;
+            }
+            item->setText(label);
+            item->setToolTip({});
+            item->setData(Qt::UserRole + 4, input);
+            item->setHidden(_inputFilter && !label.contains(_inputFilter->text(), Qt::CaseInsensitive));
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
             item->setData(Qt::UserRole + 2, inputState);
+            item->setData(Qt::UserRole + 3, input.value(QStringLiteral("can_restore")).toBool());
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(excluded.contains(id) ? Qt::Unchecked : Qt::Checked);
+            if (!excluded.contains(id)) selected.push_back(id);
             const QString incorporationError =
                 input.value(QStringLiteral("error")).toString();
             if (!incorporationError.isEmpty()) {
-                item->setToolTip(tr("Input incorporation failed: %1")
+                item->setToolTip(tr("Input update failed: %1")
                                      .arg(incorporationError));
                 label += tr(": %1").arg(incorporationError);
                 item->setText(label);
             }
             if (kind == selectedKind && id == selectedId) _ephemeralList->setCurrentItem(item);
         }
+        for (const auto& id : _inputItems.keys())
+            if (!present.contains(id)) delete _inputItems.take(id);
+        _service->setInputSelection(selected);
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(commitAvailable || _localDraftsReady);
-    _addInputs->setEnabled(_connected && _hasSession && _localDraftsReady);
-    if (_ephemeralCount > 0 && !commitAvailable && _uncommittedCount > 0)
-        _commitHint->setText(tr("Commit unavailable: %1")
-                                 .arg(status.value(QStringLiteral("commit_unavailable_reason")).toString()));
-    else if (queuedCount > 0 && pendingCount > 0)
-        _commitHint->setText(
-            tr("Queued inputs join before the next optimizer step; pending inputs "
-               "wait for the next Run"));
-    else if (queuedCount > 0)
-        _commitHint->setText(tr("Queued inputs join before the next optimizer step"));
-    else if (pendingCount > 0)
-        _commitHint->setText(tr("Pending inputs join the fit on the next Run"));
-    else
-        _commitHint->clear();
+    _commitInputs->setEnabled(_connected && _service->ownsInputWorkspace() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));
+    _addInputs->setEnabled(_connected && _service->ownsInputWorkspace() && _hasSession && (_localDraftsReady || _service->hasInputDrafts()));
+    _commitHint->setText(tr("Checked inputs are selected. Saves update local drafts; Apply changes future fit steps; Commit writes the selected revisions."));
 }
 
 void SpiralPanel::setSessionCheckpoint(const QString& hostPath)
@@ -2346,7 +2400,7 @@ void SpiralPanel::refreshReloadRequired()
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
         != normalizedReloadRequest(_loadedSessionRequest);
-    _run->setEnabled(_connected && _sessionRunnable && !_reloadRequired);
+    _run->setEnabled(_connected && _service->ownsInputWorkspace() && _sessionRunnable && !_reloadRequired);
     if (_reloadRequired)
         _state->setText(tr("Reload required — fit inputs or session configuration changed"));
     else if (wasReloadRequired)

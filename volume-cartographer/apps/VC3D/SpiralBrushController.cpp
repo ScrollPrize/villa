@@ -1,4 +1,5 @@
 #include "SpiralBrushController.hpp"
+#include <QUuid>
 
 #include "SpiralBrushCursorWidget.hpp"
 #include "SurfaceOverlayColors.hpp"
@@ -283,6 +284,15 @@ bool SpiralBrushController::hasUnfinalizedPolylines() const
                 ? line.volumePoints.size() >= 2
                 : pointCollectionHasChanges(line));
     });
+}
+
+bool SpiralBrushController::hasLocalChangesFor(const QString& id) const
+{
+    for (const auto& line : _polylines)
+        if (line.id == id && (line.state == GestureState::Painted || line.state == GestureState::Ready)) return true;
+    for (const auto& gesture : _gestures)
+        if (gesture.id == id && (gesture.state == GestureState::Painted || gesture.state == GestureState::Ready)) return true;
+    return false;
 }
 
 bool SpiralBrushController::hasReadyDrafts() const
@@ -881,6 +891,24 @@ void SpiralBrushController::appendPointCollectionPoint(
     emit paintStateChanged();
 }
 
+void SpiralBrushController::editCatalogCollection(PclRole role, const QString& collectionId, const QString& alias)
+{
+    for (std::size_t index = 0; index < _polylines.size(); ++index) {
+        auto& line = _polylines[index];
+        if ((!alias.isEmpty() && line.id == alias)
+            || (line.pclEdit && line.pclEdit->role == role && line.pclEdit->collectionId == collectionId)) {
+            _activePolyline = static_cast<int>(index);
+            updateCursorWidget();
+            refreshAll();
+            emit paintStateChanged();
+            return;
+        }
+    }
+    const auto& sources = sourcesFor(role).sources;
+    for (std::size_t index = 0; index < sources.size(); ++index)
+        if (sources[index].collectionId == collectionId) { selectEditablePcl(role, index); return; }
+}
+
 void SpiralBrushController::selectEditablePcl(PclRole role, std::size_t sourceIndex)
 {
     const auto& set = sourcesFor(role);
@@ -1077,8 +1105,6 @@ void SpiralBrushController::rebuildEditablePclHitIndex(VolumeViewerBase* viewer)
         const auto& line = _polylines[lineIndex];
         if (line.kind != PolylineGesture::Kind::PointCollection || !line.pclEdit
             || line.pclEdit->deleted
-            || line.state == GestureState::Finalizing
-            || line.state == GestureState::Finalized
             || (!line.pclEdit->collectionId.isEmpty() && !line.pclEdit->dirty))
             continue;
 
@@ -2096,11 +2122,11 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         const QString operation = line.pclEdit->deleted
             ? QStringLiteral("delete_collection")
             : QStringLiteral("replace_collection");
-        result.id = QStringLiteral("%1_%2_%3_%4_%5")
+        result.id = line.id.isEmpty() ? QStringLiteral("%1_%2_%3_%4_%5")
             .arg(vc3d::spiral::pclRoleCollectionPrefix(role),
                  line.pclEdit->deleted ? QStringLiteral("delete")
                                        : QStringLiteral("replace"),
-                 line.pclEdit->collectionId, stamp, suffix);
+                 line.pclEdit->collectionId, stamp, suffix) : line.id;
         result.role = vc3d::spiral::pclRoleName(role);
         result.operation = operation;
         result.targetCollectionId = line.pclEdit->collectionId;
@@ -2123,73 +2149,44 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         const auto matchesRole = [pclRole](const PolylineGesture& line) {
             return !pclRole || (line.pclEdit && line.pclEdit->role == *pclRole);
         };
-        QJsonObject collections;
-        int collectionId = 0;
         for (auto& line : _polylines) {
             if (!includesKind(line.kind) || !matchesRole(line)
                 || line.state != GestureState::Ready
                 || (line.kind == PolylineGesture::Kind::PointCollection
-                    ? !pointCollectionHasChanges(line)
-                    : line.volumePoints.size() < 2))
-                continue;
-            if (line.kind == PolylineGesture::Kind::PointCollection
-                && line.pclEdit && !line.pclEdit->collectionId.isEmpty())
-                continue;
-            if (line.kind == PolylineGesture::Kind::PointCollection
-                && line.pclEdit) {
+                    ? !pointCollectionHasChanges(line) : line.volumePoints.size() < 2)
+                || (line.kind == PolylineGesture::Kind::PointCollection
+                    && line.pclEdit && !line.pclEdit->collectionId.isEmpty())) continue;
+            QJsonObject collection;
+            if (line.kind == PolylineGesture::Kind::PointCollection && line.pclEdit) {
                 auto draft = *line.pclEdit;
-                draft.collectionId = QString::number(collectionId);
-                const QJsonObject serialized = draft.replacementDocument().object()
-                    .value(QStringLiteral("collections")).toObject()
-                    .value(draft.collectionId).toObject();
-                collections[QString::number(collectionId++)] = serialized;
-                continue;
+                draft.collectionId = QStringLiteral("0");
+                collection = draft.replacementDocument().object()
+                    .value(QStringLiteral("collections")).toObject().value(draft.collectionId).toObject();
+            } else {
+                QJsonObject points;
+                for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
+                    const cv::Vec3f& point = line.volumePoints[static_cast<std::size_t>(index)];
+                    points[QString::number(index)] = QJsonObject{
+                        {QStringLiteral("p"), QJsonArray{point[0], point[1], point[2]}},
+                        {QStringLiteral("wind_a"), QJsonValue::Null},
+                        {QStringLiteral("creation_time"), line.creationTime + index}};
+                }
+                collection = {{QStringLiteral("name"), QStringLiteral("%1_%2").arg(namePrefix).arg(line.sequence, 4, 10, QLatin1Char('0'))},
+                    {QStringLiteral("points"), points},
+                    {QStringLiteral("metadata"), QJsonObject{{QStringLiteral("winding_is_absolute"), false}}},
+                    {QStringLiteral("color"), QJsonArray{line.color.redF(), line.color.greenF(), line.color.blueF()}}};
             }
-            QJsonObject points;
-            for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
-                const cv::Vec3f& point = line.volumePoints[static_cast<std::size_t>(index)];
-                points[QString::number(index)] = QJsonObject{
-                    {QStringLiteral("p"), QJsonArray{point[0], point[1], point[2]}},
-                    {QStringLiteral("wind_a"), QJsonValue::Null},
-                    {QStringLiteral("creation_time"), line.creationTime + index},
-                };
-            }
-            collections[QString::number(collectionId++)] = QJsonObject{
-                {QStringLiteral("name"),
-                 QStringLiteral("%1_%2").arg(namePrefix).arg(
-                     line.sequence, 4, 10, QLatin1Char('0'))},
-                {QStringLiteral("points"), points},
-                {QStringLiteral("metadata"),
-                 QJsonObject{{QStringLiteral("winding_is_absolute"), false}}},
-                {QStringLiteral("color"),
-                 QJsonArray{line.color.redF(), line.color.greenF(), line.color.blueF()}},
-            };
+            PreparedPointCollections result;
+            if (line.id.isEmpty()) line.id = QStringLiteral("%1_%2").arg(idPrefix,
+                QUuid::createUuid().toString(QUuid::WithoutBraces));
+            result.id = line.id;
+            result.role = role;
+            result.document = QJsonDocument(QJsonObject{
+                {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
+                {QStringLiteral("collections"), QJsonObject{{QStringLiteral("0"), collection}}}});
+            line.state = GestureState::Finalizing;
+            results.push_back(std::move(result));
         }
-        if (collections.isEmpty()) return;
-        const QString stamp = QDateTime::currentDateTimeUtc().toString(
-            QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-        const QString suffix = QString::number(QRandomGenerator::global()->generate(), 16)
-                                   .rightJustified(8, '0');
-        PreparedPointCollections result;
-        result.id = QStringLiteral("%1_%2_%3").arg(idPrefix, stamp, suffix);
-        result.role = role;
-        result.document = QJsonDocument(QJsonObject{
-            {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
-            {QStringLiteral("collections"), collections},
-        });
-        for (auto& line : _polylines) {
-            if (includesKind(line.kind) && matchesRole(line)
-                && line.state == GestureState::Ready
-                && (line.kind == PolylineGesture::Kind::PointCollection
-                    ? pointCollectionHasChanges(line)
-                    : line.volumePoints.size() >= 2)
-                && !(line.kind == PolylineGesture::Kind::PointCollection
-                     && line.pclEdit && !line.pclEdit->collectionId.isEmpty())) {
-                line.id = result.id;
-                line.state = GestureState::Finalizing;
-            }
-        }
-        results.push_back(std::move(result));
     };
     prepareKinds({PolylineGesture::Kind::Freehand, PolylineGesture::Kind::Anchored},
                  QStringLiteral("drawn_control_points"),
@@ -2253,16 +2250,26 @@ void SpiralBrushController::finalizationFailed(const QString& id)
 {
     for (auto& gesture : _gestures) {
         if (gesture.id == id) {
-            gesture.id.clear();
             gesture.state = GestureState::Ready;
         }
     }
     for (auto& line : _polylines) {
         if (line.id == id && line.state == GestureState::Finalizing) {
-            line.id.clear();
             line.state = GestureState::Ready;
         }
     }
+    invalidateEditablePclHitIndex();
+    refreshAll();
+    emit paintStateChanged();
+}
+
+void SpiralBrushController::discardDraft(const QString& id)
+{
+    _activePolyline = -1;
+    _activeGesture = -1;
+    std::erase_if(_gestures, [&](const auto& item) { return item.id == id; });
+    std::erase_if(_polylines, [&](const auto& item) { return item.id == id; });
+    updateSuppressedPclIds();
     invalidateEditablePclHitIndex();
     refreshAll();
     emit paintStateChanged();

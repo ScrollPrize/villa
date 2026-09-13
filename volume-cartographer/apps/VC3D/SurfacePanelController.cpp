@@ -1577,6 +1577,10 @@ bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentId
     for (const auto& id : segmentIds) {
         const std::string idStd = id.toStdString();
         try {
+            if (_managedDeletionHandler && _managedDeletionHandler(id)) {
+                ++successCount;
+                continue;
+            }
             // Must clean up CState before destroying the Surface
             // to avoid dangling pointers in signal handlers.
             // Suppress signals during batch deletion to prevent handlers from

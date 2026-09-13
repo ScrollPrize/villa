@@ -103,7 +103,9 @@ from config import Config
 # Version 32 publishes a relative-winding point-cloud artifact next to the
 # same-winding one and opens the collection-mutation protocol to the
 # ``relative`` role, so both editable PCL roles share one client workflow.
-API_VERSION = 32
+# API 33 separates immutable transfers from revisioned input batches and
+# requires a dataset editing owner for service mutations.
+API_VERSION = 33
 
 
 class SessionState(str, Enum):

@@ -2,6 +2,10 @@
 
 #include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
+#include "SpiralInputDraft.hpp"
+#include <QJsonArray>
+#include <QTemporaryDir>
+#include <memory>
 
 #include <QJsonObject>
 #include <QElapsedTimer>
@@ -41,7 +45,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 32;
+    static constexpr int kApiVersion = 33;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -101,6 +105,21 @@ public:
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     void commitInputs();
+    void applyInputDrafts(bool commit = false, const QStringList& selection = {});
+    void refreshInputCatalog();
+    QJsonArray inputDraftStatus() const;
+    bool hasInputDrafts() const;
+    bool ownsInputWorkspace() const { return _inputOwner; }
+    void restoreInputDraft(const QString& id);
+    void editInputDraft(const QString& id);
+    void resolveInputConflict(const QJsonObject& conflict, const QString& action);
+    void discardInputDraft(const QString& id);
+    void discardInputWorkspace(std::function<void()> done);
+    void releaseInputWorkspace(std::function<void()> done);
+    QString workingCopy(const QString& source, QString* error = nullptr);
+    QString inputWorkspaceId() const { return _inputWorkspaceId; }
+    void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
+
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {},
@@ -122,6 +141,13 @@ public:
                           FetchPreviewFileCallback done);
 
 signals:
+    void inputDraftsChanged();
+    void inputWorkspaceReleased();
+    void inputDraftStaged(const QString& alias);
+    void inputDraftDiscarded(const QString& alias);
+    void inputConflict(const QJsonObject& conflict);
+    void inputEditorRequested(const QJsonObject& input, const QString& workingPath);
+    void inputBatchFinished(const QString& error);
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
     void serviceStateChanged(const QString& state);
@@ -227,18 +253,50 @@ private:
     void fetchAdvertisedDataset();
     QString commandId();
     QString endpointFingerprint() const;
-    void continueUpload(const QString& uploadId, const QString& inputId,
-                        const QString& kind, const QString& baseDir,
-                        QStringList pendingFiles);
-    void uploadJsonInputInternal(const QString& kind, const QString& filePath,
-                                 const QString& inputId, const QString& role,
-                                 const QString& baseRevision,
-                                 const QString& operation,
-                                 const QString& targetCollectionId,
-                                 const QString& baseSourceRevision);
-    void finishInputUpload(const QString& kind, const QString& inputId,
-                           const QString& error,
-                           const QJsonObject& body = {});
+    struct DraftTransfer {
+        QString id, directory, uploadId;
+        QJsonObject manifest;
+    };
+    struct DraftCommand {
+        vc3d::spiral::InputDraftBatch batch;
+        QVector<DraftTransfer> transfers;
+        QJsonObject request;
+        QJsonArray revisions;
+        QStringList localDeletions;
+        QString commitId;
+        bool commit = false;
+        bool applied = false;
+    };
+    void stageInput(const QString& kind, const QString& path, const QString& alias,
+                    const QString& role = {}, const QString& targetCollection = {}, bool deleted = false);
+    void resumeInputCommand();
+    void transferInput(int index);
+    void sendInputChanges();
+    void finishInputChanges(const QJsonObject& response);
+    void persistInputCommand();
+    void failInputCommand(const QString& error, const QJsonObject& body = {});
+    void finishInputCommand();
+    void installInputCatalog(const QJsonArray& inputs);
+    void claimInputWorkspace();
+    QString logicalInputId(const QString& kind, const QString& alias,
+                           const QString& role, const QString& targetCollection);
+    QMap<QString, std::shared_ptr<vc3d::spiral::InputDraft>> _inputDrafts;
+    QMap<QString, QJsonObject> _inputCatalog;
+    QStringList _inputOrder;
+    mutable QJsonArray _inputRowsCache;
+    mutable bool _inputRowsDirty = true;
+    QMap<QString, QString> _inputAliases;
+    QMap<QString, QString> _inputErrors;
+    QMap<QString, QString> _workingCopies;
+    QStringList _inputSelection;
+    bool _inputSelectionExplicit = false;
+    QString _inputWorkspaceId;
+    bool _inputOwner = false;
+    bool _inputCommandBusy = false;
+    std::shared_ptr<DraftCommand> _inputCommand;
+    std::function<void()> _afterInputCommand;
+    vc3d::spiral::InputDraftSubmission _inputSubmission;
+    QTemporaryDir _inputCopies;
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);

@@ -20,6 +20,7 @@ class QDialog;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QListWidgetItem;
 class QPushButton;
 class QSpinBox;
 class QDoubleSpinBox;
@@ -201,6 +202,9 @@ private:
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
+    QHash<QString, QListWidgetItem*> _inputItems;
+    QLineEdit* _inputFilter = nullptr;
+    QJsonObject _lastInputStatus;
     QJsonObject _loadedSessionRequest;
     QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;

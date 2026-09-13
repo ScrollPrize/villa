@@ -333,6 +333,47 @@ class DevicePatchAtlasTests(unittest.TestCase):
         ])
         torch.testing.assert_close(atlas.lookup(idx, ijs), expected)
 
+    def test_replacement_reorders_shared_geometry_and_removes_patches(self):
+        a, b, c = [self._fake_patch(5, width, seed)
+                   for width, seed in [(7, 71), (4, 72), (6, 73)]]
+        original = self.PatchAtlas({'a': a, 'b': b}, device='cpu').materialize()
+        original.append_patches({'c': c})
+        replacement = self._fake_patch(6, 8, 74)
+        candidate = original.replaced({'c': c, 'a': a, 'new': replacement})
+        self.assertEqual(original.id_to_idx, {'a': 0, 'b': 1, 'c': 2})
+        self.assertIs(candidate._geometry_chunks[0]['zyxs_flat'],
+                      original._geometry_chunks[1]['zyxs_flat'])
+        self.assertIs(candidate._geometry_chunks[1]['zyxs_flat'],
+                      original._geometry_chunks[0]['zyxs_flat'])
+        for atlas, patches in [(candidate, [c, a, replacement]),
+                               (candidate.replaced({'a': a, 'c': c}), [a, c])]:
+            indices = torch.arange(len(patches))
+            ijs = torch.tensor([[1.5, 2.25]] * len(patches))
+            expected = torch.stack([self._manual_bilinear(p.zyxs, 1.5, 2.25)
+                                    for p in patches])
+            torch.testing.assert_close(atlas.lookup(indices, ijs), expected)
+            vertex_ids = atlas.offsets[:-1] + atlas.widths + 2
+            torch.testing.assert_close(atlas.vertex_zyxs(vertex_ids),
+                                       torch.stack([p.zyxs[1, 2] for p in patches]))
+        empty = candidate.replaced({})
+        empty.append_patches({'b': b})
+        torch.testing.assert_close(
+            empty.lookup(torch.tensor([0]), torch.tensor([[1.5, 2.25]]))[0],
+            self._manual_bilinear(b.zyxs, 1.5, 2.25))
+
+    def test_replacement_single_remapped_chunk_is_not_packed(self):
+        a, b = self._fake_patch(5, 7, 81), self._fake_patch(6, 8, 82)
+        original = self.PatchAtlas({'a': a, 'b': b}, device='cpu').materialize()
+        candidate = original.replaced({'b': b, 'a': a})
+        self.assertEqual(len(candidate._geometry_chunks), 1)
+        torch.testing.assert_close(candidate.vertex_zyxs(torch.tensor([0, 48])),
+                                   torch.stack([b.zyxs[0, 0], a.zyxs[0, 0]]))
+        expected = torch.stack([self._manual_bilinear(p.zyxs, 1.5, 2.25)
+                                for p in [b, a]])
+        torch.testing.assert_close(
+            candidate.lookup(torch.tensor([0, 1]), torch.tensor([[1.5, 2.25]] * 2)),
+            expected)
+
     def test_largest_patch_component_uses_eight_connectivity(self):
         mask = np.zeros((8, 10), dtype=bool)
         mask[0:3, 0:3] = True
@@ -449,6 +490,8 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.unverified_patch_atlas = self.PatchAtlas(
                 context.unverified_patches, device='cpu').materialize()
             context.cross_patch_pcls = []
+            context.regular_pcl_catalog = {}
+            context.fiber_catalog = {}
             context.unattached_pcl_strips = _UnattachedPclStripList()
             context.unattached_component_edges = []
             context.interactive_driver = None

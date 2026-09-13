@@ -131,6 +131,9 @@ public:
     void stopTools();
 
     bool beginEditingSession(std::shared_ptr<QuadSurface> surface);
+    bool prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface);
+    void setEditingDestinationResolver(std::function<bool(const std::shared_ptr<QuadSurface>&)> resolver)
+    { _editingDestinationResolver = std::move(resolver); }
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
@@ -234,6 +237,7 @@ signals:
     void growthInProgressChanged(bool running);
     // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
+    void surfaceSavedTo(const QString& path);
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(vc::PointRef point);
     void annotationSelectionCleared();
@@ -514,6 +518,7 @@ private:
 
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
+    std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 

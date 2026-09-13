@@ -3065,6 +3065,8 @@ void SegmentationModule::performAutosave()
             failureMessage = tr("unknown error");
         }
 
+        if (failureMessage.isEmpty() && savedSnapshot)
+            emit surfaceSavedTo(QString::fromStdString(savedSnapshot->path.string()));
         const bool canRetry = _editManager && _editManager->hasSession();
         const auto completion = failureMessage.isEmpty()
             ? _autosaveState.completeSuccess(autosaveTicket)

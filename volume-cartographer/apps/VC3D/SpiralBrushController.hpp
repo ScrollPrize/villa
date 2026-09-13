@@ -78,6 +78,8 @@ public:
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
     bool hasReadyDrafts() const;
+    bool hasLocalChangesFor(const QString& id) const;
+    void editCatalogCollection(PclRole role, const QString& collectionId, const QString& alias = {});
     void markDraftsReady();
     int brushDiameter() const { return _diameterPx; }
 
@@ -91,6 +93,7 @@ public:
     // the display overlay, which otherwise hid it for the rest of the session.
     void commitSucceeded(const QStringList& ids);
     void discardUnfinalized();
+    void discardDraft(const QString& id);
 
 signals:
     void paintStateChanged();

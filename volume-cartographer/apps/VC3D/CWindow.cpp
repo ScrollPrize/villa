@@ -2610,6 +2610,21 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
+                [this](const QString& id, const QString& path) {
+                    try {
+                        auto surface = std::make_shared<QuadSurface>(path.toStdString());
+                        surface->ensureLoaded();
+                        _state->setSurface(id.toStdString(), surface);
+                        onSurfaceActivatedPreserveEditing(id, surface.get());
+                        if (_segmentationModule) {
+                            _segmentationModule->setEditingEnabled(true);
+                            _segmentationModule->beginEditingSession(surface);
+                        }
+                    } catch (const std::exception& error) {
+                        showStatusBarMessage(QString::fromUtf8(error.what()), 15000);
+                    }
+                });
         connect(_spiralWorkspace->viewerManager(), &ViewerManager::baseViewerCreated,
                 this, [this](VolumeViewerBase* viewer) {
                     if (auto* chunked = viewer
@@ -2677,6 +2692,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                         _spiralWorkspace->noteTrackedFiberSaved(
                             generation, QString::fromStdString(path.string()));
                 }
+            });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberFileRemoved,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteFiberRemoved(path);
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -7414,6 +7433,25 @@ void CWindow::CreateWidgets(void)
         _state->pointCollection(),
         _segmentationWidget->isEditingEnabled(),
         this);
+    _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return _segmentationModule->prepareEditingDestination(surface);
+    });
+    connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::surfaceSavedTo,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
+            });
+    _surfacePanel->setManagedDeletionHandler([this](const QString& id) {
+        return _spiralWorkspace && _state && _state->vpkg()
+            && _spiralWorkspace->stageManagedPatchRemoval(_state->vpkg()->getSurface(id.toStdString()));
+    });
+    _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+    });
+    connect(_segmentationModule.get(), &SegmentationModule::surfaceSavedTo,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
+            });
+
 
     if (_segmentationModule && _planeSlicingOverlay) {
         QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());

@@ -1,5 +1,15 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
 
+add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
+set_target_properties(test_spiral_input_draft PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_spiral_input_draft PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_input_draft PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME spiral_input_draft COMMAND test_spiral_input_draft)
+vc_register_test_target(test_spiral_input_draft)
+vc_register_ctest(spiral_input_draft test_spiral_input_draft)
+
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
 
@@ -407,3 +417,19 @@ add_test(NAME line_annotation_optimization_queue
 vc_register_test_target(test_line_annotation_optimization_queue)
 vc_register_ctest(line_annotation_optimization_queue
     test_line_annotation_optimization_queue)
+
+add_executable(test_spiral_input_workflow
+    test_spiral_input_workflow.cpp
+    ../SpiralServiceManager.cpp ../SpiralServiceManager.hpp
+    ../SpiralServiceManagerInputs.cpp
+    ../SpiralArtifactCache.cpp ../SpiralArtifactCache.hpp
+    ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp)
+set_target_properties(test_spiral_input_workflow PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_spiral_input_workflow PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_compile_definitions(test_spiral_input_workflow PRIVATE
+    SPIRAL_CLIENT_SERVICE_FIXTURE="${PROJECT_SOURCE_DIR}/../spiral-fitting/tests/revisioned_client_service.py")
+target_link_libraries(test_spiral_input_workflow PRIVATE vc_core Qt6::Core Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Test)
+add_test(NAME spiral_input_workflow COMMAND test_spiral_input_workflow)
+vc_register_test_target(test_spiral_input_workflow)
+vc_register_ctest(spiral_input_workflow test_spiral_input_workflow)
+set_tests_properties(spiral_input_workflow PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
