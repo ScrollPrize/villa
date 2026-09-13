@@ -9,6 +9,19 @@ retains the existing prediction products and makes no embedding reads.
 
 ## Scoring and storage
 
+Opt-in `--embedding-reference-mode` selects `mean` (unchanged default), `best`,
+`ema`, `ema-seed`, `ema-gated`, or `ema-seed-gated`. `best` takes minimum
+`1-cosine` over the bounded history and requires uniform falloff. EMA modes use
+`--embedding-ema-half-life-base-voxels` (default512): for step distance D,
+`d=2^(-D/half_life)`, new reference is `normalize(d*old+(1-d)*candidate)`.
+Score uses the parent reference before update. Exact cancellation keeps old.
+Seed modes average EMA and fixed restart-seed costs equally. Gated modes update
+only if selected presence>=0.5 and cosine to parent reference>=0.5; scoring and
+tracing still proceed when the gate rejects. Rejected distance never accumulates
+into a later update. Memory is copied per beam and reset at every restart.
+History settings do not affect EMA modes. These tracer-reference EMAs are
+independent of the EMA99 model snapshot. Defaults and other costs are unchanged.
+
 - Extra cost per candidate: `weight * mean(1 - cosine(candidate, reference))`.
   This uses the same per-step cost units as existing alignment/smoothness, not
   another step-length multiplier. Cosine is clamped to [-1,1]. The cost is

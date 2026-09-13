@@ -92,6 +92,8 @@ struct FiberTraceConfig {
     double embeddingHistoryWindowBaseVoxels = 256.0;
     int embeddingHistoryCount = 8;
     std::string embeddingHistoryFalloff = "uniform";
+    std::string embeddingReferenceMode = "mean";
+    double embeddingEmaHalfLifeBaseVoxels = 512;
     double stepVoxels = 4.0;
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;

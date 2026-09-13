@@ -151,7 +151,7 @@ def test_sweep_fill_requires_managed_launch(tmp_path, monkeypatch):
 
 def test_configurable_embedding_search():
     from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants, search_weight
-    history = dict(spacing=128, window=4096, count=64, falloff='linear')
+    history = dict(spacing=128, window=4096, count=64, falloff='linear', mode='ema-seed', half_life=512)
     rows = configured_variants({'candidates': [dict(history, weight=.4)]})
     assert [r['name'] for r in rows] == ['off', 'original', 'candidate-000']
     assert rows[-1]['window'] == 4096
@@ -181,3 +181,14 @@ def test_product_storage_preserves_signed_float32(tmp_path):
     array[:] = -0.375
     reopened = create_product_omezarr_groups(**options)["embedding_000"]["0"]
     np.testing.assert_array_equal(reopened[:], np.full((4, 4, 4), -.375, np.float32))
+
+
+def test_embedding_reference_variants():
+    from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants
+    base = dict(weight=.25, spacing=128, window=1024, count=8, falloff='uniform')
+    for mode in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated'):
+        row = configured_variants({'candidates': [dict(base, mode=mode, half_life=128)]})[-1]
+        assert row['mode'] == mode and row['half_life'] == 128
+    for update in (dict(mode='max'), dict(mode='best', falloff='gaussian'), dict(half_life=0), dict(half_life=float('nan'))):
+        with pytest.raises(ValueError):
+            configured_variants({'candidates': [{**base, **update}]})

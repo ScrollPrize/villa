@@ -52,6 +52,33 @@ TEST_CASE("embedding history is arclength bounded and branch local")
     CHECK_THROWS(fiberEmbeddingCost({1}, history, 640, 256));
 }
 
+TEST_CASE("embedding best history and normalized EMA references")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingHistory h{{0, {-1, 0}}, {24, {1, 0}}};
+    CHECK(fiberEmbeddingCost({1, 0}, h, 32, 32, "uniform", true) == 0);
+    CHECK(fiberEmbeddingCost({1, 0}, h, 100, 32, "uniform", true) == 0);
+    FiberEmbeddingMemory m;
+    advanceFiberEmbeddingMemory(m, {1, 0}, 0, 128, 1, false);
+    auto branch = m;
+    CHECK(fiberEmbeddingMemoryCost({0, 1}, m, false) == 1);
+    advanceFiberEmbeddingMemory(branch, {0, 1}, 128, 128, 1, false);
+    CHECK(branch.ema[0] == doctest::Approx(std::sqrt(.5)));
+    CHECK(branch.ema[1] == doctest::Approx(std::sqrt(.5)));
+    CHECK(m.ema == std::vector<float>{1, 0});
+    CHECK(branch.seed == m.seed);
+    CHECK(fiberEmbeddingMemoryCost({0, 1}, branch, true) == doctest::Approx(1-.5*std::sqrt(.5)));
+    advanceFiberEmbeddingMemory(m, {0, 1}, 128, 128, 1, true);
+    CHECK(m.ema == m.seed); // cosine gate
+    advanceFiberEmbeddingMemory(m, {.8f, .6f}, 128, 128, .4, true);
+    CHECK(m.ema == m.seed); // presence gate
+    advanceFiberEmbeddingMemory(m, {-1, 0}, 128, 128, 1, false);
+    CHECK(m.ema == m.seed); // cancellation
+    CHECK_THROWS(advanceFiberEmbeddingMemory(m, {}, 1, 128, 1, false));
+    CHECK_THROWS(advanceFiberEmbeddingMemory(m, {1, 0}, 1, 0, 1, false));
+    CHECK_THROWS(fiberEmbeddingMemoryCost({1}, m, false));
+}
+
 TEST_CASE("signed float32 channels interpolate before normalization through shared cache")
 {
     namespace fs = std::filesystem;
@@ -448,6 +475,17 @@ TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embe
     auto same = vc::fiber_tracer::traceFiberOneWay(predictions, request);
     CHECK(predictions.reads > 0);
     CHECK(old.points == same.points);
+    for (const auto* mode : {"best", "ema", "ema-seed", "ema-gated", "ema-seed-gated"}) {
+        request.config.embeddingReferenceMode = mode;
+        CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
+    }
+    request.config.embeddingReferenceMode = "unknown";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingReferenceMode = "best";
+    request.config.embeddingHistoryFalloff = "gaussian";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingHistoryFalloff = "uniform";
+    request.config.embeddingReferenceMode = "ema";
     predictions.invalid = true;
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), doctest::Contains("trace seed has no valid embedding"), std::runtime_error);
     StraightPrediction missing;

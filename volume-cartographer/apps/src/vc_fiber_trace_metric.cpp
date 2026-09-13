@@ -57,6 +57,8 @@ void printUsage(const char* argv0)
         << "  --cone-grid-size N              legacy square-to-disk grid size when cone step <= 0 [25]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
         << "  --embedding-weight N            local cosine history penalty [0=disabled]\n"
+        << "  --embedding-reference-mode MODE mean|best|ema|ema-seed|ema-gated|ema-seed-gated\n"
+        << "  --embedding-ema-half-life-base-voxels N reference EMA half-life [512]\n"
         << "  --embedding-history-spacing-base-voxels N  reference spacing [32]\n"
         << "  --embedding-history-window-base-voxels N   reference window [256]\n"
         << "  --embedding-history-count N     maximum references per hypothesis [8]\n"

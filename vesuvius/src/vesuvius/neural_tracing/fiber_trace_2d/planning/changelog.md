@@ -1,3 +1,10 @@
+## 2026-09-13 — EMA99 tracer reference variants
+
+- Added opt-in best-history and per-beam EMA/seed/gated references to shared
+  native tracer. EMA99 update6500: EMA512 weight.25 gives69 restarts vs87 off
+  and82 original, exact repeats; complete mode sweep and neighboring weights.
+  Defaults unchanged. See docs/embedding_ema99_references_20260913.md.
+
 ## 2026-09-13 — Paired embedding tracer tuning
 
 - Generalized existing embedding-only sweep for configured histories and selected-history weight search.

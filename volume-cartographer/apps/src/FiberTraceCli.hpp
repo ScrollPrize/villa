@@ -99,6 +99,10 @@ inline bool parseTraceOption(
         config.embeddingHistoryFalloff = value("embedding-history-falloff");
     else if (argument == "--embedding-history-count")
         config.embeddingHistoryCount = parseInt(value("embedding-history-count"), "embedding-history-count");
+    else if (argument == "--embedding-reference-mode")
+        config.embeddingReferenceMode = value("embedding-reference-mode");
+    else if (argument == "--embedding-ema-half-life-base-voxels")
+        config.embeddingEmaHalfLifeBaseVoxels = parseDouble(value("embedding-ema-half-life-base-voxels"), "embedding-ema-half-life-base-voxels");
     else if (argument == "--smoothness-weight")
         config.smoothnessWeight = parseDouble(value("smoothness-weight"), "smoothness-weight");
     else if (argument == "--smoothness-normal-weight")
@@ -153,6 +157,8 @@ inline nlohmann::json traceConfigJson(const FiberTraceConfig& config)
         {"embedding_history_window_base_voxels", config.embeddingHistoryWindowBaseVoxels},
         {"embedding_history_count", config.embeddingHistoryCount},
         {"embedding_history_falloff", config.embeddingHistoryFalloff},
+        {"embedding_reference_mode", config.embeddingReferenceMode},
+        {"embedding_ema_half_life_base_voxels", config.embeddingEmaHalfLifeBaseVoxels},
         {"step_voxels", config.stepVoxels},
         {"cone_angle_degrees", config.coneAngleDegrees},
         {"cone_angle_step_degrees", config.coneAngleStepDegrees},

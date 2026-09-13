@@ -1,7 +1,10 @@
-# Embedding tuning
+# Status
 
-- [x] Freeze snapshot and start controls.
-- [x] Independent plan review.
-- [x] Configurable search and CPU tests.
-- [x] History grid, weight search, count/local refinement.
-- [x] Exact-repeat winner, final report.
+- [x] Commit previous work
+- [x] Review plan
+- [x] Freeze EMA99 and controls
+- [x] Implement/test variants
+- [x] Sweep and refine
+- [x] Document results
+
+Next separately requested experiment: representative/diverse appearance anchors.

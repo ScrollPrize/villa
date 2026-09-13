@@ -65,7 +65,8 @@ def configured_variants(settings):
         raise ValueError("candidates must be nonempty and cannot accompany weight_search")
     rows = list(variants(True))
     for i, candidate in enumerate(custom):
-        if set(candidate) != {"weight", "spacing", "window", "count", "falloff"}:
+        required = {"weight", "spacing", "window", "count", "falloff"}
+        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life"}:
             raise ValueError("candidate must contain only embedding weight/spacing/window/count/falloff")
         if any(not isinstance(candidate[k], (int, float)) or not math.isfinite(candidate[k]) or candidate[k] <= 0
                for k in ("spacing", "window")):
@@ -76,6 +77,14 @@ def configured_variants(settings):
             raise ValueError("weight must be finite and nonnegative")
         if candidate['falloff'] not in ('uniform', 'linear', 'gaussian'):
             raise ValueError("unsupported falloff")
+        mode = candidate.get('mode', 'mean')
+        if mode not in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated'):
+            raise ValueError('unsupported reference mode')
+        if mode == 'best' and candidate['falloff'] != 'uniform':
+            raise ValueError('best history requires uniform falloff')
+        half = candidate.get('half_life', 512)
+        if not isinstance(half, (int, float)) or not math.isfinite(half) or half <= 0:
+            raise ValueError('invalid EMA half life')
         rows.append(dict(candidate, name=f"candidate-{i:03d}"))
     return rows
 
@@ -122,6 +131,10 @@ def run(settings):
                           ("history-falloff", "falloff")]:
             cleaned += ["--embedding-" + flag, str(variant[key])]
         evaluation["trace_args"] = cleaned
+        if 'mode' in variant:
+            evaluation['trace_args'] += ['--embedding-reference-mode', variant['mode']]
+        if 'half_life' in variant:
+            evaluation['trace_args'] += ['--embedding-ema-half-life-base-voxels', str(variant['half_life'])]
         atomic_write(output / (variant["name"] + ".json"), evaluation)
         stores, mapping, channels = {}, {}, {}
         for source in evaluation["sources"]:
@@ -173,7 +186,7 @@ def run(settings):
         if len(completed) != len(scheduled):
             raise RuntimeError("full history grid incomplete; cannot select winner")
         best = min(completed, key=lambda v: v["failures"])
-    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff")}, "name":"repeat-best"})
+    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life") if k in best}, "name":"repeat-best"})
     report["best"] = best["name"]
     report["repeat_identical"] = repeated.get("replay_hash") == best["replay_hash"]
     atomic_write(output / "report.json", report)

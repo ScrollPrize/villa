@@ -7,11 +7,17 @@
     "baseline": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_route_analysis_20260913_v3/report.json"
   },
   "embedding_trace_sweep": {
-    "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_paired_tune_20260913_v1",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_paired_tune_refine_20260913_v1",
-    "weight_search": false,
-    "candidates": [{"weight":0.25,"spacing":128,"window":1024,"count":1,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":2,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":4,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":8,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":16,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":32,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":1024,"count":64,"falloff":"gaussian"},{"weight":0.25,"spacing":64,"window":1024,"count":64,"falloff":"gaussian"},{"weight":0.25,"spacing":256,"window":1024,"count":64,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":512,"count":64,"falloff":"gaussian"},{"weight":0.25,"spacing":128,"window":2048,"count":64,"falloff":"gaussian"}],
-    "search_history": {"spacing":128,"window":1024,"count":64,"falloff":"gaussian"},
+    "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_weight_20260913_v1",
+    "weight_search": true,
+    "search_history": {
+      "spacing": 128,
+      "window": 1024,
+      "count": 8,
+      "falloff": "gaussian",
+      "mode": "ema",
+      "half_life": 512
+    },
     "start_weight": 0.25,
     "grid_weight": 0.25,
     "fill_missing": true,
@@ -31,8 +37,8 @@
     "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric"
   },
   "embedding_trace_pilot": {
-    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_paired_tune_20260913_v1-frozen/live_inference/_models/ee272228afaee9f4163338b5d803338f834ddd7bdfcbdb6e34c03a08e76b6f0f/snapshot.pt",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_trace_paired_tune_20260913_v1",
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1-frozen/live_inference/_models/0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417/snapshot.pt",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
     "resume": false,
     "prepared_config": "/ephemeral/hendrik/fiber3d_train2/evaluations/collection_182306_best11k_full256_b8_20260912_v1/full.json",
     "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",

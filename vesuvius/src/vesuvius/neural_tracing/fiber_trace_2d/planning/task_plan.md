@@ -1,12 +1,16 @@
-# Embedding tuning plan
+# Plan
 
-1. Freeze raw4300/550400, same hard held-out fiber and bidirectional metric. Run off/.25 controls and signed embedding cache under manager nonexclusive oneGPU20GiB/16CPU. Training stays active. Restarts ranked by existing total_failures, complete traces only.
-2. Generalize existing sweep configuration, not tracer implementation: explicit candidate histories accepted; weight search accepts selected history and starting weight instead of hardcoded old optimum. Keep old defaults/tests. Validate values and preserve all non-embedding trace args.
-3. First grid weight.25: spacing8/32/128 and window64/256/1024/4096 with count64 and uniform/linear/Gaussian (skip spacing>window); include old controls. This covers short and newly relevant long ranges. Select minimum failures, then .05 weight neighbor descent from.25 with that history (ties retain center). Compare count8/16/32/64 at winning weight/history, and a local history refinement at the new weight if weight changed. Retain zero-weight control as candidate. Report local, not global optimum. Stop refining when no strict improvement among tested neighbors.
-4. Reuse cached inference; manager fills only additional missing coverage. Require exact old-control replay and exact repeat of final winner. CPU regression tests via existing approved test runner, then complete actual tuning. Report settings/counts/restarts relative to fresh off/default and log full result directories. No global default changes unless separately requested.
+1. Freeze current EMA99 hash/update, run off/original and previous best (.25,128/1024/count8/gaussian) before native changes.
+2. Extend shared native helper and CLI; default weighted mean unchanged. Best history=min cosine cost over retained references, no age discount. EMA normalized per beam with distance half-lives128/512/2048; score against parent before updating. Fixed seed per restart. EMA+seed equally averages two costs. Gated variant only updates presence>=.5 and parent cosine>=.5; decay based on distance of current step even after rejected updates.
+3. Native tests: formulas, best vs mean, gate, beam copy isolation, invalid options. Approved runner builds/tests; no geometry/default changes.
+4. Rerun unchanged controls; sweep .25 weight with EMA/gated/EMA+seed/gated+seed at three half-lives, best history windows256/1024/4096 spacing128/count64. Reuse frozen cache, manager-gated extension. Repeat winner and refine +/- .05 weight to local minimum.
+5. Report full results and timings, single-fiber limitation; keep defaults unchanged.
 
 ## Spec update
-No numerical, training or protocol change. Configurable experiment search only; settings restricted to embedding parameters, unchanged deterministic selection and fail-closed coverage.
+Document opt-in modes, formulas, ownership; preserve mean default.
 
 ## Docs updates
-New tuning report with snapshot/data, search grid and local refinement, complete controls/repeat, timings and single-fiber overfit limitation. Task log/status/changelog brief.
+Add EMA99 report and embedding_tracing options; update changelog, status, task log.
+
+## Validation
+Independent review; approved experiment/test runners; native/Python regression tests; exact off/mean pre-change replay and winning repeat. Existing CMake build (documented build_dependencies.sh absent).

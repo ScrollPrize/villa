@@ -474,6 +474,14 @@ void requireNormalSamplerForNormalAwareSmoothness(const FiberTraceConfig& config
 
 void validateTraceConfig(const FiberTraceConfig& config)
 {
+    const auto& mode = config.embeddingReferenceMode;
+    if (mode != "mean" && mode != "best" && mode != "ema" && mode != "ema-seed" &&
+        mode != "ema-gated" && mode != "ema-seed-gated")
+        throw std::invalid_argument("unknown embedding reference mode");
+    if (mode == "best" && config.embeddingHistoryFalloff != "uniform")
+        throw std::invalid_argument("best embedding history requires uniform falloff");
+    if (!std::isfinite(config.embeddingEmaHalfLifeBaseVoxels) || config.embeddingEmaHalfLifeBaseVoxels <= 0)
+        throw std::invalid_argument("embedding EMA half life must be positive");
     if (config.embeddingHistoryFalloff != "uniform" && config.embeddingHistoryFalloff != "linear" &&
         config.embeddingHistoryFalloff != "gaussian")
         throw std::invalid_argument("unknown embedding history falloff");
@@ -594,6 +602,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
 
 struct BeamState {
     FiberEmbeddingHistory embeddingHistory;
+    FiberEmbeddingMemory embeddingMemory;
     struct PathNode {
         TraceVec point{0.0f, 0.0f, 0.0f};
         std::shared_ptr<const PathNode> previous;
@@ -660,9 +669,12 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     if (vector.empty()) { score.valid = false; score.loss = std::numeric_limits<float>::infinity(); return; }
     const double arc = (parent.tracedLength + traceLength(point - beamEndpoint(parent))) * config.traceToBaseScale;
     // Same per-step units as the existing local alignment/smoothness costs.
-    score.loss += static_cast<float>(config.embeddingWeight * fiberEmbeddingCost(
+    const bool ema = config.embeddingReferenceMode.starts_with("ema");
+    const double cost = ema ? fiberEmbeddingMemoryCost(vector, parent.embeddingMemory,
+        config.embeddingReferenceMode.starts_with("ema-seed")) : fiberEmbeddingCost(
         vector, parent.embeddingHistory, arc, config.embeddingHistoryWindowBaseVoxels,
-        config.embeddingHistoryFalloff));
+        config.embeddingHistoryFalloff, config.embeddingReferenceMode == "best");
+    score.loss += static_cast<float>(config.embeddingWeight * cost);
     score.embedding = vector;
 }
 
@@ -1403,7 +1415,12 @@ void updateTargetPlaneCrossings(
     out.historyDirection = updateHistoryDirection(parent.historyDirection, task.direction, parent.depth, config.cumulativeSmoothnessSteps);
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength + traceLength(candidate.point - beamEndpoint(parent));
-    if (config.embeddingWeight > 0)
+    if (config.embeddingWeight > 0 && config.embeddingReferenceMode.starts_with("ema"))
+        advanceFiberEmbeddingMemory(out.embeddingMemory, score.embedding,
+            traceLength(candidate.point - beamEndpoint(parent)) * config.traceToBaseScale,
+            config.embeddingEmaHalfLifeBaseVoxels, score.selectedPresence,
+            config.embeddingReferenceMode.ends_with("gated"));
+    else if (config.embeddingWeight > 0)
         advanceFiberEmbeddingHistory(out.embeddingHistory, score.embedding,
             out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
             config.embeddingHistoryWindowBaseVoxels, static_cast<size_t>(config.embeddingHistoryCount));
@@ -1755,6 +1772,7 @@ template <typename LossAt>
         predictions.sampleEmbeddings({start}, seed);
         if (seed.size() != 1 || seed.front().empty()) throw std::runtime_error("trace seed has no valid embedding");
         initial.embeddingHistory.push_back({0, seed.front()});
+        initial.embeddingMemory.ema = initial.embeddingMemory.seed = seed.front();
     }
     updateTargetPlaneCrossings(start, start, targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings);
     initial.reached = targetPlanesReached(targetPlanes, initial.crossedTargetPlaneMask, initial.targetPlaneCrossings, acceptThresholdVoxels);

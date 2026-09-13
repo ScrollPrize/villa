@@ -1,5 +1,15 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Opt-in embedding reference modes
+
+- Default mean preserves history-weighted cosine costs. Best mode uses maximum
+  cosine over bounded references, requiring uniform falloff. EMA modes maintain
+  per-beam normalized references, decay exp2(-step_distance/half_life), score
+  before updating, retain old on exact cancellation. Optional fixed seed cost
+  has equal weight with EMA; optional update gate presence>=.5 and cosine>=.5.
+  Gate only inhibits updates, without accumulated catch-up distance. Every
+  restart resets seed and EMA; no GT access. Half-life is positive finite.
+
 ## Trace comparison reporting
 
 - The five-scroll aggregate is Classic's exact arithmetic mean multiplied by
