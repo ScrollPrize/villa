@@ -93,7 +93,18 @@ EMA_SERIES = [('current999', 'current_ema_0p999.pt', 0.999),
               ('best999', 'best_ema_0p999.pt', 0.999),
               ('best99', 'best_ema_0p99.pt', 0.99)]
 SNAPSHOT_VARIANTS = [*EMA_SERIES, ('current99', 'current_ema_0p99.pt', 0.99),
-                     ('current', 'current.pt', None)]
+                     ('current', 'current.pt', None), ('best', 'best.pt', None)]
+
+
+def check_series_training_state(settings, identity):
+    from villa_gpu_manager.processes import process_state
+    expected = settings.get('expected_training_state', 'alive')
+    if expected not in ('alive', 'dead'):
+        raise ValueError('expected_training_state must be alive or dead')
+    observed = process_state(identity, os.getuid())
+    if observed != expected:
+        raise RuntimeError(f'expected training root {expected}, observed {observed}; no automatic restart')
+    return observed
 
 
 def freeze_snapshot_selection(run, filename, decay, cache):
@@ -119,7 +130,6 @@ def freeze_snapshot_selection(run, filename, decay, cache):
 
 
 def trace_series_prepare():
-    from villa_gpu_manager.processes import process_state
     settings = json.loads(CONTROL.read_text())['trace_series']
     available = {name: (name, filename, decay) for name, filename, decay in SNAPSHOT_VARIANTS}
     variants = settings.get('variants', [name for name, _, _ in EMA_SERIES])
@@ -128,8 +138,7 @@ def trace_series_prepare():
             len(set(variants)) != len(variants)):
         raise ValueError('variants must be a nonempty unique list of supported snapshot names')
     identity = json.loads((Path(settings['launch']) / 'controller.json').read_text())
-    if process_state(identity, os.getuid()) != 'alive':
-        raise RuntimeError('expected live training root; no automatic restart')
+    check_series_training_state(settings, identity)
     root = Path(settings['output'])
     root.mkdir(parents=True, exist_ok=False)
     entries = []
@@ -143,7 +152,6 @@ def trace_series_prepare():
 
 
 def trace_series_next(*, retry_failed=False):
-    from villa_gpu_manager.processes import process_state
     from fiber3d_comparison_report import series_report
     root = Path(json.loads(CONTROL.read_text())['trace_series']['output'])
     path = root / 'series.json'
@@ -156,8 +164,7 @@ def trace_series_next(*, retry_failed=False):
         raise RuntimeError('explicit retry requires a failed evaluation')
     if entry['status'] != 'pending' and not retry_failed:
         raise RuntimeError('previous evaluation interrupted/failed; inspect before retrying')
-    if process_state(state['training_identity'], os.getuid()) != 'alive':
-        raise RuntimeError('training root is no longer alive; no automatic restart')
+    check_series_training_state(state['settings'], state['training_identity'])
     output = root / entry['name']
     if retry_failed:
         attempts = entry.setdefault('failed_attempts', [])
@@ -178,12 +185,10 @@ def trace_series_next(*, retry_failed=False):
         report_path = root / f"comparison_after_{entry['name']}.md"
         report_path.write_text(report)
         entry['report'] = str(report_path)
-        entry['training_root_state'] = process_state(state['training_identity'], os.getuid())
-        if entry['training_root_state'] != 'alive':
-            raise RuntimeError('evaluation completed but original training root is not alive')
+        entry['training_root_state'] = check_series_training_state(state['settings'], state['training_identity'])
         path.write_text(json.dumps(state, indent=2))
         print(report, flush=True)
-        print(f"REPORT={report_path}; original training root remains alive", flush=True)
+        print(f"REPORT={report_path}; original training root remains {entry['training_root_state']}", flush=True)
     except BaseException as exc:
         entry.update(status='failed', error=f'{type(exc).__name__}: {exc}')
         path.write_text(json.dumps(state, indent=2))

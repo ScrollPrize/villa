@@ -23,10 +23,27 @@ def equal_scroll_score(metrics):
     return math.fsum(values) / len(SCROLLS)
 
 
+def classic_normalized_score(metrics, classic):
+    """Classic-scaled geometric relative score, not an observed mean distance."""
+    scale = equal_scroll_score(classic)
+    equal_scroll_score(metrics)  # Validate identical scroll set and finite means.
+    baseline = [classic['scrolls'][s]['mean_segment_length_mm'] for s in SCROLLS]
+    values = [metrics['scrolls'][s]['mean_segment_length_mm'] for s in SCROLLS]
+    if any(v <= 0 for v in baseline):
+        raise ValueError('Classic means must be positive')
+    if any(v == 0 for v in values):
+        return 0.0
+    return scale * math.exp(math.fsum(math.log(v) - math.log(b)
+                                    for v, b in zip(values, baseline)) / len(SCROLLS))
+
+
 def comparison_markdown(rows):
     if not rows:
         raise ValueError('empty comparison')
-    scores = [equal_scroll_score(row['metrics']) for row in rows]
+    classic = [row['metrics'] for row in rows if row['name'] == 'Classic']
+    if len(classic) != 1:
+        raise ValueError('comparison requires exactly one Classic baseline')
+    scores = [classic_normalized_score(row['metrics'], classic[0]) for row in rows]
     for row in rows:
         for scroll in SCROLLS:
             value = row['metrics']['scrolls'][scroll]
@@ -43,11 +60,12 @@ def comparison_markdown(rows):
         return f'**{text}**' if math.isclose(value, best, rel_tol=0, abs_tol=1e-10) else text
 
     lines = ['# Equal-scroll tracing comparison', '',
-             'Overall score: arithmetic mean of the five per-scroll means, **20% each**.',
+             'Overall: Classic arithmetic mean × geometric mean of five model/Classic scroll ratios (**20% each**).',
+             f'Classic scale = {equal_scroll_score(classic[0]):.9f}mm. This normalized score is not an observed mean distance.',
              'Lengths are mm. Best/tied values are bold; old pooled overall scores are omitted.',
              'Classic is longer-trained; modern checkpoint ages are recorded below or in their source reports.',
              'This comparison does not match training budgets.', '',
-             '## Overall', '', '| Model | Equal-scroll score ↑ |', '|---|---:|']
+             '## Overall', '', '| Model | Classic-normalized score (mm) ↑ |', '|---|---:|']
     for row, score in zip(rows, scores):
         lines.append(f"| {row['name']} | {cell(score, max(scores), 3)} |")
     for scroll in SCROLLS:
@@ -64,12 +82,13 @@ def comparison_markdown(rows):
                 values.append(cell(row['metrics']['scrolls'][scroll][key], best, digits))
             lines.append(f"| {row['name']} | " + ' | '.join(values) + ' |')
     lines += ['', '## Checkpoint provenance', '',
-              '| Label | Step | Samples | Decay | Test loss |', '|---|---:|---:|---:|---:|']
+              '| Label | Step | Samples | Decay | Selected because | Test metric | Test loss |',
+              '|---|---:|---:|---:|---|---|---:|']
     for row in rows:
         if 'selection' in row:
             s = row['selection']['selected']
             decay = s.get('decay', 'unknown')
-            lines.append(f"| {row['name']} | {s['step']} | {s['samples']} | {'raw' if decay is None else decay} | {s['metric']:.6f} |")
+            lines.append(f"| {row['name']} | {s['step']} | {s['samples']} | {'raw' if decay is None else decay} | {selection_reason(s)} | {s.get('metric_name', 'unknown')} | {s['metric']:.6f} |")
     lines += ['', '## Evaluation sources', '']
     for row in rows:
         lines.append(f"- {row['name']}: `{row['output']}`")
@@ -78,6 +97,33 @@ def comparison_markdown(rows):
     lines += ['', 'Small-scroll support is limited (0332:3fibers;1451:2fibers).',
               'No statistical significance claim. Training is not stopped or restarted by evaluation.', '']
     return '\n'.join(lines)
+
+
+def selection_reason(selected):
+    filename = Path(selected.get('path', '')).name
+    if filename.startswith('best'):
+        return 'best test loss'
+    if filename.startswith('current'):
+        return 'latest/current'
+    return 'unspecified'
+
+
+def snapshot_label(row):
+    if row['name'] == 'Classic' or 'selection' not in row:
+        return row['name']
+    selection = row['selection']
+    selected = selection['selected']
+    run = Path(selection['run']).name
+    family = ('Combined finetune' if run.startswith('finetune_') else
+              'NML' if run.startswith('s1a_nml_') else
+              'Combined' if 's1a' in run else 'JSON')
+    filename = Path(selected['path']).name
+    # Older selection records lack decay; use their explicit snapshot filename.
+    kind = ('EMA999' if '_ema_0p999' in filename else
+            'EMA99' if '_ema_0p99' in filename else
+            'raw' if '_ema_' not in filename else filename)
+    return (f"{family} {kind} ({selection_reason(selected)}; test={selected['metric']:.6f})"
+            f" — {selected['samples']:,} samples / u{selected['step']:,}")
 
 
 def series_report(state):
@@ -93,4 +139,6 @@ def series_report(state):
         if entry['status'] == 'done':
             rows.append(dict(name='New ' + entry['name'], output=entry['output'],
                              metrics=entry['metrics'], selection=entry['selection']))
+    for row in rows:
+        row['name'] = snapshot_label(row)
     return comparison_markdown(rows)

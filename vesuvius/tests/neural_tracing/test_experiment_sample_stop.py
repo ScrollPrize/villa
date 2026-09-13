@@ -188,7 +188,7 @@ def test_exact_raw_freeze_accepts_training_ema_state_not_ema_export(runner, monk
         runner.freeze_snapshot_selection(tmp_path, 'current.pt', None, tmp_path)
 
 
-@pytest.mark.parametrize('variants', [None, ['best99', 'best999'], ['current999', 'current99', 'current']])
+@pytest.mark.parametrize('variants', [None, ['best99', 'best999'], ['current999', 'current99', 'current'], ['current999', 'current99', 'current', 'best']])
 def test_series_prepares_all_exact_variants_without_training_mutations(runner, monkeypatch, tmp_path, variants):
     import villa_gpu_manager.processes as processes
     launch = tmp_path / 'launch'
@@ -214,6 +214,8 @@ def test_series_prepares_all_exact_variants_without_training_mutations(runner, m
                 if variants is None else
                 ([('best_ema_0p99.pt', .99), ('best_ema_0p999.pt', .999)] if variants[0] == 'best99' else
                  [('current_ema_0p999.pt', .999), ('current_ema_0p99.pt', .99), ('current.pt', None)]))
+    if variants and 'best' in variants:
+        expected.append(('best.pt', None))
     assert seen == expected
     assert [e['status'] for e in json.loads((tmp_path / 'series/series.json').read_text())['entries']] == ['pending'] * len(expected)
     stop.assert_not_called()
@@ -233,15 +235,16 @@ def test_series_invalid_variants_fail_before_freezing(runner, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize('fail', [False, True])
-def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path, fail):
+@pytest.mark.parametrize('training_state', ['alive', 'dead'])
+def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path, fail, training_state):
     import villa_gpu_manager.processes as processes
     monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
     import fiber3d_comparison_report as reporting
     control = tmp_path / 'control.json'
     control.write_text(json.dumps({'trace_series':{'output':str(tmp_path)}}))
     monkeypatch.setattr(runner, 'CONTROL', control)
-    monkeypatch.setattr(processes, 'process_state', lambda *a: 'alive')
-    state = dict(training_identity={'pid':123}, settings={'template':'template'},
+    monkeypatch.setattr(processes, 'process_state', lambda *a: training_state)
+    state = dict(training_identity={'pid':123}, settings={'template':'template', 'expected_training_state': training_state},
                  entries=[dict(name=n, status='pending', selection={}) for n, _, _ in runner.EMA_SERIES])
     path = tmp_path / 'series.json'
     path.write_text(json.dumps(state))
@@ -278,6 +281,14 @@ def test_series_next_order_and_failure_never_skips(runner, monkeypatch, tmp_path
         assert [e['status'] for e in json.loads(path.read_text())['entries']] == ['done', 'done', 'pending']
 
 
+@pytest.mark.parametrize('expected,observed', [('alive','dead'), ('dead','alive'), ('dead','unknown'), ('invalid','alive')])
+def test_series_training_state_fails_closed(runner, monkeypatch, expected, observed):
+    import villa_gpu_manager.processes as processes
+    monkeypatch.setattr(processes, 'process_state', lambda *a: observed)
+    with pytest.raises((ValueError, RuntimeError)):
+        runner.check_series_training_state({'expected_training_state':expected}, {})
+
+
 def test_evaluation_cache_names_include_series_directory(runner, monkeypatch, tmp_path):
     template = tmp_path / 'template.json'
     template.write_text(json.dumps({'evaluation': {}}))
@@ -297,7 +308,7 @@ def test_equal_scroll_report_and_bolding(runner, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
     from fiber3d_comparison_report import SCROLLS, comparison_markdown, equal_scroll_score
     rows = []
-    for name, failures in [('A', 99), ('B', 49)]:
+    for name, failures in [('Classic', 99), ('B', 49)]:
         scrolls = {s:dict(directions=1, failures=failures, directed_reference_mm=2000,
                          mean_segment_length_mm=2000/(failures+1), median_segment_length_mm=1,
                          p05_segment_length_mm=.1, p95_segment_length_mm=10, zero_length_segments=0) for s in SCROLLS}
@@ -307,9 +318,50 @@ def test_equal_scroll_report_and_bolding(runner, monkeypatch):
     assert '| B | **40.000** |' in doc
     assert '| B | **49** | **40.000** | **1.000** | **0.1000** | **10.000** | **0** |' in doc
     rows[0]['selection'] = dict(selected=dict(step=1, samples=128, metric=.4), sha256='hash')
-    assert '| A | 1 | 128 | unknown | 0.400000 |' in comparison_markdown(rows)
+    assert '| Classic | 1 | 128 | unknown | unspecified | unknown | 0.400000 |' in comparison_markdown(rows)
     rows[0]['selection']['selected']['decay'] = None
-    assert '| A | 1 | 128 | raw | 0.400000 |' in comparison_markdown(rows)
+    assert '| Classic | 1 | 128 | raw | unspecified | unknown | 0.400000 |' in comparison_markdown(rows)
     rows[1]['metrics']['scrolls'][SCROLLS[0]]['directions'] = 2
     with pytest.raises(ValueError, match='coverage'):
         comparison_markdown(rows)
+
+
+def test_snapshot_labels(runner, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
+    from fiber3d_comparison_report import snapshot_label
+    row = {'name':'New current99', 'selection':{'run':'/runs/finetune_5scroll_s1a',
+           'selected':{'path':'/snapshots/current_ema_0p99.pt', 'samples':6336000, 'step':49500, 'metric':.455648}}}
+    assert snapshot_label(row) == 'Combined finetune EMA99 (latest/current; test=0.455648) — 6,336,000 samples / u49,500'
+    row['selection']['run'] = '/runs/s1a_nml_test'
+    assert snapshot_label(row).startswith('NML EMA99 (latest/current; ')
+    row['selection']['run'] = '/runs/compare_5scroll_test'
+    row['selection']['selected']['path'] = '/snapshots/best.pt'
+    assert snapshot_label(row).startswith('JSON raw (best test loss; ')
+    assert snapshot_label({'name':'Classic'}) == 'Classic'
+
+
+def test_classic_normalization(runner, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(runner.__file__).parent))
+    from fiber3d_comparison_report import SCROLLS, classic_normalized_score, comparison_markdown
+    def metrics(values):
+        return {'scrolls': {s: {'mean_segment_length_mm': v} for s, v in zip(SCROLLS, values)}}
+    base = metrics([18, 1.8, 3, 4, 5])
+    scale = 31.8 / 5
+    assert classic_normalized_score(base, base) == pytest.approx(scale)
+    assert classic_normalized_score(metrics([19.8, 1.98, 3.3, 4.4, 5.5]), base) == pytest.approx(scale * 1.1)
+    a = classic_normalized_score(metrics([22, 1.8, 3, 4, 5]), base)
+    b = classic_normalized_score(metrics([18, 2.2, 3, 4, 5]), base)
+    assert a == pytest.approx(b)
+    scaled_base = metrics([180, 1.8, 3, 4, 5])
+    scaled_model = metrics([220, 1.8, 3, 4, 5])
+    assert classic_normalized_score(scaled_model, scaled_base) / classic_normalized_score(
+        scaled_base, scaled_base) == pytest.approx(a / scale)
+    assert classic_normalized_score(metrics([0, 1, 1, 1, 1]), base) == 0
+    with pytest.raises(ValueError, match='positive'):
+        classic_normalized_score(base, metrics([0, 1, 1, 1, 1]))
+    for bad in [-1, float('nan'), float('inf')]:
+        with pytest.raises(ValueError, match='invalid'):
+            classic_normalized_score(metrics([bad, 1, 1, 1, 1]), base)
+    for rows in [[], [{'name':'A', 'metrics':base}], [{'name':'Classic','metrics':base}] * 2]:
+        with pytest.raises(ValueError):
+            comparison_markdown(rows)
