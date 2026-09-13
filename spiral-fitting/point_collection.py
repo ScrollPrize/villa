@@ -572,9 +572,14 @@ def link_unattached_points_to_patches(
     between_shadows = []
     shadows: Dict[int, Dict[str, Any]] = {}
     for collection_id, collection in point_collections.items():
+        absolute = collection.get('metadata', {}).get('winding_is_absolute', False)
         unattached = {
             point_id: point for point_id, point in collection['points'].items()
             if 'on_patch' not in point
+            # Startup permits unusable annotations on unattached absolute
+            # points. Keep them out of supervision when new patches arrive too.
+            and (not absolute or (np.isfinite(point['winding_annotation'])
+                                  and point['winding_annotation'] > 0))
         }
         if not unattached:
             continue

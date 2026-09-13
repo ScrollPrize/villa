@@ -268,16 +268,18 @@ def _validate_upload_content(kind, role, directory, *, operation=None,
     raise ApiError(HTTPStatus.BAD_REQUEST, f"Unknown input kind {kind!r}")
 
 
-def _merge_pcl_documents_assigning(existing, incoming):
+def _merge_pcl_documents_assigning(existing, incoming, *, min_next_id=0):
     """Merge the incoming multi-collection document into the existing one.
 
     Returns the merged document and the mapping from each incoming
     collection key to the key it received in the merged document: the
-    identity an editable-role collection has from now on.
+    identity an editable-role collection has from now on. ``min_next_id``
+    reserves IDs removed earlier in the same commit.
     """
     merged = dict(existing)
     collections = dict(existing.get("collections", {}))
-    next_id = max((int(key) for key in collections), default=-1) + 1
+    next_id = max(min_next_id,
+                  max((int(key) for key in collections), default=-1) + 1)
     assigned = {}
     for key, collection in sorted(incoming.get("collections", {}).items(),
                                   key=lambda item: int(item[0])):

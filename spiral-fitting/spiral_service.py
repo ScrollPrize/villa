@@ -2855,6 +2855,9 @@ class ServiceState:
         with target.open("r", encoding="utf-8") as stream:
             merged = json.load(stream)
         target_collections = merged.get("collections")
+        # Pending additions must not take the identity of a resident collection
+        # deleted by this commit: the next Run still has that collection loaded.
+        min_next_id = max((int(key) for key in target_collections), default=-1) + 1
         target_ids = [snapshot.record.target_collection_id
                       for snapshot in mutation_snapshots]
         if len(set(target_ids)) != len(target_ids):
@@ -2886,7 +2889,8 @@ class ServiceState:
         for snapshot in additions:
             with Path(snapshot.path).open("r", encoding="utf-8") as stream:
                 incoming = json.load(stream)
-            merged, assigned = _merge_pcl_documents_assigning(merged, incoming)
+            merged, assigned = _merge_pcl_documents_assigning(
+                merged, incoming, min_next_id=min_next_id)
             collection_ids[(snapshot.kind, snapshot.id)] = assigned
         temp = target.with_name(
             f".{target.name}.incoming-{secrets.token_hex(4)}")

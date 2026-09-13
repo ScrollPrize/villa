@@ -3685,15 +3685,14 @@ class CommitTests(unittest.TestCase):
         self.assertIn("same_winding_artifact", response)
         result = json.loads(relative.read_text())
         self.assertEqual(result["custom"], "kept")
-        # The addition is renumbered onto the merged snapshot (max id + 1
-        # after the deletion of "7").
-        self.assertEqual(sorted(result["collections"], key=int), ["2", "3"])
+        # The addition stays above the original maximum, including deleted IDs.
+        self.assertEqual(sorted(result["collections"], key=int), ["2", "8"])
         self.assertEqual(
             [point["wind_a"] for point in
              result["collections"]["2"]["points"].values()], [0, 1])
         self.assertEqual(result["collections"]["2"]["points"]["0"]["p"],
                          [1, 0, 0])
-        self.assertEqual(result["collections"]["3"]["name"], "wraps_new")
+        self.assertEqual(result["collections"]["8"]["name"], "wraps_new")
         self.assertEqual(json.loads(same.read_text())["collections"], {})
         self.assertEqual(len(list(self.dataset.glob(
             "relative_windings.json.*.bak"))), 1)
@@ -3858,6 +3857,29 @@ class CommitTests(unittest.TestCase):
         self.assertNotIn("operation", pending[0])
         mark(pending)
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+
+    def test_commit_deleting_highest_id_does_not_reuse_it_for_additions(self):
+        target = self._stage_same_winding_addition()
+        source = json.loads(target.read_text())
+        upload_id = _upload_input(
+            self.state, "pcl", "delete-3",
+            {"3.json": json.dumps(source).encode()},
+            role="same_winding", operation="delete_collection",
+            target_collection_id="3",
+            base_source_revision=self.state._file_sha256(target))
+        self.state.finalize_upload(upload_id)
+        self._finalize("pcl", "add-second", PCL_FILES, role="same_winding")
+
+        self.state.commit_inputs()
+
+        self.assertEqual(sorted(json.loads(target.read_text())["collections"]),
+                         ["4", "5"])
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, _, _, _ = self.session.run_calls[-1]
+        additions = {entry["id"]: entry["committed_collection_ids"]
+                     for entry in pending if entry["id"] != "delete-3"}
+        self.assertEqual(additions,
+                         {"add-same": {"0": "4"}, "add-second": {"0": "5"}})
 
     def test_incorporated_addition_is_requeued_to_learn_its_committed_ids(self):
         # The fit holds the collection under a resident id only; a later

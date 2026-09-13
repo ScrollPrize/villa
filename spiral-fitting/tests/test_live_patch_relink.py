@@ -279,6 +279,27 @@ class LivePatchRelinkTests(unittest.TestCase):
         self.assertNotIn('on_patch', context.regular_pcl_catalog[cid]['points'][0])
         context._rebuild_pcl_sampling_strata.assert_not_called()
 
+    def test_absolute_relink_skips_unusable_annotations(self):
+        cid = 5
+        pcl = self._regular_pcl(cid, [[50.0, 10.0, 10.0]] * 5)
+        pcl['metadata'].update(winding_is_absolute=True, input_role='absolute')
+        annotations = [float('nan'), float('inf'), 0.0, -1.0, 2.0]
+        for point, annotation in zip(pcl['points'].values(), annotations):
+            point['winding_annotation'] = annotation
+        context = self._context({cid: pcl})
+
+        self._add_patch(context, 'p1', _flat_patch(50.0, 0.0, 0.0))
+
+        self.assertIn('p1', context.verified_patches)
+        self.assertEqual(len(pcl['points']), 5)
+        for point_id in range(4):
+            self.assertNotIn('on_patch', pcl['points'][point_id])
+        self.assertEqual(pcl['points'][4]['on_patch']['id'], 'p1')
+        self.assertEqual(len(context.cross_patch_pcls), 1)
+        attached = context.cross_patch_pcls[0]['points_by_patch']['p1']
+        self.assertEqual(len(attached), 1)
+        self.assertEqual(context.unattached_pcl_strips, [])
+
     def test_second_patch_claims_points_the_first_left_over(self):
         cid = 5
         pcl = self._regular_pcl(cid, [
