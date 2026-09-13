@@ -64,20 +64,21 @@ def _get_with_retry(url: str, timeout: float = 60.0, retries: int = 4) -> reques
     `requests.get(url)` with no timeout blocks forever when a connection stalls after the
     headers arrive: the socket stays open, no more body arrives, and nothing raises. Measured
     against a local server that sends headers, half the body, then nothing — the shape of a
-    stalled CDN connection — a bare `requests.get` was still running after 15 minutes, while the
-    same call with `timeout=` raised in 5 s.
+    stalled CDN connection — a bare `requests.get` was still running when the test gave up at
+    15 s, while the same call with `timeout=` raised in 5.0 s. In the wild this cost 3 h 23 m of
+    a stalled job before it was noticed.
 
     Retries reuse `_is_transient_read_error`, so deterministic failures (404, auth) re-raise on
     the first attempt rather than being retried four times.
     """
     delay = 0.5
-    for attempt in range(retries):
+    for attempt in range(max(1, int(retries))):
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
             return response
         except Exception as e:
-            if attempt == retries - 1 or not _is_transient_read_error(e):
+            if attempt == max(1, int(retries)) - 1 or not _is_transient_read_error(e):
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 8.0)
