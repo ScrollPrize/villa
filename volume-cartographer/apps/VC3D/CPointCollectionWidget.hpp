@@ -128,6 +128,6 @@ private slots:
     QDoubleSpinBox* _winding_spinbox;
     QPushButton *_convert_to_anchor_button;
 
-    std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
+    std::unordered_map<vc::PointRef, CorrPointResult> _corr_point_results;
     std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };

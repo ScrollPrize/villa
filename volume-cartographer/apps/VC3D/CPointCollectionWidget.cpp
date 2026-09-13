@@ -337,7 +337,7 @@ void CPointCollectionWidget::refreshTree()
             QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
             pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
 
-            auto res_it = _corr_point_results.find(point.id);
+            auto res_it = _corr_point_results.find({point.collectionId, point.id});
             if (res_it != _corr_point_results.end()) {
                 if (corrResultPositionMatches(res_it->second, point.p)) {
                     if (std::isfinite(res_it->second.winding_obs)) {
@@ -480,7 +480,7 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
         pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
 
-        auto res_it = _corr_point_results.find(point.id);
+        auto res_it = _corr_point_results.find({point.collectionId, point.id});
         if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
             if (std::isfinite(res_it->second.winding_obs)) {
                 pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
@@ -531,7 +531,7 @@ void CPointCollectionWidget::onPointChanged(const ColPoint& point)
             if (winding_item) winding_item->setText({});
             if (err_item) err_item->setText({});
 
-            auto res_it = _corr_point_results.find(point.id);
+            auto res_it = _corr_point_results.find({point.collectionId, point.id});
             if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
                 if (winding_item && std::isfinite(res_it->second.winding_obs)) {
                     winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
@@ -974,26 +974,53 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
         }
         utils::Json j = utils::Json::parse_file(jsonPath);
 
-        if (j.contains("points") && j["points"].is_object()) {
-            auto points = j["points"];  // copy — ref into Json::at() cache gets evicted by nested calls
+        const auto readId = [](const utils::Json& value) -> std::optional<uint64_t> {
+            if (!value.is_number_integer() || value.get_double() < 0) return std::nullopt;
+            return value.get_uint64();
+        };
+        const auto storeResult = [this](vc::PointRef ref, const utils::Json& val) {
+            CorrPointResult r;
+            if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
+                r.winding_obs = val["winding_obs"].get_float();
+            }
+            if (val.contains("winding_err") && val["winding_err"].is_number()) {
+                r.winding_err = val["winding_err"].get_float();
+            }
+            if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
+                r.p[0] = val["p"][0].get_float();
+                r.p[1] = val["p"][1].get_float();
+                r.p[2] = val["p"][2].get_float();
+            }
+            _corr_point_results[ref] = r;
+        };
+
+        // The legacy ID-keyed object loses results when collections share IDs.
+        // Prefer the qualified list, even when it is empty.
+        if (j.contains("points_list") && j["points_list"].is_array()) {
+            auto points = j["points_list"];
+            for (const auto& val : points) {
+                if (!val.is_object() || !val.contains("collection_id") ||
+                    !val.contains("point_id")) continue;
+                const auto cid = readId(val["collection_id"]);
+                const auto pid = readId(val["point_id"]);
+                if (cid && pid) storeResult({*cid, *pid}, val);
+            }
+        } else if (j.contains("points") && j["points"].is_object()) {
+            auto points = j["points"];  // copy before nested Json access
             for (auto it = points.begin(); it != points.end(); ++it) {
                 const std::string key = it.key();
                 const auto& val = *it;
+                if (!val.is_object() || key.empty() ||
+                    key.find_first_not_of("0123456789") != std::string::npos) continue;
                 uint64_t pid = 0;
                 try { pid = std::stoull(key); } catch (...) { continue; }
-                CorrPointResult r;
-                if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
-                    r.winding_obs = val["winding_obs"].get_float();
+                if (val.contains("collection_id")) {
+                    const auto cid = readId(val["collection_id"]);
+                    if (cid) storeResult({*cid, pid}, val);
+                } else {
+                    const auto refs = _point_collection->findPointRefs(pid);
+                    if (refs.size() == 1) storeResult(refs.front(), val);
                 }
-                if (val.contains("winding_err") && val["winding_err"].is_number()) {
-                    r.winding_err = val["winding_err"].get_float();
-                }
-                if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
-                    r.p[0] = val["p"][0].get_float();
-                    r.p[1] = val["p"][1].get_float();
-                    r.p[2] = val["p"][2].get_float();
-                }
-                _corr_point_results[pid] = r;
             }
         }
 
