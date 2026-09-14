@@ -312,6 +312,16 @@ if(VC_RUN_E2E)
         ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
 endif()
 
+add_executable(test_obj2tifxyz_e2e test_obj2tifxyz_e2e.cpp)
+target_link_libraries(test_obj2tifxyz_e2e PRIVATE doctest::doctest nlohmann_json::nlohmann_json)
+vc_register_test_target(test_obj2tifxyz_e2e)
+if(VC_RUN_E2E)
+    add_test(NAME test_obj2tifxyz_e2e COMMAND test_obj2tifxyz_e2e)
+    vc_register_ctest(test_obj2tifxyz_e2e test_obj2tifxyz_e2e)
+    set_tests_properties(test_obj2tifxyz_e2e PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>")
+endif()
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_volume_sample)
