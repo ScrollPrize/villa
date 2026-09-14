@@ -411,3 +411,35 @@ def test_adopted_fiber_reingests_snapshot(context, tmp_path, dataset_change):
     assert context.fiber_catalog['fiber-uuid']['source_file'] == str(snapshot)
     assert context._workspace_membership['fiber-uuid']['revision'] == 1
     assert context._workspace_membership['fiber-uuid']['resident_id'] == 6
+
+
+@pytest.mark.parametrize('radius', [0, 10])
+@pytest.mark.parametrize('enabled', [False, True])
+def test_combined_role_and_track_settings_use_final_geometry(
+        context, monkeypatch, radius, enabled):
+    import fit_spiral
+    ctx = context
+    ctx.config.update({'input_use_pcl_relative': not enabled,
+                       'track_exclusion_radius': 5})
+    ctx._source_point_collections[5]['metadata']['input_role'] = 'relative'
+    ctx.using_tracks = True
+    ctx.tracks = ['retained track']
+    ctx.track_families = ctx.track_source_ids = None
+    ctx.track_crossing_cache = ctx.track_graph = None
+    ctx._refresh_trusted_geometry()
+    old_tree = ctx.trusted_geometry_tree
+
+    def prepare(*args, anchor_tree, sampling_config, **kwargs):
+        return {'flat_zyx_cpu': torch.zeros((1, 3)),
+                'anchor_tree': anchor_tree, 'policy': sampling_config}
+
+    monkeypatch.setattr(fit_spiral, 'prepare_main_phase_tracks', prepare)
+    ctx.apply_config({'input_use_pcl_relative': enabled,
+                      'track_exclusion_radius': radius,
+                      'track_max_tortuosity': 2}, current_iteration=0)
+
+    assert bool(ctx.regular_pcl_catalog) == enabled
+    assert ctx.trusted_geometry_tree is not old_tree
+    assert ctx.prepared_main_tracks['anchor_tree'] is ctx.trusted_geometry_tree
+    assert ctx.prepared_main_tracks['policy']['max_tortuosity'] == 2
+    assert ctx.preview_extent_tracks[0] is ctx.prepared_main_tracks['flat_zyx_cpu']

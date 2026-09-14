@@ -712,3 +712,35 @@ def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(art
     ws.catalog.accept([Change(ws.catalog.entry(peer).identity, 1, None)])
     assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
     assert artifact_names(state, original) == {'first.json', 'peer.json', 'last.json'}
+
+
+@pytest.mark.parametrize('deleted', [False, True])
+def test_existing_external_refresh_retries_failed_application(workspace, deleted):
+    editing, resident = workspace
+    entry = editing.catalog.entries()[0]
+    target = Path(entry.identity.source)
+    document = json.loads(target.read_text())
+    if deleted:
+        del document['collections']['7']
+    else:
+        document['collections']['7']['name'] = 'external'
+    target.write_text(json.dumps(document))
+    resident.fail = True
+    editing.claim(TOKEN, 'failed-refresh')
+    refreshed = editing.catalog.entry(entry.identity.id)
+    assert (refreshed.accepted, refreshed.applied, refreshed.persisted) == (2, 1, 2)
+    assert refreshed.errors
+    resident.fail = False
+    editing.claim(TOKEN, 'retry-refresh')
+    restored = editing.catalog.entry(entry.identity.id)
+    assert (restored.accepted, restored.applied, restored.persisted) == (2, 2, 2)
+    assert not restored.errors
+    assert resident.calls[-1][1][0]['revision'] == 2
+    calls = len(resident.calls)
+    editing.claim(TOKEN, 'refresh-again')
+    assert len(resident.calls) == calls
+    assert json.loads(target.read_text()) == document
+    # A subsequent local edit commits against the captured external base.
+    change(editing, entry.identity.id, 2, 'local')
+    commit(editing, entry.identity.id, 3)
+    assert json.loads(target.read_text())['collections']['7']['name'] == 'local'

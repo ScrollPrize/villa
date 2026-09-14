@@ -248,11 +248,18 @@ class Catalog:
                                  if error[:2] != (revision.number, "apply")))
 
     def mark_persisted(self, revisions):
+        self._mark_persisted(revisions, require_applied=True)
+
+    def mark_external_persisted(self, revisions):
+        """Record captured dataset content even if resident application fails."""
+        self._mark_persisted(revisions, require_applied=False)
+
+    def _mark_persisted(self, revisions, *, require_applied):
         revisions = tuple(revisions)
         with self._lock:
             self._validate_selection(revisions)
             for revision in revisions:
-                if revision.number not in self._entries[revision.id].applied_history:
+                if require_applied and revision.number not in self._entries[revision.id].applied_history:
                     raise ApiError(409, "Only successfully applied revisions can be committed")
             for revision in revisions:
                 entry = self._entries[revision.id]

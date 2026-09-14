@@ -4509,31 +4509,6 @@ class FitContext:
                     [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
                     + list(self.unattached_strip_sampling_groups),
                     self.config)
-            if reprepare_tracks and rebuilt_tracks is None and self.tracks:
-                rebuilt_tracks = prepare_main_phase_tracks(
-                    self.tracks, None, float(self.config['track_exclusion_radius']),
-                    self.device, anchor_tree=self.trusted_geometry_tree,
-                    sampling_config=validate_track_sampling_config(self.config),
-                    track_families=self.track_families,
-                    track_source_ids=self.track_source_ids,
-                    crossing_cache=self.track_crossing_cache,
-                    track_graph=self.track_graph,
-                    progress=self.progress)
-                replace_prepared_tracks = True
-
-            target_tracks = (
-                rebuilt_tracks
-                if replace_prepared_tracks else self.prepared_main_tracks)
-            if ({'track_length_bin_weights',
-                 'track_max_track_crossing_per_step',
-                 'track_min_walk_steps_per_track',
-                 'track_max_walk_steps_per_track',
-                 'track_min_walks_per_track',
-                 'track_max_walks_per_track',
-                 'track_walk_minimum_cycle_travel'}
-                    & changed):
-                configure_prepared_track_sampling(target_tracks, config)
-
             if 'patch_loss_z_margin' in changed:
                 self.patch_sampling_probabilities = \
                     self._prepare_patch_sampling_cache(self.verified_patches_list)
@@ -4651,6 +4626,32 @@ class FitContext:
                 rebuilt_unverified_probabilities = self.unverified_patch_sampling_probabilities
                 rebuilt_unverified_atlas = self.unverified_patch_atlas
                 rederived_views = True
+            # Prepare tracks against the final participation geometry and policy.
+            if reprepare_tracks and rebuilt_tracks is None and self.tracks:
+                rebuilt_tracks = prepare_main_phase_tracks(
+                    self.tracks, None, float(self.config['track_exclusion_radius']),
+                    self.device, anchor_tree=self.trusted_geometry_tree,
+                    sampling_config=validate_track_sampling_config(self.config),
+                    track_families=self.track_families,
+                    track_source_ids=self.track_source_ids,
+                    crossing_cache=self.track_crossing_cache,
+                    track_graph=self.track_graph,
+                    progress=self.progress)
+                replace_prepared_tracks = True
+
+            target_tracks = (
+                rebuilt_tracks
+                if replace_prepared_tracks else self.prepared_main_tracks)
+            if ({'track_length_bin_weights',
+                 'track_max_track_crossing_per_step',
+                 'track_min_walk_steps_per_track',
+                 'track_max_walk_steps_per_track',
+                 'track_min_walks_per_track',
+                 'track_max_walks_per_track',
+                 'track_walk_minimum_cycle_travel'}
+                    & changed):
+                configure_prepared_track_sampling(target_tracks, config)
+
             if rebuild_strata and not rederived_views:
                 self._rebuild_pcl_sampling_strata()
         except Exception:

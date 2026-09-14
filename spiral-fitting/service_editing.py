@@ -108,13 +108,17 @@ class EditingWorkspace:
                                else self._copy(identity.source, destination))
                 changes.append(Change(identity, entry.accepted, content))
             changed = self.catalog.accept(changes) if changes else ()
+            # These snapshots already exist in the dataset. Keep persistence
+            # separate from resident application so a failed refresh stays clean
+            # and is selected again on the next reconnect.
+            self.catalog.mark_external_persisted(changed)
             changed_ids = {r.id for r in changed}
             revisions = (*changed, *(e.current for e in self.catalog.entries()
                 if e.applied < e.accepted and e.accepted == e.persisted
                 and e.identity.id not in changed_ids))
             self.accepted_commands[command_id] = revisions
-        if revisions and self._apply(command_id, revisions).get('applied'):
-            self.catalog.mark_persisted(revisions)
+        if revisions:
+            self._apply(command_id, revisions)
 
     def require(self, token):
         self.lease.require(token)
