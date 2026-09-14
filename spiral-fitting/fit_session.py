@@ -946,6 +946,7 @@ def write_autosave_metadata(
     session_namespace: str | Path,
     dataset_root: str | Path,
     completed_iterations: int,
+    model_state_sha256: str | None = None,
 ) -> str:
     """Record what an autosave is, next to it, atomically.
 
@@ -967,6 +968,10 @@ def write_autosave_metadata(
         "sha256": file_sha256(checkpoint),
         "api_version": API_VERSION,
     }
+    if model_state_sha256:
+        # The surface identity the checkpoint payload carries, readable
+        # without loading the archive.
+        document["model_state_sha256"] = str(model_state_sha256)
     temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(document, stream, indent=2)

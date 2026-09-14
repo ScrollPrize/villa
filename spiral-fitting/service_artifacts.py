@@ -171,14 +171,36 @@ class ArtifactRegistry:
                 raise TimeoutError(f"Artifact readers did not stop; retained {root}")
             time.sleep(0.05)
 
-    def prune(self, kind, session_id, keep):
-        """Prune all but the newest ``keep`` artifacts of one kind."""
+    def find(self, kind, root, session_id=None):
+        """The live artifact of one kind already registered on ``root``.
+
+        Returns its reference, or None; ``session_id`` narrows the search to
+        one session. Two artifacts must never both own one directory, since
+        pruning either would delete the other's files.
+        """
+        root = Path(root).resolve(strict=False)
+        with self._lock:
+            for artifact in self._artifacts.values():
+                if (artifact.kind == kind and Path(artifact.root) == root
+                        and (session_id is None
+                             or artifact.session_id == session_id)):
+                    return artifact.ref()
+        return None
+
+    def prune(self, kind, session_id, keep, retain=None):
+        """Prune all but the newest ``keep`` artifacts of one kind.
+
+        ``retain(artifact)`` may exempt an older artifact from this pass; it
+        stays registered and is reconsidered at the next one.
+        """
         to_delete = []
         with self._lock:
             matching = [a for a in self._artifacts.values()
                         if a.kind == kind and a.session_id == session_id]
             matching.sort(key=lambda a: a.generation)
             for artifact in matching[:-keep] if keep else matching:
+                if retain is not None and retain(artifact):
+                    continue
                 del self._artifacts[artifact.artifact_id]
                 self._pruned_ids[artifact.artifact_id] = True
                 while len(self._pruned_ids) > MAX_PRUNED_IDS_REMEMBERED:

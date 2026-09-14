@@ -622,6 +622,11 @@ class InteractiveFitSession:
         self._next_preview_iteration = None
         self._automatic_previews_disabled = False
         self._preview_session_id = uuid.uuid4().hex
+        # The checkpoint the resident model is byte-identical to, or None
+        # once a step has moved the parameters away from every saved file.
+        # Set by a save, a load and a resume; the host pairs it with the
+        # preview it published for the same model state.
+        self._checkpoint_state = None
         # Set by every run; the default matters only for the interval before
         # the first one.
         self._autosave_on_pause = True
@@ -698,6 +703,8 @@ class InteractiveFitSession:
                 # knows whether a diagnostics publication follows the surface.
                 "preview_diagnostics": getattr(
                     self, "_preview_diagnostics", False),
+                "checkpoint_state": copy.deepcopy(
+                    getattr(self, "_checkpoint_state", None)),
                 "supports_input_incorporation": self._context is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
                 "progress": self._progress_reporter().snapshot(),
@@ -1031,8 +1038,33 @@ class InteractiveFitSession:
             self._context = context
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
+        self._record_checkpoint_state(
+            getattr(context, "resume_path", None), context.start_iteration)
         self._progress_reporter().clear()
         self._transition(SessionState.Idle, IDLE_PHASE)
+
+    def _record_checkpoint_state(self, path, completed_iterations):
+        """Name the checkpoint the resident model now equals, if any.
+
+        The digest is taken from the live model rather than read out of the
+        file: it is then right for checkpoints written before the field
+        existed, and for a resume that migrated the payload on the way in.
+        """
+        state = None
+        digest = getattr(self._context, "model_state_digest", None)
+        if path and digest is not None:
+            try:
+                state = {
+                    "path": str(path),
+                    "model_state_sha256": digest(),
+                    "completed_iterations": int(completed_iterations),
+                }
+            except Exception as exc:
+                print(f"WARNING: could not digest the resident model state: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+        with self._condition:
+            self._checkpoint_state = state
+        return state
 
     def _optimize(self, context):
         """Drive the resident optimizer loop on the fitter thread.
@@ -1190,12 +1222,15 @@ class InteractiveFitSession:
                 reason=f"save command {command.command_id}")
         path = None
         error = None
+        checkpoint_state = None
         try:
             self._progress_reporter().begin(
                 "saving_checkpoint", "Saving checkpoint",
                 detail=Path(command.path).name)
             path = self._context.save_checkpoint(
                 command.path, self._completed)
+            checkpoint_state = self._record_checkpoint_state(
+                path, self._completed)
             self._progress_reporter().finish()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1207,7 +1242,10 @@ class InteractiveFitSession:
             # The waiter is released only once the session is back in the
             # state it will be observed in.
             if error is None:
-                command.complete(path=path)
+                command.complete(
+                    path=path,
+                    model_state_sha256=(checkpoint_state or {}).get(
+                        "model_state_sha256"))
             else:
                 command.fail(error)
 
@@ -1304,6 +1342,7 @@ class InteractiveFitSession:
         finally:
             del checkpoint, pending
         self._progress_reporter().clear()
+        checkpoint_state = self._record_checkpoint_state(path, completed)
         with self._condition:
             # The durable step the checkpoint reached is the session's
             # iteration now; the LR schedule was realigned to it rather than
@@ -1318,7 +1357,9 @@ class InteractiveFitSession:
                 SessionState.Idle, IDLE_PHASE)
         self._publish_status()
         command.complete(path=path, completed_iterations=completed,
-                         config_revision=revision)
+                         config_revision=revision,
+                         model_state_sha256=(checkpoint_state or {}).get(
+                             "model_state_sha256"))
 
     def _run_checkpoint_discard(self, command):
         """Release a payload no rank will apply and return to Idle."""
@@ -1695,6 +1736,8 @@ class InteractiveFitSession:
             command.fail(error)
             raise RuntimeError(error) from exc
         self._progress_reporter().clear()
+        self._record_checkpoint_state(
+            paths.checkpoint or None, context.start_iteration)
         with self._condition:
             self.input_manifest = paths.manifest()
             self._completed = self._target = context.start_iteration
@@ -1721,6 +1764,7 @@ class InteractiveFitSession:
         with self._condition:
             self._iteration_in_progress = None
             self._completed = completed_iterations
+            self._checkpoint_state = None
             self._latest_metrics = {"total_loss": total_loss, "losses": dict(losses),
                                     "learning_rate": learning_rate, **dict(metrics or {})}
             self._pending = max(0, self._pending - 1)
@@ -1804,6 +1848,7 @@ class InteractiveFitSession:
             detail=AUTOSAVE_CHECKPOINT_NAME)
         autosave = str(Path(self._output_path) / AUTOSAVE_CHECKPOINT_NAME)
         self._context.save_checkpoint(autosave, self._completed)
+        checkpoint_state = self._record_checkpoint_state(autosave, self._completed)
         # Name the file beside itself. An always-loaded service picks its
         # startup autosave from these sidecars alone: the output root it
         # belongs to, the dataset it was fit against, and how far it got.
@@ -1812,7 +1857,8 @@ class InteractiveFitSession:
             autosave,
             session_namespace=self.paths.output_directory,
             dataset_root=self.paths.dataset_root,
-            completed_iterations=self._completed)
+            completed_iterations=self._completed,
+            model_state_sha256=(checkpoint_state or {}).get("model_state_sha256"))
         return autosave
 
     def _publish_preview(self, diagnostics=False):
