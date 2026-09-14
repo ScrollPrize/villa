@@ -1,61 +1,24 @@
-# Demand-scoped GPU lease
+# Plan
 
-## Startup follow-up
-Defer manager bootstrap and the first Supervisor tick/registration until an input read is ready for
-GPU dispatch. Before that, hold no grant and launch no GPU worker. Closing an
-unused lease must not register a task. Retain existing idle release and pause
-semantics after activation; no protocol changes. Test delayed reads, first
-ready tile and close-before-demand with the approved CPU/live test caller.
-Update specs, demand GPU docs and task log with this startup contract.
-
-## Goal follow-up: cached CPU validation
-
-The cached-only run has now terminated on missing chunk141/60/58 in family4,
-after three completed searches (68/69/67). Continue only the remaining four
-families in a fresh report using the user-requested adaptive demand lease:
-nonexclusive20GiB budget, no initial request, cooperative pause and30s idle
-release. Retain completed reports. Never silently skip missing coverage.
-
-After exact-repeat verification, finish the seven family refinements not
-completed in the interrupted report: plain mean LRU own/transfer seeds,
-windowed anchors own/transfer seeds, and normalized mean novelty/plain/hit
-variants. Reuse the original saved axes/seeds unchanged. Run cached-only with
-inference disabled, original controls, per-family repeats and best repeat.
-Missing coverage is a real incomplete-test result, not permission to fill tiles
-or silently skip a candidate. Keep the GPU sweep stopped.
-
-The preceding cached-only restriction describes the completed interim phase;
-after its recorded miss, the adaptive continuation above is the active plan.
-
-Keep the GPU sweep stopped. Inspect saved unmatched failure regions, then
-repeat LRU64 and support-softmin67 with `fill_missing=false` through the approved
-experiment caller. Include original controls and duplicate softmin candidate;
-compare exact replay hashes, not just counts. Missing coverage must fail closed,
-never request GPUs. Preserve earlier interrupted search config in its committed
-planning/embedding_anchor_boundaries_next.json artifact. Document results.
-
-1. Stop sweep via approved caller; verify terminal zero grant.
-2. Separate GPU lifetime from DemandWorkerPool CPU readers/accumulators.
-   Gate GPU startup until authorization; drain submitted tiles before join;
-   retain pending reads, accumulation and native tracing state.
-3. Reuse manager Supervisor with pool cohort adapter. Lazy registration;
-   self-pause after 30 idle seconds, unpause on demand; administrative pause
-   remains authoritative. CPU tracing intentionally continues outside GPU grant.
-4. Replace sweep-wide fixed reservation with shared demand-loop ownership.
-   Cached-only variants reserve nothing. Preserve cache identity validation.
-5. Native request waits must tolerate scheduling pause with heartbeat support,
-   preserving disconnect/error and bounded coordinator failure detection.
+1. Add training-local geometry filtering shared by file-backed train/test 3D
+   loaders. Keep maximal contiguous cspline/trace runs between exact CP line
+   indices; split at rejected spans, never bridge gaps; trim exterior tails.
+2. Preserve NML node/edge supervision (synthetic legacy metadata is not real
+   provenance). Missing/legacy JSON modes are ineligible. Report retained runs
+   and skipped files; fail clearly if a dataset has no eligible data.
+3. Keep scroll-balanced arclength sampling over retained lengths and existing
+   optimized queued loading/targets/manager. Independent runs cannot bridge gaps.
+4. New JSON-only five-scroll config from regular EMA comparison: LR0.01,
+   2M updates,batch128,no embeddings,normal test/snapshot intervals. Remove
+   historical auxiliary dataset, whose provenance is unqualified.
+5. CPU tests: geometry, gap-free deterministic sampling, train/test loader
+   integration, actual corpus coverage. No GPU kernels or separate evaluator
+   changes. Independent plan/implementation review.
 
 ## Spec update
-Document 30s idle release, safe drain/join before acknowledgement, CPU continuation,
-no admission while paused, locked manager wire protocol unchanged.
-
-## Tests
-Independent plan/implementation review. Approved cooperative test caller: fake
-clock lifecycle tests, shared pool output equivalence across restarts, cleanup,
-manager pause/reacquire, native heartbeat timeout. Small manager-granted GPU
-smoke test where available; do not launch full sweep.
+Document training-only eligibility, exact CP trimming, gap splitting and NML
+exception; no length cutoff. Changed data identity invalidates old comparisons.
 
 ## Docs updates / changelog
-Update tracing docs, status, task log and changelog. Previous boundary sweep is
-interrupted; preserve partial report, do not label unrepeated winners final.
+Document new config/start command, changed test population, corpus statistics,
+tests and limitations. Update status/task_log and concise changelog entry.

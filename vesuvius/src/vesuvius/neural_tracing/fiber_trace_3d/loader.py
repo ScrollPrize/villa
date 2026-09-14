@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace, field
 from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
                         InvalidNormalSampleError)
 from .arc_sampling import FiberLocation, ScrollArcSampler
+from .training_spans import training_fiber_spans
 from pathlib import Path
 from typing import Any
 
@@ -2096,6 +2097,9 @@ class FiberTrace3DLoader:
             return records
 
         for dataset_config in self.config.datasets:
+            dataset_record_start = len(records)
+            source_fibers = 0
+            ineligible_fibers = 0
             volume_path_raw = dataset_config.get("base_volume_path", dataset_config.get("volume_path"))
             if volume_path_raw is None:
                 raise ValueError("dataset entry must define base_volume_path")
@@ -2132,7 +2136,13 @@ class FiberTrace3DLoader:
                     transform_xyz=transform_xyz,
                     transform_identity=transform_identity,
                 )
+                eligible_fibers = []
                 for source_fiber_index, fiber in enumerate(fibers):
+                    parts = training_fiber_spans(fiber)
+                    source_fibers += 1
+                    ineligible_fibers += not bool(parts)
+                    eligible_fibers.extend((source_fiber_index, part) for part in parts)
+                for source_fiber_index, fiber in eligible_fibers:
                     bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
                     if bad_control is not None:
                         bad_index, bad_zyx = bad_control
@@ -2149,6 +2159,7 @@ class FiberTrace3DLoader:
                         "fiber3d",
                         str(fiber_path),
                         source_fiber_index,
+                        fiber.metadata.get("training_control_span"),
                         transform_identity,
                         _round_json_array(np.asarray(fiber.line_points_xyz, dtype=np.float64)),
                     )
@@ -2165,6 +2176,15 @@ class FiberTrace3DLoader:
                             dataset_config=dict(dataset_config),
                         )
                     )
+            retained = len(records) - dataset_record_start
+            print(f"fiber_trace_3d training spans: scroll={dataset_config.get('scroll_id', '?')} "
+                  f"sources={source_fibers} eligible_runs={retained} "
+                  f"ineligible_sources={ineligible_fibers} modes=cspline,trace tails=excluded",
+                  flush=True)
+            if not retained:
+                raise ValueError(f"dataset {dataset_config.get('fiber_glob', dataset_config)} "
+                                 "has no eligible training spans (requires cspline/trace "
+                                 "between control points, or explicit NML edges)")
         if not records:
             raise ValueError("no fiber records loaded")
         return records

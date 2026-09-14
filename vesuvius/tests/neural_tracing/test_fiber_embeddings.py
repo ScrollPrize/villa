@@ -488,6 +488,15 @@ def test_real_manifest_scales_and_actual_augmentation(tmp_path, monkeypatch):
         "grad_mag_encode_scale": 1000., "grad_mag_factor": 1., "groups": groups}))
     # Input annotations use a translation transform, distinct from augmentation.
     fiber = _write_fiber(tmp_path / "fiber.json", points=[[x, 27, 29] for x in range(10, 51, 2)])
+    # This geometry/interpolation test uses explicitly eligible spline spans;
+    # the shared old fixture writer otherwise synthesizes Lasagna provenance.
+    from dataclasses import replace
+    original_load = module.load_fiber_file
+    def load_spline_fixture(*args, **kwargs):
+        return [replace(f, control_point_segments=tuple(
+            replace(m, interp_mode="cspline") if m is not None else None
+            for m in f.control_point_segments)) for f in original_load(*args, **kwargs)]
+    monkeypatch.setattr(module, "load_fiber_file", load_spline_fixture)
     transform = np.eye(4)
     transform[:3, 3] = [0, 5, 3]
     monkeypatch.setattr(module, "make_coordinate_sampler", lambda **kw: NumpyZarrCoordinateSampler(

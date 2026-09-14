@@ -913,9 +913,20 @@
   -1 rather than pretending to be an original control point.
 - Dataset `dense_supervision: true` enables dense selected-polyline supervision
   for JSON. False/absent preserves CP-only JSON behavior; NML stays dense.
-  Dense JSON uses every selected-fiber segment intersecting the patch, including
-  distant arc sections that re-enter it; other fibers do not become positive.
+  Dense JSON uses every retained selected-component segment intersecting the
+  patch, including distant arc sections that re-enter it; other components
+  and fibers do not become positive.
   Crop, prefetch, augmentation tangent and targets share the continuous location.
+- File-backed 3D training and its test loaders retain only JSON `cspline` and
+  `trace` spans between exact original control points, with no length cutoff.
+  Exterior line tails and Lasagna/unknown-provenance spans are excluded.
+  Maximal contiguous accepted runs become independent records; no connector
+  crosses an excluded span. Arclength sampling weights retained lengths, not
+  component count. Empty datasets fail clearly rather than changing scroll
+  balance silently. NML explicit edges remain accepted despite their synthetic
+  legacy interpolation metadata. Shared file parsing and the separate tracing
+  evaluator remain unchanged. Internal `_array_records` test fixtures supply
+  already-selected geometry and do not perform file provenance filtering.
 - 3D training uses a strict stream/data index split. `stream_index` is the
   unbounded deterministic stream position; `data_index` is the bounded
   dataset-selection index after applying `training.max_sample_index` /

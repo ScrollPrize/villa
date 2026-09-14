@@ -1,3 +1,9 @@
+## 2026-09-14 — Training span eligibility
+
+- 3D training/test loaders retain only spline/traced JSON components and trim
+  extrapolation. Added fresh JSON-only five-scroll LR0.01 EMA config. Separate
+  tracing evaluation unchanged; see docs/training_span_eligibility.md.
+
 ## 2026-09-13 — EMA99 tracer reference variants
 
 - Added opt-in best-history and per-beam EMA/seed/gated references to shared
