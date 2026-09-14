@@ -10,6 +10,7 @@ from config import Config, FitConfig
 from dt_targets import DtTargetCacheManager
 from fit_spiral import FitContext, PatchAtlas
 import test_live_patch_relink as relink
+from test_revisioned_runtime import resident
 
 
 @pytest.fixture
@@ -122,6 +123,48 @@ def test_mixed_revisions_keep_fiber_filename_and_restore_role_content(context, t
         {**record, 'revision': 3} for record in records]))
     assert ctx._workspace_membership['pcl-uuid']['resident_id'] == resident_id
     assert ctx.fiber_catalog['fiber-uuid']['file_basename'] == 'fiber-name.json'
+
+
+@pytest.mark.parametrize('adopt', [False, True])
+def test_startup_fiber_survives_replay_without_input_role(context, adopt):
+    pcl = relink._regular_pcl(5, [[50, 80, 80], [50, 110, 110]])
+    pcl['id'] = 5
+    pcl['metadata'].pop('input_role')
+    pcl['metadata'].update(logical_input_kind='fiber', logical_input_id='startup')
+    pcl['sampling_group'] = 'fibers'
+    context._source_point_collections = {5: pcl}
+    records = ([{'id': 'workspace-fiber', 'kind': 'fiber', 'source_id': 'startup',
+                 'path': '/immutable/not-reloaded.json', 'adopt': True}]
+               if adopt else [])
+    candidate = context.prepare_input_changes(records)
+    logical_id = 'workspace-fiber' if adopt else 'startup'
+    assert set(candidate.fiber_catalog) == {logical_id}
+    assert not candidate.regular_pcl_catalog
+    assert candidate.unattached_pcl_strips[0]['logical_input_kind'] == 'fiber'
+    assert 'input_role' not in pcl['metadata']
+
+
+def test_missing_sampling_weight_rejects_batch_without_stopping_resident(context, resident, tmp_path):
+    import json
+    path = tmp_path / 'new_group.json'
+    path.write_text(json.dumps({'vc_pointcollections_json_version': '1', 'collections': {
+        '0': {'name': 'new', 'points': {
+            '0': {'p': [80, 80, 50]}, '1': {'p': [110, 110, 50]}}}}}))
+    context.config = FitConfig({**dict(context.config), 'pcl_sampling_weights': {'drawn': 1}})
+    session, _, _, _ = resident
+    session._context = context
+    before, optimiser = context.regular_pcl_catalog, context.optimiser
+    records = [{'id': 'new', 'kind': 'pcl', 'path': str(path), 'role': 'same_winding'}]
+    result = session.apply_input_changes('missing-weight', records, timeout=5)
+    assert not result['applied']
+    assert 'sampling group' in str(result)
+    assert context.regular_pcl_catalog is before
+    assert context.optimiser is optimiser
+    assert session._completed == 7
+    context.config = FitConfig({**dict(context.config),
+                                'pcl_sampling_weights': {'drawn': 1, 'new_group': 1}})
+    assert session.apply_input_changes('fixed-weight', records, timeout=5)['applied']
+    assert session._completed == 7
 
 
 def test_invalid_absolute_annotations_fail_during_preparation(context, tmp_path):

@@ -10,6 +10,7 @@ class SpiralPointCollectionEditTest : public QObject
 private slots:
     void importsNumericOrderAndPreservesCoordinates();
     void appendEraseReverseAndSerialize();
+    void appendContinuesNegativeWindings();
     void transientSurfacePositionsFollowPointEdits();
     void projectionPositionsUsePerDraftRetainedStorage();
     void deletionCanBeUndoneWithoutInventingAnEdit();
@@ -108,6 +109,24 @@ void SpiralPointCollectionEditTest::appendEraseReverseAndSerialize()
     QCOMPARE(appended[0].toDouble(), 20.0);
     QCOMPARE(appended[1].toDouble(), 10.0);
     QCOMPARE(appended[2].toDouble(), 5.0);
+}
+
+void SpiralPointCollectionEditTest::appendContinuesNegativeWindings()
+{
+    using namespace vc3d::spiral;
+    EditablePclDraft draft;
+    draft.role = PclRole::Relative;
+    draft.collectionId = QStringLiteral("0");
+    draft.appendPreviewPoint({1.0f, 2.0f, 3.0f});
+    draft.appendPreviewPoint({4.0f, 5.0f, 6.0f});
+    draft.points[0].sourcePayload[QStringLiteral("wind_a")] = -3.0;
+    draft.points[1].sourcePayload[QStringLiteral("wind_a")] = -2.0;
+    const auto document = draft.replacementDocument();
+    auto imported = importEditablePcls(document, 1.0, QString(64, QLatin1Char('b')),
+                                      true, PclRole::Relative);
+    QCOMPARE(imported.size(), std::size_t{1});
+    imported[0].appendPreviewPoint({7.0f, 8.0f, 9.0f});
+    QCOMPARE(*editablePclPointWinding(imported[0].points.back()), -1.0);
 }
 
 void SpiralPointCollectionEditTest::transientSurfacePositionsFollowPointEdits()

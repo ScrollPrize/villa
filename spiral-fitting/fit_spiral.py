@@ -104,7 +104,9 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    MissingPclSamplingWeightError,
     build_pcl_sampling_strata,
+    pcl_sampling_group_weight,
     get_fiber_direction_loss,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
@@ -1947,7 +1949,7 @@ class FitContext:
                         entries.append(f'{key}: {count}')
                     else:
                         entries.append(
-                            f'{key} (w={self.config["pcl_sampling_weights"][key]}): {count}')
+                            f'{key} (w={pcl_sampling_group_weight(group, self.config)}): {count}')
                 return ', '.join(entries)
             print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
             print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
@@ -4159,7 +4161,9 @@ class FitContext:
             while True:
                 points, fibers = {}, {}
                 for cid, pcl in candidate._source_point_collections.items():
-                    role = pcl.get('metadata', {}).get('input_role')
+                    metadata = pcl.get('metadata', {})
+                    role = ('fiber' if metadata.get('logical_input_kind') == 'fiber'
+                            else metadata.get('input_role'))
                     enabled = (input_source_enabled(self.config, 'fibers') if role == 'fiber'
                                else pcl_input_enabled(self.config, None if role == 'legacy' else role,
                                                       pcl.get('source_file', '')))
@@ -4273,6 +4277,9 @@ class FitContext:
                 get_interactive_dt_resume_iteration(current_iteration, target_iteration,
                                                     cfg['influence_disable_dt_frac']))
             return candidate
+        except MissingPclSamplingWeightError as exc:
+            # Reject configuration errors without stopping the resident worker.
+            raise ValueError(str(exc)) from exc
         finally:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)

@@ -40,7 +40,11 @@ _pinned_to_device = geom_utils.pinned_to_device
 _cached_scalar_tensor = geom_utils.cached_scalar_tensor
 
 
-def _pcl_sampling_group_weight(group, cfg):
+class MissingPclSamplingWeightError(KeyError):
+    """An explicitly weighted sampling group has no configured weight."""
+
+
+def pcl_sampling_group_weight(group, cfg):
     # Look up the per-step sampling weight of a sampling group in
     # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
     # .json suffix stripped, so the source json stem (e.g. 'relative_windings') or the
@@ -50,7 +54,7 @@ def _pcl_sampling_group_weight(group, cfg):
     try:
         return float(cfg['pcl_sampling_weights'][key])
     except KeyError:
-        raise KeyError(
+        raise MissingPclSamplingWeightError(
             f'pcl_sampling_weights has no entry for sampling group {key!r}; '
             f'when set, it must list a weight for every group'
         )
@@ -85,7 +89,7 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     weighted = cfg['pcl_sampling_weights'] is not None
     strata, groups, weights, member_probs = [], [], [], []
     for group, indices in group_to_indices.items():
-        weight = _pcl_sampling_group_weight(group, cfg) if weighted else 1.0
+        weight = pcl_sampling_group_weight(group, cfg) if weighted else 1.0
         if weighted and weight <= 0:
             continue  # switched off
         indices = np.asarray(indices, dtype=np.int64)

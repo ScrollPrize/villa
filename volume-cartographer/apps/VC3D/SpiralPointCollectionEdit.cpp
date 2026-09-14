@@ -98,12 +98,12 @@ void EditablePclDraft::appendPreviewPoint(
     if (pclRoleHasWindingAnnotations(role)) {
         // New relative collections count from 0; an appended point continues
         // one past the highest winding already present.
-        double next = 0.0;
+        std::optional<double> maximum;
         for (const EditablePclPoint& point : points) {
             if (const auto winding = payloadWinding(point.sourcePayload))
-                next = std::max(next, *winding + 1.0);
+                maximum = maximum ? std::max(*maximum, *winding) : *winding;
         }
-        payload[QStringLiteral("wind_a")] = next;
+        payload[QStringLiteral("wind_a")] = maximum ? *maximum + 1.0 : 0.0;
     } else {
         payload[QStringLiteral("wind_a")] = QJsonValue::Null;
     }
