@@ -3328,6 +3328,15 @@ void LineAnnotationController::importFibers()
         showError(tr("No volume package is loaded."));
         return;
     }
+    // A pending delete has captured its targets by file name and is waiting
+    // for saves to drain. An import picks unsuffixed names for files that
+    // do not exist on disk, so it could give a captured name to a new fiber
+    // (the captured file may already be gone while its entry is still
+    // loaded), and the delete would then remove the import. Imports wait.
+    if (_deletingFibers) {
+        showError(tr("A fiber delete is in progress; import once it has finished."));
+        return;
+    }
 
     const auto options = showFiberJsonPathDialog(_parentWidget.data(), true, dir);
     if (!options) {
@@ -14566,13 +14575,19 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
         return;
     }
     std::vector<uint64_t> affectedFiberIds;
+    // Named refs are matched by file name only (see
+    // LineAnnotationFiberDeletion.hpp): a reload during the delete's save
+    // drain reassigns stored ids, so a ref's recorded id can point at the
+    // deleted fiber's new id while its name says another fiber.
     auto removeBranches = [&](std::vector<FiberBranchRef>& branches, uint64_t ownerFiberId) {
         const auto before = branches.size();
         branches.erase(
             std::remove_if(branches.begin(),
                            branches.end(),
                            [fiberId, &fileName](const FiberBranchRef& branch) {
-                               return branchReferencesFiber(branch, fiberId, fileName);
+                               return vc3d::line_annotation::branchRefersToDeletedFiber(
+                                   branch.branchFiberId, branch.branchFileName,
+                                   fiberId, fileName);
                            }),
             branches.end());
         if (branches.size() != before) {

@@ -179,4 +179,20 @@ inline bool sessionBelongsToDeletedFiber(uint64_t sessionFiberId,
     return std::binary_search(deletedIdsSorted.begin(), deletedIdsSorted.end(), sessionFiberId);
 }
 
+// Whether a branch (cross-fiber link) reference points at a fiber just
+// deleted. Branch refs carry both the runtime id and the file name of the
+// fiber they point to; the id can be stale after a reload for the same
+// reason as a session's, so when both sides have a file name the names
+// decide, and the id counts only when a name is missing on either side.
+inline bool branchRefersToDeletedFiber(uint64_t branchFiberId,
+                                       const std::string& branchFileName,
+                                       uint64_t deletedFiberId,
+                                       const std::string& deletedFileName)
+{
+    if (!branchFileName.empty() && !deletedFileName.empty()) {
+        return branchFileName == deletedFileName;
+    }
+    return deletedFiberId != 0 && branchFiberId == deletedFiberId;
+}
+
 } // namespace vc3d::line_annotation

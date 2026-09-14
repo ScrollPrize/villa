@@ -19,6 +19,7 @@ using vc3d::line_annotation::captureFiberDeleteTargets;
 using vc3d::line_annotation::resolveFiberDeleteTargets;
 using vc3d::line_annotation::resolveFiberDeletionAcrossWait;
 using vc3d::line_annotation::sessionBelongsToDeletedFiber;
+using vc3d::line_annotation::branchRefersToDeletedFiber;
 
 namespace
 {
@@ -223,6 +224,24 @@ private slots:
         QVERIFY(sessionBelongsToDeletedFiber(3, "", deletedIds, deletedNames));
         QVERIFY(!sessionBelongsToDeletedFiber(4, "", deletedIds, deletedNames));
         QVERIFY(!sessionBelongsToDeletedFiber(3, "a.json", deletedIds, deletedNames));
+    }
+
+    // Link cleanup after the delete: a branch ref that names its target is
+    // matched by that name only, so an open session's link to c.json is not
+    // torn out just because a reload gave the deleted b.json the id the
+    // link still records for c.
+    void branchCleanupMatchesNamedReferencesByFileNameOnly()
+    {
+        // Initially a=1, b=2, c=3; A's session links to C as (3, "c.json").
+        // After the reload new=1, a=2, b=3, c=4, and b (now id 3) is deleted.
+        QVERIFY(!branchRefersToDeletedFiber(3, "c.json", 3, "b.json"));
+        QVERIFY(branchRefersToDeletedFiber(2, "b.json", 3, "b.json"));
+        // A ref without a name has only its id.
+        QVERIFY(branchRefersToDeletedFiber(3, "", 3, "b.json"));
+        QVERIFY(!branchRefersToDeletedFiber(4, "", 3, "b.json"));
+        // A deleted fiber without a name matches by id as well.
+        QVERIFY(branchRefersToDeletedFiber(3, "c.json", 3, ""));
+        QVERIFY(!branchRefersToDeletedFiber(3, "c.json", 0, ""));
     }
 
     // Nothing to delete: the wait is skipped, and the report still names
