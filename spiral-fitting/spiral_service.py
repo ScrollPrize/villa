@@ -2246,6 +2246,13 @@ class ServiceState:
 
     def commit_input_revisions(self, token, request):
         result = self.editing().commit(token, request)
+        with self.lock:
+            if self.dataset_resolution is not None:
+                previous = self.dataset_resolution
+                self.dataset_resolution = bind_service_paths(
+                    resolve_dataset_root(previous.root),
+                    previous.resolved.get("output_directory", ""),
+                    previous.resolved.get("cache_directory", ""))
         self._refresh_pcl_artifacts()
         return {**self.status(), **result}
 

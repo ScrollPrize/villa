@@ -354,7 +354,8 @@ def _apply_input_changes_at_boundary(session, batch_id, records, influence_confi
                     break
                 call("cancel_input_boundary", {"reservation_epoch": epoch})
                 suggestions = [int(result["next_iteration"])
-                               for result in reservations.values()]
+                               for result in reservations.values()
+                               if not result.get("reserved")]
                 next_target = max(suggestions)
                 if next_target == target:
                     raise ValueError("Resident fit cannot accept inputs in its current state")

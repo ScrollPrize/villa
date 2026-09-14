@@ -39,6 +39,12 @@ class EditingHttpTests(HttpServiceFixture):
             return error.code, json.load(error)
 
     def test_lost_responses_reconcile_one_logical_input_and_exact_commit(self):
+        from spiral_service import bind_service_paths, resolve_dataset_root
+        dataset = self.root / 'dataset'
+        output, cache = self.root / 'output', self.root / 'shared-cache'
+        self.state.dataset_resolution = bind_service_paths(
+            resolve_dataset_root(dataset), output, cache)
+        self.assertNotIn('fibers', self.state.dataset_resolution.resolved)
         data = b'{"type":"vc3d_fiber","version":1,"points":[]}'
         input_id, upload_id = str(uuid4()), uuid4().hex
         manifest = {'upload_id': upload_id, 'id': input_id, 'kind': 'fiber',
@@ -78,6 +84,12 @@ class EditingHttpTests(HttpServiceFixture):
                 body={'command_id': 'commit', 'revisions': [{'id': input_id, 'revision': 1}]})
             self.assertEqual(code, 200, payload)
         self.assertEqual((self.root / 'dataset' / 'fibers' / f'{input_id}.json').read_bytes(), data)
+        # A full rebuild must load the newly published fiber before replay adopts it.
+        rebuilt = self.state._dataset_session_request({})
+        self.assertEqual(rebuilt['paths']['fibers'], str(dataset / 'fibers'))
+        self.assertEqual(rebuilt['paths']['output_directory'], str(output))
+        self.assertEqual(rebuilt['paths']['cache_directory'], str(cache))
+        self.assertNotIn('fibers', self.state.dataset_resolution.missing_optional)
         self.assertEqual(len(self.resident.calls), 1)
         command['changes'][0]['deleted'] = True
         self.assertEqual(self.request('POST', '/session/input-changes', headers=self.owner,

@@ -188,6 +188,38 @@ def test_distributed_decision_requires_all_ranks_prepared(failure):
     assert result["applied"] is (failure is None)
 
 
+@pytest.mark.parametrize("faster_rank", [0, 1])
+def test_distributed_boundary_retry_handles_mixed_reservations(faster_rank):
+    session = SimpleNamespace(_condition=threading.Condition(), _live_reservation_epoch=0,
+                              status=lambda: {"current_iteration": 7})
+    calls = []
+
+    def call(name, arguments, **kwargs):
+        calls.append((name, arguments.copy()))
+        if name == "reserve_input_boundary":
+            target = arguments["target_iteration"]
+            return {rank: ({"reserved": False, "next_iteration": 8}
+                           if rank == faster_rank and target == 7 else
+                           {"reserved": True, "target_iteration": target})
+                    for rank in range(2)}
+        if name == "prepare_input_batch":
+            assert arguments["target_iteration"] == 8
+            return {rank: {"prepared": True, "membership": {"revision": 2}}
+                    for rank in range(2)}
+        return {0: {}, 1: {}}
+
+    session._call = call
+    result = _apply_input_changes_at_boundary(
+        session, "batch", [{"revision": 2}], {}, timeout=2, distributed=True)
+    assert result["applied"] and result["iteration"] == 8
+    assert [name for name, _ in calls] == [
+        "reserve_input_boundary", "cancel_input_boundary", "reserve_input_boundary",
+        "prepare_input_batch", "finish_input_batch"]
+    assert calls[0][1]["reservation_epoch"] == calls[1][1]["reservation_epoch"]
+    assert calls[2][1]["reservation_epoch"] == calls[1][1]["reservation_epoch"]
+    assert calls[-1][1]["install"]
+
+
 def test_worker_failure_is_reported_instead_of_waiting_for_timeout(resident):
     from spiral_runtime import InputBatchCommand
     session, _, _, _ = resident
