@@ -128,6 +128,11 @@ const LinkPalette kLinkSameType{QColor(255, 140, 0, 245), QColor(255, 140, 0, 17
 const LinkPalette kLinkSameTypePending{QColor(255, 190, 120, 245),
                                        QColor(255, 190, 120, 175)};
 
+// The map draws a link as a dot on each of its two control points, which
+// overlap when zoomed out; the fill is thinned so the two stacked compound
+// to roughly the palette's 175 rather than to near-opaque.
+constexpr int kLinkEndpointFillAlpha = 120;
+
 // A link is same-type only when both fibers carry the same known H/V tag; an
 // unknown tag on either end falls back to the cross-type colours.
 const LinkPalette& linkPalette(char hvTagA, char hvTagB, bool pending)
@@ -1841,8 +1846,12 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             auto* connector = _scene->addLine(QLineF(a, b));
             connector->setPen(connectorPen);
             connector->setZValue(3.9);
+            // Two stacked fills read darker than one; this alpha compounds,
+            // where the dots overlap, to about the palette's own.
+            QColor fill = palette.brush;
+            fill.setAlpha(kLinkEndpointFillAlpha);
             for (const QPointF& endpoint : {a, b}) {
-                auto* dot = new ScaledDot(QBrush(palette.brush),
+                auto* dot = new ScaledDot(QBrush(fill),
                                           cosmeticPen(palette.pen, 1.0),
                                           crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
