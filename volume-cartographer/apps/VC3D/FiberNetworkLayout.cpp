@@ -1433,8 +1433,99 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         result.windings.push_back(WindingMark{
             static_cast<double>(mark) * circumference, static_cast<int>(mark)});
     }
+
+    // The sheet model: least squares of umbilicus radius against the winding
+    // coordinate over every sample of the anchored, drawable fibers. Winding
+    // W = (chirality * theta) / 2*pi + turns is what the geometry above drew
+    // each sample at, divided by the circumference at rRef.
+    {
+        double sumW = 0.0;
+        double sumR = 0.0;
+        double sumWW = 0.0;
+        double sumWR = 0.0;
+        double count = 0.0;
+        double minW = std::numeric_limits<double>::infinity();
+        double maxW = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            if (!drawable[i] ||
+                solve.placements[i].anchor == winding::ComponentAnchor::Unresolved) {
+                continue;
+            }
+            const winding::FiberTrace& trace = traces[i];
+            const double turns = solve.placements[i].turns;
+            const std::size_t n = std::min(trace.theta.size(), trace.radius.size());
+            for (std::size_t j = 0; j < n; ++j) {
+                const double w = thetaScale * trace.theta[j] / kTwoPi + turns;
+                const double r = trace.radius[j];
+                if (!std::isfinite(w) || !std::isfinite(r)) {
+                    continue;
+                }
+                sumW += w;
+                sumR += r;
+                sumWW += w * w;
+                sumWR += w * r;
+                count += 1.0;
+                minW = std::min(minW, w);
+                maxW = std::max(maxW, w);
+            }
+        }
+        // Half a winding of span is the least that fixes a slope worth
+        // trusting; below that the map's own reference radius is the honest
+        // answer.
+        constexpr double kMinWindingSpanForPitch = 0.5;
+        result.sheetRadius0Vx = rRefVx;
+        result.sheetPitchVx = 0.0;
+        if (count >= 2.0 && maxW - minW >= kMinWindingSpanForPitch) {
+            const double denominator = count * sumWW - sumW * sumW;
+            if (denominator > 0.0) {
+                const double pitch = (count * sumWR - sumW * sumR) / denominator;
+                const double radius0 = (sumR - pitch * sumW) / count;
+                if (std::isfinite(pitch) && std::isfinite(radius0) && pitch > 0.0 &&
+                    radius0 > 0.0) {
+                    result.sheetRadius0Vx = radius0;
+                    result.sheetPitchVx = pitch;
+                }
+            }
+        }
+    }
     sortUnplaced();
     return result;
+}
+
+double sheetDistanceVx(const SheetModel& model, double xVx)
+{
+    if (!(model.rRefVx > 0.0)) {
+        return xVx;
+    }
+    const double w = xVx / (kTwoPi * model.rRefVx);
+    return kTwoPi * (model.radius0Vx * w + 0.5 * model.pitchVx * w * w);
+}
+
+double sheetXForDistanceVx(const SheetModel& model, double distanceVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double target = distanceVx / kTwoPi;
+    double w = 0.0;
+    if (model.pitchVx > 0.0) {
+        // pitch/2 * w^2 + radius0 * w - target = 0, the root on the branch where
+        // the radius is positive (w >= -radius0/pitch).
+        const double discriminant =
+            model.radius0Vx * model.radius0Vx + 2.0 * model.pitchVx * target;
+        if (discriminant < 0.0) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        w = (-model.radius0Vx + std::sqrt(discriminant)) / model.pitchVx;
+    } else {
+        w = target / model.radius0Vx;
+    }
+    return w * kTwoPi * model.rRefVx;
+}
+
+SheetModel sheetModelOf(const GlobalResult& result)
+{
+    return SheetModel{result.rRefVx, result.sheetRadius0Vx, result.sheetPitchVx};
 }
 
 ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
@@ -1520,6 +1611,8 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
                         static_cast<int64_t>(result.gatedSegmentCount)));
     hashU64(digest,
             static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
+    hashDouble(digest, result.sheetRadius0Vx);
+    hashDouble(digest, result.sheetPitchVx);
     hashU64(digest, result.fibers.size());
     for (const GlobalPlacedFiber& fiber : result.fibers) {
         hashU64(digest, fiber.fiber.id);
