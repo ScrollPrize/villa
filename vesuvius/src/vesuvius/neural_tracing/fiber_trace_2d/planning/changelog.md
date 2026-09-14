@@ -2574,3 +2574,11 @@
   admission, aggregation controls, tests and per-family refinement harness.
   Initial windowed/LRU sweeps do not beat EMA69; further evaluation ongoing.
   See docs/embedding_multi_anchor_20260913.md; defaults unchanged.
+# 2026-09-14: embedding sweep paused for cooperative GPU work
+
+Previous embedding refinement task: confirmed best 64 restarts on frozen EMA99
+update6500 versus 87 without embeddings. Completed mechanism/refinement reports
+are in docs/embedding_refinement_summary_20260914.md. Boundary sweep stopped on
+user request after eight families and partial ninth; preserved report under
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1/`.
+Partial support-softmin 67 has not received the final exact-repeat stage.

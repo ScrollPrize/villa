@@ -66,3 +66,85 @@ Normalized-mean A/B scored75 at three borrowed settings versus ordinary64/68/66.
 It is included in the active refinement round, not selected as the default.
 See [detailed report](embedding_multi_anchor_20260913.md) for build hashes,
 timings, tests, controls, mechanism descriptions and limitations.
+## Interrupted boundary sweep: verified partial results
+
+Follow-up CPU-only replay at
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_boundary_cpu_verify_20260914_v1/`
+confirmed support-softmin67 twice with the exact interrupted-run replay hash
+`7be2e5ca221dc6cde71e28c85936a2cc813697a8588302205585843de4a03a84`.
+LRU64 and both original controls also reproduced their earlier hashes. Thus the
+67 result is now repeat-verified, although the interrupted full boundary search
+itself remains incomplete. All replay variants used `fill_missing=false` and
+inferred zero tiles; no GPU reservation was requested. Command:
+`vesuvius/scripts/run_fiber3d_experiment embedding-trace-sweep` with the checked-in
+CPU-verification control. Process exited0; final LRU best-repeat also reproduced
+64 and hash `013d255be05b3b6fb295a14b4a9c92fffef2558b724179d00d8b8903ed1b81a0`.
+
+### Failure-location comparison: LRU64 versus support-softmin67
+
+Inspecting the alternative trace's matches within±32 base voxels around the
+four LRU-only events gives:
+
+| Direction/case | LRU failure arc | Softmin maximum error/threshold | Softmin segments in neighborhood |
+|---|---:|---:|---|
+| forward/0 | 2102.14 | 1.006 | 5,6 (nearby restart) |
+| reverse/1 | 9676.86 | 0.829 | 26 |
+| reverse/1 | 12656.47 | 0.343 | 33 |
+| reverse/1 | 12792.75 | 0.858 | 33 |
+
+Below1 means those saved matched points satisfy the actual ellipse threshold.
+This supports three locally cleaner neighborhoods, not three independently
+recoverable errors: softmin had restarted near12574.57 before the latter two,
+so its different history may explain that advantage. There is no demonstrated
+GT-free rule for switching policies at these locations.
+
+CPU-only analysis of saved `refine-0000/cases/{0,1}/trace.json` and
+`refine-0106/cases/{0,1}/trace.json` in the interrupted report directory.
+Both cover the same reference arc range in each direction (~14891.716 base
+voxels). Counts are29+35 versus32+35. Sorted failure reference arcs were matched
+one-to-one, greedily pairing earliest endpoints within the stated radius;
+otherwise advancing the smaller endpoint. No event is matched twice.
+
+| Radius (base voxels) | Matched failures | LRU-only failures | Softmin-only failures |
+|---:|---:|---:|---:|
+| 32 | 57 | 7 | 10 |
+| 64 | 60 | 4 | 7 |
+| 128 | 61 | 3 | 6 |
+| 256 | 61 | 3 | 6 |
+
+At64 voxels, matching counts by direction are28/29 and32/35 of LRU's failures.
+Thus most failures occur near the same reference locations; the second policy
+is not broadly complementary despite its different appearance representation.
+This weakens the case for adding a general mixture solely from aggregate scores.
+Unmatched failures are **not** demonstrated recoveries or an oracle improvement:
+restart locations change later trace history, and proximity tolerance is an
+analysis convention rather than the evaluator's ellipse criterion. The next
+useful check would inspect the few unmatched regions and their full paths before
+designing a selector. No new traces, inference, or GPU reservation were used.
+
+Inspected `embedding_ema99_anchor_boundaries_20260914_v1/report.json` after
+the requested stop: 141 variant records and eight completed family searches.
+The final repeat stage was not reached. These are tuning-fiber results using
+EMA99 update6500, not independent validation or confirmed global optima.
+
+| Family / starting point | Restarts | Anchors | Spacing (base voxels) | Weight |
+|---|---:|---:|---:|---:|
+| Novelty mean LRU | **64** | 2 | 512 | 0.10 |
+| Novelty nearest LRU, own seed | 68 | 4 | 768 | 0.25 |
+| Novelty nearest LRU, transferred seed | 72 | 2 | 2048 | 0.10 |
+| Whole-path appearance, own seed | 70 | 1 | 384 | 0.25 |
+| Whole-path appearance, transferred seed | 72 | 2 | 1536 | 0.10 |
+| Support-softmin, own seed | 71 | 2 | 512 | 0.25 |
+| Support-softmin, transferred seed | 67 | 2 | 1024 | 0.10 |
+| Plain nearest LRU | 66 | 2 | 512 | 0.10 |
+
+Novelty thresholds above are0.1; support-softmin temperatures are0.03; EMA mix
+is zero. The best recorded variant remains64, so this partial search does not
+justify replacing the previously repeated64-restart policy.
+
+Next useful evidence, when sweeps resume: exact-repeat the improved67-restart
+support-softmin candidate and compare its failure locations against the64
+policy. Complementary recovered regions could motivate a new combination;
+aggregate restart counts alone do not establish that. Finish pending families
+only with the new demand-scoped manager handling. No GPU work was restarted
+for this report.
