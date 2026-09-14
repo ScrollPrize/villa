@@ -163,6 +163,19 @@ six-level uint8 OME-Zarr pyramid in scroll coordinates. Label conversion writes
 preparer writes one `(21,Y,X)` array tagged `level2-zmean4-21slice-v1` and
 refuses to overwrite either a destination or its `.partial` path.
 
+Optional post-processing for native predictions:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.postprocessing.surface_consistency \
+  /data/predictions/w035.ome.zarr \
+  /data/predictions/w035-gsc.ome.zarr
+```
+
+This keeps, per voxel, the strongest of the three axis-aligned local plane
+means, which preserves in-sheet probability mass and attenuates isolated
+off-sheet responses; it reads and writes the same sparse six-level OME-Zarr
+layout. See `docs/ink_detection.md` for the evidence and arguments.
+
 ## Labeling loop
 
 Train, infer, inspect the probability TIFF, extend the segment's ink and
