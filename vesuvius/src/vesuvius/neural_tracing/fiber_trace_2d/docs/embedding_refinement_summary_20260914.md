@@ -164,6 +164,55 @@ not newly claimed repetitions. Controls87/82 reproduced exactly on continuation.
 
 These results do not beat the earlier verified64-restart policy.
 
+Adaptive continuation: the transferred windowed-anchor family finished at76
+restarts (K2, spacing384, window1024, weight0.10, EMA mix0.9, half-life128).
+It needed12 new inference tiles to complete previously missing coverage; the
+grant was released afterward. Neighbor weights0.05/0.15 give79/86. Thus its
+second seed does not improve on the own-seed67 result.
+
+The normalized-mean novelty family subsequently finished at68 (K2, spacing512,
+weight0.30, novelty0.10, nearest touch, no EMA mix). The plain normalized family
+then finished at71 (K2, spacing512, weight0.25, novelty0, nearest touch, no EMA
+mix). The hit-touch normalized family finished at68 (K2, spacing512,
+weight0.30, novelty0.10, hit touch, no EMA mix). None improves the verified64
+result.
+
+The adaptive continuation exited successfully on 2026-09-14:89 completed
+replays,12 newly inferred tiles, all four family-winner repeats and the
+within-run best repeat exactly identical by full replay hash. Final minima:
+
+| Family | Restarts |
+|---|---:|
+| Windowed anchors, transferred seed | 76 |
+| Normalized mean LRU, novelty/nearest touch | 68 |
+| Normalized mean LRU, no novelty/nearest touch | 71 |
+| Normalized mean LRU, novelty/hit touch | 68 |
+
+Authoritative full report:
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_remaining_adaptive_refine_20260914_v1/report.json`.
+The overall retained policy remains ordinary mean novelty LRU at64 restarts
+(K2, spacing512, weight0.10, novelty0.10, nearest touch, no EMA mix), versus87
+with embeddings off. This is a single tuning-fiber result, not held-out proof.
+Training/evaluation span eligibility and endpoint trimming are the next task;
+no reference changes were made in this sweep.
+
+### Reference provenance caveat
+
+The current tuning fiber contains six traced CP spans and one Lasagna fallback
+span with endpoint chord138.499 base voxels. Current training and whole-fiber
+evaluation do not filter interpolation provenance. Consequently all scores here
+refer to that unchanged stored reference, not a trace/short-span-only reference.
+A future eligibility change requires a separately identified evaluation and
+baseline; do not compare its restart totals directly with these whole-line
+totals. The 50-fiber test set contains60 Lasagna spans, while its three PHerc0332
+fibers contain none (296 short splines and24 traced spans).
+
+The current dense loader and live evaluation also retain any line-point tails
+before the first or after the last original control point. The live evaluator
+uses the complete parsed line and synthesizes endpoint controls; it is not the
+older CP-bounded `traceWholeFiberMetric` path. These tails have not been trimmed
+from the current benchmark either.
+
 ### Remaining search: plain mean LRU sensitivity (partial)
 
 `embedding_ema99_remaining_cpu_refine_20260914_v1/report.json`, first completed

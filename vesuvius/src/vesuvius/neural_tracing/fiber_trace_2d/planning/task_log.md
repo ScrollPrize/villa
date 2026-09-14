@@ -1,5 +1,43 @@
 # Demand-scoped GPU ownership (2026-09-14)
 
+- Final adaptive sweep57397 exited0:89 completed replays,12 inferred tiles,
+  minima76/68/71/68; all4 family repeats and within-run best repeat exactly
+  match full replay hashes. Prior overall best64 unchanged (off87). User asks
+  preserve/commit this state before fixing training/eval eligibility. No new
+  sweeps or training started. Full report path recorded in refinement summary.
+- Endpoint audit: current arc sampler and dense labels use all line_points,
+  including any tails outside original CP bounds. Current 50-fiber live eval
+  also copies all parsed linePoints and synthesizes endpoint CPs
+  (FiberTraceEvaluationCli.cpp:312,375). Older traceWholeFiberMetric instead
+  measures CP-first to CP-last; do not confuse these evaluation paths.
+  No trimming implemented; current reference remains unchanged.
+- Adaptive57397 normalized-mean-plain search finished71 (K2/spacing512/w.25,
+  novelty0, nearest touch). Last normalized hit-touch family now searching;
+  repeat stage pending, prior verified64 still best. No additional inferred
+  tiles beyond12. Existing reference preserved despite provenance caveat.
+- User-requested read-only provenance audit: neither arc sampling/dense training
+  nor native whole-fiber reference replay filters segment_to_next.interp_mode.
+  Current split JSON counts: training946files,14515cspline/25416trace/755lasagna;
+  test50files,406cspline/1426trace/60lasagna. PHerc0332 train74files:
+  12574/409/14; test3:296/24/0. All0332 spline CP chords<100basevoxels.
+  Current tuning fiber has1lasagna fallback span(chord138.499),6trace spans.
+  NML synthetic legacy metadata is not actual Lasagna provenance. No filtering
+  implemented or reference data changed; potential benchmark quality limitation.
+- Live adaptive57397 finished normalized-mean-novel family at68 (K2/512/w.30,
+  novelty.1, nearest touch); no improvement over64. Two normalized families
+  remain, total12 newly inferred tiles. Final repeat stage not reached.
+
+- Adaptive family's windowed-anchor transferred seed finished76 at K2,
+  spacing384/window1024/w.10/EMA mix.9/half-life128 (weight.05/.15 gave79/86).
+  Worse than own-seed67; no reason to replace64. Three normalized-mean families
+  remain and live57397 has started them. Total new inference so far12tiles.
+
+- Adaptive run57397 resumed automatically after manager wait: task f54924d2
+  initialized/running, first missing-coverage candidate completed88 restarts
+  with12 inferred tiles in298.48s including queue wait. Next variant started
+  from cached predictions. This validates real deferred demand/resume beyond
+  the earlier synthetic smoke; elapsed time is not an inference benchmark.
+
 - Adaptive continuation live57397, report remaining_adaptive_refine_20260914_v1:
   controls87/82 exact hashes. Review confirmed four remaining families unchanged.
   Initial missing chunk starts4 CPU reads with no GPU registration; only after

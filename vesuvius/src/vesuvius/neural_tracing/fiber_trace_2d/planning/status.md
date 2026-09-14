@@ -8,5 +8,7 @@
 - [x] CPU-only exact verification of LRU64 and softmin67.
 - [x] Three remaining family searches finished (68/69/67); CPU sweep stopped
   correctly on missing coverage before final repeats.
-- [ ] Finish four remaining families with demand-managed missing-tile inference.
-- [ ] Record coverage limits or completed minima/repeats; consolidate final evidence.
+- [x] Finish four remaining families with demand-managed missing-tile inference.
+- [x] Record completed minima76/68/71/68 and exact repeats;89 completed replays,
+  exit0,12 inferred tiles. Overall prior best64 unchanged.
+- [x] Document reference provenance and untrimmed tails; filtering not changed.
