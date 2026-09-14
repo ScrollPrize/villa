@@ -945,6 +945,10 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
+# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
+# under apps/src, shared with the command-line tool so the tested code is the
+# shipped code).
+vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 
