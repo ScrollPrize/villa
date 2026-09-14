@@ -249,6 +249,9 @@ vc_add_test(NAME test_global_cache_root)
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
+if(TARGET test_fiber_trace3d)
+    target_sources(test_fiber_trace3d PRIVATE ../../apps/src/FiberLiveBridge.cpp)
+endif()
 
 vc_add_test(NAME test_fiber_anchors
     LIBS doctest::doctest vc_fiber_tracer)

@@ -17,6 +17,76 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <future>
+#if defined(__unix__) || defined(__APPLE__)
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+TEST_CASE("live heartbeat keeps paused demand pending, never marks it ready") {
+    bool keepalive = true;
+    SUBCASE("live coordinator may wait beyond request deadline") {}
+    SUBCASE("stopped heartbeats still time out") { keepalive = false; }
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    auto server = std::async(std::launch::async, [&] {
+        int fd = ::accept(listener, nullptr, nullptr);
+        std::string input;
+        char c;
+        // Consume hello and demand before heartbeats.
+        int lines = 0;
+        while (lines < 2 && ::recv(fd, &c, 1, 0) == 1) {
+            input += c;
+            if (c == '\n') ++lines;
+        }
+        auto send = [&](const std::string& message) {
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+#ifdef SO_NOSIGPIPE
+            int on = 1;
+            ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
+            return ::send(fd, message.data(), message.size(), flags);
+        };
+        for (int i = 0; i < 8; ++i) {
+            if (keepalive) send("{\"version\":1,\"type\":\"heartbeat\"}\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        send("{\"version\":1,\"type\":\"ready\",\"request_id\":1}\n");
+        // Keep peer alive until bridge shutdown to avoid a ready/EOF race.
+        while (::recv(fd, &c, 1, 0) > 0) {}
+        ::close(fd);
+    });
+    {
+        FiberLiveBridge bridge({{"port", ntohs(address.sin_port)}, {"token", "test"},
+                                {"timeout_seconds", 1}, {"heartbeat_wait", true}});
+        const auto start = std::chrono::steady_clock::now();
+        if (keepalive) {
+            bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}});
+            CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(1500));
+        } else {
+            bool failed = false;
+            try { bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}}); }
+            catch (const std::runtime_error& error) {
+                failed = true;
+                CHECK(std::string(error.what()) == "timed out waiting for inference chunks");
+            }
+            CHECK(failed);
+        }
+    }
+    server.get();
+    ::close(listener);
+}
+#endif
 
 TEST_CASE("embedding falloff is normalized and preserves uniform default")
 {
