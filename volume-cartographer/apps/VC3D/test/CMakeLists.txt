@@ -1,13 +1,22 @@
-# Standalone unit test for SeedingBatchTracker (apps/VC3D/SeedingBatchTracker.*),
-# the honest run/expand batch-outcome aggregation extracted from SeedingWidget.
-# Deterministic, no process launch, no volume data — safe for the default ctest
-# run. Built only under VC_TESTING (wired from the top-level testing block).
-#
-# The tracker is a small QObject-free class using only QString/QStringList/QSet,
-# so we compile its source straight into the test and link just Qt6::Core (for
-# QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
-# in, keeping the test fast and self-contained.
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+
+add_executable(test_vc_settings
+    test_vc_settings.cpp)
+
+set_target_properties(test_vc_settings PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_vc_settings PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_vc_settings PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME vc_settings COMMAND test_vc_settings)
+vc_register_test_target(test_vc_settings)
+vc_register_ctest(vc_settings test_vc_settings)
 
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
@@ -166,6 +175,8 @@ set_target_properties(test_command_line_tool_runner PROPERTIES
 
 target_include_directories(test_command_line_tool_runner PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_compile_definitions(test_command_line_tool_runner PRIVATE VC_TESTING)
 
 target_link_libraries(test_command_line_tool_runner PRIVATE
     Qt6::Core

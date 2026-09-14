@@ -1275,7 +1275,8 @@
         ],
         "paramRenames": {
           "atlasPath": "atlas_path",
-          "configPath": "config_path"
+          "configPath": "config_path",
+          "initShellDir": "init_shell_dir"
         },
         "tool": "vc3d_lasagna_start_optimization"
       },
@@ -1285,6 +1286,9 @@
             "type": "string"
           },
           "configPath": {
+            "type": "string"
+          },
+          "initShellDir": {
             "type": "string"
           },
           "mode": {
@@ -2964,6 +2968,34 @@
         },
         "required": [
           "location"
+        ],
+        "type": "object"
+      }
+    },
+    "segments.create_editable_copy": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_create_editable_segment_copy"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
         ],
         "type": "object"
       }

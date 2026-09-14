@@ -36,7 +36,6 @@ struct Entry {
 enum class Category { Volumes, Segments, NormalGrids };
 
 struct LoadOptions {
-    std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
     bool deferResolution = false;
 };
@@ -44,13 +43,6 @@ struct LoadOptions {
 bool isLocationRemote(const std::string& location);
 std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
-
-// Open-data volume entries carry their sample identity in a tag. Keep their
-// chunk caches grouped with the other catalog data while leaving ordinary
-// remote volumes directly beneath the configured cache root.
-std::filesystem::path remoteVolumeCacheRootForEntry(
-    const std::filesystem::path& configuredRoot,
-    const Entry& entry);
 
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
@@ -130,8 +122,7 @@ public:
     AttachVolumeResult attachPreparedVolume(
         const std::string& location,
         std::vector<std::string> tags,
-        const std::shared_ptr<Volume>& volume,
-        const std::filesystem::path& remoteCacheRoot = {});
+        const std::shared_ptr<Volume>& volume);
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
     // Replace singleton keyed tags and merge ordinary tags in one operation,
     // refreshing a loaded remote volume at most once.
@@ -174,7 +165,6 @@ public:
         std::vector<std::string> manifestTags,
         bool fiberInference,
         const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-        const std::filesystem::path& remoteCacheRoot = {},
         bool updateSelection = true,
         bool persistChanges = true,
         const std::vector<std::string>& manifestSingletonPrefixes = {});
@@ -239,9 +229,6 @@ public:
 
     void setSegmentsChangedCallback(std::function<void()> cb);
 
-    [[nodiscard]] bool hasRemoteCacheRoot() const;
-    [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
-    void setRemoteCacheRoot(const std::filesystem::path& dir);
     // Completes a deferred load. Ordinary load() callers remain eager.
     void resolveDeferredEntries();
 
@@ -263,7 +250,6 @@ private:
     std::string name_ = "Untitled";
     int version_ = 1;
     vc::project::LoadOptions opts_;
-    std::filesystem::path remoteCacheRoot_;
     bool automaticPersistence_ = true;
 
     std::vector<vc::project::Entry> volumes_;

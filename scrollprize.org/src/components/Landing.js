@@ -610,7 +610,7 @@ export function Landing() {
   const openPrizeTotal = openPrizes.reduce((sum, p) => sum + p.amount, 0);
   const openById = Object.fromEntries(openPrizes.map((p) => [p.id, p]));
   const grandPrize2027 = openById["grand-prize-2027"];
-  const firstLetters = openById["first-letters"];
+  const firstLetters = openById["first-letters-2027"];
   const firstTitle = openById["first-title"];
   const progressPrizes = openById["progress-prizes"];
 

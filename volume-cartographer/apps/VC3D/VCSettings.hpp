@@ -1,78 +1,50 @@
 #pragma once
 
-#include <QDebug>
-#include <QDir>
-#include <QFileInfo>
 #include <QString>
+
+#include <filesystem>
+
+#include "vc/core/util/RemoteCacheSettings.hpp"
 
 namespace vc3d {
 
-// Single source of truth for where downloaded remote-volume chunks land.
-//
-// Priority — first match wins:
-//   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
-//   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
-//   3. `suggestion` if non-empty
-//   4. ~/.VC3D/remote_cache
-//
-// If /volpkgs or /ephemeral exists, the cache is forced there and any
-// `suggestion` is ignored: these mounts are the whole point of the host
-// being provisioned, and a stale per-volpkg or per-user setting pointing
-// elsewhere silently fills the root disk.
-//
-// Fail-fast: if /volpkgs or /ephemeral exists but isn't writable by the
-// running user (typical: directory owned by root, mode 0755), we abort
-// rather than fall through — that masks the real problem.
-//
-// The chosen path is created on disk before return.
-inline QString remoteCachePath(const QString& suggestion = {})
+inline QString pathToQString(const std::filesystem::path& path)
 {
-    for (const QString& root : {QStringLiteral("/volpkgs"),
-                                QStringLiteral("/ephemeral")}) {
-        QFileInfo fi(root);
-        if (!fi.exists()) {
-            continue;
-        }
-        if (!fi.isDir()) {
-            qFatal("remoteCachePath: %s exists but is not a directory",
-                   qUtf8Printable(root));
-        }
-        // QFileInfo::isWritable() is unreliable on some FUSE/NFS mounts,
-        // so probe by trying to create the cache subtree.
-        const QString p = root + "/remote_cache";
-        if (!QDir().mkpath(p)) {
-            qFatal("remoteCachePath: %s exists but remote_cache/ cannot be "
-                   "created (check ownership/perms — must be writable by "
-                   "this user)",
-                   qUtf8Printable(root));
-        }
-        if (!QFileInfo(p).isWritable()) {
-            qFatal("remoteCachePath: %s is not writable by this user",
-                   qUtf8Printable(p));
-        }
-        return p;
-    }
-
-    QString p = suggestion.trimmed();
-    if (p.isEmpty()) {
-        p = QDir::homePath() + "/.VC3D/remote_cache";
-    }
-    QDir().mkpath(p);
-    return p;
+#ifdef _WIN32
+    return QString::fromStdWString(path.native());
+#else
+    const auto& native = path.native();
+    return QString::fromUtf8(native.data(), static_cast<qsizetype>(native.size()));
+#endif
 }
+
+inline constexpr auto kRemoteCacheDirectorySetting =
+    vc::settings::kRemoteCacheDirectory;
 
 inline QString settingsFilePath()
 {
-    // Settings must stay in the user's home — /ephemeral is lost on stop.
-    // Tests may redirect the otherwise fixed per-user directory without
-    // changing production behavior.
-    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
-    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
-    QDir dir;
-    if (!dir.exists(configDir)) {
-        dir.mkpath(configDir);
-    }
-    return configDir + "/VC3D.ini";
+    return pathToQString(vc::settings::settingsFilePath());
+}
+
+// Process-active root for downloaded remote-volume chunks. The value is fixed
+// on first use; settings changes take effect after VC3D restarts.
+//
+// Priority — first match wins:
+//   1. viewer/remote_cache_dir from the process-wide VC3D settings
+//   2. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
+//   3. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   4. ~/.VC3D/remote_cache
+//
+// Resolution and directory creation are implemented in shared core code so
+// GUI and command-line project loading cannot diverge.
+inline QString remoteCachePath()
+{
+    return pathToQString(vc::settings::remoteCachePath());
+}
+
+inline std::filesystem::path remoteCachePathFs()
+{
+    return vc::settings::remoteCachePath();
 }
 
 // =============================================================================
@@ -179,9 +151,9 @@ namespace viewer {
     constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
 
-    // Remote volume chunk cache directory. Resolved through
-    // vc3d::remoteCachePath() — see that function for the priority rules.
-    constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
+    // Process-wide remote volume cache directory. All VC3D consumers resolve
+    // it through vc3d::remoteCachePath().
+    constexpr auto REMOTE_CACHE_DIR = kRemoteCacheDirectorySetting;
 
     // Recent remote zarr URLs used to pre-fill attach dialog
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
@@ -329,10 +301,12 @@ namespace line_annotation {
     // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    // Cruise speed of the Left/Right arrow pan between control points, in line
-    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
-    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
-    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
+    // Cruise speed of the Left/Right arrow pan between control points, in base
+    // voxels of optimized-polyline arclength per second. Up/Down adjust it.
+    // "_vx" retires the line-positions-per-second key: its values would be 4x
+    // to 32x off in the new unit, so they are neither read nor migrated.
+    constexpr auto ARROW_PAN_SPEED_VX = "lineAnnotation/arrow_pan_speed_vx";
+    constexpr double ARROW_PAN_SPEED_VX_DEFAULT = 96.0;
     // "_v2" retires ratios saved before the fixed top strip / smaller bottom
     // strip layout; old values would override the new default proportions.
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";

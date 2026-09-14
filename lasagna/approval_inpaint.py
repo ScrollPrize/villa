@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from dtypes import numpy_float_hi
 import tifffile
 
 
@@ -167,7 +168,7 @@ def nearest_valid_index(xyz: np.ndarray, valid: np.ndarray, seed: tuple[float, f
 		raise ValueError(f"xyz must have shape (H, W, 3), got {xyz.shape}")
 	if valid.shape != xyz.shape[:2]:
 		raise ValueError(f"valid shape mismatch: {valid.shape} vs {xyz.shape[:2]}")
-	seed_np = np.asarray(seed, dtype=np.float64)
+	seed_np = np.asarray(seed, dtype=numpy_float_hi)
 	if seed_np.shape != (3,) or not np.isfinite(seed_np).all():
 		raise ValueError(f"approval inpaint seed must contain three finite values, got {seed}")
 
@@ -181,7 +182,7 @@ def nearest_valid_index(xyz: np.ndarray, valid: np.ndarray, seed: tuple[float, f
 		mask = flat_valid[start:end]
 		if not bool(mask.any()):
 			continue
-		coords = flat_xyz[start:end][mask].astype(np.float64, copy=False)
+		coords = flat_xyz[start:end][mask].astype(numpy_float_hi, copy=False)
 		d2 = np.sum((coords - seed_np.reshape(1, 3)) ** 2, axis=1)
 		local = int(np.argmin(d2))
 		if float(d2[local]) < best_d2:
@@ -431,10 +432,10 @@ def _sample_xyz_at_index_center(
 	fc = max(0.0, min(float(col) - c0, 1.0))
 	corners = [(r0, c0), (r1, c0), (r0, c1), (r1, c1)]
 	if all(bool(valid[r, c]) for r, c in corners):
-		p00 = xyz[r0, c0].astype(np.float64)
-		p10 = xyz[r1, c0].astype(np.float64)
-		p01 = xyz[r0, c1].astype(np.float64)
-		p11 = xyz[r1, c1].astype(np.float64)
+		p00 = xyz[r0, c0].astype(numpy_float_hi)
+		p10 = xyz[r1, c0].astype(numpy_float_hi)
+		p01 = xyz[r0, c1].astype(numpy_float_hi)
+		p11 = xyz[r1, c1].astype(numpy_float_hi)
 		p = (
 			(1.0 - fr) * (1.0 - fc) * p00
 			+ fr * (1.0 - fc) * p10
@@ -446,8 +447,8 @@ def _sample_xyz_at_index_center(
 	valid_rc = np.argwhere(valid)
 	if valid_rc.size == 0:
 		raise ValueError("approval inpaint source tifxyz contains no valid vertices")
-	d2 = (valid_rc[:, 0].astype(np.float64) - float(row)) ** 2 + (
-		valid_rc[:, 1].astype(np.float64) - float(col)
+	d2 = (valid_rc[:, 0].astype(numpy_float_hi) - float(row)) ** 2 + (
+		valid_rc[:, 1].astype(numpy_float_hi) - float(col)
 	) ** 2
 	rr, cc = (int(v) for v in valid_rc[int(np.argmin(d2))])
 	return float(xyz[rr, cc, 0]), float(xyz[rr, cc, 1]), float(xyz[rr, cc, 2])
@@ -577,8 +578,8 @@ def build_approval_inpaint(
 	if not coords:
 		raise ValueError("approval inpaint generated no valid skeleton correction points")
 
-	rows = np.asarray([p[0] for p in coords], dtype=np.float64)
-	cols = np.asarray([p[1] for p in coords], dtype=np.float64)
+	rows = np.asarray([p[0] for p in coords], dtype=numpy_float_hi)
+	cols = np.asarray([p[1] for p in coords], dtype=numpy_float_hi)
 	rmin = int(rows.min())
 	rmax = int(rows.max())
 	cmin = int(cols.min())
@@ -587,8 +588,8 @@ def build_approval_inpaint(
 	center_c = 0.5 * (float(cmin) + float(cmax))
 	new_seed = _sample_xyz_at_index_center(xyz, valid, center_r, center_c)
 
-	corr_xyz = np.asarray([xyz[r, c] for r, c in coords], dtype=np.float64)
-	seed_xyz = np.asarray(new_seed, dtype=np.float64)
+	corr_xyz = np.asarray([xyz[r, c] for r, c in coords], dtype=numpy_float_hi)
+	seed_xyz = np.asarray(new_seed, dtype=numpy_float_hi)
 	offsets = corr_xyz - seed_xyz.reshape(1, 3)
 	raw_w = 2.0 * float(np.max(np.abs(offsets[:, 0])))
 	raw_h = 2.0 * float(np.max(np.abs(offsets[:, 1])))

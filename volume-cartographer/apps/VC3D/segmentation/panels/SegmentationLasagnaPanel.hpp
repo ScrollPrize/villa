@@ -84,11 +84,13 @@ public:
     ///   configPath: empty => selectedLasagnaConfigPathForMode(mode)
     ///   seed:       nullopt => panel seed / focus (no seed override)
     ///   atlasPath:  empty => panel selection; applied via setSelectedAtlasPath
+    ///   initShellDir: path visible to the fit-service host; empty => manifest
     bool startOptimizationHeadless(CState* state,
                                    LasagnaMode mode,
                                    const QString& configPath,
                                    std::optional<cv::Vec3i> seed,
                                    const QString& atlasPath,
+                                   const QString& initShellDir,
                                    QString* errorMessage = nullptr);
     /// Repeats the last action without entering the interactive signal chain.
     bool repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage = nullptr);
@@ -172,7 +174,8 @@ private:
         int seedX,
         int seedY,
         int seedZ,
-        Presentation presentation = Presentation::Interactive);
+        Presentation presentation = Presentation::Interactive,
+        const QString& initShellDirOverride = QString());
 
     // -- Sections --
     CollapsibleSettingsGroup* _connectionGroup{nullptr};

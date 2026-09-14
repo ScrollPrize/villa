@@ -9,6 +9,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -3111,9 +3112,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
 
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                dbg_surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
-                dbg_surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
+                vc::surface::storeAreaMeta(dbg_surf->meta,
+                                           static_cast<double>(area_est_vx2),
+                                           static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
@@ -3198,9 +3199,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt";
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-                float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-                dbg_surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
-                dbg_surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
+                vc::surface::storeAreaMeta(dbg_surf->meta,
+                                           static_cast<double>(area_est_vx2),
+                                           static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
                 dbg_surf->save(tgt_dir / uuid, uuid, true);
                 delete dbg_surf;
@@ -3208,10 +3209,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         float const current_area_vx2 = loc_valid_count*src_step*src_step*step*step;
-        float const current_area_cm2 = current_area_vx2 * voxelsize * voxelsize / 1e8;
-        printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%f cm^2) best th: %d\n",
+        const auto current_area_cm2 = vc::surface::areaCm2FromVox2(
+            static_cast<double>(current_area_vx2), static_cast<double>(voxelsize));
+        const std::string current_area_cm2_text = current_area_cm2
+            ? std::to_string(*current_area_cm2) + " cm^2"
+            : std::string("cm^2 unknown");
+        printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%s) best th: %d\n",
                generation, static_cast<unsigned long>(cands.size()), succ, static_cast<unsigned long>(fringe.size()),
-               current_area_vx2, current_area_cm2, best_inliers_gen);
+               current_area_vx2, current_area_cm2_text.c_str(), best_inliers_gen);
 
         if (sweep_prune_distance_active &&
             generation >= sweep_prune_min_generations &&
@@ -3534,8 +3539,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     }
 
     float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
-    float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
-    std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
+    const auto area_est_cm2 = vc::surface::areaCm2FromVox2(
+        static_cast<double>(area_est_vx2), static_cast<double>(voxelsize));
+    std::cout << "area est: " << area_est_vx2 << " vx^2 (";
+    if (area_est_cm2)
+        std::cout << *area_est_cm2 << " cm^2)";
+    else
+        std::cout << "cm^2 unknown: volume has no voxel size)";
+    std::cout << std::endl;
 
     cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
     cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
@@ -3544,8 +3555,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     surf->setChannel("generations", generations_hr(used_area_hr));
 
     surf->meta = utils::Json::object();
-    surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
-    surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
+    vc::surface::storeAreaMeta(surf->meta,
+                               static_cast<double>(area_est_vx2),
+                               static_cast<double>(voxelsize));
     surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
     if (resume_growth) {
         const int offset_col = grid_margin + expanded_left - used_area.x;
