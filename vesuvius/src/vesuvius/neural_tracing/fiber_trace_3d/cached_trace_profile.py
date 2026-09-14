@@ -129,6 +129,86 @@ class PublishedStore:
         return None
 
 
+def run_full(workload):
+    """Full original-fiber replay, immutable published cache, no GPU or rendering."""
+    import subprocess
+    previous = Path(workload["cached_evaluation"])
+    summary = json.loads((previous / "summary.json").read_text())
+    inventory = json.loads((previous / "inference_summary.json").read_text())
+    if not summary.get("completed") or any((previous / p).exists() for p in ("incomplete.json", "inference_incomplete.json")):
+        raise ValueError("cached evaluation requires completed input")
+    bindings_path = previous.parent / "full_bindings.json"
+    if bindings_path.exists():
+        bindings = json.loads(bindings_path.read_text())
+        if bindings["checkpoint_sha256"] != workload["checkpoint_sha256"]:
+            raise ValueError("completed bindings checkpoint mismatch")
+        for source in bindings["sources"]:
+            for fiber in source["fibers"]:
+                if sha256_file(fiber["path"]) != fiber["sha256"]:
+                    raise ValueError("annotation changed since completed evaluation")
+    output = Path(workload["output_root"])
+    output.mkdir(parents=True, exist_ok=False)
+    evaluation = deepcopy(summary["config"])
+    evaluation.pop("live_endpoint", None)
+    evaluation.update(output=str(output / "full"), render=False)
+    binary = Path(workload["native_binary"])
+    stores, mapping, channels = {}, {}, {}
+    hashes = {}
+    for source in evaluation["sources"]:
+        if bindings_path.exists():
+            recorded = next(b for b in bindings["sources"] if b["collection"] == source["id"])
+            if sha256_file(source["normal_manifest"]) != recorded["normal_manifest_sha256"]:
+                raise ValueError("normal manifest changed since completed evaluation")
+        root = Path(source["fiber_manifest"]).resolve().parent
+        if str(root) not in inventory["cache_roots"].values():
+            raise ValueError("cache not recorded by completed inference")
+        model = json.loads((root / "inference.json").read_text())["model"]
+        if model["checkpoint_sha256"] != workload["checkpoint_sha256"]:
+            raise ValueError("cached checkpoint mismatch")
+        for path in [*source["fibers"], source["normal_manifest"]]:
+            hashes[path] = sha256_file(path)
+        key = str(root)
+        if key not in stores:
+            stores[key] = PublishedStore(source["fiber_manifest"])
+            channels[key] = stores[key].channels
+        mapping[source["id"]] = key
+    # Export using the very same native selection implementation as replay.
+    config_path = output / "evaluation.json"
+    atomic_write(config_path, evaluation)
+    evaluation["reference_plan"] = json.loads(subprocess.check_output(
+        [str(binary), "replay-references", "--config", str(config_path)], text=True))
+    if any(sha256_file(path) != digest for path, digest in hashes.items()):
+        raise ValueError("input changed during reference planning")
+    atomic_write(config_path, evaluation)
+    atomic_write(output / "provenance.json", {"previous_evaluation": str(previous),
+        "checkpoint_sha256": workload["checkpoint_sha256"], "input_sha256": hashes,
+        "allow_inference": False, "render": False})
+    coordinate_native(evaluation, binary, stores, mapping, channels,
+        {key: set() for key in stores}, {}, (),
+        {"cached_trace_timeout_seconds": 3600}, allow_inference=False)
+    result = json.loads((output / "full/summary.json").read_text())
+    expected_cases = 2 * sum(len(fiber["runs"]) for source in evaluation["reference_plan"]["sources"] for fiber in source["fibers"])
+    if result["cases"] != expected_cases:
+        raise ValueError("cached replay coverage differs from selected reference plan")
+    report = write_metric_comparison(result, output / "metrics.json")
+    print(json.dumps(report["after"], indent=2), flush=True)
+    return report
+
+
+def write_metric_comparison(result, path):
+    """Shared reporting-only comparison; preserves raw artifacts, hides old counts."""
+    from .replay_metrics import complete_report
+    report = complete_report(result)
+    before = complete_report(result, episode_distance=0)
+    # Publish old distance metrics for comparison, not old event counts.
+    for group in [before["global_result"], *before["scrolls"].values(), *before["collections"].values()]:
+        for key in ("failures", "reliability_segments", "zero_length_segments"):
+            group.pop(key, None)
+    comparison = {"before_distance_metrics": before, "after": report}
+    atomic_write(path, comparison)
+    return comparison
+
+
 def run(workload):
     settings = workload["profile"]
     previous = Path(settings["completed_evaluation"])

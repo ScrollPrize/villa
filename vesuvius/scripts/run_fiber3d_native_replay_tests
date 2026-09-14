@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # Read-only build reuse; creates only pytest's temporary synthetic fixtures.
 set -euo pipefail
-if (( $# < 1 || $# > 2 )); then
-    echo "usage: bash $0 /path/to/native-build [python]" >&2
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+suite=full
+if (( $# == 0 )); then
+    # Machine-local choices live in a reviewed config; the approved command stays
+    # constant. Explicit build/python arguments retain the original full suite.
+    {
+        read -r build_dir
+        read -r python_bin
+        read -r suite
+    } < <(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["build_dir"]); print(c["python"]); print(c["suite"])' "$repo_dir/vesuvius/scripts/fiber3d_native_replay_tests.json")
+elif (( $# <= 2 )); then
+    build_dir=$1
+    python_bin=${2:-python3}
+else
+    echo "usage: bash $0 [ /path/to/native-build [python] ]" >&2
     exit 2
 fi
-build_dir=$(cd "$1" && pwd)
-python_bin=${2:-python3}
-repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+build_dir=$(cd "$build_dir" && pwd)
 find_binary() {
     local name=$1 candidate
     for candidate in "$build_dir/$name" "$build_dir/bin/$name" "$build_dir/core/test/$name" "$build_dir/apps/$name"; do
@@ -19,6 +30,28 @@ find_binary() {
     echo "missing rebuilt executable: $name in $build_dir" >&2
     return 1
 }
+if [[ "$suite" == inspection ]]; then
+    replay_binary=$(find_binary vc_fiber_trace_metric)
+    native_test=$(find_binary test_fiber_replay)
+    "$native_test"
+    cd "$repo_dir"
+    export VC_REPLAY_TEST_BINARY="$replay_binary"
+    export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+    export PYTHONPATH="$repo_dir/vesuvius/src:$repo_dir"
+    exec "$python_bin" -m pytest --noconftest -q \
+        vesuvius/tests/neural_tracing/test_native_replay_evaluation.py \
+        vesuvius/tests/neural_tracing/test_visualization_report.py \
+        vesuvius/tests/neural_tracing/test_replay_metrics.py \
+        vesuvius/tests/neural_tracing/test_cached_trace_profile.py \
+        lasagna/tests/test_demand_predict3d.py \
+        vesuvius/tests/neural_tracing/test_inference_cache_identity.py \
+        vesuvius/tests/neural_tracing/test_live_inference_cache_namespace.py \
+        vesuvius/tests/scripts/test_classic_fiber_evaluation.py
+fi
+if [[ "$suite" != full ]]; then
+    echo "unknown native replay test suite: $suite" >&2
+    exit 2
+fi
 trace_test=$(find_binary test_fiber_trace3d)
 cache_test=$(find_binary test_global_cache_root)
 replay_binary=$(find_binary vc_fiber_trace_metric)

@@ -33,8 +33,8 @@ from lasagna import tiled_predict3d as tiled
 from lasagna import demand_predict3d as demand
 from lasagna.inference_provenance import atomic_write, json_digest, sha256_file
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
-from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
 from vesuvius.neural_tracing.fiber_trace_3d import inference_adapter
+from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import resolve_prediction_cache
 from vesuvius.neural_tracing.fiber_trace_3d.infer import _checkpoint_config_for_inference, _resolve_inference_precision
 
 
@@ -48,7 +48,7 @@ def location(base, value):
 
 
 def inference_cache_root(cache_root, namespace=None):
-    """Optional fresh prediction-only namespace; source fetch caches stay shared."""
+    """Optional resumable prediction-only namespace; source fetch caches stay shared."""
     root = Path(cache_root) / "live_inference"
     if namespace is None:
         return root
@@ -57,9 +57,11 @@ def inference_cache_root(cache_root, namespace=None):
     destination = root / "_namespaces" / namespace
     if not destination.resolve().is_relative_to(root.resolve()):
         raise ValueError("inference cache namespace escapes live_inference through a symlink")
-    # Single-use prevents accidentally measuring a prediction-cache hit as a
-    # source-prefetched inference rerun. Existing predictions remain untouched.
-    destination.mkdir(parents=True, exist_ok=False)
+    if destination.is_symlink():
+        raise ValueError("inference cache namespace must not be a symlink")
+    # Model/source identity and DemandStore's writer lock govern safe reuse.
+    # Timing runs requiring fresh inference must choose a new namespace.
+    destination.mkdir(parents=True, exist_ok=True)
     return destination
 
 
@@ -242,11 +244,13 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
     def prepare_output():
         tiled.create_product_omezarr_groups(products=products, base_shape_zyx=source_identity["base_shape"],
             n_levels=level + power + 1, ome_chunk=geometry.chunk, ome_compressor=settings.get("compressor", "blosc-zstd"))
-        tiled.write_lasagna_product_manifest(output_path=cache / "inference.lasagna.json", products=products,
-            base_shape_zyx=source_identity["base_shape"], provenance_json="inference.json")
-        atomic_write(cache / "inference.json", {"source": source_identity, "model": model_identity,
-            "coverage": "partial; readiness requires complete published sibling chunks; live scheduling state is RAM-only",
-            "coarser_pyramids": "not generated"})
+        if not (cache / "inference.lasagna.json").exists():
+            tiled.write_lasagna_product_manifest(output_path=cache / "inference.lasagna.json", products=products,
+                base_shape_zyx=source_identity["base_shape"], provenance_json="inference.json")
+        if not (cache / "inference.json").exists():
+            atomic_write(cache / "inference.json", {"source": source_identity, "model": model_identity,
+                "coverage": "partial; readiness requires complete published sibling chunks; live scheduling state is RAM-only",
+                "coarser_pyramids": "not generated"})
     return demand.DemandStore(cache, {"source": source_identity, "model": model_identity},
         geometry, adapter, output, accumulator_dtype=settings.get("accumulator_dtype", "float16"),
         accumulator_layout=settings.get("accumulator_layout", "flat"),
@@ -275,6 +279,12 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     if config.get("version") != 1 or not config.get("sources"):
         raise ValueError("evaluation config requires version1 and explicit sources")
     binary = Path(shutil.which(str(native_binary)) or native_binary).resolve()
+    annotation_hashes = {location(base, path): sha256_file(Path(location(base, path)))
+                         for source in config["sources"] for path in source["fibers"]}
+    references = json.loads(subprocess.check_output(
+        [str(binary), "replay-references", "--config", str(config_path)], text=True))
+    if any(sha256_file(Path(path)) != digest for path, digest in annotation_hashes.items()):
+        raise ValueError("annotation changed while selecting evaluation references")
     resolver = binary.with_name("vc_cache_root")
     cache_root = Path(subprocess.check_output([str(resolver)], text=True).strip())
     prediction_cache_root = inference_cache_root(cache_root, config.get("inference_cache_namespace"))
@@ -304,15 +314,15 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     max_batch_size = settings.get("max_batch_size", 1)
     if type(max_batch_size) is not int or max_batch_size < 1:
         raise ValueError("inference.max_batch_size must be a positive integer")
-    implementation = implementation_identity()
     model_identity = {"schema": 1, "checkpoint_sha256": checkpoint_digest, "config": effective,
                       "precision": precision, "tile": tile, "overlap": overlap, "border": border,
                       "scale": scale, "chunk": chunk, "accumulator_dtype": dtype,
-                      "compressor": settings.get("compressor", "blosc-zstd"), "implementation": implementation,
+                      "compressor": settings.get("compressor", "blosc-zstd"),
                       "max_batch_size": max_batch_size,
                       "embedding_channels": "signed-float32-v2" if settings.get("emit_embeddings", False) else None}
-    model_key = json_digest(model_identity)
     evaluation = dict(config)
+    evaluation["reference_plan"] = references
+    evaluation["annotation_sha256"] = annotation_hashes
     if not isinstance(config.get("render", False), bool):
         raise ValueError("render must be a boolean")
     evaluation["render"] = render or config.get("render", False)
@@ -326,7 +336,7 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
     connection = None
     pool = None
     with ExitStack() as cleanup:
-        for source in config["sources"]:
+        for source_index, source in enumerate(config["sources"]):
             source_id = source["id"]
             if source_id in source_to_store:
                 raise ValueError("duplicate source ID")
@@ -349,9 +359,11 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
                 "coordinate_space": source.get("coordinate_space")}
             source_key = json_digest(source_identity)
             source_to_store[source_id] = source_key
-            cache = prediction_cache_root / source_key / model_key
+            cache, stored_model_identity = resolve_prediction_cache(
+                prediction_cache_root / source_key, source_identity, model_identity, geometry, settings)
+            print(f"live-eval cache source={source_id} existing={(cache / 'cache_identity.json').is_file()} path={cache}", flush=True)
             if source_key not in stores:
-                store = cleanup.enter_context(create_demand_store(cache, source_identity, model_identity,
+                store = cleanup.enter_context(create_demand_store(cache, source_identity, stored_model_identity,
                     geometry, effective, snapshot, level, settings))
                 products = store.products
                 stores[source_key] = store
@@ -366,14 +378,19 @@ def run(config_path, checkpoint, devices, native_binary, model_config=None, *, r
             entry["input_volume"] = input_path
             if "ct_volume" in source:
                 entry["ct_volume"] = location(base, source["ct_volume"])
+            elif evaluation["render"]:
+                # The input pyramid's level zero is the base coordinate frame.
+                # Native Volume/cache supports the same remote source as loading.
+                entry["ct_volume"] = input_path
+                entry["ct_base_volume"] = True
             entry["fibers"] = [location(base, f) for f in source["fibers"]]
             evaluation["sources"].append(entry)
-            for path in entry["fibers"]:
-                loaded = load_fiber_file(Path(path))
-                if len(loaded) != 1:
-                    raise ValueError("each explicit fiber path must contain one annotation")
-                backgrounds[source_key].update(reference_chunks(loaded[0].line_points_xyz,
-                    (1 << level) * scale, geometry.output_shape, chunk))
+            for fiber in references["sources"][source_index]["fibers"]:
+                for run in fiber["runs"]:
+                    backgrounds[source_key].update(reference_chunks(run["points_base_xyz"],
+                        (1 << level) * scale, geometry.output_shape, chunk))
+        if any(sha256_file(Path(path)) != digest for path, digest in annotation_hashes.items()):
+            raise ValueError("annotation changed before native evaluation launch")
         return coordinate_native(evaluation, binary, stores, source_to_store, channel_indices,
             backgrounds, readers, device_list, settings, started=started)
 
@@ -385,6 +402,7 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
     max_batch_size = settings.get("max_batch_size", 1)
     if type(max_batch_size) is not int or max_batch_size < 1:
         raise ValueError("inference.max_batch_size must be a positive integer")
+    producer_implementation = implementation_identity()  # Run provenance only, never a cache key.
     native = connection = pool = None
     with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
         listener = cleanup.enter_context(socket.socket())
@@ -418,7 +436,17 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             last_report = time.monotonic()
             queue_log = None
             last_queue_report = 0.0
+            last_metrics_report, metrics_cases = 0.0, -1
             while not authenticated or native.poll() is None or waiters or (pool is not None and pool.busy):
+                if evaluation.get("render") and time.monotonic() - last_metrics_report >= 30:
+                    root = Path(evaluation["output"])
+                    count = sum(1 for _ in (root / "cases").glob("*/trace.json"))
+                    image_count = sum(1 for _ in (root / "cases").glob("*/rendered*/strips_*.jpg"))
+                    if count and (count, image_count) != metrics_cases:
+                        from vesuvius.neural_tracing.fiber_trace_3d.visualization_report import write_trace_progress_report
+                        write_trace_progress_report(root, root.parent)
+                        metrics_cases = (count, image_count)
+                    last_metrics_report = time.monotonic()
                 if not allow_inference and time.monotonic() - started > settings.get("cached_trace_timeout_seconds", 300):
                     raise TimeoutError("cached trace profiling exceeded its bounded duration")
                 if select.select([connection], [], [], 0.005)[0]:
@@ -505,7 +533,11 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                     time.sleep(0.005)
                 queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
                     "phase": "complete", "trace_requests_waiting": 0, **pool.queue_snapshot()}) + "\n")
+            from .replay_metrics import correct_summary
+            summary_path = Path(evaluation["output"]) / "summary.json"
+            atomic_write(summary_path, correct_summary(json.loads(summary_path.read_text())))
             atomic_write(Path(evaluation["output"]) / "inference_summary.json", {
+                "producer_implementation": producer_implementation,
                 "wall_seconds": time.monotonic() - started, "worker_pool": pool.stats if pool else None,
                 "sources": {key: store.stats for key, store in stores.items()},
                 "cache_roots": {key: str(store.root) for key, store in stores.items()},
@@ -514,6 +546,7 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             destination = Path(evaluation["output"])
             destination.mkdir(parents=True, exist_ok=True)
             atomic_write(destination / "inference_incomplete.json", {"error": str(error),
+                "producer_implementation": producer_implementation,
                 "sources": {key: store.stats for key, store in stores.items()}})
             if connection is not None:
                 try:

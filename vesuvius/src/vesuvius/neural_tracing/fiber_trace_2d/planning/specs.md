@@ -1,5 +1,58 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Reported combined-distance mean (user override 2026-09-14)
+
+- At each aggregation scope (scroll, collection, paired fiber, pooled total),
+  reported mean = combined directed reference distance/(reported restarts+1).
+  Do not add one per fiber or directed run. Single-run formula is unchanged.
+- Actual reliability segment count remains restarts+directed runs. Median/P05/P95
+  continue using those actual segments; the reported mean is not their arithmetic
+  average and may exceed them. Empty coverage has no score.
+- `mean_definition=combined-directed-distance-per-restarts-plus-one-v1` and
+  `mean_denominator` disambiguate this from historical segment-average reports.
+  The restart episode policy itself and stored raw trace events are unchanged.
+
+## Batched fiber inspection pages
+
+- Nondefault evaluation ellipse factors are supported in inspection: use the
+  replay factor for frame radii, metadata and margins, with the long axis vertical.
+  Normal40/factor2 displays40/80; defaultfactor4 behavior is retained.
+
+- Shared reference-plan file identities resolve existing annotation symlinks,
+  matching Python Path.resolve. Different aliases of the same annotation must not
+  fail prefetch/replay parity; content/selection drift and missing targets still fail.
+
+- Evaluation/reference-prefetch/visualization share native cp-bounded-no-lasagna-v1
+  selection: exact control-point bounds, no extrapolated tails, skip actual Lasagna
+  interpolation spans; merge adjacent eligible spans. Each disconnected run is
+  independently bidirectionally seeded, never treated as a skip failure or joined
+  by a fabricated segment. Report selected fibers separately from eligible runs.
+  Mean = combined directed eligible length/(reported restarts + 1); excluded-only fibers
+  have no score. Preserve original arc offsets including reverse run_end−local_arc.
+  Historical unfiltered coverage is not directly ranked against filtered results.
+
+- Inline render combines CT and presence in paired rows for reference/traced
+  top and side views using identical physical coordinates. Target two base voxels
+  per output pixel with render_scale=1, no enlargement; legacy CT-only APIs unchanged.
+  CT labels identify source level, trilinear interpolation and coarse fallback.
+- Inspection top/side strips share a centerline-derived longitudinal sample count
+  per component; offset ribbon edge lengths must not independently stretch views.
+  Own-trace failure markers use trace endpoints, not ambiguous reference-arc inversion.
+- Cross-sections align with both traced views via inverse strip mapping, using
+  actual traced points. Every restart has old endpoint/new start sections in
+  separate lanes if needed. Planes are normal to trace tangent; long axis vertical. Radii
+  come from the actual replay metric, full extents equal twice the radii, and
+  faint ellipses show trace-centered display tolerance, not the GT-centered
+  historical rejection boundary. Singleton segments explicitly record nearest
+  strip-endpoint anchoring and reference-tangent fallback.
+- Restart labels identify native failure indices; JSON retains reference XYZ,
+  directional and original-fiber arc (including reverse mapping), physical mm,
+  section axes/radii and image placements. Coincident IDs remain distinct in
+  galleries/metadata even where strip labels overlap.
+- Per-fiber progress metrics must be available before rendering completes,
+  with terminal segments, direction counts, paired/single-direction formulas
+  and case/image links. Final reporting additionally validates all pages.
+
 ## Opt-in embedding reference modes
 
 - LRU anchor touch policy defaults to `nearest` (refresh nearest even for novel
@@ -104,7 +157,7 @@
 ## Explicit fresh-inference comparison subsets (2026-09-11)
 
 - Classic runner source.test_fibers optionally selects original filenames only after validating complete locked collection membership, hashes and count. Empty, duplicate, unknown and non-filename entries fail. Default evaluates the entire source.
-- Fresh inference comparisons use distinct single-use inference_cache_namespace values; fetched source CT/normal caches remain shared. Tile-size comparisons report normalized inferred volume and total wall, retain output chunk size, and disclose changed overlap amplification and possible blended prediction differences.
+- Fresh inference comparisons use distinct unused inference_cache_namespace values; repeated use resumes matching predictions. Fetched source CT/normal caches remain shared. Tile-size comparisons report normalized inferred volume and total wall, retain output chunk size, and disclose changed overlap amplification and possible blended prediction differences.
 
 ## Canonical batched tracer (2026-09-11)
 
@@ -247,16 +300,20 @@
   reference-segment-intersection prefetch. Prefetch is drained before coordinator
   completion. First-version priorities are monotone promotions without aging.
 - Cache lives under the shared global root's `live_inference/<source>/<model>`.
-  Optional evaluation `inference_cache_namespace` creates a fresh, single-use
+  Optional evaluation `inference_cache_namespace` creates or resumes a named
   `live_inference/_namespaces/<name>/<source>/<model>` prediction tree for timing
   reruns. It never relocates/clears source CT or normal caches, nor old predictions.
   Names are1–64ASCII letters/digits/underscore/hyphen, starting alphanumeric;
-  existing namespaces and resolved symlink escapes are rejected. Omitted/null
+  namespace symlinks and resolved symlink escapes are rejected. Fresh-inference
+  timing runs must select an unused namespace. Omitted/null
   retains normal reusable prediction-cache behavior. It is an operational path
   choice, not an inference/numerical parameter.
   Source identity includes locator/revision/metadata/lattice; inference identity
-  includes frozen checkpoint SHA256, effective parameters, relevant code hashes
-  and runtime versions. Require an updated revision for mutable input content.
+  includes frozen checkpoint SHA256 and effective inference parameters, not code
+  file hashes or runtime versions. Code/runtime are run provenance only. Legacy
+  code-hashed directories are reusable when all other model/source/geometry
+  settings match (absent embedding_channels means disabled). Original identity
+  metadata is retained. Require an updated revision for mutable input content.
 - Single-writer coordinator dictionaries, sets and deques track tiles, chunks,
   priorities and pending/applied contributions entirely in RAM. No database,
   mutable persistent ledger or per-chunk done markers. One static cache identity
@@ -4730,6 +4787,19 @@
   valid MTL, and 1x1 TIFF. The manifest records the selected group path, its
   actual base-to-group scale/offset transform and shape, native-grid contract, and
   artifact hashes.
+- The many-fiber `replay-set --render` entrypoint additionally renders inferred
+  presence beside the CT modality as separate image sets. It uses the same
+  overview geometry, stored matches, overlays, component gaps and pagination.
+  Presence uses the canonical prediction lattice and maximum presence across
+  options from complete presence/nx/ny products; sampling invokes the case-local
+  readiness gate before reading interpolation corners. Inference and render-lock
+  waits release CPU permits, and rendering finishes before case completion.
+  Legacy concrete local CT group validation is unchanged. This batch entrypoint
+  also accepts `ct_base_volume=true` for a local/remote uint8 CT pyramid whose
+  level-zero shape matches prediction base geometry; its transform is identity.
+  The live runner supplies its input pyramid automatically when no explicit CT
+  binding is present. Remote selected-array transforms are not inferred.
+  Rendering remains off by default and uses the completed in-memory replay.
 - Independently of the failure-local artifacts, every replay run with `--vis`
   publishes indexed full-selected-interval direct-inspection JPEGs. It builds
   the reference `LineModel` and one line model per at-least-two-point fiberlet
@@ -7203,3 +7273,38 @@ Maximum4096 pending vectors with preflight delay/step check and loud runtime
 overflow. Default delay0 and all existing method defaults remain unchanged.
 Opt-in seed-only scoring retains the initial embedding unchanged until a new
 trace; no history expiry/admission. It is distinct from the EMA+seed mixture.
+# Traced-strip restart label correction
+
+Inspection labels both reference and traced top/side strips. Traced `Rn-` and
+`Rn+` identify the old committed endpoint and actual next-segment start, matching
+cross-section IDs, in both modalities. No fabricated strip for singleton traces;
+no changes to sampling, trace geometry or evaluation metrics.
+# Reported restart episodes
+
+Default metric restart-episodes-80-base-voxels-v1 partitions reference distance
+at the first event of each episode. First event always counts; a later event
+counts only if its gap from the preceding actual event is >=80 base voxels.
+Reset grouping per directed eligible run. Include terminal span. Report only
+filtered restart counts and corresponding mean/median/P05/P95. Preserve all
+trace events and visual R IDs; IDs need not match the reported count. Episode
+metadata records first/last event indices and reference span. Means describe
+episode-separated reference distance, not uninterrupted successful tracing.
+CPU-only cached-full uses shared PublishedStore/coordinator, no inference or
+rendering, and fails on missing dependencies. Existing saved reports can be
+recomputed using report-metrics without mutating their trace artifacts.
+# Evaluation thickness-only tolerance and return window (2026-09-14)
+
+- Replay evaluation can specify `tangential_threshold_factor` (default4) and
+  `excursion_grace_base_voxels` (default0). Existing defaults remain immediate
+  failure with normal20/tangent80 when threshold20 is used.
+- Current comparison uses threshold40/factor2: thickness tolerance doubled,
+  width remains80. Grace160 measures committed traced travel after first
+  outside point, resets on reentry, and fails if still outside after that travel.
+  Pending outside excursions at termination/reference end count as failure.
+- Native and Lasagna replay share this policy. JSON stores the ellipse factor;
+  restoration validates geometry consistency. Nondefault-factor rendering is
+  explicitly rejected until the rendering geometry supports it.
+- Reported restart episodes remain separated by80 base voxels; include terminal
+  segments. No change to CP-bounded/non-Lasagna eligibility or model inputs.
+- Evaluator development uses the no-argument workspace build runner documented
+  in vesuvius/scripts/native-build-deps/README.md; historical configs preserved.

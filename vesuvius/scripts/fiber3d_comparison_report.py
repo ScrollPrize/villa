@@ -17,6 +17,8 @@ METRICS = [('failures', 'Restarts ↓', 0, False),
 def equal_scroll_score(metrics):
     if set(metrics['scrolls']) != set(SCROLLS):
         raise ValueError('comparison requires exactly the same five scrolls')
+    if any(metrics['scrolls'][s].get('directions', 1) == 0 for s in SCROLLS):
+        raise ValueError('comparison is undefined for an unevaluated scroll')
     values = [metrics['scrolls'][s]['mean_segment_length_mm'] for s in SCROLLS]
     if any(not math.isfinite(v) or v < 0 for v in values):
         raise ValueError('invalid per-scroll mean')
@@ -25,6 +27,8 @@ def equal_scroll_score(metrics):
 
 def classic_normalized_score(metrics, classic):
     """Classic-scaled geometric relative score, not an observed mean distance."""
+    if metrics.get('reference_selection_policy', 'whole_explicit_fibers_no_crop') != classic.get('reference_selection_policy', 'whole_explicit_fibers_no_crop'):
+        raise ValueError('reference selection policy differs; rerun matched coverage before ranking')
     scale = equal_scroll_score(classic)
     equal_scroll_score(metrics)  # Validate identical scroll set and finite means.
     baseline = [classic['scrolls'][s]['mean_segment_length_mm'] for s in SCROLLS]
@@ -51,7 +55,7 @@ def comparison_markdown(rows):
             if value['directions'] != ref['directions'] or not math.isclose(
                     value['directed_reference_mm'], ref['directed_reference_mm'], rel_tol=1e-9):
                 raise ValueError('evaluation coverage differs between models')
-            expected = value['directed_reference_mm'] / (value['failures'] + value['directions'])
+            expected = value['directed_reference_mm'] / (value['failures'] + 1)
             if not math.isclose(value['mean_segment_length_mm'], expected, rel_tol=1e-9):
                 raise ValueError('inconsistent per-scroll mean')
 
@@ -72,7 +76,7 @@ def comparison_markdown(rows):
         ref = rows[0]['metrics']['scrolls'][scroll]
         lines += ['', f"## {scroll} — {ref['directions'] // 2} fibers", '',
                   f"{ref['directions']} directions; {ref['directed_reference_mm']:.3f}mm directed reference.",
-                  'Total segments = restarts + directions.', '',
+                  'Mean = combined directed distance / (restarts + 1). Percentiles use actual segments.', '',
                   '| Model | ' + ' | '.join(m[1] for m in METRICS) + ' |',
                   '|---|' + '|'.join('---:' for _ in METRICS) + '|']
         for row in rows:

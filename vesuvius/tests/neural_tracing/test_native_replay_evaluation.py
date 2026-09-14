@@ -61,7 +61,8 @@ class SyntheticFiberAdapter:
     native_output_stride = 1
 
     def __init__(self, config, *, checkpoint, level, scaledown, inference_scaledown,
-                 chunk_size, product_prefix, zarr_path_prefix):
+                 chunk_size, product_prefix, zarr_path_prefix, emit_embeddings=False):
+        assert not emit_embeddings
         from lasagna.tiled_predict3d import OutputProductSpec, OutputChannelSpec
         self.config, self.checkpoint = config, checkpoint
         self.output_products = tuple(OutputProductSpec(name=f"fiber_option_{i:03d}", level=level,
@@ -116,6 +117,7 @@ def replay_fixture(tmp_path):
                                 "datasets": [{"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1, 1, 1]}]}]}]
     points = [[8, 16, 16], [24, 16, 16]]
     write(tmp_path / "annotation.json", {"type": "vc3d_fiber", "version": 1,
+          "optimization_mode": "native_fiber_trace3d",
           "line_points": points, "control_points": points})
     config = {"version": 1, "output": "evaluation", "workers": 2,
               "decoded_cache_bytes": 1024 * 1024,
@@ -137,6 +139,91 @@ def replay_fixture(tmp_path):
         return result
 
     return tmp_path, config, run
+
+
+def test_eligible_spans_trim_extrapolation_and_skip_lasagna(replay_fixture):
+    root, config, run = replay_fixture
+    def metadata(mode):
+        return dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
+            interp_goal="trace", interp_mode=mode, metric=None, msg="test",
+            normal_manifest="", fiber_manifest="", trace_to_base_scale=1,
+            meeting_error_base_voxels=None, meeting_error_ratio=None, meeting_source="",
+            failure_code="", failure_detail="", lasagna_failure_code="", lasagna_failure_detail="",
+            config=dict(step_voxels=4, cone_angle_degrees=25, cone_angle_step_degrees=5,
+                cone_grid_size=25, beam_width=8, beam_prune_distance_voxels=1, beam_lookahead_steps=2,
+                smoothness_weight=2, smoothness_normal_weight=.1, smoothness_tangent_weight=10,
+                smoothness_free_angle_degrees=0, cumulative_smoothness_steps=4,
+                cumulative_smoothness_tangent_weight=2, initial_free_angle_degrees=0,
+                max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20))
+    points = [[x, 16, 16] for x in range(4, 29, 2)]
+    controls = [{"position": points[i], "segment_to_next": metadata(mode)}
+                for i, mode in [(1, "cspline"), (3, "cspline"), (5, "lasagna"), (8, "cspline")]]
+    controls.append({"position": points[10]})
+    annotation = dict(type="vc3d_fiber", version=3, optimization_mode="native_fiber_trace3d",
+                      line_points=points, control_points=controls)
+    (root / "annotation.json").write_text(json.dumps(annotation))
+    plan = json.loads(run("replay-references", "--config", root / "evaluation.json").stdout)
+    selected = plan["sources"][0]["fibers"][0]
+    assert selected["original_length_base_voxels"] == 24
+    assert selected["eligible_length_base_voxels"] == 12
+    assert [r["line_indices"] for r in selected["runs"]] == [[1, 5], [8, 10]]
+    config["reference_plan"] = plan
+    config["render"] = True
+    (root / "evaluation.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "evaluation.json")
+    summary = json.loads((root / "evaluation/summary.json").read_text())
+    assert summary["cases"] == 4 and summary["failures"] == 0
+    assert summary["directed_reference_length_mm"] == pytest.approx(.024)
+    assert summary["mean_segment_length_mm"] == pytest.approx(.006)
+    for case in range(4):
+        document = json.loads((root / f"evaluation/cases/{case}/trace.json").read_text())
+        span = document["provenance"]["reference_run"]
+        metadata_json = json.loads((root / f"evaluation/cases/{case}/rendered/render.json").read_text())
+        for section in metadata_json["cross_sections"]:
+            lo, hi = span["original_arcs_base"]
+            expected = hi - section["directional_arc_base"] if document["provenance"]["reverse"] else lo + section["directional_arc_base"]
+            assert section["original_fiber_arc_base"] == pytest.approx(expected)
+    for cp in controls[:-1]:
+        cp["segment_to_next"]["interp_mode"] = "lasagna"
+    (root / "annotation.json").write_text(json.dumps(annotation))
+    changed = run("replay-set", "--config", root / "evaluation.json", check=False)
+    assert changed.returncode != 0 and "selection changed" in changed.stderr
+    config.pop("reference_plan")
+    config["output"] = "excluded"
+    (root / "excluded.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "excluded.json")
+    empty = json.loads((root / "excluded/summary.json").read_text())
+    assert empty["cases"] == 0 and empty["failures"] == 0
+    assert empty["mean_segment_length_mm"] is None
+
+
+@pytest.mark.parametrize("directory_alias", [False, True])
+def test_reference_plan_resolves_symlink_identity(replay_fixture, directory_alias):
+    root, config, run = replay_fixture
+    target = root / "annotation.json"
+    if directory_alias:
+        (root / "test").symlink_to(root, target_is_directory=True)
+        alias = root / "test/annotation.json"
+    else:
+        alias = root / "test.json"
+        alias.symlink_to("annotation.json")
+    config["sources"][0]["fibers"] = [str(alias)]
+    (root / "alias.json").write_text(json.dumps(config))
+    plan = json.loads(run("replay-references", "--config", root / "alias.json").stdout)
+    assert plan["sources"][0]["fibers"][0]["fiber_path"] == str(target.resolve())
+    config["reference_plan"] = plan
+    config["sources"][0]["fibers"] = [str(alias.resolve())]
+    (root / "resolved.json").write_text(json.dumps(config))
+    run("replay-set", "--config", root / "resolved.json")
+    assert json.loads((root / "evaluation/summary.json").read_text())["cases"] == 2
+    document = json.loads(target.read_text())
+    document["control_points"][1][0] -= 1
+    document["line_points"][1][0] -= 1
+    target.write_text(json.dumps(document))
+    changed = run("replay-set", "--config", root / "resolved.json", check=False)
+    assert changed.returncode != 0 and "selection changed" in changed.stderr
+    target.unlink()
+    assert run("replay-references", "--config", root / "alias.json", check=False).returncode != 0
 
 
 def test_bidirectional_export_and_posthoc_strips(replay_fixture):
@@ -195,10 +282,61 @@ def test_batch_render_flag_matches_posthoc_and_preserves_traces(replay_fixture):
         after = json.loads((root / f"inline/cases/{index}/trace.json").read_text())
         assert before["replay"] == after["replay"]
         assert list((root / f"inline/cases/{index}/rendered").glob("strips_*.jpg"))
+        metadata = json.loads((root / f"inline/cases/{index}/rendered/render.json").read_text())
+        assert metadata["modalities"] == ["ct", "presence"]
+        assert metadata["render_scale"] == 1
+        assert metadata["base_samples_per_pixel"] == 2
+        assert metadata["cross_sections"] and metadata["rows"]
+        for failure in after["replay"]["failures"]:
+            sections = [s for s in metadata["cross_sections"] if s.get("restart_index") == failure["index"]]
+            for role, offset, point_index in [("breakoff", 0, -1), ("restart_start", 1, 0)]:
+                segment_index = failure["segment_index"] + offset
+                if segment_index >= len(after["replay"]["segments"]):
+                    continue
+                points = after["replay"]["segments"][segment_index]["trace_points_base_xyz"]
+                if not points:
+                    continue
+                matching = [s for s in sections if s["role"] == role]
+                assert len(matching) == 1
+                assert matching[0]["center_base_xyz"] == points[point_index]
+        for section in metadata["cross_sections"]:
+            assert section["page"] == section["strip_page"]
+            left, right = section["columns"]
+            assert (left + right - 1) / 2 == section["strip_center_column"]
+        assert not (root / f"inline/cases/{index}/rendered_presence").exists()
     run("render-replay", root / "evaluation/cases/0/trace.json", "--config", root / "render.json")
-    expected = {p.name: p.read_bytes() for p in (root / "rendered").glob("strips_*.jpg")}
-    actual = {p.name: p.read_bytes() for p in (root / "inline/cases/0/rendered").glob("strips_*.jpg")}
-    assert actual == expected
+    assert list((root / "rendered").glob("strips_*.jpg"))  # Legacy CT-only posthoc remains available.
+
+
+def test_batch_render_base_pyramid(replay_fixture):
+    root, config, run = replay_fixture
+    config["sources"][0].update(ct_volume="ct.zarr", ct_base_volume=True)
+    (root / "base.json").write_text(json.dumps(config))
+    run("replay-set", "--render", "--config", root / "base.json")
+    for index in range(2):
+        metadata = json.loads((root / f"evaluation/cases/{index}/rendered/render.json").read_text())
+        assert metadata["texture_source"]["scale_from_base_xyz"] == [1, 1, 1]
+        assert metadata["texture_source"]["shape_zyx"] == [32, 32, 32]
+
+
+def test_batch_render_remote_base_pyramid(replay_fixture):
+    from functools import partial
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    root, config, run = replay_fixture
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(root)))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config["sources"][0].update(
+            ct_volume=f"http://127.0.0.1:{server.server_port}/ct.zarr", ct_base_volume=True)
+        (root / "remote.json").write_text(json.dumps(config))
+        run("replay-set", "--render", "--config", root / "remote.json")
+        assert list((root / "evaluation/cases/0/rendered").glob("strips_*.jpg"))
+        assert json.loads((root / "evaluation/cases/0/rendered/render.json").read_text())["modalities"] == ["ct", "presence"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("ct", [None, "missing.zarr/0", "https://example.invalid/ct.zarr/0"])
@@ -290,6 +428,9 @@ def test_live_gate_matches_offline_with_all_cases_waiting(replay_fixture, beam_w
     listener.listen(1)
     listener.settimeout(15)
     config["output"] = "live-evaluation"
+    # Rendering requests additional off-center interpolation chunks while CPU
+    # permits are released; one worker/two cases also exercises render-lock waits.
+    config["render"] = True
     config["profile_tracing"] = True
     config["readiness_cache_entries"] = readiness_entries
     config["live_endpoint"] = {"port": listener.getsockname()[1], "token": "synthetic-secret", "timeout_seconds": 15}
@@ -425,6 +566,7 @@ def test_complete_runner_cold_and_warm_with_identity_model(replay_fixture, monke
         assert summary["config"]["render"] is True
         for i in range(2):
             assert list((root / name / f"cases/{i}/rendered").glob("strips_*.jpg"))
+            assert json.loads((root / name / f"cases/{i}/rendered/render.json").read_text())["format"] == "vc_fiber_inspection"
     cold = json.loads((root / "cold/inference_summary.json").read_text())
     warm = json.loads((root / "warm/inference_summary.json").read_text())
     assert cold["worker_pool"]["tiles"] > 0

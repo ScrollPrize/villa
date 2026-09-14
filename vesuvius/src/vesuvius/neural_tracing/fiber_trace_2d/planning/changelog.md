@@ -1,3 +1,19 @@
+## 2026-09-14 — Combined fiber inspection and resumable inference
+
+- Current EMA999 u10200 full matched evaluation:119restarts vs148 forEMA99u5200,
+  combined mean57.230mm vs46.091mm; complete in350.144s. Full Classic/u1800/u5200
+  per-scroll comparison in docs/benchmarks/eligible_ema999_u10200_20260914.md.
+
+- Corrected cross-section alignment: paired traced top/side views share one
+  centerline sampling scale; native restart bands use actual endpoints even
+  when reference progress plateaus. Regression checks actual rendered pixels.
+
+- Named inference caches resume; model keys use checkpoint/inference parameters,
+  not code hashes. Compatible old hash-keyed cache directories remain reusable.
+- Inline combined CT/presence strips at quarter linear resolution, acceptance
+  cross-sections and restart arc metadata; partial per-fiber metrics no longer
+  wait for all rendering. See docs/batched_trace_strips.md.
+
 ## 2026-09-13 — EMA99 tracer reference variants
 
 - Added opt-in best-history and per-beam EMA/seed/gated references to shared
@@ -2574,3 +2590,54 @@
   admission, aggregation controls, tests and per-family refinement harness.
   Initial windowed/LRU sweeps do not beat EMA69; further evaluation ongoing.
   See docs/embedding_multi_anchor_20260913.md; defaults unchanged.
+## 2026-09-14 — Many-fiber CT and presence strips
+
+- Inline inspection now downsamples to two base voxels/pixel, labels CT sampling,
+  aligns dense sections to inverse traced-strip positions, and pairs old-end/new-start
+  restart sections. Selection now excludes extrapolated tails and actual Lasagna CP
+  spans for tracing, reference prefetch and rendering; per-fiber metrics pool eligible
+  runs without counting excluded jumps. Original line arcs and per-run links retained.
+- Reuse approved no-argument native replay test runner (JSON configuration) and
+  existing Classic evaluation runner; no ad-hoc environment-prefixed test commands.
+
+- Extended inline replay-set rendering with presence top/side reference/traced
+  views, shared restart-aware overview layout, remote CT base-pyramid support,
+  and source/page/component metadata. Existing tracing defaults unchanged.
+- Isolated native build and synthetic offline/remote/live-readiness tests;
+  usage and limitations: docs/batched_trace_strips.md.
+# 2026-09-14 traced-strip labels
+
+Fixed missing restart IDs in traced CT/presence top/side strips; label committed
+old/new endpoints Rn-/Rn+ after raster assembly. Evaluation metrics unchanged.
+# 2026-09-14 restart episode statistics
+
+Reported restarts now group retries less than80 base voxels apart; all means and
+quantiles use episode partitions. Preserve visual events. CPU-only cached full
+evaluation/reporting modes added; Classic rerun complete, current32000 matched
+rerun blocked on missing cache. Results: docs/benchmarks/restart_episodes80_20260914.md.
+# 2026-09-14 — thickness-only replay tolerance and workspace builds
+
+- Added shared excursion return window and independently specified ellipse
+  thickness/width; compared Classic and EMA99u1800 over all50 fibers.
+- Results: Classic510→292 restarts, EMA99 334→174; full metrics in
+  docs/benchmarks/thickness40_grace160_20260914.md.
+- Reusable no-argument native build now writes inside workspace;21native and
+  136Python regressions pass. No new dependency installation.
+# 2026-09-14 — fresh current EMA99 update5200
+
+- Frozen current EMA99u5200/samples665600, full50-fiber current40/80/grace160
+  protocol:148restarts,20.937888mm mean vs prioru1800 174/19.400077.
+- Full matched per-scroll/combined scores and commands in
+  docs/benchmarks/eligible_ema99_u5200_20260914.md. No tracer/training changes.
+# 2026-09-14 — aggregate mean denominator override
+
+- Report combined directed distance/(reported restarts+1), replacing the
+  aggregate restarts+directed-runs denominator. Actual segments/quantiles intact.
+- Corrected current-protocol three-model table and JSON:
+  docs/benchmarks/combined_restart_mean_20260914.md. No tracing rerun.
+# 2026-09-14 — EMA99u5200 current-policy visualization
+
+- Inspection frame/metadata now use actual ellipse factor;40/80 supported.
+- Full50fibers/180galleries complete under eligible_ema99_u5200_vis_20260914_v1.
+  Exact replay/metric parity with prior nonvisual run; per-fiber index and worst
+  fiber/case ranking saved.22native+138Python tests passed.

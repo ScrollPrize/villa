@@ -1,0 +1,9 @@
+prefix=/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/_deps/libbacktrace-install
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libbacktrace
+Description: Existing local libbacktrace for the evaluator build (no installation)
+Version: 1.0
+Libs: -L${libdir} -lbacktrace
+Cflags: -I${includedir}

@@ -1,0 +1,465 @@
+{
+  "name": "Embedding EMA99 reference6500_tuned",
+  "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_full_reference6500_tuned_20260914_v2",
+  "metrics": {
+    "metric_definition": "complete-reference-partition-v1",
+    "global_result": {
+      "metric_definition": "complete-reference-partition-v1",
+      "directions": 100,
+      "failures": 2181,
+      "reliability_segments": 2281,
+      "directed_reference_mm": 8081.5580596248055,
+      "mean_segment_length_mm": 3.542989066034549,
+      "median_segment_length_mm": 0.11666173776289296,
+      "p05_segment_length_mm": 0.008014251848113054,
+      "p95_segment_length_mm": 17.155134626658597,
+      "zero_length_segments": 24
+    },
+    "scrolls": {
+      "PHerc0139": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 20,
+        "failures": 544,
+        "reliability_segments": 564,
+        "directed_reference_mm": 1392.3474973602404,
+        "mean_segment_length_mm": 2.468701236454327,
+        "median_segment_length_mm": 0.0653583725199211,
+        "p05_segment_length_mm": 0.004559261417568798,
+        "p95_segment_length_mm": 14.125104939006869,
+        "zero_length_segments": 11
+      },
+      "PHerc0332": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 6,
+        "failures": 19,
+        "reliability_segments": 25,
+        "directed_reference_mm": 471.22168934474814,
+        "mean_segment_length_mm": 18.848867573789924,
+        "median_segment_length_mm": 10.668941349190753,
+        "p05_segment_length_mm": 0.006670146692878182,
+        "p95_segment_length_mm": 69.75897561043928,
+        "zero_length_segments": 0
+      },
+      "PHerc1299": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 10,
+        "failures": 195,
+        "reliability_segments": 205,
+        "directed_reference_mm": 599.7478831328873,
+        "mean_segment_length_mm": 2.9255994299165233,
+        "median_segment_length_mm": 0.34821779479106657,
+        "p05_segment_length_mm": 0.01085990668138436,
+        "p95_segment_length_mm": 14.511223818959374,
+        "zero_length_segments": 2
+      },
+      "PHerc1451": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 4,
+        "failures": 59,
+        "reliability_segments": 63,
+        "directed_reference_mm": 94.43014019691505,
+        "mean_segment_length_mm": 1.4988911142367467,
+        "median_segment_length_mm": 0.14672007735672207,
+        "p05_segment_length_mm": 0.008352308792313572,
+        "p95_segment_length_mm": 9.318943099257393,
+        "zero_length_segments": 0
+      },
+      "PHercParis4": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 60,
+        "failures": 1364,
+        "reliability_segments": 1424,
+        "directed_reference_mm": 5523.810849590015,
+        "mean_segment_length_mm": 3.879080652801977,
+        "median_segment_length_mm": 0.1108300064583706,
+        "p05_segment_length_mm": 0.009591039955839297,
+        "p95_segment_length_mm": 20.227604822919226,
+        "zero_length_segments": 11
+      }
+    },
+    "collections": {
+      "PHerc0139": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 20,
+        "failures": 544,
+        "reliability_segments": 564,
+        "directed_reference_mm": 1392.3474973602404,
+        "mean_segment_length_mm": 2.468701236454327,
+        "median_segment_length_mm": 0.0653583725199211,
+        "p05_segment_length_mm": 0.004559261417568798,
+        "p95_segment_length_mm": 14.125104939006869,
+        "zero_length_segments": 11
+      },
+      "PHerc0332": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 6,
+        "failures": 19,
+        "reliability_segments": 25,
+        "directed_reference_mm": 471.22168934474814,
+        "mean_segment_length_mm": 18.848867573789924,
+        "median_segment_length_mm": 10.668941349190753,
+        "p05_segment_length_mm": 0.006670146692878182,
+        "p95_segment_length_mm": 69.75897561043928,
+        "zero_length_segments": 0
+      },
+      "PHerc1229": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 10,
+        "failures": 195,
+        "reliability_segments": 205,
+        "directed_reference_mm": 599.7478831328873,
+        "mean_segment_length_mm": 2.9255994299165233,
+        "median_segment_length_mm": 0.34821779479106657,
+        "p05_segment_length_mm": 0.01085990668138436,
+        "p95_segment_length_mm": 14.511223818959374,
+        "zero_length_segments": 2
+      },
+      "PHerc1451": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 4,
+        "failures": 59,
+        "reliability_segments": 63,
+        "directed_reference_mm": 94.43014019691505,
+        "mean_segment_length_mm": 1.4988911142367467,
+        "median_segment_length_mm": 0.14672007735672207,
+        "p05_segment_length_mm": 0.008352308792313572,
+        "p95_segment_length_mm": 9.318943099257393,
+        "zero_length_segments": 0
+      },
+      "PHercParis4_eval_fibers": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 48,
+        "failures": 876,
+        "reliability_segments": 924,
+        "directed_reference_mm": 4224.802858470846,
+        "mean_segment_length_mm": 4.572297465877539,
+        "median_segment_length_mm": 0.14983381434664306,
+        "p05_segment_length_mm": 0.009694052110542488,
+        "p95_segment_length_mm": 28.316773451667135,
+        "zero_length_segments": 5
+      },
+      "PHercParis4_fibers": {
+        "metric_definition": "complete-reference-partition-v1",
+        "directions": 12,
+        "failures": 488,
+        "reliability_segments": 500,
+        "directed_reference_mm": 1299.0079911191685,
+        "mean_segment_length_mm": 2.598015982238337,
+        "median_segment_length_mm": 0.0747615714967017,
+        "p05_segment_length_mm": 0.009543740903396394,
+        "p95_segment_length_mm": 10.263620018199525,
+        "zero_length_segments": 6
+      }
+    }
+  },
+  "summary_sha256": "82d5e0ffa806ff87ca11a22a4a6421fc5405dc4a9f9a0fe829c34a418dc7a323",
+  "new": true,
+  "config": {
+    "version": 1,
+    "checkpoint": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1-frozen/live_inference/_models/0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417/snapshot.pt",
+    "checkpoint_sha256": "0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417",
+    "split_root": "/ephemeral/hendrik/fiber3d_train/2026-09-09_x4_collection/split_95_5_length_seed20260910",
+    "output_root": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_full_reference6500_tuned_20260914_v2",
+    "native_binary": "/tmp/vc-live-native-cmake/bin/vc_fiber_trace_metric",
+    "catalog_path": "/tmp/fiber-evaluation-catalog-20260910.json",
+    "devices": "0,1,2,3,4,5,6,7",
+    "pilot_devices": "0",
+    "pilot_source_id": "PHerc0139",
+    "pilot_result": "/ephemeral/hendrik/fiber3d_train2/evaluations/classic_s1_91500_20260910/pilot",
+    "sources": [
+      {
+        "id": "PHerc0139",
+        "sample_id": "PHerc0139",
+        "volume_id": "20260102150214",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 10,
+        "normal": {
+          "kind": "catalogue",
+          "selector": "atlas:20260419180421@L2"
+        }
+      },
+      {
+        "id": "PHerc0332",
+        "sample_id": "PHerc0332",
+        "volume_id": "20251211183505",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 3,
+        "normal": {
+          "kind": "catalogue",
+          "selector": "atlas:20260419180421@L2"
+        }
+      },
+      {
+        "id": "PHerc1229",
+        "sample_id": "PHerc1299",
+        "volume_id": "20260309130042",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 5,
+        "normal": {
+          "kind": "catalogue",
+          "selector": "atlas:20260419180421@L2"
+        }
+      },
+      {
+        "id": "PHerc1451",
+        "sample_id": "PHerc1451",
+        "volume_id": "20260319101107",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 2,
+        "normal": {
+          "kind": "catalogue",
+          "selector": "atlas:20260419180421@L2"
+        }
+      },
+      {
+        "id": "PHercParis4_eval_fibers",
+        "sample_id": "PHercParis4",
+        "volume_id": "20260411134726",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 24,
+        "normal": {
+          "kind": "manager-run",
+          "selector": "PHercParis4-20260411134726-las-sd2-5b17ff6c"
+        }
+      },
+      {
+        "id": "PHercParis4_fibers",
+        "sample_id": "PHercParis4",
+        "volume_id": "20260411134726",
+        "input_volume": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+        "input_level": 1,
+        "expected_test_count": 6,
+        "normal": {
+          "kind": "manager-run",
+          "selector": "PHercParis4-20260411134726-las-sd2-5b17ff6c"
+        }
+      }
+    ],
+    "evaluation": {
+      "gpu_manager": {
+        "enabled": true,
+        "exclusive": false,
+        "priority": 0,
+        "cpu_cores": 96,
+        "vram_bytes_per_gpu": 21474836480,
+        "label": "embedding_full_reference6500_tuned_20260914_v2"
+      },
+      "error_threshold_base_voxels": 20,
+      "inference": {
+        "accumulator_dtype": "float32",
+        "border": 32,
+        "chunk_size": 32,
+        "compressor": "blosc-zstd",
+        "input_workers": 32,
+        "input_slots": 128,
+        "input_io_threads": 16,
+        "input_decode_threads": 2,
+        "result_slots": 64,
+        "accumulator_layout": "chunk-major",
+        "overlap": 96,
+        "precision": "bf16",
+        "scaledown_power": 2,
+        "slots_per_gpu": 1,
+        "tile_size": 256,
+        "max_batch_size": 1,
+        "request_timeout_seconds": 3600,
+        "input_cache_bytes": 4294967296,
+        "emit_embeddings": true
+      },
+      "match_refine_steps": 1,
+      "render": false,
+      "trace_args": [
+        "--threads",
+        "1",
+        "--beam-width",
+        "8",
+        "--beam-lookahead-steps",
+        "2",
+        "--step-voxels",
+        "4",
+        "--smoothness-normal-weight",
+        "0.1",
+        "--smoothness-tangent-weight",
+        "10",
+        "--embedding-weight",
+        "0.1",
+        "--embedding-history-spacing-base-voxels",
+        "512",
+        "--embedding-history-window-base-voxels",
+        "1024",
+        "--embedding-history-count",
+        "8",
+        "--embedding-history-falloff",
+        "uniform",
+        "--embedding-reference-mode",
+        "anchors-lru",
+        "--embedding-ema-half-life-base-voxels",
+        "512",
+        "--embedding-anchor-count",
+        "2",
+        "--embedding-anchor-ema-mix",
+        "0",
+        "--embedding-anchor-aggregation",
+        "mean",
+        "--embedding-anchor-novelty",
+        "0.1",
+        "--embedding-anchor-touch",
+        "nearest"
+      ],
+      "version": 1,
+      "workers": 64,
+      "inference_cache_namespace": "embedding_full_reference6500_tuned_20260914_v2",
+      "profile_tracing": true,
+      "decoded_cache_bytes": 17179869184
+    }
+  },
+  "effective_trace": {
+    "beam_lookahead_steps": 2,
+    "beam_prune_distance_voxels": 1,
+    "beam_width": 8,
+    "cone_angle_degrees": 25,
+    "cone_angle_step_degrees": 5,
+    "cone_grid_size": 25,
+    "cumulative_smoothness_steps": 4,
+    "cumulative_smoothness_tangent_weight": 2,
+    "embedding_anchor_aggregation": "mean",
+    "embedding_anchor_count": 2,
+    "embedding_anchor_ema_mix": 0,
+    "embedding_anchor_novelty": 0.1,
+    "embedding_anchor_temperature": 0.1,
+    "embedding_anchor_touch": "nearest",
+    "embedding_ema_delay_base_voxels": 0,
+    "embedding_ema_half_life_base_voxels": 512,
+    "embedding_history_count": 8,
+    "embedding_history_falloff": "uniform",
+    "embedding_history_spacing_base_voxels": 512,
+    "embedding_history_window_base_voxels": 1024,
+    "embedding_reference_mode": "anchors-lru",
+    "embedding_weight": 0.1,
+    "lazy_lookahead": true,
+    "lookahead_parent_cap": 32,
+    "lookahead_retry_parent_cap": 0,
+    "max_step_factor": 3,
+    "parallel_threads": 1,
+    "smoothness_free_angle_degrees": 0,
+    "smoothness_normal_weight": 0.1,
+    "smoothness_tangent_weight": 10,
+    "smoothness_weight": 2,
+    "step_voxels": 4
+  },
+  "inference_summary_sha256": "164c7c7af8812f94fae998c9e946722d1c4c4180b2556b49b9b1572ae9396c62",
+  "inference": {
+    "coordinator_seconds": 1102.6300801895559,
+    "native_seconds": 1054.225871753,
+    "sources": {
+      "5353a107b5d394f37ebf9e543817d693e39be28d7500a3991820dee7d9e5c823": {
+        "inferred_tiles": 1078,
+        "published_chunks": 468,
+        "warm_chunks": 0
+      },
+      "6f3ddc1490019e865be779f53e09db0264bfe76004a035b97498ed852f55b3cc": {
+        "inferred_tiles": 24224,
+        "published_chunks": 7601,
+        "warm_chunks": 0
+      },
+      "891c28cce8edbbee74ce9cd7317bd0e9bb29b7b8ef797dc62dd7fac9b2d2bc08": {
+        "inferred_tiles": 517,
+        "published_chunks": 139,
+        "warm_chunks": 0
+      },
+      "a94d5ea349549975e372f8d5e9fb68a2fb5474c3dd06f00950b7d1cbe33ade20": {
+        "inferred_tiles": 2396,
+        "published_chunks": 731,
+        "warm_chunks": 0
+      },
+      "f87eef23d15f7f99edf8a4ffa452785e2eb024b9a2890b962d737770e6374487": {
+        "inferred_tiles": 5755,
+        "published_chunks": 1868,
+        "warm_chunks": 0
+      }
+    },
+    "batch_seconds": {
+      "count": 33970,
+      "sum": 7211.149270307273,
+      "mean": 0.2122799314191131,
+      "p50": 0.21095026563853025,
+      "p95": 0.22050622263923286,
+      "min": 0.20833601243793964,
+      "max": 0.47744297608733177
+    },
+    "worker_pool": {
+      "batch_size_counts": {
+        "1": 33970
+      },
+      "batches": 33970,
+      "gpu_memory_peaks": {
+        "0": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "1": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "2": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "3": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "4": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "5": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "6": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        },
+        "7": {
+          "cuda_peak_allocated_bytes": 5088567296,
+          "cuda_peak_reserved_bytes": 6981419008
+        }
+      },
+      "input_copy_seconds": 62.58459587208927,
+      "input_slot_bytes": 33554432,
+      "input_slots": 128,
+      "input_workers": 32,
+      "load_seconds": 32595.807772744447,
+      "max_batch_size": 1,
+      "pump_admit_seconds": 1.373718824237585,
+      "pump_background_seconds": 62.190837904810905,
+      "pump_dispatch_seconds": 3.5518372636288404,
+      "pump_events_seconds": 56.77923175692558,
+      "result_slot_bytes": 25165824,
+      "result_slots": 64,
+      "shared_slot_bytes": 5905580032,
+      "tiles": 33970,
+      "worker_seconds": 7211.149270307273
+    }
+  },
+  "case_artifacts": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_full_reference6500_tuned_20260914_v2/full/cases",
+  "selection": {
+    "sha256": "0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417",
+    "run": "/ephemeral/hendrik/fiber3d_train2/runs/combined_5scroll_s1a_paired_contrastive_128_sd1_16x8_ema_20260913_174112",
+    "selected": {
+      "path": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1-frozen/live_inference/_models/0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417/snapshot.pt",
+      "step": 6500,
+      "samples": 832000,
+      "metric": 1.0569821988604196,
+      "metric_name": "test_ema_0p99/loss_total",
+      "decay": 0.99
+    }
+  },
+  "classic_normalized_score": 4.694521405120314
+}

@@ -1,4 +1,4 @@
-"""Fresh prediction caches must not invalidate or relocate source fetches."""
+"""Named prediction caches resume without invalidating or relocating data."""
 from pathlib import Path
 
 import pytest
@@ -30,8 +30,10 @@ def test_namespace_is_fresh_and_preserves_existing_data(tmp_path):
     assert namespace == cache / "live_inference" / "_namespaces" / "warm_inputs_v1"
     assert namespace.is_dir() and not list(namespace.iterdir())
     assert source.read_bytes() == old_prediction.read_bytes() == b"unchanged"
-    with pytest.raises(FileExistsError):
-        inference_cache_root(cache, "warm_inputs_v1")
+    chunk = namespace / "published_chunk"
+    chunk.write_bytes(b"cached prediction")
+    assert inference_cache_root(cache, "warm_inputs_v1") == namespace
+    assert chunk.read_bytes() == b"cached prediction"
     assert inference_cache_root(cache, "warm_inputs_v2") != namespace
 
 
@@ -62,5 +64,14 @@ def test_existing_namespace_symlink_is_not_reused(tmp_path):
     parent = root / "_namespaces"
     parent.mkdir(parents=True)
     (parent / "warm_inputs").symlink_to(root, target_is_directory=True)
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ValueError, match="symlink"):
         inference_cache_root(cache, "warm_inputs")
+
+
+def test_namespace_file_is_not_replaced(tmp_path):
+    namespace = inference_cache_root(tmp_path, "test")
+    namespace.rmdir()
+    namespace.write_bytes(b"keep")
+    with pytest.raises(FileExistsError):
+        inference_cache_root(tmp_path, "test")
+    assert namespace.read_bytes() == b"keep"

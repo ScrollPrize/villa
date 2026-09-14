@@ -186,7 +186,7 @@ def prepare(workload, *, pilot_only=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "profile", "observe"])
+    parser.add_argument("mode", choices=["freeze-snapshot", "prepare", "prepare-pilot", "validate-pilot", "validate-full", "pilot", "full", "cached-full", "report-metrics", "profile", "observe", "report-progress", "reference-plan"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--devices", help="runtime device selection (default from workload)")
     parser.add_argument("--manager-socket")
@@ -196,6 +196,42 @@ def main():
     parser.add_argument("--seconds", type=float, default=20, help="read-only observe duration,1–60s")
     args = parser.parse_args()
     workload = load_workload(args.config)
+    if args.mode == "freeze-snapshot":
+        from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint
+        from lasagna.inference_provenance import atomic_write
+        import torch
+        snapshot, digest = freeze_checkpoint(Path(workload["checkpoint"]), Path(workload["output_root"]) / "frozen")
+        saved = torch.load(snapshot, map_location="cpu", weights_only=False)
+        metadata = {"checkpoint": str(snapshot), "checkpoint_sha256": digest,
+                    "source": workload["checkpoint"],
+                    "metadata": {k: v for k, v in saved.items() if isinstance(v, (str, int, float, bool, type(None)))},
+                    "config": saved.get("config", {})}
+        atomic_write(Path(workload["output_root"]) / "snapshot.json", metadata)
+        print(json.dumps(metadata, indent=2, default=str))
+        return 0
+    if args.mode == "report-metrics":
+        from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import write_metric_comparison
+        source = Path(workload["cached_evaluation"]) / "summary.json"
+        destination = Path(workload["output_root"]) / "saved_trace_metrics.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        report = write_metric_comparison(json.loads(source.read_text()), destination)
+        print(json.dumps(report["after"], indent=2))
+        return 0
+    if args.mode == "cached-full":
+        # Read-only published-cache evaluator: no manager GPU lease, no CUDA.
+        import os
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        from vesuvius.neural_tracing.fiber_trace_3d.cached_trace_profile import run_full
+        run_full(workload)
+        return 0
+    if args.mode == "report-progress":
+        from vesuvius.neural_tracing.fiber_trace_3d.visualization_report import write_trace_progress_report
+        root = Path(workload["output_root"])
+        report = write_trace_progress_report(root / "full", root)
+        print(json.dumps({"paired_fibers": report["paired_fibers"],
+            "arithmetic_mean_per_fiber_mm": report["arithmetic_mean_per_fiber_mm"],
+            "short_below_average": report["short_below_average"][:5]}, indent=2))
+        return 0
     if args.mode == "observe":
         if args.pid is None:
             parser.error("observe requires --pid")
@@ -223,6 +259,9 @@ def main():
         return
     CHECKPOINT, SPLIT, ROOT, BINARY = (Path(workload[k]) for k in ("checkpoint", "split_root", "output_root", "native_binary"))
     validate_only = args.mode.startswith("validate-")
+    reference_plan_only = args.mode == "reference-plan"
+    if reference_plan_only:
+        args.mode = "full"
     if validate_only:
         args.mode = args.mode.removeprefix("validate-")
     if args.mode in ("prepare", "prepare-pilot"):
@@ -247,18 +286,35 @@ def main():
     for source in config["sources"]:
         if sha256_file(source["normal_manifest"]) != expected_normals[source["id"]]:
             raise ValueError(f"normal manifest changed: {source['id']}")
+    if reference_plan_only:
+        from lasagna.inference_provenance import atomic_write
+        plan = json.loads(subprocess.check_output([str(BINARY), "replay-references", "--config", str(ROOT / "full.json")], text=True))
+        plan["annotation_sha256"] = {f["path"]: f["sha256"] for s in audit["sources"] for f in s["fibers"]}
+        atomic_write(ROOT / "reference_plan.json", plan)
+        print(json.dumps({"policy": plan["policy"], "sources": [{"source": s["source_id"],
+            "selected_fibers": len(s["fibers"]), "eligible_runs": sum(len(f["runs"]) for f in s["fibers"]),
+            "excluded_fibers": sum(not f["runs"] for f in s["fibers"]),
+            "original_voxels": sum(f["original_length_base_voxels"] for f in s["fibers"]),
+            "eligible_voxels": sum(f["eligible_length_base_voxels"] for f in s["fibers"])} for s in plan["sources"]]}, indent=2))
+        return 0
     if args.mode == "full":
         pilot_root = Path(workload.get("pilot_result", ROOT / "pilot"))
         if any((pilot_root / name).exists() for name in ("incomplete.json", "inference_incomplete.json")):
             raise ValueError("pilot is incomplete")
         pilot_summary = json.loads((pilot_root / "summary.json").read_text())
-        if not pilot_summary.get("completed") or pilot_summary.get("cases") != 2:
+        if not pilot_summary.get("completed") or pilot_summary.get("cases", 0) < 2 or pilot_summary["cases"] % 2:
             raise ValueError("successful bidirectional pilot required")
         json.loads((pilot_root / "inference_summary.json").read_text())
     if validate_only:
         print("Checkpoint, locked split membership/content, config and normal manifests verified.", flush=True)
         return
-    return run(ROOT / f"{args.mode}.json", CHECKPOINT, devices, BINARY, unmanaged=True)
+    result = run(ROOT / f"{args.mode}.json", CHECKPOINT, devices, BINARY, unmanaged=True)
+    if config.get("render") and result in (None, 0):
+        from vesuvius.neural_tracing.fiber_trace_3d.visualization_report import write_visualization_report
+        write_visualization_report(ROOT / args.mode, ROOT,
+            provenance={"checkpoint": str(CHECKPOINT), "checkpoint_sha256": audit["checkpoint_sha256"],
+                        "workload": str(args.config.resolve()), "native_binary": str(BINARY)})
+    return result
 
 
 if __name__ == "__main__":

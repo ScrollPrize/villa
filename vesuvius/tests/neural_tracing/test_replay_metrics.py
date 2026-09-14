@@ -37,8 +37,9 @@ def test_one_restart_and_terminal():
 
 def test_zero_failures_repeats_endpoints_and_reverse():
     assert reference_segments(case(failures=())) == [10]
-    assert reference_segments(case(failures=(0, 4, 4, 10), direction="reverse")) == [0, 4, 0, 6, 0]
-    assert segment_statistics([10, 20], 2)["mean_segment_length_mm"] == 15
+    assert reference_segments(case(failures=(0, 4, 4, 10), direction="reverse")) == [0, 10]
+    assert reference_segments(case(failures=(0, 4, 4, 10)), episode_distance=0) == [0, 4, 0, 6, 0]
+    assert segment_statistics([10, 20], 2)["mean_segment_length_mm"] == 30
     assert segment_statistics([10], 1)["p05_segment_length_mm"] == 10
     assert segment_statistics([], 0)["reliability_segments"] == 0
 
@@ -56,15 +57,40 @@ def test_incomplete():
         reference_segments(c)
 
 
+def test_combined_restart_denominator_and_unchanged_quantiles():
+    stats = segment_statistics([10, 20, 30, 40, 50, 60, 100, 115.1609036763345], 6)
+    assert stats["failures"] == 2
+    assert stats["reliability_segments"] == 8
+    assert stats["mean_denominator"] == 3
+    assert stats["mean_segment_length_mm"] == pytest.approx(425.1609036763345 / 3)
+    assert stats["median_segment_length_mm"] == 45
+    assert segment_statistics([10, 20, 30], 3)["mean_segment_length_mm"] == 60
+    assert segment_statistics([], 0)["mean_denominator"] == 0
+
+
+def test_previously_filtered_summary_keeps_counts_with_new_mean():
+    old = correct_summary(summary())
+    old.pop("mean_definition")
+    old.pop("mean_denominator")
+    old["mean_segment_length_mm"] = 20 / 3
+    new = correct_summary(old)
+    assert new["failures"] == old["failures"]
+    assert new["mean_segment_length_mm"] == 10
+    assert new["median_segment_length_mm"] == old["median_segment_length_mm"]
+    assert correct_summary(new) == new
+
+
 def test_pooled_units_and_idempotence():
     s = summary()
     before = copy.deepcopy(s)
     fixed = correct_summary(s)
     assert s == before
-    assert fixed["mean_segment_length_mm"] == pytest.approx(20 / 3)
+    assert fixed["mean_segment_length_mm"] == pytest.approx(20 / 2)
+    assert fixed["mean_denominator"] == 2
+    assert fixed["mean_segment_length_percent"] == 50
     assert fixed["reliability_segments"] == 3
     assert fixed["sources"][1]["summary"]["mean_segment_length_mm"] == 10
-    assert fixed["sources"][0]["cases"] == s["sources"][0]["cases"]
+    assert fixed["sources"][0]["cases"][0]["failures"] == s["sources"][0]["cases"][0]["failures"]
     assert correct_summary(fixed) == fixed
     assert complete_report(fixed)["global_result"]["median_segment_length_mm"] == 6
 
@@ -87,3 +113,29 @@ def test_saved_migration_preserves_original_and_cases(tmp_path):
     fixed = output.read_bytes()
     assert module.migrate(output, True)["status"] == "already-correct"
     assert output.read_bytes() == fixed
+
+
+def test_episodes_chain_boundary_and_run_reset():
+    assert reference_segments(case(300, (0, 70, 140, 220))) == [0, 220, 80]
+    assert reference_segments(case(300, (10, 89, 169))) == [10, 159, 131]
+    assert reference_segments(case(300, (10, 90))) == [10, 80, 210]
+    assert reference_segments(case(300, (10, 90), direction="reverse")) == [10, 80, 210]
+    assert reference_segments(case(20, (2,))) == [2, 18]  # first event always counts
+    for distance in (-1, float("nan")):
+        with pytest.raises(ValueError):
+            reference_segments(case(), episode_distance=distance)
+
+
+def test_filtered_summary_is_idempotent_and_validates_original_counts():
+    s = summary()
+    c = s["sources"][0]["cases"][0]
+    c["failures"] = [{"directional_reference_arc_base_voxels": v} for v in (1, 2, 3)]
+    s["failures"] = 3
+    fixed = correct_summary(s)
+    assert fixed["failures"] == 1
+    assert len(fixed["sources"][0]["cases"][0]["failures"]) == 3
+    assert correct_summary(fixed) == fixed
+    assert complete_report(fixed, episode_distance=0)["global_result"]["failures"] == 3
+    s["failures"] = 2
+    with pytest.raises(ValueError, match="failure total"):
+        complete_report(s)

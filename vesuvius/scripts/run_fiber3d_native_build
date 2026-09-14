@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# No installs/downloads. Workspace-local evaluator build; existing dependencies.
+set -euo pipefail
+if (( $# != 0 )); then echo "This build runner takes no arguments." >&2; exit 2; fi
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+build_dir="$repo_dir/volume-cartographer/build/fiber-evaluation"
+export AGENTS_AGENT_MODE=1
+export PKG_CONFIG_PATH="$repo_dir/vesuvius/scripts/native-build-deps${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+dependency_root=/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/_deps
+for existing in "$dependency_root/libbacktrace-install/lib/libbacktrace.a" \
+                "$dependency_root/libbacktrace-install/include/backtrace.h" \
+                "$dependency_root/vc_delta3d-src/CMakeLists.txt"; do
+    if [[ ! -f "$existing" ]]; then
+        echo "Missing existing dependency (no automatic installation): $existing" >&2
+        exit 1
+    fi
+done
+pkg-config --exists libbacktrace
+cmake -S "$repo_dir/volume-cartographer" -B "$build_dir" -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DVC_BUILD_APPS=OFF -DVC_BUILD_FIBERLETS=ON -DVC_BUILD_FLATBOI=OFF \
+    -DVC_BUILD_PYTHON=OFF -DVC_BUILD_UI_TRACER=OFF -DVC_ENABLE_HIGHS=OFF \
+    -DVC_TESTING=ON -DVC_USE_PCH=OFF -DVC_USE_CCACHE=OFF -DVC_MARCH_NATIVE=OFF \
+    -DVC_USE_SYSTEM_LIBBACKTRACE=ON -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+    -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/_deps/vc_delta3d-src
+cmake --build "$build_dir" --target vc_fiber_trace_metric vc_cache_root test_fiber_replay -j 8
