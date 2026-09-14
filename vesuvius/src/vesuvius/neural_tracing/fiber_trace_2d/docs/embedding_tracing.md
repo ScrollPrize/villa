@@ -9,6 +9,13 @@ retains the existing prediction products and makes no embedding reads.
 
 ## Scoring and storage
 
+Experimental LRU `--embedding-anchor-touch hit` only refreshes an old anchor
+when an observation exactly matches or has cosine distance below the novelty
+threshold. Novel observations evict actual LRU without first touching their
+nearest anchor. Default `nearest` retains the original forced-nearest touch.
+This isolates replacement semantics without changing costs or memory. Native
+build and empirical evaluation are pending the running frozen-binary sweep.
+
 `--embedding-reference-mode anchors` builds a compact observed appearance model.
 The regular bounded history is its observation bank (<=64); greedy medoid
 selection minimizes summed nearest cosine distance, taking up to
@@ -180,6 +187,26 @@ Native QuickBuild unchanged. Explicit selection regression plus existing suites:
 98 Python passed39.35s, two native suites passed1.88s, logs under
 `cooperative-tests/20260913_143916_847400`. No install or training changes.
 # History parameter sweep
+
+Experimental `--embedding-reference-mode seed` scores cosine distance to the
+fixed initial embedding only, with no update or expiry. It resets per trace.
+This is a control for sparse histories that rarely admit a second observation,
+and is distinct from `ema-seed`, which mixes an adaptive EMA with the seed.
+
+Experimental `--embedding-reference-mode ema-delayed` uses the same normalized
+EMA, but delays admission by `--embedding-ema-delay-base-voxels` (default0,
+maximum2048). The seed is active immediately. Candidates score their parent's
+reference; selected-child observations enter a private FIFO and update the EMA
+only once the traced arclength exceeds their observation arclength by the delay.
+Each update retains its original step distance, not the time/distance of release.
+Zero delay calls the ordinary EMA update exactly. No GT or future observation
+is consulted. This tests resistance to immediate wrong-turn reinforcement, at
+the cost of slower adaptation to correct appearance changes; it is not a
+confidence guarantee. Pending memory is capped at4096 observations per beam;
+delay/step capacity is checked before tracing and unexpected overflow fails
+loudly. Ordinary step8/delay32–256 needs4–32 pending vectors. The preflight
+half-step estimate is conservative, not a guarantee at arbitrary float coordinate
+magnitudes. No full-path queue or cross-beam sharing is introduced.
 
 Experimental `--embedding-reference-mode appearance` corrects the windowed
 medoid restriction: it maintains up to `--embedding-anchor-count` whole-path

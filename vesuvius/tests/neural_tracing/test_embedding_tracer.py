@@ -194,6 +194,16 @@ def test_family_refinement_cycles_and_retains_each_family():
     assert fine[0]['parameters']['weight']==.35
 
 
+def test_lru_touch_policy_validation():
+    from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants
+    candidate = dict(weight=.1, spacing=512, window=1024, count=8,
+                     falloff='uniform', mode='anchors-lru', touch='hit')
+    assert configured_variants({'candidates':[candidate]})[-1]['touch'] == 'hit'
+    for override in ({'touch':'unknown'}, {'mode':'appearance'}, {'mode':'ema'}):
+        with pytest.raises(ValueError, match='touch'):
+            configured_variants({'candidates':[dict(candidate, **override)]})
+
+
 def test_product_storage_preserves_signed_float32(tmp_path):
     from lasagna.tiled_predict3d import OutputProductSpec, OutputChannelSpec, create_product_omezarr_groups
     product = OutputProductSpec(name="embedding", level=0, scaledown=1,
@@ -211,9 +221,14 @@ def test_product_storage_preserves_signed_float32(tmp_path):
 def test_embedding_reference_variants():
     from vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep import configured_variants
     base = dict(weight=.25, spacing=128, window=1024, count=8, falloff='uniform')
-    for mode in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated'):
+    for mode in ('mean', 'best', 'seed', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated', 'ema-delayed'):
         row = configured_variants({'candidates': [dict(base, mode=mode, half_life=128)]})[-1]
         assert row['mode'] == mode and row['half_life'] == 128
+    row = configured_variants({'candidates': [dict(base, mode='ema-delayed', delay=64)]})[-1]
+    assert row['delay'] == 64
+    for delay in (-1, 2049, float('inf'), float('nan')):
+        with pytest.raises(ValueError):
+            configured_variants({'candidates': [dict(base, mode='ema-delayed', delay=delay)]})
     for update in (dict(mode='max'), dict(mode='best', falloff='gaussian'), dict(half_life=0), dict(half_life=float('nan'))):
         with pytest.raises(ValueError):
             configured_variants({'candidates': [{**base, **update}]})

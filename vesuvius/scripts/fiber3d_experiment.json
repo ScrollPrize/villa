@@ -8,557 +8,137 @@
   },
   "embedding_trace_sweep": {
     "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_all_refine_20260913_v1",
-    "weight_search": false,
-    "search_history": {
-      "spacing": 128,
-      "window": 1024,
-      "count": 8,
-      "falloff": "gaussian",
-      "mode": "ema",
-      "half_life": 512
-    },
-    "start_weight": 0.25,
-    "grid_weight": 0.25,
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_seed_delay_touch_20260914_v1",
     "fill_missing": true,
-    "controls_only": true,
     "gpu_manager": {
       "exclusive": false,
       "priority": 0,
       "cpu_cores": 16,
       "vram_bytes_per_gpu": 21474836480,
-      "label": "embedding-history-sweep"
+      "label": "embedding-method-comparison"
     },
     "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
-    "refine": [
+    "candidates": [
       {
-        "label": "anchors-lru-best-novel",
-        "seed": {
-          "aggregation": "best",
-          "anchors": 4,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "anchors-lru",
-          "novelty": 0.1,
-          "spacing": 512,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ],
-          "novelty": [
-            0.02,
-            0.05,
-            0.1,
-            0.2,
-            0.3
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema",
+        "weight": 0.25,
+        "half_life": 512,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       },
       {
-        "label": "appearance-best",
-        "seed": {
-          "anchors": 2,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "appearance",
-          "spacing": 512,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema-delayed",
+        "weight": 0.25,
+        "half_life": 512,
+        "delay": 0,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       },
       {
-        "label": "appearance-support-softmin",
-        "seed": {
-          "aggregation": "support-softmin",
-          "anchors": 2,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "appearance",
-          "spacing": 512,
-          "temperature": 0.03,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ],
-          "temperature": [
-            0.01,
-            0.03,
-            0.1,
-            0.3,
-            1
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "anchors-lru",
+        "aggregation": "mean",
+        "weight": 0.1,
+        "anchors": 2,
+        "novelty": 0.1,
+        "ema_mix": 0,
+        "spacing": 512,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "anchors-lru-best-plain",
-        "seed": {
-          "aggregation": "best",
-          "anchors": 4,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "anchors-lru",
-          "spacing": 512,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "anchors-lru",
+        "aggregation": "mean",
+        "weight": 0.1,
+        "anchors": 2,
+        "novelty": 0.1,
+        "touch": "hit",
+        "ema_mix": 0,
+        "spacing": 512,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "anchors-lru-mean-plain",
-        "seed": {
-          "aggregation": "mean",
-          "anchors": 4,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "anchors-lru",
-          "spacing": 512,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "anchors-lru",
+        "aggregation": "best",
+        "weight": 0.1,
+        "anchors": 2,
+        "novelty": 0.1,
+        "touch": "hit",
+        "ema_mix": 0,
+        "spacing": 512,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "anchors-lru-mean-novel",
-        "seed": {
-          "aggregation": "mean",
-          "anchors": 4,
-          "count": 8,
-          "ema_mix": 0,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "anchors-lru",
-          "novelty": 0.1,
-          "spacing": 512,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            64,
-            128,
-            512
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ],
-          "novelty": [
-            0.02,
-            0.05,
-            0.1,
-            0.2,
-            0.3
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "seed",
+        "weight": 0.1,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "anchors",
-        "seed": {
-          "anchors": 8,
-          "count": 64,
-          "ema_mix": 0.9,
-          "falloff": "uniform",
-          "half_life": 512,
-          "mode": "anchors",
-          "spacing": 256,
-          "weight": 0.25,
-          "window": 16384
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            128,
-            256
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "anchors": [
-            2,
-            4,
-            8
-          ],
-          "ema_mix": [
-            0,
-            0.5,
-            0.9
-          ],
-          "half_life": [
-            128,
-            512,
-            2048
-          ],
-          "window": [
-            1024,
-            4096,
-            16384
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "seed",
+        "weight": 0.25,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "ema",
-        "seed": {
-          "count": 8,
-          "falloff": "gaussian",
-          "half_life": 512,
-          "mode": "ema",
-          "spacing": 128,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "half_life": [
-            64,
-            128,
-            256,
-            384,
-            512,
-            768,
-            1024,
-            2048
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "seed",
+        "weight": 0.5,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "uniform"
       },
       {
-        "label": "ema-gated",
-        "seed": {
-          "count": 8,
-          "falloff": "gaussian",
-          "half_life": 512,
-          "mode": "ema-gated",
-          "spacing": 128,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "half_life": [
-            64,
-            128,
-            256,
-            384,
-            512,
-            768,
-            1024,
-            2048
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema-delayed",
+        "weight": 0.25,
+        "half_life": 512,
+        "delay": 32,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       },
       {
-        "label": "ema-seed",
-        "seed": {
-          "count": 8,
-          "falloff": "gaussian",
-          "half_life": 128,
-          "mode": "ema-seed",
-          "spacing": 128,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "half_life": [
-            64,
-            128,
-            256,
-            384,
-            512,
-            768,
-            1024,
-            2048
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema-delayed",
+        "weight": 0.25,
+        "half_life": 512,
+        "delay": 64,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       },
       {
-        "label": "ema-seed-gated",
-        "seed": {
-          "count": 8,
-          "falloff": "gaussian",
-          "half_life": 128,
-          "mode": "ema-seed-gated",
-          "spacing": 128,
-          "weight": 0.25,
-          "window": 1024
-        },
-        "axes": {
-          "half_life": [
-            64,
-            128,
-            256,
-            384,
-            512,
-            768,
-            1024,
-            2048
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema-delayed",
+        "weight": 0.25,
+        "half_life": 512,
+        "delay": 128,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       },
       {
-        "label": "best",
-        "seed": {
-          "count": 64,
-          "falloff": "uniform",
-          "mode": "best",
-          "spacing": 128,
-          "weight": 0.25,
-          "window": 256
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            128
-          ],
-          "window": [
-            128,
-            256,
-            1024,
-            4096
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ]
-        },
-        "neighbor_weight": true
-      },
-      {
-        "label": "mean",
-        "seed": {
-          "count": 8,
-          "falloff": "uniform",
-          "spacing": 32,
-          "weight": 0.25,
-          "window": 256
-        },
-        "axes": {
-          "spacing": [
-            8,
-            32,
-            128
-          ],
-          "window": [
-            128,
-            256,
-            1024,
-            4096
-          ],
-          "weight": [
-            0.1,
-            0.25,
-            0.5
-          ],
-          "falloff": [
-            "uniform",
-            "linear",
-            "gaussian"
-          ],
-          "count": [
-            8,
-            64
-          ]
-        },
-        "neighbor_weight": true
+        "mode": "ema-delayed",
+        "weight": 0.25,
+        "half_life": 512,
+        "delay": 256,
+        "spacing": 128,
+        "window": 1024,
+        "count": 8,
+        "falloff": "gaussian"
       }
     ]
   },

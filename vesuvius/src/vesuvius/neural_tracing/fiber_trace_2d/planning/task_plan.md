@@ -7,6 +7,54 @@
 5. Sweep K2/4/8, short bank32 samples spacing128/window4096 and long bank64 spacing256/window16384; anchor-only and half EMA mixture. Same .25 weight, manager nonexclusive20GiB/16CPU and cached inference extension. Repeat best exactly. Compare against69, full tables/timings. Refine useful anchor mixture/weight if promising; otherwise inspect promising EMA half-life neighbors256/384/640/768/1024 as an additional approach. Continue sensible measured refinements until improvement stabilized or no supported next acceleration/quality idea remains.
 
 ## Spec update
+Reviewed next replacement-policy A/B: opt-in LRU `hit` touch policy. Existing
+`nearest` policy refreshes even an anchor outside the novelty threshold, then
+evicts another anchor. `hit` refreshes only exact/familiar observations; a novel
+observation evicts actual LRU without touching an old anchor. Same threshold,
+cadence, capacity and scoring, no new state. Default nearest remains unchanged.
+Test deterministic eviction, familiar touches, threshold equality and default
+equivalence. Compare at the64-restart settings, then refine if promising.
+
+Independent methodology review adds a fixed-seed-only control (not EMA+seed):
+many sparse-anchor segments have no post-seed observation, so isolate whether
+adaptation itself helps before attributing results to the memory policy.
+Opt-in seed mode uses the initial embedding unchanged throughout each trace,
+reset at each new seed; no history updates or expiration. Include in the delayed
+EMA sweep and refine its weight. If results justify it, next investigate local
+embedding-independent directional ambiguity as an admission gate; measure the
+margin distribution before inventing thresholds. Do not claim contamination
+from current single-fiber evidence.
+
+Reviewed conditional follow-up after seed/delay: whole-path observed-reference
+scoring instead of synthetic centroid scoring. Retain the identical sums,
+supports, merge criterion and admission; keep one observed exemplar per cluster,
+choose the nearer of the two prior exemplars to the merged sum direction, stable
+ties/zero-sum retain earlier. This is a hierarchical observed representative, NOT
+an exact medoid (discarded examples cannot be recovered). First inspect
+centroid-to-exemplar cosine; if nearly1, a broad sweep is not justified. Otherwise
+test as a score-only A/B then refine if promising. No claimed guaranteed benefit.
+
+Another reviewed conditional mechanism: embedding-cost reliability weighting by
+selected presence^q (q0 exact existing arithmetic; initial.5/1/2), leaving other
+costs/reference updates unchanged. Off-fiber training supervision is presence-
+weighted, but GT positives are not, so this is a hypothesis not a required fix.
+It can accidentally make background cheaper: measure selected-path presence
+alongside restarts before accepting it. Current single-branch semantics match
+training max presence; do not silently generalize to multi-branch models.
+
+Additional hypothesis queued after family refinements: opt-in delayed EMA
+updates. Dense novelty-LRU admissions8/32 worsened71 to76/84, which is consistent
+with (not proof of) appearance contamination after a wrong turn. Keep per-beam
+pending observations and apply only after a configured arclength delay, seed
+active immediately, score parent state. EMA decay uses applied observation
+distance (stored directly to preserve arithmetic); zero delay must reproduce ordinary EMA. Bound pending memory at4096 observations per beam and
+error on overflow, no silent dropping. Preflight uses clamped float step and
+positive base scale with conservative half-step capacity estimate; retain runtime
+check because float coordinate precision is not universally bounded. Default
+delay0, maximum2048, initial trials32/64/128/256; use empty-vector storage to
+avoid adding allocations in other modes. Review/test boundary, zero-delay,
+contamination lag, copy/reset, capacity; same frozen benchmark then refine.
+
 Algorithmic refinements after initial grids (independently reviewed):
 - LRU novelty gate: touch closest at observation cadence, but insert only if its
   cosine distance is at least novelty threshold. Threshold0 preserves prior LRU.
@@ -47,6 +95,29 @@ Opt-in anchors mode, deterministic greedy coverage selection, bounded bank, EMA 
 New multi-anchor report, embedding_tracing options, task log/status/changelog including failures and limits.
 
 ## Validation
+Prepared next mechanism grid in `embedding_methods_next.json`; after current
+sweep exits and native tests pass, use it as the existing experiment control's
+`embedding_trace_sweep` section. Same frozen pilot and manager allocation.
+Require EMA control/zero-delay hashes identical, replay current64 setting after
+rebuild, then compare seed-only, delayedEMA and hit-only touch. Refine each new
+method after this initial grid. File is a prepared configuration, not a claim
+that those experiments ran.
+
+After the single-start family round, test transfer of the winning anchor
+settings into the other anchor policies (preserving each policy's semantics),
+then refine newly improved seeds. The plainLRU K2/.10 gain appeared only on a
+later coordinate cycle: a novel/mean/appearance family can miss the same
+capacity×weight interaction if neither single-coordinate move initially helps.
+Compare each transferred seed against that family's existing best; this is
+multi-start refinement, not a claim that coordinate minima are global optima.
+Also refine admission distance around/above512 (192,256,384,512,768,1024,
+1536,2048) and include capacity1 for the winning LRU policies; initial axes
+stopped at512 and K2. For LRU, set unused history window>=largest spacing to
+pass shared validation, with an equivalent-scoring control. Source level1 and
+tile256 mean512base is one full input tile width (not blend stride); this is
+scale context, not evidence that tile boundaries cause the optimum. One-anchor
+LRU isolates periodic reference replacement versus genuinely multi-anchor use.
+
 Post-grid refinement requested: optimize each reference family's best seed,
 including nonwinning families. Prioritize anchor admission8/32/64 after actual
 replay analysis found61/74 segments had no post-seed observation at512 spacing

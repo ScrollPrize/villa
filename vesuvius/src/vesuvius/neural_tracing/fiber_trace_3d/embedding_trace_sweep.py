@@ -117,7 +117,7 @@ def configured_variants(settings):
     rows = list(variants(True))
     for i, candidate in enumerate(custom):
         required = {"weight", "spacing", "window", "count", "falloff"}
-        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life", "anchors", "ema_mix", "aggregation", "novelty", "temperature"}:
+        if not required <= set(candidate) or set(candidate) - required - {"mode", "half_life", "delay", "anchors", "ema_mix", "aggregation", "novelty", "touch", "temperature"}:
             raise ValueError("candidate must contain only embedding weight/spacing/window/count/falloff")
         if any(not isinstance(candidate[k], (int, float)) or not math.isfinite(candidate[k]) or candidate[k] <= 0
                for k in ("spacing", "window")):
@@ -129,13 +129,19 @@ def configured_variants(settings):
         if candidate['falloff'] not in ('uniform', 'linear', 'gaussian'):
             raise ValueError("unsupported falloff")
         mode = candidate.get('mode', 'mean')
-        if mode not in ('mean', 'best', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated', 'anchors', 'anchors-lru', 'appearance'):
+        touch = candidate.get('touch', 'nearest')
+        if touch not in ('nearest', 'hit') or (touch == 'hit' and mode != 'anchors-lru'):
+            raise ValueError('invalid anchor touch policy')
+        if mode not in ('mean', 'best', 'seed', 'ema', 'ema-seed', 'ema-gated', 'ema-seed-gated', 'ema-delayed', 'anchors', 'anchors-lru', 'appearance'):
             raise ValueError('unsupported reference mode')
         if mode == 'best' and candidate['falloff'] != 'uniform':
             raise ValueError('best history requires uniform falloff')
         half = candidate.get('half_life', 512)
         if not isinstance(half, (int, float)) or not math.isfinite(half) or half <= 0:
             raise ValueError('invalid EMA half life')
+        delay = candidate.get('delay', 0)
+        if not isinstance(delay, (int, float)) or not math.isfinite(delay) or not 0 <= delay <= 2048:
+            raise ValueError('invalid EMA delay')
         if type(candidate.get('anchors', 4)) is not int or not 1 <= candidate.get('anchors', 4) <= 8:
             raise ValueError('invalid anchor count')
         mix = candidate.get('ema_mix', .5)
@@ -201,7 +207,9 @@ def run(settings):
             evaluation['trace_args'] += ['--embedding-reference-mode', variant['mode']]
         if 'half_life' in variant:
             evaluation['trace_args'] += ['--embedding-ema-half-life-base-voxels', str(variant['half_life'])]
-        for key, flag in [('anchors', 'anchor-count'), ('ema_mix', 'anchor-ema-mix'), ('aggregation','anchor-aggregation'), ('novelty','anchor-novelty'), ('temperature','anchor-temperature')]:
+        if 'delay' in variant:
+            evaluation['trace_args'] += ['--embedding-ema-delay-base-voxels', str(variant['delay'])]
+        for key, flag in [('anchors', 'anchor-count'), ('ema_mix', 'anchor-ema-mix'), ('aggregation','anchor-aggregation'), ('novelty','anchor-novelty'), ('touch','anchor-touch'), ('temperature','anchor-temperature')]:
             if key in variant:
                 evaluation['trace_args'] += ['--embedding-'+flag, str(variant[key])]
         atomic_write(output / (variant["name"] + ".json"), evaluation)
@@ -272,7 +280,7 @@ def run(settings):
         if len(completed) != len(scheduled):
             raise RuntimeError("full history grid incomplete; cannot select winner")
         best = min(completed, key=lambda v: v["failures"])
-    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life", "anchors", "ema_mix", "aggregation", "novelty", "temperature") if k in best}, "name":"repeat-best"})
+    repeated = execute({**{k:best[k] for k in ("weight", "spacing", "window", "count", "falloff", "mode", "half_life", "delay", "anchors", "ema_mix", "aggregation", "novelty", "touch", "temperature") if k in best}, "name":"repeat-best"})
     report["best"] = best["name"]
     report["repeat_identical"] = repeated.get("replay_hash") == best["replay_hash"]
     atomic_write(output / "report.json", report)

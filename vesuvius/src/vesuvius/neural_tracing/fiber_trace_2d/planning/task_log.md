@@ -8,6 +8,44 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Overnight all-family sweep finished exit0:270 replays, all13 family winners and global64 repeated identically (29+35). Other improved families windowed67, gated-seed73, best-history74, mean70. Native build/test now safe and started via exact approved runner. A nonessential manager-status command incorrectly triggered approval and delayed agent continuation overnight; do not repeat it or add approval-dependent diagnostics. Reuse only exact approved launchers/process handles for external actions.
+
+- Six families complete: novelty meanLRU finished its finite local refinement at64 (`refine-0118`); no later axis/weight neighbor improved it. Exact repeats remain scheduled after all13 families. Python-only approved runner117passed44.55s (`cooperative-tests/20260914_000935_303937`), including new hit-touch validation. Native tests intentionally wait for active binary users.
+
+- Implemented reviewed hit-only LRU recency as opt-in `--embedding-anchor-touch hit`: familiar observations touch/skip; novel observations do not refresh an unmatched anchor before LRU eviction. Default nearest unchanged. Native eviction/default/threshold tests and Python validation added. Unbuilt until active sweep finishes; no measured quality claim yet. This is a replacement-policy experiment, not a bug fix to the previously specified policy.
+
+- New provisional global best `refine-0118`: novelty-gated meanLRU K2/spacing512/.10/novelty.10/noEMA =64 restarts. Family first improved75→68 by weight.10, then68→64 by K2. Continue axes/cycles and exact-repeat checks; not finished at first gain. Monitoring now reads best-so-far as well as last row so improvements between polls are not overlooked.
+
+- Verified frozen cache geometry:sourceL1,tile256,outputscale4→embedding grid8base voxels. Winning512base admission equals full input tile width, not blend stride. Final local refinement must include intermediate/larger distances192/256/384/768/1024/1536/2048 and K1; initial LRU axes ended at512/K2 and cannot establish optimum beyond that boundary. No claim tile boundaries cause the result.
+
+- MeanLRU family completed68 (K4/spacing512/.30/noEMA), second cycle found no better axes. K2/.30=70,mixtures.5/.9=71/89. Five families complete; nearestLRU66 still best, next novelty-gated meanLRU. Live sweep49134 verified throughout; no native rebuild.
+
+- MeanLRU improved73→68 at weight.30 (`refine-0099`,K4/spacing512/noEMA) during fine .05 neighbor search. Further neighbors/cycles continue; nearestLRU66 remains global best. This confirms importance of refining nonwinning families rather than abandoning initial grids.
+
+- Added post-round cross-seed check: transfer successful K2/spacing512/.10 anchor parameters to other policies, then refine if improved. Current novelty-LRU starts from71 and may reject an initially worse K2 move, missing a favorable K2×weight interaction. Do not equate a single-start coordinate minimum with maximal/global quality.
+
+- Plain nearestLRU family completed at66 after three coordinate cycles:K2/spacing512/.10/noEMA. Weight.15=81,spacing32/.10=76,spacing128/.10=86; no further axis improvement. Four families complete; continue meanLRU next. Equivalent-scoring half-life128/2048 both reproduced66 (half-life128 exacthash checked); scheduled final exact-parameter repeats remain outstanding.
+
+- Provisional66 replay hash68d07241e4ac50456fc1f1ff52263c9374ecfb4e7dde451097037dfa783fe172,41.98s. Actual68 trace segments:median112/mean469.41base voxels,53 shorter than512. However54.49% of total traced length is beyond the first512, so sparse histories are NOT equivalent to seed-only by distance; the planned explicit seed control remains necessary.
+
+- New provisional global best `refine-0072`: plain nearestLRU K2 spacing512 weight.10 noEMA =66 restarts, versus EMA69. Found on second coordinate cycle after K4→K2 improvement. Exact-repeat still pending; continue refinement and all remaining families, do not stop at first gain.
+
+- Verified live sweep49134 continuation:70 replays now; three families complete71/72/71. Plain nearestLRU improved73→72 with K2 (spacing512,.25,noEMA), so coordinate descent is cycling again around K2. Mixtures.5/.9 scored84/82; weight.30 scored77. No overall improvement over EMA69. No native rebuild while sweep active; staged seed/delay still awaits native validation.
+
+- Reviewed conditional observed-exemplar appearance variant: unchanged clustering/admission, choose between merged clusters' observed representatives for scoring instead of synthetic centroid. Concrete representation hypothesis, not exact medoid; inspect centroid/exemplar gap before broad experiments. Scheduled only after seed/delay results, not implemented yet.
+
+- Checked whether live-wrapper setup dominates sweeps: mechanism EMA69 candidate35.33s versus cached-only identical repeat37.78s (bothzero new tiles). No evidence for speculative cached-first rewrite; keep current validated execution path.
+
+- All-family refinement: whole-path nearest appearance converged72 (K2 spacing512,weight.25,noEMA); nearby.20/.30 weights85/74. Next support-softmin family. Latest seed/delay Python116 tests44.27s passed (`20260913_225248_815482`).
+
+- Independent methodology review identified sparse-history/seed-only confound. Added explicit fixed-seed mode as control for next delayed-EMA experiment (EMA+seed is not seed-only). No updates/expiry, shared existing cosine scoring, per-trace reset. Defer any embedding-independent ambiguity gate until evidence/margin measurements justify it.
+
+- First all-family refinement complete: novelty-LRU nearest stays71 (K4 spacing512 novelty.1 weight.25, noEMA); denser8/32 worsened76/84. Whole-path appearance now refining; spacing8 worsened72 to82. Keep hypotheses tentative; no new global winner yet.
+
+- Delayed implementation review passed semantics/plumbing; caught empty-deque allocation affecting all beams. Switched pending FIFO to an empty nonallocating vector (batch front erase), so unrelated modes gain no heap allocation. Python116 tests44.72s pass (`20260913_224408_775734`); native validation pending active sweep completion.
+
+- Delayed EMA hypothesis independently reviewed: bounded4096 FIFO per beam, preflight delay/actual-step capacity check plus loud runtime overflow; seed active immediately, score parent then selected-child updates. Store original per-observation step distances to preserve EMA arithmetic; delay0 directly calls old helper. Typical delay32..256/step8 pending4..32. Implemented native helper/integration, CLI and sweep option/tests; native rebuild deliberately waits for active13-family sweep to retain fixed binary. Python-only test runner used meanwhile. Dense noveltyLRU8/32 scored76/84 vs sparse71: contamination remains a hypothesis, not established causality.
+
 - Mechanism24-replay grid complete, EMA69 repeats exactly. Best noveltyLRU71 and support-softmin71; no global win. Started `embedding_ema99_all_refine_20260913_v1`:13 independent families, dense admissions first and .05 neighbor weight descent. Per-family progress now persisted as each finishes; updated Python116 tests39.16s passed (`20260913_222829_257218`). Training remains manager-cooperative/nonexclusive; no model or geometry changes.
 
 - Important diagnostic: whole-path72-restart trace has74 segments, actual traced lengths mean432.11/median144.00/max6088.02base voxels. At spacing512,61/74 end before first admission after seed (mean1.55 observations); spacing12836/74 (mean3.84); spacing32only1/74 (mean14.07). Initial grids undersample anchor updates on this restart-heavy case. Prioritize spacing8/32/64 for all anchor-family refinement; do not infer poor appearance-memory potential from sparse initial trials. Calculated from actual trace_points_base_xyz, not GT lengths.

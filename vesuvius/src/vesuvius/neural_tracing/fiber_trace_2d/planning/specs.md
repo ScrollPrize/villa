@@ -2,6 +2,12 @@
 
 ## Opt-in embedding reference modes
 
+- LRU anchor touch policy defaults to `nearest` (refresh nearest even for novel
+  observations). Opt-in `hit` refreshes only exact or within-novelty-threshold
+  matches; novel observations evict actual LRU without touching old anchors.
+  Threshold equality is novel. Same cadence, scoring, capacity and copy/reset;
+  hit policy requires anchors-lru. No new state or automatic default change.
+
 - `anchors` uses <=64 arclength-sampled observed embeddings, <=8 representative
   medoids selected by deterministic greedy reduction of summed nearest cosine
   distance across the bank. Stable earliest ties, stop on no positive gain.
@@ -7188,3 +7194,12 @@ Nearest/mean cosine distance and optional convex EMA mixture score parent state;
 per-beam copies and seed resets prevent sibling/future leakage. Defaults unchanged.
 Optional LRU novelty distance in[0,2] suppresses insertion of familiar observations
 after touching nearest/advancing admission cadence. Zero retains original LRU.
+
+Opt-in delayed EMA retains a bounded per-beam FIFO of selected observations,
+applying ordered updates after an arclength delay with original step distances.
+Seed active immediately; zero delay must reproduce ordinary EMA exactly.
+No GT gating or future information; parent scoring precedes child admission.
+Maximum4096 pending vectors with preflight delay/step check and loud runtime
+overflow. Default delay0 and all existing method defaults remain unchanged.
+Opt-in seed-only scoring retains the initial embedding unchanged until a new
+trace; no history expiry/admission. It is distinct from the EMA+seed mixture.

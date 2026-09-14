@@ -9,6 +9,69 @@ measures failure/restart using the unchanged ellipse. Training remains running.
 
 ## Implementation
 
+### Completed independent refinements
+
+All13 families completed,270 replays total, process exit0. Every family winner
+and the overall winner reproduced its exact replay hash. Overall64 =29+35
+directional restarts. Finite coordinate searches, not proof of global optima.
+
+| Family | Restarts |
+|---|---:|
+| Novelty nearest-LRU |71|
+| Whole-path nearest |72|
+| Whole-path support-softmin |71|
+| Plain nearest-LRU |66|
+| Plain mean-LRU |68|
+| Novelty mean-LRU |**64**|
+| Windowed representative anchors |67|
+| EMA |69|
+| Gated EMA |75|
+| EMA + seed |78|
+| Gated EMA + seed |73|
+| Best history |74|
+| Mean history |70|
+
+Further seed-only/delayedEMA/hit-only replacement experiments and multi-start
+boundary refinements follow; the following paragraphs record discoveries made
+during this completed round.
+
+Confirmed global best of this round at `refine-0118`: **64 restarts**, novelty-gated mean-LRU
+with2 anchors,512-base-voxel spacing,weight.10,novelty.10,noEMA. Wall36.82s;
+replay hash `013d255be05b3b6fb295a14b4a9c92fffef2558b724179d00d8b8903ed1b81a0`.
+This family's finite local search and exact repeat are complete. It improves on
+EMA69 by5 restarts (7.2%) on this same tuning fiber; not a generalization result.
+
+`embedding_ema99_all_refine_20260913_v1/report.json` records the finite axes and
+all replays. At `refine-0072`, plain nearest-LRU improved to **66 restarts
+(28+38)** versus EMA512/.25's69 (28+41). Settings:2 anchors,512-base-voxel
+admission spacing,weight.10,noEMA mix,novelty0. Runtime41.98s, same frozen input
+and QuickBuildO3 binary as above. This is a tuning result on one fiber, not a
+generalization claim; this family's finite-axis refinement is complete, while
+the final exact-parameter repeat remains open.
+The exact replay hash is
+`68d07241e4ac50456fc1f1ff52263c9374ecfb4e7dde451097037dfa783fe172`;
+the equivalent-scoring half-life128 variant reproduced it exactly (EMA mix0).
+
+The66-restart trace has68 segments,median112/mean469.41base voxels.53 have
+traced length below512, but54.49% of total traced distance occurs beyond
+that point. Sparse anchors therefore are not equivalent to seed-only by traced
+distance; a separate seed-only control is still needed. These are path-length
+statistics, not instrumentation of internal beam lookahead/admission events.
+
+Completed families so far:novelty-LRU71,whole-path nearest72,support-softmin71,
+plain nearest-LRU66 (three coordinate cycles).
+Plain mean-LRU completed68 (K4/spacing512/.30/noEMA,two coordinate cycles).
+Novelty mean-LRU completed64 at the settings above.
+Other families and further mechanism tests are still running/planned. Do not
+interpret this partial section as the final refinement report.
+
+Frozen native build for this refinement:QuickBuild,optimization3;
+`vc_fiber_trace_metric` SHA256
+`4cadee53019df7a8cf2d96f640aba8b69b84adeb93b40c21529afb5e4f369470`,
+shared `libvc_fiber_tracer.so` SHA256
+`20197fb52e6a413ed82a6a6df296f217586caed3b2e9cf0164150990655bc96c`.
+Pending seed/delayed-EMA source changes are not in this running binary.
+
 Shared `FiberEmbedding.hpp` greedily chooses observed medoids to reduce summed
 nearest cosine distance over the bounded observation bank. First anchor is most
 central; subsequent anchors have maximum coverage gain, stable earliest ties,
