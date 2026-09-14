@@ -85,6 +85,8 @@ ZarrMetadata parse_zarray(std::string_view json_str) {
                 meta.compression_level = cl->get_int();
             else if (auto* lv = json_find(*p, "level"); lv && lv->is_number())
                 meta.compression_level = lv->get_int();
+            if (auto* q = json_find(*p, "q"); q && q->is_number())
+                meta.codec_q = static_cast<float>(q->get_double());
         }
     }
 
@@ -181,7 +183,10 @@ ZarrMetadata parse_zarr_json(std::string_view json_str) {
                 if (auto* cs = json_find(cfg, "chunk_shape"); cs && cs->is_array())
                     for (const auto& v : (*cs))
                         sc.sub_chunks.push_back(v.get_size_t());
-                // index_location is always "start" — ignore any "end" values
+                if (auto* il = json_find(cfg, "index_location"); il && il->is_string())
+                    sc.index_location = il->get_string();
+                if (sc.index_location != "start" && sc.index_location != "end")
+                    throw std::runtime_error("zarr: unsupported sharding index_location: " + sc.index_location);
                 if (auto* ic = json_find(cfg, "index_codecs"); ic && ic->is_array())
                     for (const auto& icv : (*ic))
                         if (icv.is_object()) sc.index_codecs.push_back(parse_codec_config(icv));
@@ -265,7 +270,7 @@ std::string serialize_zarr_json(const ZarrMetadata& meta) {
                     sub_cs.push_back(JsonValue(c));
                 sc_cfg["chunk_shape"] = JsonValue(std::move(sub_cs));
             }
-            sc_cfg["index_location"] = JsonValue("start");
+            sc_cfg["index_location"] = JsonValue(meta.shard_config->index_location);
 
             {
                 JsonArray idx_codecs;
@@ -689,17 +694,45 @@ bool ZarrArray::needs_byteswap() const noexcept {
 }
 
 std::optional<std::vector<std::byte>>
+ZarrArray::extract_inner_chunk_raw(std::span<const std::byte> shard_data,
+                                   std::span<const std::size_t> inner_indices) const {
+    const auto& sc = *meta_.shard_config;
+    const auto n_inner = meta_.total_sub_chunks_per_shard();
+    const std::size_t index_total = sc.index_bytes(n_inner);
+    if (shard_data.size() < index_total) return std::nullopt;
+    std::span<const std::byte> index_data = sc.index_at_end()
+        ? shard_data.subspan(shard_data.size() - index_total, n_inner * 16)
+        : shard_data.subspan(0, n_inner * 16);
+    std::size_t linear = 0, stride = 1;
+    for (std::size_t d = inner_indices.size(); d-- > 0;) {
+        linear += inner_indices[d] * stride;
+        stride *= meta_.sub_chunks_per_shard(d);
+    }
+    if (linear >= n_inner) return std::nullopt;
+    const std::uint64_t offset = detail::read_le64(index_data.data() + linear * 16);
+    const std::uint64_t nbytes = detail::read_le64(index_data.data() + linear * 16 + 8);
+    if (offset == ~std::uint64_t(0) || nbytes == 0) return std::nullopt;
+    if (offset > shard_data.size() || nbytes > shard_data.size() - offset) return std::nullopt;
+    return std::vector<std::byte>(shard_data.begin() + static_cast<std::ptrdiff_t>(offset),
+                                  shard_data.begin() + static_cast<std::ptrdiff_t>(offset + nbytes));
+}
+
+std::optional<std::vector<std::byte>>
 ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
                                std::span<const std::size_t> inner_indices) const {
     const auto& sc = *meta_.shard_config;
     const auto n_inner = meta_.total_sub_chunks_per_shard();
     const std::size_t index_size = n_inner * 16;
+    const std::size_t index_total = sc.index_bytes(n_inner);
 
-    if (shard_data.size() < index_size)
+    if (shard_data.size() < index_total)
         throw std::runtime_error("zarr: shard too small to contain index");
 
-    // Index is always at the start of the shard.
-    std::span<const std::byte> index_data = shard_data.subspan(0, index_size);
+    // The index (16 bytes per inner chunk, optionally followed by a crc32c
+    // checksum) sits at the start or the end of the shard per index_location.
+    std::span<const std::byte> index_data = sc.index_at_end()
+        ? shard_data.subspan(shard_data.size() - index_total, index_size)
+        : shard_data.subspan(0, index_size);
 
     std::vector<std::byte> decoded_index;
     if (!sc.index_codecs.empty()) {
@@ -1017,6 +1050,25 @@ bool is_canonical_c3d(const ZarrMetadata& m) noexcept {
     return true;
 }
 
+bool is_canonical_volcomp(const ZarrMetadata& m) noexcept {
+    if (m.dtype != ZarrDtype::uint8 || m.ndim() != 3) return false;
+    auto has_volcomp = [](const std::vector<ZarrCodecConfig>& cs) {
+        for (const auto& c : cs) if (c.name == "volcomp") return true;
+        return false;
+    };
+    if (m.shard_config) {
+        const auto& sc = *m.shard_config;
+        if (sc.sub_chunks.size() != 3) return false;
+        for (std::size_t d = 0; d < 3; ++d)
+            if (sc.sub_chunks[d] != 128 || m.chunks[d] % 128 != 0) return false;
+        return has_volcomp(sc.sub_codecs);
+    }
+    if (m.chunks.size() != 3) return false;
+    for (std::size_t d = 0; d < 3; ++d)
+        if (m.chunks[d] != 128) return false;
+    return m.compressor_id == "volcomp" || has_volcomp(m.codecs);
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -1075,6 +1127,13 @@ FileSystemStore::get_partial(const std::string& key, std::size_t offset, std::si
     std::vector<std::byte> buf(actual_len);
     f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(actual_len));
     return buf;
+}
+
+std::optional<std::size_t> FileSystemStore::size_of(const std::string& key) const {
+    std::error_code ec;
+    auto sz = std::filesystem::file_size(safe_path(key), ec);
+    if (ec) return std::nullopt;
+    return static_cast<std::size_t>(sz);
 }
 
 void FileSystemStore::set(const std::string& key, std::span<const std::byte> value) {
@@ -1153,6 +1212,12 @@ HttpStore::get_partial(const std::string& key, std::size_t offset, std::size_t l
     auto resp = client_->get_range(make_url(key), offset, length);
     if (!resp.ok()) return std::nullopt;
     return std::move(resp.body);
+}
+
+std::optional<std::size_t> HttpStore::size_of(const std::string& key) const {
+    auto resp = client_->head(make_url(key));
+    if (!resp.ok() || resp.content_length == 0) return std::nullopt;
+    return resp.content_length;
 }
 
 std::string HttpStore::make_url(const std::string& key) const {
@@ -1302,6 +1367,9 @@ std::string serialize_zarray(const ZarrMetadata& meta) {
     } else if (meta.compressor_id == "lz4") {
         s += "  \"compressor\": {\"id\": \"lz4\", \"acceleration\": "
              + std::to_string(meta.compression_level) + "},\n";
+    } else if (meta.compressor_id == "volcomp") {
+        s += "  \"compressor\": {\"id\": \"volcomp\", \"q\": "
+             + std::to_string(meta.codec_q > 0.0f ? meta.codec_q : 8.0f) + "},\n";
     } else {
         // zstd, gzip, zlib, bz2, ...
         s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\", \"level\": "
@@ -2212,7 +2280,31 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
     }
     if (linear > std::numeric_limits<std::size_t>::max() / 16)
         return std::nullopt;
-    const std::size_t index_offset = linear * 16;
+    std::size_t index_offset = linear * 16;
+    const auto& sc = *meta_.shard_config;
+    if (sc.index_at_end()) {
+        // Need the shard size to locate the trailing index. Stores that
+        // cannot stat cheaply fall back to a whole-shard read.
+        std::optional<std::size_t> shard_size;
+        auto key0 = chunk_key(shard_idx);
+        if (store_) {
+            auto full_key = array_key_.empty() ? key0 : array_key_ + "/" + key0;
+            shard_size = store_->size_of(full_key);
+            if (!shard_size) {
+                auto whole = store_->get_if_exists(full_key);
+                if (!whole) return std::nullopt;
+                return extract_inner_chunk_raw(*whole, inner_idx);
+            }
+        } else {
+            std::error_code ec;
+            auto sz = std::filesystem::file_size(root_ / key0, ec);
+            if (ec) return std::nullopt;
+            shard_size = static_cast<std::size_t>(sz);
+        }
+        const std::size_t index_total = sc.index_bytes(meta_.total_sub_chunks_per_shard());
+        if (*shard_size < index_total) return std::nullopt;
+        index_offset += *shard_size - index_total;
+    }
     auto is_missing_or_empty = [](std::uint64_t offset, std::uint64_t nbytes) {
         return (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
                (offset == ~std::uint64_t(0) - 1 && nbytes == 0) ||
