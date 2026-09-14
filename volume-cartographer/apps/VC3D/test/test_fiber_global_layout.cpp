@@ -176,6 +176,41 @@ std::vector<InputFiber> mirrored(std::vector<InputFiber> fibers)
     return fibers;
 }
 
+// The dented sheet of the solver's traversal-group tests, in volume space:
+// an H fiber at height z along radius R + b(u+2)^2 and angle
+// theta0 + eps(u^3 - 3u), u in [-3, 3] (angle forward, back, forward), and a
+// V fiber on the ray theta0 at a fixed radius. With the V fiber a thickness
+// inside the dent's outer limb it is on the next sheet inward: the three
+// crossings read inside, inside, outside, and only their count says so.
+constexpr double kHairpinR = 20000.0;
+constexpr double kHairpinB = 100.0;
+constexpr double kHairpinEps = 0.03;
+constexpr double kHairpinTheta0 = 0.3 * kTwoPi;
+constexpr int kHairpinOuterIndex = 473;  // u = sqrt3 at 0.01 steps from -3
+
+std::vector<InputFiber> hairpinPair(bool linked)
+{
+    std::vector<cv::Vec3d> arc;
+    for (int i = 0; i <= 600; ++i) {
+        const double u = -3.0 + 0.01 * i;
+        const double r = kHairpinR + kHairpinB * (u + 2.0) * (u + 2.0) - 100.0;
+        const double theta = kHairpinTheta0 + kHairpinEps * (u * u * u - 3.0 * u);
+        arc.push_back(cv::Vec3d(r * std::cos(theta), r * std::sin(theta), 30000.0));
+    }
+    const double outerLimb = kHairpinR + kHairpinB * (1.7320508 + 2.0) * (1.7320508 + 2.0);
+    std::vector<InputFiber> fibers;
+    fibers.push_back(makeFiber(700, QStringLiteral("f-h"), 'H', arc,
+                               {0, kHairpinOuterIndex, 600}));
+    fibers.push_back(makeFiber(701, QStringLiteral("f-v"), 'V',
+                               verticalPoints(kHairpinTheta0, outerLimb - 300.0,
+                                              29000.0, 31000.0, 25.0),
+                               {0, 40, 80}));
+    if (linked) {
+        addLink(fibers[0], 1, fibers[1], 1);
+    }
+    return fibers;
+}
+
 const GlobalPlacedFiber* findFiber(const GlobalResult& result, uint64_t id)
 {
     for (const GlobalPlacedFiber& fiber : result.fibers) {
@@ -357,7 +392,11 @@ private slots:
     // same wrong-winding link that is suspect between two traced fibers is
     // silent when one end is pure control-point interpolation, and any
     // dropped crossings it causes draw no red rings.
-    void interpolatedFibersDeclareNoWindingErrors()
+    // Declarations are not gated on trust: an interpolated fiber's wrong
+    // link and the crossings it contradicts are reported exactly as a traced
+    // fiber's would be. Its evidence is attenuated uniformly, so the same
+    // constraints fall.
+    void interpolatedFibersDeclareLikeAnyOther()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
         std::vector<InputFiber> fibers =
@@ -371,19 +410,16 @@ private slots:
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
         QVERIFY(trusted.suspectLinkCount > 0);
 
-        // Same geometry, same wrong link - but the H fiber is pure
-        // interpolation, so nothing about it is declarable.
+        // Same geometry, same wrong link, the H fiber pure interpolation.
         std::vector<InputFiber> untrusted = fibers;
         untrusted[0].tracedSegments.assign(
             untrusted[0].controlPoints.size() - 1, false);
-        const GlobalResult silent = vc3d::fiber_map::buildGlobalLayout(
+        const GlobalResult declared = vc3d::fiber_map::buildGlobalLayout(
             untrusted, umbilicus, defaultParams());
-        QCOMPARE(silent.suspectLinkCount, 0);
-        QCOMPARE(silent.droppedCrossingCount, 0);
-        QVERIFY(silent.suspectCrossings.empty());
-        // The fibers are still placed - exclusion is about declarations, not
-        // participation.
-        QCOMPARE(silent.fibers.size(), trusted.fibers.size());
+        QCOMPARE(declared.suspectLinkCount, trusted.suspectLinkCount);
+        QCOMPARE(declared.droppedCrossingCount, trusted.droppedCrossingCount);
+        QCOMPARE(declared.suspectCrossings.size(), trusted.suspectCrossings.size());
+        QCOMPARE(declared.fibers.size(), trusted.fibers.size());
     }
 
     // Linked-network ids drive the dock grouping and the selection's network
@@ -957,6 +993,246 @@ private slots:
         QVERIFY(std::none_of(ignored->fiber.kollesisTerminations.begin(),
                              ignored->fiber.kollesisTerminations.end(),
                              [](bool flagged) { return flagged; }));
+    }
+
+    // A folded pair's crossings are read together: one group with a verdict,
+    // every event carried out for inspection, no rings while the map honours
+    // the verdict - and the verdict recovers the winding gap of one.
+    void foldedPairIsReadAsOneGroup()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        for (const bool mirror : {false, true}) {
+            std::vector<InputFiber> fibers = hairpinPair(false);
+            if (mirror) {
+                fibers = mirrored(fibers);
+            }
+            const GlobalResult result =
+                vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+            QCOMPARE(result.crossingEvents.size(), std::size_t{3});
+            QCOMPARE(result.crossingGroups.size(), std::size_t{1});
+            const auto& group = result.crossingGroups.front();
+            QCOMPARE(group.hFiberId, uint64_t{700});
+            QCOMPARE(group.vFiberId, uint64_t{701});
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, vc3d::fiber_map::winding::CrossingKind::Outside);
+            QCOMPARE(group.members.size(), std::size_t{3});
+            for (const auto& event : result.crossingEvents) {
+                QCOMPARE(event.status, vc3d::fiber_map::winding::CrossingStatus::InGroup);
+                QCOMPARE(event.groupId, 0LL);
+                QCOMPARE(event.hFiberId, uint64_t{700});
+            }
+            QCOMPARE(result.traversalGroupCount, 1);
+            QCOMPARE(result.declaredGroupCount, 0);
+            QCOMPARE(result.droppedCrossingCount, 0);
+            QVERIFY(result.suspectCrossings.empty());
+            const GlobalPlacedFiber* h = findFiber(result, 700);
+            const GlobalPlacedFiber* v = findFiber(result, 701);
+            QVERIFY(h != nullptr && v != nullptr);
+            // H strictly outside V: a whole winding between them.
+            QVERIFY(h->meta.windingLo > v->meta.windingHi + 0.5);
+        }
+    }
+
+    // The same pair with a same-winding link the verdict contradicts: the
+    // stronger link holds, the group is dropped as one unit and declared as
+    // one conflict, marked at each of its three places with a shared group.
+    void droppedGroupIsOneConflictMarkedAtEachMember()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers = hairpinPair(true);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.crossingGroups.size(), std::size_t{1});
+        const auto& group = result.crossingGroups.front();
+        QVERIFY(group.hasVerdict);
+        QCOMPARE(group.status, vc3d::fiber_map::winding::CrossingStatus::Dropped);
+        QCOMPARE(group.violationTurns, 1.0);
+        QCOMPARE(result.declaredGroupCount, 1);
+        QCOMPARE(result.droppedCrossingCount, 0);
+        QCOMPARE(result.suspectLinkCount, 0);
+        QCOMPARE(result.suspectCrossings.size(), std::size_t{3});
+        for (const auto& mark : result.suspectCrossings) {
+            QCOMPARE(mark.groupId, 0LL);
+            QCOMPARE(mark.violationTurns, 1.0);
+            QCOMPARE(mark.hFiberId, uint64_t{700});
+            QCOMPARE(mark.vFiberId, uint64_t{701});
+            QVERIFY(mark.eventIndex < result.crossingEvents.size());
+            QCOMPARE(mark.posVx, result.crossingEvents[mark.eventIndex].posVx);
+        }
+        const GlobalPlacedFiber* h = findFiber(result, 700);
+        const GlobalPlacedFiber* v = findFiber(result, 701);
+        QVERIFY(h != nullptr && v != nullptr);
+        QVERIFY(std::abs(h->meta.windingLo - v->meta.windingLo) < 0.6);
+    }
+
+    // The cache's contract, shard by shard: two independent cold builds of
+    // the same input hold bit-identical detection shards - representatives,
+    // events, groups and tallies - and a moved fiber changes some shard.
+    void cachedShardsAreTheFreshOnesBitForBit()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = hairpinPair(false);
+        std::vector<InputFiber> weave = cacheFixture();
+        fibers.insert(fibers.end(), weave.begin(), weave.end());
+        const GlobalLayoutParams params = defaultParams();
+        vc3d::fiber_map::GlobalLayoutCache first;
+        vc3d::fiber_map::GlobalLayoutCache second;
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &first);
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &second);
+        const auto shardsA = first.cachedDetections();
+        const auto shardsB = second.cachedDetections();
+        QCOMPARE(shardsA.size(), shardsB.size());
+        QVERIFY(!shardsA.empty());
+        bool sawGroups = false;
+        for (std::size_t i = 0; i < shardsA.size(); ++i) {
+            QVERIFY(vc3d::fiber_map::winding::identicalPairCrossings(*shardsA[i], *shardsB[i]));
+            sawGroups = sawGroups || !shardsA[i]->groups.empty();
+        }
+        QVERIFY(sawGroups);
+        // Nudge the folded V fiber and rebuild INTO the first cache: exactly
+        // the shards it takes part in (one per H fiber) recompute, and every
+        // shard the warmed cache then holds - recomputed or reused - is the
+        // one an independent cold build produces.
+        for (cv::Vec3d& point : fibers[1].linePoints) {
+            point[2] += 30.0;
+        }
+        fibers[1].controlPoints[1] = fibers[1].linePoints[40];
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &first);
+        int hFibers = 0;
+        for (const InputFiber& fiber : fibers) {
+            hFibers += fiber.hvTag == 'H' ? 1 : 0;
+        }
+        QCOMPARE(first.lastStats().pairsRecomputed, hFibers);
+        QVERIFY(first.lastStats().pairsReused > 0);
+        vc3d::fiber_map::GlobalLayoutCache third;
+        vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &third);
+        const auto shardsWarm = first.cachedDetections();
+        const auto shardsC = third.cachedDetections();
+        QCOMPARE(shardsWarm.size(), shardsC.size());
+        for (std::size_t i = 0; i < shardsC.size(); ++i) {
+            QVERIFY(vc3d::fiber_map::winding::identicalPairCrossings(*shardsWarm[i], *shardsC[i]));
+        }
+        // And the move did change some shard against the original build
+        // (recomputation need not change every affected shard's output).
+        int differing = 0;
+        for (std::size_t i = 0; i < shardsB.size(); ++i) {
+            if (!vc3d::fiber_map::winding::identicalPairCrossings(*shardsB[i], *shardsC[i])) {
+                ++differing;
+            }
+        }
+        QVERIFY(differing >= 1);
+        QVERIFY(differing <= hFibers);
+    }
+
+    // Groups are part of the memoized detection: cached and fresh builds of
+    // a folded pair are identical, and every exported group and event field
+    // is in the result digest.
+    void groupsAreCachedAndDigested()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = hairpinPair(false);
+        std::vector<InputFiber> weave = cacheFixture();
+        fibers.insert(fibers.end(), weave.begin(), weave.end());
+        const GlobalLayoutParams params = defaultParams();
+        const GlobalResult fresh =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        const GlobalResult cold =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalResult warm =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(cold) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QCOMPARE(warm.traversalGroupCount, 1);
+        QCOMPARE(warm.crossingGroups.size(), fresh.crossingGroups.size());
+        // Adding a link changes no shard, only the solve.
+        addLink(fibers[0], 1, fibers[1], 1);
+        const GlobalResult freshLinked =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        const GlobalResult warmLinked =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warmLinked) ==
+                vc3d::fiber_map::digestGlobalResult(freshLinked));
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QCOMPARE(warmLinked.declaredGroupCount, 1);
+        // The endpoint clearance is a detection parameter: changing it
+        // recomputes every pair.
+        GlobalLayoutParams strict = params;
+        strict.solver.endpointClearanceTurns = 0.02;
+        const GlobalResult freshStrict =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, strict);
+        const GlobalResult warmStrict =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, strict, &cache);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warmStrict) ==
+                vc3d::fiber_map::digestGlobalResult(freshStrict));
+        QVERIFY(cache.lastStats().pairsRecomputed > 0);
+
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(freshLinked);
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].hasVerdict = false;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].insideCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingGroups[0].orientationSum += 2;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.crossingEvents[0].orientation = -tweaked.crossingEvents[0].orientation;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            // The folded pair sorts after the weave: take one of its events.
+            tweaked.crossingEvents[tweaked.crossingGroups[0].members[0]].groupId = -1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            QVERIFY(!tweaked.suspectCrossings.empty());
+            tweaked.suspectCrossings[0].groupId = -1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.declaredGroupCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.traversalGroupCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            const std::size_t e = tweaked.crossingGroups[0].members[0];
+            tweaked.crossingEvents[e].confidence += 0.25;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            const std::size_t e = tweaked.crossingGroups[0].members[0];
+            tweaked.crossingEvents[e].touch = !tweaked.crossingEvents[e].touch;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = freshLinked;
+            tweaked.unresolvedIntersectionCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
     }
 };
 

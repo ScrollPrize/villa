@@ -24,6 +24,7 @@
 
 using vc3d::fiber_map::winding::ComponentAnchor;
 using vc3d::fiber_map::winding::Crossing;
+using vc3d::fiber_map::winding::CrossingGroup;
 using vc3d::fiber_map::winding::CrossingKind;
 using vc3d::fiber_map::winding::CrossingStatus;
 using vc3d::fiber_map::winding::FiberTrace;
@@ -146,6 +147,71 @@ int countDroppedCrossings(const SolveResult& result)
         }
     }
     return dropped;
+}
+
+
+// --- Folded sheets, for the traversal-group tests.
+//
+// The dented sheet of the geometry review: radius R + b*(u+2)^2 and angle
+// theta0 + eps*(u^3 - 3u), u in [-3, 3]. The angle runs forward, turns back
+// over |u| < 1 (a dent toward the umbilicus) and runs forward again, so the
+// ray at theta0 meets the sheet three times: u = -sqrt3, 0, +sqrt3, at radii
+// R + 0.07b, R + 4b, R + 13.9b.
+constexpr double kHairpinR = 20000.0;
+constexpr double kHairpinTheta0 = kTwoPi * 0.3;
+constexpr double kSqrt3 = 1.7320508075688772;
+
+double hairpinRadius(double u, double b)
+{
+    return kHairpinR + b * (u + 2.0) * (u + 2.0);
+}
+
+double hairpinTheta(double u, double eps)
+{
+    return kHairpinTheta0 + eps * (u * u * u - 3.0 * u);
+}
+
+// An H fiber along the dented sheet at height z, from u0 to u1, its radius
+// offset from the sheet by faceOffset (negative = inner face, as the sheet
+// model puts H fibers).
+std::size_t addHairpinH(World& world, double z, double u0, double u1, double b,
+                        double eps, double faceOffset)
+{
+    FiberTrace fiber;
+    fiber.hvTag = 'H';
+    for (double u = u0; u <= u1 + 1e-9; u += 0.01) {
+        fiber.theta.push_back(hairpinTheta(u, eps));
+        fiber.z.push_back(z);
+        fiber.radius.push_back(hairpinRadius(u, b) + faceOffset);
+    }
+    world.fibers.push_back(std::move(fiber));
+    world.trueM.push_back(0);
+    return world.fibers.size() - 1;
+}
+
+// A V fiber on the ray theta0 at a fixed radius, spanning [z0, z1].
+std::size_t addRayV(World& world, double radius, double z0, double z1, long long trueM)
+{
+    FiberTrace fiber;
+    fiber.hvTag = 'V';
+    for (double z = z0; z <= z1 + 1e-9; z += 25.0) {
+        fiber.theta.push_back(kHairpinTheta0);
+        fiber.z.push_back(z);
+        fiber.radius.push_back(radius);
+    }
+    world.fibers.push_back(std::move(fiber));
+    world.trueM.push_back(trueM);
+    return world.fibers.size() - 1;
+}
+
+// The one group of a solve, or fails the test.
+const CrossingGroup& singleGroup(const SolveResult& result)
+{
+    static const CrossingGroup none;
+    if (result.groups.size() != 1) {
+        return none;
+    }
+    return result.groups.front();
 }
 
 // The standard three-winding weave: one H fiber spiralling through three
@@ -369,10 +435,9 @@ private slots:
     }
 
     // An untrusted fiber (no model-traced span) must lose a repair conflict,
-    // and its dropped crossing is not declarable: H sits well inside trusted
-    // V1 (weak inside, conf 0.9) and well outside untrusted V2 (strict, raw
-    // conf 1.0 attenuated to 0.5); the V1=V2 link closes the cycle and the
-    // attenuated outside is the deterministic victim.
+    // H sits well inside trusted V1 (weak inside, conf 0.9) and well outside
+    // untrusted V2 (strict, raw conf 1.0 attenuated to 0.5); the V1=V2 link
+    // closes the cycle and the attenuated outside is the deterministic victim.
     void untrustedEvidenceLosesConflicts()
     {
         World world;
@@ -392,13 +457,13 @@ private slots:
         for (const Crossing& crossing : result.crossings) {
             if (crossing.status == CrossingStatus::Dropped) {
                 QCOMPARE(crossing.kind, CrossingKind::Outside);
-                QVERIFY(!crossing.declarable);
             }
         }
         // The surviving inside and the link keep all three together.
         QCOMPARE(result.placements[v1].turns - result.placements[h].turns, 0.0);
         QCOMPARE(result.placements[v2].turns - result.placements[v1].turns, 0.0);
-        // And no drift declaration: the only drop involved untrusted geometry.
+        // And no drift declaration: one contested traversal is one piece of
+        // evidence, whoever it involves.
         QVERIFY(!result.placements[h].sheetDriftSuspect);
     }
 
@@ -453,10 +518,10 @@ private slots:
         QVERIFY(!result.placements[h].sheetDriftSuspect);
     }
 
-    // The drift declaration itself requires trusted geometry: the same
-    // contradictions raised by an untrusted H fiber are expected
-    // interpolation noise, not a tag.
-    void untrustedFibersAreNeverDriftSuspects()
+    // Declarations are not gated on trust: the same contradictions raised by
+    // an untrusted (interpolated) H fiber are reported like any other's. Its
+    // evidence is attenuated uniformly, so the repair falls the same way.
+    void untrustedFibersAreDriftSuspectsLikeAnyOther()
     {
         World world;
         const auto regressing = [](double w, double z) {
@@ -471,10 +536,7 @@ private slots:
         const SolveResult result =
             solveWindings(world.fibers, world.links, params);
         QVERIFY(countDroppedCrossings(result) > 0);
-        QVERIFY(!result.placements[h].sheetDriftSuspect);
-        for (const Crossing& crossing : result.crossings) {
-            QVERIFY(!crossing.declarable);
-        }
+        QVERIFY(result.placements[h].sheetDriftSuspect);
     }
 
     // The common-lift translate search: gauges five turns apart still meet.
@@ -585,6 +647,14 @@ private slots:
         QCOMPARE(result.crossings.front().kind, CrossingKind::Inside);
         QCOMPARE(result.crossings.front().mergedCount, 2);
         checkRelativeTurns(result, world, {h, world.fibers.size() - 1});
+        // The apex retracing is a touch: both detections kept as events,
+        // flagged, counted by no group.
+        QCOMPARE(result.events.size(), std::size_t{2});
+        for (const Crossing& event : result.events) {
+            QVERIFY(event.touch);
+            QCOMPARE(event.representative, std::size_t{0});
+        }
+        QVERIFY(result.groups.empty());
     }
 
     // A link-only network proves no winding: however large, it must not be
@@ -820,6 +890,516 @@ private slots:
         QCOMPARE(result.placements[island].anchor, ComponentAnchor::Unresolved);
         QVERIFY(result.placements[island].windingLo >= 0.0);
         QVERIFY(result.placements[island].windingLo < 1.0);
+    }
+
+    // --- Traversal groups: the V fiber sits inside or outside the wiggly H
+    // arc, decided by the count of crossings at which H is radially inside V,
+    // not by any one crossing's sign.
+
+    // V on the outer face of the dented sheet's outer limb: the ray meets the
+    // H fiber three times, every time inside V. A uniform group keeps its
+    // members' own constraints (there is nothing to correct) and is reported.
+    void uniformHairpinGroupKeepsIndividualConstraints()
+    {
+        World world;
+        const double b = 100.0;
+        const std::size_t h = addHairpinH(world, 30000.0, -3.0, 3.0, b, 0.03, -kSheetStep);
+        const std::size_t v =
+            addRayV(world, hairpinRadius(kSqrt3, b), 29000.0, 31000.0, 0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        const CrossingGroup& group = singleGroup(result);
+        QCOMPARE(group.multiplicity, 3);
+        QCOMPARE(group.insideCount, 3);
+        QVERIFY(group.orientationSum % 2 != 0);
+        QVERIFY(!group.mixedSigns);
+        QVERIFY(!group.hasVerdict);
+        for (const Crossing& crossing : result.crossings) {
+            QCOMPARE(crossing.status, CrossingStatus::Used);
+            QCOMPARE(crossing.kind, CrossingKind::Inside);
+        }
+        QCOMPARE(countDroppedCrossings(result), 0);
+        // Three weak inside constraints say H is on V's winding or inward;
+        // with no equality evidence the solver may pack V further out, so
+        // only the inequality is asserted.
+        QVERIFY(result.placements[v].turns - result.placements[h].turns >= 0.0);
+    }
+
+    // V a thickness inside the outer limb, i.e. on the next sheet inward: the
+    // crossings read inside, inside, outside. Each sign alone is wrong twice;
+    // the count (two inside, even) says V is on the umbilicus side of the H
+    // arc, so H is strictly outside, and one group constraint replaces the
+    // three - which recovers the true winding gap of one. Both chiralities.
+    void mixedHairpinGroupRecoversTheGap()
+    {
+        for (const bool mirror : {false, true}) {
+            World base;
+            const double b = 100.0;
+            const std::size_t h = addHairpinH(base, 30000.0, -3.0, 3.0, b, 0.03, -kSheetStep);
+            const std::size_t v =
+                addRayV(base, hairpinRadius(kSqrt3, b) - 300.0, 29000.0, 31000.0, -1);
+            const World world = mirror ? mirrored(base) : base;
+            const SolveResult result =
+                solveWindings(world.fibers, world.links, SolverParams{});
+            QCOMPARE(result.crossings.size(), std::size_t{3});
+            const CrossingGroup& group = singleGroup(result);
+            QCOMPARE(group.multiplicity, 3);
+            QCOMPARE(group.insideCount, 2);
+            QVERIFY(group.mixedSigns);
+            QVERIFY(group.orientationSum % 2 != 0);
+            QVERIFY(group.traversalCovered);
+            QVERIFY(!group.coverageGap);
+            QVERIFY(!group.unresolved);
+            QVERIFY(group.hasVerdict);
+            QCOMPARE(group.verdict, CrossingKind::Outside);
+            QCOMPARE(group.status, CrossingStatus::Used);
+            QCOMPARE(group.violationTurns, 0.0);
+            for (const Crossing& crossing : result.crossings) {
+                QCOMPARE(crossing.status, CrossingStatus::InGroup);
+                QCOMPARE(crossing.groupIndex, 0LL);
+            }
+            QCOMPARE(countDroppedCrossings(result), 0);
+            QCOMPARE(result.droppedGroupCount, 0);
+            // The group alone carries the winding: it is crossing evidence,
+            // so the pair is a primary component.
+            QCOMPARE(result.placements[h].anchor, ComponentAnchor::Primary);
+            QCOMPARE(result.placements[v].anchor, ComponentAnchor::Primary);
+            checkRelativeTurns(result, world, {h, v});
+        }
+    }
+
+    // Two of the three crossings sit within the merge band of each other with
+    // opposite signs; the display representative is one dot, but the count is
+    // over the events: two inside, one outside, verdict Outside.
+    void mixedKindMergeDoesNotCorruptTheCount()
+    {
+        World world;
+        const double b = 10.0;
+        addHairpinH(world, 30000.0, -3.0, 3.0, b, 0.03, 0.0);
+        // Between the middle limb (R + 40) and the outer limb (R + 139): the
+        // middle crossing reads inside by 50, the outer outside by 49, the
+        // inner inside by 89 - all within one tie band of each other.
+        addRayV(world, kHairpinR + 90.0, 29000.0, 31000.0, -1);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QVERIFY(result.crossings.size() < 3);
+        int merged = 0;
+        for (const Crossing& crossing : result.crossings) {
+            merged += crossing.mergedCount;
+        }
+        QCOMPARE(merged, 3);
+        const CrossingGroup& group = singleGroup(result);
+        QCOMPARE(group.multiplicity, 3);
+        QCOMPARE(group.insideCount, 2);
+        QVERIFY(group.hasVerdict);
+        QCOMPARE(group.verdict, CrossingKind::Outside);
+        // Three events behind two representatives, every event kept.
+        QCOMPARE(group.members.size(), std::size_t{3});
+        QCOMPARE(result.events.size(), std::size_t{3});
+        for (const Crossing& event : result.events) {
+            QVERIFY(event.representative < result.crossings.size());
+            QCOMPARE(event.status, CrossingStatus::InGroup);
+        }
+    }
+
+    // The group's verdict is a constraint like any other: opposed by a
+    // stronger same-winding link it is dropped as one unit, violated by a
+    // whole winding, and its members are reported as one shared conflict
+    // rather than three independent errors.
+    void groupLosesToAStrongerLinkAsOneUnit()
+    {
+        World world;
+        const double b = 100.0;
+        const std::size_t h = addHairpinH(world, 30000.0, -3.0, 3.0, b, 0.03, -kSheetStep);
+        const std::size_t v =
+            addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29000.0, 31000.0, 0);
+        // Link H's outer-limb sample (u = sqrt3 -> index round((sqrt3+3)/0.01))
+        // to V at the same height: an equality the group's Outside contradicts.
+        const std::size_t hSample = static_cast<std::size_t>(std::llround((kSqrt3 + 3.0) / 0.01));
+        const std::size_t vSample = 40;  // z = 30000
+        world.links.push_back(LinkInput{h, hSample, v, vSample});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        const CrossingGroup& group = singleGroup(result);
+        QVERIFY(group.hasVerdict);
+        QCOMPARE(group.status, CrossingStatus::Dropped);
+        QCOMPARE(group.violationTurns, 1.0);
+        QCOMPARE(result.droppedGroupCount, 1);
+        QCOMPARE(result.droppedCrossingCount, 0);
+        QVERIFY(result.droppedLinks.empty());
+        for (const Crossing& crossing : result.crossings) {
+            QCOMPARE(crossing.status, CrossingStatus::InGroup);
+        }
+        // One contested traversal is not drift evidence.
+        QVERIFY(!result.placements[h].sheetDriftSuspect);
+        checkRelativeTurns(result, world, {h, v});
+    }
+
+    // An H trace cut off at the V fiber's angle may have an incomplete count:
+    // no verdict, the members constrain individually and their conflict
+    // surfaces as it always did.
+    void hTraceCutAtTheVFiberGetsNoVerdict()
+    {
+        World world;
+        const double b = 100.0;
+        // The mixed case, but the H trace ends at u = sqrt3 + 0.02: past the
+        // outer crossing by a hair, so its last sample sits at the V fiber's
+        // angle. Everything else about the group is eligible.
+        addHairpinH(world, 30000.0, -3.0, kSqrt3 + 0.02, b, 0.03, -kSheetStep);
+        addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29000.0, 31000.0, -1);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        const CrossingGroup& group = singleGroup(result);
+        QCOMPARE(group.multiplicity, 3);
+        QVERIFY(group.mixedSigns);
+        QVERIFY(group.orientationSum % 2 != 0);
+        QVERIFY(!group.coverageGap);
+        QVERIFY(!group.unresolved);
+        QVERIFY(!group.traversalCovered);
+        QVERIFY(!group.hasVerdict);
+        QCOMPARE(countDroppedCrossings(result), 1);
+    }
+
+    // An H trace whose ends rise above and fall below the V fiber's height
+    // range: whether it crossed the V fiber's angle once or three times is
+    // not knowable from what was traced, so no verdict.
+    void uncoveredEndpointsGiveNoVerdict()
+    {
+        World world;
+        const double b = 100.0;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (double u = -3.0; u <= 3.0 + 1e-9; u += 0.01) {
+            h.theta.push_back(hairpinTheta(u, 0.03));
+            h.z.push_back(30000.0 + 200.0 * u);
+            h.radius.push_back(hairpinRadius(u, b) - kSheetStep);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        // Spans the three crossings (z 29654, 30000, 30346) but not the H
+        // trace's ends (29400, 30600).
+        addRayV(world, hairpinRadius(kSqrt3, b) - 300.0, 29500.0, 30500.0, -1);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        const CrossingGroup& group = singleGroup(result);
+        QVERIFY(group.mixedSigns);
+        QVERIFY(group.orientationSum % 2 != 0);
+        QVERIFY(!group.traversalCovered);
+        QVERIFY(!group.hasVerdict);
+    }
+
+    // A V fiber wobbling back and forth across an H fiber crosses it an even
+    // number of times with orientations that cancel: no traversal, no
+    // verdict, and the members' own signs stand (here they conflict, and the
+    // conflict is repaired as before).
+    void wobbleIsNotATraversal()
+    {
+        World world;
+        // A straight H climbing in z as it turns.
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (int i = 0; i <= 400; ++i) {
+            const double w = 0.2 + 0.2 * i / 400.0;
+            h.theta.push_back(kTwoPi * w);
+            h.z.push_back(29000.0 + 2000.0 * i / 400.0);
+            h.radius.push_back(sheetR(w, h.z.back()) - kSheetStep);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        // A V fiber whose angle weaves across the H fiber's four times, on
+        // the H fiber's own sheet for the first half and a thickness further
+        // in for the second: two crossings inside, two outside.
+        FiberTrace v;
+        v.hvTag = 'V';
+        for (int i = 0; i <= 400; ++i) {
+            const double z = 29000.0 + 2000.0 * i / 400.0;
+            const double wH = 0.2 + 0.2 * i / 400.0;
+            const double w = wH + 0.03 * std::sin(kTwoPi * 2.0 * i / 400.0 + 0.5);
+            v.theta.push_back(kTwoPi * w);
+            v.z.push_back(z);
+            v.radius.push_back(sheetR(w, z) - (i > 200 ? 2.0 * kSheetStep : 0.0));
+        }
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        const CrossingGroup& group = singleGroup(result);
+        QVERIFY(group.multiplicity >= 4);
+        QVERIFY(group.mixedSigns);
+        QCOMPARE(group.orientationSum % 2, 0);
+        QVERIFY(!group.hasVerdict);
+        for (const Crossing& crossing : result.crossings) {
+            QVERIFY(crossing.status != CrossingStatus::InGroup);
+        }
+        QVERIFY(countDroppedCrossings(result) >= 1);
+    }
+
+    // A V fiber folding back in height sweeps a curtain that covers the same
+    // point three times over; its limbs are counted separately, so an H fiber
+    // on the middle limb gets no verdict and the limbs' disagreement surfaces
+    // as before.
+    void heightFoldIsCountedPerLimb()
+    {
+        World world;
+        const double b = 100.0;
+        FiberTrace h;
+        h.hvTag = 'H';
+        for (double theta = kHairpinTheta0 - 0.3; theta <= kHairpinTheta0 + 0.3 + 1e-9;
+             theta += 0.002) {
+            h.theta.push_back(theta);
+            h.z.push_back(30000.0);
+            h.radius.push_back(hairpinRadius(0.0, b) - kSheetStep);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        FiberTrace v;
+        v.hvTag = 'V';
+        for (double u = -3.0; u <= 3.0 + 1e-9; u += 0.01) {
+            v.theta.push_back(kHairpinTheta0);
+            v.z.push_back(30000.0 + 400.0 * (u * u * u - 3.0 * u));
+            v.radius.push_back(hairpinRadius(u, b));
+        }
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{3});
+        for (const CrossingGroup& group : result.groups) {
+            QVERIFY(!group.hasVerdict);
+        }
+        QVERIFY(countDroppedCrossings(result) >= 1);
+    }
+
+    // An H fiber that comes up to the V fiber's angle at a vertex and turns
+    // back touches it without crossing: the record is kept and flagged, and
+    // no group counts it. The legacy representative is unchanged.
+    void hVertexTouchIsNotACrossing()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        // Angle climbs to exactly the V fiber's angle at a sample, then falls.
+        for (int i = 0; i <= 20; ++i) {
+            h.theta.push_back(kHairpinTheta0 - 0.2 + 0.01 * i);
+            h.z.push_back(30000.0);
+            h.radius.push_back(kHairpinR - kSheetStep);
+        }
+        for (int i = 1; i <= 20; ++i) {
+            h.theta.push_back(kHairpinTheta0 - 0.01 * i);
+            h.z.push_back(30000.0);
+            h.radius.push_back(kHairpinR - kSheetStep);
+        }
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        addRayV(world, kHairpinR, 29000.0, 31000.0, 0);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{1});
+        QCOMPARE(result.events.size(), std::size_t{1});
+        QVERIFY(result.events.front().touch);
+        QVERIFY(result.groups.empty());
+    }
+
+    // A V fold whose apex is sampled twice at one (angle, height) - with
+    // differing radius, so every 3D segment has length - is still one vertex
+    // to both branches: an H fiber zigzagging across the apex three times
+    // makes three touch pairs, no crossing and no group.
+    void repeatedApexSamplesAreOneVertex()
+    {
+        World world;
+        FiberTrace v;
+        v.hvTag = 'V';
+        v.theta = {0.0, 0.0, 0.0, 0.0};
+        v.z = {29900.0, 30000.0, 30000.0, 29900.0};
+        v.radius = {20000.0, 20000.0, 20100.0, 20100.0};
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        FiberTrace h;
+        h.hvTag = 'H';
+        h.theta = {-0.2, 0.2, -0.2, 0.2};
+        h.z = {30000.0, 30000.0, 30000.0, 30000.0};
+        h.radius = {18000.0, 20000.0, 21000.0, 23000.0};
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        SolverParams params;
+        params.chiralityOverride = 1;
+        const SolveResult result = solveWindings(world.fibers, world.links, params);
+        QVERIFY(!result.events.empty());
+        for (const Crossing& event : result.events) {
+            QVERIFY(event.touch);
+        }
+        for (const CrossingGroup& group : result.groups) {
+            QVERIFY(!group.hasVerdict);
+        }
+    }
+
+    // An H fiber running up the V fiber's own angle for a stretch overlaps it
+    // collinearly in the projection with no angular width at all: the
+    // overlap is measured along height, and the translate is unresolved.
+    void verticalCollinearOverlapIsUnresolved()
+    {
+        World world;
+        FiberTrace h;
+        h.hvTag = 'H';
+        h.theta = {-0.2, 0.0, 0.0, -0.2, 0.2, -0.2, 0.2};
+        for (int i = 0; i < 7; ++i) {
+            h.z.push_back(29900.0 + 20.0 * i);
+        }
+        h.radius = {19000.0, 19000.0, 21000.0, 21000.0, 21000.0, 21000.0, 17000.0};
+        world.fibers.push_back(std::move(h));
+        world.trueM.push_back(0);
+        FiberTrace v;
+        v.hvTag = 'V';
+        v.theta = {0.0, 0.0};
+        v.z = {29000.0, 31000.0};
+        v.radius = {20000.0, 20000.0};
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(0);
+        SolverParams params;
+        params.chiralityOverride = 1;
+        const SolveResult result = solveWindings(world.fibers, world.links, params);
+        QVERIFY(result.unresolvedIntersectionCount > 0);
+        for (const CrossingGroup& group : result.groups) {
+            QVERIFY(group.unresolved);
+            QVERIFY(!group.hasVerdict);
+        }
+    }
+
+    // The solve over externally supplied shards assembles them canonically:
+    // shuffled shards give the identical result, groups and events included.
+    void shuffledShardsSolveIdentically()
+    {
+        World world = threeWindingWorld();
+        addH(world, 0.05, 2.9, 30500.0);
+        // Two folded pairs with verdict groups, at different heights.
+        const double dent = 100.0;
+        addHairpinH(world, 42000.0, -3.0, 3.0, dent, 0.03, -kSheetStep);
+        addRayV(world, hairpinRadius(kSqrt3, dent) - 300.0, 41000.0, 43000.0, -1);
+        addHairpinH(world, 46000.0, -3.0, 3.0, dent, 0.03, -kSheetStep);
+        addRayV(world, hairpinRadius(kSqrt3, dent) - 300.0, 45000.0, 47000.0, -1);
+        SolverParams params;
+        const int chirality = vc3d::fiber_map::winding::inferChirality(world.fibers,
+                                                                        params.chiralityOverride);
+        std::vector<vc3d::fiber_map::winding::CanonicalTrace> canonical;
+        for (const FiberTrace& fiber : world.fibers) {
+            canonical.push_back(vc3d::fiber_map::winding::canonicalizeTrace(fiber, chirality));
+        }
+        std::vector<vc3d::fiber_map::winding::PairCrossings> shards;
+        std::vector<vc3d::fiber_map::winding::PairDetection> ordered;
+        for (std::size_t hIndex = 0; hIndex < canonical.size(); ++hIndex) {
+            if (canonical[hIndex].hvTag != 'H') {
+                continue;
+            }
+            for (std::size_t vIndex = 0; vIndex < canonical.size(); ++vIndex) {
+                if (canonical[vIndex].hvTag != 'V') {
+                    continue;
+                }
+                shards.push_back(vc3d::fiber_map::winding::detectPairCrossings(
+                    canonical[hIndex], canonical[vIndex], params));
+                ordered.push_back({hIndex, vIndex, nullptr});
+            }
+        }
+        for (std::size_t i = 0; i < ordered.size(); ++i) {
+            ordered[i].detection = &shards[i];
+        }
+        std::vector<vc3d::fiber_map::winding::PairDetection> shuffled(ordered.rbegin(),
+                                                                       ordered.rend());
+        std::swap(shuffled[0], shuffled[shuffled.size() / 2]);
+        const SolveResult a =
+            solveWindings(world.fibers, world.links, params, chirality, ordered);
+        const SolveResult b =
+            solveWindings(world.fibers, world.links, params, chirality, shuffled);
+        QCOMPARE(a.crossings.size(), b.crossings.size());
+        QCOMPARE(a.events.size(), b.events.size());
+        QCOMPARE(a.groups.size(), b.groups.size());
+        QVERIFY(a.groups.size() >= 2);
+        const auto sameCrossing = [](const Crossing& x, const Crossing& y) {
+            return x.hFiber == y.hFiber && x.vFiber == y.vFiber && x.zVx == y.zVx &&
+                   x.psiH == y.psiH && x.n == y.n && x.deltaR == y.deltaR &&
+                   x.confidence == y.confidence && x.kind == y.kind && x.status == y.status &&
+                   x.orientation == y.orientation && x.touch == y.touch &&
+                   x.vBranch == y.vBranch && x.representative == y.representative &&
+                   x.coveredByGroups == y.coveredByGroups && x.groupIndex == y.groupIndex &&
+                   x.violationTurns == y.violationTurns;
+        };
+        for (std::size_t i = 0; i < a.crossings.size(); ++i) {
+            QVERIFY(sameCrossing(a.crossings[i], b.crossings[i]));
+        }
+        for (std::size_t i = 0; i < a.events.size(); ++i) {
+            QVERIFY(sameCrossing(a.events[i], b.events[i]));
+        }
+        int verdicts = 0;
+        for (std::size_t i = 0; i < a.groups.size(); ++i) {
+            const CrossingGroup& x = a.groups[i];
+            const CrossingGroup& y = b.groups[i];
+            QCOMPARE(x.hFiber, y.hFiber);
+            QCOMPARE(x.vFiber, y.vFiber);
+            QCOMPARE(x.n, y.n);
+            QCOMPARE(x.members, y.members);
+            QCOMPARE(x.hasVerdict, y.hasVerdict);
+            QCOMPARE(x.verdict, y.verdict);
+            QCOMPARE(x.status, y.status);
+            QCOMPARE(x.confidence, y.confidence);
+            QCOMPARE(x.violationTurns, y.violationTurns);
+            verdicts += x.hasVerdict ? 1 : 0;
+        }
+        QCOMPARE(verdicts, 2);
+        for (std::size_t f = 0; f < world.fibers.size(); ++f) {
+            QCOMPARE(a.placements[f].turns, b.placements[f].turns);
+            QCOMPARE(a.placements[f].anchor, b.placements[f].anchor);
+        }
+        QCOMPARE(a.droppedCrossingCount, b.droppedCrossingCount);
+        QCOMPARE(a.droppedGroupCount, b.droppedGroupCount);
+    }
+
+    // Exactly parallel owner segments leave an intersection the detector
+    // cannot place; the translate is marked unresolved and gets no verdict.
+    void parallelOwnersMarkTheTranslateUnresolved()
+    {
+        World world;
+        const double b = 100.0;
+        addHairpinH(world, 30000.0, -3.0, 3.0, b, 0.03, -kSheetStep);
+        // The V fiber of the mixed case runs up the ray (its samples offset so
+        // none sits at the H fiber's height: the three crossings are clean),
+        // then returns down beside it and, at the H fiber's height, steps
+        // flat across: two samples at z = 30000, exactly collinear with the H
+        // segments they overlap - an intersection the detector cannot place.
+        // Only that unresolved step stands between the group and a verdict.
+        FiberTrace v;
+        v.hvTag = 'V';
+        const double radius = hairpinRadius(kSqrt3, b) - 300.0;
+        for (double z = 29012.5; z <= 31000.0; z += 25.0) {
+            v.theta.push_back(kHairpinTheta0);
+            v.z.push_back(z);
+            v.radius.push_back(radius);
+        }
+        for (double z = 31000.0; z >= 30000.0 - 1e-9; z -= 25.0) {
+            v.theta.push_back(kHairpinTheta0 + 0.4);
+            v.z.push_back(z);
+            v.radius.push_back(radius);
+        }
+        v.theta.push_back(kHairpinTheta0 + 0.3);
+        v.z.push_back(30000.0);
+        v.radius.push_back(radius);
+        world.fibers.push_back(std::move(v));
+        world.trueM.push_back(-1);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QVERIFY(result.unresolvedIntersectionCount > 0);
+        QVERIFY(!result.groups.empty());
+        bool sawEligibleButUnresolved = false;
+        for (const CrossingGroup& group : result.groups) {
+            QVERIFY(!group.hasVerdict);
+            if (group.multiplicity >= 3 && group.mixedSigns && group.orientationSum % 2 != 0 &&
+                group.traversalCovered && !group.coverageGap) {
+                QVERIFY(group.unresolved);
+                sawEligibleButUnresolved = true;
+            }
+        }
+        QVERIFY(sawEligibleButUnresolved);
     }
 };
 

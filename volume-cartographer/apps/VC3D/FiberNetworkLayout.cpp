@@ -721,6 +721,9 @@ ContentDigest detectionParamsDigest(const winding::SolverParams& params)
     hashDouble(digest, params.minTransversality);
     hashDouble(digest, params.zMergeVx);
     hashDouble(digest, params.untrustedConfidenceFactor);
+    hashDouble(digest, params.endpointClearanceTurns);
+    // Detection format version: events, orientation and traversal groups.
+    hashU64(digest, 2);
     return digest;
 }
 
@@ -736,6 +739,16 @@ ContentDigest combineDigests(uint64_t seed,
 }
 
 } // namespace
+
+std::vector<const winding::PairCrossings*> GlobalLayoutCache::cachedDetections() const
+{
+    std::vector<const winding::PairCrossings*> shards;
+    shards.reserve(_pairs.size());
+    for (const auto& entry : _pairs) {
+        shards.push_back(&entry.second.detection);
+    }
+    return shards;
+}
 
 void GlobalLayoutCache::clear()
 {
@@ -1297,6 +1310,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.tieCount = solve.tieCount;
     result.gatedSegmentCount = solve.gatedSegmentCount;
     result.tangentialCount = solve.tangentialCount;
+    result.unresolvedIntersectionCount = solve.unresolvedIntersectionCount;
     result.detectMs = solve.detectMs;
     result.solveMs = solve.solveMs;
 
@@ -1423,25 +1437,98 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         // A link the repair had to drop is winding-suspect whatever its
         // residual now reads: the map placed its endpoints against it. The
         // boundary is inclusive because a residual AT the threshold already
-        // solves with zero confidence. Suspicion requires model-traced
-        // geometry on both ends - the residual of a link into an
-        // interpolated fiber is as suspect as the unwrap it rode on.
-        placedLink.suspect = (traces[link.a].trusted && traces[link.b].trusted) &&
-                             (placedLink.turnErr >= params.suspectTurns ||
-                              droppedLinks.count(l) != 0);
+        // solves with zero confidence.
+        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
+                             droppedLinks.count(l) != 0;
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
         }
         result.links.push_back(std::move(placedLink));
     }
 
-    for (const winding::Crossing& crossing : solve.crossings) {
-        // Declared errors only: a drop involving an untrusted fiber is the
-        // interpolation's fault, and a drop the final map SATISFIES anyway is
-        // greedy-repair debris (the real culprit fell in a later cycle) -
-        // neither is an annotation mistake to ring in red.
+    // Every crossing event goes out as an inspection record, positioned where
+    // the user will look for it: the solver's position is on the raw unrolled
+    // trace; the map draws a resampled (and possibly smoothed) curve, so the
+    // point is projected onto the drawn polyline of the H fiber it belongs to.
+    result.crossingEvents.reserve(solve.events.size());
+    for (const winding::Crossing& crossing : solve.events) {
+        CrossingEvent event;
+        const double x =
+            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
+            rRefVx;
+        event.posVx = drawable[crossing.hFiber]
+            ? nearestPointOnPolyline(geometry[crossing.hFiber].samples,
+                                     QPointF(x, crossing.zVx))
+            : QPointF(x, crossing.zVx);
+        event.hFiberId = ordered[crossing.hFiber]->id;
+        event.vFiberId = ordered[crossing.vFiber]->id;
+        event.n = crossing.n;
+        event.kind = crossing.kind;
+        event.status = crossing.status;
+        event.deltaR = crossing.deltaR;
+        event.transversality = crossing.transversality;
+        event.tangential = crossing.tangential;
+        event.touch = crossing.touch;
+        event.orientation = crossing.orientation;
+        event.mergedCount = crossing.mergedCount;
+        event.confidence = crossing.confidence;
+        event.violationTurns = crossing.violationTurns;
+        event.groupId = crossing.groupIndex;
+        result.crossingEvents.push_back(std::move(event));
+    }
+    result.crossingGroups.reserve(solve.groups.size());
+    for (const winding::CrossingGroup& group : solve.groups) {
+        CrossingGroupRecord record;
+        record.hFiberId = ordered[group.hFiber]->id;
+        record.vFiberId = ordered[group.vFiber]->id;
+        record.n = group.n;
+        record.vBranch = group.vBranch;
+        record.members = group.members;
+        record.multiplicity = group.multiplicity;
+        record.insideCount = group.insideCount;
+        record.orientationSum = group.orientationSum;
+        record.insideOrientationSum = group.insideOrientationSum;
+        record.mixedSigns = group.mixedSigns;
+        record.coverageGap = group.coverageGap;
+        record.unresolved = group.unresolved;
+        record.onCurtain = group.onCurtain;
+        record.traversalCovered = group.traversalCovered;
+        record.minAbsDeltaR = group.minAbsDeltaR;
+        record.meanTransversality = group.meanTransversality;
+        record.hasVerdict = group.hasVerdict;
+        record.verdict = group.verdict;
+        record.confidence = group.confidence;
+        record.status = group.status;
+        record.violationTurns = group.violationTurns;
+        if (group.hasVerdict) {
+            ++result.traversalGroupCount;
+        }
+        result.crossingGroups.push_back(std::move(record));
+    }
+
+    // Declared errors only: a drop the final map SATISFIES anyway is
+    // greedy-repair debris (the real culprit fell in a later cycle), not an
+    // annotation mistake to ring in red. A crossing that constrained through
+    // its group (InGroup) is never declared on its own. An individual
+    // declaration is marked at every event its representative stood for.
+    const auto markFor = [&](std::size_t eventIndex, double violationTurns,
+                             long long groupId) {
+        const CrossingEvent& event = result.crossingEvents[eventIndex];
+        CrossingMark mark;
+        mark.posVx = event.posVx;
+        mark.hFiberId = event.hFiberId;
+        mark.vFiberId = event.vFiberId;
+        mark.n = event.n;
+        mark.kind = event.kind;
+        mark.deltaR = event.deltaR;
+        mark.violationTurns = violationTurns;
+        mark.eventIndex = eventIndex;
+        mark.groupId = groupId;
+        return mark;
+    };
+    for (std::size_t c = 0; c < solve.crossings.size(); ++c) {
+        const winding::Crossing& crossing = solve.crossings[c];
         if (crossing.status != winding::CrossingStatus::Dropped ||
-            !crossing.declarable ||
             crossing.violationTurns < solverParams.declarationViolationTurns) {
             continue;
         }
@@ -1449,16 +1536,35 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         if (!drawable[crossing.hFiber]) {
             continue;
         }
-        // The solver's position is on the raw unrolled trace; the map draws
-        // a resampled (and possibly smoothed) curve, so the mark is projected
-        // onto the drawn polyline of the H fiber it belongs to, where the
-        // user will look for it.
-        const double x =
-            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
-            rRefVx;
-        result.suspectCrossings.push_back(CrossingMark{
-            nearestPointOnPolyline(geometry[crossing.hFiber].samples,
-                                   QPointF(x, crossing.zVx))});
+        // Every event the representative stood for that the map itself
+        // violates: a merged event of the other sign that the map satisfies
+        // is not an error at its place, and an event whose group constrained
+        // for it is the group's to declare.
+        for (std::size_t e = 0; e < solve.events.size(); ++e) {
+            const winding::Crossing& event = solve.events[e];
+            if (event.representative == c &&
+                event.status == winding::CrossingStatus::Dropped &&
+                event.violationTurns >= solverParams.declarationViolationTurns) {
+                result.suspectCrossings.push_back(markFor(e, event.violationTurns, -1));
+            }
+        }
+    }
+    // A dropped, violated traversal group is one conflict, marked at every
+    // place the pair met.
+    for (std::size_t g = 0; g < solve.groups.size(); ++g) {
+        const winding::CrossingGroup& group = solve.groups[g];
+        if (!group.hasVerdict || group.status != winding::CrossingStatus::Dropped ||
+            group.violationTurns < solverParams.declarationViolationTurns) {
+            continue;
+        }
+        ++result.declaredGroupCount;
+        if (!drawable[group.hFiber]) {
+            continue;
+        }
+        for (const std::size_t member : group.members) {
+            result.suspectCrossings.push_back(
+                markFor(member, group.violationTurns, static_cast<long long>(g)));
+        }
     }
 
     const double padX = std::max(kPadFraction * (hiX - loX), params.minPadXVx);
@@ -1636,6 +1742,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
     hashDouble(digest, solver.linkSuspectTurns);
     hashDouble(digest, solver.untrustedConfidenceFactor);
     hashDouble(digest, solver.declarationViolationTurns);
+    hashDouble(digest, solver.endpointClearanceTurns);
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(solver.chiralityOverride)));
     return digest;
@@ -1662,6 +1769,12 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
             static_cast<uint64_t>(static_cast<int64_t>(result.suspectLinkCount)));
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.droppedCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.declaredGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.traversalGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.unresolvedIntersectionCount)));
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(result.gatedSegmentCount)));
     hashU64(digest,
@@ -1724,10 +1837,63 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashDouble(digest, mark.xVx);
         hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(mark.number)));
     }
+    const auto hashI64 = [&digest](long long value) {
+        hashU64(digest, static_cast<uint64_t>(value));
+    };
     hashU64(digest, result.suspectCrossings.size());
     for (const CrossingMark& mark : result.suspectCrossings) {
         hashDouble(digest, mark.posVx.x());
         hashDouble(digest, mark.posVx.y());
+        hashU64(digest, mark.hFiberId);
+        hashU64(digest, mark.vFiberId);
+        hashI64(mark.n);
+        hashU64(digest, static_cast<uint64_t>(mark.kind));
+        hashDouble(digest, mark.deltaR);
+        hashDouble(digest, mark.violationTurns);
+        hashU64(digest, mark.eventIndex);
+        hashI64(mark.groupId);
+    }
+    hashU64(digest, result.crossingEvents.size());
+    for (const CrossingEvent& event : result.crossingEvents) {
+        hashDouble(digest, event.posVx.x());
+        hashDouble(digest, event.posVx.y());
+        hashU64(digest, event.hFiberId);
+        hashU64(digest, event.vFiberId);
+        hashI64(event.n);
+        hashU64(digest, static_cast<uint64_t>(event.kind));
+        hashU64(digest, static_cast<uint64_t>(event.status));
+        hashDouble(digest, event.deltaR);
+        hashDouble(digest, event.transversality);
+        hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0));
+        hashI64(event.orientation);
+        hashI64(event.mergedCount);
+        hashDouble(digest, event.confidence);
+        hashDouble(digest, event.violationTurns);
+        hashI64(event.groupId);
+    }
+    hashU64(digest, result.crossingGroups.size());
+    for (const CrossingGroupRecord& group : result.crossingGroups) {
+        hashU64(digest, group.hFiberId);
+        hashU64(digest, group.vFiberId);
+        hashI64(group.n);
+        hashU64(digest, group.vBranch);
+        hashU64(digest, group.members.size());
+        for (const std::size_t member : group.members) {
+            hashU64(digest, member);
+        }
+        hashI64(group.multiplicity);
+        hashI64(group.insideCount);
+        hashI64(group.orientationSum);
+        hashI64(group.insideOrientationSum);
+        hashU64(digest, (group.mixedSigns ? 1 : 0) | (group.coverageGap ? 2 : 0) |
+                            (group.unresolved ? 4 : 0) | (group.onCurtain ? 8 : 0) |
+                            (group.traversalCovered ? 16 : 0) | (group.hasVerdict ? 32 : 0));
+        hashDouble(digest, group.minAbsDeltaR);
+        hashDouble(digest, group.meanTransversality);
+        hashU64(digest, static_cast<uint64_t>(group.verdict));
+        hashDouble(digest, group.confidence);
+        hashU64(digest, static_cast<uint64_t>(group.status));
+        hashDouble(digest, group.violationTurns);
     }
     hashU64(digest, result.unplaced.size());
     for (const UnplacedFiber& fiber : result.unplaced) {

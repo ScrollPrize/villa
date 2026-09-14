@@ -1590,6 +1590,14 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     if (_layout.droppedCrossingCount > 0) {
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
     }
+    if (_layout.declaredGroupCount > 0) {
+        // A traversal group read together and still contradicted by the map:
+        // one conflict, ringed at each place the pair met.
+        status += tr(" · %1 group conflicts").arg(_layout.declaredGroupCount);
+    }
+    if (_layout.traversalGroupCount > 0) {
+        status += tr(" · %1 grouped").arg(_layout.traversalGroupCount);
+    }
     const qint64 totalMs =
         job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
     if (job.stats.used && !job.fullRebuild) {
