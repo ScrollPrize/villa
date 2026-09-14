@@ -4216,7 +4216,10 @@ class FitContext:
                 rejected_verified = before_verified - set(candidate.verified_patches)
                 rejected = before_unverified - set(candidate.unverified_patches)
                 for record in records:
-                    if record['kind'] != 'patch' or record.get('deleted'):
+                    # Sources predate startup theta validation. Adoption may
+                    # repeat its exclusions; only live revisions must fail.
+                    if (record['kind'] != 'patch' or record.get('deleted')
+                            or record.get('adopt')):
                         continue
                     rejected_ids = rejected if record.get('role') == 'unverified' else rejected_verified
                     member = candidate._workspace_membership[str(record['id'])]

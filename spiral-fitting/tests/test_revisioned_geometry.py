@@ -230,6 +230,51 @@ def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypa
     assert set(context.verified_patches) == {'baseline'}
 
 
+@pytest.mark.parametrize('role', ['verified', 'unverified'])
+@pytest.mark.parametrize('adopt', [True, False])
+def test_theta_rejected_baseline_replay(context, monkeypatch, role, adopt):
+    import fit_spiral
+    # Startup retains pre-validation sources, even after excluding a patch
+    # from the active geometry. Replay must repeat that exclusion successfully.
+    excluded = relink._flat_patch(50, 510, 510)
+    source = getattr(context, f'_source_{role}_patches')
+    source['excluded'] = excluded
+    build_theta = FitContext._build_theta_crossing_map
+
+    def reject(candidate):
+        warnings = []
+        if 'excluded' in getattr(candidate, f'{role}_patches'):
+            warnings = candidate._exclude_non_liftable_patches(
+                ['excluded'] if role == 'verified' else [],
+                ['excluded'] if role == 'unverified' else [],
+                {'inconsistent_edges': 1})
+        return warnings + build_theta(candidate)
+
+    monkeypatch.setattr(FitContext, '_build_theta_crossing_map', reject)
+    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
+                        lambda path: pytest.fail('baseline was reloaded') if adopt
+                        else copy.copy(excluded))
+    record = {'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
+              'path': '/immutable/excluded', 'role': role, 'revision': 1,
+              'adopt': adopt}
+    if not adopt:
+        with pytest.raises(ValueError, match='theta consistency'):
+            context.prepare_input_changes([record])
+        assert set(context.verified_patches) == {'baseline'}
+        assert source['excluded'] is excluded
+        return
+
+    for _ in range(2):
+        candidate = context.prepare_input_changes([record])
+        assert 'excluded' not in getattr(candidate, f'{role}_patches')
+        assert getattr(candidate, f'_source_{role}_patches')['excluded'] is excluded
+        assert set(candidate.verified_patches) == {'baseline'}
+        assert any('non-liftable patch' in warning for warning in candidate._input_warnings)
+        assert candidate._workspace_membership['excluded-uuid'] == {
+            'kind': 'patch', 'revision': 1, 'resident_id': 'excluded', 'deleted': False}
+        context.install_input_changes(candidate)
+
+
 @pytest.mark.parametrize('role', ['same_winding', 'relative', 'absolute', 'drawn_control_points'])
 def test_patch_additions_rederive_one_view_per_collection(context, monkeypatch, role):
     import fit_spiral
