@@ -17,6 +17,76 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <future>
+#if defined(__unix__) || defined(__APPLE__)
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+TEST_CASE("live heartbeat keeps paused demand pending, never marks it ready") {
+    bool keepalive = true;
+    SUBCASE("live coordinator may wait beyond request deadline") {}
+    SUBCASE("stopped heartbeats still time out") { keepalive = false; }
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    auto server = std::async(std::launch::async, [&] {
+        int fd = ::accept(listener, nullptr, nullptr);
+        std::string input;
+        char c;
+        // Consume hello and demand before heartbeats.
+        int lines = 0;
+        while (lines < 2 && ::recv(fd, &c, 1, 0) == 1) {
+            input += c;
+            if (c == '\n') ++lines;
+        }
+        auto send = [&](const std::string& message) {
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+#ifdef SO_NOSIGPIPE
+            int on = 1;
+            ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
+            return ::send(fd, message.data(), message.size(), flags);
+        };
+        for (int i = 0; i < 8; ++i) {
+            if (keepalive) send("{\"version\":1,\"type\":\"heartbeat\"}\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        send("{\"version\":1,\"type\":\"ready\",\"request_id\":1}\n");
+        // Keep peer alive until bridge shutdown to avoid a ready/EOF race.
+        while (::recv(fd, &c, 1, 0) > 0) {}
+        ::close(fd);
+    });
+    {
+        FiberLiveBridge bridge({{"port", ntohs(address.sin_port)}, {"token", "test"},
+                                {"timeout_seconds", 1}, {"heartbeat_wait", true}});
+        const auto start = std::chrono::steady_clock::now();
+        if (keepalive) {
+            bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}});
+            CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(1500));
+        } else {
+            bool failed = false;
+            try { bridge.await("test", 0, 0, {{"test.zarr", {0,0,0}}}); }
+            catch (const std::runtime_error& error) {
+                failed = true;
+                CHECK(std::string(error.what()) == "timed out waiting for inference chunks");
+            }
+            CHECK(failed);
+        }
+    }
+    server.get();
+    ::close(listener);
+}
+#endif
 
 TEST_CASE("embedding falloff is normalized and preserves uniform default")
 {
@@ -230,6 +300,33 @@ TEST_CASE("hit-only LRU does not refresh unmatched anchors before eviction")
     advanceFiberEmbeddingLru(equality,{0,1},10,10,2,1,true);
     CHECK(equality.entries.size() == 2);
     CHECK(equality.lastUsed.front() == 0);
+}
+
+TEST_CASE("normalized LRU mean removes coherence shrinkage and handles cancellation")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingLru state;
+    advanceFiberEmbeddingLru(state,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(state,{0,1},10,10,2);
+    CHECK(state.coherence==doctest::Approx(std::sqrt(.5)));
+    CHECK(fiberEmbeddingLruCost({1,0},state,true)==.5);
+    CHECK(fiberEmbeddingLruCost({1,0},state,true,true)==doctest::Approx(1-std::sqrt(.5)));
+    auto branch=state;
+    advanceFiberEmbeddingLru(branch,{-1,0},20,10,2,0,true);
+    CHECK(state.entries.front().vector==std::vector<float>{1,0});
+    CHECK(fiberEmbeddingLruCost({1,0},branch,true,true)==doctest::Approx(1+std::sqrt(.5)));
+    CHECK(fiberEmbeddingLruCost({1,0},state,true,true)==doctest::Approx(1-std::sqrt(.5)));
+    FiberEmbeddingLru opposite;
+    advanceFiberEmbeddingLru(opposite,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(opposite,{-1,0},10,10,2);
+    CHECK(opposite.coherence==0);
+    CHECK(fiberEmbeddingLruCost({1,0},opposite,true,true)==1);
+    CHECK(fiberEmbeddingLruCost({0,1},opposite,true,true)==1);
+    FiberEmbeddingLru small;
+    advanceFiberEmbeddingLru(small,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(small,{-1,1e-6f},10,10,2);
+    CHECK(small.coherence>0);
+    CHECK(fiberEmbeddingLruCost({0,1},small,true,true)==0);
 }
 
 TEST_CASE("supported appearance softmin is normalized and split invariant")
@@ -676,6 +773,18 @@ TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embe
         request.config.embeddingReferenceMode = mode;
         CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
     }
+    request.config.embeddingReferenceMode = "anchors-lru";
+    request.config.embeddingAnchorAggregation = "normalized-mean";
+    vc::fiber_tracer::FiberTraceProfile embeddingProfile;
+    request.config.profile = &embeddingProfile;
+    CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
+    CHECK(embeddingProfile.embeddingLruScoredCandidates>0);
+    CHECK(embeddingProfile.embeddingLruCoherenceHistogram[10]==embeddingProfile.embeddingLruScoredCandidates);
+    CHECK(embeddingProfile.embeddingLruCoherenceSum==doctest::Approx(embeddingProfile.embeddingLruScoredCandidates));
+    request.config.profile = nullptr;
+    request.config.embeddingReferenceMode = "appearance";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingAnchorAggregation = "best";
     request.config.embeddingReferenceMode = "anchors-lru";
     request.config.embeddingAnchorTouch = "hit";
     CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);

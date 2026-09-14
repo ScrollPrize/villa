@@ -9,12 +9,23 @@ retains the existing prediction products and makes no embedding reads.
 
 ## Scoring and storage
 
+Experimental LRU aggregation `normalized-mean` uses cosine distance to the
+normalized sum of anchors, rather than mean distance to individual anchors.
+Ordinary mean equals `1-r*cos(query,mean_direction)`, where r is the length of
+the mean vector; normalization removes this disagreement-based shrinkage.
+Exact cancellation costs1. The cached sum is refreshed only on bank changes.
+Trace profiling records candidate-weighted r deciles (last bucket1, numerical
+overshoot clipped for binning). This may amplify near-cancelling directions;
+native validation passed. Initial same-setting A/B worsened64/68/66 to75
+restarts each on the frozen tuning fiber; independent refinement remains in
+progress. No default change. See embedding_multi_anchor_20260913.md.
+
 Experimental LRU `--embedding-anchor-touch hit` only refreshes an old anchor
 when an observation exactly matches or has cosine distance below the novelty
 threshold. Novel observations evict actual LRU without first touching their
 nearest anchor. Default `nearest` retains the original forced-nearest touch.
 This isolates replacement semantics without changing costs or memory. Native
-build and empirical evaluation are pending the running frozen-binary sweep.
+tests pass; empirical comparison is running on the frozen model/cache.
 
 `--embedding-reference-mode anchors` builds a compact observed appearance model.
 The regular bounded history is its observation bank (<=64); greedy medoid
@@ -251,3 +262,5 @@ the ungated LRU policy.
 
 See [the full history-spacing/falloff sweep](embedding_history_sweep_20260913.md)
 for all36 combinations, controls and exact-repeat checks. Defaults remain unchanged.
+For sweep GPU pause/idle release and the stop command, see
+[Cooperative GPU use in embedding sweeps](demand_gpu_sweeps.md).

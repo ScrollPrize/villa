@@ -13,6 +13,30 @@ def model_parameters(model):
     return result
 
 
+def validate_cached_model(model, checkpoint_digest, settings):
+    """Validate explicit cache extension by numerical parameters, not code hashes."""
+    model = model_parameters(model)
+    if model["checkpoint_sha256"] != checkpoint_digest:
+        raise ValueError("cannot extend cache with different checkpoint")
+    settings = dict(settings)
+    keys = {"precision": "precision", "tile_size": "tile", "overlap": "overlap",
+            "border": "border", "chunk_size": "chunk", "accumulator_dtype": "accumulator_dtype",
+            "compressor": "compressor", "max_batch_size": "max_batch_size"}
+    for setting, key in keys.items():
+        if setting == "precision" and settings.get(setting) == "auto":
+            settings.pop(setting)
+        if setting in settings and settings[setting] != model.get(key):
+            raise ValueError(f"cannot extend cache with different {setting}")
+        if setting not in settings and key in model:
+            settings[setting] = model[key]
+    if "scaledown_power" in settings and 1 << int(settings["scaledown_power"]) != model["scale"]:
+        raise ValueError("cannot extend cache with different scale")
+    if "emit_embeddings" in settings and bool(settings["emit_embeddings"]) != bool(model["embedding_channels"]):
+        raise ValueError("cannot extend cache with different embedding channels")
+    settings.setdefault("emit_embeddings", bool(model["embedding_channels"]))
+    return settings
+
+
 def resolve_prediction_cache(source_root, source, model, geometry, settings):
     """Return a compatible directory and its unchanged recorded model identity.
 

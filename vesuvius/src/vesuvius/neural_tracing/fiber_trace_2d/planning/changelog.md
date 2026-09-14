@@ -14,6 +14,12 @@
   cross-sections and restart arc metadata; partial per-fiber metrics no longer
   wait for all rendering. See docs/batched_trace_strips.md.
 
+## 2026-09-14 — Training span eligibility
+
+- 3D training/test loaders retain only spline/traced JSON components and trim
+  extrapolation. Added fresh JSON-only five-scroll LR0.01 EMA config. Separate
+  tracing evaluation unchanged; see docs/training_span_eligibility.md.
+
 ## 2026-09-13 — EMA99 tracer reference variants
 
 - Added opt-in best-history and per-beam EMA/seed/gated references to shared
@@ -2641,3 +2647,12 @@ rerun blocked on missing cache. Results: docs/benchmarks/restart_episodes80_2026
 - Full50fibers/180galleries complete under eligible_ema99_u5200_vis_20260914_v1.
   Exact replay/metric parity with prior nonvisual run; per-fiber index and worst
   fiber/case ranking saved.22native+138Python tests passed.
+
+# 2026-09-14: embedding sweep paused for cooperative GPU work
+
+Previous embedding refinement task: confirmed best 64 restarts on frozen EMA99
+update6500 versus 87 without embeddings. Completed mechanism/refinement reports
+are in docs/embedding_refinement_summary_20260914.md. Boundary sweep stopped on
+user request after eight families and partial ninth; preserved report under
+`/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_anchor_boundaries_20260914_v1/`.
+Partial support-softmin 67 has not received the final exact-repeat stage.

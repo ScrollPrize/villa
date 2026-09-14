@@ -464,6 +464,17 @@ def format_queue_snapshot(row):
             f"publish(q/submitted)={row['publications_queued']}/{row['publications_submitted']}")
 
 
+def _gated_demand_worker(gate, arguments, vram_budget):
+    # No CUDA context/model before the manager records this child's identity.
+    gate.wait()
+    if arguments[1].startswith("GPU-"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = arguments[1]
+        arguments = (arguments[0], "cuda:0", *arguments[2:])
+    if vram_budget is not None:
+        os.environ["FIBER_INFERENCE_VRAM_BUDGET_BYTES"] = str(vram_budget)
+    tiled._multi_gpu_worker_main(*arguments)
+
+
 class DemandWorkerPool:
     """Shared persistent model workers, bounded descriptor slots and fast readers.
 
@@ -473,7 +484,7 @@ class DemandWorkerPool:
     """
     def __init__(self, stores, readers, devices, *, slots_per_gpu=2, input_workers=8, input_slots=None,
                  result_slots=None, accumulator_workers=None, flush_workers=4, profile_pipeline=False,
-                 max_batch_size=1):
+                 max_batch_size=1, deferred_gpu=False):
         if type(max_batch_size) is not int or max_batch_size < 1:
             raise ValueError("max_batch_size must be a positive integer")
         if not stores or not devices or slots_per_gpu < 1 or input_workers < 1:
@@ -523,6 +534,11 @@ class DemandWorkerPool:
         self.flush_workers = int(flush_workers)
         self.sequence = 0
         self.profile_pipeline = profile_pipeline
+        self.gpu_authorized = not deferred_gpu
+        self.gpu_gate = None
+        self._gpu_stopping = None
+        self._closed = False
+        self.last_gpu_activity = time.monotonic()
         self.stage_samples = [] if profile_pipeline else None
         self.input_workers = int(input_workers)
         self.profile_samples = []
@@ -560,17 +576,80 @@ class DemandWorkerPool:
                 process.start()
                 self.accumulator_processes.append(process)
             scales = {p.name: self.geometry.scale for p in first.products}
-            for i, device in enumerate(devices):
-                process = context.Process(target=tiled._multi_gpu_worker_main, args=(
-                    i, str(device), self.adapter, None, self.geometry.tile,
+            self.gpu_arguments = (
+                    self.adapter, None, self.geometry.tile,
                     tiled.blend_ramp(self.geometry.tile, self.geometry.border, self.geometry.overlap), scales,
                     int(getattr(self.adapter, "native_output_stride", 1)), input_specs, result_specs,
-                    self.work, self.events, profile_pipeline, max_batch_size, True))
-                process.start()
-                self.processes.append(process)
+                    self.work, self.events, profile_pipeline, max_batch_size, True)
+            if not deferred_gpu:
+                self.start_gpu(devices)
+                self.authorize_gpu()
         except BaseException:
             self.close()
             raise
+
+    def start_gpu(self, devices, *, vram_budget=None):
+        if self.processes or self.active or self.input_owners:
+            raise RuntimeError("GPU restart before submitted tiles drained")
+        context = mp.get_context("spawn")
+        self.gpu_gate = context.Event()
+        self.gpu_authorized = False
+        self.last_gpu_activity = time.monotonic()
+        try:
+            for i, device in enumerate(devices):
+                process = context.Process(target=_gated_demand_worker, args=(self.gpu_gate, (
+                    i, str(device), *self.gpu_arguments), vram_budget))
+                process.start()
+                self.processes.append(process)
+        except BaseException:
+            self.stop_gpu()
+            raise
+
+    def authorize_gpu(self):
+        self.gpu_gate.set()
+        self.gpu_authorized = True
+
+    def stop_gpu(self):
+        """Only at a drained boundary; shared CPU/result buffers remain alive."""
+        while not self.poll_stop_gpu():
+            time.sleep(.01)
+
+    def poll_stop_gpu(self):
+        """Nonblocking join state machine for manager/heartbeat event loops."""
+        if self.active or self.input_owners:
+            raise RuntimeError("cannot release GPUs with submitted tiles")
+        self.gpu_authorized = False
+        if self._gpu_stopping is None:
+            for process in self.processes:
+                if process.is_alive():
+                    process.terminate()
+            self._gpu_stopping = (time.monotonic() + 10, False)
+        for process in self.processes:
+            process.join(timeout=0)
+        if any(p.is_alive() for p in self.processes):
+            deadline, killed = self._gpu_stopping
+            if time.monotonic() >= deadline:
+                if killed:
+                    raise RuntimeError("GPU worker survived shutdown; retain reservation")
+                for process in self.processes:
+                    if process.is_alive():
+                        process.kill()
+                self._gpu_stopping = (time.monotonic() + 10, True)
+            return False
+        self.processes = []
+        self.gpu_gate = None
+        self._gpu_stopping = None
+        # A terminated idle Queue reader may own its reader lock. Never reuse
+        # those transports for a replacement worker generation.
+        for channel in (self.work, self.events):
+            channel.cancel_join_thread()
+            channel.close()
+        context = mp.get_context("spawn")
+        self.work = context.Queue(maxsize=self.stats["input_slots"])
+        self.events = context.Queue(maxsize=self.stats["input_slots"] * 2 + 8)
+        self.gpu_arguments = (*self.gpu_arguments[:8], self.work, self.events,
+                              *self.gpu_arguments[10:])
+        return True
 
     @property
     def busy(self):
@@ -675,7 +754,7 @@ class DemandWorkerPool:
         return min(choices, default=None)
 
     def pump(self):
-        for process in self.processes + self.accumulator_processes:
+        for process in ([] if self._gpu_stopping is not None else self.processes) + self.accumulator_processes:
             if process.exitcode is not None:
                 raise RuntimeError(f"inference/accumulator worker {process.name} exited unexpectedly: {process.exitcode}")
         phase_started = time.perf_counter()
@@ -712,8 +791,14 @@ class DemandWorkerPool:
         self.stats["pump_admit_seconds"] += time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         dispatched = 0
+        # CPU failures must surface even while GPU dispatch is paused.
+        for _, _, _, future, _ in self.loading.values():
+            if future.done():
+                error = future.exception()
+                if error is not None:
+                    raise error
         for sequence, (name, tile, slot, future, started) in list(self.loading.items()):
-            if dispatched >= 8:
+            if not self.gpu_authorized or dispatched >= 8:
                 break
             if not future.done() or not self.free:
                 continue
@@ -727,6 +812,7 @@ class DemandWorkerPool:
             del self.loading[sequence]
             self.stats["load_seconds"] += time.perf_counter() - started
             dispatched += 1
+            self.last_gpu_activity = time.monotonic()
         self.stats["pump_dispatch_seconds"] += time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         while True:
@@ -759,6 +845,7 @@ class DemandWorkerPool:
                 self.profile_samples.append({**event[7], "worker_index": event[5],
                     "coordinator_receive_delay_s": time.perf_counter() - event[8]})
             name, tile, slot = self.active.pop(event[1])
+            self.last_gpu_activity = time.monotonic()
             tasks = self.stores[name].begin_complete(tile, self.result_specs[slot], slot, event[1])
             self.accumulating[event[1]] = [name, tile, slot, len(tasks)]
             for task in tasks:
@@ -781,6 +868,8 @@ class DemandWorkerPool:
         self.stats["pump_background_seconds"] += time.perf_counter() - phase_started
 
     def close(self):
+        if self._closed:
+            return
         # Cancel work on failure/exit; never block on a full data queue to send
         # a shutdown sentinel. No raw output from a terminated worker is ready.
         for process in self.processes + self.accumulator_processes:
@@ -803,6 +892,7 @@ class DemandWorkerPool:
         for channel in (self.work, self.events, self.accumulator_events, *self.accumulator_queues):
             channel.cancel_join_thread()
             channel.close()
+        self._closed = True
 
     def __enter__(self):
         return self

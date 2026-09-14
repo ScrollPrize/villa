@@ -9,7 +9,8 @@ import sys
 
 from lasagna.inference_provenance import atomic_write, json_digest
 from .cached_trace_profile import PublishedStore, extend_cached_replay
-from .live_evaluate import coordinate_native, implementation_identity
+from .live_evaluate import coordinate_native
+from .inference_cache import validate_cached_model
 
 
 def variants(controls_only=False, weight=.25):
@@ -147,8 +148,10 @@ def configured_variants(settings):
         mix = candidate.get('ema_mix', .5)
         if not isinstance(mix, (int, float)) or not math.isfinite(mix) or not 0 <= mix <= 1:
             raise ValueError('invalid anchor EMA mix')
-        if candidate.get('aggregation','best') not in ('best','mean','support-softmin'):
+        if candidate.get('aggregation','best') not in ('best','mean','normalized-mean','support-softmin'):
             raise ValueError('invalid anchor aggregation')
+        if candidate.get('aggregation') == 'normalized-mean' and mode != 'anchors-lru':
+            raise ValueError('normalized-mean requires anchors-lru')
         if mode == 'anchors' and candidate.get('aggregation','best') != 'best':
             raise ValueError('representative anchors require best aggregation')
         if (mode == 'appearance' and candidate.get('aggregation') == 'mean') or (mode != 'appearance' and candidate.get('aggregation') == 'support-softmin'):
@@ -175,8 +178,8 @@ def run(settings):
         identity = json.loads((Path(source["fiber_manifest"]).parent / "cache_identity.json").read_text())
         if identity["identity"]["model"]["checkpoint_sha256"] != pilot["checkpoint_sha256"]:
             raise ValueError("frozen checkpoint mismatch")
-        if fill_missing and identity["identity"]["model"]["implementation"] != implementation_identity():
-            raise ValueError("inference implementation changed: cannot extend frozen cache")
+        if fill_missing:
+            validate_cached_model(identity["identity"]["model"], pilot["checkpoint_sha256"], base["inference"])
     output = Path(settings["output"])
     output.mkdir(parents=True, exist_ok=False)
     report = dict(checkpoint_sha256=pilot["checkpoint_sha256"], step=pilot["step"],
@@ -224,7 +227,8 @@ def run(settings):
         print("sweep start " + variant["name"], flush=True)
         try:
             if fill_missing and variant["name"] not in previous and variant["name"] != "repeat-best":
-                extend_cached_replay(evaluation, settings["native_binary"], Path(pilot["checkpoint"]))
+                extend_cached_replay(evaluation, settings["native_binary"], Path(pilot["checkpoint"]),
+                                     gpu_manager=settings["gpu_manager"])
             else:
                 coordinate_native(evaluation, Path(settings["native_binary"]), stores, mapping, channels,
                     {k: set() for k in stores}, {}, (),
@@ -292,14 +296,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("control")
     parser.add_argument("--unmanaged", action="store_true")
-    parser.add_argument("--devices", default="0")
+    parser.add_argument("--devices")
     args = parser.parse_args()
     settings = json.loads(Path(args.control).read_text())["embedding_trace_sweep"]
-    if settings.get("fill_missing", False) and not args.unmanaged:
-        from .managed_evaluation import launch_managed
-        return launch_managed([sys.executable, "-m", "vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_sweep", args.control],
-                              devices="0", settings=settings["gpu_manager"])
-    run(settings)
+    if args.devices is not None and settings.get("fill_missing", False):
+        settings["gpu_manager"] = dict(settings["gpu_manager"], devices=args.devices)
+    if settings.get("fill_missing", False) and args.unmanaged:
+        parser.error("sweep tile inference requires demand-scoped manager ownership")
+    import signal
+    def stopped(*_):
+        raise KeyboardInterrupt("sweep stopped")
+    previous = signal.signal(signal.SIGTERM, stopped)
+    try:
+        run(settings)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

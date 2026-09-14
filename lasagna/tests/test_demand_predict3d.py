@@ -130,6 +130,49 @@ def test_invalid_explicit_input_slots(tmp_path, slots):
         DemandWorkerPool({"test": store}, {}, ["cpu"], input_slots=slots)
 
 
+def test_gpu_lifetime_restart_retains_cpu_reads_and_exact_output(tmp_path):
+    geometry = DemandGeometry((8, 4, 4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, geometry.chunk)
+    with DemandStore(tmp_path, {"test": "pause"}, geometry, adapter, output) as store:
+        with DemandWorkerPool({"s": store}, {"s": lambda tile: np.full((4, 4, 4), 255, np.uint8)},
+                              ["cpu"], deferred_gpu=True, input_workers=1) as pool:
+            for z in range(2):
+                store.request((z, 0, 0))
+                deadline = time.monotonic() + 20
+                while not pool.loading and time.monotonic() < deadline:
+                    pool.pump()
+                assert pool.loading and not pool.active and not pool.processes
+                pool.start_gpu(["cpu"])
+                pool.pump()
+                assert not pool.active  # still gated, CPU state retained
+                pool.authorize_gpu()
+                while pool.busy and time.monotonic() < deadline:
+                    pool.pump()
+                    time.sleep(.005)
+                assert not pool.busy
+                pool.stop_gpu()
+                assert not pool.processes
+        np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:],
+                                      np.full(geometry.shape, 255, np.uint8))
+
+
+def test_paused_gpu_does_not_hide_failed_cpu_read(tmp_path):
+    geometry = DemandGeometry((4,4,4), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    def reader(tile):
+        raise RuntimeError('read failed while paused')
+    with DemandStore(tmp_path, {'test': 'read-failure'}, geometry, adapter, output) as store:
+        with DemandWorkerPool({'s': store}, {'s': reader}, ['cpu'], deferred_gpu=True) as pool:
+            store.request((0,0,0))
+            with pytest.raises(RuntimeError, match='read failed while paused'):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    pool.pump()
+                    time.sleep(.005)
+                pytest.fail('paused input error was hidden')
+            assert not pool.processes
+
+
 def outputs(root, shape, chunk, scale=1):
     adapter = IdentityAdapter(root, chunk, scale)
     # The logical output here is already on its final lattice (level zero in

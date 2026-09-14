@@ -1,15 +1,86 @@
 # Multi-anchor appearance experiments
 
+See [consolidated completed refinements](embedding_refinement_summary_20260914.md)
+for per-family parameters, bounds and replay hashes (active boundary round pending).
+
 Goal: improve the69-restart EMA512 reference result. Same frozen current model
 EMA99 update6500/832000 patches, SHA256
 `0a2651b711e7e5ee6d445ac8c68ff482c1951798ced2f44896c25602e1c50417`.
 Same whole PHerc1299 held-out fiber `lt_20260825T075316065_000069.json`
 (dataset aliasPHerc1229), both directions. No GT in reference updates; GT only
-measures failure/restart using the unchanged ellipse. Training remains running.
+measures failure/restart using the unchanged ellipse. Training was left running
+during the initial sweeps, then stopped at the user's request on September14;
+all later experiments retain this same frozen snapshot and use manager grants.
 
-## Implementation
+## Normalized-mean A/B (September14)
 
-### Completed independent refinements
+`embedding_ema99_normalized_mean_20260914_v1/report.json`:10 replays, exit0,
+best64 exact repeat. Off87/original82/EMA69 and ordinary mean64/68/hit66
+reproduce their earlier full replay hashes. No default change.
+
+| Settings (spacing512, no EMA) | Ordinary mean | Normalized mean | Coherence ordinary / normalized |
+|---|---:|---:|---:|
+| K2, weight.10, novelty.10, nearest touch |**64**|75|.97519 / .97784|
+| K4, weight.30, novelty0, nearest touch |68|75|.98169 / .97611|
+| K2, weight.10, novelty.10, hit-only touch |66|75|.97643 / .97711|
+
+Coherence is candidate-parent-weighted norm(sum anchors)/K, including candidate
+states subsequently rejected. All six profiles have nonzero counts and exact
+histogram/count agreement (7.23–7.51 million); none has coherence below.1.
+The three75-restart results have different trace hashes, not identical routes.
+Near-cancellation is not observed here. Ordinary mean may benefit from its
+coherence-dependent influence, but these comparisons do not prove causation.
+All three normalized seeds receive their own finite refinement next.
+
+Native commit `c60fe9bcf`, GCC QuickBuildO3:
+executable SHA256 `7042b28783170a87259b008894c23e87976e9eceed638ecd3d404000449e7586`,
+DSO `61f290801bc4654ec8c8920e016a3cc02ec228d63295e5d08e9133d346d810af`.
+Native2 tests pass1.66s, Python118 pass32.63s; logs
+`cooperative-tests/20260914_071900_187504`. Same frozen workload and manager
+grant as the other experiments. The next boundary sweep uses this same build.
+
+## Seed, delayed update and hit-only LRU initial comparison
+
+Report `embedding_ema99_seed_delay_touch_20260914_v1/report.json`:15 replays,
+exit0, winner64 exactly repeated. Off87/original82/EMA69 and the64-restart
+reference all reproduce their earlier hashes after rebuild. Delay0 matches EMA
+bit-for-bit in replay. Same frozen model, fiber and native build recorded below.
+
+| Method | Settings | Restarts |
+|---|---|---:|
+| Seed-only | weight.10/.25/.50 |80 /76 /82|
+| Delayed EMA | half512,weight.25,delay32/64/128/256 |86 /78 /80 /78|
+| Hit-only mean-LRU | K2,spacing512,weight.10,novelty.10 |66|
+| Hit-only nearest-LRU | same |74|
+| Existing nearest-touch mean-LRU | same |**64**|
+
+No new mechanism beats64 in this initial comparison. Seed-only being worse
+supports retaining adaptation at these settings; it does not prove every
+adaptive policy helps. Delaying updates did not improve EMA here. Each new
+method now receives its own refinement, including a second delayedEMA seed to
+check weight/delay interaction; then anchor boundary/multi-start tests follow.
+
+## Completed independent refinements
+
+The subsequent five-family search in
+`embedding_ema99_new_method_refine_20260914_v1/report.json` has finished its
+coordinate searches and all exact repeats (91 replays, exit0). Every family
+winner and the overall64 winner reproduced its full replay hash. Results:
+
+| Family | Best settings | Restarts |
+|---|---|---:|
+| Seed-only | weight .30 |72|
+| Hit-only mean-LRU | K2, spacing512, weight.10, novelty.10 |66|
+| Hit-only nearest-LRU | K2, spacing768, weight.25, novelty.10 |68|
+| Delayed EMA, start weight.25 | delay0, half512, weight.25 |69|
+| Delayed EMA, start weight.10 | delay512, half1024, weight.10 |71|
+
+Both LRU winners use no EMA mixture. These finite searches do not improve the
+confirmed64-restart nearest-touch novelty mean-LRU. Delayed EMA's lower-weight
+start finds a different local result but not a better result than ordinary EMA.
+Across91 replays, wall seconds mean35.47, min/median/p95/max
+3.31/35.43/40.07/40.94 (nearest-rank p95). Includes the inexpensive embedding-off
+control, setup and variable trajectories; not isolated algorithm overhead.
 
 All13 families completed,270 replays total, process exit0. Every family winner
 and the overall winner reproduced its exact replay hash. Overall64 =29+35
@@ -46,8 +117,8 @@ all replays. At `refine-0072`, plain nearest-LRU improved to **66 restarts
 (28+38)** versus EMA512/.25's69 (28+41). Settings:2 anchors,512-base-voxel
 admission spacing,weight.10,noEMA mix,novelty0. Runtime41.98s, same frozen input
 and QuickBuildO3 binary as above. This is a tuning result on one fiber, not a
-generalization claim; this family's finite-axis refinement is complete, while
-the final exact-parameter repeat remains open.
+generalization claim; this family's finite-axis refinement and final exact
+repeat are complete.
 The exact replay hash is
 `68d07241e4ac50456fc1f1ff52263c9374ecfb4e7dde451097037dfa783fe172`;
 the equivalent-scoring half-life128 variant reproduced it exactly (EMA mix0).
@@ -62,15 +133,18 @@ Completed families so far:novelty-LRU71,whole-path nearest72,support-softmin71,
 plain nearest-LRU66 (three coordinate cycles).
 Plain mean-LRU completed68 (K4/spacing512/.30/noEMA,two coordinate cycles).
 Novelty mean-LRU completed64 at the settings above.
-Other families and further mechanism tests are still running/planned. Do not
-interpret this partial section as the final refinement report.
+All family results are listed above; further mechanism tests remain in progress.
 
 Frozen native build for this refinement:QuickBuild,optimization3;
 `vc_fiber_trace_metric` SHA256
 `4cadee53019df7a8cf2d96f640aba8b69b84adeb93b40c21529afb5e4f369470`,
 shared `libvc_fiber_tracer.so` SHA256
 `20197fb52e6a413ed82a6a6df296f217586caed3b2e9cf0164150990655bc96c`.
-Pending seed/delayed-EMA source changes are not in this running binary.
+Seed/delayed-EMA source changes were not in that completed sweep's binary.
+The subsequent mechanism sweep uses QuickBuildO3 executable SHA256
+`41908b8475ebcda07fbc1b51d85116cdd0b6b4db5e780d1d4a8da5bae332e466`
+and shared tracer SHA256
+`808b6a606d35a47036deda58aa3a1a59172b924403b1f8b8a4fb75ae6efa5a8d`.
 
 Shared `FiberEmbedding.hpp` greedily chooses observed medoids to reduce summed
 nearest cosine distance over the bounded observation bank. First anchor is most

@@ -55,6 +55,12 @@
 
 ## Opt-in embedding reference modes
 
+- LRU `normalized-mean` scores cosine to the equal-anchor sum normalized to
+  unit length; exact cancellation costs1. Cache only changes with bank contents.
+  Ordinary mean/best arithmetic stays unchanged. Existing profile reports
+  candidate-weighted coherence=sum-vector norm/K with decile bins plus1 bucket;
+  no mutation from parallel scoring and no GT information in reference updates.
+
 - LRU anchor touch policy defaults to `nearest` (refresh nearest even for novel
   observations). Opt-in `hit` refreshes only exact or within-novelty-threshold
   matches; novel observations evict actual LRU without touching old anchors.
@@ -964,9 +970,20 @@
   -1 rather than pretending to be an original control point.
 - Dataset `dense_supervision: true` enables dense selected-polyline supervision
   for JSON. False/absent preserves CP-only JSON behavior; NML stays dense.
-  Dense JSON uses every selected-fiber segment intersecting the patch, including
-  distant arc sections that re-enter it; other fibers do not become positive.
+  Dense JSON uses every retained selected-component segment intersecting the
+  patch, including distant arc sections that re-enter it; other components
+  and fibers do not become positive.
   Crop, prefetch, augmentation tangent and targets share the continuous location.
+- File-backed 3D training and its test loaders retain only JSON `cspline` and
+  `trace` spans between exact original control points, with no length cutoff.
+  Exterior line tails and Lasagna/unknown-provenance spans are excluded.
+  Maximal contiguous accepted runs become independent records; no connector
+  crosses an excluded span. Arclength sampling weights retained lengths, not
+  component count. Empty datasets fail clearly rather than changing scroll
+  balance silently. NML explicit edges remain accepted despite their synthetic
+  legacy interpolation metadata. Shared file parsing and the separate tracing
+  evaluator remain unchanged. Internal `_array_records` test fixtures supply
+  already-selected geometry and do not perform file provenance filtering.
 - 3D training uses a strict stream/data index split. `stream_index` is the
   unbounded deterministic stream position; `data_index` is the bounded
   dataset-selection index after applying `training.max_sample_index` /
@@ -7302,9 +7319,26 @@ recomputed using report-metrics without mutating their trace artifacts.
   outside point, resets on reentry, and fails if still outside after that travel.
   Pending outside excursions at termination/reference end count as failure.
 - Native and Lasagna replay share this policy. JSON stores the ellipse factor;
-  restoration validates geometry consistency. Nondefault-factor rendering is
-  explicitly rejected until the rendering geometry supports it.
+  restoration validates geometry consistency. Rendering supports nondefault
+  factors through the shared ellipse frame and metadata (including40/80).
 - Reported restart episodes remain separated by80 base voxels; include terminal
   segments. No change to CP-bounded/non-Lasagna eligibility or model inputs.
 - Evaluator development uses the no-argument workspace build runner documented
   in vesuvius/scripts/native-build-deps/README.md; historical configs preserved.
+
+# Demand-scoped sweep GPU lifecycle (2026-09-14)
+
+- Embedding sweeps use pausable/adaptable manager ownership only for tile GPU
+  work. CPU tracing/read/accumulation may continue while GPU allocation is zero;
+  those CPU activities are explicitly outside paused GPU lease accounting.
+- GPU dispatch stops on release; submitted tiles drain, GPU children join,
+  then release is acknowledged. CPU queues/results/trace state survive.
+- Before first ready input, do not bootstrap/register/request GPUs. Closing
+  without input demand never registers. CPU reads continue independently.
+- After30s without GPU tile activity self-pause/release; request again when a
+  read is ready for GPU dispatch. Never clear administrative pause on demand.
+- Native coordinator heartbeats allow live scheduling waits beyond request
+  timeout; they never mark chunks ready. EOF/errors/missing heartbeat fail.
+- Locked manager protocol remains unchanged; existing Supervisor coordinates
+  reconnect/release. Numerical inference and cached output conventions stay
+  unchanged; any cache compatibility must be exact and explicitly audited.

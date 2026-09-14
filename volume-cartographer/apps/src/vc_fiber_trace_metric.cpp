@@ -62,7 +62,7 @@ void printUsage(const char* argv0)
         << "  --embedding-ema-delay-base-voxels N delayed EMA admission [0, maximum2048]; mode ema-delayed\n"
         << "  --embedding-anchor-count N      representative medoids [4, maximum8]; mode anchors\n"
         << "  --embedding-anchor-ema-mix N    EMA cost fraction [0.5], anchor fraction=1-N\n"
-        << "  --embedding-anchor-aggregation MODE best|mean for anchors-lru; spacing limits admission\n"
+        << "  --embedding-anchor-aggregation MODE best|mean|normalized-mean for anchors-lru; support-softmin for appearance\n"
         << "  appearance reference mode uses whole-path spherical centroids (no age expiry)\n"
         << "  --embedding-anchor-novelty D minimum insertion distance for LRU (default 0)\n"
         << "  --embedding-anchor-touch nearest|hit LRU recency policy (default nearest)\n"

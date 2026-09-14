@@ -8,7 +8,7 @@
   },
   "embedding_trace_sweep": {
     "pilot": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_reference_20260913_v1",
-    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_seed_delay_touch_20260914_v1",
+    "output": "/ephemeral/hendrik/fiber3d_train2/evaluations/embedding_ema99_remaining_adaptive_refine_20260914_v1",
     "fill_missing": true,
     "gpu_manager": {
       "exclusive": false,
@@ -18,127 +18,172 @@
       "label": "embedding-method-comparison"
     },
     "native_binary": "/home/hendrik/villa/volume-cartographer/build/dev-quickbuild-gcc/bin/vc_fiber_trace_metric",
-    "candidates": [
+    "controls_only": true,
+    "refine": [
       {
-        "mode": "ema",
-        "weight": 0.25,
-        "half_life": 512,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
+        "label": "anchors-transfer",
+        "seed": {
+          "anchors": 2,
+          "count": 64,
+          "ema_mix": 0.9,
+          "falloff": "uniform",
+          "half_life": 128,
+          "mode": "anchors",
+          "spacing": 256,
+          "weight": 0.1,
+          "window": 1024
+        },
+        "axes": {
+          "spacing": [
+            192,
+            256,
+            384,
+            512,
+            768,
+            1024
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "weight": [
+            0.1,
+            0.25,
+            0.5
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 0,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
+        "label": "normalized-mean-novel",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 2,
+          "weight": 0.1,
+          "novelty": 0.1,
+          "touch": "nearest",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "anchors-lru",
-        "aggregation": "mean",
-        "weight": 0.1,
-        "anchors": 2,
-        "novelty": 0.1,
-        "ema_mix": 0,
-        "spacing": 512,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
+        "label": "normalized-mean-plain",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 4,
+          "weight": 0.3,
+          "novelty": 0,
+          "touch": "nearest",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
       },
       {
-        "mode": "anchors-lru",
-        "aggregation": "mean",
-        "weight": 0.1,
-        "anchors": 2,
-        "novelty": 0.1,
-        "touch": "hit",
-        "ema_mix": 0,
-        "spacing": 512,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "anchors-lru",
-        "aggregation": "best",
-        "weight": 0.1,
-        "anchors": 2,
-        "novelty": 0.1,
-        "touch": "hit",
-        "ema_mix": 0,
-        "spacing": 512,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "seed",
-        "weight": 0.1,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "seed",
-        "weight": 0.25,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "seed",
-        "weight": 0.5,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "uniform"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 32,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 64,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 128,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
-      },
-      {
-        "mode": "ema-delayed",
-        "weight": 0.25,
-        "half_life": 512,
-        "delay": 256,
-        "spacing": 128,
-        "window": 1024,
-        "count": 8,
-        "falloff": "gaussian"
+        "label": "normalized-mean-hit",
+        "seed": {
+          "mode": "anchors-lru",
+          "aggregation": "normalized-mean",
+          "anchors": 2,
+          "weight": 0.1,
+          "novelty": 0.1,
+          "touch": "hit",
+          "spacing": 512,
+          "window": 4096,
+          "count": 8,
+          "falloff": "uniform",
+          "ema_mix": 0
+        },
+        "axes": {
+          "weight": [
+            0.05,
+            0.1,
+            0.25,
+            0.5
+          ],
+          "spacing": [
+            32,
+            128,
+            512,
+            1024,
+            2048
+          ],
+          "anchors": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "novelty": [
+            0,
+            0.1,
+            0.2
+          ]
+        },
+        "neighbor_weight": true
       }
     ]
   },
@@ -253,7 +298,7 @@
     "continuation_config": "/ephemeral/hendrik/fiber3d_train2/comparisons/nml_json_combined_20260912/continuation_config.json"
   },
   "production": {
-    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_combined_5scroll_s1a_paired_contrastive_ema_16x8.json"
+    "config": "/home/hendrik/villa/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_5scroll_json_eligible_ema_16x8.json"
   },
   "trace_series": {
     "launch": "/ephemeral/hendrik/fiber3d_train2/runs/.launches/finetune_5scroll_s1a_128_sd1_16x8_ema_lr0001-20260912_223739",

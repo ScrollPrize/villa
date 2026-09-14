@@ -28,6 +28,8 @@ public:
     std::atomic<bool> cancelled{false};
     size_t next = 1;
     std::chrono::seconds timeout{600};
+    bool heartbeatWait = false;
+    std::chrono::steady_clock::time_point lastHeartbeat = std::chrono::steady_clock::now();
     int fd = -1;
     std::thread reader;
 
@@ -40,6 +42,7 @@ public:
         if (port < 1 || port > 65535 || token.empty() || seconds < 1)
             throw std::invalid_argument("invalid live inference endpoint");
         timeout = std::chrono::seconds(seconds);
+        heartbeatWait = endpoint.value("heartbeat_wait", false);
         fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) throw std::runtime_error("cannot open live control socket");
         timeval sendTimeout{seconds, 0};
@@ -149,6 +152,12 @@ public:
                     if (value.at("version") != 1) throw std::runtime_error("unsupported live response version");
                     if (value.at("type") == "error")
                         throw std::runtime_error(value.at("message").get<std::string>());
+                    if (value.at("type") == "heartbeat" && heartbeatWait) {
+                        std::lock_guard lock(mutex);
+                        lastHeartbeat = std::chrono::steady_clock::now();
+                        changed.notify_all();
+                        continue; // Liveness only: no request is marked ready.
+                    }
                     if (value.at("type") != "ready") throw std::runtime_error("invalid live response type");
                     std::lock_guard lock(mutex);
                     const auto found = waiting.find(value.at("request_id").get<size_t>());
@@ -189,7 +198,21 @@ public:
                   {"chunks", std::move(dependencies)}});
             auto lock = awaitLock(profile);
             const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            if (!changed.wait_for(lock, timeout, [&] { return state->done || !error.empty(); })) {
+            bool expired = false;
+            if (heartbeatWait) {
+                while (!state->done && error.empty()) {
+                    const auto deadline = lastHeartbeat + timeout;
+                    changed.wait_until(lock, deadline);
+                    if (!state->done && error.empty() &&
+                        std::chrono::steady_clock::now() >= lastHeartbeat + timeout) {
+                        expired = true;
+                        break;
+                    }
+                }
+            } else {
+                expired = !changed.wait_for(lock, timeout, [&] { return state->done || !error.empty(); });
+            }
+            if (expired) {
                 lock.unlock();
                 cancel("timed out waiting for inference chunks");
                 lock.lock();
