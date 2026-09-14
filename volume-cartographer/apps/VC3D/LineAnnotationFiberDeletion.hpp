@@ -195,4 +195,17 @@ inline bool branchRefersToDeletedFiber(uint64_t branchFiberId,
     return deletedFiberId != 0 && branchFiberId == deletedFiberId;
 }
 
+// Whether two (id, file name) pairs name the same stored fiber. The one rule
+// behind the session and branch matches above: when both sides carry a file
+// name the names decide, because runtime ids are reassigned by a reload;
+// the ids count only when a name is missing on either side.
+inline bool sameFiberIdentity(uint64_t idA, const std::string& fileNameA,
+                              uint64_t idB, const std::string& fileNameB)
+{
+    if (!fileNameA.empty() && !fileNameB.empty()) {
+        return fileNameA == fileNameB;
+    }
+    return idA != 0 && idA == idB;
+}
+
 } // namespace vc3d::line_annotation

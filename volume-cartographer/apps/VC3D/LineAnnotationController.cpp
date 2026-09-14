@@ -3328,16 +3328,6 @@ void LineAnnotationController::importFibers()
         showError(tr("No volume package is loaded."));
         return;
     }
-    // A pending delete has captured its targets by file name and is waiting
-    // for saves to drain. An import picks unsuffixed names for files that
-    // do not exist on disk, so it could give a captured name to a new fiber
-    // (the captured file may already be gone while its entry is still
-    // loaded), and the delete would then remove the import. Imports wait.
-    if (_deletingFibers) {
-        showError(tr("A fiber delete is in progress; import once it has finished."));
-        return;
-    }
-
     const auto options = showFiberJsonPathDialog(_parentWidget.data(), true, dir);
     if (!options) {
         return;
@@ -3376,6 +3366,18 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
     if (dir.empty()) {
         if (errorMessage) {
             *errorMessage = tr("No volume package is loaded.");
+        }
+        return false;
+    }
+    // A pending delete has captured its targets by file name and is waiting
+    // for saves to drain. An import picks unsuffixed names for files that
+    // do not exist on disk, so it could give a captured name to a new fiber
+    // (the captured file may already be gone while its entry is still
+    // loaded), and the delete would then remove the import. Imports wait -
+    // here, on the path both the menu and the agent bridge go through.
+    if (_deletingFibers) {
+        if (errorMessage) {
+            *errorMessage = tr("A fiber delete is in progress; import once it has finished.");
         }
         return false;
     }
@@ -14487,13 +14489,17 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
                 continue;
             }
             StoredFiber linkedFiber = storedFiberFromSession(*pane.session);
+            // A session keeps the id it was opened with while a reload
+            // reassigns the stored fibers' ids, so a named snapshot is
+            // upserted onto the stored fiber with its file name, never
+            // onto whichever fiber now holds the session's id (see
+            // LineAnnotationFiberDeletion.hpp).
             auto linkedIt = std::find_if(
                 _fibers.begin(),
                 _fibers.end(),
                 [fiberId, &linkedFiber](const StoredFiber& candidate) {
-                    return candidate.id == fiberId ||
-                           (!linkedFiber.fileName.empty() &&
-                            candidate.fileName == linkedFiber.fileName);
+                    return vc3d::line_annotation::sameFiberIdentity(
+                        fiberId, linkedFiber.fileName, candidate.id, candidate.fileName);
                 });
             if (linkedIt == _fibers.end()) {
                 _fibers.push_back(std::move(linkedFiber));

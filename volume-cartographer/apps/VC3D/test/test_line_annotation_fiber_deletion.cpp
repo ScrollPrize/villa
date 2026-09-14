@@ -20,6 +20,7 @@ using vc3d::line_annotation::resolveFiberDeleteTargets;
 using vc3d::line_annotation::resolveFiberDeletionAcrossWait;
 using vc3d::line_annotation::sessionBelongsToDeletedFiber;
 using vc3d::line_annotation::branchRefersToDeletedFiber;
+using vc3d::line_annotation::sameFiberIdentity;
 
 namespace
 {
@@ -242,6 +243,20 @@ private slots:
         // A deleted fiber without a name matches by id as well.
         QVERIFY(branchRefersToDeletedFiber(3, "c.json", 3, ""));
         QVERIFY(!branchRefersToDeletedFiber(3, "c.json", 0, ""));
+    }
+
+    // The scheduler upserts a session's snapshot into the stored list; after
+    // a reload the session's id can be another stored fiber's, so a named
+    // snapshot lands on the stored fiber with its name, never on the id.
+    void storedFiberIdentityPrefersFileNames()
+    {
+        // A's session (opened as id 1, "a.json") after a reload that made
+        // new=1, a=2: the snapshot must match stored (2, "a.json"), not (1, "new.json").
+        QVERIFY(!sameFiberIdentity(1, "a.json", 1, "new.json"));
+        QVERIFY(sameFiberIdentity(1, "a.json", 2, "a.json"));
+        QVERIFY(sameFiberIdentity(5, "", 5, "x.json"));
+        QVERIFY(!sameFiberIdentity(5, "", 6, "x.json"));
+        QVERIFY(!sameFiberIdentity(0, "", 0, ""));
     }
 
     // Nothing to delete: the wait is skipped, and the report still names
