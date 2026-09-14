@@ -1,4 +1,4 @@
-find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
 add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
 set_target_properties(test_spiral_input_draft PROPERTIES
