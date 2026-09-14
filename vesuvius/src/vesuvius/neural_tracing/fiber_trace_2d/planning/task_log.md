@@ -8,6 +8,14 @@
 - User added next LRU anchor experiment; scheduled after refinement instead of stopping. Capacity4/8, admission128/512, nearest/average/EMA blend. Finer EMA results256/384/640/768/1024=74/72/87/84/73; no improvement yet. ShortK2 mixes.75/.9=91/76.
 # Latest continuation
 
+- Fourth boundary family complete:whole-path appearance own-seed converged70 atK1/spacing384/weight.25, versus previous72. AlternativeK2/.10 start now running (initial76). Fourof15 searches complete; final repeats pending, overall64 unchanged.
+
+- Whole-path own-seed refinement now provisional70 atK1/spacing384/weight.25, improving72→71 withK1 then70 on next spacing cycle. Active72112; no new global best or exact-repeat claim yet.
+
+- Third boundary search complete:nearest-novel transferredK2/.10 converged72 atspacing2048, worse than own-seed68. Largest tested spacing is a search boundary, not a proven optimum; this seed does not beat existing policy best. Whole-path appearance refinement follows on live72112; threeof15 complete.
+
+- Boundary round second family complete:novelty nearestLRU improved71→68 atK4/spacing768/weight.25 (noEMA,novelty.1). Weight.30=79,.50=83; next transferredK2/.10 seed started. Overall64 unchanged; final exact repeats remain pending.
+
 - Consolidated18 completed refinement entries with exact parameters/axes/hash prefixes and full report links in docs/embedding_refinement_summary_20260914.md; clearly pre-boundary, not a final claim. Active nearest-novelLRU improved71→68 atspacing768/K4/.25; still refining and final repeats pending.
 
 - Boundary sweep72112 first family complete:novelty meanLRU remains64 atK2/spacing512/weight.10. Testedspacing192/256/384/768/1024/1536/2048, K1/4/8, weights.05/.15/.25/.50 without gain. K1=71 andK8=68; exact final repeat still pending with otherfamilies. Nearest noveltyLRU own-seed family now running.
