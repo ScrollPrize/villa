@@ -73,6 +73,55 @@ def test_idle_batch_applies_without_run_and_replays_once(resident):
         session.apply_input_changes("batch", [{"revision": 3}])
 
 
+@pytest.mark.parametrize('running', [False, True])
+@pytest.mark.parametrize('outcome', ['install', 'discard', 'invalid'])
+def test_input_batch_restores_progress_after_preparation(running, outcome):
+    from spiral_progress import ProgressReporter
+    from spiral_runtime import InputBatchCommand
+    from test_spiral_headless import ProtocolTests
+
+    session = ProtocolTests()._idle_session(completed=2616)
+    session._state = SessionState.Running if running else SessionState.Idle
+    session._run_start_completed = 2500
+    session._target = 3750 if running else 2616
+    session._pending = 1134 if running else 0
+    session.progress = ProgressReporter(publish=session._progress_changed,
+                                        publish_interval=0)
+
+    def prepare(*args, **kwargs):
+        session.progress.begin('loading', 'Preparing patch sampling',
+                               step=0, total_steps=0, unit='patches')
+        if outcome == 'invalid':
+            raise ValueError('invalid patch')
+        return SimpleNamespace(_workspace_membership={}, verified_patches={},
+                               unverified_patches={})
+
+    session._context = SimpleNamespace(
+        prepare_input_changes=prepare,
+        install_input_changes=Mock(return_value=[]))
+    prepared = InputBatchCommand(batch_id='patch')
+    session._input_batches = {'patch': {'prepare': prepared}}
+    session._run_input_batch(prepared)
+    assert session._phase == 'Preparing patch sampling'
+
+    session._run_input_batch(InputBatchCommand(
+        batch_id='patch', action='install' if outcome == 'install' else 'discard'))
+
+    if running:
+        assert session._phase == 'Optimizing'
+        progress = session.progress.snapshot()
+        assert progress['operation'] == 'optimizing'
+        assert progress['unit'] == 'iterations'
+        assert (progress['step'], progress['total_steps']) == (116, 1250)
+        session.iteration_completed(completed_iterations=2617, total_loss=1,
+                                    losses={}, learning_rate=1e-5)
+        assert session._phase == 'Optimizing'
+        assert session.progress.snapshot()['step'] == 117
+    else:
+        assert session._phase == 'Idle'
+        assert session.progress.snapshot() is None
+
+
 def test_preparation_failure_leaves_active_state_and_allows_next_batch(resident):
     session, active, _, _ = resident
     result = session.apply_input_changes("invalid", [{"invalid": True}], timeout=2)
@@ -161,3 +210,23 @@ def test_failed_run_configuration_completes_its_command(resident):
     assert command.done.is_set() and 'invalid setting' in command.error
     assert resident._pending == 0
     assert resident.status()['state'] == 'Idle'
+
+
+def test_distributed_close_retry_rejects_surviving_file_users():
+    from spiral_runtime import DistributedInteractiveFitSession
+    session = DistributedInteractiveFitSession.__new__(DistributedInteractiveFitSession)
+    session._closed = True
+    worker = Mock()
+    worker.is_alive.return_value = True
+    session._processes = [worker]
+    session._listener = session._watchdog_thread = None
+    with pytest.raises(TimeoutError):
+        session.close()
+    worker.is_alive.return_value = False
+    listener = Mock()
+    listener.is_alive.return_value = True
+    session._listener = listener
+    with pytest.raises(TimeoutError):
+        session.close()
+    listener.is_alive.return_value = False
+    session.close()

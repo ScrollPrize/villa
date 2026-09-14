@@ -1092,6 +1092,36 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(disabled["paths"]["tracks_dbm"], "")
         self.assertEqual(disabled["paths"]["pcls"], [])
 
+    def test_omitted_spacing_mode_preserves_default_winding_input(self):
+        winding = self.root / "winding_inference"
+        winding.mkdir()
+        (winding / "manifest.json").write_text(json.dumps({
+            "artifact_type": "winding_inference_crossings",
+            "format_version": 1,
+        }))
+        (self.root / "outer_shell").mkdir()
+        self.state.dataset_resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
+        config = {**_NO_DENSE_LOSSES,
+                  "input_use_winding_inference": True,
+                  "input_use_outer_shell": True}
+        config.pop("dense_spacing_mode")
+        self.assertNotIn("dense_spacing_mode", config)
+        request = {"run": {"z_begin": 0, "z_end": 10, "config": config}}
+
+        paths, run, _, _ = self.state._prepare_session_request(request)
+
+        self.assertEqual(paths.winding_inference, str(winding))
+        self.assertEqual(paths.surf_sdt, "")
+        self.assertEqual(run.config, config)
+
+        # Missing default-mode inputs must fail preflight, before GPU work.
+        self.state.dataset_resolution.resolved["winding_inference"] = ""
+        with self.assertRaises(ApiError) as caught:
+            self.state._prepare_session_request(request)
+        self.assertIn("winding_inference",
+                      {detail["field"] for detail in caught.exception.details})
+
     def test_checkpoint_config_selects_winding_model_inputs(self):
         winding = self.root / "winding_inference"
         winding.mkdir()

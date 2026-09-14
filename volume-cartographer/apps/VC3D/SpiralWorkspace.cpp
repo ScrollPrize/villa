@@ -45,6 +45,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMessageBox>
+#include <QProgressBar>
 #include <QRegularExpression>
 #include <QScopedValueRollback>
 #include <QSettings>
@@ -411,6 +412,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         // error and the panel's "Logs" button opens the detail on demand.
         _pythonOutput->appendOutput(tr("Error: %1").arg(error));
     });
+    auto* copyProgress = new QProgressBar(this);
+    copyProgress->setRange(0, 0);
+    copyProgress->setMaximumWidth(100);
+    auto* copyLabel = new QLabel(this);
+    statusBar()->addPermanentWidget(copyLabel);
+    statusBar()->addPermanentWidget(copyProgress);
+    copyLabel->hide();
+    copyProgress->hide();
+    connect(_service, &SpiralServiceManager::inputCopyProgress, this,
+            [copyLabel, copyProgress](int active, const QString& message) {
+                copyLabel->setText(message);
+                copyLabel->setVisible(active > 0);
+                copyProgress->setVisible(active > 0);
+            });
     connect(_service, &SpiralServiceManager::inputWorkspaceReleased, this, [this]() {
         cancelLineAnnotationDraft();
         if (_lineAnnotationController)
@@ -752,16 +767,35 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 QString workingCopyError;
                 const bool savesDrained = !_lineAnnotationController
                     || _lineAnnotationController->flushFiberSavesForDestinationChange(&workingCopyError);
-                const QString fibersLocalPath = sourceFibersPath.isEmpty() || !savesDrained ? QString()
-                    : _service->workingCopy(sourceFibersPath, &workingCopyError);
                 if (!workingCopyError.isEmpty()) statusBar()->showMessage(workingCopyError, 15000);
-                if (_lineAnnotationController && !fibersLocalPath.isEmpty()) {
-                    QString error;
-                    if (_lineAnnotationController->redirectFiberSource(
-                            sourceFibersPath.toStdString(), fibersLocalPath.toStdString(), &error)) {
-                        _externalFiberSource = fibersLocalPath;
-                        _managedFiberDirectories.insert(QDir(fibersLocalPath).absolutePath());
-                    } else statusBar()->showMessage(error, 15000);
+                if (!sourceFibersPath.isEmpty() && savesDrained) {
+                    const QPointer<SpiralWorkspace> workspace(this);
+                    const auto fiberGeneration = _lineAnnotationController
+                        ? _lineAnnotationController->fiberDataGeneration() : 0;
+                    _service->workingCopyAsync(sourceFibersPath,
+                        [workspace, sourceFibersPath, fiberGeneration](const QString& localPath, const QString& copyError) {
+                            if (!workspace) return;
+                            if (!copyError.isEmpty()) {
+                                workspace->statusBar()->showMessage(copyError, 15000);
+                                return;
+                            }
+                            auto* controller = workspace->_lineAnnotationController;
+                            if (!controller || !workspace->_externalFiberSource.isEmpty()) return;
+                            QString error;
+                            if (!controller->flushFiberSavesForDestinationChange(&error)
+                                || controller->fiberDataGeneration() != fiberGeneration) {
+                                workspace->_service->invalidateWorkingCopy(sourceFibersPath);
+                                workspace->statusBar()->showMessage(error.isEmpty()
+                                    ? tr("Fibers changed while copying. Reconnect to prepare a fresh working copy.")
+                                    : error, 15000);
+                                return;
+                            }
+                            if (controller->redirectFiberSource(sourceFibersPath.toStdString(),
+                                                               localPath.toStdString(), &error)) {
+                                workspace->_externalFiberSource = localPath;
+                                workspace->_managedFiberDirectories.insert(QDir(localPath).absolutePath());
+                            } else workspace->statusBar()->showMessage(error, 15000);
+                        });
                 }
                 }
                 _previewSource.reset();
@@ -1734,7 +1768,8 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         if (_brush->hasReadyDrafts()) finalizeBrushPaint();
         else maybeCommitForPendingExit();
     } else if (box.clickedButton() == discard) {
-        _service->discardInputWorkspace([this, exit]() { discardBrushWork(); exit(); });
+        discardBrushWork();
+        exit();
     }
 }
 

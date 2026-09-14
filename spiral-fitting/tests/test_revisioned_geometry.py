@@ -164,6 +164,29 @@ def test_rebuild_adopts_baseline_geometry_without_reading_it_again(context):
     assert 'baseline' in ctx.verified_patches
 
 
+@pytest.mark.parametrize('role', ['verified', 'unverified'])
+def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypatch, role):
+    import fit_spiral
+    # A baseline may be absent because it has no valid quads, was eroded
+    # away, or was excluded by the ROI, name filter, or source toggle.
+    # Registration must not try to reinterpret any of those decisions.
+    monkeypatch.setattr(fit_spiral, 'load_tifxyz',
+                        lambda path: pytest.fail('excluded baseline was reloaded'))
+    original = context._source_verified_patches['baseline']
+    candidate = context.prepare_input_changes([{
+        'id': 'excluded-uuid', 'kind': 'patch', 'source_id': 'excluded',
+        'path': '/immutable/excluded', 'role': role, 'revision': 1,
+        'adopt': True,
+    }])
+    assert candidate._workspace_membership['excluded-uuid'] == {
+        'kind': 'patch', 'revision': 1, 'resident_id': 'excluded', 'deleted': False,
+    }
+    context.install_input_changes(candidate)
+    assert context._source_verified_patches == {'baseline': original}
+    assert not context._source_unverified_patches
+    assert set(context.verified_patches) == {'baseline'}
+
+
 @pytest.mark.parametrize('role', ['same_winding', 'relative', 'absolute', 'drawn_control_points'])
 def test_patch_additions_rederive_one_view_per_collection(context, monkeypatch, role):
     import fit_spiral

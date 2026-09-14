@@ -3,9 +3,11 @@
 #include <QJsonArray>
 #include <QFile>
 #include <QDir>
+#include <QDirIterator>
 #include <QTemporaryDir>
 #include <QProcess>
 #include "SpiralServiceManager.hpp"
+#include "SpiralActivityWidget.hpp"
 
 class SpiralInputWorkflowTests : public QObject {
     Q_OBJECT
@@ -30,6 +32,110 @@ class SpiralInputWorkflowTests : public QObject {
         return {};
     }
 private slots:
+    void preparationAndCopyStayVisibleInPanel() {
+        SpiralActivityWidget activity;
+        auto* label = activity.findChild<QLabel*>(QStringLiteral("spiralInputActivityText"));
+        QVERIFY(label);
+        QVERIFY(activity.isHidden());
+        activity.setPreparation(QStringLiteral("Preparing dataset snapshots"));
+        QVERIFY(!activity.isHidden());
+        QVERIFY(label->text().contains(QStringLiteral("Preparing dataset snapshots")));
+        QTRY_VERIFY_WITH_TIMEOUT(label->text().contains(QStringLiteral("Elapsed: 0m 1s")), 3000);
+        activity.setCopy(1, QStringLiteral("Copying inputs: 10 files, 20 MiB"));
+        QVERIFY(label->text().contains(QStringLiteral("Preparing dataset snapshots")));
+        QVERIFY(label->text().contains(QStringLiteral("10 files, 20 MiB")));
+        activity.setPreparation({});
+        QVERIFY(!activity.isHidden());
+        QVERIFY(!label->text().contains(QStringLiteral("Preparing dataset snapshots")));
+        activity.setCopy(0, {});
+        QVERIFY(activity.isHidden());
+        activity.setPreparation(QStringLiteral("Loading input list"));
+        activity.reset();
+        QVERIFY(activity.isHidden());
+        QVERIFY(label->text().isEmpty());
+    }
+
+    void asynchronousWorkingCopy() {
+        const auto source = qEnvironmentVariable("SPIRAL_TEST_COPY_SOURCE");
+        if (source.isEmpty()) QSKIP("Set SPIRAL_TEST_COPY_SOURCE to a real input directory");
+        QVERIFY(QFileInfo(source).isDir());
+        SpiralServiceManager client;
+        QSignalSpy progress(&client, &SpiralServiceManager::inputCopyProgress);
+        QString working, error, second;
+        int completions = 0;
+        int ticks = 0;
+        QTimer heartbeat;
+        heartbeat.setInterval(1);
+        connect(&heartbeat, &QTimer::timeout, this, [&]() { ++ticks; });
+        heartbeat.start();
+        QElapsedTimer elapsed;
+        elapsed.start();
+        client.workingCopyAsync(source, [&](const QString& path, const QString& message) {
+            working = path; error = message; ++completions;
+            QCOMPARE(QThread::currentThread(), client.thread());
+        });
+        const auto launchMs = elapsed.elapsed();
+        client.workingCopyAsync(source, [&](const QString& path, const QString&) {
+            second = path; ++completions;
+        });
+        QCOMPARE(completions, 0);
+        QTRY_COMPARE_WITH_TIMEOUT(completions, 2, 120000);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(!working.isEmpty());
+        QCOMPARE(second, working);
+        QVERIFY(ticks > 0);
+        QVERIFY(!progress.isEmpty());
+        QCOMPARE(progress.last()[0].toInt(), 0);
+        qInfo() << "Copy launch ms:" << launchMs << "completion ms:" << elapsed.elapsed()
+                << "UI heartbeat ticks:" << ticks;
+        QDirIterator files(source, QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
+        int checked = 0;
+        while (files.hasNext()) {
+            const auto original = files.next();
+            QFile before(original), after(QDir(working).filePath(QDir(source).relativeFilePath(original)));
+            QVERIFY(before.open(QIODevice::ReadOnly));
+            QVERIFY(after.open(QIODevice::ReadOnly));
+            QCOMPARE(before.size(), after.size());
+            while (!before.atEnd()) QCOMPARE(before.read(1024 * 1024), after.read(1024 * 1024));
+            ++checked;
+        }
+        QVERIFY(checked > 0);
+        qInfo() << "Verified identical files:" << checked;
+        bool reused = false;
+        client.workingCopyAsync(source, [&](const QString& path, const QString& message) {
+            QCOMPARE(path, working); QVERIFY(message.isEmpty()); reused = true;
+        });
+        QVERIFY(reused);
+    }
+
+    void cancelledCopyDoesNotOpenEditor() {
+        const auto source = qEnvironmentVariable("SPIRAL_TEST_COPY_SOURCE");
+        if (source.isEmpty()) QSKIP("Set SPIRAL_TEST_COPY_SOURCE to a real input directory");
+        SpiralServiceManager client;
+        bool called = false;
+        client.workingCopyAsync(source, [&](const QString&, const QString&) { called = true; });
+        client.disconnectFromService();
+        QTest::qWait(200);
+        QVERIFY(!called);
+        bool completed = false;
+        client.workingCopyAsync(source, [&](const QString& path, const QString& error) {
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QVERIFY(!path.isEmpty()); completed = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(completed, 120000);
+        QVERIFY(!called);
+    }
+
+    void workingCopyFailure() {
+        QTemporaryDir root;
+        SpiralServiceManager client;
+        bool completed = false;
+        client.workingCopyAsync(root.filePath("missing"), [&](const QString& path, const QString& error) {
+            QVERIFY(path.isEmpty()); QVERIFY(!error.isEmpty()); completed = true;
+        });
+        QTRY_VERIFY(completed);
+    }
+
     void remoteRestoreAndRestartReplaceCatalog() {
         const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
         if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to the existing Spiral Python environment");
@@ -57,16 +163,22 @@ private slots:
         SpiralServiceManager client;
         connect(&client, &SpiralServiceManager::errorOccurred, &client,
                 [](const QString& error) { qWarning().noquote() << error; });
+        QSignalSpy preparation(&client, &SpiralServiceManager::inputPreparationProgress);
         client.connectToService(profile);
         QTRY_VERIFY_WITH_TIMEOUT(client.ownsInputWorkspace(), 10000);
+        QVERIFY(preparation.size() >= 4);
+        QVERIFY(preparation.first()[0].toString().contains(QStringLiteral("catalog")));
+        QVERIFY(preparation.last()[0].toString().isEmpty());
         QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
         const auto firstWorkspace = client.inputWorkspaceId();
         const auto firstId = fiberRow(client).value(QStringLiteral("id")).toString();
+        QVERIFY(!fiberRow(client).value(QStringLiteral("session_changed")).toBool());
         QVERIFY(!QFile::exists(fiberRow(client).value(QStringLiteral("path")).toString()));
         const auto baseline = root.filePath(QStringLiteral("dataset/fibers/baseline.json"));
         const auto original = document(baseline);
         QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
         client.removeInputDraft(firstId);
+        QVERIFY(fiberRow(client).value(QStringLiteral("session_changed")).toBool());
         client.applyInputDrafts();
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
         client.restoreInputDraft(firstId);
@@ -74,6 +186,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
         QCOMPARE(document(baseline), original);
         QVERIFY(!client.hasInputDrafts());
+        QVERIFY(fiberRow(client).value(QStringLiteral("session_changed")).toBool());
 
         // Establish an alias and an explicit selection in the old workspace.
         const auto local = root.filePath(QStringLiteral("local.json"));
@@ -96,6 +209,7 @@ private slots:
         QVERIFY(client.inputWorkspaceId() != firstWorkspace);
         QCOMPARE(client.inputDraftStatus().size(), qsizetype(1));
         const auto secondId = fiberRow(client).value(QStringLiteral("id")).toString();
+        QVERIFY(!fiberRow(client).value(QStringLiteral("session_changed")).toBool());
         QVERIFY(secondId != firstId);
         edited[QStringLiteral("name")] = QStringLiteral("after restart");
         write(local, QJsonDocument(edited).toJson());
@@ -106,6 +220,24 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 4, 10000);
         QCOMPARE(document(baseline), edited);
         QVERIFY(!client.hasInputDrafts());
+
+        // Exit discards accepted drafts without restoring/applying the dataset.
+        const auto workspacePath = root.filePath(QStringLiteral("output/editing-workspaces/%1")
+                                                .arg(client.inputWorkspaceId()));
+        QVERIFY(QFileInfo(workspacePath).isDir());
+        auto disposable = edited;
+        disposable[QStringLiteral("name")] = QStringLiteral("discard on exit");
+        write(local, QJsonDocument(disposable).toJson());
+        client.stageJsonInput(QStringLiteral("fiber"), local, QStringLiteral("baseline"));
+        client.applyInputDrafts();
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 5, 10000);
+        bool released = false;
+        client.releaseInputWorkspace([&]() { released = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(released, 10000);
+        QVERIFY(!client.ownsInputWorkspace());
+        QVERIFY(client.inputDraftStatus().isEmpty());
+        QVERIFY(!QFileInfo::exists(workspacePath));
+        QCOMPARE(document(baseline), edited);
         client.disconnectFromService();
         service.terminate();
         QVERIFY(service.waitForFinished(5000));

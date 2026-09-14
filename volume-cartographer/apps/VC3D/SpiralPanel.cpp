@@ -1,4 +1,6 @@
 #include "SpiralPanel.hpp"
+#include "SpiralActivityWidget.hpp"
+#include "SpiralInputFilter.hpp"
 
 #include "SpiralReloadComparison.hpp"
 #include "SpiralSessionSync.hpp"
@@ -67,6 +69,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* statusDock = new QWidget(this);
     auto* statusDockLayout = new QVBoxLayout(statusDock);
     statusDockLayout->setContentsMargins(0, 0, 0, 0);
+    auto* inputActivity = new SpiralActivityWidget(statusDock);
+    statusDockLayout->addWidget(inputActivity);
+    connect(_service, &SpiralServiceManager::inputPreparationProgress,
+            inputActivity, &SpiralActivityWidget::setPreparation);
+    connect(_service, &SpiralServiceManager::inputCopyProgress,
+            inputActivity, &SpiralActivityWidget::setCopy);
+    connect(_service, &SpiralServiceManager::connectionStateChanged, inputActivity,
+            [inputActivity](SpiralServiceManager::ConnectionState state, const QString&) {
+                if (state != SpiralServiceManager::ConnectionState::Ready) inputActivity->reset();
+            });
 
     auto makeSection = [this, contents, layout](const QString& title,
                                                 const QString& objectName,
@@ -818,10 +830,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runLayout->addWidget(ephemeralLabel);
     _inputFilter = new QLineEdit(runContents);
     _inputFilter->setPlaceholderText(tr("Filter inputs by name or kind"));
-    connect(_inputFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
-        for (auto* item : _inputItems) item->setHidden(!item->text().contains(text, Qt::CaseInsensitive));
-    });
+    connect(_inputFilter, &QLineEdit::textChanged, this, &SpiralPanel::refreshInputVisibility);
     runLayout->addWidget(_inputFilter);
+    _showOriginalInputs = new QCheckBox(tr("Show original dataset inputs"), runContents);
+    _showOriginalInputs->setToolTip(tr("Include unchanged inputs loaded from the dataset. Hidden inputs remain selected for the fit."));
+    connect(_showOriginalInputs, &QCheckBox::toggled, this, &SpiralPanel::refreshInputVisibility);
+    runLayout->addWidget(_showOriginalInputs);
     runLayout->addWidget(_inputList);
     runLayout->addLayout(commitRow);
     runLayout->addWidget(_commitHint);
@@ -954,6 +968,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     }
                 }
                 if (state == CS::Starting || state == CS::Connecting) {
+                    _editingAccessError.clear();
                     // A new connection may be to another dataset entirely, so
                     // the previous scroll specification stops being true here.
                     applyScrollSpec({});
@@ -1052,6 +1067,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::sessionSynchronized,
             this, &SpiralPanel::synchronizeSession);
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
+        if (_connected && !_service->ownsInputWorkspace())
+            _editingAccessError = error;
         _warnings->setText(error);
     });
     connect(_service, &SpiralServiceManager::checkpointUploadProgress, this,
@@ -1108,67 +1125,67 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                  tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
             return;
         }
-        guardSessionExit([this]() {
-            if (_sessionState == QStringLiteral("Uninitialized")) {
-                QJsonObject request = sessionRequest();
-                QJsonObject paths =
-                    request.value(QStringLiteral("paths")).toObject();
-                // Initialize Fit always starts a new model. Checkpoint startup
-                // belongs to the Checkpoint section's Load action.
-                paths[QStringLiteral("checkpoint")] = QString();
-                request[QStringLiteral("paths")] = paths;
-                persist();
-                _warnings->setText(tr("Initializing the fit…"));
-                _service->initializeSession(request);
-                return;
-            }
-            // Nothing to apply: this would discard the trained model and build
-            // the same session again. Still allowed — starting a fit over is a
-            // legitimate thing to want — but not by accident. A failed session
-            // is exempt: rebuilding an identical request is the recovery.
-            if (!_reloadRequired && _sessionState != QStringLiteral("Error")
-                && QMessageBox::question(
-                       this, tr("Rebuild Fit"),
-                       tr("No fit input or session setting has changed. Rebuilding "
-                          "discards everything this session has trained and builds "
-                          "it again from the same request. Continue?"))
-                       != QMessageBox::Yes)
-                return;
-            // A model-stage rebuild keeps the loaded host inputs, and with
-            // them everything already incorporated into the fit, so there is
-            // nothing to warn about; only a full rebuild discards them.
-            if (_uncommittedCount > 0 && pendingRebuildStage() != QStringLiteral("model")
-                && QMessageBox::question(
-                       this, tr("Uncommitted inputs"),
-                       tr("The current session has %1 added input(s) that were not committed "
-                          "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
-                       != QMessageBox::Yes)
-                return;
-            // A session that failed to build may have failed because of what
-            // it was pointed at — a poisoned autosave, or an input the panel
-            // still names. The recovery case therefore also offers the
-            // service's own launch defaults, which ignore every autosave.
-            bool useDefaults = false;
-            if (_sessionState == QStringLiteral("Error")) {
-                QMessageBox box(QMessageBox::Question, tr("Rebuild Fit (recover)"),
-                                tr("The resident session failed to build. Rebuild it from "
-                                   "the panel's inputs, or from the service's launch "
-                                   "defaults, ignoring every autosave?"),
-                                QMessageBox::Cancel, this);
-                auto* panelInputs = box.addButton(tr("Use Panel Inputs"),
-                                                 QMessageBox::AcceptRole);
-                auto* launchDefaults = box.addButton(tr("Use Launch Defaults"),
-                                                     QMessageBox::DestructiveRole);
-                box.exec();
-                if (box.clickedButton() == launchDefaults) useDefaults = true;
-                else if (box.clickedButton() != panelInputs) return;
-            }
+        // Initializing/rebuilding retains the editing workspace and its lease.
+        // Only leaving the workspace should invoke guardSessionExit().
+        if (_sessionState == QStringLiteral("Uninitialized")) {
+            QJsonObject request = sessionRequest();
+            QJsonObject paths =
+                request.value(QStringLiteral("paths")).toObject();
+            // Initialize Fit always starts a new model. Checkpoint startup
+            // belongs to the Checkpoint section's Load action.
+            paths[QStringLiteral("checkpoint")] = QString();
+            request[QStringLiteral("paths")] = paths;
             persist();
-            if (useDefaults)
-                _service->rebuildWithDefaults();
-            else
-                _service->rebuildSession(sessionRequest());
-        });
+            _warnings->setText(tr("Initializing the fit…"));
+            _service->initializeSession(request);
+            return;
+        }
+        // Nothing to apply: this would discard the trained model and build
+        // the same session again. Still allowed — starting a fit over is a
+        // legitimate thing to want — but not by accident. A failed session
+        // is exempt: rebuilding an identical request is the recovery.
+        if (!_reloadRequired && _sessionState != QStringLiteral("Error")
+            && QMessageBox::question(
+                   this, tr("Rebuild Fit"),
+                   tr("No fit input or session setting has changed. Rebuilding "
+                      "discards everything this session has trained and builds "
+                      "it again from the same request. Continue?"))
+                   != QMessageBox::Yes)
+            return;
+        // A model-stage rebuild keeps the loaded host inputs, and with
+        // them everything already incorporated into the fit, so there is
+        // nothing to warn about; only a full rebuild discards them.
+        if (_uncommittedCount > 0 && pendingRebuildStage() != QStringLiteral("model")
+            && QMessageBox::question(
+                   this, tr("Uncommitted inputs"),
+                   tr("The current session has %1 added input(s) that were not committed "
+                      "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
+                   != QMessageBox::Yes)
+            return;
+        // A session that failed to build may have failed because of what
+        // it was pointed at — a poisoned autosave, or an input the panel
+        // still names. The recovery case therefore also offers the
+        // service's own launch defaults, which ignore every autosave.
+        bool useDefaults = false;
+        if (_sessionState == QStringLiteral("Error")) {
+            QMessageBox box(QMessageBox::Question, tr("Rebuild Fit (recover)"),
+                            tr("The resident session failed to build. Rebuild it from "
+                               "the panel's inputs, or from the service's launch "
+                               "defaults, ignoring every autosave?"),
+                            QMessageBox::Cancel, this);
+            auto* panelInputs = box.addButton(tr("Use Panel Inputs"),
+                                             QMessageBox::AcceptRole);
+            auto* launchDefaults = box.addButton(tr("Use Launch Defaults"),
+                                                 QMessageBox::DestructiveRole);
+            box.exec();
+            if (box.clickedButton() == launchDefaults) useDefaults = true;
+            else if (box.clickedButton() != panelInputs) return;
+        }
+        persist();
+        if (useDefaults)
+            _service->rebuildWithDefaults();
+        else
+            _service->rebuildSession(sessionRequest());
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
@@ -2071,6 +2088,40 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         it.value()->setChecked(it.key() == QStringLiteral("output"));
 }
 
+void SpiralPanel::refreshInputVisibility()
+{
+    for (auto* item : _inputItems)
+        item->setHidden(!vc3d::spiral::inputVisible(
+            item->data(Qt::UserRole + 4).toJsonObject(), item->text(),
+            _inputFilter->text(), _showOriginalInputs->isChecked()));
+}
+
+void SpiralPanel::updateWarnings(const QJsonObject& status)
+{
+    // A healthy status response does not mean the editing claim succeeded.
+    // Retain its error until editing access is acquired or a new connection starts.
+    if (_service->ownsInputWorkspace()) _editingAccessError.clear();
+    QStringList diagnostics;
+    if (_connected && !_service->ownsInputWorkspace()) {
+        diagnostics.push_back(_editingAccessError.isEmpty()
+            ? tr("Waiting to acquire editing access to the service…")
+            : tr("Editing access unavailable: %1\nIf another VC3D client or service owns editing, "
+                 "release it there, then disconnect and reconnect here.").arg(_editingAccessError));
+    }
+    const QString error = status.value(QStringLiteral("error")).toString();
+    if (!error.isEmpty()) diagnostics.push_back(error);
+    const QString previewError =
+        status.value(QStringLiteral("preview_publish_error")).toString();
+    if (!previewError.isEmpty())
+        diagnostics.push_back(
+            tr("Preview publication failed: %1").arg(previewError));
+    for (const QJsonValue& warning : status.value(QStringLiteral("warnings")).toArray()) {
+        const QString text = warning.toString().trimmed();
+        if (!text.isEmpty()) diagnostics.push_back(text);
+    }
+    _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
+}
+
 void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     _lastInputStatus = status;
@@ -2215,22 +2266,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     if (_reloadRequired)
         stateText += QStringLiteral("\n")
             + tr("Reload required — fit inputs or training configuration changed");
+    if (_connected && !_service->ownsInputWorkspace())
+        stateText += QStringLiteral("\n")
+            + tr("Fit controls require editing access to the service. See warnings below.");
     _state->setText(stateText);
     const QJsonObject metrics = status.value("latest_metrics").toObject();
     _metrics->setText(metrics.contains("total_loss") ? tr("Loss: %1").arg(metrics.value("total_loss").toDouble()) : QString());
-    QStringList diagnostics;
-    const QString error = status.value(QStringLiteral("error")).toString();
-    if (!error.isEmpty()) diagnostics.push_back(error);
-    const QString previewError =
-        status.value(QStringLiteral("preview_publish_error")).toString();
-    if (!previewError.isEmpty())
-        diagnostics.push_back(
-            tr("Preview publication failed: %1").arg(previewError));
-    for (const QJsonValue& warning : status.value(QStringLiteral("warnings")).toArray()) {
-        const QString text = warning.toString().trimmed();
-        if (!text.isEmpty()) diagnostics.push_back(text);
-    }
-    _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
+    updateWarnings(status);
     const bool runnable = idle;
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
@@ -2307,7 +2349,6 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             item->setText(label);
             item->setToolTip({});
             item->setData(Qt::UserRole + 4, input);
-            item->setHidden(_inputFilter && !label.contains(_inputFilter->text(), Qt::CaseInsensitive));
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
             item->setData(Qt::UserRole + 2, inputState);
@@ -2328,6 +2369,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         for (const auto& id : _inputItems.keys())
             if (!present.contains(id)) delete _inputItems.take(id);
         _service->setInputSelection(selected);
+        refreshInputVisibility();
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
     _commitInputs->setEnabled(_connected && _service->ownsInputWorkspace() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));

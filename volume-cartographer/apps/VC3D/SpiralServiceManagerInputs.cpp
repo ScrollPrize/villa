@@ -1,5 +1,10 @@
 #include "SpiralServiceManager.hpp"
 #include "SpiralArtifactCache.hpp"
+#include "SpiralInputCopy.hpp"
+#include <QFutureWatcher>
+#include <QPromise>
+#include <limits>
+#include <QtConcurrent/QtConcurrent>
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -17,30 +22,7 @@
 namespace {
 QString uuid() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 
-bool copyInput(const QString& source, const QString& destination, QString& error)
-{
-    const QFileInfo info(source);
-    if (info.isSymLink()) {
-        error = QObject::tr("Input working copies cannot contain symbolic links: %1").arg(source);
-        return false;
-    }
-    if (info.isDir()) {
-        if (!QDir().mkpath(destination)) {
-            error = QObject::tr("Cannot create %1").arg(destination);
-            return false;
-        }
-        const QDir directory(source);
-        for (const auto& child : directory.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden))
-            if (!copyInput(child.absoluteFilePath(), QDir(destination).filePath(child.fileName()), error)) return false;
-        return true;
-    }
-    QDir().mkpath(QFileInfo(destination).absolutePath());
-    if (!QFile::copy(source, destination)) {
-        error = QObject::tr("Cannot copy %1 to %2").arg(source, destination);
-        return false;
-    }
-    return true;
-}
+using vc3d::spiral::copyInput;
 
 QJsonObject readDocument(const QString& path, QString& error)
 {
@@ -65,40 +47,57 @@ bool writeDocument(const QString& path, const QJsonObject& document)
 }
 }
 
+void SpiralServiceManager::reportInputPreparation(const QString& message)
+{
+    emit inputPreparationProgress(message);
+    if (!message.isEmpty()) emit logMessage(message);
+}
+
 void SpiralServiceManager::claimInputWorkspace()
 {
+    reportInputPreparation(tr("Reading the service's input catalog…"));
+    const auto failed = [this](const QString& error) {
+        reportInputPreparation({});
+        emit errorOccurred(error);
+    };
     get(QStringLiteral("/session/input-catalog"), Timeout::Load,
-        [this](const QJsonObject& catalog) {
+        [this, failed](const QJsonObject& catalog) {
             const auto workspace = catalog.value(QStringLiteral("workspace_id")).toString();
             if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
                 _inputOwner = false;
-                emit errorOccurred(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
+                failed(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
                 return;
             }
+    reportInputPreparation(catalog.value(QStringLiteral("ready")).toBool()
+        ? tr("Requesting editing access. The service is checking dataset inputs for changes…")
+        : tr("Requesting editing access. The service is preparing snapshots of dataset fibers, patches and point collections…"));
     postWithRetry(QStringLiteral("/session/editing/claim"),
         {{QStringLiteral("command_id"), commandId()}}, Timeout::Load, 2,
-        [this](const QJsonObject& response) {
+        [this, failed](const QJsonObject& response) {
             const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
             if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
-                emit errorOccurred(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
+                failed(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
                 return;
             }
             if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId)
                 clearInputWorkspace();
             _inputWorkspaceId = workspace;
+            reportInputPreparation(tr("Editing access acquired. Loading the input list…"));
             get(QStringLiteral("/session/input-catalog"), Timeout::Command,
                 [this](const QJsonObject& catalog) {
                     installInputCatalog(catalog.value(QStringLiteral("inputs")).toArray());
                     _inputOwner = true;
+                    reportInputPreparation({});
+                    emit logMessage(tr("Editing workspace ready"));
                     emit inputDraftsChanged();
                     if (_inputCommand) resumeInputCommand();
-                }, [this](const QString& error) { emit errorOccurred(error); });
-        }, [this](const QString& error) {
+                }, failed);
+        }, [this, failed](const QString& error) {
             _inputOwner = false;
-            emit errorOccurred(error);
+            failed(error);
             refreshInputCatalog(); // Other clients can observe the catalog.
         });
-        }, [this](const QString& error) { emit errorOccurred(error); });
+        }, failed);
 }
 
 void SpiralServiceManager::refreshInputCatalog()
@@ -277,6 +276,9 @@ QJsonArray SpiralServiceManager::inputDraftStatus() const
         row[QStringLiteral("accepted_revision")] = qint64(draft.accepted());
         row[QStringLiteral("applied_revision")] = qint64(draft.applied());
         row[QStringLiteral("persisted_revision")] = qint64(draft.persisted());
+        row[QStringLiteral("session_changed")] =
+            row.value(QStringLiteral("session_changed")).toBool()
+            || draft.accepted() != 1 || snapshot.localRevision > 1;
         QString state = draft.dirty() ? tr("local") : draft.applied() < draft.accepted() ? tr("accepted") : tr("applied");
         if (_inputCommand) for (const auto& selected : _inputCommand->batch.entries)
             if (selected.id == it.key()) state = _inputCommand->applied ? tr("committing") : tr("applying");
@@ -302,7 +304,7 @@ QJsonArray SpiralServiceManager::inputDraftStatus() const
 
 QString SpiralServiceManager::workingCopy(const QString& source, QString* error)
 {
-    const auto canonical = QFileInfo(source).canonicalFilePath();
+    const auto canonical = QFileInfo(source).absoluteFilePath();
     if (_workingCopies.contains(canonical)) return _workingCopies[canonical];
     const auto destination = QDir(_inputCopies.path()).filePath(
         QStringLiteral("working/%1/%2").arg(uuid(), QFileInfo(source).fileName()));
@@ -313,6 +315,87 @@ QString SpiralServiceManager::workingCopy(const QString& source, QString* error)
     }
     _workingCopies[canonical] = destination;
     return destination;
+}
+
+void SpiralServiceManager::invalidateWorkingCopy(const QString& source)
+{
+    const auto key = QFileInfo(source).absoluteFilePath();
+    _workingCopies.remove(key);
+    _workingCopyDirectories.remove(key);
+}
+
+void SpiralServiceManager::workingCopyAsync(const QString& source, FetchPreviewFileCallback done)
+{
+    // Path construction is cheap; all source filesystem traversal stays in the worker.
+    const auto key = QFileInfo(source).absoluteFilePath();
+    if (_workingCopies.contains(key)) {
+        done(_workingCopies.value(key), {});
+        return;
+    }
+    auto* watcher = _workingCopyJobs.value(key);
+    const auto generation = _workingCopyGeneration;
+    const bool startCopy = !watcher;
+    if (!watcher) {
+        watcher = new QFutureWatcher<vc3d::spiral::InputCopyResult>(this);
+        _workingCopyJobs[key] = watcher;
+        connect(watcher, &QFutureWatcherBase::progressTextChanged, this,
+                [this, generation](const QString& text) {
+                    if (generation == _workingCopyGeneration)
+                        emit inputCopyProgress(_workingCopyJobs.size(), text);
+                });
+        connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, key, generation]() {
+            watcher->deleteLater();
+            if (generation != _workingCopyGeneration) return;
+            _workingCopyJobs.remove(key);
+            if (!watcher->isCanceled()) {
+                const auto result = watcher->result();
+                if (result.error.isEmpty()) {
+                    _workingCopies[key] = result.path;
+                    _workingCopyDirectories[key] = result.directory;
+                }
+            }
+            emit inputCopyProgress(_workingCopyJobs.size(), tr("Preparing input working copies…"));
+        });
+    }
+    connect(watcher, &QFutureWatcherBase::finished, this,
+            [this, watcher, generation, done = std::move(done)]() {
+                if (generation != _workingCopyGeneration || watcher->isCanceled()) return;
+                const auto result = watcher->result();
+                done(result.error.isEmpty() ? result.path : QString(), result.error);
+            });
+    if (!startCopy) return;
+    emit inputCopyProgress(_workingCopyJobs.size(), tr("Copying input files…"));
+    watcher->setFuture(QtConcurrent::run([key](QPromise<vc3d::spiral::InputCopyResult>& promise) {
+        vc3d::spiral::InputCopyResult result;
+        // The worker owns its temporary directory even if the UI is destroyed.
+        result.directory = std::shared_ptr<QTemporaryDir>(new QTemporaryDir,
+            [](QTemporaryDir* directory) {
+                // Removing a large working tree must not block the UI either.
+                (void)QtConcurrent::run([directory]() { delete directory; });
+            });
+        if (!result.directory->isValid()) {
+            result.error = QObject::tr("Cannot create an input working directory");
+        } else {
+            result.path = QDir(result.directory->path()).filePath(QFileInfo(key).fileName());
+            int files = 0;
+            qint64 bytes = 0;
+            QElapsedTimer elapsed;
+            elapsed.start();
+            promise.setProgressRange(0, std::numeric_limits<int>::max());
+            copyInput(key, result.path, result.error, [&](qint64 size) {
+                if (promise.isCanceled()) return false;
+                if (size >= 0) { ++files; bytes += size; }
+                if (elapsed.elapsed() >= 100) {
+                    promise.setProgressValueAndText(files,
+                        QObject::tr("Copying inputs: %1 files, %2 MiB")
+                            .arg(files).arg(bytes / (1024 * 1024)));
+                    elapsed.restart();
+                }
+                return true;
+            });
+        }
+        promise.addResult(result);
+    }));
 }
 
 void SpiralServiceManager::commitInputs() { applyInputDrafts(true); }
@@ -655,11 +738,12 @@ void SpiralServiceManager::editInputDraft(const QString& id)
         return;
     }
     auto open = [this, input](const QString& source) {
-        QString error;
         const bool fiber = input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber");
-        const auto working = workingCopy(fiber ? QFileInfo(source).absolutePath() : source, &error);
-        if (working.isEmpty()) emit errorOccurred(error);
-        else emit inputEditorRequested(input, fiber ? QDir(working).filePath(QFileInfo(source).fileName()) : working);
+        workingCopyAsync(fiber ? QFileInfo(source).absolutePath() : source,
+            [this, input, source, fiber](const QString& working, const QString& error) {
+                if (working.isEmpty()) emit errorOccurred(error);
+                else emit inputEditorRequested(input, fiber ? QDir(working).filePath(QFileInfo(source).fileName()) : working);
+            });
     };
     const auto local = snapshot.content.manifest.value(QStringLiteral("path")).toString();
     if (draft->dirty() && QFileInfo::exists(local)) { open(local); return; }
@@ -707,6 +791,12 @@ void SpiralServiceManager::discardInputWorkspace(std::function<void()> done)
 void SpiralServiceManager::releaseInputWorkspace(std::function<void()> done)
 {
     if (!_inputOwner) { if (done) done(); return; }
+    // Stop local continuations before releasing their server-side workspace.
+    if (_inputCommand) _inputSubmission.reconciled(_inputCommand->batch.commandId);
+    _inputCommand.reset();
+    _inputCommandBusy = false;
+    _afterInputCommand = {};
+    cancelWorkingCopies();
     postWithRetry(QStringLiteral("/session/editing/release"),
         {{QStringLiteral("command_id"), commandId()}}, Timeout::LongCommand, 2,
         [this, done](const QJsonObject&) {
@@ -715,9 +805,19 @@ void SpiralServiceManager::releaseInputWorkspace(std::function<void()> done)
         }, [this](const QString& error) { emit errorOccurred(error); });
 }
 
+void SpiralServiceManager::cancelWorkingCopies()
+{
+    ++_workingCopyGeneration;
+    for (auto* job : _workingCopyJobs) job->cancel();
+    _workingCopyJobs.clear();
+    emit inputCopyProgress(0, {});
+}
+
 void SpiralServiceManager::clearInputWorkspace()
 {
+    cancelWorkingCopies();
     _workingCopies.clear();
+    emit inputCopyProgress(0, {});
     _inputOwner = false;
     _inputWorkspaceId.clear();
     _inputDrafts.clear();
@@ -729,4 +829,6 @@ void SpiralServiceManager::clearInputWorkspace()
     _inputSelectionExplicit = false;
     emit inputWorkspaceReleased();
     emit inputDraftsChanged();
+    // Editors must detach before background cleanup removes their files.
+    _workingCopyDirectories.clear();
 }

@@ -7433,13 +7433,6 @@ void CWindow::CreateWidgets(void)
         _state->pointCollection(),
         _segmentationWidget->isEditingEnabled(),
         this);
-    _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
-        return _segmentationModule->prepareEditingDestination(surface);
-    });
-    connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::surfaceSavedTo,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
-            });
     _surfacePanel->setManagedDeletionHandler([this](const QString& id) {
         return _spiralWorkspace && _state && _state->vpkg()
             && _spiralWorkspace->stageManagedPatchRemoval(_state->vpkg()->getSurface(id.toStdString()));
@@ -7529,6 +7522,13 @@ void CWindow::CreateWidgets(void)
     _segmentationGrower = std::make_unique<SegmentationGrower>(growerContext, growerCallbacks, this);
 
     _segmentationCommandHandler = std::make_unique<SegmentationCommandHandler>(this, _state, this);
+    _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return _segmentationModule->prepareEditingDestination(surface);
+    });
+    connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::surfaceSavedTo,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
+            });
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());

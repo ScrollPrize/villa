@@ -4,6 +4,88 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## CUDA startup check
+
+VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
+before loading fit inputs. This creates the CUDA context before dataset reads
+increase filesystem cache pressure, and reports startup failures independently
+of atlas size. CPU-only `FitContext.load_host_inputs()` callers remain unchanged.
+The GPU atlas progress messages appear when geometry is actually materialized.
+
+On Linux NVIDIA GB10 systems, startup OOM diagnostics include host memory figures
+and NVIDIA's manual cache-flush workaround. The application never flushes system
+caches itself. Early initialization does not guarantee that the full fit will
+fit in shared CPU/GPU memory.
+
+Validate with the existing environment, from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_cuda_startup.py \
+  spiral-fitting/tests/test_spiral_headless.py \
+  spiral-fitting/tests/test_spiral_progress.py
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c \
+  'from types import SimpleNamespace; from fit_spiral import FitContext; FitContext.check_cuda_ready(SimpleNamespace(progress=None))'
+```
+
+See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
+
+## Editing input snapshots
+
+The service snapshots patch directories, fiber JSON files and point collections
+when claiming a dataset editing workspace. `input_snapshot.py` tries Linux
+`FICLONE` or macOS `clonefile` for independent copy-on-write files. Unsupported
+filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
+errors propagate. Hard links are never used.
+
+The fallback hashes bytes while copying, verifies the destination, and compares
+the final source fingerprint with the captured tree. Clones are hashed once and
+compared with the final source. This reduces full content reads from four to
+three for ordinary copies and two for clones. Snapshots retain the existing
+SHA-256 format, sorted tree membership, empty directories and symlink rejection.
+Changes during capture that leave the source different from the captured bytes
+are rejected. No model inputs, precision or numerical algorithms change.
+
+Run the focused tests using the existing environment, from the repository root:
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_input_snapshot.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py
+```
+
+Benchmark real patches (temporary copies are removed; sources stay unchanged):
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
+  spiral-fitting/tests/benchmark_input_snapshots.py \
+  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
+```
+
+Use `--destination PATH` to test another filesystem. The default is `/tmp`.
+`--count` selects the first N sorted patch directories (default 32).
+
+Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
+`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
+five iterations, ordinary-copy fallback on the local ext-family filesystem.
+These are cache-warm measurements, not end-to-end fit initialization times.
+
+| Snapshot implementation | Mean | Min | Median | Max |
+| --- | ---: | ---: | ---: | ---: |
+| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
+| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
+
+Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
+0.649 s of 0.834 s total across all five iterations; file copying accounted for
+0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
+but the separate source pre-read is eliminated. Reflink throughput and actual
+macOS cloning require validation on supporting filesystems; unit tests cover
+the platform dispatch and fallback/error paths.
+
+Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
+and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
+
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
@@ -347,6 +429,39 @@ Invalid selected drafts keep the batch unapplied and remain editable. Scoped
 external-source conflicts offer Use Current, Apply Local After Review, or Save
 Local as New; unrelated PCL collection changes are merged during publication.
 
+Editing workspaces are disposable session storage. **Discard and Exit** drops
+local drafts and releases the workspace directly. **Commit** exits only after
+publication succeeds, then releases temporary copies. Release and service
+shutdown stop file users and remove the entire `editing-workspaces/<id>`
+directory, including baseline snapshots, revisions and uploads. Reconnect,
+Stop, and Rebuild keep the workspace and its drafts. The next claim snapshots
+only committed dataset inputs.
+
+New workspaces carry versioned ownership metadata and a lifetime advisory lock.
+Startup reclaims marked directories whose owner has exited, including after a
+crash or forced termination. Live owners, symlinks, unrecognized markers and
+legacy folders without markers are left untouched; legacy storage requires
+manual cleanup. Dataset inputs, saved fit outputs, exports and shared caches
+are preserved. Interrupted Commit recovery directories (`.spiral-publication-*`
+beside dataset targets) are retained and their paths logged. Cleanup errors are
+reported with the workspace path; when a reader or worker cannot stop, files
+and ownership remain intact for a release retry or later startup reclamation.
+
+Cleanup regression checks (no installation needed):
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_workspace_cleanup.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_spiral_service_v2.py
+```
+
+Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll
+close/reopen check. It edits a temporary dataset copy and verifies that both the
+source bytes and committed copy remain unchanged; it uses a resident test double
+and does not run GPU fitting.
+
 Regression checks for this workflow (using existing environments/builds):
 
 ```bash
@@ -354,7 +469,7 @@ Regression checks for this workflow (using existing environments/builds):
 AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
   spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
-AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_spiral_input_draft test_spiral_input_workflow -j 2
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
 AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
 ```
 

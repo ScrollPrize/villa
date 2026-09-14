@@ -94,10 +94,22 @@ class EditingHttpTests(HttpServiceFixture):
                                       headers=self.owner)[0], 404)
 
     def test_release_retries_are_idempotent_over_http(self):
+        root = self.state.editing().root
         for _ in range(2):
             code, payload, _ = self.request('POST', '/session/editing/release', headers=self.owner,
                 body={'command_id': 'release'})
             self.assertEqual(code, 200, payload)
+        self.assertFalse(root.exists())
+        self.request('GET', '/session/status')
+        self.request('GET', '/session/input-catalog')
+        self.assertIsNone(self.state.editing_workspace)
+        self.request('POST', '/session/editing/claim', headers=self.owner,
+                     body={'command_id': 'new-claim'})
+        fresh = self.state.editing_workspace
+        self.assertNotEqual(root, fresh.root)
+        self.request('POST', '/session/editing/release', headers=self.owner,
+                     body={'command_id': 'release'})
+        self.assertTrue(fresh.root.exists())
 
     def test_fiber_editor_artifact_contains_immutable_desired_peers(self):
         from test_service_editing import upload

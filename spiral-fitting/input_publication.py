@@ -19,7 +19,7 @@ from uuid import uuid4
 from service_http import ApiError, sha256_file
 
 
-def fingerprint(path):
+def fingerprint(path, *, file_digest=sha256_file):
     """Byte-exact file/directory identity; absence is represented by None."""
     path = Path(path)
     if path.is_symlink():
@@ -27,7 +27,7 @@ def fingerprint(path):
     if not path.exists():
         return None
     if path.is_file():
-        return "file:" + sha256_file(path)
+        return "file:" + file_digest(path)
     if not path.is_dir():
         raise ApiError(409, f"Managed input is not a regular file or directory: {path}")
     entries = []
@@ -36,7 +36,7 @@ def fingerprint(path):
         if child.is_symlink():
             raise ApiError(409, f"Managed input contains a symlink: {child}")
         if child.is_file():
-            entries.append((relative, "file", sha256_file(child)))
+            entries.append((relative, "file", file_digest(child)))
         elif child.is_dir():
             entries.append((relative, "directory"))
         else:
@@ -191,6 +191,9 @@ class PublicationTransaction:
         return [{"target": str(p.output.target), "phase": p.phase,
                  "expected": p.output.expected, "result": p.result}
                 for p in self._publications]
+
+    def recovery_paths(self):
+        return [p.directory for p in self._publications if p.directory.exists()]
 
     def release(self):
         """Call only after recording persistence of every selected revision."""

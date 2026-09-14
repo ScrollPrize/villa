@@ -38,6 +38,9 @@ only verbs that hold a request open are the ones that are genuinely quick.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from input_workspace import MutationCoordinator
+from workspace_storage import reclaim_workspaces
 from service_editing import EditingWorkspace
 from collections import OrderedDict, deque
 from collections.abc import Mapping
@@ -46,6 +49,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import logging
 import os
 from pathlib import Path
 import re
@@ -454,6 +458,14 @@ class ServiceState:
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,), startup_run=None):
         self.lock = threading.RLock()
+        self._workspace_condition = threading.Condition(self.lock)
+        self._workspace_closing = False
+        self._service_closed = False
+        self._workspace_users = 0
+        self._background_jobs = set()
+        self._retiring_sessions = []
+        self._teardown_lock = threading.Lock()
+        self._release_receipts = MutationCoordinator()
         self._pcl_publication_locks = {
             role: threading.Lock() for role in EDITABLE_PCL_ROLES
         }
@@ -507,15 +519,110 @@ class ServiceState:
         self._preview_export_active = False
         self.config_catalog = Config.catalog()
         self.session_revision = 0
+        if self._output_root() is not None:
+            reclaim_workspaces(self._output_root())
 
     # ------------------------------------------------------------------
     # Status and health
     # ------------------------------------------------------------------
 
-    def editing(self):
+    @contextmanager
+    def workspace_use(self):
+        with self._workspace_condition:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
+            self._workspace_users += 1
+        try:
+            yield
+        finally:
+            with self._workspace_condition:
+                self._workspace_users -= 1
+                self._workspace_condition.notify_all()
+
+    def _start_background(self, *, target, args=(), name, daemon=True):
+        def run():
+            try:
+                target(*args)
+            finally:
+                with self._workspace_condition:
+                    self._background_jobs.discard(threading.current_thread())
+                    self._workspace_condition.notify_all()
+        with self._workspace_condition:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
+            thread = threading.Thread(target=run, name=name, daemon=daemon)
+            self._background_jobs.add(thread)
+            thread.start()
+
+    def release_editing(self, token, command_id):
+        def release(_):
+            with self._teardown_lock:
+                workspace = self.editing_workspace
+                if workspace is None:
+                    raise ApiError(403, "This client does not own an editing workspace")
+                workspace.require(token)
+                self._teardown_workspace()
+                return {"released": True}
+        return self._release_receipts.execute(command_id, 'release',
+            {'token_digest': hashlib.sha256(str(token).encode()).hexdigest()},
+            release, recoverable=lambda exc: isinstance(exc, (TimeoutError, OSError)))
+
+    def _teardown_workspace(self):
+        try:
+            self._drain_and_remove_workspace()
+        except Exception:
+            root = self.editing_workspace.root if self.editing_workspace else self._output_root()
+            logging.exception("Spiral teardown failed; retained workspace %s", root)
+            raise
+
+    def _drain_and_remove_workspace(self):
+        # Do not drop any references or locks until every file user has stopped.
+        with self._workspace_condition:
+            self._workspace_closing = True
+            self._workspace_condition.notify_all()
+            deadline = time.monotonic() + 15
+            while self._workspace_users or self._background_jobs:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Workspace users did not stop; files retained")
+                self._workspace_condition.wait(remaining)
+            workspace, session = self.editing_workspace, self.session
+            process = self._preview.process
+        if workspace is not None:
+            workspace.coordinator.shutdown(lambda: None)
+        stop_process_group(process)
+        if process is not None and process.poll() is None:
+            raise TimeoutError("Preview process did not stop; workspace retained")
+        for retiring in tuple(self._retiring_sessions):
+            retiring.close()
+            self._retiring_sessions.remove(retiring)
+        if session is not None:
+            session.close()
+        if workspace is not None:
+            self.artifacts.retire_root(workspace.root)
+            # Publication recovery lives beside dataset targets, outside root.
+            for transaction in workspace.transactions.values():
+                for path in transaction.recovery_paths():
+                    self.logs.write('stderr', f'Retained Commit recovery: {path}\n')
+            workspace.close()
+        with self.lock:
+            self.session = None
+            self.session_id = None
+            self.editing_workspace = None
+            self._input_content_artifacts.clear()
+            self._session_state = SessionState.Uninitialized
+            self._session_phase = "Waiting for fit initialization"
+            self._session_error = None
+            self._workspace_closing = False
+
+    def editing(self, *, create=True):
         """The dataset workspace survives resident generations and disconnects."""
         with self.lock:
+            if self._workspace_closing or self._service_closed:
+                raise ApiError(410, "The editing workspace is closing")
             if self.editing_workspace is None:
+                if not create:
+                    raise ApiError(409, "Claim an editing workspace first")
                 if self.dataset_root is None or self._output_root() is None:
                     raise ApiError(409, "A managed dataset and output are required")
                 sources = (self.dataset_resolution.to_dict()
@@ -530,7 +637,11 @@ class ServiceState:
             return dict(self._active_run_influence or {})
 
     def input_content_artifact(self, input_id, revision_number):
-        workspace = self.editing()
+        with self.workspace_use():
+            return self._input_content_artifact(input_id, revision_number)
+
+    def _input_content_artifact(self, input_id, revision_number):
+        workspace = self.editing(create=False)
         revision, = workspace._selection([{'id': input_id, 'revision': int(revision_number)}])
         if revision.content is None:
             raise ApiError(410, "This input revision is a deletion")
@@ -569,7 +680,7 @@ class ServiceState:
     def input_upload_manager(self, upload_id):
         if upload_id in self.checkpoint_uploads.uploads:
             return self.checkpoint_uploads
-        return self.editing().uploads
+        return self.editing(create=False).uploads
 
     def editing_lifecycle(self, token, operation, request, callback):
         workspace = self.editing()
@@ -1065,10 +1176,10 @@ class ServiceState:
             self.status_generation += 1
             session_id = self.session_id
             session = self.session
-        threading.Thread(
+        self._start_background(
             target=self._rebuild_model,
             args=(session_id, session, paths, run),
-            name="spiral-model-rebuild", daemon=True).start()
+            name="spiral-model-rebuild", daemon=True)
 
     def _rebuild_model(self, session_id, session, paths, run):
         """Ask the resident session to replace its model stage."""
@@ -1088,6 +1199,8 @@ class ServiceState:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
             previous = self.session
+            if previous is not None:
+                self._retiring_sessions.append(previous)
             self.session = None
             self._building = True
             self.session_generation += 1
@@ -1105,14 +1218,14 @@ class ServiceState:
             self._session_error = None
             self.status_generation += 1
             session_id = self.session_id
-        threading.Thread(
+        self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run,
                   preview, scroll),
-            name="spiral-session-build", daemon=True).start()
-        threading.Thread(
+            name="spiral-session-build", daemon=True)
+        self._start_background(
             target=self._refresh_pcl_artifacts,
-            name="spiral-pcl-artifact-publish", daemon=True).start()
+            name="spiral-pcl-artifact-publish", daemon=True)
 
     def _build(self, session_id, previous, paths, run,
                preview, scroll):
@@ -1127,6 +1240,8 @@ class ServiceState:
         try:
             if previous is not None:
                 previous.close()
+                with self.lock:
+                    self._retiring_sessions.remove(previous)
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
@@ -1621,10 +1736,10 @@ class ServiceState:
             self._preview_export_active = True
             self.status_generation += 1
             session_id = self.session_id
-        threading.Thread(
+        self._start_background(
             target=self._export_preview,
             args=(session, session_id, diagnostics),
-            name="spiral-preview-export", daemon=True).start()
+            name="spiral-preview-export", daemon=True)
         return {**self.status(), "accepted": True}
 
     def _export_preview(self, session, session_id, diagnostics=False):
@@ -2043,7 +2158,9 @@ class ServiceState:
         if self.session_paths is not None and self.session_paths.output_directory:
             return Path(self.session_paths.output_directory)
         if self.dataset_resolution is not None:
-            return Path(self.dataset_resolution.resolved["output_directory"])
+            output = self.dataset_resolution.resolved.get("output_directory")
+            if output:
+                return Path(output)
         return None
 
     def _staging_root(self):
@@ -2109,9 +2226,14 @@ class ServiceState:
         return {**self.status(), **result}
 
     def gc_uploads(self):
-        self.checkpoint_uploads.collect_garbage()
-        if self.editing_workspace is not None:
-            self.editing_workspace.uploads.collect_garbage()
+        try:
+            with self.workspace_use():
+                self.checkpoint_uploads.collect_garbage()
+                if self.editing_workspace is not None:
+                    self.editing_workspace.uploads.collect_garbage()
+        except ApiError as exc:
+            if exc.status != 410:
+                raise
 
 
     # ------------------------------------------------------------------
@@ -2150,15 +2272,10 @@ class ServiceState:
                 self.command_condition.notify_all()
 
     def close(self):
-        with self.lock:
-            session = self.session
-            self.session = None
-            process = self._preview.process
-        stop_process_group(process)
-        if session:
-            session.close()
-        if self.editing_workspace is not None:
-            self.editing_workspace.close()
+        with self._teardown_lock:
+            with self.lock:
+                self._service_closed = True
+            self._teardown_workspace()
 
 
 class SpiralServer(ThreadingHTTPServer):
@@ -2288,15 +2405,16 @@ ROUTES = (
                                                 ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
     Route("POST", "/session/editing/release", "editing_release",
-          lambda ctx: ctx.state.editing().release(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
+          lambda ctx: ctx.state.release_editing(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
                                                   ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
     Route("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content",
           lambda ctx: ctx.state.input_content_artifact(ctx.args[0], ctx.args[1]), Idempotency.NONE),
     Route("GET", "/session/input-catalog", "input_catalog",
-          lambda ctx: ctx.state.editing().status(), Idempotency.NONE),
+          lambda ctx: (ctx.state.editing_workspace.status() if ctx.state.editing_workspace else
+                       {"workspace_id": None, "ready": False, "inputs": [], "transactions": {}}), Idempotency.NONE),
     Route("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command",
-          lambda ctx: ctx.state.editing().coordinator.outcome(ctx.args[0]), Idempotency.NONE),
+          lambda ctx: ctx.state.editing(create=False).coordinator.outcome(ctx.args[0]), Idempotency.NONE),
     Route("POST", "/session/input-changes", "input_changes",
           lambda ctx: ctx.state.editing().change(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
           Idempotency.NONE, reads_body=True),
@@ -2512,6 +2630,14 @@ class SpiralHandler(BaseHTTPRequestHandler):
             registry.release(artifact)
 
     def _dispatch(self):
+        self._authorise()
+        path = unquote(urlparse(self.path).path).rstrip("/")
+        if self.command == "POST" and path == "/session/editing/release":
+            return self._dispatch_active()
+        with self.server.state.workspace_use():
+            return self._dispatch_active()
+
+    def _dispatch_active(self):
         """Authorise, resolve one route, and apply its retry semantics."""
         self._authorise()
         parsed_url = urlparse(self.path)
@@ -2528,7 +2654,11 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
-        workspace = state.editing() if state.dataset_root is not None else state.editing_workspace
+        workspace = state.editing_workspace
+        if (state.dataset_root is not None and workspace is None
+                and self.command != "GET"
+                and route.operation not in {"editing_claim", "editing_release"}):
+            raise ApiError(403, "Claim an editing workspace first")
         if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
             token = self.headers.get("X-Spiral-Workspace-Token")
             workspace.require(token)

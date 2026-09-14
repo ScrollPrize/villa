@@ -843,6 +843,7 @@ class InteractiveFitSession:
                 storage_backend=self.run_config.storage_backend,
                 render_volume_scale=self.run_config.render_volume_scale,
                 dist_context=dist_context)
+            context.check_cuda_ready()
             context.load_host_inputs()
             context.resolve_output_path()
             context.build_device_state()
@@ -1382,7 +1383,17 @@ class InteractiveFitSession:
         with self._condition:
             self._prepared_input_batch_id = None
             self._release_live_reservation_locked(command)
-            command.complete(**result)
+            running = self._state is SessionState.Running
+        # Preparation shares the fitter's progress reporter. Restore its
+        # owner after both install and discard, before training can resume.
+        if running:
+            self._begin_optimization_progress()
+        else:
+            self._progress_reporter().clear()
+            with self._condition:
+                self._transition_locked(SessionState.Idle, IDLE_PHASE)
+        self._publish_status()
+        command.complete(**result)
 
     def prepare_input_batch(self, batch_id, records, influence_config=None, *,
                             target_iteration, reservation_epoch,
@@ -2543,8 +2554,17 @@ class DistributedInteractiveFitSession:
                           ranks=(0,), timeout=timeout + COMMAND_ACK_GRACE_S,
                           collective=False)
 
+    def _require_stopped(self):
+        # A timed-out close sets _closed before cleanup. Retrying it must not
+        # authorize deleting inputs while a process or listener is still alive.
+        if any(process.is_alive() for process in self._processes) or any(
+                thread is not None and thread.is_alive()
+                for thread in (self._listener, self._watchdog_thread)):
+            raise TimeoutError("Spiral GPU workers or listeners are still using session files")
+
     def close(self, timeout=15.0):
         if self._closed:
+            self._require_stopped()
             return
         with self._condition:
             self._closing = True
@@ -2553,6 +2573,7 @@ class DistributedInteractiveFitSession:
             self._abort_workers()
             self._stop_coordinator_threads()
             self._close_rendezvous()
+            self._require_stopped()
             return
         try:
             self._call("close", {"timeout": timeout},
@@ -2570,6 +2591,7 @@ class DistributedInteractiveFitSession:
                 raise TimeoutError("Spiral GPU workers did not stop at a safe boundary")
             self._stop_coordinator_threads()
             self._close_rendezvous()
+            self._require_stopped()
 
 
 def create_session(paths, run, preview, scroll, status_callback=None,

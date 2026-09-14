@@ -20,6 +20,24 @@ from service_http import ApiError
 TOKEN = 'test-client'
 
 
+def test_session_activity_survives_commit():
+    catalog = Catalog()
+    original = InputIdentity(str(uuid4()), 'fiber', '/dataset/original.json')
+    added = InputIdentity(str(uuid4()), 'fiber', '/dataset/added.json')
+    content = Content.from_json({'path': '/snapshot/first'})
+    catalog.register_base(original, content)
+    assert not catalog.entry(original.id).status()['session_changed']
+    revisions = catalog.accept([Change(original, 1, Content.from_json({'path': '/snapshot/edited'})),
+                                Change(added, 0, content)])
+    catalog.mark_applied(revisions)
+    catalog.mark_persisted(revisions)
+    assert catalog.entry(original.id).status()['session_changed']
+    assert catalog.entry(added.id).status()['session_changed']
+    external = InputIdentity(str(uuid4()), 'fiber', '/dataset/external.json')
+    catalog.register_external_bases(((external, content),))
+    assert catalog.entry(external.id).status()['session_changed']
+
+
 class Resident:
     def __init__(self):
         self.calls = []

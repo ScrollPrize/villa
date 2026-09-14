@@ -10,13 +10,14 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
 import threading
 from uuid import UUID, uuid4, uuid5
 
 from input_publication import Output, PublicationTransaction, fingerprint
+from input_snapshot import snapshot_input
 from input_workspace import (Catalog, Change, Content, InputIdentity,
                              MutationCoordinator, WorkspaceLease)
+from workspace_storage import create_workspace, remove_workspace, storage_lock, owner_lock_path
 from service_files import ExclusiveFileLock
 from service_http import ApiError
 from service_uploads import (PCL_ROLE_FILES, UploadEnvironment, UploadManager,
@@ -28,6 +29,7 @@ class EditingWorkspace:
         self.dataset = Path(dataset).resolve()
         self.id = str(uuid4())
         self.root = Path(output) / 'editing-workspaces' / self.id
+        self._owner_lock = create_workspace(self.root)
         self.sources = copy.deepcopy(sources)
         self.resident = resident
         self.influence = influence or (lambda: {})
@@ -55,8 +57,8 @@ class EditingWorkspace:
                     self._seed()
                 except BaseException:
                     self.catalog = Catalog()
-                    shutil.rmtree(self.root, ignore_errors=True)
-                    self.lease.close()
+                    # Keep the owned directory for a retry or service teardown.
+                    # Retain client ownership so a failed claim can be released.
                     raise
             if already_seeded:
                 self.refresh_clean(f'{command_id}:refresh')
@@ -117,11 +119,6 @@ class EditingWorkspace:
     def require(self, token):
         self.lease.require(token)
 
-    def release(self, token, command_id):
-        return self.coordinator.execute(command_id, 'release',
-            {'token_digest': hashlib.sha256(str(token).encode()).hexdigest()},
-            lambda _: (self.lease.release(token) or {'released': True}))
-
     def _target(self, value):
         path = Path(value)
         if path.is_symlink():
@@ -132,17 +129,8 @@ class EditingWorkspace:
         return target
 
     def _copy(self, source, destination):
-        before = fingerprint(source)
-        if before is None:
-            raise ApiError(409, 'Input source disappeared while taking a snapshot')
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if Path(source).is_dir():
-            shutil.copytree(source, destination)
-        else:
-            shutil.copy2(source, destination)
-        if fingerprint(destination) != before or fingerprint(source) != before:
-            raise ApiError(409, 'Input source changed while taking a snapshot')
-        return Content.from_json({'path': str(destination), 'fingerprint': before})
+        captured = snapshot_input(source, destination)
+        return Content.from_json({'path': str(destination), 'fingerprint': captured})
 
     def _json_content(self, document, destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -633,4 +621,12 @@ class EditingWorkspace:
         return result
 
     def close(self):
-        self.coordinator.shutdown(self.lease.close)
+        def cleanup():
+            with storage_lock(self.root.parent):
+                remove_workspace(self.root)
+                owner_lock_path(self.root).unlink(missing_ok=True)
+                self._owner_lock.release()
+            self.lease.close()
+            self.catalog = Catalog()
+            self.uploads.uploads.clear()
+        self.coordinator.shutdown(cleanup, timeout=15)

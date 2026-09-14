@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import secrets
+import time
 import threading
 from uuid import UUID
 
@@ -84,6 +85,7 @@ class Entry:
     persisted: int = 0
     applied_history: frozenset[int] = frozenset()
     errors: tuple[tuple[int, str, str], ...] = ()
+    session_added: bool = False
 
     @property
     def accepted(self):
@@ -104,6 +106,9 @@ class Entry:
             "collection_id": self.identity.collection_id,
             "accepted_revision": self.accepted, "applied_revision": self.applied,
             "persisted_revision": self.persisted, "deleted": self.deleted,
+            # Committing does not turn a session addition/change into an
+            # original dataset input. Keep its history visible to clients.
+            "session_changed": self.session_added or self.base is None or self.accepted != self.base.number,
             "content": self.current.content.json() if self.current.content else None,
             "errors": [{"revision": number, "stage": stage, "message": message}
                        for number, stage, message in self.errors],
@@ -148,7 +153,8 @@ class Catalog:
                                                     identity.collection_id + 1)
                 revision = Revision(identity.id, 1, content)
                 entries[identity.id] = Entry(identity, revision, (revision,),
-                    1 if applied else 0, 1, frozenset({1}) if applied else frozenset())
+                    1 if applied else 0, 1, frozenset({1}) if applied else frozenset(),
+                    session_added=not applied)
                 targets.add(target)
                 revisions.append(revision)
             self._entries, self._next_collection_ids = entries, counters
@@ -376,13 +382,17 @@ class MutationCoordinator:
             self._finish(command_id)
             return copy.deepcopy(result)
 
-    def shutdown(self, callback):
+    def shutdown(self, callback, timeout=15):
         """Stop accepting mutations and drain the active mutation before closing."""
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+            deadline = time.monotonic() + timeout
             while self._running is not None:
-                self._condition.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Editing mutation did not stop; workspace retained")
+                self._condition.wait(remaining)
         callback()
 
     def _finish(self, command_id):

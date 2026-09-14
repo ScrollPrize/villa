@@ -87,6 +87,8 @@ private:
     void applyResolution(const QJsonObject& resolution, bool force);
     void applyScrollSpec(const QJsonObject& spec);
     void updateStatus(const QJsonObject& status);
+    void updateWarnings(const QJsonObject& status);
+    void refreshInputVisibility();
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
     QString pendingRebuildStage() const;
     void setSessionCheckpoint(const QString& hostPath);
@@ -204,6 +206,7 @@ private:
     QJsonArray _lastInputDrafts;
     QHash<QString, QListWidgetItem*> _inputItems;
     QLineEdit* _inputFilter = nullptr;
+    QCheckBox* _showOriginalInputs = nullptr;
     QJsonObject _lastInputStatus;
     QJsonObject _loadedSessionRequest;
     QJsonObject _attachedAdvancedConfig;
@@ -224,6 +227,7 @@ private:
     bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
+    QString _editingAccessError;
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
     bool _localDraftsReady = false;

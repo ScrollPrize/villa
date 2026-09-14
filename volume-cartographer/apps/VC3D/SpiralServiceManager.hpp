@@ -3,6 +3,8 @@
 #include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
 #include "SpiralInputDraft.hpp"
+#include "SpiralInputCopy.hpp"
+#include <QFutureWatcher>
 #include <QJsonArray>
 #include <QTemporaryDir>
 #include <memory>
@@ -116,6 +118,8 @@ public:
     void discardInputDraft(const QString& id);
     void discardInputWorkspace(std::function<void()> done);
     void releaseInputWorkspace(std::function<void()> done);
+    void invalidateWorkingCopy(const QString& source);
+    void workingCopyAsync(const QString& source, FetchPreviewFileCallback done);
     QString workingCopy(const QString& source, QString* error = nullptr);
     QString inputWorkspaceId() const { return _inputWorkspaceId; }
     void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
@@ -138,6 +142,8 @@ public:
                           FetchPreviewFileCallback done);
 
 signals:
+    void inputPreparationProgress(const QString& message);
+    void inputCopyProgress(int activeCopies, const QString& message);
     void inputDraftsChanged();
     void inputWorkspaceReleased();
     void inputDraftStaged(const QString& alias);
@@ -286,6 +292,11 @@ private:
     QMap<QString, QString> _inputAliases;
     QMap<QString, QString> _inputErrors;
     QMap<QString, QString> _workingCopies;
+    QMap<QString, std::shared_ptr<QTemporaryDir>> _workingCopyDirectories;
+    QMap<QString, QFutureWatcher<vc3d::spiral::InputCopyResult>*> _workingCopyJobs;
+    quint64 _workingCopyGeneration = 0;
+    void cancelWorkingCopies();
+    void reportInputPreparation(const QString& message);
     QStringList _inputSelection;
     bool _inputSelectionExplicit = false;
     QString _inputWorkspaceId;

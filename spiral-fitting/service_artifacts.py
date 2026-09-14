@@ -117,8 +117,8 @@ class ArtifactRegistry:
 
     def _get(self, artifact_id):
         artifact = self._artifacts.get(artifact_id)
-        if artifact is None:
-            if artifact_id in self._pruned_ids:
+        if artifact is None or artifact.pruned:
+            if artifact is not None or artifact_id in self._pruned_ids:
                 raise ApiError(HTTPStatus.GONE, "Artifact has been pruned")
             raise ApiError(HTTPStatus.NOT_FOUND, "Unknown artifact")
         return artifact
@@ -151,6 +151,25 @@ class ArtifactRegistry:
                 delete_root = artifact.root
         if delete_root is not None:
             shutil.rmtree(delete_root, ignore_errors=True)
+
+    def retire_root(self, root, timeout=15):
+        """Reject new readers and drain existing readers before external cleanup."""
+        root = Path(root).resolve()
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                matching = [a for a in self._artifacts.values()
+                            if a.root.is_relative_to(root)]
+                for artifact in matching:
+                    artifact.pruned = True
+                if not any(a.inflight for a in matching):
+                    for artifact in matching:
+                        del self._artifacts[artifact.artifact_id]
+                        self._pruned_ids[artifact.artifact_id] = True
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Artifact readers did not stop; retained {root}")
+            time.sleep(0.05)
 
     def prune(self, kind, session_id, keep):
         """Prune all but the newest ``keep`` artifacts of one kind."""

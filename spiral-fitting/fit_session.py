@@ -289,7 +289,9 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # An invalid mode is reported as its own validation error; the
     # mode-derived asset predicates then all read as disabled so the invalid
     # mode never masquerades as missing-file errors.
-    mode = str(config.get("dense_spacing_mode", "phase"))
+    # Partial requests must select the same inputs as the fitter, which fills
+    # omitted fields from Config before constructing its context.
+    mode = str(config.get("dense_spacing_mode", Config().dense_spacing_mode))
     return mode if mode in ("phase", "grad_mag", "winding_model") else None
 
 
@@ -1261,8 +1263,7 @@ def validate_session_request(
         if spec.kind != "zarr-group":
             check_catalog_input(spec)
 
-    spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag", "winding_model"):
+    if _dense_spacing_mode(run.config) is None:
         errors.append({"field": "dense_spacing_mode",
                        "message": "Must be phase, grad_mag, or winding_model"})
 

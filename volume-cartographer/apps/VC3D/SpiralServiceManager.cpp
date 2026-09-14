@@ -498,6 +498,7 @@ void SpiralServiceManager::fetchAdvertisedDataset()
 
 void SpiralServiceManager::disconnectFromService()
 {
+    cancelWorkingCopies();
     ++_connectionGeneration;
     _inputOwner = false;
     _inputCommandBusy = false;
@@ -523,6 +524,7 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     if (ownsProcess()) {
+        cancelWorkingCopies();
         ++_connectionGeneration;
         _inputOwner = false;
         _inputCommandBusy = false;

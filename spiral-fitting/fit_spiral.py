@@ -1979,6 +1979,50 @@ class FitContext:
         # copies made for PCLs that participate in both loss families.
         self.link_distance_tolerance = link_distance_tolerance
 
+    def check_cuda_ready(self):
+        """Create the CUDA context before input reads increase host cache pressure."""
+        progress_or_null(self.progress).begin('loading', 'Checking CUDA availability')
+        try:
+            # Use the current device selected by the distributed driver. Keep
+            # the allocation alive through synchronization; do not consume RNG.
+            probe = torch.empty(1, device='cuda')
+            torch.cuda.synchronize()
+            del probe
+        except RuntimeError as exc:
+            message = (
+                'CUDA startup check failed before loading fit inputs '
+                '(one-element allocation and synchronization). '
+                'This failure is independent of the patch atlas size. '
+                f'Original error: {exc}')
+            is_oom = isinstance(exc, torch.OutOfMemoryError) or 'out of memory' in str(exc).lower()
+            if is_oom and sys.platform == 'linux':
+                # Diagnostics must not hide the original error if querying
+                # device properties or Linux memory accounting also fails.
+                try:
+                    shared_memory = 'GB10' in torch.cuda.get_device_name()
+                except Exception:
+                    shared_memory = False
+                if shared_memory:
+                    message += (
+                        '\nNVIDIA GB10 shares RAM with the CPU. Filesystem cache '
+                        'pressure or physical-memory fragmentation can prevent '
+                        'CUDA context allocation despite ample available RAM. '
+                        'Stop the Spiral service, then try NVIDIA\'s manual '
+                        'cache-flush workaround and restart the service: '
+                        "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'. "
+                        'This releases filesystem caches and may slow subsequent reads; '
+                        'Spiral does not run it automatically.')
+                    try:
+                        with open('/proc/meminfo') as stream:
+                            fields = [line.strip() for line in stream
+                                      if line.split(':', 1)[0] in {
+                                          'MemTotal', 'MemFree', 'MemAvailable',
+                                          'Buffers', 'Cached'}]
+                        message += '\nHost memory: ' + '; '.join(fields)
+                    except OSError:
+                        pass
+            raise RuntimeError(message) from exc
+
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
 
@@ -2249,9 +2293,6 @@ class FitContext:
         # casing, and interactive patch incorporation can append to it later.
         patch_atlas = PatchAtlas(verified_patches, device='cuda')
         if verified_patches:
-            progress.begin(
-                'loading', 'Building verified-patch GPU atlas',
-                detail=f'{len(verified_patches):,} patches')
             print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
             topology_stats = patch_atlas.topology_memory_stats()
             print(
@@ -2912,8 +2953,14 @@ class FitContext:
         progress = progress_or_null(self.progress)
 
         self.device = torch.device('cuda')
+        progress.begin(
+            'loading', 'Building verified-patch GPU atlas',
+            detail=f'{len(self.verified_patches):,} patches')
         self.patch_atlas.materialize(self.device)
         if self.unverified_patch_atlas is not None:
+            progress.begin(
+                'loading', 'Building unverified-patch GPU atlas',
+                detail=f'{len(self.unverified_patches):,} patches')
             self.unverified_patch_atlas.materialize(self.device)
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
@@ -4004,22 +4051,22 @@ class FitContext:
                     if deleted:
                         source.pop(patch_id, None)
                         removed.extend([('patch', logical_id), ('patch', patch_id)])
-                    elif not (adopt and patch_id in source):
+                    elif not adopt:
+                        # Baseline adoption only binds workspace identities.
+                        # The initial loader already selected usable geometry
+                        # (z range, erosion, name filter, and input toggles).
+                        # An absent baseline must stay excluded, not be read
+                        # again through the stricter live-revision loader.
                         patch = load_tifxyz(path)
                         patch._source_path = os.path.abspath(path)
                         cells = patch.erosion_cells(self.config['patch_erode_patches'])
                         valid = cells <= 0 or erode_patch_valid_region(patch, cells)
                         intersects = patch_intersects_z_roi(patch, self.z_begin, self.z_end)
                         if not valid or not intersects:
-                            if adopt:
-                                candidate._workspace_membership[logical_id] = {
-                                    'kind': kind, 'revision': record.get('revision'),
-                                    'resident_id': patch_id, 'deleted': deleted}
-                                continue
                             reason = 'has no valid quads' if not valid else 'is outside the fitted z range'
                             raise ValueError(f'Patch {logical_id} {reason}')
                         source[patch_id] = patch
-                        if not unverified and not adopt:
+                        if not unverified:
                             changed_patches[logical_id] = patch
                     resident_id = patch_id
                 elif kind in {'pcl', 'fiber'}:
@@ -5201,6 +5248,7 @@ class FitContext:
         progress = progress_or_null(self.progress)
         has_progress = self.progress is not None
 
+        self.check_cuda_ready()
         self.load_host_inputs()
         self.resolve_output_path()
         self.build_device_state()

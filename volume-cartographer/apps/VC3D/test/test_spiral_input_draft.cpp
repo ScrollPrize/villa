@@ -1,4 +1,5 @@
 #include "SpiralInputDraft.hpp"
+#include "SpiralInputFilter.hpp"
 
 #include <QtTest/QtTest>
 
@@ -9,6 +10,19 @@ class SpiralInputDraftTest : public QObject
     Q_OBJECT
 
 private slots:
+    void inputFilterDefaultsToSessionChanges()
+    {
+        const QJsonObject original{{"committed", true}, {"session_changed", false}};
+        const QJsonObject changed{{"committed", true}, {"session_changed", true}};
+        QVERIFY(!inputVisible(original, "patch original", "", false));
+        QVERIFY(inputVisible(original, "patch original", "", true));
+        QVERIFY(inputVisible(changed, "fiber edited", "", false));
+        QVERIFY(inputVisible(changed, "fiber edited", "FIBER", false));
+        QVERIFY(!inputVisible(changed, "fiber edited", "patch", true));
+        QVERIFY(inputVisible({{"dirty", true}}, "local edit", "", false));
+        QVERIFY(inputVisible({{"error", "conflict"}}, "failed input", "", false));
+    }
+
     void oldAcknowledgementPreservesNewerEdit()
     {
         InputDraft draft("collection", {{{"points", 2}}, false}, 1);
