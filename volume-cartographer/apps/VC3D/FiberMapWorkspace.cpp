@@ -149,24 +149,28 @@ constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
 // Dots (control points, link crossings, suspect-link rings) are drawn in scene
-// units, so they grow with the zoom, but never smaller than their kMin*Px on
-// screen: a few pixels when a whole network is in view, an easy target once
-// zoomed in. The third number of each triple is the ceiling for the
-// pixel-clamped radius, and with it the painting bounds: once zoomed far enough
-// out the dots stop growing in scene units rather than outrun their bounding
-// rect.
+// units, so they grow with the zoom, but their on-screen radius is clamped
+// from both sides: never smaller than kMin*Px, so they stay visible when a
+// whole network is in view, and never larger than kMax*Px, so zooming in to
+// inspect a fiber does not bury the 2 px line under a marker sized for print.
+// The *BoundsCm value is the ceiling for the scene-space radius the pixel
+// floor can demand when zoomed far out, and with it the painting bounds: the
+// dots stop growing in scene units rather than outrun their bounding rect.
 //
-// These are the sizes the markers are meant to have on a printed map, in cm;
-// the scene is in voxels, so each is multiplied by sceneVxPerCm() at build time.
-// Nothing below may reach the scene without that conversion.
+// The cm sizes are what the markers are meant to measure on a printed map;
+// the scene is in voxels, so each is multiplied by sceneVxPerCm() at build
+// time. Nothing below may reach the scene without that conversion.
 constexpr qreal kControlDotRadiusCm = 0.06;
 constexpr qreal kMinControlDotPx = 3.5;
+constexpr qreal kMaxControlDotPx = 6.0;
 constexpr qreal kControlDotBoundsCm = 0.5;
 constexpr qreal kCrossingDotRadiusCm = 0.10;
 constexpr qreal kMinCrossingDotPx = 5.2;
+constexpr qreal kMaxCrossingDotPx = 8.0;
 constexpr qreal kCrossingDotBoundsCm = 0.4;
 constexpr qreal kSuspectRingRadiusCm = 0.08;
 constexpr qreal kMinSuspectRingPx = 4.0;
+constexpr qreal kMaxSuspectRingPx = 7.0;
 constexpr qreal kSuspectRingBoundsCm = 0.6;
 // Slack kept on either side of the content so a zoomed-in view can pan the outer
 // panels away from the edge, in cm; it is the floor under the quarter-of-the-width
@@ -354,22 +358,40 @@ private:
     QRectF _rect;
 };
 
+// The radius a ScaledDot is drawn with at a given view scale (scene units per
+// screen pixel is 1/scale): the scene radius, held between the pixel floor
+// and the pixel ceiling, and never past the scene bound the bounding rect was
+// sized for. Shared with the workspace's control-dot hit test so the grab
+// area and the visible dot agree at every zoom.
+qreal scaledDotRadius(qreal radius, qreal minPixels, qreal maxPixels, qreal maxRadius,
+                      qreal scale)
+{
+    if (!(scale > 0.0)) {
+        return std::min(radius, maxRadius);
+    }
+    const qreal floorRadius = minPixels / scale;
+    const qreal ceilingRadius = std::max(floorRadius, maxPixels / scale);
+    return std::min(std::clamp(radius, floorRadius, ceilingRadius), maxRadius);
+}
+
 // Round marker of the map: the highlighted fiber's control points, the link
 // crossings and the suspect-link rings. Unlike the pinned chips it lives in
-// scene space, so zooming in makes it a bigger target; the on-screen radius is
-// only clamped from below so the markers stay visible when zoomed out.
+// scene space, so zooming in makes it a bigger target, but only up to a pixel
+// ceiling: past that it stays a small marker on the line rather than covering
+// it, and when zoomed out a pixel floor keeps it visible.
 class ScaledDot : public QGraphicsItem
 {
 public:
-    // radius and maxRadius are scene units (voxels); minPixels is on screen, and
-    // the level-of-detail factor converts between the two, so this needs to know
-    // nothing about what a scene unit measures.
+    // radius and maxRadius are scene units (voxels); minPixels and maxPixels
+    // are on screen, and the level-of-detail factor converts between the two,
+    // so this needs to know nothing about what a scene unit measures.
     ScaledDot(const QBrush& fill, const QPen& outline, qreal radius,
-              qreal minPixels, qreal maxRadius)
+              qreal minPixels, qreal maxPixels, qreal maxRadius)
         : _fill(fill)
         , _outline(outline)
         , _radius(radius)
         , _minPixels(minPixels)
+        , _maxPixels(maxPixels)
         , _maxRadius(maxRadius)
     {
     }
@@ -392,9 +414,8 @@ public:
     {
         const qreal lod =
             QStyleOptionGraphicsItem::levelOfDetailFromTransform(painter->worldTransform());
-        const qreal radius = lod > 0.0
-            ? std::clamp<qreal>(_minPixels / lod, _radius, _maxRadius)
-            : _radius;
+        const qreal radius =
+            scaledDotRadius(_radius, _minPixels, _maxPixels, _maxRadius, lod);
         painter->setRenderHint(QPainter::Antialiasing, true);
         painter->setPen(_outline);
         painter->setBrush(_fill);
@@ -406,6 +427,7 @@ private:
     QPen _outline;
     qreal _radius = 0.0;
     qreal _minPixels = 0.0;
+    qreal _maxPixels = 0.0;
     qreal _maxRadius = 0.0;
 };
 
@@ -596,6 +618,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             &FiberMapWorkspace::updateLabelChipVisibility);
     connect(_view, &FiberMapView::controlPointMenuRequested,
             this, &FiberMapWorkspace::handleControlPointMenu);
+    _tree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(_tree, &QTreeWidget::customContextMenuRequested,
+            this, &FiberMapWorkspace::handleTreeContextMenu);
     connect(_tree, &QTreeWidget::currentItemChanged, this,
             [this](QTreeWidgetItem* current, QTreeWidgetItem*) {
                 if (_syncingSelection || !current) {
@@ -1715,7 +1740,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             auto* dot = new ScaledDot(QBrush(palette.brush),
                                       cosmeticPen(palette.pen, 1.0),
                                       crossingDotRadius,
-                                      kMinCrossingDotPx, crossingDotBounds);
+                                      kMinCrossingDotPx, kMaxCrossingDotPx,
+                                      crossingDotBounds);
             _scene->addItem(dot);
             dot->setPos(middle);
             dot->setZValue(4.0);
@@ -1731,7 +1757,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         for (const QPointF& endpoint : {a, b}) {
             auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
                                        suspectRingRadius, kMinSuspectRingPx,
-                                       suspectRingBounds);
+                                       kMaxSuspectRingPx, suspectRingBounds);
             _scene->addItem(ring);
             ring->setPos(endpoint);
             ring->setZValue(5.0);
@@ -2125,7 +2151,7 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         auto* dot = new ScaledDot(QBrush(color), cosmeticPen(theme.chipInk, 1.0),
                                   kControlDotRadiusCm * vxPerCm, kMinControlDotPx,
-                                  kControlDotBoundsCm * vxPerCm);
+                                  kMaxControlDotPx, kControlDotBoundsCm * vxPerCm);
         _scene->addItem(dot);
         dot->setPos(entry->fiber.controlPoints[i]);
         dot->setZValue(kHighlightZ + 1.0);
@@ -2137,16 +2163,30 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 
 void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos)
 {
-    if (_highlightedFiber == 0 || _controlPointDots.empty() || !_controller) {
+    // The menu acts on the selected fiber only, and only when the click lands
+    // on it - its line or one of its control dots. Selecting by left click
+    // first is what says, unambiguously, which fiber "Delete" means; a
+    // ctrl+right-click elsewhere does nothing rather than guess.
+    if (_highlightedFiber == 0 || !_controller) {
         return;
     }
     if (refreshStaleState()) {
         return;
     }
+    const uint64_t fiberId = _highlightedFiber;
+    const auto entry = _entries.constFind(fiberId);
+    if (entry == _entries.constEnd()) {
+        return;
+    }
+
     // Grabbing a dot must work wherever it is drawn: kControlDotTolerancePx is
-    // the floor, the scene-space radius takes over once zoomed in.
-    const double tolerance = std::max(sceneTolerance(kControlDotTolerancePx),
-                                      kControlDotRadiusCm * sceneVxPerCm());
+    // the floor, the dot's drawn radius at this zoom takes over once it is
+    // the bigger of the two.
+    const double vxPerCm = sceneVxPerCm();
+    const double drawnRadius = scaledDotRadius(
+        kControlDotRadiusCm * vxPerCm, kMinControlDotPx, kMaxControlDotPx,
+        kControlDotBoundsCm * vxPerCm, std::abs(_view->transform().m11()));
+    const double tolerance = std::max(sceneTolerance(kControlDotTolerancePx), drawnRadius);
     int bestIndex = -1;
     double bestDistance = tolerance;
     for (QGraphicsItem* dot : _controlPointDots) {
@@ -2157,32 +2197,29 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
             bestIndex = dot->data(1).toInt();
         }
     }
-    if (bestIndex < 0) {
+    if (bestIndex < 0 && fiberAt(scenePos) != fiberId) {
         return;
     }
 
-    const uint64_t fiberId = _highlightedFiber;
-    const auto entry = _entries.constFind(fiberId);
-    if (entry == _entries.constEnd()) {
-        return;
-    }
     const std::string fileName = entry->fiber.fileName;
-    // Parentless: exec() runs a nested event loop, and a parented stack menu would
-    // be deleted by its parent if the workspace went away inside it and then
-    // destroyed again by stack unwinding.
-    QMenu menu;
-    QAction* action = menu.addAction(tr("Go to control point %1 in %2")
-                                        .arg(bestIndex)
-                                        .arg(_controller->fiberDisplayName(fiberId)));
+    const QString displayName = _controller->fiberDisplayName(fiberId);
     // menu.exec() runs a nested event loop, so the fiber set can change while
     // the menu is open. Two protections: the dependency set is captured now and
-    // re-compared when the action fires, because bestIndex indexes the control
+    // re-compared when an action fires, because bestIndex indexes the control
     // points as they were when the menu was built — an edit in between could
     // have made it mean a different point, or none; and the runtime id is
     // resolved from the file name at that same moment, because a reload
     // reassigns ids.
     const vc3d::fiber_map::FiberMapDependencies menuDependencies =
         currentDependencies();
+    // Parentless: exec() runs a nested event loop, and a parented stack menu would
+    // be deleted by its parent if the workspace went away inside it and then
+    // destroyed again by stack unwinding.
+    QMenu menu;
+    if (bestIndex >= 0) {
+        QAction* action = menu.addAction(tr("Go to control point %1 in %2")
+                                            .arg(bestIndex)
+                                            .arg(displayName));
     connect(action, &QAction::triggered, this,
             [this, fileName, bestIndex, menuDependencies]() {
                 if (!_controller) {
@@ -2230,5 +2267,123 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 }
                 emit openFiberAtControlPointRequested(target, bestIndex);
             });
+        menu.addSeparator();
+    }
+    QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
+    connect(deleteAction, &QAction::triggered, this,
+            [this, fileName, displayName, menuDependencies]() {
+                // Deferred past menu.exec()'s nested loop: the confirmation
+                // is modal, and the delete itself ends in a scene rebuild
+                // that must not tear items down while the press that opened
+                // the menu is still unwinding.
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, fileName, displayName, menuDependencies]() {
+                        confirmAndDeleteFiber(fileName, displayName, menuDependencies);
+                    },
+                    Qt::QueuedConnection);
+            });
     menu.exec(globalPos);
+}
+
+void FiberMapWorkspace::handleTreeContextMenu(const QPoint& pos)
+{
+    if (!_tree || !_controller) {
+        return;
+    }
+    QTreeWidgetItem* item = _tree->itemAt(pos);
+    if (!item) {
+        return;
+    }
+    // Network headers carry no fiber.
+    const uint64_t fiberId = item->data(0, Qt::UserRole).toULongLong();
+    if (fiberId == 0) {
+        return;
+    }
+    if (refreshStaleState()) {
+        return;
+    }
+    // The row is selected first, so the fiber the menu names is the fiber
+    // highlighted on the map - the same rule as the map's own menu.
+    if (_tree->currentItem() != item) {
+        _tree->setCurrentItem(item);
+    }
+    std::string fileName;
+    if (const auto entry = _entries.constFind(fiberId); entry != _entries.constEnd()) {
+        fileName = entry->fiber.fileName;
+    } else {
+        for (const vc3d::fiber_map::UnplacedFiber& unplaced : _layout.unplaced) {
+            if (unplaced.id == fiberId) {
+                fileName = unplaced.fileName;
+                break;
+            }
+        }
+    }
+    if (fileName.empty()) {
+        return;
+    }
+    const QString displayName = _controller->fiberDisplayName(fiberId);
+    const vc3d::fiber_map::FiberMapDependencies menuDependencies =
+        currentDependencies();
+    QMenu menu;
+    QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
+    connect(deleteAction, &QAction::triggered, this,
+            [this, fileName, displayName, menuDependencies]() {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, fileName, displayName, menuDependencies]() {
+                        confirmAndDeleteFiber(fileName, displayName, menuDependencies);
+                    },
+                    Qt::QueuedConnection);
+            });
+    menu.exec(_tree->viewport()->mapToGlobal(pos));
+}
+
+void FiberMapWorkspace::confirmAndDeleteFiber(
+    const std::string& fileName,
+    const QString& displayName,
+    const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
+{
+    if (!_controller) {
+        return;
+    }
+    // Anything moved since the menu was built? Then this map is not the thing
+    // to be deleting from; it refreshes instead (this runs outside any nested
+    // loop, so the destructive half may run inline).
+    const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+        menuDependencies, currentDependencies(), /*layoutBuilt=*/true, QString());
+    if (verdict.action != StaleVerdict::Action::Fresh) {
+        refreshStaleState();
+        Logger()->warn("Fiber map: dependencies changed while the menu was open; "
+                       "not deleting {}",
+                       fileName);
+        return;
+    }
+    const QMessageBox::StandardButton answer = QMessageBox::question(
+        this,
+        tr("Delete fiber"),
+        tr("Delete fiber %1?\n\nThis removes its file from the package and cannot be undone.")
+            .arg(displayName),
+        QMessageBox::Yes | QMessageBox::Cancel,
+        QMessageBox::Cancel);
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+    // The dialog ran its own event loop, so the id is resolved from the file
+    // name only now, and a name that no longer resolves means the map is not
+    // to be trusted until rebuilt - the one staleness that latches.
+    if (!_controller) {
+        return;
+    }
+    const uint64_t target = _controller->fiberIdForFileName(fileName);
+    if (target == 0) {
+        markStale(tr("Fibers changed — press Update"));
+        Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
+        return;
+    }
+    Logger()->info("Fiber map: deleting fiber {}", fileName);
+    _controller->deleteFibers({target});
+    // The fiber generation moved; rather than wait for the visible-only
+    // poll's next tick, notice it now so the automatic update starts at once.
+    refreshStaleState();
 }

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
@@ -230,7 +231,20 @@ private:
     void paintFiberEmphasis(FiberEntry& entry, FiberEmphasis emphasis);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
+    // Ctrl+right-click on the map: acts on the selected fiber, and only when
+    // the click lands on it. "Go to control point" when a dot was hit, and
+    // "Delete" always.
     void handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos);
+    // Right-click on a fiber row of the dock: selects the row, then offers
+    // the same Delete.
+    void handleTreeContextMenu(const QPoint& pos);
+    // The confirmed delete both menus end in. Runs outside the menus' nested
+    // event loops; the fiber is re-resolved from its file name after the
+    // confirmation dialog, and nothing happens if the map's dependencies
+    // moved since the menu was built.
+    void confirmAndDeleteFiber(const std::string& fileName,
+                               const QString& displayName,
+                               const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
     void selectFiberRow(uint64_t fiberId);
     [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;
     [[nodiscard]] double sceneTolerance(double viewPixels) const;
