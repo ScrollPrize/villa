@@ -33,6 +33,9 @@ set(srcs
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
+    FiberMapRuler.cpp
+    FiberMapRuler.hpp
+    FiberMapRulerMath.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp

@@ -305,6 +305,24 @@ add_test(NAME fiber_map_rebuild_queue COMMAND test_fiber_map_rebuild_queue)
 vc_register_test_target(test_fiber_map_rebuild_queue)
 vc_register_ctest(fiber_map_rebuild_queue test_fiber_map_rebuild_queue)
 
+add_executable(test_fiber_map_ruler_math
+    test_fiber_map_ruler_math.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapRulerMath.hpp)
+
+set_target_properties(test_fiber_map_ruler_math PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_ruler_math PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_ruler_math PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_ruler_math COMMAND test_fiber_map_ruler_math)
+vc_register_test_target(test_fiber_map_ruler_math)
+vc_register_ctest(fiber_map_ruler_math test_fiber_map_ruler_math)
+
 add_executable(test_line_annotation_optimization_queue
     test_line_annotation_optimization_queue.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationOptimizationQueue.hpp)

@@ -24,6 +24,9 @@
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
 
+class FiberMapRuler;
+struct FiberMapRulerModel;
+struct FiberMapRulerStyle;
 class LineAnnotationController;
 class QDockWidget;
 class QEvent;
@@ -32,6 +35,8 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
+class QPaintEvent;
+class QResizeEvent;
 class QHideEvent;
 class QPushButton;
 class QShowEvent;
@@ -42,12 +47,18 @@ class QWheelEvent;
 // Pan/zoom view of the fiber map, with the same gestures as the volume viewers:
 // right-drag pans, the wheel zooms. Left clicks are reported as selection
 // requests; ctrl+right-click without a drag asks for the control-point menu.
+// Three rulers sit in the viewport margins - windings along the top, sheet
+// distance along the bottom, height along the left - and repaint with every
+// viewport paint, so they always label what is in view.
 class FiberMapView : public QGraphicsView
 {
     Q_OBJECT
 
 public:
     explicit FiberMapView(QWidget* parent = nullptr);
+
+    void setRulerModel(const FiberMapRulerModel& model);
+    void setRulerStyle(const FiberMapRulerStyle& style);
 
 signals:
     void clicked(QPointF scenePos);
@@ -61,8 +72,17 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    // Every viewport paint (scroll, zoom, scene change) refreshes the rulers,
+    // which read the transform rather than track the events behind it.
+    void paintEvent(QPaintEvent* event) override;
 
 private:
+    void placeRulers();
+
+    FiberMapRuler* _topRuler = nullptr;
+    FiberMapRuler* _leftRuler = nullptr;
+    FiberMapRuler* _bottomRuler = nullptr;
     // Right-button press position, against which the pan is called a drag (and
     // the ctrl+right menu suppressed), plus the running pan reference.
     QPoint _pressPosition;
