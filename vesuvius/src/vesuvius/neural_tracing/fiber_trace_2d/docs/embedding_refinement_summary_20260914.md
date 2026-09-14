@@ -142,9 +142,25 @@ Novelty thresholds above are0.1; support-softmin temperatures are0.03; EMA mix
 is zero. The best recorded variant remains64, so this partial search does not
 justify replacing the previously repeated64-restart policy.
 
-Next useful evidence, when sweeps resume: exact-repeat the improved67-restart
-support-softmin candidate and compare its failure locations against the64
-policy. Complementary recovered regions could motivate a new combination;
-aggregate restart counts alone do not establish that. Finish pending families
-only with the new demand-scoped manager handling. No GPU work was restarted
-for this report.
+The subsequent cached-only verification reproduced support-softmin67 and
+LRU64 exactly; their failure-location comparison is recorded above. No causal
+benefit from combining them has been established. The seven remaining family
+refinements are now running cached-only; new GPU inference remains disabled.
+
+### Remaining search: plain mean LRU sensitivity (partial)
+
+`embedding_ema99_remaining_cpu_refine_20260914_v1/report.json`, first completed
+family search, before its final repeat stage: K4, spacing512, weight0.30 remains
+the coordinate minimum at68 restarts. Holding the other two parameters fixed:
+
+| Parameter | Values → restarts |
+|---|---|
+| Spacing (base voxels) | 192→87, 256→75, 384→72, 512→68, 768→75, 1024→78, 1536→74, 2048→77 |
+| Anchor count | 1→73, 2→70, 4→68, 8→77 |
+| Weight | 0.10→78, 0.25→73, 0.30→68, 0.35→86, 0.50→82 |
+
+This is a coordinate search, not a full Cartesian optimum or independent
+validation. More anchors or denser insertion did not help around this seed.
+The separate transferred seed search is still running; do not combine its
+unfinished results into a final family conclusion. All these trials use the
+same frozen predictions, both directions and GT threshold as the controls.

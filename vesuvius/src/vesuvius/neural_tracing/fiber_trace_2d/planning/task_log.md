@@ -1,5 +1,17 @@
 # Demand-scoped GPU ownership (2026-09-14)
 
+- Recorded first remaining family's one-coordinate sensitivity: plain mean
+  LRU K4/512/w.30 stays68; denser insertion and more anchors worsen it locally.
+  This is not a Cartesian optimum. Corrected stale next-step paragraph now that
+  softmin67 exact verification has completed. Live session14738 continues the
+  transferred seed search with zero inferred tiles; final repeats pending.
+
+- Continuation verified live exec14738 (not restarted): remaining CPU refinement
+  report has21 completed variants and first plain-mean-LRU family minimum68.
+  Family repeats are performed at search end and remain pending; overall prior
+  verified best64 unchanged. All21 inferred_tiles counts zero. Startup follow-up
+  committed separately as eb6f749db.
+
 - Startup follow-up: defer manager bootstrap and first Supervisor tick until
   the first input is ready. No GPU grant during initial CPU reads, and unused
   close never registers. Review caught idle-manager exit before delayed first
