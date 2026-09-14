@@ -3307,18 +3307,8 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     }
 
     *it = std::move(renamed);
-    // Sessions keep the id they were opened with, and a reload since then
-    // may have reassigned the stored ids; a session that knows its file
-    // name is therefore matched by the old name, and by id only when it
-    // has no name to go by.
     for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
-        }
-        const bool isThisFiber = pane.session->fiberFileName.empty()
-            ? pane.session->fiberId == fiberId
-            : pane.session->fiberFileName == oldFileName;
-        if (isThisFiber) {
+        if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberFileName = it->fileName;
             pane.session->fiberUsername = it->username;
             pane.session->fiberStartedAt = it->startedAt;
@@ -14630,9 +14620,15 @@ void LineAnnotationController::removeBranchLinksToFiber(uint64_t fiberId,
         }
     };
 
+    // Owner ids are scheduled against the stored list, whose ids are
+    // current; a session keeps the id it was opened with, so a named
+    // session's owner id is the current id of the stored fiber with its
+    // name (see LineAnnotationFiberDeletion.hpp).
     for (const auto& pane : _panes) {
         if (pane.session) {
-            removeBranches(pane.session->branches, pane.session->fiberId);
+            removeBranches(pane.session->branches,
+                           vc3d::line_annotation::currentOwnerIdForSession(
+                               pane.session->fiberId, pane.session->fiberFileName, _fibers));
         }
     }
     for (auto& fiber : _fibers) {

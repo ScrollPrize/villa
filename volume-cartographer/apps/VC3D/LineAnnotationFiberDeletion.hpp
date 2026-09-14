@@ -237,4 +237,26 @@ inline bool sameFiberIdentity(uint64_t idA, const std::string& fileNameA,
     return idA != 0 && idA == idB;
 }
 
+// The id to schedule a metadata save under for an open session that owns a
+// changed link. Owner ids are looked up against the stored list, whose ids
+// are current, while the session keeps the id it was opened with; a named
+// session therefore maps to the current id of the stored fiber with its
+// name, and falls back to its own id only when it has no name or no stored
+// fiber carries the name.
+template <class Fiber>
+uint64_t currentOwnerIdForSession(uint64_t sessionFiberId,
+                                  const std::string& sessionFileName,
+                                  const std::vector<Fiber>& fibersNow)
+{
+    if (sessionFileName.empty()) {
+        return sessionFiberId;
+    }
+    for (const Fiber& fiber : fibersNow) {
+        if (fiber.fileName == sessionFileName) {
+            return fiber.id;
+        }
+    }
+    return sessionFiberId;
+}
+
 } // namespace vc3d::line_annotation
