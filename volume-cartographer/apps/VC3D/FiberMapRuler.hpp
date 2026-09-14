@@ -1,7 +1,9 @@
 #pragma once
 
 #include <QColor>
-#include <QWidget>
+#include <QFont>
+#include <QRect>
+#include <QString>
 
 #include <optional>
 #include <vector>
@@ -12,7 +14,7 @@ class QGraphicsView;
 class QPainter;
 
 // What the rulers read off the current layout. An empty model (hasLayout
-// false) paints a blank band.
+// false) paints nothing.
 struct FiberMapRulerModel {
     bool hasLayout = false;
     // Winding gridlines: scene x per integer winding.
@@ -22,6 +24,12 @@ struct FiberMapRulerModel {
     // Unset when the package could not say, in which case the distance rulers
     // count voxels rather than guess a physical length.
     std::optional<double> voxelSizeUm;
+    // The edges of the scroll extent the axes attach to, in scene
+    // coordinates: the ceiling (scene y of the top), the floor (scene y of the
+    // bottom) and the map's left edge.
+    double extentTopSceneY = 0.0;
+    double extentBottomSceneY = 0.0;
+    double extentLeftSceneX = 0.0;
 };
 
 struct FiberMapRulerStyle {
@@ -30,20 +38,20 @@ struct FiberMapRulerStyle {
     QColor tick;
 };
 
-// One ruler band along an edge of the Fiber Map view. It lives in the view's
-// viewport margin, so it never covers the map, and it reads the view
-// transform on every paint: whatever is scrolled or zoomed into view, the
-// labels for it are on the edge. Three modes:
-//   Windings      - the winding number at every gridline (top edge)
-//   SheetDistance - distance along the sheet from winding 0 (bottom edge)
-//   Height        - scroll height above the volume floor (left edge)
+// One axis of the Fiber Map, painted as an overlay in the view's foreground
+// pass. It floats at the edge of the scroll extent while that edge is on
+// screen - the labels sit just outside the map, in the empty ground beside it
+// - and clamps to the viewport edge once the extent scrolls off, so whatever
+// is in view is always labelled. It reads the view transform on every paint.
+// Three modes:
+//   Windings      - the winding number at every gridline (above the ceiling)
+//   SheetDistance - distance along the sheet from winding 0 (below the floor)
+//   Height        - scroll height above the volume floor (left of the map)
 // The distance modes label in physical units when the voxel size is known and
 // in voxels otherwise; the tick step comes from a 1-2-5 ladder so that ticks
 // stay a readable distance apart at any zoom.
-class FiberMapRuler : public QWidget
+class FiberMapRuler
 {
-    Q_OBJECT
-
 public:
     enum class Edge { Top, Left, Bottom };
     enum class Mode { Windings, SheetDistance, Height };
@@ -51,26 +59,36 @@ public:
     // Band thickness across the edge, in device-independent pixels.
     static int thicknessFor(Edge edge);
 
-    FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode, QWidget* parent = nullptr);
+    FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode);
 
     void setModel(FiberMapRulerModel model);
-    void setRulerStyle(const FiberMapRulerStyle& style);
+    void setStyle(const FiberMapRulerStyle& style);
+    void setFont(const QFont& font);
 
-protected:
-    void paintEvent(QPaintEvent* event) override;
+    // Where the band lies for the current transform, in viewport
+    // coordinates: against the extent edge when that is inside the viewport,
+    // against the matching viewport edge otherwise. Empty without a layout.
+    [[nodiscard]] QRect bandRect(const QRect& viewport) const;
+
+    // Paints the band into `painter`, which must be in viewport (device)
+    // coordinates - the caller disables the world transform first.
+    void paint(QPainter& painter, const QRect& viewport);
+
+    // What the band means, for a tooltip over it.
+    [[nodiscard]] QString toolTipText() const;
 
 private:
-    void paintWindings(QPainter& painter);
-    void paintSheetDistance(QPainter& painter);
-    void paintHeight(QPainter& painter);
+    void paintWindings(QPainter& painter, const QRect& band);
+    void paintSheetDistance(QPainter& painter, const QRect& band);
+    void paintHeight(QPainter& painter, const QRect& band);
     // The unit caption at the far end of the band; returns the rect it took so
     // labels can stay clear of it.
-    QRect paintCaption(QPainter& painter, const QString& caption);
-    void updateToolTip();
+    QRect paintCaption(QPainter& painter, const QRect& band, const QString& caption);
 
     QGraphicsView* _view = nullptr;
     Edge _edge;
     Mode _mode;
     FiberMapRulerModel _model;
     FiberMapRulerStyle _style;
+    QFont _font;
 };

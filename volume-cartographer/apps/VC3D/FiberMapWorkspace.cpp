@@ -25,18 +25,18 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QPaintEvent>
+#include <QHelpEvent>
 #include <QPainterPath>
 #include <QPalette>
 #include <QPen>
 #include <QPushButton>
-#include <QResizeEvent>
 #include <QScopeGuard>
 #include <QScrollBar>
 #include <QtConcurrent/QtConcurrent>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolTip>
 #include <QTransform>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -472,68 +472,68 @@ FiberMapView::FiberMapView(QWidget* parent)
     // context-menu event that would reach the surrounding QMainWindow.
     setContextMenuPolicy(Qt::PreventContextMenu);
 
-    // The rulers live in the viewport margins, never over the map. They are
-    // children of the view itself (not the viewport) so the viewport's own
-    // painting leaves them alone.
-    _topRuler = new FiberMapRuler(this, FiberMapRuler::Edge::Top,
-                                  FiberMapRuler::Mode::Windings, this);
-    _leftRuler = new FiberMapRuler(this, FiberMapRuler::Edge::Left,
-                                   FiberMapRuler::Mode::Height, this);
-    _bottomRuler = new FiberMapRuler(this, FiberMapRuler::Edge::Bottom,
-                                     FiberMapRuler::Mode::SheetDistance, this);
-    setViewportMargins(FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Left),
-                       FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Top),
-                       0,
-                       FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Bottom));
-    placeRulers();
+    _rulers.push_back(std::make_unique<FiberMapRuler>(
+        this, FiberMapRuler::Edge::Top, FiberMapRuler::Mode::Windings));
+    _rulers.push_back(std::make_unique<FiberMapRuler>(
+        this, FiberMapRuler::Edge::Left, FiberMapRuler::Mode::Height));
+    _rulers.push_back(std::make_unique<FiberMapRuler>(
+        this, FiberMapRuler::Edge::Bottom, FiberMapRuler::Mode::SheetDistance));
+    for (const auto& ruler : _rulers) {
+        ruler->setFont(font());
+    }
 }
+
+FiberMapView::~FiberMapView() = default;
 
 void FiberMapView::setRulerModel(const FiberMapRulerModel& model)
 {
-    for (FiberMapRuler* ruler : {_topRuler, _leftRuler, _bottomRuler}) {
+    for (const auto& ruler : _rulers) {
         ruler->setModel(model);
     }
+    viewport()->update();
 }
 
 void FiberMapView::setRulerStyle(const FiberMapRulerStyle& style)
 {
-    for (FiberMapRuler* ruler : {_topRuler, _leftRuler, _bottomRuler}) {
-        ruler->setRulerStyle(style);
+    for (const auto& ruler : _rulers) {
+        ruler->setStyle(style);
     }
-    // The margin corners the bands do not cover are the view's own frame
-    // area; painting it in the bands' colour makes the rulers read as one
-    // frame around the map.
-    QPalette framePalette = palette();
-    framePalette.setColor(QPalette::Window, style.background);
-    setPalette(framePalette);
-    setAutoFillBackground(true);
+    viewport()->update();
 }
 
-// The bands hug the viewport: the horizontal ones share its x range so a
-// ruler x is a viewport x, the vertical one shares its y range likewise.
-void FiberMapView::placeRulers()
+void FiberMapView::drawForeground(QPainter* painter, const QRectF& rect)
 {
-    const QRect area = viewport()->geometry();
-    const int top = FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Top);
-    const int left = FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Left);
-    const int bottom = FiberMapRuler::thicknessFor(FiberMapRuler::Edge::Bottom);
-    _topRuler->setGeometry(area.left(), area.top() - top, area.width(), top);
-    _bottomRuler->setGeometry(area.left(), area.top() + area.height(), area.width(), bottom);
-    _leftRuler->setGeometry(area.left() - left, area.top(), left, area.height());
-}
-
-void FiberMapView::resizeEvent(QResizeEvent* event)
-{
-    QGraphicsView::resizeEvent(event);
-    placeRulers();
-}
-
-void FiberMapView::paintEvent(QPaintEvent* event)
-{
-    QGraphicsView::paintEvent(event);
-    for (FiberMapRuler* ruler : {_topRuler, _leftRuler, _bottomRuler}) {
-        ruler->update();
+    QGraphicsView::drawForeground(painter, rect);
+    if (!painter) {
+        return;
     }
+    // The axes are laid out in device pixels against the viewport, so the
+    // scene transform comes off for the duration.
+    painter->save();
+    painter->setWorldMatrixEnabled(false);
+    const QRect area = viewport()->rect();
+    for (const auto& ruler : _rulers) {
+        ruler->paint(*painter, area);
+    }
+    painter->restore();
+}
+
+bool FiberMapView::viewportEvent(QEvent* event)
+{
+    if (event && event->type() == QEvent::ToolTip) {
+        auto* help = static_cast<QHelpEvent*>(event);
+        const QRect area = viewport()->rect();
+        for (const auto& ruler : _rulers) {
+            const QRect band = ruler->bandRect(area);
+            if (band.contains(help->pos())) {
+                QToolTip::showText(help->globalPos(), ruler->toolTipText(), viewport(), band);
+                event->accept();
+                return true;
+            }
+        }
+        QToolTip::hideText();
+    }
+    return QGraphicsView::viewportEvent(event);
 }
 
 void FiberMapView::wheelEvent(QWheelEvent* event)
@@ -1653,21 +1653,13 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const FiberMapPalette& theme = activePalette();
     _scene->setBackgroundBrush(theme.surface);
 
-    // The rulers read the layout through the view; an empty layout blanks
-    // them. Their colours are the map's, so a theme switch re-styles them
-    // with the same rebuild.
-    _view->setRulerStyle(FiberMapRulerStyle{
-        tint(theme.surface, theme.ink, 0.06), theme.inkSoft, theme.winding});
-    {
-        FiberMapRulerModel rulerModel;
-        rulerModel.hasLayout = !_layout.fibers.empty();
-        rulerModel.windings = _layout.windings;
-        rulerModel.sheet = vc3d::fiber_map::sheetModelOf(_layout);
-        rulerModel.voxelSizeUm = _voxelSizeUm;
-        _view->setRulerModel(rulerModel);
-    }
+    // The axes read the layout through the view; an empty layout blanks them.
+    // Their colours are the map's, so a theme switch re-styles them with the
+    // same rebuild. The model is completed below once the extent is known.
+    _view->setRulerStyle(FiberMapRulerStyle{theme.surface, theme.inkSoft, theme.winding});
 
     if (_layout.fibers.empty()) {
+        _view->setRulerModel(FiberMapRulerModel{});
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
@@ -1706,6 +1698,18 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const auto entry = _entries.constFind(fiberId);
         return entry == _entries.constEnd() ? '?' : entry->fiber.hvTag;
     };
+
+    {
+        FiberMapRulerModel rulerModel;
+        rulerModel.hasLayout = true;
+        rulerModel.windings = _layout.windings;
+        rulerModel.sheet = vc3d::fiber_map::sheetModelOf(_layout);
+        rulerModel.voxelSizeUm = _voxelSizeUm;
+        rulerModel.extentTopSceneY = extentTopY;
+        rulerModel.extentBottomSceneY = extentBottomY;
+        rulerModel.extentLeftSceneX = _layout.x0Vx;
+        _view->setRulerModel(rulerModel);
+    }
 
     // One ground for the whole map, spanning the scroll's own z extent.
     auto* ground = _scene->addRect(
@@ -1865,10 +1869,11 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     }
 
     // The scroll extent, when known, is part of what the first-build fit
-    // shows; the winding numbers live on the ruler now, so the scene keeps no
-    // room for them above the layout.
+    // shows. The axes float just outside the extent, so the fit keeps a
+    // slice of room above the ceiling and below the floor for their bands.
     const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect = QRectF(_layout.x0Vx, sceneTopY, sceneWidth, height);
+    _contentRect =
+        QRectF(_layout.x0Vx, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
 
     // Panning stops at the scene rect, so the rect runs wider than the content:
     // zoomed in, the map's edges can be dragged away from the viewport edge

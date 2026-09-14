@@ -35,8 +35,7 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
-class QPaintEvent;
-class QResizeEvent;
+class QPainter;
 class QHideEvent;
 class QPushButton;
 class QShowEvent;
@@ -47,15 +46,18 @@ class QWheelEvent;
 // Pan/zoom view of the fiber map, with the same gestures as the volume viewers:
 // right-drag pans, the wheel zooms. Left clicks are reported as selection
 // requests; ctrl+right-click without a drag asks for the control-point menu.
-// Three rulers sit in the viewport margins - windings along the top, sheet
-// distance along the bottom, height along the left - and repaint with every
-// viewport paint, so they always label what is in view.
+// Three axes are painted over the viewport in the foreground pass - windings
+// above the scroll ceiling, sheet distance below the floor, height left of
+// the map - each floating at its extent edge while that is on screen and
+// clamped to the viewport edge once it is not, so whatever is in view is
+// labelled.
 class FiberMapView : public QGraphicsView
 {
     Q_OBJECT
 
 public:
     explicit FiberMapView(QWidget* parent = nullptr);
+    ~FiberMapView() override;
 
     void setRulerModel(const FiberMapRulerModel& model);
     void setRulerStyle(const FiberMapRulerStyle& style);
@@ -72,17 +74,14 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
-    void resizeEvent(QResizeEvent* event) override;
-    // Every viewport paint (scroll, zoom, scene change) refreshes the rulers,
-    // which read the transform rather than track the events behind it.
-    void paintEvent(QPaintEvent* event) override;
+    // The axes, drawn in viewport coordinates over everything in the scene.
+    void drawForeground(QPainter* painter, const QRectF& rect) override;
+    // Tooltips over an axis band explain the axis.
+    bool viewportEvent(QEvent* event) override;
 
 private:
-    void placeRulers();
-
-    FiberMapRuler* _topRuler = nullptr;
-    FiberMapRuler* _leftRuler = nullptr;
-    FiberMapRuler* _bottomRuler = nullptr;
+    // Owned; plain painter objects, not widgets.
+    std::vector<std::unique_ptr<FiberMapRuler>> _rulers;
     // Right-button press position, against which the pan is called a drag (and
     // the ctrl+right menu suppressed), plus the running pan reference.
     QPoint _pressPosition;
