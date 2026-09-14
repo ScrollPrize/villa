@@ -6,7 +6,6 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
-#include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -3045,23 +3044,26 @@ void LineAnnotationController::deleteFiber(uint64_t fiberId)
     deleteFibers({fiberId});
 }
 
-void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
+vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers(
+    std::vector<uint64_t> fiberIds)
 {
     namespace deletion = vc3d::line_annotation;
+    deletion::FiberDeleteOutcome outcome;
 
     std::sort(fiberIds.begin(), fiberIds.end());
     fiberIds.erase(std::unique(fiberIds.begin(), fiberIds.end()), fiberIds.end());
     fiberIds.erase(std::remove(fiberIds.begin(), fiberIds.end(), uint64_t{0}), fiberIds.end());
     if (fiberIds.empty()) {
-        return;
+        return outcome;
     }
     // One delete at a time. The save drain below runs a nested event loop
     // that still delivers input, so a second delete could otherwise start
     // inside the first; every UI entry point (Fibers docks, fiber map) shares
     // this controller, so the guard has to live here.
     if (_deletingFibers) {
-        showError(tr("A fiber delete is already in progress."), true);
-        return;
+        outcome.error = tr("A fiber delete is already in progress.").toStdString();
+        showError(QString::fromStdString(outcome.error), true);
+        return outcome;
     }
     _deletingFibers = true;
     const auto releaseDeleting = qScopeGuard([this]() { _deletingFibers = false; });
@@ -3083,6 +3085,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
             [this]() -> const std::vector<StoredFiber>& { return _fibers; },
             identityNow,
             [this]() { waitForFiberSaves(); });
+    outcome.requested = resolution.targets;
     for (const uint64_t notLoaded : resolution.notLoaded) {
         Logger()->warn("deleteFibers: fiber {} is not loaded; skipping", notLoaded);
     }
@@ -3092,9 +3095,12 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     if (resolution.aborted) {
         Logger()->warn("deleteFibers: {} while pending saves were finishing; nothing deleted",
                        resolution.abortReason);
-        showError(tr("The project changed while pending saves were finishing; "
-                     "no fibers were deleted."));
-        return;
+        outcome.aborted = true;
+        outcome.error = tr("The project changed while pending saves were finishing; "
+                           "no fibers were deleted.")
+                            .toStdString();
+        showError(QString::fromStdString(outcome.error));
+        return outcome;
     }
     for (const auto& target : resolution.missing) {
         Logger()->warn("deleteFibers: {} is no longer loaded; skipping", target.fileName);
@@ -3104,7 +3110,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
                        target.fileName);
     }
     if (resolution.resolvedIds.empty()) {
-        return;
+        return outcome;
     }
 
     // resolvedIds are the CURRENT runtime ids (sorted, unique). Removal
@@ -3138,6 +3144,11 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
         }
         deletedIds.push_back(fiberId);
         deletedFibers.push_back({fiberId, fiberIt->fileName});
+        outcome.deletedFileNames.push_back(fiberIt->fileName);
+    }
+    outcome.deletedIds = deletedIds;
+    if (!removalErrors.isEmpty()) {
+        outcome.error = removalErrors.join(QLatin1Char('\n')).toStdString();
     }
     const auto reportRemovalErrors = qScopeGuard([this, &removalErrors]() {
         if (!removalErrors.isEmpty()) {
@@ -3145,7 +3156,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
         }
     });
     if (deletedIds.empty()) {
-        return;
+        return outcome;
     }
 
     if (_linkCandidate && std::binary_search(deletedIds.begin(),
@@ -3194,6 +3205,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     }
     emitFiberSummaries();
     emit fibersDeleted(deletedIds);
+    return outcome;
 }
 
 void LineAnnotationController::renameFiberFile(uint64_t fiberId)
@@ -14478,10 +14490,27 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
     std::vector<FiberSaveSnapshot> snapshots;
     snapshots.reserve(uniqueFiberIds.size());
     for (const uint64_t fiberId : uniqueFiberIds) {
+        // The owner ids come from both open sessions (which keep the id they
+        // were opened with) and stored fibers (current ids); after a reload
+        // the two numberings disagree. A pane is the owner only when its
+        // session and the stored fiber of this id are the same fiber by the
+        // shared identity rule - names when both are known, id otherwise -
+        // so a stored owner cannot pick up an unrelated session that happens
+        // to hold its number.
+        std::string storedFileName;
+        if (const auto storedIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                               [fiberId](const StoredFiber& candidate) {
+                                                   return candidate.id == fiberId;
+                                               });
+            storedIt != _fibers.end()) {
+            storedFileName = storedIt->fileName;
+        }
         bool addedOpenPaneSnapshot = false;
         for (const auto& pane : _panes) {
             if (!pane.session ||
-                pane.session->fiberId != fiberId ||
+                !vc3d::line_annotation::sameFiberIdentity(pane.session->fiberId,
+                                                         pane.session->fiberFileName,
+                                                         fiberId, storedFileName) ||
                 pane.session->suppressFiberSave ||
                 pane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
                 pane.session->optimizedLine.points.empty() ||

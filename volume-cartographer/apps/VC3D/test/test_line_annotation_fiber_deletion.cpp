@@ -21,6 +21,8 @@ using vc3d::line_annotation::resolveFiberDeletionAcrossWait;
 using vc3d::line_annotation::sessionBelongsToDeletedFiber;
 using vc3d::line_annotation::branchRefersToDeletedFiber;
 using vc3d::line_annotation::sameFiberIdentity;
+using vc3d::line_annotation::FiberDeleteOutcome;
+using vc3d::line_annotation::FiberDeleteTarget;
 
 namespace
 {
@@ -257,6 +259,29 @@ private slots:
         QVERIFY(sameFiberIdentity(5, "", 5, "x.json"));
         QVERIFY(!sameFiberIdentity(5, "", 6, "x.json"));
         QVERIFY(!sameFiberIdentity(0, "", 0, ""));
+    }
+
+    // A caller reporting per requested id (the agent bridge) reads the
+    // outcome through the captured names, never through ids that a reload
+    // may have handed to other fibers.
+    void outcomeAnswersPerRequestedIdByCapturedName()
+    {
+        FiberDeleteOutcome outcome;
+        outcome.requested = {FiberDeleteTarget{2, "b.json"}, FiberDeleteTarget{3, "c.json"}};
+        outcome.deletedFileNames = {"b.json"};
+        QVERIFY(outcome.deletedRequested(2));
+        QVERIFY(!outcome.deletedRequested(3));
+        QVERIFY(!outcome.deletedRequested(9));
+        // The resolution carries the capture for the caller to build this.
+        std::vector<Fiber> fibers = reloaded({"a.json", "b.json"});
+        const FiberDeleteResolution resolution = resolveFiberDeletionAcrossWait(
+            std::vector<uint64_t>{2},
+            [&fibers]() -> const std::vector<Fiber>& { return fibers; },
+            []() { return kPackage; },
+            []() {});
+        QCOMPARE(resolution.targets.size(), std::size_t{1});
+        QCOMPARE(resolution.targets[0].requestedId, uint64_t{2});
+        QCOMPARE(resolution.targets[0].fileName, std::string("b.json"));
     }
 
     // Nothing to delete: the wait is skipped, and the report still names

@@ -28,6 +28,7 @@
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
@@ -275,7 +276,11 @@ public:
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void deleteFiber(uint64_t fiberId);
-    void deleteFibers(std::vector<uint64_t> fiberIds);
+    // Deletes the requested fibers' files and drops them from the package.
+    // Returns what was done in terms of the file names captured before the
+    // save drain (see LineAnnotationFiberDeletion.hpp): the requested ids
+    // may have been reassigned by a reload during the drain.
+    vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
     void importFibers();
     void exportFibers();

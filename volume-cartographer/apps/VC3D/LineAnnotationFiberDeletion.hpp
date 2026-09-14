@@ -58,8 +58,35 @@ struct FiberDeleteResolution {
     // either would be a guess, so neither is.
     std::vector<FiberDeleteTarget> ambiguous;
     // From the capture, carried through for the caller's reporting.
+    std::vector<FiberDeleteTarget> targets;
     std::vector<uint64_t> notLoaded;
     std::vector<uint64_t> unnamed;
+};
+
+// What a delete did, for callers that must report per requested fiber: the
+// requested ids may have been reassigned by a reload during the wait, so the
+// outcome speaks in the file names captured before it. `requested` holds the
+// capture (requested id -> file name) and `deletedFileNames` the files that
+// were actually removed; `aborted` says the package identity moved and
+// nothing was removed.
+struct FiberDeleteOutcome {
+    bool aborted = false;
+    std::string error;
+    std::vector<FiberDeleteTarget> requested;
+    std::vector<std::string> deletedFileNames;
+    // Current runtime ids of the deleted fibers, as emitted to observers.
+    std::vector<uint64_t> deletedIds;
+
+    [[nodiscard]] bool deletedRequested(uint64_t requestedId) const
+    {
+        for (const FiberDeleteTarget& target : requested) {
+            if (target.requestedId == requestedId) {
+                return std::find(deletedFileNames.begin(), deletedFileNames.end(),
+                                 target.fileName) != deletedFileNames.end();
+            }
+        }
+        return false;
+    }
 };
 
 // Before the wait: the file name each requested id would be deleted at.
@@ -95,6 +122,7 @@ FiberDeleteResolution resolveFiberDeleteTargets(const FiberDeleteCapture& captur
                                                 const FiberDeletePackageIdentity& after)
 {
     FiberDeleteResolution resolution;
+    resolution.targets = capture.targets;
     resolution.notLoaded = capture.notLoaded;
     resolution.unnamed = capture.unnamed;
     if (before.fibersDir.empty() || after.fibersDir.empty()) {
@@ -150,6 +178,7 @@ FiberDeleteResolution resolveFiberDeletionAcrossWait(const std::vector<uint64_t>
     const FiberDeleteCapture capture = captureFiberDeleteTargets(requestedIds, fibersNow());
     if (capture.targets.empty()) {
         FiberDeleteResolution resolution;
+        resolution.targets = capture.targets;
         resolution.notLoaded = capture.notLoaded;
         resolution.unnamed = capture.unnamed;
         return resolution;
