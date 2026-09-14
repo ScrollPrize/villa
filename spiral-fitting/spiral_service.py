@@ -73,7 +73,7 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          input_source_enabled, pcl_input_enabled, phase_bundle_enabled,
                          winding_inference_enabled, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
-                         validate_session_request)
+                         scroll_spec_config_defaults, validate_session_request)
 from config import (BACKFILLABLE_CONFIG_DEFAULTS,
                     CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
                     filter_known_config_keys, rebuild_stage)
@@ -901,7 +901,17 @@ class ServiceState:
         return response
 
     def configuration_catalog(self):
-        return {**self._base(), **self.config_catalog}
+        # The advertised defaults are the dataset's: spiral-scroll.json may
+        # state the scroll's winding count, which a resident session applies
+        # over the Python baseline exactly as a headless fit does.
+        defaults = {**self.config_catalog["defaults"],
+                    **self._scroll_config_defaults()}
+        return {**self._base(), **self.config_catalog, "defaults": defaults}
+
+    def _scroll_config_defaults(self):
+        """Configuration defaults the dataset's scroll specification implies."""
+        return scroll_spec_config_defaults(
+            (self.scroll_spec or {}).get("winding_count"))
 
     def dataset(self):
         return {**self._base(), **self.dataset_resolution.to_dict(),
@@ -1911,9 +1921,10 @@ class ServiceState:
         current = session.status().get("applied_config")
         request_run = self.session_request.get("run") or {}
         if current is None:
-            current = Config(
-                request_run.get("config") or {}
-            ).as_dict()
+            current = Config({
+                **self._scroll_config_defaults(),
+                **(request_run.get("config") or {}),
+            }).as_dict()
             for key in ("z_begin", "z_end"):
                 if key in request_run:
                     current[key] = request_run[key]

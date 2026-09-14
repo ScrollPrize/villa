@@ -894,6 +894,29 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["resolved"]["cache_directory"],
                          str(self.cache))
 
+    def test_configuration_defaults_follow_the_scroll_spec_winding_count(self):
+        baseline = Config()
+        defaults = self.state.configuration_catalog()["defaults"]
+        self.assertEqual(defaults["shell_outer_winding_idx"],
+                         baseline.shell_outer_winding_idx)
+        self.assertEqual(defaults["model_gap_expander_num_windings"],
+                         baseline.model_gap_expander_num_windings)
+        (self.root / "spiral-scroll.json").write_text(json.dumps({
+            "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
+            "spiral_outward_sense": "CW", "winding_count": 90}))
+        resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
+        state = ServiceState(dataset_root=str(self.root),
+                             dataset_resolution=resolution)
+        defaults = state.configuration_catalog()["defaults"]
+        self.assertEqual(defaults["shell_outer_winding_idx"], 90)
+        self.assertEqual(defaults["model_gap_expander_num_windings"], 90)
+        # The Python baseline the catalog is built from is untouched, and
+        # the dataset advertisement carries the count the defaults came from.
+        self.assertEqual(state.config_catalog["defaults"]["shell_outer_winding_idx"],
+                         baseline.shell_outer_winding_idx)
+        self.assertEqual(state.dataset()["scroll_spec"]["winding_count"], 90)
+
     def test_dataset_endpoint_advertises_named_session(self):
         resolution = spiral_service.bind_service_paths(
             resolve_dataset_root(self.root), self.output / "alice", self.cache)

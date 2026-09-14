@@ -239,7 +239,8 @@ _PCL_LINK_DESCRIPTIONS = {
 _GAP_EXPANDER_DESCRIPTIONS = {
     "model_gap_expander_num_windings": (
         "Legacy/fallback physical winding-count estimate used by exporters; "
-        "it does not allocate the gap lattice."),
+        "it does not allocate the gap lattice. Defaults to the dataset's "
+        "spiral-scroll.json winding_count when that file states one."),
     "model_gap_expander_capacity_windings": (
         "Allocated gap-lattice capacity, not a claim about the physical "
         "winding count. Must be at least shell_outer_winding_idx + 3."),
@@ -624,6 +625,10 @@ class Config:
         # are deliberately separate.  shell_outer_winding_idx is the active
         # hypothesis; num_windings remains the legacy/fallback physical
         # estimate used by exporters, while capacity only shapes the lattice.
+        # 130 is the PHercParis4 scroll's count and only the last fallback:
+        # a dataset states its own in spiral-scroll.json (winding_count),
+        # which the CLI and the interactive runtime apply over these defaults
+        # (see fit_session.ScrollSpec.config_defaults).
         self.model_gap_expander_num_windings = 130
         self.model_gap_expander_capacity_windings = \
             DEFAULT_GAP_EXPANDER_CAPACITY
@@ -882,6 +887,9 @@ class Config:
         self.output_first_winding = 10
         self.output_winding_margin = 4
         self.output_step_size = 20
+        # PHercParis4's count, the fallback for a dataset whose
+        # spiral-scroll.json states no winding_count (see
+        # fit_session.ScrollSpec.config_defaults).
         self.shell_outer_winding_idx = 130
         self.shell_outer_winding_margin = 10
         self.shell_num_theta_bins = 720

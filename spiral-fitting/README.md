@@ -100,6 +100,20 @@ This is not covered by scrollprize.org/tutorial_spiral. Required keys:
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
 
+Optional `winding_count` — how many windings the scroll has from the
+umbilicus to its outer edge (the sheets a radial ray crosses), an integer
+of at least 2. When present it is the default for the fit's winding-count
+settings, `shell_outer_winding_idx` and `model_gap_expander_num_windings`;
+an explicit value in `FIT_SPIRAL_CONFIG_OVERRIDES`, in a session request's
+advanced config, or in a checkpoint's stored `cfg` still wins. Without it
+those settings keep their Python default of 130, which is PHercParis4's
+count and wrong for most other scrolls: every dense sampler integrates out
+to `shell_outer_winding_idx` and the preview exporter writes windings 10
+through it inclusive, so a count that is too high exports windings outside
+the papyrus and one that is too low truncates the scroll. A count above
+`model_gap_expander_capacity_windings - 3` (141 at the default capacity)
+also needs that capacity raised, or the fit refuses to build.
+
 Also optional, and easy to get wrong silently: `normal_zarr_group`
 (default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr
 pyramid level the `normal_x`/`normal_y` lasagna stores are read at.
@@ -498,7 +512,11 @@ unavailable.
 name and voxel resolution and of the Lasagna store layout (zarr groups,
 coordinate scale). None of them are panel settings: the panel reports them
 read-only, and the service rejects a session request that carries
-`scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
+`scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`. Its
+optional `winding_count` is different: it seeds the session's
+`shell_outer_winding_idx` and `model_gap_expander_num_windings` and the
+defaults `/configuration` advertises, but both stay editable advanced
+settings.
 
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
