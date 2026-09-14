@@ -406,6 +406,7 @@ void FiberMapRuler::paintSheetDistance(QPainter& painter, const QRect& band)
     }
     const QFontMetrics metrics(_font);
     const int textTop = band.top() + kMajorTickPx + 1;
+    const QTransform toViewport = _view->viewportTransform();
     for (long long k = range->first; k <= range->second; ++k) {
         for (int half = 0; half < 2; ++half) {
             const double distance = (static_cast<double>(k) + 0.5 * half) * ticks.stepVx;
@@ -413,10 +414,11 @@ void FiberMapRuler::paintSheetDistance(QPainter& painter, const QRect& band)
             if (!std::isfinite(sceneX)) {
                 continue;
             }
-            const int x = _view->mapFromScene(QPointF(sceneX, 0.0)).x();
-            if (x < band.left() - 1 || x > band.right() + 1) {
+            const double xF = toViewport.map(QPointF(sceneX, 0.0)).x();
+            if (!std::isfinite(xF) || xF < band.left() - 1.0 || xF > band.right() + 1.0) {
                 continue;
             }
+            const int x = static_cast<int>(std::lround(xF));
             const bool major = half == 0;
             painter.setPen(_style.tick);
             painter.drawLine(x, band.top() + 1, x,
@@ -466,13 +468,15 @@ void FiberMapRuler::paintHeight(QPainter& painter, const QRect& band)
     const QFontMetrics metrics(_font);
     const int tickEnd = band.right() - 1;
     const int textRight = band.right() - kMajorTickPx - 3;
+    const QTransform toViewport = _view->viewportTransform();
     for (long long k = range->first; k <= range->second; ++k) {
         for (int half = 0; half < 2; ++half) {
             const double z = (static_cast<double>(k) + 0.5 * half) * ticks.stepVx;
-            const int y = _view->mapFromScene(QPointF(0.0, -z)).y();
-            if (y < band.top() - 1 || y > band.bottom() + 1) {
+            const double yF = toViewport.map(QPointF(0.0, -z)).y();
+            if (!std::isfinite(yF) || yF < band.top() - 1.0 || yF > band.bottom() + 1.0) {
                 continue;
             }
+            const int y = static_cast<int>(std::lround(yF));
             const bool major = half == 0;
             painter.setPen(_style.tick);
             painter.drawLine(tickEnd - (major ? kMajorTickPx : kMinorTickPx), y, tickEnd, y);

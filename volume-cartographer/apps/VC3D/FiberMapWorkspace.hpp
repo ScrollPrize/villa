@@ -335,6 +335,11 @@ private:
     QTimer* _stalePollTimer = nullptr;
     bool _fiberDockSized = false;
     bool _retheming = false;
+    // A delete is confirmed-or-pending: from the confirmation dialog opening
+    // until the queued delete has run (or the dialog was dismissed). One at a
+    // time, because the controller's delete yields to the event loop while it
+    // drains saves.
+    bool _deleteInFlight = false;
     // What the current layout was built from, and whether a change has been seen
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;

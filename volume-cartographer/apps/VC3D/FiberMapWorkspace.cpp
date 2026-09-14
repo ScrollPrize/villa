@@ -2392,6 +2392,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
         menu.addSeparator();
     }
     QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
+    deleteAction->setEnabled(!_deleteInFlight);
     connect(deleteAction, &QAction::triggered, this,
             [this, fileName, displayName, menuDependencies]() {
                 // Deferred past menu.exec()'s nested loop: the confirmation
@@ -2449,6 +2450,7 @@ void FiberMapWorkspace::handleTreeContextMenu(const QPoint& pos)
         currentDependencies();
     QMenu menu;
     QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
+    deleteAction->setEnabled(!_deleteInFlight);
     connect(deleteAction, &QAction::triggered, this,
             [this, fileName, displayName, menuDependencies]() {
                 QMetaObject::invokeMethod(
@@ -2487,6 +2489,15 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
     if (dependenciesMoved("menu")) {
         return;
     }
+    // One delete at a time. The controller's deleteFibers drains queued
+    // saves in a nested loop that processes input, so without this a second
+    // confirmation of the same fiber could start a second delete that, once
+    // the first had removed the file, fell back to an unrelated one.
+    if (_deleteInFlight) {
+        Logger()->warn("Fiber map: a delete is already pending; ignoring {}", fileName);
+        return;
+    }
+    _deleteInFlight = true;
     // The confirmation is modeless (open(), not exec()): a nested loop with a
     // parented dialog would be undefined if the workspace were torn down
     // meanwhile, whereas this dialog simply dies with its parent and the
@@ -2517,6 +2528,15 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
                     },
                     Qt::QueuedConnection);
             });
+    // Any way of closing the dialog other than Yes (Cancel, Escape, the
+    // window close) releases the guard; Yes hands it to deleteConfirmedFiber.
+    // finished() carries the standard button for a button click, and
+    // QDialog::Rejected for a close, neither of which is Yes.
+    connect(dialog, &QMessageBox::finished, this, [this](int result) {
+        if (result != QMessageBox::Yes) {
+            _deleteInFlight = false;
+        }
+    });
     dialog->open();
 }
 
@@ -2524,6 +2544,15 @@ void FiberMapWorkspace::deleteConfirmedFiber(
     const std::string& fileName,
     const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
 {
+    // The guard taken at confirmation is released on every way out of here,
+    // including after a deleteFibers that outlived the workspace (then there
+    // is nothing left to release).
+    const QPointer<FiberMapWorkspace> self(this);
+    const auto releaseGuard = qScopeGuard([self]() {
+        if (self) {
+            self->_deleteInFlight = false;
+        }
+    });
     if (!_controller) {
         return;
     }
@@ -2549,9 +2578,8 @@ void FiberMapWorkspace::deleteConfirmedFiber(
     }
     Logger()->info("Fiber map: deleting fiber {}", fileName);
     // deleteFibers drains queued saves in a nested loop, during which this
-    // workspace could be destroyed; the guard keeps the epilogue off a dead
+    // workspace could be destroyed; `self` keeps the epilogue off a dead
     // object.
-    const QPointer<FiberMapWorkspace> self(this);
     _controller->deleteFibers({target});
     if (!self) {
         return;
