@@ -464,7 +464,21 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     } else statusBar()->showMessage(error, 15000);
                 } else if (kind == QStringLiteral("pcl")) {
                     const auto role = vc3d::spiral::pclRoleFromName(input.value(QStringLiteral("role")).toString());
-                    if (role) _brush->editCatalogCollection(*role, QString::number(input.value(QStringLiteral("collection_id")).toInteger()), input.value(QStringLiteral("alias")).toString());
+                    QFile file(path);
+                    if (!role || !file.open(QIODevice::ReadOnly)) {
+                        statusBar()->showMessage(tr("Cannot open the selected PCL revision"), 15000);
+                        return;
+                    }
+                    QJsonParseError error;
+                    const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+                    if (error.error != QJsonParseError::NoError || !document.isObject()) {
+                        statusBar()->showMessage(tr("The selected PCL revision is invalid"), 15000);
+                        return;
+                    }
+                    const auto collectionId = input.value(QStringLiteral("collection_id"));
+                    _brush->editCatalogCollection(*role,
+                        collectionId.isDouble() ? QString::number(collectionId.toInteger()) : QString(),
+                        input.value(QStringLiteral("alias")).toString(), document);
                 }
             });
     connect(_service, &SpiralServiceManager::inputDraftDiscarded, this, [this](const QString& alias) {

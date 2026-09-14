@@ -814,13 +814,14 @@ void SpiralServiceManager::editInputDraft(const QString& id)
     if (!draft || draft->deleted()) return;
     const auto snapshot = draft->snapshot();
     const auto input = _inputCatalog.value(id, snapshot.content.manifest);
-    if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")) {
-        auto editorInput = input;
-        editorInput[QStringLiteral("alias")] = snapshot.content.manifest.value(QStringLiteral("alias"));
-        emit inputEditorRequested(editorInput, {});
-        return;
-    }
-    auto open = [this, id, input](const QString& source) {
+    auto open = [this, id, input, snapshot](const QString& source) {
+        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")) {
+            auto editorInput = input;
+            editorInput[QStringLiteral("alias")] = snapshot.content.manifest.value(QStringLiteral("alias")).toString(id);
+            // PCL editors import the immutable snapshot into memory.
+            emit inputEditorRequested(editorInput, source);
+            return;
+        }
         const bool fiber = input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber");
         const auto copySource = fiber ? QFileInfo(source).absolutePath() : source;
         _inputWorkingCopySources[id].insert(QFileInfo(copySource).absoluteFilePath());

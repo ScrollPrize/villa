@@ -25,3 +25,19 @@ volume-cartographer/build/bin/VC3D
 The Qt workflow test runs its own temporary local service. It requires permission
 to bind loopback sockets. Snapshot implementation and benchmark details are in
 the [Spiral fitting README](../../spiral-fitting/README.md).
+
+PCL editors load the selected accepted revision after local changes are discarded,
+including collections applied but not yet committed. Active local brush edits are
+retained when reselecting an input. The `pclEditorsReopenAcceptedRevision` workflow
+test covers reopening existing and newly added collections. To run it with real
+scroll geometry, set `SPIRAL_TEST_PCL_SOURCE` to a point-collection JSON file:
+
+```sh
+QT_QPA_PLATFORM=offscreen \
+  SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
+  SPIRAL_TEST_PCL_SOURCE=/path/to/dataset/same_windings.json \
+  volume-cartographer/build/bin/test_spiral_input_workflow pclEditorsReopenAcceptedRevision
+```
+
+The test copies one collection into its temporary workspace and changes its name;
+the source file remains unchanged.

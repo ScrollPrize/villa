@@ -338,6 +338,7 @@ void SpiralBrushController::setPclSource(
 {
     clearEditablePclHover();
     auto& set = sourcesFor(role);
+    set.sourceToPreviewScale = sourceToPreviewScale;
     set.sources = vc3d::spiral::importEditablePcls(
         document, sourceToPreviewScale, sourceRevision, editable, role);
     set.indexById.clear();
@@ -892,12 +893,15 @@ void SpiralBrushController::appendPointCollectionPoint(
     emit paintStateChanged();
 }
 
-void SpiralBrushController::editCatalogCollection(PclRole role, const QString& collectionId, const QString& alias)
+void SpiralBrushController::editCatalogCollection(
+    PclRole role, const QString& collectionId, const QString& alias,
+    const QJsonDocument& document)
 {
     for (std::size_t index = 0; index < _polylines.size(); ++index) {
         auto& line = _polylines[index];
         if ((!alias.isEmpty() && line.id == alias)
-            || (line.pclEdit && line.pclEdit->role == role && line.pclEdit->collectionId == collectionId)) {
+            || (!collectionId.isEmpty() && line.pclEdit
+                && line.pclEdit->role == role && line.pclEdit->collectionId == collectionId)) {
             _activePolyline = static_cast<int>(index);
             updateCursorWidget();
             refreshAll();
@@ -905,20 +909,29 @@ void SpiralBrushController::editCatalogCollection(PclRole role, const QString& c
             return;
         }
     }
-    const auto& sources = sourcesFor(role).sources;
-    for (std::size_t index = 0; index < sources.size(); ++index)
-        if (sources[index].collectionId == collectionId) { selectEditablePcl(role, index); return; }
+    auto sources = vc3d::spiral::importEditablePcls(
+        document, sourcesFor(role).sourceToPreviewScale, {}, true, role);
+    if (sources.size() != 1) return;
+    // A staged collection can still carry its original JSON key. The catalog
+    // identity is the target for subsequent replacements, including additions.
+    sources.front().collectionId = collectionId;
+    selectEditablePcl(sources.front(), alias);
 }
 
 void SpiralBrushController::selectEditablePcl(PclRole role, std::size_t sourceIndex)
 {
     const auto& set = sourcesFor(role);
     if (sourceIndex >= set.sources.size()) return;
-    const auto& source = set.sources[sourceIndex];
+    selectEditablePcl(set.sources[sourceIndex]);
+}
+
+void SpiralBrushController::selectEditablePcl(
+    const vc3d::spiral::EditablePclDraft& source, const QString& alias)
+{
     if (!source.editable) return;
     for (std::size_t index = 0; index < _polylines.size(); ++index) {
         auto& line = _polylines[index];
-        if (line.pclEdit && line.pclEdit->role == role
+        if (!source.collectionId.isEmpty() && line.pclEdit && line.pclEdit->role == source.role
             && line.pclEdit->collectionId == source.collectionId) {
             if (line.pclEdit->deleted) {
                 line.pclEdit->setDeleted(false);
@@ -933,6 +946,7 @@ void SpiralBrushController::selectEditablePcl(PclRole role, std::size_t sourceIn
         }
     }
     PolylineGesture line;
+    line.id = alias;
     line.kind = PolylineGesture::Kind::PointCollection;
     line.color = collectionColor(source.sourceCollection);
     line.creationTime = QDateTime::currentMSecsSinceEpoch();
@@ -941,6 +955,7 @@ void SpiralBrushController::selectEditablePcl(PclRole role, std::size_t sourceIn
     _polylines.push_back(std::move(line));
     _activePolyline = static_cast<int>(_polylines.size()) - 1;
     invalidateEditablePclHitIndex();
+    updateSuppressedPclIds();
     updateCursorWidget();
     refreshAll();
     emit paintStateChanged();

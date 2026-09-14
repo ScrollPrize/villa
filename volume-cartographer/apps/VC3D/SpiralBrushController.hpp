@@ -78,7 +78,8 @@ public:
     bool hasUnfinalizedPolylines() const;
     bool hasReadyDrafts() const;
     bool hasLocalChangesFor(const QString& id) const;
-    void editCatalogCollection(PclRole role, const QString& collectionId, const QString& alias = {});
+    void editCatalogCollection(PclRole role, const QString& collectionId,
+                               const QString& alias, const QJsonDocument& document);
     void markDraftsReady();
     int brushDiameter() const { return _diameterPx; }
 
@@ -167,6 +168,7 @@ private:
         QSet<qulonglong> editableIds;
         QPointer<PointsOverlayController> hitOverlay;
         QSet<QString> suppressedIds;
+        double sourceToPreviewScale = 1.0;
         bool visible = false;
     };
     // A viewer this controller filters events on and draws a cursor cue in.
@@ -200,6 +202,7 @@ private:
         VolumeViewerBase* viewer, const QPointF& devicePos);
     void selectEditablePcl(const EditablePclHit& hit);
     void selectEditablePcl(PclRole role, std::size_t sourceIndex);
+    void selectEditablePcl(const vc3d::spiral::EditablePclDraft& source, const QString& alias = {});
     void reverseActivePcl();
     void confirmDeleteActivePcl();
     const std::vector<cv::Vec3f>& pointCollectionPositions(

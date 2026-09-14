@@ -139,6 +139,93 @@ private slots:
         QTRY_VERIFY(completed);
     }
 
+    void pclEditorsReopenAcceptedRevision() {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to the existing Spiral Python environment");
+        QTemporaryDir root;
+        QVERIFY(root.isValid());
+        QProcess service;
+        service.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.remove(QStringLiteral("SPIRAL_REVISION_CLIENT_LIVE"));
+        environment.remove(QStringLiteral("SPIRAL_REVISION_DROP_REPLIES"));
+        environment.remove(QStringLiteral("SPIRAL_REVISION_FAIL_PUBLICATION"));
+        environment.remove(QStringLiteral("SPIRAL_REVISION_REMOTE_CATALOG"));
+        service.setProcessEnvironment(environment);
+        service.start(python, {QStringLiteral(SPIRAL_CLIENT_SERVICE_FIXTURE), root.path()});
+        QVERIFY(service.waitForStarted());
+        QVERIFY(service.waitForReadyRead(30000));
+        const int port = service.readLine().trimmed().toInt();
+        QVERIFY(port > 0);
+        const auto stopService = qScopeGuard([&]() {
+            service.terminate();
+            service.waitForFinished(5000);
+        });
+        auto original = document(qEnvironmentVariable("SPIRAL_TEST_PCL_SOURCE",
+            root.filePath(QStringLiteral("pcl-template.json"))));
+        const auto collections = original.value(QStringLiteral("collections")).toObject();
+        QVERIFY(!collections.isEmpty());
+        // Keep the real collection's geometry and metadata, assigning a key
+        // different from the catalog's eventual collection ID.
+        original[QStringLiteral("collections")] = QJsonObject{{QStringLiteral("17"), collections.begin().value()}};
+        const auto renamed = [](QJsonObject value, const QString& name) {
+            auto collection = value.value(QStringLiteral("collections")).toObject().value(QStringLiteral("17")).toObject();
+            collection[QStringLiteral("name")] = name;
+            value[QStringLiteral("collections")] = QJsonObject{{QStringLiteral("17"), collection}};
+            return value;
+        };
+        SpiralServiceProfile profile;
+        profile.id = QStringLiteral("pcl-reopen-test");
+        profile.baseUrl = QUrl(QStringLiteral("http://127.0.0.1:%1").arg(port));
+        profile.apiKey = QStringLiteral("test-key");
+        SpiralServiceManager client;
+        client.connectToService(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(client.ownsInputWorkspace(), 10000);
+        QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
+        QSignalSpy editors(&client, &SpiralServiceManager::inputEditorRequested);
+        const auto source = root.filePath(QStringLiteral("local-pcl.json"));
+        write(source, QJsonDocument(original).toJson());
+        client.stageJsonInput(QStringLiteral("pcl"), source, QStringLiteral("pcl"), QStringLiteral("same_winding"));
+        const auto id = client.inputDraftStatus().first().toObject().value(QStringLiteral("id")).toString();
+        client.applyInputDrafts(true);
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 1, 10000);
+        const auto accepted = renamed(original, QStringLiteral("accepted edit"));
+        write(source, QJsonDocument(accepted).toJson());
+        client.stageJsonInput(QStringLiteral("pcl"), source, id, QStringLiteral("same_winding"));
+        client.applyInputDrafts();
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
+        const auto published = document(root.filePath(QStringLiteral("dataset/same_windings.json")));
+        QVERIFY(!published.isEmpty());
+        const auto local = renamed(original, QStringLiteral("discard me"));
+        write(source, QJsonDocument(local).toJson());
+        client.stageJsonInput(QStringLiteral("pcl"), source, id, QStringLiteral("same_winding"));
+        client.editInputDraft(id);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 1, 10000);
+        QCOMPARE(document(editors.last()[1].toString()), local);
+        client.discardInputDraft(id);
+        client.editInputDraft(id);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 2, 10000);
+        QCOMPARE(document(editors.last()[1].toString()), accepted);
+        QCOMPARE(editors.last()[0].toJsonObject().value(QStringLiteral("alias")).toString(), id);
+        QCOMPARE(document(root.filePath(QStringLiteral("dataset/same_windings.json"))), published);
+
+        // A new accepted input must open even though it has no dataset artifact.
+        write(source, QJsonDocument(original).toJson());
+        client.stageJsonInput(QStringLiteral("pcl"), source, QStringLiteral("new-pcl"), QStringLiteral("same_winding"));
+        const auto newId = client.inputDraftStatus().last().toObject().value(QStringLiteral("id")).toString();
+        QVERIFY(newId != id);
+        client.applyInputDrafts();
+        QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 3, 10000);
+        write(source, QJsonDocument(local).toJson());
+        client.stageJsonInput(QStringLiteral("pcl"), source, newId, QStringLiteral("same_winding"));
+        client.discardInputDraft(newId);
+        client.editInputDraft(newId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 3, 10000);
+        QCOMPARE(document(editors.last()[1].toString()), original);
+        QCOMPARE(document(root.filePath(QStringLiteral("dataset/same_windings.json"))), published);
+        client.disconnectFromService();
+    }
+
     void remoteSaveAsNewCapturesAcceptedContent() {
         const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
         if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to the existing Spiral Python environment");
