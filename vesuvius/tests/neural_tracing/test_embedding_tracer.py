@@ -130,7 +130,7 @@ def test_sweep_grid():
             list(variants(weight=invalid))
 
 
-def test_sweep_fill_requires_managed_launch(tmp_path, monkeypatch):
+def test_sweep_fill_uses_demand_ownership_not_whole_sweep_grant(tmp_path, monkeypatch):
     import json
     import sys
     from vesuvius.neural_tracing.fiber_trace_3d import embedding_trace_sweep as sweep
@@ -143,10 +143,14 @@ def test_sweep_fill_requires_managed_launch(tmp_path, monkeypatch):
         calls.append((command, kwargs))
         return 17
     monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.managed_evaluation.launch_managed", launch)
-    monkeypatch.setattr(sweep, "run", lambda settings: pytest.fail("must acquire grant first"))
-    assert sweep.main() == 17
-    assert calls[0][0][2].endswith("embedding_trace_sweep")
-    assert calls[0][1]["settings"] == manager
+    seen = []
+    monkeypatch.setattr(sweep, "run", lambda settings: seen.append(settings))
+    sweep.main()
+    assert not calls
+    assert seen[0]["gpu_manager"] == manager
+    monkeypatch.setattr(sys, "argv", ["sweep", str(control), "--unmanaged"])
+    with pytest.raises(SystemExit):
+        sweep.main()
 
 
 @pytest.mark.parametrize('mode,aggregation',[('anchors-lru','mean'),('anchors-lru','normalized-mean'),('appearance','best'),('appearance','support-softmin')])

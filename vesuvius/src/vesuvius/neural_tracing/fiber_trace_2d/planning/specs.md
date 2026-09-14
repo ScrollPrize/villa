@@ -7209,3 +7209,17 @@ Maximum4096 pending vectors with preflight delay/step check and loud runtime
 overflow. Default delay0 and all existing method defaults remain unchanged.
 Opt-in seed-only scoring retains the initial embedding unchanged until a new
 trace; no history expiry/admission. It is distinct from the EMA+seed mixture.
+# Demand-scoped sweep GPU lifecycle (2026-09-14)
+
+- Embedding sweeps use pausable/adaptable manager ownership only for tile GPU
+  work. CPU tracing/read/accumulation may continue while GPU allocation is zero;
+  those CPU activities are explicitly outside paused GPU lease accounting.
+- GPU dispatch stops on release; submitted tiles drain, GPU children join,
+  then release is acknowledged. CPU queues/results/trace state survive.
+- After30s without GPU tile activity self-pause/release; request again when a
+  read is ready for GPU dispatch. Never clear administrative pause on demand.
+- Native coordinator heartbeats allow live scheduling waits beyond request
+  timeout; they never mark chunks ready. EOF/errors/missing heartbeat fail.
+- Locked manager protocol remains unchanged; existing Supervisor coordinates
+  reconnect/release. Numerical inference and cached output conventions stay
+  unchanged; any cache compatibility must be exact and explicitly audited.

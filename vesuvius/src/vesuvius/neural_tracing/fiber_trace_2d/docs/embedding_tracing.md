@@ -262,3 +262,5 @@ the ungated LRU policy.
 
 See [the full history-spacing/falloff sweep](embedding_history_sweep_20260913.md)
 for all36 combinations, controls and exact-repeat checks. Defaults remain unchanged.
+For sweep GPU pause/idle release and the stop command, see
+[Cooperative GPU use in embedding sweeps](demand_gpu_sweeps.md).

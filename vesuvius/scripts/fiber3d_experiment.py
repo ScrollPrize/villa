@@ -689,21 +689,23 @@ def main():
         (root / 'watcher.json').write_text(json.dumps(process_identity(process.pid)))
         print(f'watcher pid={process.pid} log={root / "watch.log"}', flush=True)
         return
-    if sys.argv[1:] == ['embedding-stop-pilot']:
+    if sys.argv[1:] in (['embedding-stop-pilot'], ['embedding-stop-sweep']):
         from villa_gpu_manager.processes import process_identity
+        module = ('embedding_trace_sweep' if sys.argv[1] == 'embedding-stop-sweep'
+                  else 'embedding_trace_pilot')
         matches = []
         for proc in Path('/proc').glob('[0-9]*'):
             try:
                 args = (proc / 'cmdline').read_bytes().split(b'\0')
                 if (proc.stat().st_uid == os.getuid() and b'-m' in args and
-                    b'vesuvius.neural_tracing.fiber_trace_3d.embedding_trace_pilot' in args and
+                    ('vesuvius.neural_tracing.fiber_trace_3d.' + module).encode() in args and
                     str(CONTROL).encode() in args and b'--unmanaged' not in args):
                     matches.append(int(proc.name))
             except (FileNotFoundError, ProcessLookupError):
                 continue
         for pid in matches:
             stop_production_identity(process_identity(pid))
-        print(f'stopped managed pilot roots: {matches}', flush=True)
+        print(f'stopped managed {module} roots: {matches}', flush=True)
         return
     if sys.argv[1:] == ['embedding-freeze-current']:
         from vesuvius.neural_tracing.fiber_trace_3d.live_evaluate import freeze_checkpoint

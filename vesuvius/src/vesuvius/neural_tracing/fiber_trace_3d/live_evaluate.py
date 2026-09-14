@@ -385,7 +385,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
     max_batch_size = settings.get("max_batch_size", 1)
     if type(max_batch_size) is not int or max_batch_size < 1:
         raise ValueError("inference.max_batch_size must be a positive integer")
-    native = connection = pool = None
+    native = connection = pool = gpu_lease = None
+    adaptive = settings.get("demand_gpu_manager")
     with ExitStack() as cleanup, tempfile.TemporaryDirectory(prefix="fiber-live-control-") as control:
         listener = cleanup.enter_context(socket.socket())
         listener.bind(("127.0.0.1", 0))
@@ -394,6 +395,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
         token = secrets.token_hex(32)
         evaluation["live_endpoint"] = {"port": listener.getsockname()[1], "token": token,
                                        "timeout_seconds": int(settings.get("request_timeout_seconds", 600))}
+        if adaptive is not None:
+            evaluation["live_endpoint"]["heartbeat_wait"] = True
         runtime_config = Path(control) / "evaluation.json"
         atomic_write(runtime_config, evaluation)
         log = cleanup.enter_context((Path(control) / "native.log").open("w+"))
@@ -418,6 +421,7 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             last_report = time.monotonic()
             queue_log = None
             last_queue_report = 0.0
+            last_heartbeat = 0.0
             while not authenticated or native.poll() is None or waiters or (pool is not None and pool.busy):
                 if not allow_inference and time.monotonic() - started > settings.get("cached_trace_timeout_seconds", 300):
                     raise TimeoutError("cached trace profiling exceeded its bounded duration")
@@ -469,12 +473,18 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                         result_slots=settings.get("result_slots"),
                         max_batch_size=max_batch_size,
                         accumulator_workers=settings.get("accumulator_workers"),
-                        flush_workers=int(settings.get("flush_workers", 4)))
+                        flush_workers=int(settings.get("flush_workers", 4)),
+                        deferred_gpu=adaptive is not None)
+                    if adaptive is not None:
+                        from .demand_gpu import DemandGpuLease
+                        gpu_lease = DemandGpuLease(pool, adaptive)
                     queue_log = cleanup.enter_context((Path(evaluation["output"]) / "inference_queues.jsonl").open("x"))
                     print(f"live-eval buffers={pool.stats['shared_slot_bytes'] / (1 << 30):.2f}GiB "
                           f"input_slots={pool.stats['input_slots']} readers={pool.stats['input_workers']} "
                           f"result_slots={pool.stats['result_slots']} max_batch_size={max_batch_size}", flush=True)
                 if pool is not None:
+                    if gpu_lease is not None:
+                        gpu_lease.tick()
                     pool.pump()
                     if time.monotonic() - last_queue_report >= 1:
                         row = {"elapsed_seconds": time.monotonic() - started, "phase": "tracing",
@@ -482,6 +492,9 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                         queue_log.write(json.dumps(row) + "\n")
                         print("queues " + demand.format_queue_snapshot(row) + f" trace_waiters={len(waiters)}", flush=True)
                         last_queue_report = time.monotonic()
+                if adaptive is not None and authenticated and time.monotonic() - last_heartbeat >= 1:
+                    connection.sendall(b'{"version":1,"type":"heartbeat"}\n')
+                    last_heartbeat = time.monotonic()
                 for request_id, targets in list(waiters.items()):
                     if all(stores[key].ready(origin) for key, origin in targets):
                         connection.sendall((json.dumps({"version": 1, "type": "ready", "request_id": request_id}) + "\n").encode())
@@ -497,6 +510,8 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
             # finished before lower-priority prefetch did.
             if pool is not None:
                 while pool.busy:
+                    if gpu_lease is not None:
+                        gpu_lease.tick()
                     pool.pump()
                     if time.monotonic() - last_queue_report >= 1:
                         queue_log.write(json.dumps({"elapsed_seconds": time.monotonic() - started,
@@ -532,10 +547,16 @@ def coordinate_native(evaluation, binary, stores, source_to_store, channel_indic
                         native.wait()
             raise
         finally:
-            if pool is not None:
-                pool.close()
-            if connection is not None:
-                connection.close()
+            try:
+                if gpu_lease is not None:
+                    gpu_lease.close()
+            finally:
+                try:
+                    if pool is not None:
+                        pool.close()
+                finally:
+                    if connection is not None:
+                        connection.close()
             log.flush()
             log.seek(0)
             text = log.read()

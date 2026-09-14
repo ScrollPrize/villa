@@ -1,5 +1,5 @@
 {
-  "suites": ["embedding-native-build", "embedding-native-tests", "embedding-tracer"],
+  "suites": ["demand-gpu-cpu", "demand-gpu-live", "embedding-native-build", "embedding-native-tests", "embedding-tracer"],
   "native_build": false,
   "gpu_devices": ["0", "1"],
   "timeout_seconds": 300,

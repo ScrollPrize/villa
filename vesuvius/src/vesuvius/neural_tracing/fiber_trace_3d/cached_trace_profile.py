@@ -13,12 +13,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_fiber_file
 from .live_evaluate import coordinate_native
 
 
-def extend_cached_replay(evaluation, binary, checkpoint):
+def extend_cached_replay(evaluation, binary, checkpoint, *, gpu_manager=None):
     """Continue an existing inference cache through shared demand publication.
 
     Unlike a fresh experiment namespace, this explicitly validates and locks
     the existing cache. The numerical adapter/store/control loop are unchanged.
-    Caller must own its GPU grant before entering.
+    Caller must own its GPU grant, or supply a demand-scoped manager request.
     """
     from contextlib import ExitStack
     import subprocess
@@ -27,9 +27,12 @@ def extend_cached_replay(evaluation, binary, checkpoint):
     from .live_evaluate import (Vc3dCoordinateSampler, NativeTileReader,
         create_demand_store, native_reader_options, implementation_identity,
         input_root_attributes, validate_input_lattice)
+    from .inference_compatibility import compatible_implementation
     binary = Path(binary)
     cache_root = subprocess.check_output([str(binary.with_name("vc_cache_root"))], text=True).strip()
-    settings = evaluation["inference"]
+    settings = dict(evaluation["inference"])
+    if gpu_manager is not None:
+        settings["demand_gpu_manager"] = gpu_manager
     stores, readers, mapping, channels = {}, {}, {}, {}
     with ExitStack() as cleanup:
         for source in evaluation["sources"]:
@@ -37,7 +40,7 @@ def extend_cached_replay(evaluation, binary, checkpoint):
             persisted = json.loads((cache / "cache_identity.json").read_text())
             identity = persisted["identity"]
             model, original = identity["model"], identity["source"]
-            if model["implementation"] != implementation_identity() or model["checkpoint_sha256"] != sha256_file(checkpoint):
+            if not compatible_implementation(model["implementation"], implementation_identity()) or model["checkpoint_sha256"] != sha256_file(checkpoint):
                 raise ValueError("cannot extend cache with different checkpoint/implementation")
             geometry = DemandGeometry(**persisted["geometry"])
             sampler = Vc3dCoordinateSampler(original["locator"], level=original["level"],

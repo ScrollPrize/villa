@@ -36,6 +36,8 @@ CPU_TESTS = [
     "tests/neural_tracing/test_cooperative_reference.py",
 ]
 SUITES = {
+    "demand-gpu-cpu": ["tests/neural_tracing/test_demand_gpu.py", "../lasagna/tests/test_demand_predict3d.py", "../gpu_manager/tests/test_supervisor.py"],
+    "demand-gpu-live": ["tests/neural_tracing/test_demand_gpu.py", "-k", "live_manager", "-s"],
     "paired": ["tests/neural_tracing/test_paired_embeddings.py", "tests/neural_tracing/test_local_competition.py", "tests/neural_tracing/test_fiber_embeddings.py", "tests/neural_tracing/test_cooperative_resources.py", "tests/neural_tracing/test_startup_calibration.py", "tests/neural_tracing/test_cooperative_setup.py", "tests/neural_tracing/test_sample_broker.py"],
     "paired-data": ["tests/neural_tracing/test_paired_embeddings.py", "-k", "real_data_preflight", "-s"],
     "embedding-tracer": ["tests/neural_tracing/test_embedding_tracer.py", "tests/neural_tracing/test_cached_trace_profile.py", "tests/neural_tracing/test_managed_evaluation.py", "tests/neural_tracing/test_cooperative_resources.py", "../gpu_manager/tests/test_exclusive.py", "../lasagna/tests/test_demand_predict3d.py", "../lasagna/tests/test_omezarr_compression.py"],
@@ -112,6 +114,11 @@ def main():
         env.pop("FIBER_COOPERATIVE_CUDA_TEST", None)
         env.pop("FIBER_COOPERATIVE_TEST_GPUS", None)
         env.pop("FIBER_EMBEDDING_DATA_TEST", None)
+        if suite == "demand-gpu-live":
+            # This suite tests its own demand-scoped lease, not an outer
+            # exclusive reservation which would prevent reacquisition.
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+            env["FIBER_DEMAND_GPU_SMOKE"] = "1"
         if suite in ("embedding-data", "paired-data"):
             env["FIBER_EMBEDDING_DATA_TEST"] = "1"
         if control.get("native_build", False):
