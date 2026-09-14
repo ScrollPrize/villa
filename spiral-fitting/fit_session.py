@@ -97,7 +97,15 @@ from config import Config
 # Version 30 makes session creation explicit.  A service starts in
 # Uninitialized and does not import the fitting runtime, initialize CUDA, read
 # fit inputs, or select an autosave until POST /session/initialize.
-API_VERSION = 30
+# Version 31 is this branch's combined live-input/editor contract. It separates
+# client-local drafts from submitted inputs, adds CAS revisions for fibers and
+# same-winding collections, and publishes the same-winding artifact metadata.
+# Version 32 publishes a relative-winding point-cloud artifact next to the
+# same-winding one and opens the collection-mutation protocol to the
+# ``relative`` role, so both editable PCL roles share one client workflow.
+# API 33 separates immutable transfers from revisioned input batches and
+# requires a dataset editing owner for service mutations.
+API_VERSION = 33
 
 
 class SessionState(str, Enum):
@@ -150,6 +158,23 @@ class PclRole(str, Enum):
     DRAWN_CONTROL_POINTS = "drawn_control_points"
 
 
+# Roles whose conventional file the service snapshots as a display artifact
+# and whose collections a client may replace or delete in place. Both roles
+# share one PointCollections document shape; a relative collection carries an
+# integer ``wind_a`` per point whose pairwise differences are the constraint,
+# a same-winding collection carries none.
+EDITABLE_PCL_ROLES: tuple[PclRole, ...] = (PclRole.SAME_WINDING, PclRole.RELATIVE)
+EDITABLE_PCL_ROLE_VALUES: frozenset[str] = frozenset(
+    role.value for role in EDITABLE_PCL_ROLES)
+
+# Roles whose participation toggle a resident session applies at a Run
+# boundary (config._RUN_MUTABLE_INPUT_KEYS classifies the keys). These are
+# exactly the editable roles: the live add/replace/delete machinery that
+# makes their collections editable is what lets a toggle load or drop a whole
+# role without rebuilding the fit.
+RUN_MUTABLE_PCL_ROLES: tuple[PclRole, ...] = EDITABLE_PCL_ROLES
+
+
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
     "unverified_patches": "input_use_unverified_patches",
@@ -169,6 +194,11 @@ _PCL_ROLE_TOGGLE_KEYS = {
     PclRole.SAME_WINDING: "input_use_pcl_same_winding",
     PclRole.DRAWN_CONTROL_POINTS: "input_use_pcl_drawn_control_points",
 }
+
+
+def pcl_role_toggle_key(role: PclRole | str) -> str:
+    """The input_use_pcl_* configuration key gating one PCL role."""
+    return _PCL_ROLE_TOGGLE_KEYS[PclRole(role)]
 
 
 def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
@@ -259,7 +289,9 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # An invalid mode is reported as its own validation error; the
     # mode-derived asset predicates then all read as disabled so the invalid
     # mode never masquerades as missing-file errors.
-    mode = str(config.get("dense_spacing_mode", "phase"))
+    # Partial requests must select the same inputs as the fitter, which fills
+    # omitted fields from Config before constructing its context.
+    mode = str(config.get("dense_spacing_mode", Config().dense_spacing_mode))
     return mode if mode in ("phase", "grad_mag", "winding_model") else None
 
 
@@ -584,6 +616,19 @@ _CONVENTIONAL_PCL_INPUTS = tuple(
     (filename, role) for role, filename in PCL_ROLE_CONVENTIONS)
 
 
+def conventional_pcl_document_path(dataset_root: str, role: PclRole | str) -> str:
+    """Where a dataset keeps one role's point-collection document.
+
+    The same normalised spelling resolve_dataset_root() advertises, so a path
+    derived here compares equal to a resolved ``pcl_inputs`` entry. Empty
+    when there is no dataset root.
+    """
+    if not str(dataset_root or "").strip():
+        return ""
+    filename = dict(PCL_ROLE_CONVENTIONS)[PclRole(role)]
+    return _normalise_path(Path(_normalise_path(dataset_root)) / filename)
+
+
 class ScrollSpecError(ValueError):
     """A missing, malformed, or out-of-contract spiral-scroll.json."""
 
@@ -601,6 +646,9 @@ class ScrollSpec:
     name: str
     voxel_size_um: float
     spiral_outward_sense: str
+    # Shape of the volume coordinate domain used by Spiral surfaces. This is
+    # independent of physical voxel size and may be absent in legacy specs.
+    base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
     surf_sdt_zarr_group: str = "1"
@@ -648,6 +696,16 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
     if not voxel_size_um > 0:
         raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
+    base_shape_raw = document.get("base_shape_zyx")
+    base_shape_zyx = None
+    if base_shape_raw is not None:
+        if (not isinstance(base_shape_raw, (list, tuple))
+                or len(base_shape_raw) != 3
+                or any(type(value) is not int or value <= 0
+                       for value in base_shape_raw)):
+            raise ScrollSpecError(
+                f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
+        base_shape_zyx = tuple(base_shape_raw)
     sense = str(document["spiral_outward_sense"]).upper()
     if sense not in ("CW", "ACW"):
         raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
@@ -687,6 +745,7 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         name=name,
         voxel_size_um=voxel_size_um,
         spiral_outward_sense=sense,
+        base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
         surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
@@ -1204,8 +1263,7 @@ def validate_session_request(
         if spec.kind != "zarr-group":
             check_catalog_input(spec)
 
-    spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag", "winding_model"):
+    if _dense_spacing_mode(run.config) is None:
         errors.append({"field": "dense_spacing_mode",
                        "message": "Must be phase, grad_mag, or winding_model"})
 

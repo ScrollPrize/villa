@@ -8,8 +8,11 @@
 #include <QWidget>
 #include <functional>
 
+#include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
 #include "elements/VolumeSelector.hpp"
+
+#include <array>
 
 class QCheckBox;
 class QComboBox;
@@ -17,6 +20,7 @@ class QDialog;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QListWidgetItem;
 class QPushButton;
 class QSpinBox;
 class QDoubleSpinBox;
@@ -40,6 +44,12 @@ public:
     }
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
+    void setLocalDraftsReady(bool ready);
+    // Enables the Display toggle of one editable PCL role's overlay; an
+    // unavailable overlay is unchecked and explains itself in the tooltip.
+    void setPclOverlayAvailable(vc3d::spiral::PclRole role, bool available,
+                                const QString& reason = {});
+    [[nodiscard]] double pointViewTolerance() const;
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
@@ -54,7 +64,10 @@ signals:
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
+    void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
+    void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
+    void addDraftsRequested(bool commitAfterAdd);
 
 private:
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
@@ -74,6 +87,8 @@ private:
     void applyResolution(const QJsonObject& resolution, bool force);
     void applyScrollSpec(const QJsonObject& spec);
     void updateStatus(const QJsonObject& status);
+    void updateWarnings(const QJsonObject& status);
+    void refreshInputVisibility();
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
     QString pendingRebuildStage() const;
     void setSessionCheckpoint(const QString& hostPath);
@@ -102,6 +117,8 @@ private:
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
+    std::array<QCheckBox*, vc3d::spiral::kEditablePclRoles.size()> _showPclOverlays{};
+    QDoubleSpinBox* _pointViewTolerance = nullptr;
     QComboBox* _lossMap = nullptr;
     QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;
@@ -180,12 +197,17 @@ private:
     QWidget* _apiKeyRow = nullptr;
     QWidget* _mappingRow = nullptr;
 
-    // Ephemeral inputs
-    QListWidget* _ephemeralList = nullptr;
+    // Input drafts
+    QListWidget* _inputList = nullptr;
     QPushButton* _commitInputs = nullptr;
+    QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
-    QJsonArray _lastEphemeral;
+    QJsonArray _lastInputDrafts;
+    QHash<QString, QListWidgetItem*> _inputItems;
+    QLineEdit* _inputFilter = nullptr;
+    QCheckBox* _showOriginalInputs = nullptr;
+    QJsonObject _lastInputStatus;
     QJsonObject _loadedSessionRequest;
     QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;
@@ -205,12 +227,13 @@ private:
     bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
+    QString _editingAccessError;
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
+    bool _localDraftsReady = false;
     QString _previewTransferText;
     // Last reported session lifecycle state; "Error" is the recovery case.
     QString _sessionState;
-    int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;
     bool _runningGuardedExit = false;

@@ -1,5 +1,9 @@
 #pragma once
 
+#include "LineAnnotationController.hpp"
+#include "SpiralPclRole.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
+
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QHash>
@@ -10,6 +14,8 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -35,7 +41,10 @@ class Volume;
 class SpiralOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
+class SpiralLineDraftOverlay;
 class SegmentationOverlayController;
+class PointsOverlayController;
+class VCCollection;
 class VolumeViewerBase;
 
 class SpiralWorkspace : public QMainWindow
@@ -56,11 +65,25 @@ public:
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
+    void noteTrackedFiberSaved(uint64_t generation, const QString& fiberJsonPath);
+    void noteFiberRemoved(const QString& path);
+    bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);
+    bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
+    void noteManagedPatchSaved(const QString& path);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
+    void setLineAnnotationController(LineAnnotationController* controller);
+    [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
+    [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
+    [[nodiscard]] std::optional<double> fiberBaseToPreviewFactor() const {
+        return _fiberBaseToPreviewFactor;
+    }
+    void startLineAnnotationDraft();
 
 signals:
     void spiralSessionActiveChanged(bool active);
+    void fiberBaseToPreviewFactorChanged(double factor, bool valid);
+    void patchEditorRequested(const QString& id, const QString& path);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -78,6 +101,7 @@ private:
         QString surfaceId;
         std::vector<PreviewComponent> components;
         cv::Mat_<int32_t> windingIds;
+        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
         QString error;
         struct LossMap {
             QString name;
@@ -128,6 +152,10 @@ private:
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
+    void installPclArtifact(vc3d::spiral::PclRole role, const QString& manifestPath,
+                            const QJsonObject& artifactRef);
+    void refreshPclOverlay(vc3d::spiral::PclRole role);
+    void refreshPclOverlays();
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -147,11 +175,24 @@ private:
                                      const std::shared_ptr<QuadSurface>& surface,
                                      const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
+    void finalizeLineAnnotationDraft();
+    void cancelLineAnnotationDraft();
+    void undoLineAnnotationDraftPoint();
+    void appendLineAnnotationDraftPoint(const QPointF& scenePoint,
+                                        Qt::KeyboardModifiers modifiers);
+    [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+        resolveLineAnnotationInputs(QString* errorMessage) const;
+    [[nodiscard]] QStringList fallbackFiberManifests() const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveFiberBaseShape(QString* errorMessage) const;
+    void updatePreviewCoordinateScale();
+    void submitReadyDrafts(bool commitAfterAdd);
     void maybeCommitForPendingExit();
     QString provisionalBrushRoot() const;
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updatePendingPatchIds(const QJsonObject& status);
+    void inputDraftPrepared(const QString& alias, const QString& error = {});
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -163,6 +204,23 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<SpiralBrushController> _brush;
+    std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
+    // The display-only overlay of one editable PCL role (same-winding or
+    // relative-winding), fed by the service's snapshot artifact of that
+    // role's dataset file.
+    struct PclOverlayState {
+        std::unique_ptr<VCCollection> collection;
+        std::unique_ptr<PointsOverlayController> overlay;
+        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
+        QString manifestPath;
+        bool visible = false;
+    };
+    std::array<PclOverlayState, vc3d::spiral::kEditablePclRoles.size()> _pclOverlays;
+    PclOverlayState& pclOverlay(vc3d::spiral::PclRole role)
+    {
+        return _pclOverlays[vc3d::spiral::pclRoleIndex(role)];
+    }
+    LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
@@ -173,6 +231,16 @@ private:
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
+    QJsonObject _sessionRunConfig;
+    QString _externalFiberSource;
+    QSet<QString> _managedFiberDirectories;
+    struct LineAnnotationDraft {
+        std::shared_ptr<QuadSurface> surface;
+        std::vector<QPointF> surfacePoints;
+        std::shared_ptr<std::atomic_bool> saveAllowed;
+        bool optimizing = false;
+    };
+    std::optional<LineAnnotationDraft> _lineAnnotationDraft;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
@@ -184,6 +252,11 @@ private:
     quint64 _inputSurfaceGeneration = 0;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
+    std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
+    std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
+    std::optional<double> _previewToFiberBaseScale;
+    std::optional<double> _fiberBaseToPreviewFactor;
+    QString _previewCoordinateError;
     std::vector<PreviewComponent> _previewComponents;
     cv::Mat_<int32_t> _previewWindingIds;
     QString _previewRunDiffImagePath;
@@ -221,6 +294,14 @@ private:
     QHash<QString, QString> _pendingPointCollectionPaths;
     QHash<QString, QString> _pointCollectionProvisionalPaths;
     QSet<QString> _uncommittedPointCollectionIds;
+    // Role of each staged collection replacement, for user-facing messages.
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
+    QHash<QString, QString> _managedPatchCopies;
+    QHash<QString, QString> _inputFiberDirectories;
+    int _draftPreparationRemaining = 0;
+    bool _draftPreparationFailed = false;
+    // Keyed by Spiral input id (the fiber file stem), never by runtime
+    // fiber id: runtime ids are reassigned whenever the fiber list reloads.
+    using TrackedFiber = vc3d::SpiralTrackedFiber;
 };

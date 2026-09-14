@@ -147,16 +147,40 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
-def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
+def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
-    # JSONs. line_points is the dense traced polyline; the control points lie
-    # exactly on it, and the tracer extends it ~150 points past the first and
+    # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
+    # is the dense traced polyline; the control points lie exactly on it, and the tracer extends it ~150 points past the first and
     # last control point. We fit against the dense polyline, trimmed to the
     # first-to-last control point span so the dangling ends don't act as
     # constraints.
     with open(path, 'r') as f:
         data = json.load(f)
+
+    source_shape = data.get('coordinate_base_shape_zyx')
+    if source_shape is not None:
+        for name, shape in (('coordinate_base_shape_zyx', source_shape),
+                            ('base_shape_zyx', base_shape_zyx)):
+            if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
+                           or v <= 0 for v in shape)):
+                raise ValueError(f'{name} must contain three positive integers')
+        # Match VC3D's published domains: pyramids may round extents up or
+        # down, and same-level shapes may use inclusive maximum coordinates.
+        # Use the dyadic scale, not a ratio of rounded dimensions.
+        scales = []
+        for exponent in range(-5, 6):
+            factor = 2 ** abs(exponent)
+            large, small = ((source_shape, base_shape_zyx) if exponent <= 0
+                            else (base_shape_zyx, source_shape))
+            if all((abs(a - b) <= 1 if exponent == 0 else
+                    b in ((a + factor - 1) // factor, max(1, a // factor)))
+                   for a, b in zip(large, small)):
+                scales.append(2.0 ** exponent)
+        if len(scales) != 1:
+            raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
+        coordinate_scale = scales[0]
 
     if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
@@ -269,7 +293,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     return collection
 
 
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
     if not path:
         return {}, next_id
     fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
@@ -282,7 +306,9 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
     skipped = 0
     for fiber_path in fiber_paths:
         try:
-            pcl = load_fiber_point_collection(fiber_path, next_id, min_point_spacing=min_point_spacing)
+            pcl = load_fiber_point_collection(
+                fiber_path, next_id, min_point_spacing=min_point_spacing,
+                base_shape_zyx=base_shape_zyx)
         except Exception as e:
             print(f'WARNING: failed to load fiber {fiber_path}: {e}')
             skipped += 1
@@ -325,7 +351,8 @@ def _point_id_for_orig_index(pcl, orig_index):
     return int(np.argmin(np.abs(np.asarray(kept) - orig_index)))
 
 
-def resolve_fiber_links(point_collections, include_pending=False):
+def resolve_fiber_links(point_collections, include_pending=False,
+                        assume_unannotated=False):
     """Resolve stored branch metadata into concrete point-to-point links.
 
     Fibers/PCLs carry raw 'branches' (see load_fiber_point_collection), each
@@ -336,6 +363,10 @@ def resolve_fiber_links(point_collections, include_pending=False):
 
     Returns a list of dicts:
         {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
+
+    ``assume_unannotated`` is for the canonical fiber catalog: its shared
+    point dictionaries are zero-normalized after their first materialization,
+    but source fiber documents are intrinsically unannotated.
     """
     by_basename = {}
     for cid, pcl in point_collections.items():
@@ -348,7 +379,7 @@ def resolve_fiber_links(point_collections, include_pending=False):
     # decomposition, so every consumer of the link graph (the cross-patch merge,
     # the unattached walk sampling) agrees on membership. Must run before
     # normalise_pcl_winding_annotations 0-fills unannotated pcls.
-    annotated_cids = {
+    annotated_cids = set() if assume_unannotated else {
         cid for cid, pcl in point_collections.items()
         if any(np.isfinite(p['winding_annotation']) for p in pcl['points'].values())
     }
@@ -714,6 +745,11 @@ def merge_linked_point_collections(point_collections, link_components,
             continue
         merged_id = f'fibercomp:{num_merged}'
         rep = members[0][1]
+        logical_members = [
+            pcl.get('metadata', {}).get('logical_input_id')
+            for _, pcl in members
+            if pcl.get('metadata', {}).get('logical_input_id') is not None
+        ]
         if extra_edges:
             print(f'fiber-link component {merged_id} '
                   f'({[cid for cid, _ in members]}): {len(extra_edges)} '
@@ -723,7 +759,8 @@ def merge_linked_point_collections(point_collections, link_components,
             'name': merged_id,
             'sampling_group': rep.get('sampling_group', 'fibers'),
             'metadata': {'winding_is_absolute': False,
-                         'input_role': 'fiber_link_component'},
+                         'input_role': 'fiber_link_component',
+                         'logical_input_ids': logical_members},
             'points': merged_points,
             'link_member_cids': [cid for cid, _ in members],
             'chain': ComponentChain(member_sorted, pos_of, tree_parent, extra_edges),
@@ -1460,7 +1497,9 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    base_shape_zyx=None,
     progress=None,
+    input_extent_transform=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna.
 
@@ -1471,13 +1510,22 @@ def save_combined_preview(
     flow ODE to derive a bound the configuration already states. Only a run
     that leaves the index unset derives the bound, and then from a bounded
     sample rather than from every point.
+
+    ``slice_to_spiral_transform`` maps true scroll space to spiral space and
+    its inverse places the surface. ``input_extent_transform`` (default: the
+    same transform) is the one the inputs are read through when the bound is
+    derived: after a constraint-bake reset the resident inputs live in baked
+    space and are read through the live chain, while the surface is pulled
+    back through the composed frozen+live chain.
     """
+    if input_extent_transform is None:
+        input_extent_transform = slice_to_spiral_transform
     configured_outer = cfg.get('shell_outer_winding_idx')
     if configured_outer is not None:
         exclusive_upper = int(configured_outer) + 1
     else:
         (_, exclusive_upper), _, _ = compute_winding_range_and_input_extents(
-            slice_to_spiral_transform,
+            input_extent_transform,
             dr_per_winding,
             patches,
             unattached_pcl_strips,
@@ -1552,6 +1600,7 @@ def save_combined_preview(
         source='fit_spiral interactive preview',
         first_winding=first_winding,
         cleanup_erosion_cells=3,
+        base_shape_zyx=base_shape_zyx,
     )
     return manifest
 

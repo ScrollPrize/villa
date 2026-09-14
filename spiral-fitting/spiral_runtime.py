@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -104,6 +105,11 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # Extra slack on top of a caller-supplied operation timeout (checkpoint save,
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
+
+# Input application rebuilds resident catalogs, indices, fiber views, and GPU
+# influence masks.  Its acknowledgement is the result of that whole operation,
+# not the quick queue-admission acknowledgement covered above.
+INPUT_BATCH_TIMEOUT_S = 1200.0
 
 # How long one requested preview export may take. The window covers the whole
 # operation, not just the render: the host service Lasagna-flattens and hashes
@@ -302,6 +308,93 @@ class RendezvousEndpoint:
     store_path: str
 
 
+def _apply_input_changes_at_boundary(session, batch_id, records, influence_config, *,
+                                     timeout, distributed):
+    """Use the same prepare/decision protocol for local and distributed fits.
+
+    Coordinator receipts survive caller timeouts. Device/worker timeouts still
+    use the distributed runtime's existing fail-stop policy.
+    """
+    payload = json.dumps([records, influence_config], sort_keys=True,
+                         separators=(",", ":"), allow_nan=False)
+    with session._condition:
+        if not hasattr(session, "_revision_batch_lock"):
+            session._revision_batch_lock = threading.Lock()
+            session._revision_batch_receipts = {}
+        lock = session._revision_batch_lock
+
+    def call(name, arguments):
+        if distributed:
+            return session._call(name, arguments, collective=False, return_all=True,
+                                 timeout=timeout + COMMAND_ACK_GRACE_S)
+        methods = {"reserve_input_boundary": session.reserve_input_boundary,
+                   "cancel_input_boundary": session.cancel_input_boundary,
+                   "prepare_input_batch": session.prepare_input_batch,
+                   "finish_input_batch": session.finish_input_batch}
+        return {0: methods[name](**arguments)}
+
+    with lock:
+        receipts = session._revision_batch_receipts
+        receipt = receipts.get(batch_id)
+        if receipt is not None and receipt["payload"] != payload:
+            raise ValueError("Input batch ID reused with different content")
+        if receipt is None:
+            if any("result" not in previous for previous in receipts.values()):
+                raise ValueError("Reconcile the outstanding input batch first")
+            with session._condition:
+                session._live_reservation_epoch += 1
+                epoch = session._live_reservation_epoch
+                status = session.status()
+                target = int(status.get("current_iteration", 0))
+            for _ in range(32):
+                reservations = call("reserve_input_boundary", {
+                    "target_iteration": target, "reservation_epoch": epoch,
+                    "include_idle": True})
+                if all(result.get("reserved") for result in reservations.values()):
+                    break
+                call("cancel_input_boundary", {"reservation_epoch": epoch})
+                suggestions = [int(result["next_iteration"])
+                               for result in reservations.values()
+                               if not result.get("reserved")]
+                next_target = max(suggestions)
+                if next_target == target:
+                    raise ValueError("Resident fit cannot accept inputs in its current state")
+                target = next_target
+            else:
+                raise ValueError("Could not reserve a shared input boundary")
+            receipt = receipts[batch_id] = {
+                "payload": payload, "target": target, "epoch": epoch}
+        if "result" in receipt:
+            return copy.deepcopy(receipt["result"])
+        if "preparations" not in receipt:
+            captured_records, captured_config = json.loads(payload)
+            receipt["preparations"] = call("prepare_input_batch", {
+                "batch_id": batch_id, "records": captured_records,
+                "influence_config": captured_config,
+                "target_iteration": receipt["target"],
+                "reservation_epoch": receipt["epoch"], "timeout": timeout})
+        preparations = receipt["preparations"]
+        canonical = preparations[min(preparations)]
+        succeeded = all(result.get("prepared") for result in preparations.values())
+        agreed = all(result.get("membership") == canonical.get("membership")
+                     for result in preparations.values())
+        install = succeeded and agreed
+        outcomes = call("finish_input_batch", {
+            "batch_id": batch_id, "install": install, "timeout": timeout})
+        if install:
+            result = {"applied": True, "iteration": receipt["target"],
+                      "warnings": outcomes[min(outcomes)].get("warnings", []),
+                      "prepare_seconds": max(item.get("prepare_seconds", 0) for item in preparations.values()),
+                      "install_seconds": max(item.get("install_seconds", 0) for item in outcomes.values())}
+        else:
+            result = {"applied": False, "errors": {
+                str(rank): result.get("error", "Ranks disagreed on prepared input membership")
+                for rank, result in preparations.items()
+                if not result.get("prepared") or not agreed}}
+        receipt["result"] = result
+        return copy.deepcopy(result)
+
+
 class _SessionShutdown(BaseException):
     pass
 
@@ -399,14 +492,16 @@ class RebuildModelCommand(SessionCommand):
 
 
 @dataclasses.dataclass
-class IncorporateCommand(SessionCommand):
-    """Append newly uploaded ephemeral inputs to the resident fit."""
+class InputBatchCommand(SessionCommand):
+    """Prepare or install an immutable batch while holding a worker boundary."""
 
-    kind: ClassVar[str] = "incorporate"
-
+    kind: ClassVar[str] = "input_batch"
+    batch_id: str = ""
+    action: str = "prepare"
     records: list = dataclasses.field(default_factory=list)
-    mark_incorporated: Any = None
-    influence_config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    influence_config: dict = dataclasses.field(default_factory=dict)
+    reservation_epoch: int | None = None
+    candidate: Any = dataclasses.field(default=None, repr=False)
 
 
 @dataclasses.dataclass
@@ -526,7 +621,7 @@ class InteractiveFitSession:
         self._autosave_on_pause = True
         # The FitContext this session owns, set on the fitter thread once the
         # device state is built. It doubles as the capability flag for the
-        # fitter operations (save/preview/incorporate/configure).
+        # fitter operations (save/preview/apply/configure).
         self._context = None
         # Commands queued for the fitter thread's pause boundary, oldest
         # first. Both the generation and the configuration revision fence
@@ -547,6 +642,14 @@ class InteractiveFitSession:
         # under. Re-checked at every pause boundary before another step.
         self._step_epoch = 0
         self._step_config_revision = 0
+        # A input-batch reservation prevents this rank from crossing
+        # the agreed DDP boundary while the coordinator completes the second
+        # phase.  The iteration in progress is tracked separately so a claim
+        # never targets a step that has already begun.
+        self._live_reservation_iteration = None
+        self._live_reservation_epoch = 0
+        self._input_batches = {}
+        self._iteration_in_progress = None
         self.progress = ProgressReporter(
             self._progress_changed,
             stream=sys.stdout,
@@ -741,6 +844,7 @@ class InteractiveFitSession:
                 storage_backend=self.run_config.storage_backend,
                 render_volume_scale=self.run_config.render_volume_scale,
                 dist_context=dist_context)
+            context.check_cuda_ready()
             context.load_host_inputs()
             context.resolve_output_path()
             context.build_device_state()
@@ -757,6 +861,17 @@ class InteractiveFitSession:
                     self._transition_locked(SessionState.Error, "Error")
             self._publish_status()
         finally:
+            with self._condition:
+                # Prepared candidates own device tensors too. Release them on
+                # this worker and resolve waiters when recovery is impossible.
+                for batch in self._input_batches.values():
+                    batch["prepare"].candidate = None
+                for command in self._commands:
+                    command.fail(self._error or "Resident fitter closed")
+                self._commands.clear()
+                self._prepared_input_batch_id = None
+                self._live_reservation_iteration = None
+                self._condition.notify_all()
             if context is not None:
                 # Resource release runs here, on the owning fitter thread.
                 context.close()
@@ -883,11 +998,7 @@ class InteractiveFitSession:
         with self._condition:
             self._applied_config = copy.deepcopy(config)
             self._run_config = run_mutable_config(config)
-            self._run_config_limits = {
-                'track_max_track_crossing_per_step': max(
-                    int(config.get('track_crossing_precompute_max', 0)),
-                    int(config.get('track_max_track_crossing_per_step', 0))),
-            }
+            self._run_config_limits = self._run_config_limits_for(config)
             self._default_advanced_config = default_advanced_config
         self._publish_status()
         return config
@@ -932,6 +1043,55 @@ class InteractiveFitSession:
             context.log_step_metrics(
                 iteration, loss, losses, log_metrics, shell_metrics)
 
+    def _next_command_locked(self):
+        """Dequeue the next command this boundary may execute.
+
+        Live commands hold a reserved optimizer boundary that may still lie
+        ahead of this rank: with uneven GPU progress the coordinator reserves
+        the boundary the fastest rank suggested. Such a command stays queued
+        until this rank reaches that boundary rather than being cancelled as
+        stale here. Outside Running, nothing is deferred: the reserved
+        boundary can no longer be reached and the command resolves through
+        its own no-future-step path or the stale check.
+        """
+        if not self._commands:
+            return None
+        held_batch = getattr(self, "_prepared_input_batch_id", None)
+        if held_batch is not None:
+            for index, queued in enumerate(self._commands):
+                if (isinstance(queued, InputBatchCommand)
+                        and queued.batch_id == held_batch and queued.action != "prepare"):
+                    return self._commands.pop(index)
+            return None
+        if self._state is SessionState.Running:
+            for index, queued in enumerate(self._commands):
+                if (getattr(queued, "reservation_epoch", None) is not None
+                        and queued.expected_iteration is not None
+                        and queued.expected_iteration > self._completed):
+                    continue
+                return self._commands.pop(index)
+            return None
+        return self._commands.pop(0)
+
+    def _release_live_reservation_locked(self, command):
+        """Drop the boundary a live command holds, if it is still current."""
+        reservation_epoch = getattr(command, "reservation_epoch", None)
+        if (reservation_epoch is not None
+                and self._live_reservation_iteration is not None
+                and self._live_reservation_epoch == reservation_epoch):
+            self._live_reservation_iteration = None
+            self._condition.notify_all()
+
+    def _live_expected_config_revision_locked(self):
+        """The revision a live command will find when it executes.
+
+        A Run's queued ConfigureCommand bumps the revision as it is applied,
+        ahead of every live command queued behind it; a live command queued
+        during that window must expect the post-configure revision.
+        """
+        return self._config_revision + sum(
+            isinstance(queued, ConfigureCommand) for queued in self._commands)
+
     def wait_for_iteration(self, iteration):
         while True:
             with self._condition:
@@ -939,13 +1099,20 @@ class InteractiveFitSession:
                     raise _SessionShutdown()
                 # Commands are drained before the pending check so inputs
                 # queued by run() are incorporated before the next step begins.
-                command = self._commands.pop(0) if self._commands else None
+                command = self._next_command_locked()
                 if command is None:
                     if self._pending > 0:
+                        reserved_iteration = getattr(
+                            self, "_live_reservation_iteration", None)
+                        if (reserved_iteration is not None
+                                and iteration >= reserved_iteration):
+                            self._condition.wait()
+                            continue
                         # Last gate before another training step: this rank
                         # only steps in the epoch and configuration revision
                         # its run was admitted under.
                         self._check_step_barrier_locked()
+                        self._iteration_in_progress = iteration
                         return
                     self._condition.wait()
                     continue
@@ -959,11 +1126,18 @@ class InteractiveFitSession:
                     session_generation=self.session_generation,
                     iteration=self._completed,
                     config_revision=self._config_revision)
+                if stale is not None:
+                    # A cancelled live command must not leave its boundary
+                    # held: the step loop would otherwise park at it forever.
+                    self._release_live_reservation_locked(command)
             if stale is not None:
-                command.cancel(stale)
+                if isinstance(command, InputBatchCommand) and command.action == "prepare":
+                    command.complete(prepared=False, error=stale)
+                else:
+                    command.cancel(stale)
                 continue
-            if isinstance(command, IncorporateCommand):
-                self._run_incorporation(command)
+            if isinstance(command, InputBatchCommand):
+                self._run_input_batch(command)
                 continue
             if isinstance(command, ConfigureCommand):
                 self._run_configuration(command)
@@ -1169,62 +1343,135 @@ class InteractiveFitSession:
             else:
                 command.fail(error)
 
-    def _run_incorporation(self, command):
-        """Append newly uploaded ephemeral inputs to the resident fit.
-
-        Runs on the fitter thread at the pause boundary. A failure cancels the
-        queued run and surfaces a warning instead of tearing down the session.
-        """
-        records = command.records
-        mark_incorporated = command.mark_incorporated
-        influence_config = command.influence_config
-        try:
-            if self._context is None:
-                raise RuntimeError(
-                    "The resident fitter does not support adding inputs to a running session")
-            with self._condition:
-                self._phase = "Incorporating new session inputs"
-                # run() set the pause-boundary target alongside the queued
-                # inputs; the context sizes its DT-free window from it.
-                current_iteration = self._completed
-                target_iteration = self._target
-            self._progress_reporter().begin(
-                "incorporating_inputs", "Incorporating new session inputs",
-                step=0, total_steps=len(records), unit="inputs")
-            self._publish_status()
-            incorporation_warnings = self._context.incorporate_interactive_inputs(
-                records, influence_config,
-                current_iteration=current_iteration,
-                target_iteration=target_iteration)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+    def _run_input_batch(self, command):
+        started = time.perf_counter()
+        if command.action == "prepare":
+            self._prepared_input_batch_id = command.batch_id
+            try:
+                command.candidate = self._context.prepare_input_changes(
+                    command.records, command.influence_config,
+                    current_iteration=self._completed, target_iteration=self._target)
+            except (ValueError, OSError) as exc:
+                # Content/domain preparation failures leave the active context
+                # intact. Hold this rank until every sibling is discarded.
+                command.complete(prepared=False, error=f"{type(exc).__name__}: {exc}")
+                return
+            except BaseException as exc:
+                command.fail(f"{type(exc).__name__}: {exc}")
+                raise  # Unexpected worker/device failures remain fail-stop.
+            candidate = command.candidate
+            command.complete(prepared=True, prepare_seconds=time.perf_counter() - started, membership={
+                "inputs": candidate._workspace_membership,
+                "verified_patches": list(candidate.verified_patches),
+                "unverified_patches": list(candidate.unverified_patches),
+            })
+            return
+        prepared = self._input_batches[command.batch_id]["prepare"]
+        if command.action == "install":
+            if prepared.candidate is None:
+                command.fail("Input batch has no prepared candidate")
+                return
+            try:
+                warnings = self._context.install_input_changes(prepared.candidate)
+            except BaseException as exc:
+                command.fail(f"{type(exc).__name__}: {exc}")
+                raise  # Installation must never resume partially changed ranks.
+            result = {"applied": True, "warnings": warnings,
+                      "install_seconds": time.perf_counter() - started}
+        else:
+            result = {"discarded": True}
+        prepared.candidate = None
+        with self._condition:
+            self._prepared_input_batch_id = None
+            self._release_live_reservation_locked(command)
+            running = self._state is SessionState.Running
+        # Preparation shares the fitter's progress reporter. Restore its
+        # owner after both install and discard, before training can resume.
+        if running:
+            self._begin_optimization_progress()
+        else:
             self._progress_reporter().clear()
             with self._condition:
-                self._pending = 0
-                self._target = self._completed
-                self._warnings.append(f"Input incorporation failed: {error}")
-                self._transition_locked(
-                    SessionState.Idle, IDLE_PHASE,
-                    reason="input incorporation failed")
-            if mark_incorporated is not None:
-                mark_incorporated(records, error=error)
-            command.fail(error)
-            self._publish_status()
-        else:
-            if mark_incorporated is not None:
-                mark_incorporated(records)
-            with self._condition:
-                # Incorporation warnings are advisory (the inputs were taken):
-                # they ride the status warnings the panel already displays.
-                self._warnings.extend(incorporation_warnings or ())
-                if self._state is SessionState.Running:
-                    self._phase = "Optimizing"
-            command.complete(incorporated=len(records))
-            if getattr(self, "_state", None) is SessionState.Running:
-                self._begin_optimization_progress()
+                self._transition_locked(SessionState.Idle, IDLE_PHASE)
+        self._publish_status()
+        command.complete(**result)
+
+    def prepare_input_batch(self, batch_id, records, influence_config=None, *,
+                            target_iteration, reservation_epoch,
+                            timeout=INPUT_BATCH_TIMEOUT_S):
+        payload = json.dumps([records, influence_config or {}], sort_keys=True,
+                             allow_nan=False, separators=(",", ":"))
+        with self._condition:
+            if self._state not in {SessionState.Idle, SessionState.Running}:
+                raise RuntimeError(getattr(self, "_error", None) or "Resident fitter is unavailable")
+            batches = self._input_batches
+            batch = batches.get(batch_id)
+            if batch is not None:
+                if batch["payload"] != payload:
+                    raise ValueError("Input batch ID reused with different content")
+                command = batch["prepare"]
             else:
-                self._progress_reporter().clear()
-            self._publish_status()
+                if (self._live_reservation_iteration != target_iteration
+                        or self._live_reservation_epoch != reservation_epoch):
+                    raise ValueError("Input batch does not own its worker boundary")
+                captured_records, captured_config = json.loads(payload)
+                command = InputBatchCommand(
+                    batch_id=batch_id, session_generation=self.session_generation,
+                    expected_iteration=target_iteration,
+                    expected_config_revision=self._live_expected_config_revision_locked(),
+                    reservation_epoch=reservation_epoch, records=captured_records,
+                    influence_config=captured_config)
+                batches[batch_id] = {"payload": payload, "prepare": command}
+                self._commands.append(command)
+                self._condition.notify_all()
+        return self._wait_input_batch(command, timeout)
+
+    def _wait_input_batch(self, command, timeout):
+        # A timeout is an unknown outcome. Keep the immutable command and its
+        # boundary; the same batch ID can reconcile without executing twice.
+        deadline = time.monotonic() + timeout
+        while not command.wait(min(.1, max(0, deadline - time.monotonic()))):
+            with self._condition:
+                if self._state in {SessionState.Error, SessionState.Closing}:
+                    raise RuntimeError(getattr(self, "_error", None) or "Resident fitter closed")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Input batch {command.batch_id} outcome is unknown")
+        if command.error is not None:
+            raise RuntimeError(command.error)
+        return dict(command.result)
+
+    def finish_input_batch(self, batch_id, *, install, timeout=INPUT_BATCH_TIMEOUT_S):
+        with self._condition:
+            batch = self._input_batches[batch_id]
+            prepared = batch["prepare"]
+            if not prepared.done.is_set():
+                raise ValueError("Input preparation is still running")
+            if install and not prepared.result.get("prepared"):
+                raise ValueError("Input preparation did not succeed")
+            action = "install" if install else "discard"
+            command = batch.get("finish")
+            if command is not None:
+                if command.action != action:
+                    raise ValueError("Input batch already has a different decision")
+            else:
+                command = InputBatchCommand(
+                    batch_id=batch_id, action=action,
+                    session_generation=self.session_generation,
+                    expected_iteration=prepared.expected_iteration if install else None,
+                    reservation_epoch=prepared.reservation_epoch)
+                batch["finish"] = command
+                self._commands.append(command)
+                self._condition.notify_all()
+        return self._wait_input_batch(command, timeout)
+
+    @staticmethod
+    def _run_config_limits_for(config):
+        """Per-Run ceilings the resident prepared pools impose."""
+        return {
+            'track_max_track_crossing_per_step': max(
+                int(config.get('track_crossing_precompute_max', 0)),
+                int(config.get('track_max_track_crossing_per_step', 0))),
+        }
 
     def _run_configuration(self, command):
         """Apply validated Run-scoped settings on the fitter thread."""
@@ -1251,21 +1498,15 @@ class InteractiveFitSession:
             with self._condition:
                 self._pending = 0
                 self._target = self._completed
-                # Leave newly uploaded inputs pending for a later valid Run.
-                abandoned = [queued for queued in self._commands
-                             if isinstance(queued, IncorporateCommand)]
-                self._commands = [queued for queued in self._commands
-                                  if not isinstance(queued, IncorporateCommand)]
+                # No step follows a failed configure; a live boundary held
+                # for this Run has nothing left to wait for.
+                self._live_reservation_iteration = None
                 self._warnings.append(f"Run configuration failed: {error}")
                 if previous_run_config is not None:
                     self._run_config.update(previous_run_config)
                 self._transition_locked(
                     SessionState.Idle, IDLE_PHASE,
                     reason="run configuration failed")
-            for queued in abandoned:
-                queued.cancel(
-                    f"cancelled by failed configure command "
-                    f"{command.command_id}")
             command.fail(error)
             self._publish_status()
         else:
@@ -1275,6 +1516,16 @@ class InteractiveFitSession:
                     self._run_config.update(config)
                     self.requested_config.update(config)
                     self.input_manifest.update(path_changes)
+                    # A role toggle loads or drops point-collection
+                    # documents; the manifest names what is resident.
+                    context_paths = getattr(self._context, 'paths', None)
+                    if context_paths is not None and 'pcls' in self.input_manifest:
+                        self.input_manifest['pcls'] = \
+                            context_paths.manifest()['pcls']
+                    # A crossing-ceiling change re-prepared the track pool
+                    # with the new ceiling; advertise it.
+                    self._run_config_limits = self._run_config_limits_for(
+                        self._applied_config)
             with self._condition:
                 self._config_revision += 1
                 if command.epoch is not None:
@@ -1332,6 +1583,31 @@ class InteractiveFitSession:
             self._publish_status()
             return
         context = self._context
+        # Run-boundary settings that changed alongside the model-stage ones
+        # are applied through the same path a Run would use, while the live
+        # model still exists: a refusal there is harmless, and the host-side
+        # effects (strata, strips, track pool) survive the model release
+        # below. rebuild_stage() ignored these keys when it chose "model".
+        run_changes = {
+            key: value for key, value in run_mutable_config(config).items()
+            if context.config.get(key) != value
+        }
+        if run_changes:
+            try:
+                context.apply_config(
+                    run_changes, current_iteration=self._completed)
+            except Exception as exc:
+                self._progress_reporter().clear()
+                self.paths, self.run_config = previous_paths, previous_run
+                self._resolve_session_config(self._dist_world_size)
+                with self._condition:
+                    self._warnings.append(f"Model rebuild failed: {exc}")
+                    self._transition_locked(
+                        SessionState.Idle, IDLE_PHASE,
+                        reason="model rebuild refused")
+                command.fail(f"{type(exc).__name__}: {exc}")
+                self._publish_status()
+                return
         context.config.update(config)
         context.paths = paths
         context.resume_path = paths.checkpoint or None
@@ -1370,6 +1646,7 @@ class InteractiveFitSession:
 
     def iteration_completed(self, *, completed_iterations, total_loss, losses, learning_rate, metrics=None):
         with self._condition:
+            self._iteration_in_progress = None
             self._completed = completed_iterations
             self._latest_metrics = {"total_loss": total_loss, "losses": dict(losses),
                                     "learning_rate": learning_rate, **dict(metrics or {})}
@@ -1431,8 +1708,7 @@ class InteractiveFitSession:
         self._publish_status()
 
     # Coordinator-thread commands.
-    def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, influence_config=None, run_config=None, path_changes=None,
             autosave_on_pause=True, barrier=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
@@ -1480,8 +1756,7 @@ class InteractiveFitSession:
                     key: self._run_config.get(key)
                     for key in run_config
                 }
-                # Configuration is queued ahead of incorporation: new inputs
-                # must be incorporated under the settings this run asked for.
+                # Apply the requested configuration before taking any steps.
                 self._commands.append(ConfigureCommand(
                     session_generation=self.session_generation,
                     epoch=epoch,
@@ -1490,17 +1765,6 @@ class InteractiveFitSession:
                     config=run_config, path_changes=path_changes,
                     previous_run_config=previous_run_config))
                 self._run_config.update(run_config)
-            if pending_inputs:
-                if self._context is None:
-                    raise RuntimeError(
-                        "The resident fitter does not support adding inputs to a running session")
-                self._commands.append(IncorporateCommand(
-                    session_generation=self.session_generation,
-                    epoch=epoch,
-                    expected_iteration=self._completed,
-                    records=list(pending_inputs),
-                    mark_incorporated=mark_incorporated,
-                    influence_config=dict(influence_config or {})))
             self._pending = count
             self._run_start_completed = self._completed
             self._target = target
@@ -1514,12 +1778,63 @@ class InteractiveFitSession:
             self._condition.notify_all()
             return self._target
 
+    def reserve_input_boundary(self, target_iteration, reservation_epoch, *,
+                                   include_idle=False):
+        """Phase one: hold one still-future optimizer boundary."""
+        with self._condition:
+            if (self._state is not SessionState.Running
+                    and not (include_idle and self._state is SessionState.Idle)):
+                return {"reserved": False, "no_future_step": True,
+                        "next_iteration": self._completed}
+            target_iteration = int(target_iteration)
+            in_progress = self._iteration_in_progress
+            if (target_iteration < self._completed
+                    or target_iteration > self._target
+                    or (target_iteration == self._target and not include_idle)
+                    or (in_progress is not None
+                        and target_iteration <= in_progress)):
+                suggestion = (in_progress + 1
+                              if in_progress is not None else self._completed)
+                return {"reserved": False,
+                        "no_future_step": suggestion >= self._target,
+                        "next_iteration": suggestion}
+            if (self._live_reservation_iteration is not None
+                    and (self._live_reservation_iteration != target_iteration
+                         or self._live_reservation_epoch != reservation_epoch)):
+                return {"reserved": False, "no_future_step": True,
+                        "next_iteration": (in_progress + 1
+                                           if in_progress is not None
+                                           else self._completed)}
+            self._live_reservation_iteration = target_iteration
+            self._live_reservation_epoch = int(reservation_epoch)
+            self._condition.notify_all()
+            return {"reserved": True, "target_iteration": target_iteration,
+                    "reservation_epoch": int(reservation_epoch)}
+
+    def cancel_input_boundary(self, reservation_epoch):
+        with self._condition:
+            if self._live_reservation_epoch == int(reservation_epoch):
+                self._live_reservation_iteration = None
+                self._condition.notify_all()
+        return {"cancelled": True}
+
+    def apply_input_changes(self, batch_id, records, influence_config=None, *,
+                            timeout=INPUT_BATCH_TIMEOUT_S):
+        return _apply_input_changes_at_boundary(
+            self, batch_id, records, influence_config or {}, timeout=timeout,
+            distributed=False)
+
     def stop(self, barrier=None):
         with self._condition:
             if self._state is not SessionState.Running:
                 raise RuntimeError("Session is not running")
             self._enter_epoch_locked("stop", barrier)
             self._stop_requested = True
+            self._live_reservation_iteration = None
+            # If stop landed exactly between steps, permit the one boundary
+            # needed to observe _stop_requested under the stop epoch.
+            self._step_epoch = self._command_epoch
+            self._condition.notify_all()
 
     def save_checkpoint(self, path, timeout=120.0):
         with self._condition:
@@ -1546,7 +1861,13 @@ class InteractiveFitSession:
             self._commands.append(command)
             self._condition.notify_all()
         if not command.wait(timeout):
-            raise TimeoutError(f"{command.kind} command timed out")
+            with self._condition:
+                if not command.done.is_set():
+                    if command in self._commands:
+                        self._commands.remove(command)
+                        command.cancel(f"{command.kind} command timed out after {timeout:g}s")
+                        self._condition.notify_all()
+                    raise TimeoutError(f"{command.kind} command timed out after {timeout:g}s")
         if command.error is not None:
             raise RuntimeError(command.error)
         return dict(command.result)
@@ -1693,14 +2014,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
             barrier, command_id, name, arguments = commands.get()
             try:
                 if name == "run":
-                    mark_incorporated = None
-                    if rank == 0 and arguments.get("pending_inputs"):
-                        def mark_incorporated(records, error=None, cid=command_id):
-                            events.put(("incorporated", cid, error))
                     result = session.run(
                         arguments["count"],
-                        pending_inputs=arguments.get("pending_inputs"),
-                        mark_incorporated=mark_incorporated,
                         influence_config=arguments.get("influence_config"),
                         run_config=arguments.get("run_config"),
                         path_changes=arguments.get("path_changes"),
@@ -1710,6 +2025,18 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     )
                 elif name == "stop":
                     result = session.stop(barrier=barrier)
+                elif name == "reserve_input_boundary":
+                    result = session.reserve_input_boundary(
+                        arguments["target_iteration"],
+                        arguments["reservation_epoch"],
+                        include_idle=arguments.get("include_idle", False))
+                elif name == "prepare_input_batch":
+                    result = session.prepare_input_batch(**arguments)
+                elif name == "finish_input_batch":
+                    result = session.finish_input_batch(**arguments)
+                elif name == "cancel_input_boundary":
+                    result = session.cancel_input_boundary(
+                        arguments["reservation_epoch"])
                 elif name == "export_preview":
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
@@ -1848,7 +2175,6 @@ class DistributedInteractiveFitSession:
             },
         }
         self._acks = {}
-        self._incorporation_callbacks = {}
         self._rank_statuses = {}
         self._failed_error = None
         self._closed = False
@@ -1860,6 +2186,7 @@ class DistributedInteractiveFitSession:
         # The coordinator's command epoch. Every all-rank command carries the
         # next value; ranks refuse anything else.
         self._command_epoch = 0
+        self._live_reservation_epoch = 0
         # The last state every rank agreed on. Nothing else is publishable as
         # a collective state.
         self._collective_state = SessionState.Loading
@@ -2079,14 +2406,6 @@ class DistributedInteractiveFitSession:
                 with self._condition:
                     self._acks.setdefault(command_id, {})[rank] = (ok, result)
                     self._condition.notify_all()
-            elif kind == "incorporated":
-                _, command_id, error = event
-                with self._condition:
-                    pending_callback = self._incorporation_callbacks.pop(command_id, None)
-                if pending_callback is not None:
-                    callback, records = pending_callback
-                    callback(records, error=error) if error else callback(records)
-                continue
             elif kind == "worker_error":
                 _, rank, error, trace = event
                 self._publish_rank_event(rank, {
@@ -2100,8 +2419,8 @@ class DistributedInteractiveFitSession:
                 callback(snapshot)
 
     def _call(self, name, arguments=None, ranks=None,
-              timeout=COMMAND_ACK_TIMEOUT_S, incorporation_callback=None,
-              collective=True):
+              timeout=COMMAND_ACK_TIMEOUT_S,
+              collective=True, return_all=False):
         """Send one command to the participating ranks and await every ack.
 
         ``collective`` commands carry a barrier: the same epoch, kind,
@@ -2117,10 +2436,6 @@ class DistributedInteractiveFitSession:
         ranks = tuple(range(len(self._processes))) if ranks is None else tuple(ranks)
         command_id = uuid.uuid4().hex
         with self._condition:
-            if incorporation_callback is not None:
-                records = list((arguments or {}).get("pending_inputs", []))
-                self._incorporation_callbacks[command_id] = (
-                    incorporation_callback, records)
             barrier = self._issue_barrier(name) if collective else None
         for rank in ranks:
             self._commands[rank].put(
@@ -2129,11 +2444,9 @@ class DistributedInteractiveFitSession:
         with self._condition:
             while len(self._acks.get(command_id, {})) < len(ranks):
                 if self._failed_error is not None:
-                    self._incorporation_callbacks.pop(command_id, None)
                     raise RuntimeError(self._failed_error)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._incorporation_callbacks.pop(command_id, None)
                     silent = [rank for rank in ranks
                               if rank not in self._acks.get(command_id, {})]
                     break
@@ -2143,8 +2456,9 @@ class DistributedInteractiveFitSession:
                 failures = [f"rank {rank}: {responses[rank][1]}" for rank in ranks
                             if not responses[rank][0]]
                 if failures:
-                    self._incorporation_callbacks.pop(command_id, None)
                     raise RuntimeError("; ".join(failures))
+                if return_all:
+                    return {rank: responses[rank][1] for rank in ranks}
                 return responses[ranks[0]][1]
         # A command that is not acknowledged in bounded time means a rank is
         # wedged; the session fails now rather than when a collective
@@ -2153,22 +2467,25 @@ class DistributedInteractiveFitSession:
             f"Timed out after {timeout:.0f}s waiting for GPU worker ranks "
             f"{silent} to {name}"))
 
-    def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, influence_config=None, run_config=None, path_changes=None,
             autosave_on_pause=True):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
         arguments = {
             "count": count,
-            "pending_inputs": list(pending_inputs or []),
             "influence_config": dict(influence_config or {}),
             "run_config": dict(run_config or {}),
             "path_changes": dict(path_changes or {}),
             "autosave_on_pause": bool(autosave_on_pause),
         }
-        return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S,
-                          incorporation_callback=mark_incorporated)
+        return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S)
+
+    def apply_input_changes(self, batch_id, records, influence_config=None, *,
+                            timeout=INPUT_BATCH_TIMEOUT_S):
+        return _apply_input_changes_at_boundary(
+            self, batch_id, records, influence_config or {}, timeout=timeout,
+            distributed=True)
 
     def stop(self):
         state = self.status()["state"]
@@ -2238,8 +2555,17 @@ class DistributedInteractiveFitSession:
                           ranks=(0,), timeout=timeout + COMMAND_ACK_GRACE_S,
                           collective=False)
 
+    def _require_stopped(self):
+        # A timed-out close sets _closed before cleanup. Retrying it must not
+        # authorize deleting inputs while a process or listener is still alive.
+        if any(process.is_alive() for process in self._processes) or any(
+                thread is not None and thread.is_alive()
+                for thread in (self._listener, self._watchdog_thread)):
+            raise TimeoutError("Spiral GPU workers or listeners are still using session files")
+
     def close(self, timeout=15.0):
         if self._closed:
+            self._require_stopped()
             return
         with self._condition:
             self._closing = True
@@ -2248,6 +2574,7 @@ class DistributedInteractiveFitSession:
             self._abort_workers()
             self._stop_coordinator_threads()
             self._close_rendezvous()
+            self._require_stopped()
             return
         try:
             self._call("close", {"timeout": timeout},
@@ -2265,6 +2592,7 @@ class DistributedInteractiveFitSession:
                 raise TimeoutError("Spiral GPU workers did not stop at a safe boundary")
             self._stop_coordinator_threads()
             self._close_rendezvous()
+            self._require_stopped()
 
 
 def create_session(paths, run, preview, scroll, status_callback=None,

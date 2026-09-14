@@ -4,6 +4,88 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## CUDA startup check
+
+VC3D fit sessions and command-line fits allocate one CUDA element and synchronize
+before loading fit inputs. This creates the CUDA context before dataset reads
+increase filesystem cache pressure, and reports startup failures independently
+of atlas size. CPU-only `FitContext.load_host_inputs()` callers remain unchanged.
+The GPU atlas progress messages appear when geometry is actually materialized.
+
+On Linux NVIDIA GB10 systems, startup OOM diagnostics include host memory figures
+and NVIDIA's manual cache-flush workaround. The application never flushes system
+caches itself. Early initialization does not guarantee that the full fit will
+fit in shared CPU/GPU memory.
+
+Validate with the existing environment, from the repository root:
+
+```sh
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_cuda_startup.py \
+  spiral-fitting/tests/test_spiral_headless.py \
+  spiral-fitting/tests/test_spiral_progress.py
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c \
+  'from types import SimpleNamespace; from fit_spiral import FitContext; FitContext.check_cuda_ready(SimpleNamespace(progress=None))'
+```
+
+See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
+
+## Editing input snapshots
+
+The service snapshots patch directories, fiber JSON files and point collections
+when claiming a dataset editing workspace. `input_snapshot.py` tries Linux
+`FICLONE` or macOS `clonefile` for independent copy-on-write files. Unsupported
+filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
+errors propagate. Hard links are never used.
+
+The fallback hashes bytes while copying, verifies the destination, and compares
+the final source fingerprint with the captured tree. Clones are hashed once and
+compared with the final source. This reduces full content reads from four to
+three for ordinary copies and two for clones. Snapshots retain the existing
+SHA-256 format, sorted tree membership, empty directories and symlink rejection.
+Changes during capture that leave the source different from the captured bytes
+are rejected. No model inputs, precision or numerical algorithms change.
+
+Run the focused tests using the existing environment, from the repository root:
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_input_snapshot.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py
+```
+
+Benchmark real patches (temporary copies are removed; sources stay unchanged):
+
+```sh
+PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python \
+  spiral-fitting/tests/benchmark_input_snapshots.py \
+  /home/sean/Desktop/spiral_dataset/verified_patches --iterations 5 --profile
+```
+
+Use `--destination PATH` to test another filesystem. The default is `/tmp`.
+`--count` selects the first N sorted patch directories (default 32).
+
+Measured on Linux arm64, CPython 3.14, without Python optimization flags, with
+`cProfile` enabled for both versions: 32 real verified patches, 55,302,864 bytes,
+five iterations, ordinary-copy fallback on the local ext-family filesystem.
+These are cache-warm measurements, not end-to-end fit initialization times.
+
+| Snapshot implementation | Mean | Min | Median | Max |
+| --- | ---: | ---: | ---: | ---: |
+| Previous copy plus three hash passes | 166.8 ms | 160.8 ms | 162.2 ms | 181.0 ms |
+| Streamed copy/hash plus verification | 152.3 ms | 148.9 ms | 153.2 ms | 154.0 ms |
+
+Mean time decreased 8.7%. Before the change, fingerprint calls accounted for
+0.649 s of 0.834 s total across all five iterations; file copying accounted for
+0.177 s. Afterwards, hashing remains the largest cost (0.336 s in SHA-256 updates),
+but the separate source pre-read is eliminated. Reflink throughput and actual
+macOS cloning require validation on supporting filesystems; unit tests cover
+the platform dispatch and fallback/error paths.
+
+Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
+and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
+
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
@@ -307,26 +389,123 @@ inference, and the outer shell. For example:
 }
 ```
 
-Changing one requires a whole-fit rebuild. Disabling a prerequisite also
-disables its dependent supervision: phase spacing needs normals and surface
-SDT, while winding inference needs the outer shell.
+Most role switches require a whole-fit rebuild; same-winding and relative PCL
+switches apply at the next Run. Disabled roles retain their accepted workspace
+content, and enabling a role restores that desired content. Disabling a
+prerequisite also disables its dependent supervision: phase spacing needs
+normals and surface SDT, while winding inference needs the outer shell.
 
-While a session is active you can right-click a patch in the Surface panel or
-a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
-are uploaded into a session-scoped ephemeral folder, used from the next run
-onward, and can be moved into the shared dataset with *Commit current inputs*.
-Commits from multiple service processes are serialized; distinct inputs and
-point collections are preserved, while an existing patch or fiber identifier
-is reported as a conflict and is never overwritten.
+The API 33 client and service use one revisioned input workspace per dataset.
+One service holds the dataset editing lease and one client owns that workspace;
+other connections can observe. Disconnecting retains ownership, drafts and
+command receipts. Reconnect with the same client resumes them. A fit rebuild
+replays desired inputs without replacing the editing workspace. Reconnect and
+rebuild also discover newly added dataset inputs, preserving their collection
+IDs and any existing workspace edits. A restarted service replaces a clean
+client catalog; pending edits or commands stay tied to their original workspace.
 
-Interactive influence settings are scoped to each **Run** request. The fitter
-builds a fresh influence region from only the inputs pending for that run,
-uses it for the requested iteration window, and discards it before autosaving.
+**Add/Apply changes** captures the selected local revisions and applies the
+whole validated batch at a worker boundary, including while idle or after the
+final step. **Commit current inputs** first applies the selected revisions,
+then persists those exact revisions. Editing can continue during either action;
+a response for an older revision leaves newer edits dirty. Failed transfers or
+publication can be retried with the retained command and bytes.
+
+In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
+points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
+the chain and mirrors annotations. Existing collections remain editable after
+Apply. Shift+E prepares local drafts. Managed patch and fiber editors save to
+session working copies; successful saves update drafts and do not apply or
+commit automatically. Linked-fiber saves use working copies for their peers.
+
+The input list includes baseline dataset entries and additions, with a filter
+and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
+operate on individual drafts. Applying Remove stops future supervision;
+Commit deletes the managed dataset entry. Restore remains available before
+committing a deletion. Baseline restores reference the retained service revision
+and do not require access to the service filesystem. Removal cannot reverse
+completed optimizer steps.
+Invalid selected drafts keep the batch unapplied and remain editable. Scoped
+external-source conflicts offer Use Current, Apply Local After Review, or Save
+Local as New; unrelated PCL collection changes are merged during publication.
+
+Editing workspaces are disposable session storage. **Discard and Exit** drops
+local drafts and releases the workspace directly. **Commit** exits only after
+publication succeeds, then releases temporary copies. Release and service
+shutdown stop file users and remove the entire `editing-workspaces/<id>`
+directory, including baseline snapshots, revisions and uploads. Reconnect,
+Stop, and Rebuild keep the workspace and its drafts. The next claim snapshots
+only committed dataset inputs.
+
+New workspaces carry versioned ownership metadata and a lifetime advisory lock.
+Startup reclaims marked directories whose owner has exited, including after a
+crash or forced termination. Live owners, symlinks, unrecognized markers and
+legacy folders without markers are left untouched; legacy storage requires
+manual cleanup. Dataset inputs, saved fit outputs, exports and shared caches
+are preserved. Interrupted Commit recovery directories (`.spiral-publication-*`
+beside dataset targets) are retained and their paths logged. Cleanup errors are
+reported with the workspace path; when a reader or worker cannot stop, files
+and ownership remain intact for a release retry or later startup reclamation.
+
+Cleanup regression checks (no installation needed):
+
+```bash
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_workspace_cleanup.py \
+  spiral-fitting/tests/test_service_editing.py \
+  spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_spiral_service_v2.py
+```
+
+Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll
+close/reopen check. It edits a temporary dataset copy and verifies that both the
+source bytes and committed copy remain unchanged; it uses a resident test double
+and does not run GPU fitting.
+
+Regression checks for this workflow (using existing environments/builds):
+
+```bash
+# From the repository root:
+AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
+  spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
+AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
+```
+
+The workflow tests start a loopback HTTP service and cover remote baseline
+restore, service restart, and edits made while a submission is running.
+The service suite includes transfer, revision, conflict, and publication recovery
+checks; runtime and geometry tests cover worker boundaries and supervision.
+For the retained CUDA check on temporary copies of a real dataset patch:
+
+```bash
+AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
+  SPIRAL_REVISION_PATCH=patch-directory-name \
+  spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_revisioned_live_fit.py
+```
+
+Input uploads only transfer immutable bytes. The editing workspace owns
+acceptance, application, and persistence; there is no separate ephemeral-input
+ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
+
+Interactive influence settings are captured when each **Run** request starts.
+Applying input revisions uses those captured settings and extends the
+influence region's union and the DT-disabled deadline within the remaining
+Run window. The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
 without reloading the resident session. The **Disable DT** percentage controls
-how much of that run suppresses directional DT losses after incorporating its
-pending inputs.
+how much of the remaining run suppresses directional DT losses after applying
+input revisions.
+
+Input-local validation failures reject the entire selected candidate without
+changing active supervision. Distributed ranks prepare the same candidate and
+must all agree before installation. Unexpected worker/device failures retain
+fail-stop behavior. Publication prepares all outputs before changing targets;
+a failure after publication starts retains the transaction and queues later
+mutations behind recovery. Recovery covers the running service, not crashes,
+and does not promise atomic visibility across multiple dataset files.
 
 **Checkpoints** are one panel section, and loading one is one button. It lists
 what the service advertises (checkpoints at the dataset root, and those under
@@ -348,8 +527,8 @@ With an existing fit, *Load* replaces the resident model's weights, optimiser
 and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and discards added inputs that
-were never committed. The panel reports the reasons and asks; a checkpoint no
+a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
+revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
 rebuild can accept — one written against another dataset, or against a
 configuration schema this service does not have — is reported and nothing is
 offered. A checkpoint-backed session takes its durable configuration from the

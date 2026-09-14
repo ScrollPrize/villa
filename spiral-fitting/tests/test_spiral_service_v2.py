@@ -2,7 +2,7 @@
 
 Covers bearer authentication, API-key auto-generation, launch-time dataset
 ownership, the artifact registry and its HTTP endpoints, session input
-uploads with ephemeral staging, and dataset commits. The resident fitter is
+uploads with immutable workspace staging, and checkpoint transfers. The resident fitter is
 faked; these tests exercise the service plumbing only.
 """
 
@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
 import json
-import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -23,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from unittest import mock
@@ -33,7 +33,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
+from spiral_service import (ApiError, ArtifactRegistry,
                             ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _mapped_winding_ids,
@@ -43,12 +43,11 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
+from service_uploads import UPLOADED_CHECKPOINTS_KEPT
 from lasagna_publish import PublishedPreview
-from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
-                         AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
-                         SCROLL_SPEC_OWNED_RUN_KEYS,
-                         AutosaveError, SessionState, SpiralInputPaths,
-                         SpiralPreviewConfig, SpiralRunConfig,
+from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
+                         AUTOSAVE_METADATA_SCHEMA, SCROLL_SPEC_OWNED_RUN_KEYS,
+                         AutosaveError, PclRole, SessionState, SpiralInputPaths,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
 from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
@@ -114,11 +113,9 @@ class FakeSession:
             "progress": self.progress,
         }
 
-    def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None,
+    def run(self, count, influence_config=None, run_config=None, path_changes=None,
             autosave_on_pause=True):
-        self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
-                               dict(influence_config or {}), dict(run_config or {})))
+        self.run_calls.append((count, dict(influence_config or {}), dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
         self.autosave_calls.append(autosave_on_pause)
         self.run_config.update(run_config or {})
@@ -276,14 +273,25 @@ def _digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _upload_input(state, kind, input_id, files, role=None):
+def _upload_input(state, kind, input_id, files, role=None, base_revision=None,
+                  operation=None, target_collection_id=None,
+                  base_source_revision=None):
     request = {
+        "upload_id": spiral_service.secrets.token_hex(16),
         "kind": kind, "id": input_id,
         "files": [{"name": name, "size": len(data), "sha256": _digest(data)}
                   for name, data in files.items()],
     }
     if role:
         request["role"] = role
+    if base_revision is not None:
+        request["base_revision"] = base_revision
+    if operation is not None:
+        request.update({
+            "operation": operation,
+            "target_collection_id": target_collection_id,
+            "base_source_revision": base_source_revision,
+        })
     upload_id = state.begin_upload(request)["upload_id"]
     for name, data in files.items():
         state.receive_upload_file(upload_id, name, io.BytesIO(data), len(data))
@@ -925,7 +933,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self.state._checkpoint_upload_root(),
                          self.output / "uploaded-checkpoints")
         _attach_fake_session(self.state, self.output, self.root)
-        ephemeral = self.state._session_ephemeral_dir()
+        ephemeral = self.state.editing().root
         self.assertTrue(ephemeral.is_relative_to(self.output))
         self.assertFalse(ephemeral.is_relative_to(self.root))
 
@@ -971,18 +979,20 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self._stage_for(self._base_request()), "model")
         self.assertEqual(
             self._stage_for(self._base_request(
-                {"model_num_flow_integration_steps": 5})),
+                {"model_linear_z_resolution": 24})),
             "model")
         # An unaudited key alongside an allowlisted one is still the whole
         # build, and so is anything outside run.config.
         self.assertEqual(
             self._stage_for(self._base_request({
-                "model_num_flow_integration_steps": 5,
+                "model_linear_z_resolution": 24,
                 "optimizer_random_seed": 7})),
             "all")
+        # A run-boundary key is applied through apply_config by the model
+        # rebuild, so it never widens the stage on its own.
         self.assertEqual(
             self._stage_for(self._base_request({"loss_weight_patch_radius": 1.0})),
-            "all")
+            "model")
         self.assertEqual(
             self._stage_for(self._base_request(run_tag="second")), "all")
         self.assertEqual(
@@ -990,10 +1000,44 @@ class DatasetOwnershipTests(unittest.TestCase):
                                      "config": dict(_NO_DENSE_LOSSES)}}),
             "all")
 
+    def test_shell_atlas_settings_rebuild_everything_once_tracks_were_shell_filtered(self):
+        # Without a shell-filtered track pool the atlas settings are ordinary
+        # run-boundary knobs the model rebuild applies through apply_config.
+        self._attach_session_for_request()
+        self.assertEqual(
+            self._stage_for(self._base_request({"shell_num_theta_bins": 360})),
+            "model")
+        # A session that loaded both a tracks store and an outer shell
+        # filtered the tracks against the shell; apply_config refuses the
+        # atlas settings there, so the request has to rebuild the host inputs.
+        live = SpiralInputPaths.from_mapping({
+            **self.state.session_paths.manifest(),
+            "tracks_dbm": str(self.root / "tracks.dbm"),
+            "outer_shell": str(self.root / "outer_shell"),
+        })
+        self.state.session_paths = live
+        self.state.session_request["paths"] = live.manifest()
+        run = self._base_request({"shell_num_theta_bins": 360})["run"]
+        _, run_config, preview, _ = self.state._prepare_session_request(
+            {"run": run})
+        with self.state.lock:
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    live, run_config, preview, SessionState.Idle),
+                "all")
+            # Other shell loss settings still keep the loaded inputs.
+            _, other_run, _, _ = self.state._prepare_session_request(
+                {"run": self._base_request(
+                    {"shell_huber_delta": 8.0})["run"]})
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    live, other_run, preview, SessionState.Idle),
+                "model")
+
     def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
         self._attach_session_for_request()
         paths, run, preview, _ = self.state._prepare_session_request(
-            self._base_request({"model_num_flow_integration_steps": 5}))
+            self._base_request({"model_linear_z_resolution": 24}))
         with self.state.lock:
             self.assertEqual(
                 self.state._rebuild_stage_locked(
@@ -1004,7 +1048,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         session = self._attach_session_for_request()
         generation = self.state.session_generation
         response = self.state.rebuild(
-            self._base_request({"model_num_flow_integration_steps": 5}))
+            self._base_request({"model_linear_z_resolution": 24}))
         self.assertEqual(response["stage"], "model")
         deadline = time.monotonic() + 5.0
         while self.state._building and time.monotonic() < deadline:
@@ -1017,12 +1061,12 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(self.state.session_generation, generation)
         self.assertEqual(len(session.model_rebuilds), 1)
         rebuilt_paths, rebuilt_run = session.model_rebuilds[0]
-        self.assertEqual(rebuilt_run.config["model_num_flow_integration_steps"], 5)
+        self.assertEqual(rebuilt_run.config["model_linear_z_resolution"], 24)
         self.assertEqual(rebuilt_paths.manifest(),
                          self.state.session_request["paths"])
         self.assertEqual(
             self.state.session_request["run"]["config"]
-            ["model_num_flow_integration_steps"], 5)
+            ["model_linear_z_resolution"], 24)
 
     def test_dataset_request_filters_resolved_paths_with_input_toggles(self):
         request = self.state._dataset_session_request({
@@ -1047,6 +1091,36 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(disabled["paths"]["verified_patches"], "")
         self.assertEqual(disabled["paths"]["tracks_dbm"], "")
         self.assertEqual(disabled["paths"]["pcls"], [])
+
+    def test_omitted_spacing_mode_preserves_default_winding_input(self):
+        winding = self.root / "winding_inference"
+        winding.mkdir()
+        (winding / "manifest.json").write_text(json.dumps({
+            "artifact_type": "winding_inference_crossings",
+            "format_version": 1,
+        }))
+        (self.root / "outer_shell").mkdir()
+        self.state.dataset_resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
+        config = {**_NO_DENSE_LOSSES,
+                  "input_use_winding_inference": True,
+                  "input_use_outer_shell": True}
+        config.pop("dense_spacing_mode")
+        self.assertNotIn("dense_spacing_mode", config)
+        request = {"run": {"z_begin": 0, "z_end": 10, "config": config}}
+
+        paths, run, _, _ = self.state._prepare_session_request(request)
+
+        self.assertEqual(paths.winding_inference, str(winding))
+        self.assertEqual(paths.surf_sdt, "")
+        self.assertEqual(run.config, config)
+
+        # Missing default-mode inputs must fail preflight, before GPU work.
+        self.state.dataset_resolution.resolved["winding_inference"] = ""
+        with self.assertRaises(ApiError) as caught:
+            self.state._prepare_session_request(request)
+        self.assertIn("winding_inference",
+                      {detail["field"] for detail in caught.exception.details})
 
     def test_checkpoint_config_selects_winding_model_inputs(self):
         winding = self.root / "winding_inference"
@@ -1398,7 +1472,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         # preflight only complained about the model.
         error = self._refuse_load(session, self._write_checkpoint(
             "host.ckpt", {**live, "model_num_flow_stages": 3,
-                          "track_exclusion_radius": 99.0}))
+                          "patch_erode_patches": 3}))
         self.assertEqual(error.payload["stage"], "all")
         # And a model z-domain mismatch reaches "all" through z_begin/z_end
         # rather than through a rule of its own.
@@ -1700,8 +1774,14 @@ class ExplicitInitializationTests(HttpServiceFixture):
                                        daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.state.editing().claim("test-owner", "claim")
+
+    def request(self, method, path, **kwargs):
+        kwargs['headers'] = {'X-Spiral-Workspace-Token': 'test-owner', **kwargs.get('headers', {})}
+        return super().request(method, path, **kwargs)
 
     def tearDown(self):
+        self.state.close()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(5)
@@ -1866,14 +1946,18 @@ class UploadTests(unittest.TestCase):
         self.state = ServiceState()
 
     def tearDown(self):
+        self.state.close()
         self.temporary.cleanup()
 
     def _session(self):
-        return _attach_fake_session(self.state, self.output, self.dataset)
+        self.state.dataset_root = str(self.dataset)
+        session = _attach_fake_session(self.state, self.output, self.dataset)
+        self.state.editing().claim('owner', 'claim')
+        return session
 
     def test_upload_requires_an_active_session(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.begin_upload({"kind": "patch", "id": "p1",
+            self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p1",
                                      "files": [{"name": "meta.json", "size": 1,
                                                 "sha256": "0" * 64}]})
         self.assertEqual(caught.exception.status, 409)
@@ -1882,12 +1966,12 @@ class UploadTests(unittest.TestCase):
         self._session()
         for bad_id in ("../p", "a/b", ".hidden", "", "a" * 200):
             with self.assertRaises(ApiError, msg=bad_id):
-                self.state.begin_upload({"kind": "patch", "id": bad_id,
+                self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": bad_id,
                                          "files": [{"name": "meta.json", "size": 1,
                                                     "sha256": "0" * 64}]})
         for bad_name in ("../x", "/abs", "a//b", "a/../b", "..", "a\\b"):
             with self.assertRaises(ApiError, msg=bad_name):
-                self.state.begin_upload({"kind": "patch", "id": "p1",
+                self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p1",
                                          "files": [{"name": bad_name, "size": 1,
                                                     "sha256": "0" * 64}]})
 
@@ -1896,12 +1980,12 @@ class UploadTests(unittest.TestCase):
         upload_id = _upload_input(self.state, "patch", "patch-1", PATCH_FILES)
         response = self.state.finalize_upload(upload_id)
         record = response["input"]
-        self.assertEqual(record["state"], "pending")
+        self.assertEqual(record["state"], "uploaded")
         published = Path(record["path"])
         self.assertTrue((published / "meta.json").is_file())
-        self.assertIn(".spiral-ephemeral", str(published))
+        self.assertTrue(published.is_relative_to(self.state.editing().root))
         status = self.state.status()
-        self.assertEqual(status["ephemeral_inputs"][0]["id"], "patch-1")
+        self.assertEqual(self.state.editing().catalog.entries(), ())
         self.assertEqual(status["default_advanced_config"]["optimizer_learning_rate"], 3e-5)
         self.assertNotEqual(status["default_advanced_config"], status["run_config"])
         # Finalize is idempotent.
@@ -1911,13 +1995,13 @@ class UploadTests(unittest.TestCase):
     def test_upload_put_retries_are_content_addressed(self):
         self._session()
         data = PATCH_FILES["meta.json"]
-        upload_id = self.state.begin_upload({
+        upload_id = self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16),
             "kind": "patch", "id": "retried", "files": [
                 {"name": name, "size": len(payload),
                  "sha256": _digest(payload)}
                 for name, payload in PATCH_FILES.items()],
         })["upload_id"]
-        staging = self.output / ".spiral-upload-staging" / upload_id
+        staging = self.state.editing().uploads.staging_root() / upload_id
 
         # An upload PUT carries no command ID: the manifest's size and digest
         # decide the outcome, so repeating one is safe and converges.
@@ -1951,9 +2035,7 @@ class UploadTests(unittest.TestCase):
         second = self.state.finalize_upload(upload_id)["input"]
         self.assertEqual(first, second)
         # The replay publishes nothing a second time.
-        self.assertEqual(
-            [record["id"] for record in self.state.status()["ephemeral_inputs"]],
-            ["fiber-1"])
+        self.assertEqual(self.state.editing().catalog.entries(), ())
         # A finalized upload is a session input, not a transfer any more.
         with self.assertRaisesRegex(ApiError, "already finalized"):
             self.state.receive_upload_file(
@@ -1964,7 +2046,7 @@ class UploadTests(unittest.TestCase):
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
         data = PATCH_FILES["meta.json"]
-        request = {"kind": "patch", "id": "p2", "files": [
+        request = {"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p2", "files": [
             {"name": "meta.json", "size": len(data), "sha256": _digest(data)},
             {"name": "x.tif", "size": 4, "sha256": _digest(b"xxxx")},
         ]}
@@ -1974,9 +2056,8 @@ class UploadTests(unittest.TestCase):
             self.state.finalize_upload(upload_id)
         with self.assertRaisesRegex(ApiError, "SHA-256"):
             self.state.receive_upload_file(upload_id, "x.tif", io.BytesIO(b"yyyy"), 4)
-        ephemeral = self.output / ".spiral-ephemeral"
-        self.assertFalse(any(ephemeral.rglob("*")) if ephemeral.exists() else False,
-                         "nothing may be published before finalize succeeds")
+        self.assertIsNone(self.state.editing().uploads.get(upload_id).record)
+        self.assertEqual(self.state.editing().catalog.entries(), ())
 
     def test_finalize_rejects_invalid_patch_and_untyped_json(self):
         self._session()
@@ -2020,68 +2101,163 @@ class UploadTests(unittest.TestCase):
     def test_pcl_uploads_require_a_role(self):
         self._session()
         with self.assertRaisesRegex(ApiError, "role"):
-            self.state.begin_upload({"kind": "pcl", "id": "roleless", "files": [
+            self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "pcl", "id": "roleless", "files": [
                 {"name": "pcl.json", "size": 1, "sha256": "0" * 64}]})
 
-    def test_drawn_control_points_are_forwarded_to_the_next_run(self):
-        session = self._session()
-        upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
-                                  role="drawn_control_points")
-        self.state.finalize_upload(upload_id)
-        _planned_run(self.state, {"iterations": 2})
-        _, pending, _, _, _ = session.run_calls[-1]
-        self.assertEqual([(record["id"], record["role"]) for record in pending],
-                         [("drawn-1", "drawn_control_points")])
-
-    def test_quota_is_enforced(self):
+    def test_same_winding_artifact_advertises_revision_and_editability(self):
         self._session()
-        original = spiral_service.EPHEMERAL_QUOTA_BYTES
-        spiral_service.EPHEMERAL_QUOTA_BYTES = 10
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "zero", "points": {}}},
+        }))
+
+        class Resolution:
+            scroll_spec = {"base_shape_zyx": [10, 20, 30]}
+
+        self.state.dataset_resolution = Resolution()
+        ref = self.state._publish_pcl_artifact(PclRole.SAME_WINDING, target)
+        self.assertTrue(ref["editable"])
+        self.assertEqual(ref["role"], "same_winding")
+        self.assertEqual(ref["source_revision"],
+                         self.state._file_sha256(target))
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "same-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        descriptor = json.loads(manifests[0].read_text())
+        self.assertEqual(descriptor["source"], str(target.resolve()))
+        self.assertTrue(descriptor["editable"])
+        self.assertEqual(descriptor["kind"], "spiral-same-winding-pcl")
+        self.assertEqual(descriptor["source_revision"],
+                         self.state._file_sha256(target))
+
+    def test_concurrent_pcl_publications_keep_the_advertised_artifact(self):
+        self._session()
+        target = self.dataset / "same_windings.json"
+        target.write_text('{"collections": {}}')
+        self.state.dataset_resolution = mock.Mock(
+            scroll_spec={"base_shape_zyx": [10, 20, 30]})
+        registered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+        second_registered = threading.Event()
+        real_register = self.state.artifacts.register_directory
+
+        def register(*args, **kwargs):
+            ref = real_register(*args, **kwargs)
+            if not registered.is_set():
+                registered.set()
+                self.assertTrue(release.wait(5))
+            else:
+                second_registered.set()
+            return ref
+
+        def second_publish():
+            second_started.set()
+            return self.state._publish_pcl_artifact(PclRole.SAME_WINDING, target)
+
+        with mock.patch.object(self.state.artifacts, "register_directory", register):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(self.state._publish_pcl_artifact,
+                                    PclRole.SAME_WINDING, target)
+                try:
+                    self.assertTrue(registered.wait(5))
+                    second = pool.submit(second_publish)
+                    self.assertTrue(second_started.wait(5))
+                    self.assertFalse(second_registered.wait(0.1))
+                finally:
+                    release.set()
+                first.result(timeout=5)
+                latest = second.result(timeout=5)
+        self.assertEqual(self.state.pcl_artifacts["same_winding"], latest)
+        artifact, snapshot, _ = self.state.artifacts.acquire_file(
+            latest["id"], "same_windings.json")
         try:
-            with self.assertRaisesRegex(ApiError, "quota"):
-                _upload_input(self.state, "patch", "big", PATCH_FILES)
+            self.assertEqual(snapshot.read_text(), target.read_text())
         finally:
-            spiral_service.EPHEMERAL_QUOTA_BYTES = original
+            self.state.artifacts.release(artifact)
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "same-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(json.loads(manifests[0].read_text())["source_revision"],
+                         latest["source_revision"])
 
-    def test_abandoned_uploads_leave_no_partial_data(self):
-        """An abandoned transfer expires; there is no cancel verb.
-
-        DELETE /session/inputs/<id> existed for a client that never called
-        it, so garbage collection is the whole story.
-        """
+    def test_pcl_artifact_revision_describes_the_snapshot_not_the_live_source(self):
+        # Publishing runs without the commit lock. A write landing between
+        # the copy and the hash must not advertise the newer document's
+        # revision for the older bytes, or a client could edit the stale
+        # snapshot and still pass the revision check.
         self._session()
-        upload_id = _upload_input(self.state, "patch", "aborted", PATCH_FILES)
-        staging = self.output / ".spiral-upload-staging" / upload_id
-        self.assertTrue(staging.exists())
-        self.state.uploads[upload_id].created -= \
-            spiral_service.UPLOAD_GC_SECONDS + 1
-        self.state.gc_uploads()
-        self.assertFalse(staging.exists())
-        self.assertNotIn(upload_id, self.state.uploads)
+        target = self.dataset / "same_windings.json"
+        original = json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "zero", "points": {}}},
+        })
+        target.write_text(original)
+        replaced = json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "changed", "points": {}}},
+        })
 
-    def test_expired_uploads_are_garbage_collected(self):
+        class Resolution:
+            scroll_spec = {"base_shape_zyx": [10, 20, 30]}
+
+        self.state.dataset_resolution = Resolution()
+        real_copy2 = shutil.copy2
+
+        def racing_copy2(src, dst, *args, **kwargs):
+            result = real_copy2(src, dst, *args, **kwargs)
+            Path(src).write_text(replaced)
+            return result
+
+        with unittest.mock.patch.object(spiral_service.shutil, "copy2",
+                                        racing_copy2):
+            ref = self.state._publish_pcl_artifact(PclRole.SAME_WINDING, target)
+        snapshot_revision = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        self.assertEqual(ref["source_revision"], snapshot_revision)
+        self.assertNotEqual(ref["source_revision"],
+                            self.state._file_sha256(target))
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "same-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        descriptor = json.loads(manifests[0].read_text())
+        self.assertEqual(descriptor["source_revision"], snapshot_revision)
+        self.assertEqual(
+            (manifests[0].parent / descriptor["pcl_file"]).read_text(), original)
+
+    def test_relative_winding_artifact_is_published_alongside_same_winding(self):
         self._session()
-        upload_id = _upload_input(self.state, "patch", "stale", PATCH_FILES)
-        self.state.uploads[upload_id].created -= spiral_service.UPLOAD_GC_SECONDS + 1
-        self.state.gc_uploads()
-        self.assertNotIn(upload_id, self.state.uploads)
-        self.assertFalse((self.output / ".spiral-upload-staging" / upload_id).exists())
+        relative = self.dataset / "relative_windings.json"
+        relative.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "wraps", "points": {
+                "0": {"p": [1, 2, 3], "wind_a": 0, "creation_time": 1},
+                "1": {"p": [4, 5, 6], "wind_a": 1, "creation_time": 2},
+            }}},
+        }))
 
-    def test_run_passes_pending_inputs_and_marks_incorporated(self):
-        session = self._session()
-        upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
-        self.state.finalize_upload(upload_id)
-        _planned_run(self.state, {"iterations": 10})
-        count, pending, mark, influence, _ = session.run_calls[-1]
-        self.assertEqual(count, 10)
-        self.assertEqual([record["id"] for record in pending], ["fiber-1"])
-        self.assertEqual(influence, {})
-        mark(pending)
-        self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"],
-                         "incorporated")
-        # A later run does not re-incorporate.
-        _planned_run(self.state, {"iterations": 5})
-        self.assertEqual(session.run_calls[-1][1], [])
+        class Resolution:
+            scroll_spec = {"base_shape_zyx": [10, 20, 30]}
+
+        self.state.dataset_resolution = Resolution()
+        self.state._refresh_pcl_artifacts()
+        ref = self.state.pcl_artifacts["relative"]
+        self.assertTrue(ref["editable"])
+        self.assertEqual(ref["role"], "relative")
+        self.assertEqual(ref["source_revision"],
+                         self.state._file_sha256(relative))
+        manifests = list((self.output / ".spiral-artifacts").glob(
+            "relative-winding-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        descriptor = json.loads(manifests[0].read_text())
+        self.assertEqual(descriptor["kind"], "spiral-relative-winding-pcl")
+        self.assertEqual(descriptor["pcl_file"], "relative_windings.json")
+        # No same_windings.json in this dataset: its slot stays empty while
+        # the status report still carries both keys.
+        self.assertNotIn("same_winding", self.state.pcl_artifacts)
+        status = self.state.status()
+        self.assertIsNone(status["same_winding_artifact"])
+        self.assertEqual(status["relative_winding_artifact"]["id"], ref["id"])
 
     def test_run_passes_and_validates_transient_influence_config(self):
         session = self._session()
@@ -2100,7 +2276,7 @@ class UploadTests(unittest.TestCase):
             "loss_weight_anchor": 15.0,
         }
         _planned_run(self.state, {"iterations": 10, "influence_config": influence})
-        self.assertEqual(session.run_calls[-1][3], influence)
+        self.assertEqual(session.run_calls[-1][1], influence)
 
         with self.assertRaises(ApiError) as caught:
             _planned_run(self.state, {"iterations": 10, "influence_config": {
@@ -2126,12 +2302,12 @@ class UploadTests(unittest.TestCase):
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
-        self.assertEqual(session.run_calls[-1][4], config)
+        self.assertEqual(session.run_calls[-1][2], config)
         self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
         with self.assertRaisesRegex(ApiError, "requires rebuilding"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
-                "model_num_flow_stages": 2,
+                "model_num_flow_stages": 3,
             }})
         with self.assertRaisesRegex(ApiError, "Invalid value"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
@@ -2150,7 +2326,7 @@ class UploadTests(unittest.TestCase):
             "sample_count_dense_attachment_points": 0,
         }})
 
-        self.assertEqual(session.run_calls[-1][4], {
+        self.assertEqual(session.run_calls[-1][2], {
             "sample_count_dense_attachment_points": 0,
         })
         self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
@@ -2182,24 +2358,6 @@ class UploadTests(unittest.TestCase):
                 "expected_session_revision": self.state.session_revision,
             })
         self.assertEqual(caught.exception.status, 409)
-
-    def test_a_rebuilt_session_does_not_see_previous_ephemeral_inputs(self):
-        self._session()
-        upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
-        self.state.finalize_upload(upload_id)
-        ephemeral_dir = self.state._session_ephemeral_dir()
-        self.assertTrue(ephemeral_dir.exists())
-        # A rebuild is the only way a session is replaced now; it closes the
-        # old one and takes its ephemeral scope with it.
-        with mock.patch("spiral_runtime.create_session",
-                        return_value=FakeSession()):
-            self.state._begin_build(
-                self.state.session_paths,
-                SpiralRunConfig(z_begin=0, z_end=10),
-                SpiralPreviewConfig(), None)
-            _await_build(self.state)
-        self.assertEqual(self.state.ephemeral_records, [])
-        self.assertFalse(ephemeral_dir.exists())
 
 
 def _zip_checkpoint_bytes(payload=b"payload"):
@@ -2263,7 +2421,7 @@ class CheckpointUploadTests(unittest.TestCase):
              "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(request["paths"]["checkpoint"], str(published))
         # Checkpoint uploads are not session inputs: nothing ephemeral listed.
-        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+        self.assertNotIn("ephemeral_inputs", self.state.status())
 
     def test_checkpoint_upload_requires_output_root(self):
         bare = ServiceState()
@@ -2368,7 +2526,7 @@ class CheckpointUploadTests(unittest.TestCase):
 
     def test_reusing_a_checkpoint_refreshes_retention_recency(self):
         payloads = [str(i).encode() for i in range(
-            spiral_service.UPLOADED_CHECKPOINTS_KEPT)]
+            UPLOADED_CHECKPOINTS_KEPT)]
         published = [
             Path(self._upload_checkpoint(
                 f"resume-{i}.ckpt", _zip_checkpoint_bytes(payload))["path"])
@@ -2398,393 +2556,14 @@ class CheckpointUploadTests(unittest.TestCase):
     def test_retention_prunes_old_uploads(self):
         published = [Path(self._upload_checkpoint(
             f"resume-{i}.ckpt", _zip_checkpoint_bytes(str(i).encode()))["path"])
-                     for i in range(spiral_service.UPLOADED_CHECKPOINTS_KEPT + 2)]
+                     for i in range(UPLOADED_CHECKPOINTS_KEPT + 2)]
         for old_age, path in enumerate(published):
             if path.exists():
                 # Ensure distinguishable mtimes for deterministic pruning.
                 os.utime(path, (time.time() + old_age, time.time() + old_age))
         surviving = [path for path in published if path.exists()]
-        self.assertLessEqual(len(surviving), spiral_service.UPLOADED_CHECKPOINTS_KEPT)
+        self.assertLessEqual(len(surviving), UPLOADED_CHECKPOINTS_KEPT)
         self.assertTrue(published[-1].exists(), "the newest upload must survive")
-
-    def test_checkpoint_uploads_are_exempt_from_ephemeral_quota(self):
-        original = spiral_service.EPHEMERAL_QUOTA_BYTES
-        spiral_service.EPHEMERAL_QUOTA_BYTES = 1
-        try:
-            record = self._upload_checkpoint("big.ckpt")
-            self.assertTrue(Path(record["path"]).is_file())
-        finally:
-            spiral_service.EPHEMERAL_QUOTA_BYTES = original
-
-
-class EphemeralLedgerTests(unittest.TestCase):
-    """Incorporation and persistence are independent, typed states."""
-
-    def _ledger(self):
-        ledger = EphemeralLedger(threading.RLock())
-        ledger.add({"id": "patch-1", "kind": "patch", "role": None,
-                    "path": "/staged/patch-1", "bytes": 12,
-                    "upload_id": "a" * 32})
-        return ledger
-
-    def test_new_input_is_pending_and_ephemeral(self):
-        ledger = self._ledger()
-        record = ledger.find("patch", "patch-1")
-        self.assertEqual((record.incorporation, record.persistence),
-                         ("pending", "ephemeral"))
-        self.assertEqual(ledger.pending(), [record])
-        self.assertEqual(ledger.uncommitted(), [record])
-        self.assertEqual(ledger.committed_not_incorporated(), [])
-        self.assertEqual(ledger.bytes_in_use(), 12)
-        self.assertEqual(record.status_entry(), {
-            "id": "patch-1", "kind": "patch", "role": None,
-            "state": "pending", "bytes": 12, "committed": False})
-
-    def test_the_two_states_move_independently(self):
-        ledger = self._ledger()
-        record = ledger.find("patch", "patch-1")
-
-        ledger.mark_committed([record])
-        self.assertEqual((record.incorporation, record.persistence),
-                         ("pending", "committed"))
-        # Committed but not yet part of the fit: still queued for the run,
-        # no longer a commit candidate, and called out as such.
-        self.assertEqual(ledger.pending(), [record])
-        self.assertEqual(ledger.uncommitted(), [])
-        self.assertEqual(ledger.committed_not_incorporated(), [record])
-
-        # Incorporating it settles both states, so it leaves the ledger.
-        ledger.mark_incorporated([record])
-        self.assertEqual(ledger.records, [])
-
-    def test_incorporation_can_precede_persistence(self):
-        ledger = self._ledger()
-        record = ledger.find("patch", "patch-1")
-        ledger.mark_incorporated([record])
-        self.assertEqual((record.incorporation, record.persistence),
-                         ("incorporated", "ephemeral"))
-        self.assertEqual(ledger.pending(), [])
-        self.assertEqual(ledger.uncommitted(), [record])
-        ledger.mark_committed([record])
-        self.assertEqual(ledger.records, [])
-
-    def test_incorporation_failure_keeps_the_record_with_its_error(self):
-        ledger = self._ledger()
-        record = ledger.find("patch", "patch-1")
-        ledger.mark_incorporated([record], error="RuntimeError: boom")
-        self.assertEqual(record.incorporation, "error")
-        self.assertEqual(record.error, "RuntimeError: boom")
-        # An errored input is neither queued for the fit nor committable.
-        self.assertEqual(ledger.pending(), [])
-        self.assertEqual(ledger.uncommitted(), [])
-        self.assertEqual(record.status_entry()["state"], "error")
-
-    def test_fitter_payloads_resolve_back_to_their_records(self):
-        ledger = self._ledger()
-        record = ledger.find("patch", "patch-1")
-        payload = record.payload()
-        self.assertEqual(payload["path"], "/staged/patch-1")
-        self.assertEqual(payload["state"], "pending")
-        # The fitter (and its DDP children) hand back plain records.
-        self.assertEqual(ledger.resolve([dict(payload)]), [record])
-        ledger.mark_incorporated(ledger.resolve([dict(payload)]))
-        self.assertTrue(record.incorporated)
-
-    def test_removal_and_reset_clear_the_ledger(self):
-        ledger = self._ledger()
-        ledger.remove(ledger.find("patch", "patch-1"))
-        self.assertEqual(ledger.records, [])
-        self.assertFalse(ledger.contains("patch", "patch-1"))
-        self._ledger().clear()
-
-
-class CommitTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.dataset = self.root / "dataset"
-        (self.dataset / "verified_patches").mkdir(parents=True)
-        (self.dataset / "fibers").mkdir()
-        # The ephemeral folder lives under the output directory, which may be a
-        # different filesystem; the copy-then-rename move must still work.
-        self.output = self.root / "output"
-        self.output.mkdir()
-        self.state = ServiceState()
-        self.session = _attach_fake_session(self.state, self.output, self.dataset)
-
-    def tearDown(self):
-        os.chmod(self.dataset, 0o755)
-        self.temporary.cleanup()
-
-    def _finalize(self, kind, input_id, files, role=None):
-        upload_id = _upload_input(self.state, kind, input_id, files, role=role)
-        return self.state.finalize_upload(upload_id)["input"]
-
-    def test_commit_publishes_patches_fibers_and_merges_role_pcls(self):
-        self._finalize("patch", "patch-9", PATCH_FILES)
-        self._finalize("fiber", "fiber-9", FIBER_FILES)
-        existing = {"vc_pointcollections_json_version": "1",
-                    "collections": {"3": {"name": "old", "points": {}}}}
-        target = self.dataset / "relative_windings.json"
-        target.write_text(json.dumps(existing))
-        self._finalize("pcl", "pcl-9", PCL_FILES, role="relative")
-        response = self.state.commit_inputs()
-        self.assertEqual(sorted(response["committed"]),
-                         ["fiber-9", "patch-9", "pcl-9"])
-        self.assertTrue((self.dataset / "verified_patches" / "patch-9" / "meta.json").is_file())
-        self.assertTrue((self.dataset / "fibers" / "fiber-9.json").is_file())
-        merged = json.loads(target.read_text())
-        self.assertEqual(len(merged["collections"]), 2)
-        backups = list(self.dataset.glob("relative_windings.json.*.bak"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(json.loads(backups[0].read_text()), existing)
-        # Still-pending inputs stay queued for the next run after a commit.
-        inputs = self.state.status()["ephemeral_inputs"]
-        self.assertEqual({record["id"] for record in inputs},
-                         {"patch-9", "fiber-9", "pcl-9"})
-        self.assertTrue(all(record["committed"] and record["state"] == "pending"
-                            for record in inputs))
-
-    def test_status_names_committed_but_not_incorporated_inputs(self):
-        self._finalize("patch", "patch-9", PATCH_FILES)
-        self._finalize("fiber", "fiber-9", FIBER_FILES)
-        status = self.state.status()
-        self.assertEqual(status["committed_not_incorporated"], [])
-
-        self.state.commit_inputs()
-        status = self.state.status()
-        # The dataset holds both, but the resident fit has taken neither.
-        self.assertEqual(
-            sorted(record["id"]
-                   for record in status["committed_not_incorporated"]),
-            ["fiber-9", "patch-9"])
-        self.assertEqual(
-            {record["kind"]
-             for record in status["committed_not_incorporated"]},
-            {"patch", "fiber"})
-        self.assertFalse(status["commit_available"])
-        self.assertIn("already committed", status["commit_unavailable_reason"])
-
-        # Running incorporates them; a committed and incorporated input is
-        # fully settled and drops out of the ephemeral bookkeeping.
-        _planned_run(self.state, {"iterations": 1})
-        _, pending, mark, _, _ = self.session.run_calls[-1]
-        self.assertEqual(sorted(record["id"] for record in pending),
-                         ["fiber-9", "patch-9"])
-        mark(pending)
-        status = self.state.status()
-        self.assertEqual(status["committed_not_incorporated"], [])
-        self.assertEqual(status["ephemeral_inputs"], [])
-
-    def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
-        record = self._finalize("patch", "patch-9", PATCH_FILES)
-        shutil.rmtree(record["path"])
-        with self.assertRaisesRegex(ApiError, "staged copy"):
-            self.state.commit_inputs()
-        # Validation happens before anything is published, so the dataset is
-        # untouched and the record keeps its ephemeral state.
-        self.assertFalse((self.dataset / "verified_patches" / "patch-9").exists())
-        self.assertEqual(self.state.status()["ephemeral_inputs"][0]["committed"],
-                         False)
-
-    def test_concurrent_service_commits_serialize_pcl_merges(self):
-        output_b = self.root / "output-b"
-        output_b.mkdir()
-        state_b = ServiceState()
-        _attach_fake_session(state_b, output_b, self.dataset)
-        upload_a = _upload_input(
-            self.state, "pcl", "pcl-a", PCL_FILES, role="relative")
-        upload_b = _upload_input(
-            state_b, "pcl", "pcl-b", PCL_FILES, role="relative")
-        self.state.finalize_upload(upload_a)
-        state_b.finalize_upload(upload_b)
-        target = self.dataset / "relative_windings.json"
-        target.write_text(json.dumps({
-            "vc_pointcollections_json_version": "1", "collections": {},
-        }))
-
-        active = 0
-        max_active = 0
-        activity_lock = threading.Lock()
-        original_merge = spiral_service._merge_pcl_documents
-
-        def slow_merge(existing, incoming):
-            nonlocal active, max_active
-            with activity_lock:
-                active += 1
-                max_active = max(max_active, active)
-            try:
-                time.sleep(0.1)
-                return original_merge(existing, incoming)
-            finally:
-                with activity_lock:
-                    active -= 1
-
-        errors = []
-
-        def commit(state):
-            try:
-                state.commit_inputs()
-            except BaseException as exc:
-                errors.append(exc)
-
-        with mock.patch.object(
-                spiral_service, "_merge_pcl_documents", side_effect=slow_merge):
-            threads = [
-                threading.Thread(target=commit, args=(self.state,)),
-                threading.Thread(target=commit, args=(state_b,)),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(5)
-        self.assertFalse(errors)
-        self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(max_active, 1)
-        merged = json.loads(target.read_text())
-        self.assertEqual(len(merged["collections"]), 2)
-
-    def test_independent_processes_preserve_both_pcl_commits(self):
-        target = self.dataset / "relative_windings.json"
-        target.write_text(json.dumps({
-            "vc_pointcollections_json_version": "1", "collections": {},
-        }))
-        context = multiprocessing.get_context("spawn")
-        ready = context.Queue()
-        start = context.Event()
-        result = context.Queue()
-        processes = []
-        for name in ("process-a", "process-b"):
-            output = self.root / name
-            output.mkdir()
-            processes.append(context.Process(
-                target=_commit_pcl_process,
-                args=(str(self.dataset), str(output), name, ready, start, result)))
-        for process in processes:
-            process.start()
-        self.assertEqual({ready.get(timeout=20), ready.get(timeout=20)},
-                         {"process-a", "process-b"})
-        start.set()
-        outcomes = dict(result.get(timeout=30) for _ in processes)
-        for process in processes:
-            process.join(30)
-            self.assertFalse(process.is_alive())
-            self.assertEqual(process.exitcode, 0)
-        self.assertEqual(outcomes, {"process-a": "ok", "process-b": "ok"})
-        merged = json.loads(target.read_text())
-        self.assertEqual(len(merged["collections"]), 2)
-
-    def test_drawn_control_points_commit_preserves_line_and_point_order(self):
-        existing = {
-            "vc_pointcollections_json_version": "1",
-            "collections": {"4": {"name": "existing", "points": {}}},
-        }
-        target = self.dataset / "drawn_control_points.json"
-        target.write_text(json.dumps(existing))
-        incoming = {"drawn.json": json.dumps({
-            "vc_pointcollections_json_version": "1",
-            "collections": {
-                "0": {"name": "first", "points": {
-                    "0": {"p": [0, 0, 0]}, "1": {"p": [30, 0, 0]}}},
-                "1": {"name": "second", "points": {
-                    "0": {"p": [0, 1, 0]}, "1": {"p": [30, 1, 0]}}},
-            },
-        }).encode()}
-        self._finalize("pcl", "drawn-1", incoming, role="drawn_control_points")
-        self.state.commit_inputs()
-        merged = json.loads(target.read_text())
-        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
-                         ["existing", "first", "second"])
-        self.assertEqual(list(merged["collections"]["5"]["points"]), ["0", "1"])
-        self.assertEqual(len(list(self.dataset.glob(
-            "drawn_control_points.json.*.bak"))), 1)
-
-    def test_same_winding_commit_preserves_collection_and_point_order(self):
-        existing = {
-            "vc_pointcollections_json_version": "1",
-            "collections": {"2": {"name": "existing", "points": {}}},
-        }
-        target = self.dataset / "same_windings.json"
-        target.write_text(json.dumps(existing))
-        incoming = {"same.json": json.dumps({
-            "vc_pointcollections_json_version": "1",
-            "collections": {
-                "0": {"name": "same_winding_0001", "points": {
-                    "0": {"p": [1, 2, 3]}, "1": {"p": [4, 5, 6]}}},
-                "1": {"name": "same_winding_0002", "points": {
-                    "0": {"p": [7, 8, 9]}, "1": {"p": [10, 11, 12]}}},
-            },
-        }).encode()}
-        self._finalize("pcl", "same-1", incoming, role="same_winding")
-        self.state.commit_inputs()
-        merged = json.loads(target.read_text())
-        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
-                         ["existing", "same_winding_0001", "same_winding_0002"])
-        self.assertEqual(list(merged["collections"]["3"]["points"]), ["0", "1"])
-        self.assertEqual(len(list(self.dataset.glob(
-            "same_windings.json.*.bak"))), 1)
-
-    def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
-        record = self._finalize("patch", "patch-9", PATCH_FILES)
-        staged = Path(record["path"])
-        self.state.commit_inputs()
-        # The staged copy remains the incorporation source for the next run.
-        self.assertTrue(staged.exists())
-        with self.assertRaisesRegex(ApiError, "already committed"):
-            self.state.commit_inputs()
-        _planned_run(self.state, {"iterations": 3})
-        _, pending, mark, _, _ = self.session.run_calls[-1]
-        self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
-        # Once incorporated, a committed record is done and leaves the list.
-        mark(pending)
-        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
-
-    def test_remove_pending_input_deletes_the_staged_copy(self):
-        record = self._finalize("fiber", "fiber-9", FIBER_FILES)
-        staged = Path(record["path"])
-        response = self.state.remove_input("fiber", "fiber-9")
-        self.assertEqual(response["removed"], "fiber-9")
-        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
-        self.assertFalse(staged.exists())
-        _planned_run(self.state, {"iterations": 1})
-        self.assertEqual(self.session.run_calls[-1][1], [])
-
-    def test_remove_incorporated_input_is_rejected(self):
-        self._finalize("patch", "patch-9", PATCH_FILES)
-        _planned_run(self.state, {"iterations": 1})
-        _, pending, mark, _, _ = self.session.run_calls[-1]
-        mark(pending)
-        with self.assertRaises(ApiError) as caught:
-            self.state.remove_input("patch", "patch-9")
-        self.assertEqual(caught.exception.status, 409)
-
-    def test_remove_committed_pending_input_keeps_the_dataset_copy(self):
-        self._finalize("patch", "patch-9", PATCH_FILES)
-        self.state.commit_inputs()
-        self.state.remove_input("patch", "patch-9")
-        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
-        self.assertTrue((self.dataset / "verified_patches" / "patch-9" / "meta.json").is_file())
-
-    def test_patch_identifier_collision_is_rejected_without_overwrite(self):
-        existing = self.dataset / "verified_patches" / "patch-1"
-        existing.mkdir()
-        (existing / "meta.json").write_text("original")
-        self._finalize("patch", "patch-1", PATCH_FILES)
-        with self.assertRaises(ApiError) as caught:
-            self.state.commit_inputs()
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual((existing / "meta.json").read_text(), "original")
-        # The ephemeral input is untouched and still usable.
-        self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"], "pending")
-
-    def test_commit_on_read_only_dataset_is_reported_unavailable(self):
-        self._finalize("patch", "patch-2", PATCH_FILES)
-        os.chmod(self.dataset, 0o555)
-        status = self.state.status()
-        self.assertFalse(status["commit_available"])
-        self.assertIn("read-only", status["commit_unavailable_reason"])
-        with self.assertRaisesRegex(ApiError, "read-only"):
-            self.state.commit_inputs()
 
 
 class MappedPreviewArtifactTests(unittest.TestCase):

@@ -22,9 +22,9 @@ from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             ConfigureCommand,
                             DistributedInteractiveFitSession,
-                            FileStoreRendezvous, IncorporateCommand,
-                            InteractiveFitSession, SaveCheckpointCommand,
-                            collective_view)
+                            FileStoreRendezvous, InputBatchCommand,
+                            InteractiveFitSession,
+                            SaveCheckpointCommand, collective_view)
 import spiral_helpers
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
@@ -73,7 +73,7 @@ class ScrollSpecTests(unittest.TestCase):
                 future_extension={"enabled": True})
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
-            self.assertNotIn("base_shape_zyx", spec.manifest())
+            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
             self.assertNotIn("future_extension", spec.manifest())
 
     def test_unknown_path_override_keys_are_rejected(self):
@@ -96,11 +96,22 @@ class ScrollSpecTests(unittest.TestCase):
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_base_shape_is_validated_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
+            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
+                write_scroll_spec(temporary, base_shape_zyx=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
+                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -672,7 +683,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_command_from_another_epoch_fail_stops_the_rank(self):
         session = self._idle_session(rank=1, world_size=2)
-        session._commands.append(IncorporateCommand(
+        session._commands.append(InputBatchCommand(
             session_generation=0, epoch=99, records=[]))
         with self.assertRaisesRegex(CommandBarrierViolation,
                                     "from epoch 99 while in epoch 0"):
@@ -938,104 +949,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
 
-    def test_run_queues_influence_config_with_only_pending_inputs(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 10
-        session._pending = 0
-        session._target = 10
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {
-            "optimizer_num_training_steps": 30_000,
-        }
-        session._run_config = dict(session.requested_config)
-        pending = [{"id": "new-patch"}]
-        influence = {"influence_theta_frac": 0.25}
-
-        session.run(20, pending_inputs=pending, influence_config=influence)
-
-        command = session._commands[0]
-        self.assertIsInstance(command, IncorporateCommand)
-        self.assertEqual(command.records, pending)
-        self.assertEqual(command.influence_config, influence)
-        self.assertTrue(command.command_id)
-        self.assertEqual(command.session_generation, 0)
-        self.assertEqual(command.expected_iteration, 10)
-
-    def test_run_configuration_is_queued_before_input_incorporation(self):
-        session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._condition = threading.Condition()
-        session._state = SessionState.Idle
-        session._completed = 10
-        session._pending = 0
-        session._target = 10
-        session._context = object()
-        session._commands = []
-        session.session_generation = 0
-        session._config_revision = 0
-        session._command_epoch = 0
-        session._step_epoch = 0
-        session._step_config_revision = 0
-        session.rank = 0
-        session.world_size = 1
-        session.requested_config = {"loss_weight_patch_radius": 8.0}
-        session._run_config = {"loss_weight_patch_radius": 8.0}
-
-        session.run(
-            20,
-            pending_inputs=[{"id": "new-patch"}],
-            run_config={"loss_weight_patch_radius": 4.0},
-        )
-
-        self.assertEqual([command.kind for command in session._commands],
-                         ["configure", "incorporate"])
-        self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
-
-    def test_incorporation_warnings_reach_the_session_status(self):
-        # The context takes the inputs but reports what it could not honour;
-        # those warnings ride the status the panel already displays.
-        session = self._idle_session(completed=10)
+    def _running_session(self, completed, target, reserved=None, epoch=7):
+        session = self._idle_session(completed=completed)
+        session._state = SessionState.Running
+        session._target = target
+        session._pending = target - completed
+        session._iteration_in_progress = None
+        session._live_reservation_iteration = reserved
+        session._live_reservation_epoch = epoch
         session._warnings = []
-        session._progress_reporter = lambda: NullProgressReporter()
+        session._error = None
         session._publish_status = lambda: None
-        session._context = SimpleNamespace(
-            incorporate_interactive_inputs=lambda *args, **kwargs: [
-                "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
-        command = IncorporateCommand(
-            records=[{"id": "fiber-a", "kind": "fiber"}],
-            influence_config=None,
-            mark_incorporated=None)
-
-        session._run_incorporation(command)
-
-        self.assertEqual(session._warnings, [
-            "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
-
-    def test_incorporation_without_warnings_leaves_the_status_clean(self):
-        session = self._idle_session(completed=10)
-        session._warnings = []
         session._progress_reporter = lambda: NullProgressReporter()
-        session._publish_status = lambda: None
-        # A context predating the warning return value must not break the path.
-        session._context = SimpleNamespace(
-            incorporate_interactive_inputs=lambda *args, **kwargs: None)
-        command = IncorporateCommand(
-            records=[{"id": "patch-a", "kind": "patch"}],
-            influence_config=None,
-            mark_incorporated=None)
-
-        session._run_incorporation(command)
-
-        self.assertEqual(session._warnings, [])
+        return session
 
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

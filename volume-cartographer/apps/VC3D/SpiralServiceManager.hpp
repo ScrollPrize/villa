@@ -1,6 +1,14 @@
 #pragma once
 
+#include "SpiralPclRole.hpp"
 #include "SpiralServiceProfile.hpp"
+#include "SpiralInputDraft.hpp"
+#include "SpiralInputCopy.hpp"
+#include <QSet>
+#include <QFutureWatcher>
+#include <QJsonArray>
+#include <QTemporaryDir>
+#include <memory>
 
 #include <QJsonObject>
 #include <QElapsedTimer>
@@ -10,6 +18,7 @@
 #include <QStringList>
 #include <QTimer>
 
+#include <array>
 #include <functional>
 
 class QNetworkAccessManager;
@@ -39,7 +48,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 30;
+    static constexpr int kApiVersion = 33;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -99,11 +108,35 @@ public:
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     void commitInputs();
-    void uploadPatch(const QString& directory, const QString& inputId);
-    void uploadJsonInput(const QString& kind, const QString& filePath,
+    void applyInputDrafts(bool commit = false, const QStringList& selection = {});
+    void refreshInputCatalog();
+    QJsonArray inputDraftStatus() const;
+    bool hasInputDrafts() const;
+    bool ownsInputWorkspace() const { return _inputOwner; }
+    void restoreInputDraft(const QString& id);
+    void editInputDraft(const QString& id);
+    void resolveInputConflict(const QJsonObject& conflict, const QString& action);
+    void discardInputDraft(const QString& id);
+    void discardInputWorkspace(std::function<void()> done);
+    void releaseInputWorkspace(std::function<void()> done);
+    void invalidateWorkingCopy(const QString& source);
+    void workingCopyAsync(const QString& source, FetchPreviewFileCallback done);
+    QString workingCopy(const QString& source, QString* error = nullptr);
+    QString inputWorkspaceId() const { return _inputWorkspaceId; }
+    void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
+
+    void stagePatch(const QString& directory, const QString& inputId);
+    void stageJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {});
-    // Remove an added input that has not joined the resident fit yet.
-    void removeEphemeralInput(const QString& kind, const QString& inputId);
+    // Stage a revision of an existing editable point collection.
+    void stagePclReplacement(vc3d::spiral::PclRole role,
+                              const QString& filePath,
+                              const QString& inputId,
+                              const QString& operation,
+                              const QString& targetCollectionId,
+                              const QString& sourceIdentity = {});
+    // Stage a deletion; Apply removes supervision and Commit persists it.
+    void removeInputDraft(const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
     // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.
@@ -111,6 +144,15 @@ public:
                           FetchPreviewFileCallback done);
 
 signals:
+    void inputPreparationProgress(const QString& message);
+    void inputCopyProgress(int activeCopies, const QString& message);
+    void inputDraftsChanged();
+    void inputWorkspaceReleased();
+    void inputDraftStaged(const QString& alias);
+    void inputDraftDiscarded(const QString& alias);
+    void inputConflict(const QJsonObject& conflict);
+    void inputEditorRequested(const QJsonObject& input, const QString& workingPath);
+    void inputBatchFinished(const QString& error);
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
     void serviceStateChanged(const QString& state);
@@ -129,6 +171,11 @@ signals:
     // service as a second artifact once the surface was on its way.
     void previewDiagnosticsAvailable(const QString& manifestPath,
                                      qint64 generation);
+    // Immutable display-only PCL snapshot of one editable role resolved by
+    // the service. The descriptor carries the source coordinate domain.
+    void pclArtifactAvailable(vc3d::spiral::PclRole role,
+                              const QString& manifestPath,
+                              const QJsonObject& artifactRef);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -146,11 +193,25 @@ signals:
                                const QStringList& reasons, const QString& stage,
                                const QString& message);
     void inputUploadFinished(const QString& inputId, const QString& error);
+    // On a CAS conflict, revision is the service's current revision and error
+    // is non-empty so tracked-fiber clients can update their base and retry.
+    void fiberRevisionUploadFinished(const QString& inputId,
+                                     const QString& revision,
+                                     const QString& error);
+    void pclReplacementUploadFinished(const QString& inputId,
+                                      const QString& currentRevision,
+                                      const QString& error);
+    void pclCommitConflict(const QString& currentRevision,
+                           const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
 
 private:
+    friend class SpiralInputWorkflowTests;
+    void copyInputAsync(const QString& source, FetchPreviewFileCallback done, bool reuseWorkingCopy);
+    void fetchInputContent(const QString& id, quint64 revision, const QString& kind,
+                           std::function<void(const QString&)> done);
     // Per-operation-class request timeouts: a single global timeout is wrong.
     enum class Timeout : int {
         Quick = 5000,          // health checks and status polls
@@ -201,8 +262,62 @@ private:
     void fetchAdvertisedDataset();
     QString commandId();
     QString endpointFingerprint() const;
-    void continueUpload(const QString& uploadId, const QString& inputId,
-                        const QString& baseDir, QStringList pendingFiles);
+    struct DraftTransfer {
+        QString id, directory, uploadId;
+        QJsonObject manifest;
+    };
+    struct DraftCommand {
+        vc3d::spiral::InputDraftBatch batch;
+        QVector<DraftTransfer> transfers;
+        QJsonObject request;
+        QJsonArray revisions;
+        QStringList localDeletions;
+        QString commitId;
+        bool commit = false;
+        bool applied = false;
+        bool preparing = true;
+        QString preparationError;
+        std::shared_ptr<QTemporaryDir> directory;
+    };
+    void stageInput(const QString& kind, const QString& path, const QString& alias,
+                    const QString& role = {}, const QString& targetCollection = {}, bool deleted = false,
+                    const QString& sourceIdentity = {});
+    void resumeInputCommand();
+    void transferInput(int index);
+    void sendInputChanges();
+    void finishInputChanges(const QJsonObject& response);
+    void persistInputCommand();
+    void failInputCommand(const QString& error, const QJsonObject& body = {});
+    void finishInputCommand();
+    void installInputCatalog(const QJsonArray& inputs);
+    void claimInputWorkspace();
+    void clearInputWorkspace();
+    QString logicalInputId(const QString& kind, const QString& alias,
+                           const QString& role, const QString& targetCollection,
+                           const QString& sourceIdentity);
+    QMap<QString, std::shared_ptr<vc3d::spiral::InputDraft>> _inputDrafts;
+    QMap<QString, QJsonObject> _inputCatalog;
+    QStringList _inputOrder;
+    mutable QJsonArray _inputRowsCache;
+    mutable bool _inputRowsDirty = true;
+    QMap<QString, QString> _inputAliases;
+    QMap<QString, QString> _inputErrors;
+    QMap<QString, QString> _workingCopies;
+    QMap<QString, QSet<QString>> _inputWorkingCopySources;
+    QMap<QString, std::shared_ptr<QTemporaryDir>> _workingCopyDirectories;
+    QMap<QString, QFutureWatcher<vc3d::spiral::InputCopyResult>*> _workingCopyJobs;
+    quint64 _workingCopyGeneration = 0;
+    void cancelWorkingCopies();
+    void reportInputPreparation(const QString& message);
+    QStringList _inputSelection;
+    bool _inputSelectionExplicit = false;
+    QString _inputWorkspaceId;
+    bool _inputOwner = false;
+    bool _inputCommandBusy = false;
+    std::shared_ptr<DraftCommand> _inputCommand;
+    std::function<void()> _afterInputCommand;
+    vc3d::spiral::InputDraftSubmission _inputSubmission;
+    QTemporaryDir _inputCopies;
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);
@@ -249,10 +364,17 @@ private:
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;
+    // Per editable PCL role, indexed by vc3d::spiral::pclRoleIndex.
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _installedPclArtifact;
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _fetchingPclArtifact;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
+    std::array<quint64, vc3d::spiral::kEditablePclRoles.size()> _pclSequence{};
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastDiagnosticsLocalPath;
+    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _lastPclLocalPath;
     QString _synchronizedSessionId;
+
+    QStringList pclArtifactCachePins() const;
 };

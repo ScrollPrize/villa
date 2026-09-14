@@ -1403,7 +1403,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "constant": {
@@ -1458,7 +1458,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           }
         },
@@ -1594,7 +1594,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "key": {
@@ -1612,19 +1612,26 @@
         -32602,
         -32000,
         -32010,
-        -32007
+        -32007,
+        -32008
       ],
       "mcp": {
         "paramRenames": {
+          "collectionId": "collection_id",
           "pointId": "point_id"
         },
         "tool": "vc3d_remove_point"
       },
       "params": {
         "properties": {
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
           "pointId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           }
         },
@@ -1655,7 +1662,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "newName": {
@@ -1746,7 +1753,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "constant": {
@@ -1788,7 +1795,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "color": {
@@ -1828,7 +1835,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           }
         },
@@ -1858,7 +1865,7 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "key": {
@@ -1896,13 +1903,13 @@
           },
           "collectionId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "linkedCollectionIds": {
             "items": {
               "maximum": 9007199254740991,
-              "minimum": 1,
+              "minimum": 0,
               "type": "integer"
             },
             "type": "array"
@@ -1919,22 +1926,29 @@
         -32602,
         -32000,
         -32010,
-        -32007
+        -32007,
+        -32008
       ],
       "mcp": {
         "extraParams": [
           "clear_winding"
         ],
         "paramRenames": {
+          "collectionId": "collection_id",
           "pointId": "point_id"
         },
         "tool": "vc3d_update_point"
       },
       "params": {
         "properties": {
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
           "pointId": {
             "maximum": 9007199254740991,
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "position": {

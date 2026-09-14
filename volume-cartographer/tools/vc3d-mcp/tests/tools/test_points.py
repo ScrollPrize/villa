@@ -88,6 +88,13 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         await vc3d_update_point(point_id=7)
         self._assert_wire("points.update_point", {"pointId": 7})
 
+    async def test_update_point_in_collection_zero(self) -> None:
+        await vc3d_update_point(point_id=0, collection_id=0, clear_winding=True)
+        self._assert_wire(
+            "points.update_point",
+            {"pointId": 0, "collectionId": 0, "winding": None},
+        )
+
     async def test_update_point_can_clear_winding(self) -> None:
         await vc3d_update_point(point_id=7, clear_winding=True)
         self._assert_wire("points.update_point", {"pointId": 7, "winding": None})
@@ -99,6 +106,10 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_remove_point(self) -> None:
         await vc3d_remove_point(point_id=9)
         self._assert_wire("points.remove_point", {"pointId": 9})
+
+    async def test_remove_point_in_collection_zero(self) -> None:
+        await vc3d_remove_point(point_id=0, collection_id=0)
+        self._assert_wire("points.remove_point", {"pointId": 0, "collectionId": 0})
 
     async def test_clear_collection_by_name(self) -> None:
         await vc3d_clear_point_collection(collection="corr")
