@@ -7,6 +7,7 @@ faked; these tests exercise the service plumbing only.
 """
 
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
@@ -44,7 +45,8 @@ from spiral_service import (ApiError, ArtifactRegistry,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
 from service_uploads import UPLOADED_CHECKPOINTS_KEPT
-from lasagna_publish import PublishedPreview
+from lasagna_publish import (PreviewPublication, PublishedPreview,
+                             _flatten_request_body)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA, SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, PclRole, SessionState, SpiralInputPaths,
@@ -96,6 +98,7 @@ class FakeSession:
         self.path_change_calls = []
         self.model_rebuilds = []
         self.progress = None
+        self.preview_schedules = []
 
     def status(self):
         applied = ({"applied_config": dict(self.applied_config)}
@@ -114,10 +117,11 @@ class FakeSession:
         }
 
     def run(self, count, influence_config=None, run_config=None, path_changes=None,
-            autosave_on_pause=True):
+            autosave_on_pause=True, preview_schedule=None):
         self.run_calls.append((count, dict(influence_config or {}), dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
         self.autosave_calls.append(autosave_on_pause)
+        self.preview_schedules.append(copy.deepcopy(preview_schedule))
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -1381,6 +1385,28 @@ class DatasetOwnershipTests(unittest.TestCase):
                          {"iterations": 4, "autosave_on_pause": "no"})
         self.assertEqual(caught.exception.status, 400)
 
+    def test_preview_schedule_is_optional_validated_and_service_owned(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        _planned_run(self.state, {
+            "iterations": 4,
+            "preview_schedule": {
+                "cadence_iterations": 100, "diagnostics": True},
+        })
+        self.assertEqual(session.preview_schedules, [{
+            "cadence_iterations": 100, "diagnostics": True}])
+        status = self.state.status()
+        self.assertEqual(status["preview_schedule"], {
+            "cadence_iterations": 100, "diagnostics": True})
+        self.assertEqual(status["next_preview_iteration"], 105)
+
+        for invalid in ({"cadence_iterations": 0, "diagnostics": False},
+                        {"cadence_iterations": 10, "diagnostics": "yes"}):
+            session.state = SessionState.Idle
+            with self.assertRaises(ApiError) as caught:
+                _planned_run(self.state, {
+                    "iterations": 4, "preview_schedule": invalid})
+            self.assertEqual(caught.exception.status, 400)
+
     def test_export_preview_accepts_and_runs_off_the_request_thread(self):
         """A preview costs minutes; the verb accepts it and returns.
 
@@ -1411,10 +1437,13 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(session.previews, 1)
 
         session.state = SessionState.Running
-        with self.assertRaises(ApiError) as caught:
-            self.state.export_preview()
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(session.previews, 1)
+        response = self.state.export_preview()
+        self.assertTrue(response["accepted"])
+        deadline = time.monotonic() + 5.0
+        while self.state.status()["preview_exporting"] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(session.previews, 2)
 
     def test_a_failed_preview_export_is_reported_through_status(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -2567,6 +2596,15 @@ class CheckpointUploadTests(unittest.TestCase):
 
 
 class MappedPreviewArtifactTests(unittest.TestCase):
+    @staticmethod
+    def _wait_finished(state, generation=1):
+        deadline = time.monotonic() + 5.0
+        while state._preview.completed_generation < generation \
+                and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if state._preview.completed_generation < generation:
+            raise AssertionError("background preview publication did not finish")
+
     def test_lasagna_output_scale_must_match_requested_step(self):
         self.assertEqual(
             _validate_tifxyz_output_step(
@@ -2575,6 +2613,74 @@ class MappedPreviewArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not match"):
             _validate_tifxyz_output_step(
                 {"scale": [0.04, 0.04]}, 20.0)
+
+    def test_every_generation_is_flattened_from_scratch(self):
+        profile = {
+            "args": {"model-init": "flatten"},
+            "stages": [{"name": "cold", "steps": 4500, "lr": 0.01},
+                       {"name": "cold-refine", "steps": 1000, "lr": 0.001}],
+        }
+        body = _flatten_request_body(
+            profile, {"kind": "surface"}, surface_id="s-lasagna.tifxyz",
+            publish_root=Path("/publish"), model_output=Path("/publish/m.pt"))
+        # The request carries no warm-start state from an earlier generation
+        # and leaves the configured profile's schedule untouched.
+        self.assertNotIn("export_flatten_uv", body)
+        self.assertNotIn("flatten_initial_uv", body["config"]["args"])
+        self.assertEqual(body["config"]["stages"], profile["stages"])
+        self.assertEqual(body["job_spec"]["config"], body["config"])
+        self.assertEqual(body["config"]["external_surfaces"],
+                         [{"kind": "surface"}])
+        self.assertNotIn("external_surfaces", profile)
+        self.assertTrue(body["export_flatten_map"])
+
+    def test_active_publication_coalesces_to_only_the_newest_pending_raw(self):
+        publication = PreviewPublication()
+        self.assertTrue(publication.claim(
+            "session", 1, manifest="/raw/1/manifest.json",
+            source_fit_iteration=100))
+        self.assertFalse(publication.claim(
+            "session", 2, manifest="/raw/2/manifest.json",
+            source_fit_iteration=200))
+        self.assertFalse(publication.claim(
+            "session", 3, manifest="/raw/3/manifest.json",
+            source_fit_iteration=300))
+        self.assertEqual(publication.pending_generation, 3)
+        publication.finish(1)
+        pending = publication.take_pending()
+        self.assertEqual(pending["preview_generation"], 3)
+        self.assertEqual(pending["current_iteration"], 300)
+
+    def test_published_active_and_pending_iterations_are_not_conflated(self):
+        publication = PreviewPublication()
+        publication.source_fit_iteration = 100
+        self.assertTrue(publication.claim(
+            "session", 2, manifest="/raw/2/manifest.json",
+            source_fit_iteration=200))
+        self.assertFalse(publication.claim(
+            "session", 3, manifest="/raw/3/manifest.json",
+            source_fit_iteration=300))
+
+        self.assertEqual(publication.source_fit_iteration, 100)
+        self.assertEqual(publication.active_source_fit_iteration, 200)
+        self.assertEqual(publication.pending_source_fit_iteration, 300)
+
+    def test_session_reset_invalidates_every_retained_raw_generation(self):
+        publication = PreviewPublication()
+        publication.previous_raw_manifest = "/raw/previous/manifest.json"
+        self.assertTrue(publication.claim(
+            "session", 2, manifest="/raw/active/manifest.json"))
+        self.assertFalse(publication.claim(
+            "session", 3, manifest="/raw/pending/manifest.json"))
+
+        self.assertEqual(set(publication.reset_session_scope()), {
+            "/raw/previous/manifest.json",
+            "/raw/active/manifest.json",
+            "/raw/pending/manifest.json",
+        })
+        self.assertEqual(publication.generation, 0)
+        self.assertIsNone(publication.manifest)
+        self.assertEqual(publication.pending_generation, 0)
 
     def test_failed_flatten_keeps_previous_preview_and_discards_raw_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2599,6 +2705,7 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                     "preview_generation": 1,
                     "preview_manifest_path": str(current_manifest),
                 })
+                self._wait_finished(state)
 
             self.assertEqual(
                 state._preview.artifact, {"id": "previous-preview"})
@@ -2651,6 +2758,7 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                     "preview_manifest_path": str(root / "raw" / "manifest.json"),
                     "preview_diagnostics": True,
                 })
+                self._wait_finished(state)
 
             self.assertEqual(len(announced), 1)
             self.assertEqual(announced[0].get("kind"), "spiral-preview")
@@ -2676,6 +2784,7 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                     "preview_generation": 1,
                     "preview_manifest_path": str(root / "raw" / "manifest.json"),
                 })
+                self._wait_finished(state)
 
             publisher.publish_diagnostics.assert_not_called()
             self.assertEqual(state._preview.artifact["kind"], "spiral-preview")
@@ -2700,6 +2809,7 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                     "preview_manifest_path": str(root / "raw" / "manifest.json"),
                     "preview_diagnostics": True,
                 })
+                self._wait_finished(state)
 
             self.assertEqual(state._preview.artifact["kind"], "spiral-preview")
             self.assertIsNone(state._preview.diagnostics_artifact)

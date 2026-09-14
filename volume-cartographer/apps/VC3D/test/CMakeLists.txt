@@ -188,6 +188,23 @@ vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit
 set_tests_properties(spiral_point_collection_edit PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_spiral_preview_provenance
+    test_spiral_preview_provenance.cpp)
+
+set_target_properties(test_spiral_preview_provenance PROPERTIES
+    AUTOMOC ON)
+
+target_include_directories(test_spiral_preview_provenance PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_preview_provenance PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME spiral_preview_provenance COMMAND test_spiral_preview_provenance)
+vc_register_test_target(test_spiral_preview_provenance)
+vc_register_ctest(spiral_preview_provenance test_spiral_preview_provenance)
+
 add_executable(test_download_queue_stats
     test_download_queue_stats.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueStats.cpp)
