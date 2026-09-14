@@ -433,6 +433,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _lineAnnotationController->unregisterExternalFiberSource(directory.toStdString());
         _managedFiberDirectories.clear();
         _managedPatchCopies.clear();
+        _inputFiberDirectories.clear();
         _externalFiberSource.clear();
     });
     connect(_service, &SpiralServiceManager::inputEditorRequested, this,
@@ -440,13 +441,23 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 const auto kind = input.value(QStringLiteral("kind")).toString();
                 const auto id = input.value(QStringLiteral("id")).toString();
                 if (kind == QStringLiteral("patch")) {
+                    for (auto it = _managedPatchCopies.begin(); it != _managedPatchCopies.end();) {
+                        if (it.value() == id) it = _managedPatchCopies.erase(it);
+                        else ++it;
+                    }
                     _managedPatchCopies[path] = id;
                     emit patchEditorRequested(id, path);
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
-                    QString error;
                     const auto directory = QFileInfo(path).absolutePath();
+                    const auto previous = _inputFiberDirectories.value(id);
+                    if (!previous.isEmpty() && previous != directory) {
+                        _lineAnnotationController->unregisterExternalFiberSource(previous.toStdString());
+                        _managedFiberDirectories.remove(previous);
+                    }
+                    QString error;
                     if (_lineAnnotationController->registerExternalFiberSource(directory.toStdString(), &error, true)) {
                         const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                        _inputFiberDirectories[id] = directory;
                         _externalFiberSource = directory;
                         _managedFiberDirectories.insert(QDir(directory).absolutePath());
                         if (fiber) _lineAnnotationController->openFiber(fiber);

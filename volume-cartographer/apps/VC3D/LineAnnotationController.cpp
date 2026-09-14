@@ -13452,6 +13452,17 @@ void LineAnnotationController::unregisterExternalFiberSource(const fs::path& sou
     std::error_code ec;
     fs::path canonical = fs::weakly_canonical(source, ec);
     if (ec) canonical = fs::absolute(source).lexically_normal();
+    // A removed working source must not be recreated by an old editor's
+    // debounced autosave or by closing that editor when its replacement opens.
+    std::vector<uint64_t> retiredIds;
+    for (auto& pane : _panes) {
+        if (pane.session && pane.session->fiberSourceRoot == canonical) {
+            pane.session->suppressFiberSave = true;
+            pane.session->autoSaveScheduled = false;
+            retiredIds.push_back(pane.session->fiberId);
+        }
+    }
+    closeDialogPanesForFibers(retiredIds);
     const auto oldSize = _externalFiberSources.size();
     std::erase(_externalFiberSources, canonical);
     _workingCopyFiberSources.erase(canonical);

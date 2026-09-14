@@ -298,6 +298,7 @@ private:
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
     QHash<QString, QString> _managedPatchCopies;
+    QHash<QString, QString> _inputFiberDirectories;
     int _draftPreparationRemaining = 0;
     bool _draftPreparationFailed = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime

@@ -4,6 +4,7 @@
 #include "SpiralServiceProfile.hpp"
 #include "SpiralInputDraft.hpp"
 #include "SpiralInputCopy.hpp"
+#include <QSet>
 #include <QFutureWatcher>
 #include <QJsonArray>
 #include <QTemporaryDir>
@@ -298,6 +299,7 @@ private:
     QMap<QString, QString> _inputAliases;
     QMap<QString, QString> _inputErrors;
     QMap<QString, QString> _workingCopies;
+    QMap<QString, QSet<QString>> _inputWorkingCopySources;
     QMap<QString, std::shared_ptr<QTemporaryDir>> _workingCopyDirectories;
     QMap<QString, QFutureWatcher<vc3d::spiral::InputCopyResult>*> _workingCopyJobs;
     quint64 _workingCopyGeneration = 0;

@@ -215,6 +215,31 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(successCount(completed), 2, 10000);
         QCOMPARE(document(root.filePath(QStringLiteral("dataset/fibers/%1.json").arg(newId))), original);
         QCOMPARE(document(baseline), external);
+        // Conflict resolution accepted the external revision. Open and mutate it,
+        // then discard without changing that accepted revision again.
+        client.editInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 2, 10000);
+        const auto acceptedEditorPath = editors.last()[1].toString();
+        QCOMPARE(document(acceptedEditorPath), external);
+        write(acceptedEditorPath, QJsonDocument(edited).toJson());
+        client.discardInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 3, 10000);
+        const auto restoredPath = editors.last()[1].toString();
+        QVERIFY(restoredPath != acceptedEditorPath);
+        QCOMPARE(document(restoredPath), external);
+        client.editInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 4, 10000);
+        QCOMPARE(editors.last()[1].toString(), restoredPath);
+        QCOMPARE(document(editors.last()[1].toString()), external);
+        // Also discard after staging and opening a separate local snapshot.
+        write(restoredPath, QJsonDocument(edited).toJson());
+        client.stageJsonInput(QStringLiteral("fiber"), restoredPath, firstId);
+        client.editInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 5, 10000);
+        QCOMPARE(document(editors.last()[1].toString()), edited);
+        client.discardInputDraft(firstId);
+        QTRY_COMPARE_WITH_TIMEOUT(editors.size(), 6, 10000);
+        QCOMPARE(document(editors.last()[1].toString()), external);
         client.disconnectFromService();
         service.terminate();
         QVERIFY(service.waitForFinished(5000));

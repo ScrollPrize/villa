@@ -884,6 +884,7 @@ void SpiralBrushController::appendPointCollectionPoint(
         return;
     }
     collection.pclEdit->appendPreviewPoint(volumePosition, surfacePosition);
+    collection.state = GestureState::Painted;
     invalidateEditablePclHitIndex();
     updateSuppressedPclIds();
     clearPointChainProjectionCache();
@@ -919,7 +920,10 @@ void SpiralBrushController::selectEditablePcl(PclRole role, std::size_t sourceIn
         auto& line = _polylines[index];
         if (line.pclEdit && line.pclEdit->role == role
             && line.pclEdit->collectionId == source.collectionId) {
-            line.pclEdit->setDeleted(false);
+            if (line.pclEdit->deleted) {
+                line.pclEdit->setDeleted(false);
+                line.state = GestureState::Painted;
+            }
             _activePolyline = static_cast<int>(index);
             invalidateEditablePclHitIndex();
             updateCursorWidget();
@@ -967,8 +971,7 @@ void SpiralBrushController::reverseActivePcl()
         || active.pclEdit->deleted || active.pclEdit->points.size() < 2)
         return;
     active.pclEdit->reverse();
-    if (active.state == GestureState::Ready)
-        active.state = GestureState::Painted;
+    active.state = GestureState::Painted;
     clearEditablePclHover();
     invalidateEditablePclHitIndex();
     updateSuppressedPclIds();
@@ -1012,8 +1015,7 @@ void SpiralBrushController::confirmDeleteActivePcl()
         _polylines.erase(_polylines.begin() + _activePolyline);
     } else {
         active.pclEdit->setDeleted(true);
-        if (active.state == GestureState::Ready)
-            active.state = GestureState::Painted;
+        active.state = GestureState::Painted;
     }
     _activePolyline = -1;
     invalidateEditablePclHitIndex();

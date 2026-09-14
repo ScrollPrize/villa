@@ -251,7 +251,11 @@ void SpiralServiceManager::discardInputDraft(const QString& id)
         const auto alias = draft->snapshot().content.manifest.value(QStringLiteral("alias")).toString(id);
         if (!draft->accepted()) { _inputDrafts.remove(id); _inputOrder.removeAll(id); }
         else draft->discardLocalChanges();
+        const auto sources = _inputWorkingCopySources.take(id);
+        for (const auto& source : sources) invalidateWorkingCopy(source);
         emit inputDraftDiscarded(alias);
+        // Reopen from the accepted revision so the live editor also drops its edits.
+        if (!sources.isEmpty() && draft->accepted()) editInputDraft(id);
     }
     _inputErrors.remove(id);
     emit inputDraftsChanged();
@@ -327,6 +331,7 @@ QString SpiralServiceManager::workingCopy(const QString& source, QString* error)
 void SpiralServiceManager::invalidateWorkingCopy(const QString& source)
 {
     const auto key = QFileInfo(source).absoluteFilePath();
+    if (auto* job = _workingCopyJobs.take(key)) job->cancel();
     _workingCopies.remove(key);
     _workingCopyDirectories.remove(key);
 }
@@ -361,7 +366,7 @@ void SpiralServiceManager::copyInputAsync(const QString& source, FetchPreviewFil
         connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, key, generation]() {
             watcher->deleteLater();
             if (generation != _workingCopyGeneration) return;
-            _workingCopyJobs.remove(key);
+            if (_workingCopyJobs.value(key) == watcher) _workingCopyJobs.remove(key);
             if (!watcher->isCanceled()) {
                 const auto result = watcher->result();
                 if (result.error.isEmpty()) {
@@ -815,9 +820,11 @@ void SpiralServiceManager::editInputDraft(const QString& id)
         emit inputEditorRequested(editorInput, {});
         return;
     }
-    auto open = [this, input](const QString& source) {
+    auto open = [this, id, input](const QString& source) {
         const bool fiber = input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber");
-        workingCopyAsync(fiber ? QFileInfo(source).absolutePath() : source,
+        const auto copySource = fiber ? QFileInfo(source).absolutePath() : source;
+        _inputWorkingCopySources[id].insert(QFileInfo(copySource).absoluteFilePath());
+        workingCopyAsync(copySource,
             [this, input, source, fiber](const QString& working, const QString& error) {
                 if (working.isEmpty()) emit errorOccurred(error);
                 else emit inputEditorRequested(input, fiber ? QDir(working).filePath(QFileInfo(source).fileName()) : working);
@@ -885,6 +892,7 @@ void SpiralServiceManager::clearInputWorkspace()
 {
     cancelWorkingCopies();
     _workingCopies.clear();
+    _inputWorkingCopySources.clear();
     emit inputCopyProgress(0, {});
     _inputOwner = false;
     _inputWorkspaceId.clear();
