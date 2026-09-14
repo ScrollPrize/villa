@@ -11,6 +11,7 @@ def test_idle_timer_slow_read_and_demand_unpause():
     calls = []
     future = Future()
     lease = DemandGpuLease.__new__(DemandGpuLease)
+    lease.started = True
     now = [0.]
     lease.clock = lambda: now[0]
     lease.pool = SimpleNamespace(active={}, loading={1: ('s', (), 0, future, 0)}, last_gpu_activity=0)
@@ -44,6 +45,32 @@ def test_compatibility_is_exact_not_a_fingerprint_bypass():
     assert not compatible_implementation(old, dict(new, runner='unreviewed edit'))
 
 
+def test_initial_request_waits_for_ready_input(monkeypatch):
+    import vesuvius.neural_tracing.fiber_trace_3d.demand_gpu as module
+    calls = []
+    monkeypatch.setattr(module, 'resolve_gpu_uuids', lambda devices: ['GPU-test'])
+    monkeypatch.setattr(module, 'ensure_manager', lambda socket: (calls.append('bootstrap') or 'test.sock', None))
+    monkeypatch.setattr(module, 'Client', lambda socket: SimpleNamespace(
+        close=lambda: calls.append('close'), task_id='test'))
+    def supervisor(client, **kwargs):
+        return SimpleNamespace(client=client, connected=False, stopping=False,
+            tick=lambda: calls.append('register'), error=None, status='waiting')
+    monkeypatch.setattr(module, 'Supervisor', supervisor)
+    future = Future()
+    pool = SimpleNamespace(active={}, loading={1: ('s', (), 0, future, 0)}, last_gpu_activity=0)
+    lease = DemandGpuLease(pool, dict(vram_bytes_per_gpu=4 << 30), clock=lambda: 100)
+    for _ in range(3):
+        lease.tick()
+    assert calls == [] and not lease.started
+    lease.close()
+    assert calls == ['close']  # Closing unused lease must not register either.
+    calls.clear()
+    lease = DemandGpuLease(pool, dict(vram_bytes_per_gpu=4 << 30), clock=lambda: 100)
+    future.set_result(None)
+    lease.tick()
+    assert calls == ['bootstrap', 'register'] and lease.started
+
+
 def test_drain_waits_for_submitted_tiles_but_not_cpu_results():
     calls = []
     pool = SimpleNamespace(start_gpu=lambda *a, **k: calls.append('start'),
@@ -75,6 +102,11 @@ def test_live_manager_idle_reacquire(tmp_path):
             lease = DemandGpuLease(pool, dict(exclusive=False, priority=-100,
                 cpu_cores=1, vram_bytes_per_gpu=4 << 30, label='demand-pause-smoke'))
             try:
+                for _ in range(3):
+                    lease.tick()
+                    pool.pump()
+                assert not lease.started and not pool.processes
+                assert lease.supervisor.client.task_id is None
                 for z in range(2):
                     if z == 1:
                         lease.supervisor.client.task_call('set_paused', paused=True, scope='controller')
@@ -116,6 +148,7 @@ def test_live_manager_idle_reacquire(tmp_path):
 
 def test_cleanup_aborts_on_pump_error_and_still_reconciles():
     lease = DemandGpuLease.__new__(DemandGpuLease)
+    lease.started = True
     calls = []
     supervisor = SimpleNamespace(error=None, finished=False, stop=lambda: calls.append('stop'))
     def fail(error):

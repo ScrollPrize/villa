@@ -7216,6 +7216,8 @@ trace; no history expiry/admission. It is distinct from the EMA+seed mixture.
   those CPU activities are explicitly outside paused GPU lease accounting.
 - GPU dispatch stops on release; submitted tiles drain, GPU children join,
   then release is acknowledged. CPU queues/results/trace state survive.
+- Before first ready input, do not bootstrap/register/request GPUs. Closing
+  without input demand never registers. CPU reads continue independently.
 - After30s without GPU tile activity self-pause/release; request again when a
   read is ready for GPU dispatch. Never clear administrative pause on demand.
 - Native coordinator heartbeats allow live scheduling waits beyond request

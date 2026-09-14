@@ -62,16 +62,17 @@ class DemandGpuLease:
         exclusive = settings.get("exclusive", False)
         if type(exclusive) is not bool:
             raise ValueError("gpu_manager.exclusive must be boolean")
-        socket, _ = ensure_manager(settings.get("socket"))
+        self.manager_socket = settings.get("socket")
         request = dict(max_cpu_cores=int(settings.get("cpu_cores", 16)),
                        max_gpus=len(selected), min_vram_bytes_per_gpu=budget,
                        max_vram_bytes_per_gpu=budget, allowed_gpu_uuids=selected,
                        exclusive=exclusive,
                        priority=int(settings.get("priority", 100)))
         self.pool, self.clock = pool, clock
+        self.started = False
         self.idle_paused = False
         self.last_status = None
-        self.supervisor = Supervisor(Client(socket), request=request,
+        self.supervisor = Supervisor(Client(self.manager_socket or ""), request=request,
             label=settings.get("label", "demand-inference"),
             cohort_factory=lambda grant, state: DemandCohort(pool, grant),
             clock=clock, poll_interval=.2)
@@ -81,6 +82,14 @@ class DemandGpuLease:
         # Slow input I/O is not GPU work. Reacquire only when a read is ready;
         # this also avoids idle pause/reacquire thrashing on queued slow reads.
         need = bool(pool.active or any(row[3].done() for row in pool.loading.values()))
+        if not self.started:
+            if not need:
+                return  # No registration/grant while the first input is loading.
+            # Bootstrap now, not during slow CPU reads: an unused manager may
+            # otherwise idle-exit before our first registration.
+            socket, _ = ensure_manager(self.manager_socket)
+            supervisor.client.path = str(socket)
+            self.started = True
         idle = self.idle_paused
         if need:
             idle = False
@@ -104,6 +113,9 @@ class DemandGpuLease:
             self.last_status = status
 
     def close(self):
+        if not self.started:
+            self.supervisor.client.close()
+            return
         self.supervisor.stop()
         deadline = self.clock() + 15
         while not self.supervisor.finished and self.clock() < deadline:

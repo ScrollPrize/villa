@@ -1,8 +1,10 @@
 # Cooperative GPU use in embedding sweeps
 
 The sweep is CPU-driven. Cached tracing reserves no GPU. When missing inference
-tiles appear, the shared demand pool starts CPU reads and requests a GPU grant
-through the existing manager Supervisor. GPU children are gated until the
+tiles appear, the shared demand pool starts CPU reads. Only when the first read
+is ready does it bootstrap/register with the manager and request a GPU grant
+through the existing Supervisor. Slow initial reads hold no GPU reservation;
+closing before first demand never registers a task. GPU children are gated until the
 manager records their identities and authorizes the grant.
 
 - **Pause:** stop dispatching tiles, finish submitted tiles, join GPU children,

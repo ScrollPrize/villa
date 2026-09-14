@@ -1,5 +1,13 @@
 # Demand-scoped GPU lease
 
+## Startup follow-up
+Defer manager bootstrap and the first Supervisor tick/registration until an input read is ready for
+GPU dispatch. Before that, hold no grant and launch no GPU worker. Closing an
+unused lease must not register a task. Retain existing idle release and pause
+semantics after activation; no protocol changes. Test delayed reads, first
+ready tile and close-before-demand with the approved CPU/live test caller.
+Update specs, demand GPU docs and task log with this startup contract.
+
 ## Goal follow-up: cached CPU validation
 
 After exact-repeat verification, finish the seven family refinements not

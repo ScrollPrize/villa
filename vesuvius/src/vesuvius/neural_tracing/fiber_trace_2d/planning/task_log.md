@@ -1,5 +1,15 @@
 # Demand-scoped GPU ownership (2026-09-14)
 
+- Startup follow-up: defer manager bootstrap and first Supervisor tick until
+  the first input is ready. No GPU grant during initial CPU reads, and unused
+  close never registers. Review caught idle-manager exit before delayed first
+  registration; deferring bootstrap resolves it. Protocol unchanged.
+- Approved cooperative test caller, output `20260914_092511_225918`:
+  CPU lifecycle tests 92 passed/1 opt-in skip in52.95s. Separate GPU smoke
+  verified pre-demand no-registration/no-workers assertions, then skipped after
+  90s without manager capacity (91.80s total). No GPU execution claimed for this
+  follow-up. Independent final review passed; diff check clean.
+
 - Stopped boundary sweep via approved experiment launcher. Task 9cf987a9-ef04-441e-aabf-1a8e26fea75a finished, zero held CPU/GPU confirmed. Partial report preserved at evaluations/embedding_ema99_anchor_boundaries_20260914_v1/report.json.
 - Independent plan review approved with drain/join, retained CPU state, separate administrative/self pause and heartbeat invariants.
 - Added deferred/gated GPU lifetime to shared DemandWorkerPool; existing CPU queues and numerical paths retained. Supervisor owns GPU lifecycle, no manager protocol changes.

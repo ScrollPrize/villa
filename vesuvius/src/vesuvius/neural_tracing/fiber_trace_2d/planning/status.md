@@ -3,6 +3,8 @@
 - [x] Independent plan and implementation review; findings addressed.
 - [x] Implement GPU pause/idle release/reacquire and native heartbeat.
 - [x] Tests and final review/docs; sweep left stopped.
+- [x] Startup follow-up: defer bootstrap/registration until first ready input;
+  unused cleanup never registers. Independent review and CPU tests passed.
 - [x] CPU-only exact verification of LRU64 and softmin67.
 - [ ] Finish seven remaining family refinements on cached predictions only.
 - [ ] Record coverage limits or completed minima/repeats; consolidate final evidence.
