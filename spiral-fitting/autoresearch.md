@@ -49,7 +49,7 @@ We also track **`overall_fg_fraction`** (foreground pixels ÷ total strip pixels
 
 **The first run**: Your very first run should always establish the baseline — run the pipeline as-is, unmodified. After that, prefer simple hyperparameter changes before anything drastic.
 
-**Stochasticity**: The code is sensitive to the random seed and CUDA non-determinism. Prefer changes that are robust across seeds/runs, not ones that only help for one specific seed. Since you run two at a time, a cheap robustness check is to run the same change under two seeds concurrently and see if the ink gain survives. Seemingly-beneficial changes should be verified across seeds/runs before you commit to them.
+**Stochasticity**: The code is sensitive to the random seed and CUDA non-determinism. Prefer changes that are robust across seeds/runs, not ones that only help for one specific seed. Since you run two at a time, a cheap robustness check is to run the same change under two seeds concurrently and see if the ink gain survives. Be aware of what that buys: if the rule is "both change runs beat both baseline runs", a change with no real effect passes it with probability exactly 1/C(2k, k) — **1 in 6** for two seeds, **1 in 20** for three. That is a rank statistic, so it does not depend on the noise level, the metric, or the code version; it cannot be reduced by fitting better, only by using more seeds. Seemingly-beneficial changes should be verified across seeds/runs before you commit to them.
 
 ## The pipeline and how to run it
 
