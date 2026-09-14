@@ -160,4 +160,23 @@ FiberDeleteResolution resolveFiberDeletionAcrossWait(const std::vector<uint64_t>
     return resolveFiberDeleteTargets(capture, fibersNow(), before, after);
 }
 
+// Whether an open annotation session belongs to one of the fibers just
+// deleted, for suppressing its save. A session keeps the runtime id it was
+// opened with, and a reload hands the stored fibers' ids out again without
+// touching sessions, so an id match alone can point at the wrong fiber
+// after a reload. A session that knows its file name is therefore matched
+// by that name only; an id match counts only for a session with no name,
+// which has no other identity.
+inline bool sessionBelongsToDeletedFiber(uint64_t sessionFiberId,
+                                         const std::string& sessionFileName,
+                                         const std::vector<uint64_t>& deletedIdsSorted,
+                                         const std::vector<std::string>& deletedFileNames)
+{
+    if (!sessionFileName.empty()) {
+        return std::find(deletedFileNames.begin(), deletedFileNames.end(), sessionFileName) !=
+               deletedFileNames.end();
+    }
+    return std::binary_search(deletedIdsSorted.begin(), deletedIdsSorted.end(), sessionFiberId);
+}
+
 } // namespace vc3d::line_annotation

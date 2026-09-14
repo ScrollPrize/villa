@@ -3170,24 +3170,22 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     for (uint64_t deletedId : deletedIds) {
         invalidateFiberAlignmentMetrics(deletedId, false);
     }
-    // Open sessions keep the id they were opened with; a reload reassigns
-    // the stored fibers' ids without touching them. So a session is matched
-    // by its file name as well as by id, or a survivor could re-save the
-    // file just deleted.
+    // Open sessions keep the id they were opened with, and a reload during
+    // the drain may have reassigned the stored ids; the shared rule matches
+    // a named session by file name only (see LineAnnotationFiberDeletion.hpp),
+    // so a survivor holding a deleted fiber's new id keeps saving and the
+    // deleted fiber's own session does not re-create the file.
+    std::vector<std::string> deletedFileNames;
+    deletedFileNames.reserve(deletedFibers.size());
+    for (const auto& [deletedId, deletedFileName] : deletedFibers) {
+        deletedFileNames.push_back(deletedFileName);
+    }
     for (const auto& pane : _panes) {
-        if (!pane.session) {
-            continue;
-        }
-        const bool byId = std::binary_search(deletedIds.begin(),
-                                             deletedIds.end(),
-                                             pane.session->fiberId);
-        const bool byFileName =
-            !pane.session->fiberFileName.empty() &&
-            std::any_of(deletedFibers.begin(), deletedFibers.end(),
-                        [&pane](const std::pair<uint64_t, std::string>& deleted) {
-                            return deleted.second == pane.session->fiberFileName;
-                        });
-        if (byId || byFileName) {
+        if (pane.session &&
+            deletion::sessionBelongsToDeletedFiber(pane.session->fiberId,
+                                                   pane.session->fiberFileName,
+                                                   deletedIds,
+                                                   deletedFileNames)) {
             pane.session->suppressFiberSave = true;
         }
     }
@@ -3205,6 +3203,14 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     });
     if (it == _fibers.end()) {
         showError(tr("Fiber %1 is not loaded.").arg(fiberId));
+        return;
+    }
+    // A pending delete has captured its targets by file name and is waiting
+    // for saves to drain; a rename meanwhile could vacate one of those names
+    // for another fiber (an import re-uses a free name unsuffixed) and the
+    // delete would then remove that other fiber. Renames wait their turn.
+    if (_deletingFibers) {
+        showError(tr("A fiber delete is in progress; rename the file once it has finished."));
         return;
     }
 
@@ -3289,8 +3295,18 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     }
 
     *it = std::move(renamed);
+    // Sessions keep the id they were opened with, and a reload since then
+    // may have reassigned the stored ids; a session that knows its file
+    // name is therefore matched by the old name, and by id only when it
+    // has no name to go by.
     for (const auto& pane : _panes) {
-        if (pane.session && pane.session->fiberId == fiberId) {
+        if (!pane.session) {
+            continue;
+        }
+        const bool isThisFiber = pane.session->fiberFileName.empty()
+            ? pane.session->fiberId == fiberId
+            : pane.session->fiberFileName == oldFileName;
+        if (isThisFiber) {
             pane.session->fiberFileName = it->fileName;
             pane.session->fiberUsername = it->username;
             pane.session->fiberStartedAt = it->startedAt;

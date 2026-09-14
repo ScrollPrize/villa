@@ -18,6 +18,7 @@ using vc3d::line_annotation::FiberDeleteResolution;
 using vc3d::line_annotation::captureFiberDeleteTargets;
 using vc3d::line_annotation::resolveFiberDeleteTargets;
 using vc3d::line_annotation::resolveFiberDeletionAcrossWait;
+using vc3d::line_annotation::sessionBelongsToDeletedFiber;
 
 namespace
 {
@@ -192,6 +193,36 @@ private slots:
         QCOMPARE(resolution.missing[0].fileName, std::string("b.json"));
         QCOMPARE(resolution.unnamed, std::vector<uint64_t>{4});
         QCOMPARE(resolution.notLoaded, std::vector<uint64_t>{8});
+    }
+
+    // The same id requested twice still deletes one fiber once.
+    void duplicateRequestedIdsResolveOnce()
+    {
+        std::vector<Fiber> fibers = reloaded({"a.json", "b.json", "c.json"});
+        const FiberDeleteResolution resolution = resolveFiberDeletionAcrossWait(
+            std::vector<uint64_t>{2, 2},
+            [&fibers]() -> const std::vector<Fiber>& { return fibers; },
+            []() { return kPackage; },
+            [&fibers]() { fibers = reloaded({"0-new.json", "a.json", "b.json", "c.json"}); });
+        QVERIFY(!resolution.aborted);
+        QCOMPARE(resolution.resolvedIds, std::vector<uint64_t>{3});
+    }
+
+    // Save suppression after the delete: a named session is matched by its
+    // file name only, so the session of an unrelated fiber that happens to
+    // hold a deleted fiber's NEW id after a reload keeps saving; a session
+    // without a name falls back to its id.
+    void sessionSuppressionMatchesNamedSessionsByFileNameOnly()
+    {
+        // Initially a=1, b=2, c=3 with c's session open (id 3). b is deleted
+        // after a reload made it new=1, a=2, b=3, c=4: deletedIds = {3}.
+        const std::vector<uint64_t> deletedIds = {3};
+        const std::vector<std::string> deletedNames = {"b.json"};
+        QVERIFY(!sessionBelongsToDeletedFiber(3, "c.json", deletedIds, deletedNames));
+        QVERIFY(sessionBelongsToDeletedFiber(2, "b.json", deletedIds, deletedNames));
+        QVERIFY(sessionBelongsToDeletedFiber(3, "", deletedIds, deletedNames));
+        QVERIFY(!sessionBelongsToDeletedFiber(4, "", deletedIds, deletedNames));
+        QVERIFY(!sessionBelongsToDeletedFiber(3, "a.json", deletedIds, deletedNames));
     }
 
     // Nothing to delete: the wait is skipped, and the report still names
