@@ -1064,6 +1064,78 @@ class ProtocolTests(unittest.TestCase):
             # No autosave means no metadata claiming one exists.
             self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
 
+    def _mid_run_session(self, calls, output_path, completed,
+                         autosave_on_pause=True):
+        session = self._paused_session(
+            calls, output_path, autosave_on_pause=autosave_on_pause)
+        session._completed = completed - 1
+        session._pending = 500
+        session._target = completed + 499
+        session._warnings = []
+        return session
+
+    def test_a_long_run_autosaves_every_thousand_iterations(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3000)
+
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            # The cadence save neither pauses the run nor clears its state.
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(session._state, SessionState.Running)
+            self.assertEqual(session._phase, "Optimizing")
+            self.assertEqual(session._pending, 499)
+            metadata = json.loads(
+                (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
+            self.assertEqual(metadata["completed_iterations"], 3000)
+            self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
+
+    def test_off_cadence_iterations_do_not_autosave(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3001)
+            session.iteration_completed(
+                completed_iterations=3001, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+            self.assertEqual(calls, [])
+            self.assertEqual(session._state, SessionState.Running)
+
+    def test_a_run_without_autosave_skips_the_cadence_too(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(
+                calls, output, completed=3000, autosave_on_pause=False)
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+            self.assertEqual(calls, [])
+            self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
+
+    def test_a_failed_cadence_autosave_keeps_the_previous_one_and_warns(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as output:
+            session = self._mid_run_session(calls, output, completed=3000)
+            previous = Path(output) / AUTOSAVE_CHECKPOINT_NAME
+            previous.write_bytes(b"previous autosave")
+
+            def failing_save(path, *_):
+                calls.append("save")
+                raise OSError("disk full")
+            session._context.save_checkpoint = failing_save
+
+            session.iteration_completed(
+                completed_iterations=3000, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
+
+            self.assertEqual(calls, ["save"])
+            self.assertEqual(session._state, SessionState.Running)
+            self.assertEqual(previous.read_bytes(), b"previous autosave")
+            self.assertEqual(len(session._warnings), 1)
+            self.assertIn("disk full", session._warnings[0])
+
     def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
         session = self._idle_session(completed=4)
         session.requested_config = {"optimizer_num_training_steps": 30_000}

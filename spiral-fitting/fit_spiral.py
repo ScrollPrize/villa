@@ -50,7 +50,8 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     Config, FitConfig, SHELL_ATLAS_KEYS, durable_config)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    migrate_legacy_gap_parameterization)
-from fit_session import (EDITABLE_PCL_ROLE_VALUES, RUN_MUTABLE_PCL_ROLES,
+from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, EDITABLE_PCL_ROLE_VALUES,
+                         RUN_MUTABLE_PCL_ROLES,
                          fit_input, input_source_enabled, pcl_input_enabled,
                          pcl_role_toggle_key, phase_bundle_enabled,
                          shell_losses_enabled, winding_inference_enabled)
@@ -180,7 +181,7 @@ _SDT_COVERAGE_AND_LOCATION_KEYS = (
     'path', 'source', 'complete', 'z_range_working', 'built_z_ranges_working',
 )
 
-_HEADLESS_AUTOSAVE_INTERVAL = 1000
+_HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
 
 
 def comparable_sdt_fingerprint(fingerprint):
