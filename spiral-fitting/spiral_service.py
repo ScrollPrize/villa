@@ -59,6 +59,7 @@ import signal
 import socket
 import stat
 import sys
+import tempfile
 import threading
 import time
 from http import HTTPStatus
@@ -646,8 +647,27 @@ class ServiceState:
         if revision.content is None:
             raise ApiError(410, "This input revision is a deletion")
         identity = workspace.catalog.entry(input_id).identity
-        siblings = tuple(r for r in workspace.catalog.desired()
-                         if r.content is not None and workspace.catalog.entry(r.id).identity.kind == 'fiber') if identity.kind == 'fiber' else ()
+        siblings = ()
+        if identity.kind == 'fiber':
+            desired = tuple(r for r in workspace.catalog.desired()
+                            if r.content is not None and
+                            workspace.catalog.entry(r.id).identity.kind == 'fiber')
+            by_name = {Path(workspace.catalog.entry(r.id).identity.source).name: r
+                       for r in desired}
+            # Resolve the requested revision's links, including transitive and
+            # pending links, against immutable desired peers. Never substitute
+            # the current revision for the explicitly requested entry point.
+            selected = {input_id}
+            pending = [revision]
+            while pending:
+                current = pending.pop()
+                document = json.loads(Path(current.content.json()['path']).read_text())
+                for branch in document.get('branches', []):
+                    peer = by_name.get(branch.get('branch_file'))
+                    if peer is not None and peer.id not in selected:
+                        selected.add(peer.id)
+                        pending.append(peer)
+            siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
         key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
         with self._input_content_artifact_lock:
             if key not in self._input_content_artifacts:
@@ -655,20 +675,24 @@ class ServiceState:
                 source = Path(content['path'])
                 if source.is_dir():
                     root, entry = source, 'meta.json'
+                    artifact = self.artifacts.register_directory(
+                        'input-content', workspace.id, revision.number, root, entry)
                 else:
-                    root = workspace.root / 'artifacts' / input_id / hashlib.sha256(repr(key).encode()).hexdigest()
-                    root.mkdir(parents=True, exist_ok=True)
-                    entry = Path(workspace.catalog.entry(input_id).identity.source).name
-                    workspace._copy(source, root / entry)
-                    # Linked editor saves must resolve peers against the same
-                    # immutable desired snapshot, never against dataset paths.
-                    for sibling in siblings:
-                        if sibling.id == input_id:
-                            continue
-                        name = Path(workspace.catalog.entry(sibling.id).identity.source).name
-                        workspace._copy(sibling.content.json()['path'], root / name)
-                self._input_content_artifacts[key] = self.artifacts.register_directory(
-                    'input-content', workspace.id, revision.number, root, entry)
+                    parent = workspace.root / 'artifacts' / input_id
+                    parent.mkdir(parents=True, exist_ok=True)
+                    root = Path(tempfile.mkdtemp(dir=parent))
+                    entry = Path(identity.source).name
+                    try:
+                        workspace._copy(source, root / entry)
+                        for sibling in siblings:
+                            name = Path(workspace.catalog.entry(sibling.id).identity.source).name
+                            workspace._copy(sibling.content.json()['path'], root / name)
+                        artifact = self.artifacts.register_directory(
+                            'input-content', workspace.id, revision.number, root, entry)
+                    except BaseException:
+                        shutil.rmtree(root)
+                        raise
+                self._input_content_artifacts[key] = artifact
             return {'workspace_id': workspace.id, 'artifact': self._input_content_artifacts[key]}
 
     def _editing_resident(self):

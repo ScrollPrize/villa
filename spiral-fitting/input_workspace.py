@@ -345,9 +345,16 @@ class MutationCoordinator:
                                        copy.deepcopy(receipt["error_payload"]))
                     raise RuntimeError(receipt["error"])
                 if self._recovery not in (None, command_id):
-                    # Remain queued; a client may retry after recovery.
-                    raise ApiError(409, "A dataset transaction needs recovery",
-                                   payload={"command_id": self._recovery})
+                    # This waiter is returning, so it must not retain a FIFO
+                    # slot. Keep a terminal receipt for duplicate requests.
+                    message = "A dataset transaction needs recovery"
+                    payload = {"command_id": self._recovery}
+                    receipt.update(state="rejected", error=message,
+                                   error_status=409, error_details=None,
+                                   error_payload=payload)
+                    self._queue.remove(command_id)
+                    self._condition.notify_all()
+                    raise ApiError(409, message, payload=payload)
                 if self._running is None and (
                         self._recovery == command_id
                         or self._queue and self._queue[0] == command_id):

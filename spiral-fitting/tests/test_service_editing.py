@@ -66,9 +66,11 @@ def workspace(tmp_path):
     workspace.close()
 
 
-def upload(workspace, name, kind='pcl', input_id=None):
+def upload(workspace, name, kind='pcl', input_id=None, branches=None):
     doc = ({'vc_pointcollections_json_version': '1', 'collections': {'0': {'name': name, 'points': {str(i): {'p': [i, 2, 3], 'creation_time': i} for i in range(2)}}}} if kind == 'pcl' else
            {'type': 'vc3d_fiber', 'version': 1, 'points': []})
+    if branches is not None:
+        doc['branches'] = branches
     data = json.dumps(doc).encode()
     request = {'upload_id': uuid4().hex, 'id': input_id or str(uuid4()), 'kind': kind,
                'files': [{'name': 'input.json', 'size': len(data),
@@ -594,3 +596,119 @@ def test_failed_transfer_cannot_finalize_and_retries_exact_bytes(manager, partia
     manager.receive(upload_id, 'fiber.json', io.BytesIO(DATA[offset:]), len(DATA) - offset, offset=offset)
     result = manager.finalize(upload_id)
     assert Path(result.record['path']).read_bytes() == DATA
+
+
+def test_recovery_rejects_queued_waiters_without_blocking_later_commands(monkeypatch):
+    coordinator = MutationCoordinator()
+    started, fail, queued = threading.Event(), threading.Event(), threading.Event()
+    original_wait = coordinator._condition.wait
+
+    def wait(timeout=None):
+        queued.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(coordinator._condition, 'wait', wait)
+
+    def operation(payload):
+        started.set()
+        assert fail.wait(5)
+        raise OSError('publication interrupted')
+
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(coordinator.execute, 'first', 'commit', {}, operation,
+                            recoverable=True)
+        assert started.wait(5)
+        second = pool.submit(coordinator.execute, 'second', 'apply', {}, lambda p: p)
+        assert queued.wait(5)
+        fail.set()
+        with pytest.raises(OSError):
+            first.result(5)
+        with pytest.raises(ApiError, match='needs recovery'):
+            second.result(5)
+    assert coordinator.outcome('second')['state'] == 'rejected'
+    assert coordinator._queue == []
+    coordinator.execute('first', 'commit', {}, lambda p: p, recoverable=True)
+    with pytest.raises(ApiError, match='needs recovery'):
+        coordinator.execute('second', 'apply', {}, lambda p: p)
+    assert coordinator.execute('reconnect', 'claim', {}, lambda p: 'claimed') == 'claimed'
+
+
+@pytest.fixture
+def artifact_state(workspace):
+    from spiral_service import ServiceState
+    ws, _ = workspace
+    state = ServiceState()
+    state.editing_workspace = ws
+    yield state
+    state.close()
+
+
+def add_artifact_fiber(ws, name, branches=()):
+    source = ws.root / f'{name}.json'
+    source.write_text(json.dumps({'type': 'vc3d_fiber', 'version': 1,
+                                 'points': [], 'branches': list(branches)}))
+    identity = InputIdentity(str(uuid4()), 'fiber', str(ws.dataset / 'fibers' / source.name))
+    ws.catalog.register_base(identity, Content.from_json({'path': str(source)}))
+    return identity.id
+
+
+def artifact_names(state, result):
+    return {item['name'] for item in state.artifacts.manifest(result['artifact']['id'])['files']}
+
+
+def test_editor_artifact_large_unlinked_catalog(artifact_state):
+    from service_artifacts import MAX_ARTIFACT_FILES
+    state = artifact_state
+    ws = state.editing_workspace
+    first = add_artifact_fiber(ws, 'first')
+    # Distinct catalog entries can share immutable bytes; only the selected
+    # entry should be copied, regardless of total catalog size.
+    content = ws.catalog.entry(first).current.content
+    for index in range(MAX_ARTIFACT_FILES):
+        ws.catalog.register_base(InputIdentity(str(uuid4()), 'fiber',
+            str(ws.dataset / 'fibers' / f'other-{index}.json')), content)
+    assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
+
+
+@pytest.mark.parametrize('failure_stage', ['copy', 'register'])
+def test_editor_artifact_failed_attempt_can_retry(artifact_state, monkeypatch, failure_stage):
+    state = artifact_state
+    ws = state.editing_workspace
+    first = add_artifact_fiber(ws, 'first', [{'branch_file': 'peer.json'}])
+    add_artifact_fiber(ws, 'peer')
+    owner, method = (ws, '_copy') if failure_stage == 'copy' else (state.artifacts, 'register_directory')
+    original = getattr(owner, method)
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == (2 if failure_stage == 'copy' else 1):
+            raise OSError('transient artifact failure')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, fail_once)
+    with pytest.raises(OSError, match='transient'):
+        state.input_content_artifact(first, 1)
+    assert not list((ws.root / 'artifacts' / first).iterdir())
+    result = state.input_content_artifact(first, 1)
+    assert artifact_names(state, result) == {'first.json', 'peer.json'}
+    assert state.input_content_artifact(first, 1) == result
+
+
+def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(artifact_state):
+    state = artifact_state
+    ws = state.editing_workspace
+    first = add_artifact_fiber(ws, 'first', [{'branch_file': 'peer.json', 'pending': True}])
+    peer = add_artifact_fiber(ws, 'peer', [{'branch_file': 'last.json'}])
+    add_artifact_fiber(ws, 'last', [{'branch_file': 'first.json'}])
+    unrelated = add_artifact_fiber(ws, 'unrelated')
+    original = state.input_content_artifact(first, 1)
+    assert artifact_names(state, original) == {'first.json', 'peer.json', 'last.json'}
+    ws.catalog.accept([Change(ws.catalog.entry(first).identity, 1,
+                             ws.catalog.entry(unrelated).current.content)])
+    assert state.input_content_artifact(first, 1) == original
+    assert artifact_names(state, state.input_content_artifact(first, 2)) == {'first.json'}
+    ws.catalog.accept([Change(ws.catalog.entry(peer).identity, 1, None)])
+    assert artifact_names(state, state.input_content_artifact(first, 1)) == {'first.json'}
+    assert artifact_names(state, original) == {'first.json', 'peer.json', 'last.json'}

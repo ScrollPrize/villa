@@ -116,7 +116,8 @@ class EditingHttpTests(HttpServiceFixture):
         workspace = self.state.editing()
         ids = [str(uuid4()), str(uuid4())]
         changes = [{'id': input_id, 'kind': 'fiber', 'name': name,
-                    'expected_revision': 0, 'upload_id': upload(workspace, name, 'fiber')}
+                    'expected_revision': 0, 'upload_id': upload(workspace, name, 'fiber',
+                        branches=[{'branch_file': 'peer.json'}] if name == 'first' else [])}
                    for input_id, name in zip(ids, ['first', 'peer'])]
         workspace.change('owner', {'command_id': 'fibers', 'changes': changes})
         first = self.state.input_content_artifact(ids[0], 1)
