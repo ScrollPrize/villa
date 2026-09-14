@@ -917,6 +917,8 @@ vc_add_test(NAME test_quadsurface_snapshot)
 
 vc_add_test(NAME test_quadsurface_save_concurrency)
 
+vc_add_test(NAME test_quadsurface_cache_concurrency)
+
 vc_add_test(NAME test_quadsurface_save_paths)
 
 vc_add_test(NAME test_segmentation)
