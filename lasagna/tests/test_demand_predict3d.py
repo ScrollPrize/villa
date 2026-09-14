@@ -461,6 +461,26 @@ def test_ram_only_state_reuses_published_chunks_without_sqlite(tmp_path, monkeyp
     assert not list(tmp_path.glob("*.sqlite*"))
 
 
+@pytest.mark.parametrize("layout", ["flat", "chunk-major"])
+def test_publication_borrows_existing_maps_without_remapping(tmp_path, monkeypatch, layout):
+    from concurrent.futures import ThreadPoolExecutor
+    geometry = DemandGeometry((8, 8, 8), 4, 0, 0, 1, 4)
+    adapter, output = outputs(tmp_path, geometry.shape, 4)
+    with DemandStore(tmp_path, {}, geometry, adapter, output, accumulator_layout=layout) as store:
+        for arrays in store.accumulators.values():
+            for array in arrays:
+                array[:] = 0.5  # exactly representable normalized model output
+        store.weight[:] = 1
+        def forbidden(*args, **kwargs):
+            raise AssertionError("publication must not remap full-volume accumulators")
+        with monkeypatch.context() as patch:
+            patch.setattr(np, "memmap", forbidden)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(store._publish, itertools.product((0, 4), repeat=3)))
+        assert all(not a._mmap.closed for a in store.arrays)
+        assert np.all(zarr.open_array(str(tmp_path / "value.zarr/0"), mode="r")[:] == 127)
+
+
 def test_legacy_database_is_not_opened_or_deleted(tmp_path):
     geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
     adapter, output = outputs(tmp_path, geometry.shape, 4)

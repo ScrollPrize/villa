@@ -28,6 +28,14 @@ from lasagna.inference_provenance import atomic_write
 from lasagna.inference_profiling import stage_timing
 
 
+def cache_identity(identity, geometry, accumulator_dtype, accumulator_layout, accumulator_prefault):
+    """Persistent cache contract shared by store validation and cache discovery."""
+    return json.loads(json.dumps({"schema": 2, "identity": identity, "geometry": asdict(geometry),
+        "accumulator_dtype": str(np.dtype(accumulator_dtype)), "accumulation_order": "arrival",
+        "accumulator_layout": accumulator_layout, "accumulator_prefault": accumulator_prefault},
+        sort_keys=True, allow_nan=False))
+
+
 @dataclass(frozen=True)
 class DemandGeometry:
     shape: tuple[int, int, int]
@@ -130,10 +138,7 @@ class DemandStore:
         self.publications = deque()
         self.stats = {"inferred_tiles": 0, "published_chunks": 0, "warm_chunks": 0}
         try:
-            encoded = json.loads(json.dumps({"schema": 2, "identity": identity, "geometry": asdict(geometry),
-                                  "accumulator_dtype": str(self.dtype), "accumulation_order": "arrival",
-                                  "accumulator_layout": self.layout, "accumulator_prefault": self.prefault},
-                                 sort_keys=True, allow_nan=False))
+            encoded = cache_identity(identity, geometry, self.dtype, self.layout, self.prefault)
             identity_path = self.root / "cache_identity.json"
             if identity_path.is_symlink():
                 raise ValueError("unsafe cache identity symlink")
@@ -424,12 +429,13 @@ class DemandStore:
             tuple(p.name for p in self.products), True, 0, self.geometry.chunk,
             (0, 0, 0, *self.geometry.output_shape), self.products,
             tuple((p.name, self._descriptor(self.accumulators[p.name])) for p in self.products), self._descriptor((self.weight,)))
-        cache = {}
-        try:
-            tiled._execute_flush_process_task(task, self.model_adapter, self.output_adapter, cache)
-        finally:
-            for value in cache.values():
-                value._mmap.close()
+        # These are threads in the store's process, not flush subprocesses.
+        # Borrow its existing maps: remapping whole sparse volumes per worker
+        # can exhaust virtual address space even when physical RAM is free.
+        # Publication is admitted only after this chunk's writers have finished;
+        # the shared flush helper copies the requested region before finalizing.
+        cache = {str(array.filename): array for array in self.arrays}
+        tiled._execute_flush_process_task(task, self.model_adapter, self.output_adapter, cache)
         return self._sync_published(origin)
 
     def close(self):
