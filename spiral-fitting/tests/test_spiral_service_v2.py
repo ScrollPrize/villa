@@ -2125,6 +2125,7 @@ class UploadTests(unittest.TestCase):
             "same-winding-*/manifest.json"))
         self.assertEqual(len(manifests), 1)
         descriptor = json.loads(manifests[0].read_text())
+        self.assertEqual(descriptor["source"], str(target.resolve()))
         self.assertTrue(descriptor["editable"])
         self.assertEqual(descriptor["kind"], "spiral-same-winding-pcl")
         self.assertEqual(descriptor["source_revision"],

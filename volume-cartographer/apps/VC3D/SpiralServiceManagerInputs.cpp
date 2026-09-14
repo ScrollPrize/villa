@@ -155,26 +155,31 @@ void SpiralServiceManager::installInputCatalog(const QJsonArray& inputs)
 }
 
 QString SpiralServiceManager::logicalInputId(const QString& kind, const QString& alias,
-                                             const QString& role, const QString& targetCollection)
+                                             const QString& role, const QString& targetCollection,
+                                             const QString& sourceIdentity)
 {
     if (_inputDrafts.contains(alias)) return alias;
-    const QString key = kind + QLatin1Char(':') + role + QLatin1Char(':') + alias;
+    const QString key = kind + QLatin1Char(':') + role + QLatin1Char(':') + alias
+        + QLatin1Char(':') + sourceIdentity;
     if (_inputAliases.contains(key)) return _inputAliases[key];
     for (auto it = _inputCatalog.cbegin(); it != _inputCatalog.cend(); ++it) {
         const auto& input = it.value();
         if (input.value(QStringLiteral("kind")).toString() != kind) continue;
         const QFileInfo source(input.value(QStringLiteral("source")).toString());
         const bool match = kind == QStringLiteral("pcl")
-            ? !targetCollection.isEmpty() && input.value(QStringLiteral("role")).toString() == role
+            ? !sourceIdentity.isEmpty() && input.value(QStringLiteral("source")).toString() == sourceIdentity
+                && !targetCollection.isEmpty() && input.value(QStringLiteral("role")).toString() == role
                 && QString::number(input.value(QStringLiteral("collection_id")).toInteger()) == targetCollection
             : (kind == QStringLiteral("fiber") ? source.completeBaseName() : source.fileName()) == alias;
         if (match) return _inputAliases[key] = it.key();
     }
+    if (kind == QStringLiteral("pcl") && !targetCollection.isEmpty()) return {};
     return _inputAliases[key] = uuid();
 }
 
 void SpiralServiceManager::stageInput(const QString& kind, const QString& path, const QString& alias,
-                                      const QString& role, const QString& targetCollection, bool deleted)
+                                      const QString& role, const QString& targetCollection, bool deleted,
+                                      const QString& sourceIdentity)
 {
     QString error;
     QJsonObject document;
@@ -184,7 +189,11 @@ void SpiralServiceManager::stageInput(const QString& kind, const QString& path, 
     if (kind != QStringLiteral("pcl") || deleted || keys.isEmpty()) keys = {QString()};
     for (const auto& key : keys) {
         const QString logicalAlias = keys.size() == 1 ? alias : alias + QLatin1Char('_') + key;
-        const QString id = logicalInputId(kind, logicalAlias, role, targetCollection);
+        const QString id = logicalInputId(kind, logicalAlias, role, targetCollection, sourceIdentity);
+        if (id.isEmpty()) {
+            emit errorOccurred(tr("Cannot identify the source document for PCL collection %1").arg(targetCollection));
+            return;
+        }
         QString localPath = path;
         if (kind == QStringLiteral("pcl") && !deleted && error.isEmpty()) {
             auto single = document;
@@ -227,10 +236,11 @@ void SpiralServiceManager::stageJsonInput(const QString& kind, const QString& pa
 }
 
 void SpiralServiceManager::stagePclReplacement(vc3d::spiral::PclRole role, const QString& path,
-    const QString& inputId, const QString& operation, const QString& target)
+    const QString& inputId, const QString& operation, const QString& target,
+    const QString& sourceIdentity)
 {
     stageInput(QStringLiteral("pcl"), path, inputId, vc3d::spiral::pclRoleName(role), target,
-               operation == QStringLiteral("delete_collection"));
+               operation == QStringLiteral("delete_collection"), sourceIdentity);
 }
 
 void SpiralServiceManager::removeInputDraft(const QString& id)
@@ -445,7 +455,8 @@ void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& sele
             continue;
         }
         drafts.push_back(it.value().get());
-        if (it.value()->accepted() > it.value()->persisted())
+        if (it.value()->accepted() > it.value()->persisted()
+            || it.value()->accepted() > it.value()->applied())
             revisions.append(QJsonObject{{QStringLiteral("id"), it.key()},
                 {QStringLiteral("revision"), qint64(it.value()->accepted())}});
     }
@@ -720,6 +731,7 @@ void SpiralServiceManager::finishInputCommand()
     }
     for (const auto& value : command->revisions) {
         const auto id = value.toObject().value(QStringLiteral("id")).toString();
+        _inputErrors.remove(id);
         const auto draft = _inputDrafts.value(id);
         const auto alias = draft ? draft->snapshot().content.manifest.value(QStringLiteral("alias")).toString(id) : id;
         if (draft && !draft->dirty() && draft->persisted() == draft->accepted()

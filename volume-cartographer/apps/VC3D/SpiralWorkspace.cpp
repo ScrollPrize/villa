@@ -478,7 +478,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     const auto collectionId = input.value(QStringLiteral("collection_id"));
                     _brush->editCatalogCollection(*role,
                         collectionId.isDouble() ? QString::number(collectionId.toInteger()) : QString(),
-                        input.value(QStringLiteral("alias")).toString(), document);
+                        input.value(QStringLiteral("id")).toString(), document,
+                        input.value(QStringLiteral("source")).toString());
                 }
             });
     connect(_service, &SpiralServiceManager::inputDraftDiscarded, this, [this](const QString& alias) {
@@ -1706,7 +1707,7 @@ void SpiralWorkspace::finalizeBrushPaint()
             if (!document.operation.isEmpty() && role) {
                 _service->stagePclReplacement(
                     *role, path, document.id, document.operation,
-                    document.targetCollectionId);
+                    document.targetCollectionId, document.sourceIdentity);
             } else {
                 _service->stageJsonInput(QStringLiteral("pcl"), path,
                                           document.id, document.role);
@@ -2343,7 +2344,8 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
     _brush->setPclSource(
         role, sourceDocument, scale,
         descriptor.value(QStringLiteral("source_revision")).toString(),
-        descriptor.value(QStringLiteral("editable")).toBool(false));
+        descriptor.value(QStringLiteral("editable")).toBool(false),
+        descriptor.value(QStringLiteral("source")).toString());
     _brush->setPclSourceVisible(role, state.visible);
     state.overlay->setCoordinateScale(scale);
     _panel->setPclOverlayAvailable(role, true);

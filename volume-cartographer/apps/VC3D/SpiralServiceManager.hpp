@@ -133,7 +133,8 @@ public:
                               const QString& filePath,
                               const QString& inputId,
                               const QString& operation,
-                              const QString& targetCollectionId);
+                              const QString& targetCollectionId,
+                              const QString& sourceIdentity = {});
     // Stage a deletion; Apply removes supervision and Commit persists it.
     void removeInputDraft(const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
@@ -207,6 +208,7 @@ signals:
     void errorOccurred(const QString& message);
 
 private:
+    friend class SpiralInputWorkflowTests;
     void copyInputAsync(const QString& source, FetchPreviewFileCallback done, bool reuseWorkingCopy);
     void fetchInputContent(const QString& id, quint64 revision, const QString& kind,
                            std::function<void(const QString&)> done);
@@ -278,7 +280,8 @@ private:
         std::shared_ptr<QTemporaryDir> directory;
     };
     void stageInput(const QString& kind, const QString& path, const QString& alias,
-                    const QString& role = {}, const QString& targetCollection = {}, bool deleted = false);
+                    const QString& role = {}, const QString& targetCollection = {}, bool deleted = false,
+                    const QString& sourceIdentity = {});
     void resumeInputCommand();
     void transferInput(int index);
     void sendInputChanges();
@@ -290,7 +293,8 @@ private:
     void claimInputWorkspace();
     void clearInputWorkspace();
     QString logicalInputId(const QString& kind, const QString& alias,
-                           const QString& role, const QString& targetCollection);
+                           const QString& role, const QString& targetCollection,
+                           const QString& sourceIdentity);
     QMap<QString, std::shared_ptr<vc3d::spiral::InputDraft>> _inputDrafts;
     QMap<QString, QJsonObject> _inputCatalog;
     QStringList _inputOrder;

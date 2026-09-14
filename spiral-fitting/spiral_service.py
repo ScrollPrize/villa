@@ -1369,6 +1369,7 @@ class ServiceState:
                 "role": role.value,
                 "base_shape_zyx": list(base_shape),
                 "pcl_file": pcl_name,
+                "source": str(source.resolve()),
                 "source_revision": source_revision,
                 "editable": editable,
             }

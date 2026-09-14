@@ -167,6 +167,43 @@ def test_missing_sampling_weight_rejects_batch_without_stopping_resident(context
     assert session._completed == 7
 
 
+@pytest.mark.parametrize('metadata', [
+    {'format': 'tifxyz'},
+    [],
+    {'scale': None},
+    {'scale': [1]},
+    {'scale': ['bad', 1]},
+    {'scale': [0, 1]},
+    {'scale': [float('inf'), 1]},
+])
+def test_malformed_patch_metadata_preserves_resident(context, resident, tmp_path, metadata):
+    import json
+    from tifxyz import save_tifxyz
+
+    save_tifxyz(context._source_verified_patches['baseline'].zyxs.numpy(),
+                str(tmp_path), 'draft', 1, 1, 'test')
+    path = tmp_path / 'draft'
+    meta_path = path / 'meta.json'
+    valid_metadata = meta_path.read_text()
+    meta_path.write_text(json.dumps(metadata))
+    session, _, _, _ = resident
+    session._context = context
+    atlas, points, optimiser = (context.patch_atlas, context.regular_pcl_catalog,
+                                context.optimiser)
+    records = [{'id': 'baseline', 'kind': 'patch', 'path': str(path)}]
+    result = session.apply_input_changes('malformed', records, timeout=5)
+    assert not result['applied']
+    assert 'meta.json' in str(result)
+    assert context.patch_atlas is atlas
+    assert context.regular_pcl_catalog is points
+    assert context.optimiser is optimiser
+    assert session._context is context
+    assert session._completed == 7
+    meta_path.write_text(valid_metadata)
+    assert session.apply_input_changes('repaired', records, timeout=5)['applied']
+    assert context.optimiser is optimiser
+
+
 def test_invalid_absolute_annotations_fail_during_preparation(context, tmp_path):
     import json
     path = tmp_path / 'abs_winding.json'

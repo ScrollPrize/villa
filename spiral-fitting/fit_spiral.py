@@ -4445,6 +4445,11 @@ class FitContext:
         """
         path_changes = dict(path_changes or {})
         changed = set(config)
+        if any(key.startswith('track_') for key in changed):
+            # Validate combined bounds before changing participation or any
+            # other resident derivation: restoring config alone cannot undo
+            # an installed input candidate after a rejected Run.
+            validate_track_sampling_config({**self.config, **config})
         cadence_keys = {
             'theta_crossing_map_update_interval',
             'dt_target_update_interval',

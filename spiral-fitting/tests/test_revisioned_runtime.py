@@ -132,6 +132,21 @@ def test_preparation_failure_leaves_active_state_and_allows_next_batch(resident)
     assert active["revision"] == 3
 
 
+def test_device_failure_during_preparation_remains_fail_stop():
+    from spiral_runtime import InputBatchCommand
+    from test_spiral_headless import ProtocolTests
+
+    session = ProtocolTests()._idle_session(completed=7)
+    failure = RuntimeError('CUDA device failure')
+    session._context = SimpleNamespace(
+        prepare_input_changes=Mock(side_effect=failure))
+    command = InputBatchCommand(batch_id='device-failure')
+    with pytest.raises(RuntimeError, match='CUDA device failure') as raised:
+        session._run_input_batch(command)
+    assert raised.value is failure
+    assert command.error == 'RuntimeError: CUDA device failure'
+
+
 def test_timeout_preserves_captured_batch_and_boundary_for_retry(resident):
     session, active, entered, release = resident
     release.clear()

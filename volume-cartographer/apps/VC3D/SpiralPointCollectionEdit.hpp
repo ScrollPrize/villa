@@ -32,6 +32,7 @@ struct EditablePclPoint {
 struct EditablePclDraft {
     PclRole role = PclRole::SameWinding;
     QString collectionId;
+    QString sourceIdentity;
     QJsonObject topLevel;
     QJsonObject sourceCollection;
     std::vector<EditablePclPoint> points;

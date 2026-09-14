@@ -267,6 +267,43 @@ def test_unattached_spacing_rederives_regular_strips_from_the_catalog():
 # --- point-collection role toggles ---------------------------------------------
 
 
+@pytest.mark.parametrize('settings, error', [
+    ({'track_min_walk_steps_per_track': 300}, 'min_walk_steps_per_track'),
+    ({'track_min_walks_per_track': 5}, 'min_walks_per_track'),
+])
+def test_invalid_track_policy_preserves_enabled_pcl_inputs(settings, error):
+    context = _context(input_use_pcl_same_winding=True)
+    context.tracks = ['resident track']
+    context.prepared_main_tracks = {}
+    pcl = _regular(7, [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    context.regular_pcl_catalog = {7: pcl}
+    context.cross_patch_pcls = [pcl]
+    config_before = dict(context.config)
+
+    # Model the participation removal that a successfully prepared candidate
+    # would install. Invalid settings must be rejected before reaching it.
+    context.prepare_input_changes = Mock(return_value=object())
+
+    def install(candidate):
+        context.regular_pcl_catalog = {}
+        context.cross_patch_pcls = []
+
+    context.install_input_changes = Mock(side_effect=install)
+    with pytest.raises(ValueError, match=error):
+        context.apply_config({
+            'input_use_pcl_same_winding': False, **settings,
+        }, current_iteration=0)
+
+    assert context.config == config_before
+    assert context.regular_pcl_catalog == {7: pcl}
+    assert context.cross_patch_pcls == [pcl]
+    assert context.prepared_main_tracks == {}
+    context.prepare_input_changes.assert_not_called()
+    context.install_input_changes.assert_not_called()
+    context.apply_config({}, current_iteration=0)
+    assert context.cross_patch_pcls == [pcl]
+
+
 # --- tracks ---------------------------------------------------------------------
 
 def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):

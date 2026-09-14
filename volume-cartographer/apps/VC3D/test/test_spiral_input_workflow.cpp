@@ -35,6 +35,74 @@ class SpiralInputWorkflowTests : public QObject {
         return {};
     }
 private slots:
+    void pclEditsResolveSourceDocument() {
+        SpiralServiceManager client;
+        const QJsonObject first{{"id", "a"}, {"kind", "pcl"}, {"role", "same_winding"},
+            {"source", "/dataset/first.json"}, {"collection_id", 0},
+            {"accepted_revision", 1}, {"applied_revision", 1}, {"persisted_revision", 1}};
+        auto second = first;
+        second["id"] = "b";
+        second["source"] = "/dataset/second.json";
+        client.installInputCatalog({first, second});
+        QTemporaryDir root;
+        const auto path = root.filePath("replacement.json");
+        write(path, R"({"collections":{"0":{"points":{}}}})");
+        client.stagePclReplacement(vc3d::spiral::PclRole::SameWinding, path,
+            "overlay", "replace_collection", "0", "/dataset/second.json");
+        QVERIFY(!client._inputDrafts["a"]->dirty());
+        QVERIFY(client._inputDrafts["b"]->dirty());
+        client.stagePclReplacement(vc3d::spiral::PclRole::SameWinding, {},
+            "overlay", "delete_collection", "0", "/dataset/second.json");
+        QVERIFY(client._inputDrafts["b"]->deleted());
+        QVERIFY(!client._inputDrafts["a"]->deleted());
+        // A missing source must never select an arbitrary document.
+        QSignalSpy errors(&client, &SpiralServiceManager::errorOccurred);
+        client.stagePclReplacement(vc3d::spiral::PclRole::SameWinding, {},
+            "unknown-overlay", "delete_collection", "0");
+        QCOMPARE(errors.size(), 1);
+        QCOMPARE(client._inputDrafts.size(), 2);
+        QVERIFY(!client._inputDrafts["a"]->dirty());
+        // Catalog editors carry the UUID directly.
+        client.stagePclReplacement(vc3d::spiral::PclRole::SameWinding, {},
+            "a", "delete_collection", "0");
+        QVERIFY(client._inputDrafts["a"]->deleted());
+    }
+
+    void revisionOnlyRetry_data() {
+        QTest::addColumn<int>("persisted");
+        QTest::addColumn<bool>("commit");
+        QTest::newRow("external-apply") << 2 << false;
+        QTest::newRow("external-commit") << 2 << true;
+        QTest::newRow("submitted-apply") << 1 << false;
+    }
+
+    void revisionOnlyRetry() {
+        QFETCH(int, persisted);
+        QFETCH(bool, commit);
+        SpiralServiceManager client;
+        QJsonObject row{{"id", "input"}, {"kind", "fiber"}, {"accepted_revision", 2},
+            {"applied_revision", 1}, {"persisted_revision", persisted}};
+        client.installInputCatalog({row});
+        client._inputOwner = true;
+        client._inputErrors["input"] = "previous application failure";
+        QSignalSpy completed(&client, &SpiralServiceManager::inputBatchFinished);
+        client.applyInputDrafts(commit);
+        QVERIFY(client._inputCommand);
+        QVERIFY(client._inputCommand->batch.entries.isEmpty());
+        QCOMPARE(client._inputCommand->revisions,
+            QJsonArray({QJsonObject{{"id", "input"}, {"revision", 2}}}));
+        // Complete the selected revision as a successful service response would.
+        row["applied_revision"] = 2;
+        if (commit) row["persisted_revision"] = 2;
+        client.installInputCatalog({row});
+        client.finishInputCommand();
+        QCOMPARE(successCount(completed), 1);
+        QVERIFY(client._inputErrors.isEmpty());
+        QVERIFY(client.inputDraftStatus().first().toObject().value("error").toString().isEmpty());
+        QThreadPool::globalInstance()->waitForDone();
+        QCoreApplication::processEvents();
+    }
+
     void preparationAndCopyStayVisibleInPanel() {
         SpiralActivityWidget activity;
         auto* label = activity.findChild<QLabel*>(QStringLiteral("spiralInputActivityText"));

@@ -334,13 +334,14 @@ void SpiralBrushController::setVisiblePointCollectionIds(const QSet<QString>& id
 
 void SpiralBrushController::setPclSource(
     PclRole role, const QJsonDocument& document, double sourceToPreviewScale,
-    const QString& sourceRevision, bool editable)
+    const QString& sourceRevision, bool editable, const QString& sourceIdentity)
 {
     clearEditablePclHover();
     auto& set = sourcesFor(role);
     set.sourceToPreviewScale = sourceToPreviewScale;
     set.sources = vc3d::spiral::importEditablePcls(
         document, sourceToPreviewScale, sourceRevision, editable, role);
+    for (auto& source : set.sources) source.sourceIdentity = sourceIdentity;
     set.indexById.clear();
     set.editableIds.clear();
     for (std::size_t index = 0; index < set.sources.size(); ++index) {
@@ -895,13 +896,14 @@ void SpiralBrushController::appendPointCollectionPoint(
 
 void SpiralBrushController::editCatalogCollection(
     PclRole role, const QString& collectionId, const QString& alias,
-    const QJsonDocument& document)
+    const QJsonDocument& document, const QString& sourceIdentity)
 {
     for (std::size_t index = 0; index < _polylines.size(); ++index) {
         auto& line = _polylines[index];
         if ((!alias.isEmpty() && line.id == alias)
             || (!collectionId.isEmpty() && line.pclEdit
-                && line.pclEdit->role == role && line.pclEdit->collectionId == collectionId)) {
+                && line.pclEdit->role == role && line.pclEdit->collectionId == collectionId
+                && line.pclEdit->sourceIdentity == sourceIdentity)) {
             _activePolyline = static_cast<int>(index);
             updateCursorWidget();
             refreshAll();
@@ -915,6 +917,7 @@ void SpiralBrushController::editCatalogCollection(
     // A staged collection can still carry its original JSON key. The catalog
     // identity is the target for subsequent replacements, including additions.
     sources.front().collectionId = collectionId;
+    sources.front().sourceIdentity = sourceIdentity;
     selectEditablePcl(sources.front(), alias);
 }
 
@@ -932,7 +935,8 @@ void SpiralBrushController::selectEditablePcl(
     for (std::size_t index = 0; index < _polylines.size(); ++index) {
         auto& line = _polylines[index];
         if (!source.collectionId.isEmpty() && line.pclEdit && line.pclEdit->role == source.role
-            && line.pclEdit->collectionId == source.collectionId) {
+            && line.pclEdit->collectionId == source.collectionId
+            && line.pclEdit->sourceIdentity == source.sourceIdentity) {
             if (line.pclEdit->deleted) {
                 line.pclEdit->setDeleted(false);
                 line.state = GestureState::Painted;
@@ -2147,6 +2151,7 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         result.role = vc3d::spiral::pclRoleName(role);
         result.operation = operation;
         result.targetCollectionId = line.pclEdit->collectionId;
+        result.sourceIdentity = line.pclEdit->sourceIdentity;
         result.document = line.pclEdit->replacementDocument();
         line.id = result.id;
         line.state = GestureState::Finalizing;

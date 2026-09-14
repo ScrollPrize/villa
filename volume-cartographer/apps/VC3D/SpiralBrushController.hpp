@@ -57,6 +57,7 @@ public:
         QJsonDocument document;
         QString operation;
         QString targetCollectionId;
+        QString sourceIdentity;
     };
 
     explicit SpiralBrushController(QObject* parent = nullptr);
@@ -68,7 +69,8 @@ public:
     void setVisiblePointCollectionIds(const QSet<QString>& ids);
     void setPclSource(PclRole role, const QJsonDocument& document,
                       double sourceToPreviewScale,
-                      const QString& sourceRevision, bool editable);
+                      const QString& sourceRevision, bool editable,
+                      const QString& sourceIdentity = {});
     void setPclSourceVisible(PclRole role, bool visible);
     void setPclHitOverlay(PclRole role, PointsOverlayController* overlay);
     void setPointViewTolerance(double tolerance);
@@ -79,7 +81,8 @@ public:
     bool hasReadyDrafts() const;
     bool hasLocalChangesFor(const QString& id) const;
     void editCatalogCollection(PclRole role, const QString& collectionId,
-                               const QString& alias, const QJsonDocument& document);
+                               const QString& alias, const QJsonDocument& document,
+                               const QString& sourceIdentity = {});
     void markDraftsReady();
     int brushDiameter() const { return _diameterPx; }
 

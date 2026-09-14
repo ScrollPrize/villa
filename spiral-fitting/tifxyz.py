@@ -1,6 +1,7 @@
 
 import os
 import json
+import math
 import torch
 import numpy as np
 from PIL import Image
@@ -361,6 +362,16 @@ def load_tifxyz(path, *, z_range=None):
 
     with open(f'{path}/meta.json', 'r') as meta_json:
         metadata = json.load(meta_json)
+        # Reject input errors before tensor construction so live preparation
+        # can discard the batch without masking worker/device failures.
+        if not isinstance(metadata, dict):
+            raise ValueError(f'{path}/meta.json must contain an object')
+        scale_values = metadata.get('scale')
+        if (not isinstance(scale_values, list) or len(scale_values) != 2
+                or any(type(value) not in (int, float)
+                       or not 0 < value < math.inf for value in scale_values)):
+            raise ValueError(
+                f'{path}/meta.json scale must contain two finite positive numbers')
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
         erosion_cells_override = metadata.get('spiral_patch_erode_cells')
