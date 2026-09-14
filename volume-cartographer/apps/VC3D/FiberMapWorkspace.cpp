@@ -2502,45 +2502,61 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QMessageBox::buttonClicked, this,
             [this, dialog, fileName, menuDependencies](QAbstractButton* button) {
-                if (dialog->standardButton(button) != QMessageBox::Yes || !_controller) {
+                // Only the answer is read here. The delete itself is queued
+                // out of the dialog's own signal delivery: it drains queued
+                // saves in a nested loop, and a workspace torn down during
+                // that would take the parented dialog with it while Qt is
+                // still finishing this very emission on it.
+                if (dialog->standardButton(button) != QMessageBox::Yes) {
                     return;
                 }
-                // Anything could have happened while the dialog stood open
-                // (a reload, a package switch): the dependency set is checked
-                // again, and only then is the id resolved from the file name.
-                // A name that no longer resolves under unchanged dependencies
-                // means the map is not to be trusted until rebuilt - the one
-                // staleness that latches.
-                const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
-                    menuDependencies, currentDependencies(), /*layoutBuilt=*/true,
-                    QString());
-                if (verdict.action != StaleVerdict::Action::Fresh) {
-                    refreshStaleState();
-                    Logger()->warn("Fiber map: dependencies changed while the confirmation "
-                                   "was open; not deleting {}",
-                                   fileName);
-                    return;
-                }
-                const uint64_t target = _controller->fiberIdForFileName(fileName);
-                if (target == 0) {
-                    markStale(tr("Fibers changed — press Update"));
-                    Logger()->warn("Fiber map: {} is no longer loaded; not deleting",
-                                   fileName);
-                    return;
-                }
-                Logger()->info("Fiber map: deleting fiber {}", fileName);
-                // deleteFibers drains queued saves in a nested loop, during
-                // which this workspace could be destroyed; the guard keeps the
-                // epilogue off a dead object.
-                const QPointer<FiberMapWorkspace> self(this);
-                _controller->deleteFibers({target});
-                if (!self) {
-                    return;
-                }
-                // The fiber generation moved; rather than wait for the
-                // visible-only poll's next tick, notice it now so the
-                // automatic update starts at once.
-                refreshStaleState();
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, fileName, menuDependencies]() {
+                        deleteConfirmedFiber(fileName, menuDependencies);
+                    },
+                    Qt::QueuedConnection);
             });
     dialog->open();
+}
+
+void FiberMapWorkspace::deleteConfirmedFiber(
+    const std::string& fileName,
+    const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
+{
+    if (!_controller) {
+        return;
+    }
+    // Anything could have happened while the dialog stood open (a reload, a
+    // package switch): the dependency set is checked again, and only then is
+    // the id resolved from the file name. A name that no longer resolves
+    // under unchanged dependencies means the map is not to be trusted until
+    // rebuilt - the one staleness that latches.
+    const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+        menuDependencies, currentDependencies(), /*layoutBuilt=*/true, QString());
+    if (verdict.action != StaleVerdict::Action::Fresh) {
+        refreshStaleState();
+        Logger()->warn("Fiber map: dependencies changed while the confirmation was open; "
+                       "not deleting {}",
+                       fileName);
+        return;
+    }
+    const uint64_t target = _controller->fiberIdForFileName(fileName);
+    if (target == 0) {
+        markStale(tr("Fibers changed — press Update"));
+        Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
+        return;
+    }
+    Logger()->info("Fiber map: deleting fiber {}", fileName);
+    // deleteFibers drains queued saves in a nested loop, during which this
+    // workspace could be destroyed; the guard keeps the epilogue off a dead
+    // object.
+    const QPointer<FiberMapWorkspace> self(this);
+    _controller->deleteFibers({target});
+    if (!self) {
+        return;
+    }
+    // The fiber generation moved; rather than wait for the visible-only
+    // poll's next tick, notice it now so the automatic update starts at once.
+    refreshStaleState();
 }

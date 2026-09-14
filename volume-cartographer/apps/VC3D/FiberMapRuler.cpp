@@ -333,12 +333,17 @@ void FiberMapRuler::paintWindings(QPainter& painter, const QRect& band)
     const QFontMetrics metrics(_font);
     const int baseline = band.bottom();
     const int textHeight = band.height() - kMajorTickPx - 1;
+    // Every mark of the layout is visited, on-screen or not, so each is
+    // culled in floating point before its coordinate is narrowed: far enough
+    // zoomed in, a distant mark lies beyond what an int can hold.
+    const QTransform toViewport = _view->viewportTransform();
 
     for (const vc3d::fiber_map::WindingMark& mark : _model.windings) {
-        const int x = _view->mapFromScene(QPointF(mark.xVx, 0.0)).x();
-        if (x < band.left() - 1 || x > band.right() + 1) {
+        const double xF = toViewport.map(QPointF(mark.xVx, 0.0)).x();
+        if (!std::isfinite(xF) || xF < band.left() - 1.0 || xF > band.right() + 1.0) {
             continue;
         }
+        const int x = static_cast<int>(std::lround(xF));
         const bool labelled = mark.number % labelStep == 0;
         if (!labelled && !minorTicks) {
             continue;

@@ -264,6 +264,11 @@ private:
     void confirmAndDeleteFiber(const std::string& fileName,
                                const QString& displayName,
                                const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // The delete itself, queued out of the confirmation dialog's signal:
+    // dependencies re-checked, id re-resolved from the file name, then the
+    // controller's deleteFibers behind a lifetime guard.
+    void deleteConfirmedFiber(const std::string& fileName,
+                              const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
     void selectFiberRow(uint64_t fiberId);
     [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;
     [[nodiscard]] double sceneTolerance(double viewPixels) const;
