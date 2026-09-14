@@ -113,6 +113,10 @@ only after active sweep ends. This short comparison precedes the prepared wider
 anchor boundary sweep; then refine normalized aggregation if useful.
 
 Prepared boundary/multi-start sweep in `embedding_anchor_boundaries_next.json`:
+After normalized A/B scored75 at each of the three seeds (different traces),
+include those three families for their own finite refinement too: weights
+.05/.10/.25/.50 and .05 neighbors, spacing32/128/512/1024/2048, K1/2/4/8,
+novelty0/.1/.2. A negative A/B at borrowed settings is not a tuned-method result.
 all anchor policies start from their own completed-round winner and, where
 different, K2/weight.10 transferred seed. Extend spacing through2048 for
 no-expiry methods (unused window4096), through1024 for windowed anchors with

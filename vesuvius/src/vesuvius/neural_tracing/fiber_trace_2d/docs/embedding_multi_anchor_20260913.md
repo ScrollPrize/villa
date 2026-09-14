@@ -9,7 +9,34 @@ measures failure/restart using the unchanged ellipse. Training was left running
 during the initial sweeps, then stopped at the user's request on September14;
 all later experiments retain this same frozen snapshot and use manager grants.
 
-## Seed, delayed update and hit-only LRU comparison
+## Normalized-mean A/B (September14)
+
+`embedding_ema99_normalized_mean_20260914_v1/report.json`:10 replays, exit0,
+best64 exact repeat. Off87/original82/EMA69 and ordinary mean64/68/hit66
+reproduce their earlier full replay hashes. No default change.
+
+| Settings (spacing512, no EMA) | Ordinary mean | Normalized mean | Coherence ordinary / normalized |
+|---|---:|---:|---:|
+| K2, weight.10, novelty.10, nearest touch |**64**|75|.97519 / .97784|
+| K4, weight.30, novelty0, nearest touch |68|75|.98169 / .97611|
+| K2, weight.10, novelty.10, hit-only touch |66|75|.97643 / .97711|
+
+Coherence is candidate-parent-weighted norm(sum anchors)/K, including candidate
+states subsequently rejected. All six profiles have nonzero counts and exact
+histogram/count agreement (7.23–7.51 million); none has coherence below.1.
+The three75-restart results have different trace hashes, not identical routes.
+Near-cancellation is not observed here. Ordinary mean may benefit from its
+coherence-dependent influence, but these comparisons do not prove causation.
+All three normalized seeds receive their own finite refinement next.
+
+Native commit `c60fe9bcf`, GCC QuickBuildO3:
+executable SHA256 `7042b28783170a87259b008894c23e87976e9eceed638ecd3d404000449e7586`,
+DSO `61f290801bc4654ec8c8920e016a3cc02ec228d63295e5d08e9133d346d810af`.
+Native2 tests pass1.66s, Python118 pass32.63s; logs
+`cooperative-tests/20260914_071900_187504`. Same frozen workload and manager
+grant as the other experiments. The next boundary sweep uses this same build.
+
+## Seed, delayed update and hit-only LRU initial comparison
 
 Report `embedding_ema99_seed_delay_touch_20260914_v1/report.json`:15 replays,
 exit0, winner64 exactly repeated. Off87/original82/EMA69 and the64-restart

@@ -476,6 +476,135 @@
         ]
       },
       "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-novel",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 2,
+        "weight": 0.1,
+        "novelty": 0.1,
+        "touch": "nearest",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-plain",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 4,
+        "weight": 0.3,
+        "novelty": 0,
+        "touch": "nearest",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
+    },
+    {
+      "label": "normalized-mean-hit",
+      "seed": {
+        "mode": "anchors-lru",
+        "aggregation": "normalized-mean",
+        "anchors": 2,
+        "weight": 0.1,
+        "novelty": 0.1,
+        "touch": "hit",
+        "spacing": 512,
+        "window": 4096,
+        "count": 8,
+        "falloff": "uniform",
+        "ema_mix": 0
+      },
+      "axes": {
+        "weight": [
+          0.05,
+          0.1,
+          0.25,
+          0.5
+        ],
+        "spacing": [
+          32,
+          128,
+          512,
+          1024,
+          2048
+        ],
+        "anchors": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "novelty": [
+          0,
+          0.1,
+          0.2
+        ]
+      },
+      "neighbor_weight": true
     }
   ]
 }

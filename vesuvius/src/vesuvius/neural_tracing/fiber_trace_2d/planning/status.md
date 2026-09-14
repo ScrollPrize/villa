@@ -11,6 +11,6 @@
 - [x] Build/test seed-only, delayed EMA and hit-only LRU variants (2native suites,117Python tests)
 - [x] Evaluate/refine seed/delay/hit variants (91 replays, all exact repeats pass; best remains64)
 - [x] Build/test normalized-mean and coherence diagnostics (native2/Python118 pass)
-- [ ] Recheck optimized-path controls and coherence counts
+- [x] Recheck optimized-path64 control and coherence counts (7,233,138, histogram matches)
 - [ ] Compare normalized mean against64/68/66 controls, refine if useful
 - [ ] Document full results

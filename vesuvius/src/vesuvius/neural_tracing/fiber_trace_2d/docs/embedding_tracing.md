@@ -16,7 +16,9 @@ the mean vector; normalization removes this disagreement-based shrinkage.
 Exact cancellation costs1. The cached sum is refreshed only on bank changes.
 Trace profiling records candidate-weighted r deciles (last bucket1, numerical
 overshoot clipped for binning). This may amplify near-cancelling directions;
-native validation and quality evaluation are pending, no default change.
+native validation passed. Initial same-setting A/B worsened64/68/66 to75
+restarts each on the frozen tuning fiber; independent refinement remains in
+progress. No default change. See embedding_multi_anchor_20260913.md.
 
 Experimental LRU `--embedding-anchor-touch hit` only refreshes an old anchor
 when an observation exactly matches or has cosine distance below the novelty
