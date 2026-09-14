@@ -202,6 +202,7 @@ public:
     // --- Fleet setters: apply a viewer preference to every viewer ---
     void setShowDirectionHints(bool show);
     void setShowSurfaceNormals(bool show);
+    void setShowCoordinateFrames(bool show);
     void setPlaneIntersectionLinesVisible(bool visible);
     void setSurfaceOverlaysEnabled(bool enabled);
     void setSurfaceOverlapThreshold(float threshold);
@@ -331,6 +332,7 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
+    bool _showCoordinateFrames{true};
     double _zScrollSensitivity{1.0};
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};

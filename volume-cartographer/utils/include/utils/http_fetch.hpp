@@ -138,6 +138,11 @@ public:
         AwsAuth aws_auth{};  // AWS SigV4 authentication (takes precedence over auth if non-empty)
         std::chrono::seconds connect_timeout{10};
         std::chrono::seconds transfer_timeout{30};
+        // A zero transfer timeout disables the total wall-clock deadline.
+        // When both low-speed values are non-zero, curl aborts only after the
+        // transfer remains below the byte rate for the configured duration.
+        std::size_t low_speed_limit_bytes_per_second{0};
+        std::chrono::seconds low_speed_time{0};
         bool follow_redirects{true};
         std::size_t max_retries{3};
         std::string user_agent{"utils-http/1.0"};

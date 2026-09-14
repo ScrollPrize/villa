@@ -173,13 +173,29 @@ materializeOpenDataSegmentFolder(
 [[nodiscard]] std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     const std::filesystem::path& segmentDir);
 
+// Return the outermost registered immutable Open Data root that contains the
+// segment. Using the outermost root keeps editable copies outside every
+// protected catalog entry, including legacy nested representation entries.
+[[nodiscard]] std::filesystem::path registeredOpenDataCatalogRootForSegment(
+    const VolumePkg& pkg,
+    const std::filesystem::path& catalogSegmentDir);
+
 [[nodiscard]] std::filesystem::path defaultEditableCopyPathForCatalogSegment(
     const std::filesystem::path& catalogSegmentDir,
     const std::filesystem::path& activeSegmentsRoot);
 
 void copyCatalogSegmentToEditableDirectory(
+    const VolumePkg& pkg,
     const std::filesystem::path& catalogSegmentDir,
     const std::filesystem::path& editableSegmentDir);
+
+// Attach an editable root while preserving only the catalog entry metadata
+// needed to keep it associated with the correct Open Data volume.
+void attachEditableOpenDataSegmentRoot(
+    VolumePkg& pkg,
+    const std::filesystem::path& catalogSegmentDir,
+    const std::filesystem::path& editableSegmentsRoot,
+    bool select = true);
 
 OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     VolumePkg& pkg,

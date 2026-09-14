@@ -138,17 +138,19 @@
   supports. Optimized line points between adjacent controls define the path but
   are not mandatory columns. Each control-point span is independently
   resampled by optimized-polyline arclength using the interval count whose
-  physical spacing is closest to the 32-base-voxel target; a shorter span
-  remains one interval.
-  The along-strip grid density is always declared as `1/32` samples per base
+  physical spacing is closest to the 8-base-voxel along-line target; a shorter
+  span remains one interval.
+  The along-strip grid density is always declared as `1/8` samples per base
   voxel, so a short physical control-point span expands to one nominal display
   interval. Explicit support arclengths provide the bidirectional mapping
   between original fractional point positions and nonuniform ribbon columns.
   Both generated ribbons have seven cross rows at `1/32` samples per base voxel,
   giving a fixed 192-base-voxel first-to-last-row extent close to the previous
-  typical width without depending on optimized-line spacing.
-  Generated-view clicks collapse all controls within an inclusive 32-base-voxel
-  optimized-polyline arclength radius into one control at the clicked point.
+  typical width without depending on optimized-line spacing; the along and
+  cross spacings are independent constants.
+  Generated-view clicks collapse all controls within an inclusive 8-base-voxel
+  optimized-polyline arclength radius (equal to the along-line sampling
+  distance) into one control at the clicked point.
   Before automatic full optimization, every insertion, replacement, or
   multi-control collapse first reconstructs the replacement's surviving
   adjacent spans from its authoritative line position. A multi-control collapse
@@ -245,6 +247,37 @@
   the pre-pass and reuses them for normal sampling. A fully SurfaceCache-backed
   render probes the shared `SurfaceGeometryTileCache`; subsequent tile fills
   reuse those geometry tiles and do not allocate a second full-frame matrix.
+
+## Annotation focus bounds
+
+- VC3D may hold one optional session focus bounding box in inclusive
+  base-volume XYZ coordinates. It is preserved across volume/channel switches
+  within one package, cleared when the package is replaced or closed, and is
+  not serialized into project data.
+- While enabled, ordinary plane views and annotation-role strip/cut views draw
+  the final composed framebuffer outside the box at half RGB brightness without
+  a boundary line. Base and attached-volume pixels are dimmed together; Qt
+  control markers and other scene items remain full brightness.
+- Standard segmentation QuadSurface/SurfaceCache views are outside the current
+  display scope. Focus-bounds rendering uses coordinates already generated for
+  sampling and must not add volume reads, surface intersections, or render
+  resubmission loops. Editing configured bounds while disabled must not start a
+  different render job.
+- New line seeds, branch-fiber seeds, and control-point placements are accepted
+  only inside an active box. Validation occurs before pane creation, dataset
+  access, autosave flushing, or persistence. Existing controls remain valid
+  outside the box; in particular, an already-saved seed-only fiber can be
+  reopened and resumed after the box is enabled or moved.
+- Every trace or reoptimization uses the box state captured when that work was
+  launched. Changing the box does not cancel, restart, or retroactively mutate
+  existing or in-flight annotation geometry.
+- For work launched with an active box, the entire optimized path between the
+  outer controls is retained, including temporary excursions outside the box.
+  Open tails stop after their first outside sample. A lone outside control
+  retains each contiguous connector that reaches the box, the in-box run, and
+  its first sample after exiting. If neither tail reaches the box, it retains
+  one adjacent sample to remain valid. Manual provisional edits follow the
+  same tail rule.
 
 ## Download label
 

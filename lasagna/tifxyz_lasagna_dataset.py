@@ -14,6 +14,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+from dtypes import numpy_float_hi
 import torch
 from torch.utils.data import Dataset
 
@@ -52,17 +53,17 @@ TAG = "[tifxyz_lasagna_dataset]"
 def _parse_transform(dataset: dict) -> np.ndarray | None:
     """Parse inline 3×4 affine from dataset config, optionally inverting.
 
-    Returns (3, 4) float64 ndarray in XYZ order (matching transform.json
+    Returns a (3, 4) float ndarray in XYZ order (matching transform.json
     convention), or None if no transform is specified.
     """
     raw = dataset.get("transform")
     if raw is None:
         return None
-    m = np.array(raw, dtype=np.float64)
+    m = np.array(raw, dtype=numpy_float_hi)
     if m.shape != (3, 4):
         raise ValueError(f"transform must be (3,4), got {m.shape}")
     if dataset.get("transform_invert", False):
-        m4 = np.eye(4, dtype=np.float64)
+        m4 = np.eye(4, dtype=numpy_float_hi)
         m4[:3, :] = m
         m4 = np.linalg.inv(m4)
         m = m4[:3, :]
@@ -87,7 +88,7 @@ def _build_cache_to_volume_zyx(
     down = 1.0 / float(2 ** volume_scale)
 
     # Compose in 4×4 XYZ space
-    m4 = np.eye(4, dtype=np.float64)
+    m4 = np.eye(4, dtype=numpy_float_hi)
     m4[:3, :] = transform_xyz
     # Pre-multiply by scale-up (acts on input): multiply columns 0-2 by up
     m4[:3, :3] *= up
@@ -102,7 +103,7 @@ def _build_cache_to_volume_zyx(
     # Column swap: input is (z, y, x) instead of (x, y, z)
     m4_zyx[:, 0], m4_zyx[:, 2] = m4_zyx[:, 2].copy(), m4_zyx[:, 0].copy()
 
-    return m4_zyx[:3, :].astype(np.float64)
+    return m4_zyx[:3, :].astype(numpy_float_hi)
 
 
 def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
@@ -118,8 +119,8 @@ def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
     (..., 3) array — transformed points
     """
     shape = zyx.shape
-    pts = zyx.reshape(-1, 3).astype(np.float64)
-    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+    pts = zyx.reshape(-1, 3).astype(numpy_float_hi)
+    ones = np.ones((pts.shape[0], 1), dtype=numpy_float_hi)
     homo = np.hstack([pts, ones])  # (N, 4)
     out = (affine_3x4 @ homo.T).T  # (N, 3)
     return out.astype(np.float32).reshape(shape)
@@ -1038,13 +1039,13 @@ class TifxyzLasagnaDataset(Dataset):
                 for z in (z0, z1)
                 for y in (y0, y1)
                 for x in (x0, x1)
-            ], dtype=np.float64)
+            ], dtype=numpy_float_hi)
             corners_vol = _apply_affine_zyx(patch.cache_to_volume, corners_zyx)
             aabb_min = corners_vol.min(axis=0)
             aabb_max = corners_vol.max(axis=0)
             aabb_center = (aabb_min + aabb_max) / 2.0
             label_min = np.round(
-                aabb_center - np.array(label_size, dtype=np.float64) / 2.0
+                aabb_center - np.array(label_size, dtype=numpy_float_hi) / 2.0
             ).astype(np.int64)
         else:
             label_min = np.array([z0, y0, x0], dtype=np.int64)
@@ -1452,7 +1453,7 @@ class TifxyzLasagnaDataset(Dataset):
             (bbox[0] + bbox[1]) / 2.0,
             (bbox[2] + bbox[3]) / 2.0,
             (bbox[4] + bbox[5]) / 2.0,
-        ], dtype=np.float64)
+        ], dtype=numpy_float_hi)
 
         sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
@@ -1465,7 +1466,7 @@ class TifxyzLasagnaDataset(Dataset):
             "patch_info": {
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
-                "world_center": world_center,           # (3,) float64 — base-level voxels
+                "world_center": world_center,           # (3,) numpy_float_hi — base-level voxels
                 "world_min": min_corner,                # (3,) int64 — CT read origin
                 "scale": patch.scale,                   # zarr level
                 "idx": patch.dataset_local_idx,

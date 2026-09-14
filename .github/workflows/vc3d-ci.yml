@@ -391,6 +391,10 @@ jobs:
             -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-cli --target vc_cli_all --parallel 4
           sccache --show-stats
+      - name: Test renderer file-log cleanup
+        working-directory: volume-cartographer
+        timeout-minutes: 2
+        run: python3 core/test/test_render_tifxyz_logging.py build/ci-fast-cli/bin/vc_render_tifxyz
 
   flatboi-compile:
     name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)

@@ -10,6 +10,7 @@
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QGridLayout>

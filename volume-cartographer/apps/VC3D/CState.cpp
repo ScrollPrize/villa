@@ -201,6 +201,9 @@ std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
+    if (_vpkg != pkg) {
+        clearFocusBounds();
+    }
     _vpkg = std::move(pkg);
     emit vpkgChanged(_vpkg);
 }
@@ -235,6 +238,57 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
                       *_vpkg, _currentVolumeId))
             : utils::Json::object());
     emit volumeChanged(_currentVolume, _currentVolumeId);
+}
+
+std::optional<Rect3D> CState::focusBounds() const { return _focusBounds; }
+
+std::optional<Rect3D> CState::activeFocusBounds() const
+{
+    return _focusBoundsEnabled ? _focusBounds : std::nullopt;
+}
+
+bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
+
+uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
+
+void CState::setFocusBounds(const Rect3D& bounds)
+{
+    Rect3D normalized;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(bounds.low[axis]) || !std::isfinite(bounds.high[axis])) {
+            return;
+        }
+        normalized.low[axis] = std::min(bounds.low[axis], bounds.high[axis]);
+        normalized.high[axis] = std::max(bounds.low[axis], bounds.high[axis]);
+    }
+    if (_focusBounds && _focusBounds->low == normalized.low &&
+        _focusBounds->high == normalized.high) {
+        return;
+    }
+    _focusBounds = normalized;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::setFocusBoundsEnabled(bool enabled)
+{
+    if (_focusBoundsEnabled == enabled) {
+        return;
+    }
+    _focusBoundsEnabled = enabled;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::clearFocusBounds()
+{
+    if (!_focusBounds && !_focusBoundsEnabled) {
+        return;
+    }
+    _focusBounds.reset();
+    _focusBoundsEnabled = false;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }

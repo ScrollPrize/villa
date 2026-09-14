@@ -538,6 +538,22 @@ struct CandidateScoreDebug {
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceProgressCallback& progress = {});
 
+// Fraction of a segment's start-to-target distance that bounds the endpoint
+// acceptance threshold for that segment. The fixed threshold
+// (endpointAcceptThresholdBaseVoxels, 20 vx by default) is right for long
+// spans; on a span only a few times that long it would accept an endpoint that
+// never really reached the target. Not a config field: the persisted config
+// keys are matched exactly on load, so the fraction is a compile-time constant
+// and the effective threshold is reproducible from the persisted config plus
+// the span geometry.
+inline constexpr double kEndpointAcceptSpanFraction = 0.25;
+
+// min(config.endpointAcceptThresholdBaseVoxels, kEndpointAcceptSpanFraction * span).
+// A non-finite or negative span leaves the configured threshold unchanged.
+[[nodiscard]] double effectiveEndpointAcceptThresholdBaseVoxels(
+    const FiberTraceConfig& config,
+    double spanLengthBaseVoxels);
+
 [[nodiscard]] FiberTraceSegmentResult traceFiberSegment(
     const FiberPredictionSource& predictions,
     const FiberTraceSegmentRequest& request,
