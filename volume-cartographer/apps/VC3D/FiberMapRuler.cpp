@@ -97,6 +97,28 @@ std::optional<std::pair<long long, long long>> tickIndexRange(double low, double
     return std::make_pair(static_cast<long long>(first), static_cast<long long>(last));
 }
 
+// A label rect shifted, not shrunk, to lie within the band: a label at the
+// run's end is moved inward rather than cut in half by the clip. A rect
+// larger than the band in a dimension is left where it is.
+QRect keptInside(QRect rect, const QRect& band)
+{
+    if (rect.width() <= band.width()) {
+        if (rect.left() < band.left()) {
+            rect.moveLeft(band.left());
+        } else if (rect.right() > band.right()) {
+            rect.moveRight(band.right());
+        }
+    }
+    if (rect.height() <= band.height()) {
+        if (rect.top() < band.top()) {
+            rect.moveTop(band.top());
+        } else if (rect.bottom() > band.bottom()) {
+            rect.moveBottom(band.bottom());
+        }
+    }
+    return rect;
+}
+
 } // namespace
 
 int FiberMapRuler::thicknessFor(Edge edge)
@@ -329,7 +351,8 @@ void FiberMapRuler::paintWindings(QPainter& painter, const QRect& band)
         }
         const QString text = QString::number(mark.number);
         const int textWidth = metrics.horizontalAdvance(text) + 4;
-        const QRect textRect(x - textWidth / 2, band.top(), textWidth, textHeight);
+        const QRect textRect = keptInside(
+            QRect(x - textWidth / 2, band.top(), textWidth, textHeight), band);
         if (caption.isValid() && textRect.intersects(caption)) {
             continue;
         }
@@ -398,8 +421,9 @@ void FiberMapRuler::paintSheetDistance(QPainter& painter, const QRect& band)
             }
             const QString text = ticks.label(distance);
             const int textWidth = metrics.horizontalAdvance(text) + 4;
-            const QRect textRect(x - textWidth / 2, textTop, textWidth,
-                                 band.bottom() + 1 - textTop);
+            const QRect textRect = keptInside(
+                QRect(x - textWidth / 2, textTop, textWidth, band.bottom() + 1 - textTop),
+                band);
             if (caption.isValid() && textRect.intersects(caption)) {
                 continue;
             }
@@ -452,8 +476,9 @@ void FiberMapRuler::paintHeight(QPainter& painter, const QRect& band)
             }
             const QString text = ticks.label(z);
             const int textHeight = metrics.height();
-            const QRect textRect(band.left(), y - textHeight / 2, textRight - band.left(),
-                                 textHeight);
+            const QRect textRect = keptInside(
+                QRect(band.left(), y - textHeight / 2, textRight - band.left(), textHeight),
+                band);
             if (caption.isValid() && textRect.intersects(caption)) {
                 continue;
             }
