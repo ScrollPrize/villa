@@ -24,6 +24,9 @@ namespace vc::fiber_tracer
 {
 
 struct FiberTraceProfile {
+    uint64_t embeddingLruScoredCandidates = 0;
+    double embeddingLruCoherenceSum = 0;
+    std::array<uint64_t, 11> embeddingLruCoherenceHistogram{};
     size_t oneWayCalls = 0;
     size_t generations = 0;
     size_t candidateTasks = 0;

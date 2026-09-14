@@ -232,6 +232,33 @@ TEST_CASE("hit-only LRU does not refresh unmatched anchors before eviction")
     CHECK(equality.lastUsed.front() == 0);
 }
 
+TEST_CASE("normalized LRU mean removes coherence shrinkage and handles cancellation")
+{
+    using namespace vc::fiber_tracer;
+    FiberEmbeddingLru state;
+    advanceFiberEmbeddingLru(state,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(state,{0,1},10,10,2);
+    CHECK(state.coherence==doctest::Approx(std::sqrt(.5)));
+    CHECK(fiberEmbeddingLruCost({1,0},state,true)==.5);
+    CHECK(fiberEmbeddingLruCost({1,0},state,true,true)==doctest::Approx(1-std::sqrt(.5)));
+    auto branch=state;
+    advanceFiberEmbeddingLru(branch,{-1,0},20,10,2,0,true);
+    CHECK(state.entries.front().vector==std::vector<float>{1,0});
+    CHECK(fiberEmbeddingLruCost({1,0},branch,true,true)==doctest::Approx(1+std::sqrt(.5)));
+    CHECK(fiberEmbeddingLruCost({1,0},state,true,true)==doctest::Approx(1-std::sqrt(.5)));
+    FiberEmbeddingLru opposite;
+    advanceFiberEmbeddingLru(opposite,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(opposite,{-1,0},10,10,2);
+    CHECK(opposite.coherence==0);
+    CHECK(fiberEmbeddingLruCost({1,0},opposite,true,true)==1);
+    CHECK(fiberEmbeddingLruCost({0,1},opposite,true,true)==1);
+    FiberEmbeddingLru small;
+    advanceFiberEmbeddingLru(small,{1,0},0,10,2);
+    advanceFiberEmbeddingLru(small,{-1,1e-6f},10,10,2);
+    CHECK(small.coherence>0);
+    CHECK(fiberEmbeddingLruCost({0,1},small,true,true)==0);
+}
+
 TEST_CASE("supported appearance softmin is normalized and split invariant")
 {
     using namespace vc::fiber_tracer;
@@ -676,6 +703,18 @@ TEST_CASE("embedding tracing preserves zero-weight path and rejects missing embe
         request.config.embeddingReferenceMode = mode;
         CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
     }
+    request.config.embeddingReferenceMode = "anchors-lru";
+    request.config.embeddingAnchorAggregation = "normalized-mean";
+    vc::fiber_tracer::FiberTraceProfile embeddingProfile;
+    request.config.profile = &embeddingProfile;
+    CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);
+    CHECK(embeddingProfile.embeddingLruScoredCandidates>0);
+    CHECK(embeddingProfile.embeddingLruCoherenceHistogram[10]==embeddingProfile.embeddingLruScoredCandidates);
+    CHECK(embeddingProfile.embeddingLruCoherenceSum==doctest::Approx(embeddingProfile.embeddingLruScoredCandidates));
+    request.config.profile = nullptr;
+    request.config.embeddingReferenceMode = "appearance";
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberOneWay(predictions, request), std::invalid_argument);
+    request.config.embeddingAnchorAggregation = "best";
     request.config.embeddingReferenceMode = "anchors-lru";
     request.config.embeddingAnchorTouch = "hit";
     CHECK(vc::fiber_tracer::traceFiberOneWay(predictions, request).points == old.points);

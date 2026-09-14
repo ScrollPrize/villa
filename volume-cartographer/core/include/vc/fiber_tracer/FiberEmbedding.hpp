@@ -177,11 +177,36 @@ inline void advanceFiberEmbeddingAnchors(FiberEmbeddingHistory& bank, std::vecto
         anchors = selectFiberEmbeddingAnchors(bank, count);
 }
 
+inline double fiberEmbeddingSumNorm(const std::vector<double>& sum)
+{
+    double square = 0;
+    for (double v : sum) square += v*v;
+    return std::sqrt(square);
+}
+
 struct FiberEmbeddingLru {
     FiberEmbeddingHistory entries;
     std::vector<double> lastUsed;
     double lastAdmission = 0;
+    std::vector<float> meanDirection;
+    double coherence = 0;
 };
+
+inline void refreshFiberEmbeddingLruMean(FiberEmbeddingLru& state)
+{
+    if (state.entries.empty()) throw std::invalid_argument("empty embedding LRU state");
+    std::vector<double> sum(state.entries.front().vector.size(),0);
+    for (const auto& entry : state.entries) {
+        if (entry.vector.size()!=sum.size()) throw std::invalid_argument("inconsistent embedding LRU dimensions");
+        for (size_t d=0; d<sum.size(); ++d) sum[d]+=entry.vector[d];
+    }
+    const double norm=fiberEmbeddingSumNorm(sum);
+    if (!std::isfinite(norm)) throw std::invalid_argument("nonfinite embedding LRU mean");
+    state.coherence=norm/state.entries.size();
+    state.meanDirection.resize(sum.size());
+    for (size_t d=0; d<sum.size(); ++d)
+        state.meanDirection[d]=norm>0 ? static_cast<float>(sum[d]/norm) : 0;
+}
 
 inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector<float>& vector,
     double arc, double spacing, size_t capacity, double novelty = 0, bool hitOnly = false)
@@ -209,11 +234,17 @@ inline void advanceFiberEmbeddingLru(FiberEmbeddingLru& state, const std::vector
     }
     state.entries.push_back({arc,vector});
     state.lastUsed.push_back(arc);
+    refreshFiberEmbeddingLruMean(state);
 }
 
-inline double fiberEmbeddingLruCost(const std::vector<float>& vector, const FiberEmbeddingLru& state, bool average)
+inline double fiberEmbeddingLruCost(const std::vector<float>& vector, const FiberEmbeddingLru& state, bool average,
+    bool normalizedMean = false)
 {
     if (state.entries.empty()) throw std::invalid_argument("empty embedding LRU state");
+    if (normalizedMean) {
+        if (state.meanDirection.empty()) throw std::invalid_argument("uninitialized embedding LRU mean");
+        return state.coherence==0 ? 1 : 1-fiberEmbeddingCosine(vector,state.meanDirection);
+    }
     // LRU has no age expiry: reuse the shared normalized history aggregation.
     return fiberEmbeddingCost(vector,state.entries,state.lastAdmission,
         std::numeric_limits<double>::infinity(),"uniform",!average);
@@ -228,13 +259,6 @@ struct FiberEmbeddingAppearance {
     std::vector<FiberEmbeddingCluster> clusters;
     double lastAdmission = 0;
 };
-
-inline double fiberEmbeddingSumNorm(const std::vector<double>& sum)
-{
-    double square = 0;
-    for (double v : sum) square += v*v;
-    return std::sqrt(square);
-}
 
 inline void advanceFiberEmbeddingAppearance(FiberEmbeddingAppearance& state,
     const std::vector<float>& vector, double arc, double spacing, size_t capacity)

@@ -487,8 +487,10 @@ void validateTraceConfig(const FiberTraceConfig& config)
     if (config.embeddingAnchorCount < 1 || config.embeddingAnchorCount > 8 ||
         !std::isfinite(config.embeddingAnchorEmaMix) || config.embeddingAnchorEmaMix < 0 || config.embeddingAnchorEmaMix > 1)
         throw std::invalid_argument("invalid embedding anchor count/EMA mix");
-    if (config.embeddingAnchorAggregation != "best" && config.embeddingAnchorAggregation != "mean" && config.embeddingAnchorAggregation != "support-softmin")
+    if (config.embeddingAnchorAggregation != "best" && config.embeddingAnchorAggregation != "mean" && config.embeddingAnchorAggregation != "normalized-mean" && config.embeddingAnchorAggregation != "support-softmin")
         throw std::invalid_argument("invalid embedding anchor aggregation");
+    if (config.embeddingAnchorAggregation == "normalized-mean" && mode != "anchors-lru")
+        throw std::invalid_argument("normalized-mean requires anchors-lru");
     if (mode == "anchors" && config.embeddingAnchorAggregation != "best")
         throw std::invalid_argument("representative anchors use best aggregation");
     if ((mode == "appearance" && config.embeddingAnchorAggregation == "mean") ||
@@ -701,7 +703,7 @@ void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     const double cost = (config.embeddingReferenceMode == "anchors" || lru || appearance) ?
         (1-config.embeddingAnchorEmaMix) * (appearance ? fiberEmbeddingAppearanceCost(vector,parent.embeddingAppearance,
             config.embeddingAnchorAggregation == "support-softmin" ? config.embeddingAnchorTemperature : 0) : lru ? fiberEmbeddingLruCost(vector,parent.embeddingLru,
-            config.embeddingAnchorAggregation == "mean") : fiberEmbeddingAnchorCost(vector, parent.embeddingHistory, parent.embeddingAnchors)) +
+            config.embeddingAnchorAggregation == "mean", config.embeddingAnchorAggregation == "normalized-mean") : fiberEmbeddingAnchorCost(vector, parent.embeddingHistory, parent.embeddingAnchors)) +
         config.embeddingAnchorEmaMix * fiberEmbeddingMemoryCost(vector, parent.embeddingMemory, false) :
         ema ? fiberEmbeddingMemoryCost(vector, parent.embeddingMemory,
         config.embeddingReferenceMode.starts_with("ema-seed")) : fiberEmbeddingCost(
@@ -1049,6 +1051,15 @@ void sampleCandidateNormals(
     scores.resize(tasks.size());
     if (tasks.empty())
         return scores;
+    if (profile != nullptr && config.embeddingWeight>0 && config.embeddingReferenceMode=="anchors-lru") {
+        // Candidate-parent distribution, common to fused and generic scoring.
+        for (const auto& task : tasks) {
+            const double r=beams[task.beamIndex].embeddingLru.coherence;
+            ++profile->embeddingLruScoredCandidates;
+            profile->embeddingLruCoherenceSum+=r;
+            ++profile->embeddingLruCoherenceHistogram[static_cast<size_t>(std::clamp(r,0.0,1.0)*10)];
+        }
+    }
     if (profile != nullptr) {
         profile->candidateTasks += tasks.size();
         if (lookaheadDepth <= 1) {
@@ -1829,6 +1840,8 @@ template <typename LossAt>
         initial.embeddingAnchors = {0};
         initial.embeddingLru.entries = {{0,seed.front()}};
         initial.embeddingLru.lastUsed = {0};
+        if (request.config.embeddingReferenceMode == "anchors-lru")
+            refreshFiberEmbeddingLruMean(initial.embeddingLru);
         if (request.config.embeddingReferenceMode == "appearance")
             advanceFiberEmbeddingAppearance(initial.embeddingAppearance,seed.front(),0,
                 request.config.embeddingHistorySpacingBaseVoxels,request.config.embeddingAnchorCount);
