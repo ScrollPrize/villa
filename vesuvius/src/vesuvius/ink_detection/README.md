@@ -157,6 +157,24 @@ and train/validation TIFF previews below `out_dir`. Online `val_loss` is the
 smoothed objective. Use `val_bce_unsmoothed` from the JSONL file for
 calibration-comparable BCE.
 
+Native target construction excludes validation ink from training and excludes
+ink outside the selected supervision scope from validation. Ordinary training
+still treats positive ink outside the generic supervision mask as supervised,
+unless that ink is explicitly held out. For a fixed patch, physical geometry
+and the single-wrap surface channel do not depend on annotation values.
+Full-3D validation merges an intersecting segment only through that segment's
+validation mask; a segment without one contributes no validation annotations.
+This is a label-value
+isolation rule; projection thickness and dilation do not establish a spatial
+gap between training and validation regions.
+
+Default and subtiling patch discovery apply the same training exclusion before
+measuring label coverage. Subtiling validation eligibility uses the validation
+mask, including negative-only tiles, so its cohort can differ from older runs.
+Patch cache v7 invalidates older discovery results; empty caches are recomputed.
+Subtiling cache identity includes the minimum labeled coverage threshold.
+Rebuild caches and establish a new validation baseline when adopting this fix.
+
 Flat inference writes a tiled LZW uint8 TIFF. Native inference writes a sparse
 six-level uint8 OME-Zarr pyramid in scroll coordinates. Label conversion writes
 65-plane, six-level OME-Zarr labels with the flat label at Z=32. The 9 µm

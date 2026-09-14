@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from vesuvius.ink_detection.data.normalization import exclude_validation_voxels
+from vesuvius.ink_detection.data.patch_finding_default import labeled_patch_coverage
 from vesuvius.ink_detection.types import Patch, Segment
 
 
@@ -118,67 +120,52 @@ def find_segment_patches(
     tile_size = size if finding.tile_size is None else finding.tile_size
     default_stride = int(size * finding.overlap)
     stride = default_stride if finding.stride is None else finding.stride
-    _, xyxys, _ = build_patch_index(
-        inklabels[surface],
-        supervision[surface],
-        size=size,
-        tile_size=tile_size,
-        stride=stride,
-        filter_empty_tile=finding.filter_empty_tile,
+    supervision_slice = np.asarray(supervision[surface])
+    validation_slice = (
+        None if validation is None
+        else np.asarray(validation[int(validation.shape[0] // 2)]) > 0
+    )
+    training_labels = exclude_validation_voxels(
+        np.asarray(inklabels[surface]), validation_slice
+    )
+    training_support = exclude_validation_voxels(
+        supervision_slice > 0, validation_slice
     )
     training: list[Patch] = []
     held_out: list[Patch] = []
-    for x1, y1, _, _ in xyxys.tolist():
-        z0 = surface - patch_size[0] // 2
-        bbox = (
-            z0,
-            int(y1),
-            int(x1),
-            z0 + patch_size[0],
-            int(y1) + patch_size[1],
-            int(x1) + patch_size[2],
+    # Each split has its own deterministic parent-tile sequence. A union
+    # ordered by one split could let its labels reorder the other split.
+    # Validation eligibility uses its mask so annotated negatives are retained.
+    for is_validation, tile_labels, active_support in (
+        (False, training_labels, training_support),
+        (True, validation_slice, validation_slice),
+    ):
+        if tile_labels is None:
+            continue
+        _, xyxys, _ = build_patch_index(
+            tile_labels,
+            supervision_slice,
+            size=size,
+            tile_size=tile_size,
+            stride=stride,
+            filter_empty_tile=finding.filter_empty_tile,
         )
-        supervision_patch = supervision[
-            surface,
-            int(y1) : int(y1) + patch_size[1],
-            int(x1) : int(x1) + patch_size[2],
-        ]
-        has_training = bool(supervision_patch.size and np.any(supervision_patch))
-        has_validation = False
-        if validation is not None:
-            validation_patch = validation[
-                surface,
-                int(y1) : int(y1) + patch_size[1],
-                int(x1) : int(x1) + patch_size[2],
-            ]
-            has_validation = bool(validation_patch.size and np.any(validation_patch))
-            if has_training and has_validation:
-                has_training = bool(
-                    np.any(np.asarray(supervision_patch) & ~np.asarray(validation_patch))
-                )
-        if has_validation:
-            held_out.append(
-                Patch(
+        for x1, y1, _, _ in xyxys.tolist():
+            x1, y1 = int(x1), int(y1)
+            window = (slice(y1, y1 + size), slice(x1, x1 + size))
+            if not np.any(active_support[window]):
+                continue
+            z0 = surface - patch_size[0] // 2
+            bbox = (z0, y1, x1, z0 + patch_size[0], y1 + size, x1 + size)
+            if is_validation:
+                held_out.append(Patch(
                     segment=segment,
                     bbox=bbox,
                     is_validation=True,
                     supervision_mask_override=segment.validation_mask,
-                )
-            )
-        label_patch = inklabels[
-            surface,
-            int(y1) : int(y1) + patch_size[1],
-            int(x1) : int(x1) + patch_size[2],
-        ]
-        labeled_y, labeled_x = np.nonzero(label_patch)
-        coverage = 0.0
-        if labeled_y.size:
-            coverage = float(
-                (int(labeled_y.max()) - int(labeled_y.min()) + 1)
-                * (int(labeled_x.max()) - int(labeled_x.min()) + 1)
-            ) / float(label_patch.size)
-        if has_training and coverage >= finding.min_labeled_coverage:
-            training.append(Patch(segment=segment, bbox=bbox))
+                ))
+            elif labeled_patch_coverage(training_labels[window]) >= finding.min_labeled_coverage:
+                training.append(Patch(segment=segment, bbox=bbox))
     if not training and not held_out:
         raise ValueError(f"{segment.inklabels} produced no valid patches")
     return training, held_out
